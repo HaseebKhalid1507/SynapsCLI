@@ -145,7 +145,7 @@ impl Runtime {
 
         // Slow path: delegate to auth.rs which handles locking, re-read,
         // conditional refresh, and persistence.
-        let creds = crate::auth::ensure_fresh_token()
+        let creds = crate::auth::ensure_fresh_token(&self.client)
             .await
             .map_err(|e| RuntimeError::Tool(format!(
                 "Token refresh failed: {}. Run `login` to re-authenticate.", e
@@ -426,10 +426,9 @@ impl Runtime {
                     "content": tool_results
                 }));
 
-                // Send updated history after each tool loop iteration
-                let _ = tx.send(StreamEvent::MessageHistory(messages.clone()));
-
                 if cancelled {
+                    // Send final history on cancellation so session can be saved
+                    let _ = tx.send(StreamEvent::MessageHistory(messages));
                     return Ok(());
                 }
 
@@ -534,7 +533,7 @@ impl Runtime {
             // Process complete lines from the buffer
             while let Some(newline_pos) = line_buffer.find('\n') {
                 let line = line_buffer[..newline_pos].trim_end().to_string();
-                line_buffer = line_buffer[newline_pos + 1..].to_string();
+                line_buffer.drain(..newline_pos + 1);
 
                 if !line.starts_with("data: ") {
                     continue;

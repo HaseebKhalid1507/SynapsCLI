@@ -998,8 +998,8 @@ async fn main() -> Result<()> {
         draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
 
         tokio::select! {
-            // Tick to keep redrawing during animations
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() => {
+            // Tick: redraws during animations AND during streaming (~60fps throttle)
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming => {
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
                 }
@@ -1341,6 +1341,16 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(event) = maybe_event {
+                    // Only redraw immediately for structural events (tool calls,
+                    // completion, errors). Text/thinking tokens are batched and
+                    // rendered by the 16ms tick to avoid hundreds of redraws/sec.
+                    let needs_immediate_draw = matches!(&event,
+                        StreamEvent::ToolUse { .. }
+                        | StreamEvent::ToolResult { .. }
+                        | StreamEvent::Done
+                        | StreamEvent::Error(_)
+                    );
+
                     match event {
                         StreamEvent::Thinking(text) => {
                             app.append_or_update_thinking(&text);
@@ -1388,10 +1398,11 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    // Redraw immediately so tool calls appear before execution
-                    let elapsed = last_frame.elapsed();
-                    last_frame = Instant::now();
-                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                    if needs_immediate_draw {
+                        let elapsed = last_frame.elapsed();
+                        last_frame = Instant::now();
+                        draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                    }
                 }
             }
         }

@@ -137,8 +137,24 @@ pub fn latest_session() -> std::io::Result<Session> {
         .and_then(|info| Session::load(&info.id))
 }
 
-/// List all sessions, sorted by most recently updated
+/// List all sessions, sorted by most recently updated.
+/// Uses a lightweight struct to skip deserializing the full message history.
 pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
+    /// Lightweight struct for listing — skips api_messages entirely.
+    #[derive(Deserialize)]
+    struct SessionMetadata {
+        id: String,
+        #[serde(default)]
+        title: String,
+        model: String,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        #[serde(default)]
+        session_cost: f64,
+        #[serde(default)]
+        api_messages: Vec<serde::de::IgnoredAny>,
+    }
+
     let dir = sessions_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -150,8 +166,16 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
         let path = entry.path();
         if path.extension().map_or(false, |e| e == "json") {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<Session>(&content) {
-                    sessions.push(session.info());
+                if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&content) {
+                    sessions.push(SessionInfo {
+                        id: meta.id,
+                        title: meta.title,
+                        model: meta.model,
+                        created_at: meta.created_at,
+                        updated_at: meta.updated_at,
+                        session_cost: meta.session_cost,
+                        message_count: meta.api_messages.len(),
+                    });
                 }
             }
         }
