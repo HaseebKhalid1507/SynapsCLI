@@ -283,14 +283,13 @@ pub async fn exchange_code_for_tokens(
 }
 
 /// Refresh an expired OAuth token.
-pub async fn refresh_token(refresh: &str) -> std::result::Result<OAuthCredentials, String> {
+pub async fn refresh_token(client: &Client, refresh: &str) -> std::result::Result<OAuthCredentials, String> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
         "refresh_token": refresh,
     });
 
-    let client = Client::new();
     let resp = client
         .post(TOKEN_URL)
         .header("Content-Type", "application/json")
@@ -390,7 +389,7 @@ pub fn is_token_expired(creds: &OAuthCredentials) -> bool {
 /// refreshed while we were waiting for the lock.
 ///
 /// Use this before every API call that needs a valid access token.
-pub async fn ensure_fresh_token() -> std::result::Result<OAuthCredentials, String> {
+pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCredentials, String> {
     use fs4::fs_std::FileExt;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -454,7 +453,7 @@ pub async fn ensure_fresh_token() -> std::result::Result<OAuthCredentials, Strin
     // Token is expired — refresh via API. Hold the lock across the HTTP call
     // so other instances serialize behind us rather than all hitting the
     // token endpoint simultaneously.
-    let new_creds = refresh_token(&auth.anthropic.refresh).await?;
+    let new_creds = refresh_token(client, &auth.anthropic.refresh).await?;
 
     // Write new credentials back to the SAME file handle (still locked).
     let new_auth = AuthFile {
