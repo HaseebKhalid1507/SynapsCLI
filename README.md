@@ -479,18 +479,6 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
 
-#### Syncing auth across machines
-
-The `scripts/synapsync` helper rsyncs `~/.synaps-cli/auth.json` from one host to another (e.g., from your main box to a homelab server). Install it to `~/bin/synapsync` or anywhere on `$PATH`:
-
-```bash
-cp scripts/synapsync ~/bin/synapsync
-chmod +x ~/bin/synapsync
-synapsync                                    # defaults to syncing to "jade"
-```
-
-Edit the `REMOTE` variable in the script to change the target host.
-
 ## Cost Tracking
 
 Session cost is calculated per API call using current Anthropic pricing:
