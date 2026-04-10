@@ -50,19 +50,48 @@ pub struct Runtime {
     auth_type: String,
     model: String,
     tools: ToolRegistry,
+    system_prompt: Option<String>,
+    thinking_budget: u32,
 }
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
         let (auth_token, auth_type) = Self::get_auth_token()?;
-        
+
         Ok(Runtime {
             client: Client::new(),
             auth_token,
             auth_type,
             model: "claude-sonnet-4-20250514".to_string(),
             tools: ToolRegistry::new(),
+            system_prompt: None,
+            thinking_budget: 4096,
         })
+    }
+
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = Some(prompt);
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn set_thinking_budget(&mut self, budget: u32) {
+        self.thinking_budget = budget;
+    }
+
+    pub fn thinking_level(&self) -> &str {
+        match self.thinking_budget {
+            0..=2048 => "low",
+            2049..=4096 => "medium",
+            4097..=16384 => "high",
+            _ => "xhigh",
+        }
     }
     
     fn get_auth_token() -> Result<(String, String)> {
@@ -308,20 +337,28 @@ impl Runtime {
             "stream": true,
             "thinking": {
                 "type": "enabled",
-                "budget_tokens": 4096,
+                "budget_tokens": self.thinking_budget,
                 "display": "summarized"
             }
         });
         
         if self.auth_type == "oauth" {
+            let mut system_blocks = vec![
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}),
+                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
+            ];
+            if let Some(ref prompt) = self.system_prompt {
+                system_blocks.push(json!({"type": "text", "text": prompt}));
+            }
+            body["system"] = json!(system_blocks);
+        } else if let Some(ref prompt) = self.system_prompt {
             body["system"] = json!([
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}, 
-                {"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}
+                {"type": "text", "text": prompt}
             ]);
         }
-        
+
         let response = request.json(&body).send().await?;
-        
+
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(RuntimeError::Tool(format!("API Error: {}", error_text)));
@@ -375,8 +412,8 @@ impl Runtime {
                             match content_block["type"].as_str() {
                                 Some("thinking") => {
                                     current_thinking.clear();
+                                    current_thinking_signature.clear();
                                     in_thinking = true;
-                                    let _ = tx.send(StreamEvent::Thinking("Claude is thinking...".to_string()));
                                 }
                                 Some("tool_use") => {
                                     // Start accumulating a tool_use block
@@ -386,7 +423,13 @@ impl Runtime {
                                     in_tool_use = true;
                                 }
                                 Some("text") => {
-                                    // Text block starting — flush any previous text if needed
+                                    if !current_text.is_empty() {
+                                        accumulated_content.push(json!({
+                                            "type": "text",
+                                            "text": current_text
+                                        }));
+                                        current_text.clear();
+                                    }
                                 }
                                 _ => {}
                             }
@@ -463,6 +506,39 @@ impl Runtime {
             }
         }
 
+        // Process any remaining data in line_buffer (final line without trailing newline)
+        let remaining = line_buffer.trim().to_string();
+        if remaining.starts_with("data: ") {
+            let data_part = &remaining[6..];
+            if data_part.trim() != "[DONE]" {
+                if let Ok(event) = serde_json::from_str::<Value>(data_part) {
+                    if event["type"].as_str() == Some("content_block_stop") {
+                        if in_thinking {
+                            accumulated_content.push(json!({
+                                "type": "thinking",
+                                "thinking": current_thinking,
+                                "signature": current_thinking_signature
+                            }));
+                        } else if in_tool_use {
+                            let input: Value = match serde_json::from_str(&current_tool_input_json) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("Warning: failed to parse tool input JSON: {}", e);
+                                    json!({})
+                                }
+                            };
+                            accumulated_content.push(json!({
+                                "type": "tool_use",
+                                "id": current_tool_id,
+                                "name": current_tool_name,
+                                "input": input
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
         // Return accumulated content in the expected format
         if !current_text.is_empty() {
             accumulated_content.push(json!({
@@ -501,18 +577,26 @@ impl Runtime {
             "tools": self.tools.tools_schema(),
             "thinking": {
                 "type": "enabled",
-                "budget_tokens": 4096,
+                "budget_tokens": self.thinking_budget,
                 "display": "summarized"
             }
         });
         
         if self.auth_type == "oauth" {
+            let mut system_blocks = vec![
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}),
+                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
+            ];
+            if let Some(ref prompt) = self.system_prompt {
+                system_blocks.push(json!({"type": "text", "text": prompt}));
+            }
+            body["system"] = json!(system_blocks);
+        } else if let Some(ref prompt) = self.system_prompt {
             body["system"] = json!([
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}, 
-                {"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}
+                {"type": "text", "text": prompt}
             ]);
         }
-        
+
         let response = request.json(&body).send().await?;
         let json: Value = response.json().await?;
         
@@ -536,6 +620,8 @@ impl Clone for Runtime {
             auth_type: self.auth_type.clone(),
             model: self.model.clone(),
             tools: self.tools.clone(),
+            system_prompt: self.system_prompt.clone(),
+            thinking_budget: self.thinking_budget,
         }
     }
 }

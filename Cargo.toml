@@ -17,16 +17,16 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1.89"
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
 futures = "0.3"
 tokio-stream = "0.1"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 [[bin]]
 name = "chat"
 path = "src/chat.rs"
 
 [[bin]]
-name = "server"
-path = "src/server.rs"
+name = "chatui"
+path = "src/chatui.rs"
+

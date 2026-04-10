@@ -138,6 +138,7 @@ async fn execute_bash(params: Value) -> Result<String> {
         Command::new("bash")
             .arg("-c")
             .arg(command)
+            .kill_on_drop(true)
             .output()
             .await
     }).await;
