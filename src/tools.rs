@@ -46,7 +46,7 @@ impl ToolType {
     pub fn description(&self) -> &str {
         match self {
             ToolType::Bash => "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds.",
-            ToolType::Read => "Read the contents of a file. Returns lines with line numbers. Supports reading specific ranges with offset and limit parameters for large files.",
+            ToolType::Read => "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections.",
             ToolType::Write => "Create or overwrite a file with the given content. Creates parent directories if needed. Use this for creating new files or completely rewriting existing ones.",
             ToolType::Edit => "Make a surgical edit to a file by replacing an exact string match. The old_string must appear exactly once in the file. Provide enough surrounding context to make the match unique.",
             ToolType::Grep => "Search file contents using regex patterns. Returns matching lines with file paths and line numbers. Supports file type filtering and context lines.",
@@ -190,27 +190,29 @@ impl ToolType {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolType>,
+    /// Cached schema — built once at construction, returned by reference on every API call.
+    cached_schema: Vec<Value>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut registry = ToolRegistry {
-            tools: HashMap::new(),
-        };
+        let mut tools = HashMap::new();
+        for tool in [
+            ToolType::Bash, ToolType::Read, ToolType::Write,
+            ToolType::Edit, ToolType::Grep, ToolType::Find, ToolType::Ls,
+        ] {
+            tools.insert(tool.name().to_string(), tool);
+        }
 
-        registry.register(ToolType::Bash);
-        registry.register(ToolType::Read);
-        registry.register(ToolType::Write);
-        registry.register(ToolType::Edit);
-        registry.register(ToolType::Grep);
-        registry.register(ToolType::Find);
-        registry.register(ToolType::Ls);
+        let cached_schema = tools.values().map(|tool| {
+            json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "input_schema": tool.parameters()
+            })
+        }).collect();
 
-        registry
-    }
-
-    pub fn register(&mut self, tool: ToolType) {
-        self.tools.insert(tool.name().to_string(), tool);
+        ToolRegistry { tools, cached_schema }
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolType> {
@@ -218,13 +220,7 @@ impl ToolRegistry {
     }
 
     pub fn tools_schema(&self) -> Vec<Value> {
-        self.tools.values().map(|tool| {
-            json!({
-                "name": tool.name(),
-                "description": tool.description(),
-                "input_schema": tool.parameters()
-            })
-        }).collect()
+        self.cached_schema.clone()
     }
 }
 
@@ -255,6 +251,11 @@ async fn execute_bash(params: Value) -> Result<String> {
                     result.push_str("\n[stderr]: ");
                     result.push_str(&stderr);
                 }
+                // Cap output to avoid bloating message history
+                if result.len() > 30_000 {
+                    result.truncate(30_000);
+                    result.push_str("\n\n[output truncated at 30KB]");
+                }
                 Ok(result)
             } else {
                 Err(RuntimeError::Tool(format!(
@@ -282,7 +283,7 @@ async fn execute_read(params: Value) -> Result<String> {
     let total_lines = lines.len();
 
     let offset = params["offset"].as_u64().unwrap_or(0) as usize;
-    let limit = params["limit"].as_u64().map(|l| l as usize).unwrap_or(total_lines);
+    let limit = params["limit"].as_u64().map(|l| l as usize).unwrap_or(500.min(total_lines));
 
     let start = offset.min(total_lines);
     let end = (start + limit).min(total_lines);
