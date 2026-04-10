@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::{Result, RuntimeError, ToolRegistry};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use futures::stream::Stream;
 use std::pin::Pin;
 use futures::StreamExt;
@@ -40,6 +41,7 @@ pub enum StreamEvent {
     },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
+    Usage { input_tokens: u64, output_tokens: u64 },
     Done,
     Error(String),
 }
@@ -203,16 +205,16 @@ impl Runtime {
         }
     }
 
-    pub fn run_stream(&self, prompt: String) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})])
+    pub fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel)
     }
 
-    pub fn run_stream_with_messages(&self, messages: Vec<Value>) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+    pub fn run_stream_with_messages(&self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let runtime = self.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = runtime.run_stream_internal(messages, tx.clone()).await {
+            if let Err(e) = runtime.run_stream_internal(messages, tx.clone(), cancel).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
             let _ = tx.send(StreamEvent::Done);
@@ -221,83 +223,96 @@ impl Runtime {
         Box::pin(UnboundedReceiverStream::new(rx))
     }
 
-    async fn run_stream_internal(&self, initial_messages: Vec<Value>, tx: mpsc::UnboundedSender<StreamEvent>) -> Result<()> {
+    async fn run_stream_internal(&self, initial_messages: Vec<Value>, tx: mpsc::UnboundedSender<StreamEvent>, cancel: CancellationToken) -> Result<()> {
         let mut messages = initial_messages;
-        
+
         loop {
-            let response = self.call_api_stream(&messages, tx.clone()).await?;
-            
+            // Check for cancellation before each API call
+            if cancel.is_cancelled() {
+                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                return Ok(());
+            }
+
+            let response = match self.call_api_stream(&messages, tx.clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Send whatever history we have so far, so context isn't lost
+                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    return Err(e);
+                }
+            };
+
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
-                let mut response_text = String::new();
                 let mut tool_uses = Vec::new();
-                
+
                 // Process response content
                 for item in content {
-                    match item["type"].as_str() {
-                        Some("text") => {
-                            if let Some(text) = item["text"].as_str() {
-                                response_text.push_str(text);
-                            }
-                        }
-                        Some("tool_use") => {
-                            tool_uses.push(item.clone());
-                        }
-                        _ => {}
+                    if item["type"].as_str() == Some("tool_use") {
+                        tool_uses.push(item.clone());
                     }
                 }
-                
-                
-                // If no tool uses, we're done — send final messages for multi-turn context
-                if tool_uses.is_empty() {
-                    // Add the final assistant response to messages before sending
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": content
-                    }));
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
-                    return Ok(());
-                }
-                
+
                 // Add assistant's response to conversation
                 messages.push(json!({
                     "role": "assistant",
                     "content": content
                 }));
-                
+
+                // If no tool uses, we're done
+                if tool_uses.is_empty() {
+                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    return Ok(());
+                }
+
                 // Execute tools and add results
                 let mut tool_results = Vec::new();
-                
+
                 for tool_use in tool_uses {
+                    // Check for cancellation before each tool execution
+                    if cancel.is_cancelled() {
+                        let _ = tx.send(StreamEvent::MessageHistory(messages));
+                        return Ok(());
+                    }
+
                     if let (Some(tool_name), Some(tool_id)) = (
                         tool_use["name"].as_str(),
                         tool_use["id"].as_str()
                     ) {
                         let input = &tool_use["input"];
-                        
+
                         // Send tool use event
                         let _ = tx.send(StreamEvent::ToolUse {
                             tool_name: tool_name.to_string(),
                             tool_id: tool_id.to_string(),
                             input: input.clone(),
                         });
-                        
+
                         let result = match self.tools.get(tool_name) {
                             Some(tool) => {
-                                match tool.execute(input.clone()).await {
-                                    Ok(output) => output,
-                                    Err(e) => format!("Tool execution failed: {}", e),
+                                // Race tool execution against cancellation
+                                tokio::select! {
+                                    res = tool.execute(input.clone()) => {
+                                        match res {
+                                            Ok(output) => output,
+                                            Err(e) => format!("Tool execution failed: {}", e),
+                                        }
+                                    }
+                                    _ = cancel.cancelled() => {
+                                        let _ = tx.send(StreamEvent::MessageHistory(messages));
+                                        return Ok(());
+                                    }
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
                         };
-                        
+
                         // Send tool result event
                         let _ = tx.send(StreamEvent::ToolResult {
                             tool_id: tool_id.to_string(),
                             result: result.clone(),
                         });
-                        
+
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
@@ -305,15 +320,19 @@ impl Runtime {
                         }));
                     }
                 }
-                
+
                 // Add tool results to conversation
                 messages.push(json!({
                     "role": "user",
                     "content": tool_results
                 }));
-                
+
+                // Send updated history after each tool loop iteration
+                let _ = tx.send(StreamEvent::MessageHistory(messages.clone()));
+
                 // Continue the loop to get Claude's response with tool results
             } else {
+                let _ = tx.send(StreamEvent::MessageHistory(messages));
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }
@@ -453,7 +472,8 @@ impl Runtime {
                                     }
                                 }
                                 Some("thinking_delta") => {
-                                    if let Some(text) = delta["text"].as_str() {
+                                    // Anthropic sends thinking text in delta.thinking
+                                    if let Some(text) = delta["thinking"].as_str() {
                                         current_thinking.push_str(text);
                                         let _ = tx.send(StreamEvent::Thinking(text.to_string()));
                                     }
@@ -508,7 +528,27 @@ impl Runtime {
                             current_text.clear();
                         }
                     }
-                    Some("message_delta") | Some("message_stop") => {}
+                    Some("message_delta") => {
+                        if let Some(usage) = event.get("usage") {
+                            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+                            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+                            if input_t > 0 || output_t > 0 {
+                                let _ = tx.send(StreamEvent::Usage { input_tokens: input_t, output_tokens: output_t });
+                            }
+                        }
+                    }
+                    Some("message_start") => {
+                        if let Some(msg) = event.get("message") {
+                            if let Some(usage) = msg.get("usage") {
+                                let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+                                let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+                                if input_t > 0 || output_t > 0 {
+                                    let _ = tx.send(StreamEvent::Usage { input_tokens: input_t, output_tokens: output_t });
+                                }
+                            }
+                        }
+                    }
+                    Some("message_stop") => {}
                     _ => {}
                 }
             }

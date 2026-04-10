@@ -5,8 +5,9 @@ pub mod error;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{ToolType, ToolRegistry};
-pub use session::{Session, SessionEvent};
+pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions};
 pub use error::{RuntimeError, Result};
 
 // Re-export for convenience
 pub use serde_json::Value;
+pub use tokio_util::sync::CancellationToken;

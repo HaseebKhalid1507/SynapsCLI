@@ -1,4 +1,4 @@
-use agent_runtime::{Runtime, StreamEvent, Result};
+use agent_runtime::{Runtime, StreamEvent, Result, CancellationToken};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -33,7 +33,8 @@ async fn main() -> Result<()> {
         print!("Claude: ");
         io::stdout().flush().unwrap();
 
-        let mut stream = runtime.run_stream_with_messages(messages.clone());
+        let cancel = CancellationToken::new();
+        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel);
         let mut in_thinking = false;
 
         while let Some(event) = stream.next().await {
@@ -71,9 +72,9 @@ async fn main() -> Result<()> {
                     io::stdout().flush().unwrap();
                 }
                 StreamEvent::MessageHistory(history) => {
-                    // Replace our messages with the full history (includes assistant + tool turns)
                     messages = history;
                 }
+                StreamEvent::Usage { .. } => {}
                 StreamEvent::Done => {
                     if in_thinking {
                         print!("\n");
