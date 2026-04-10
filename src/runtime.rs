@@ -266,7 +266,7 @@ impl Runtime {
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": result
+                            "content": Self::truncate_tool_result(&result)
                         }));
                     }
                 }
@@ -415,7 +415,7 @@ impl Runtime {
                     tool_results.push(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
-                        "content": result
+                        "content": Self::truncate_tool_result(&result)
                     }));
                 }
 
@@ -459,10 +459,13 @@ impl Runtime {
             request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
         }
         
+        // Strip thinking blocks from older turns to save tokens
+        let cleaned_messages = Self::strip_old_thinking(messages);
+
         let mut body = json!({
             "model": self.model,
             "max_tokens": 128000,
-            "messages": messages,
+            "messages": cleaned_messages,
             "tools": self.tools.tools_schema(),
             "stream": true,
             "thinking": {
@@ -471,19 +474,30 @@ impl Runtime {
                 "display": "summarized"
             }
         });
+
+        // Prompt caching: mark the last tool so all tool schemas are cached
+        if let Some(tools) = body["tools"].as_array_mut() {
+            if let Some(last_tool) = tools.last_mut() {
+                last_tool["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
         
         if self.auth_type == "oauth" {
             let mut system_blocks = vec![
-                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}),
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
             if let Some(ref prompt) = self.system_prompt {
                 system_blocks.push(json!({"type": "text", "text": prompt}));
             }
+            // Prompt caching: mark the last system block so entire system prompt is cached
+            if let Some(last) = system_blocks.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
             body["system"] = json!(system_blocks);
         } else if let Some(ref prompt) = self.system_prompt {
             body["system"] = json!([
-                {"type": "text", "text": prompt}
+                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
             ]);
         }
 
@@ -713,6 +727,46 @@ impl Runtime {
             "content": accumulated_content
         }))
     }
+
+    /// Strip thinking blocks from all assistant messages except the most recent one.
+    /// Thinking blocks can be 2K–32K tokens each and are re-sent with every API call.
+    /// The API only requires thinking blocks from the immediately previous assistant turn.
+    fn strip_old_thinking(messages: &[Value]) -> Vec<Value> {
+        let mut msgs = messages.to_vec();
+
+        // Find the last assistant message — its thinking must stay intact
+        let last_asst = msgs.iter().rposition(|m| m["role"].as_str() == Some("assistant"));
+
+        for (i, msg) in msgs.iter_mut().enumerate() {
+            if Some(i) == last_asst || msg["role"].as_str() != Some("assistant") {
+                continue;
+            }
+            // Remove thinking blocks from older assistant messages
+            if let Some(content) = msg["content"].as_array() {
+                let filtered: Vec<Value> = content.iter()
+                    .filter(|b| b["type"].as_str() != Some("thinking"))
+                    .cloned()
+                    .collect();
+                msg["content"] = Value::Array(filtered);
+            }
+        }
+
+        msgs
+    }
+
+    /// Truncate tool results to avoid ballooning message history.
+    /// The full result is still sent to the UI — this only caps what goes into
+    /// the API messages that are re-sent on every subsequent call.
+    const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+
+    fn truncate_tool_result(result: &str) -> String {
+        if result.len() <= Self::MAX_TOOL_RESULT_CHARS {
+            return result.to_string();
+        }
+        let truncated: String = result.chars().take(Self::MAX_TOOL_RESULT_CHARS).collect();
+        format!("{}\n\n[truncated — {} total chars, showing first {}]",
+            truncated, result.len(), Self::MAX_TOOL_RESULT_CHARS)
+    }
     
     async fn call_api(&self, messages: &[Value]) -> Result<Value> {
         let auth_header = if self.auth_type == "oauth" {
@@ -732,10 +786,13 @@ impl Runtime {
             request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
         }
         
+        // Strip thinking blocks from older turns to save tokens
+        let cleaned_messages = Self::strip_old_thinking(messages);
+
         let mut body = json!({
             "model": self.model,
             "max_tokens": 128000,
-            "messages": messages,
+            "messages": cleaned_messages,
             "tools": self.tools.tools_schema(),
             "thinking": {
                 "type": "enabled",
@@ -743,19 +800,30 @@ impl Runtime {
                 "display": "summarized"
             }
         });
+
+        // Prompt caching: mark the last tool so all tool schemas are cached
+        if let Some(tools) = body["tools"].as_array_mut() {
+            if let Some(last_tool) = tools.last_mut() {
+                last_tool["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
         
         if self.auth_type == "oauth" {
             let mut system_blocks = vec![
-                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}),
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
             if let Some(ref prompt) = self.system_prompt {
                 system_blocks.push(json!({"type": "text", "text": prompt}));
             }
+            // Prompt caching: mark the last system block so entire system prompt is cached
+            if let Some(last) = system_blocks.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
             body["system"] = json!(system_blocks);
         } else if let Some(ref prompt) = self.system_prompt {
             body["system"] = json!([
-                {"type": "text", "text": prompt}
+                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
             ]);
         }
 
