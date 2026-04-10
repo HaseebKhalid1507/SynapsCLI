@@ -3,6 +3,7 @@ pub mod tools;
 pub mod session;
 pub mod error;
 pub mod protocol;
+pub mod auth;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{ToolType, ToolRegistry};

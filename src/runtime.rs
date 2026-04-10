@@ -50,6 +50,10 @@ pub struct Runtime {
     client: Client,
     auth_token: String,
     auth_type: String,
+    /// Stored refresh token for auto-refresh (only set when auth_type == "oauth")
+    refresh_token: Option<String>,
+    /// Token expiry in epoch millis (only set when auth_type == "oauth")
+    token_expires: Option<u64>,
     model: String,
     tools: ToolRegistry,
     system_prompt: Option<String>,
@@ -58,12 +62,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
-        let (auth_token, auth_type) = Self::get_auth_token()?;
+        let (auth_token, auth_type, refresh_token, token_expires) = Self::get_auth_token()?;
 
         Ok(Runtime {
             client: Client::new(),
             auth_token,
             auth_type,
+            refresh_token,
+            token_expires,
             model: "claude-opus-4-6".to_string(),
             tools: ToolRegistry::new(),
             system_prompt: None,
@@ -103,31 +109,104 @@ impl Runtime {
             _ => "xhigh",
         }
     }
+
+    /// Check if the OAuth token is expired and refresh it if needed.
+    /// Uses Pi-style file locking for cross-process safety:
+    /// - Acquires exclusive lock on auth.json
+    /// - Re-reads inside the lock (another instance may have refreshed)
+    /// - Refreshes via API only if still expired
+    /// - Writes back atomically and releases lock
+    ///
+    /// Multiple SynapsCLI instances (or Avante/Jade) can safely call this
+    /// simultaneously — they'll serialize on the lock and only one will
+    /// actually hit the token endpoint.
+    pub async fn refresh_if_needed(&mut self) -> Result<()> {
+        if self.auth_type != "oauth" {
+            return Ok(());
+        }
+
+        // Fast path: if our in-memory token isn't expired, skip the lock entirely
+        let in_memory_expired = match self.token_expires {
+            Some(exp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                now >= exp
+            }
+            None => false,
+        };
+
+        if !in_memory_expired {
+            return Ok(());
+        }
+
+        eprintln!("\x1b[2m  ↻ checking / refreshing OAuth token...\x1b[0m");
+
+        // Slow path: delegate to auth.rs which handles locking, re-read,
+        // conditional refresh, and persistence.
+        let creds = crate::auth::ensure_fresh_token()
+            .await
+            .map_err(|e| RuntimeError::Tool(format!(
+                "Token refresh failed: {}. Run `login` to re-authenticate.", e
+            )))?;
+
+        // Update in-memory state with whatever ensure_fresh_token returned
+        // (either a freshly refreshed token, or the current one if another
+        // instance beat us to the refresh).
+        self.auth_token = creds.access;
+        self.refresh_token = Some(creds.refresh);
+        self.token_expires = Some(creds.expires);
+
+        Ok(())
+    }
     
-    fn get_auth_token() -> Result<(String, String)> {
+    fn get_auth_token() -> Result<(String, String, Option<String>, Option<u64>)> {
+        // Try auth.json via the auth module
+        if let Ok(Some(auth_file)) = crate::auth::load_auth() {
+            let creds = &auth_file.anthropic;
+            if creds.auth_type == "oauth" && !creds.access.is_empty() {
+                return Ok((
+                    creds.access.clone(),
+                    "oauth".to_string(),
+                    Some(creds.refresh.clone()),
+                    Some(creds.expires),
+                ));
+            }
+        }
+
+        // Legacy: try the old PiAuth struct format (in case auth.json has optional fields)
         let home = std::env::var("HOME").unwrap();
-        let auth_path = Path::new(&home).join(".pi/agent/auth.json");
-        
+        let auth_path = Path::new(&home).join(".synaps-cli/auth.json");
+
         if auth_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&auth_path) {
                 if let Ok(auth) = serde_json::from_str::<PiAuth>(&content) {
                     let creds = &auth.anthropic;
                     if creds.auth_type == "oauth" && creds.access.is_some() {
-                        return Ok((creds.access.as_ref().unwrap().clone(), "oauth".to_string()));
+                        return Ok((
+                            creds.access.as_ref().unwrap().clone(),
+                            "oauth".to_string(),
+                            creds.refresh.clone(),
+                            creds.expires,
+                        ));
                     }
                 }
             }
         }
-        
+
         // Fall back to env var
         if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            return Ok((api_key, "api_key".to_string()));
+            return Ok((api_key, "api_key".to_string(), None, None));
         }
         
-        Err(RuntimeError::Tool("No Anthropic credentials found".to_string()))
+        Err(RuntimeError::Tool("No Anthropic credentials found. Run `login` to authenticate.".to_string()))
     }
 
-    pub async fn run_single(&self, prompt: &str) -> Result<String> {
+    pub async fn run_single(&mut self, prompt: &str) -> Result<String> {
+        // Refresh OAuth token if expired
+        self.refresh_if_needed().await?;
+
         let mut messages = vec![json!({"role": "user", "content": prompt})];
         
         loop {
@@ -205,12 +284,21 @@ impl Runtime {
         }
     }
 
-    pub fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel)
+    pub async fn run_stream(&mut self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel).await
     }
 
-    pub fn run_stream_with_messages(&self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+    pub async fn run_stream_with_messages(&mut self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
+
+        // Refresh OAuth token if expired BEFORE cloning into the task,
+        // so all subsequent API calls in the loop use the fresh token.
+        if let Err(e) = self.refresh_if_needed().await {
+            let _ = tx.send(StreamEvent::Error(e.to_string()));
+            let _ = tx.send(StreamEvent::Done);
+            return Box::pin(UnboundedReceiverStream::new(rx));
+        }
+
         let runtime = self.clone();
 
         tokio::spawn(async move {
@@ -692,6 +780,8 @@ impl Clone for Runtime {
             client: self.client.clone(),
             auth_token: self.auth_token.clone(),
             auth_type: self.auth_type.clone(),
+            refresh_token: self.refresh_token.clone(),
+            token_expires: self.token_expires,
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),

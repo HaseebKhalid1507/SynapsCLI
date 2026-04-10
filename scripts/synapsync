@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# synapsync — sync SynapsCLI auth credentials from Avante to Jade
+# Mirrors what pi-sync-jade does, but for ~/.synaps-cli/auth.json
+
+set -euo pipefail
+
+REMOTE="jade"
+LOCAL_AUTH="$HOME/.synaps-cli/auth.json"
+REMOTE_AUTH="$HOME/.synaps-cli/auth.json"
+
+# Ensure remote dir exists
+ssh "$REMOTE" "mkdir -p ~/.synaps-cli" 2>/dev/null
+
+if [[ ! -f "$LOCAL_AUTH" ]]; then
+    echo "✗ No auth.json found at $LOCAL_AUTH"
+    echo "  Run 'login' first to authenticate."
+    exit 1
+fi
+
+scp "$LOCAL_AUTH" "$REMOTE:$REMOTE_AUTH"
+echo "✅ Synaps auth synced to $REMOTE"

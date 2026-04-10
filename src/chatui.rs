@@ -1210,7 +1210,7 @@ async fn main() -> Result<()> {
                                     app.push_msg(ChatMessage::User(input.clone()));
                                     app.api_messages.push(json!({"role": "user", "content": input}));
                                     let ct = CancellationToken::new();
-                                    stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()));
+                                    stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()).await);
                                     cancel_token = Some(ct);
                                     app.streaming = true;
                                 }
