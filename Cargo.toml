@@ -21,6 +21,7 @@ futures = "0.3"
 tokio-stream = "0.1"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+tachyonfx = "0.9"
 
 [[bin]]
 name = "chat"

@@ -15,6 +15,8 @@ use ratatui::{
 };
 use serde_json::{json, Value};
 use std::io;
+use std::time::Instant;
+use tachyonfx::{fx, Effect, Interpolation, Shader};
 
 // -- Theme -------------------------------------------------------------------
 
@@ -303,7 +305,14 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, model: &str, thinking: &str) -> io::Result<()> {
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
+    model: &str,
+    thinking: &str,
+    effect: &mut Option<Effect>,
+    elapsed: std::time::Duration,
+) -> io::Result<()> {
     terminal.draw(|frame| {
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -419,6 +428,14 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App, model:
         .alignment(Alignment::Right)
         .style(Style::default().bg(BG));
         frame.render_widget(info, footer_chunks[1]);
+
+        if let Some(ref mut fx) = effect {
+            let area = frame.area();
+            fx.process(elapsed.into(), frame.buffer_mut(), area);
+            if fx.done() {
+                *effect = None;
+            }
+        }
     })?;
     Ok(())
 }
@@ -442,15 +459,25 @@ async fn main() -> Result<()> {
     let mut app = App::new();
     let mut event_reader = EventStream::new();
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
+    let mut boot_fx: Option<Effect> = Some(
+        fx::fade_from_fg(Color::Black, (300, Interpolation::QuadOut))
+    );
+    let mut last_frame = Instant::now();
 
     loop {
         if app.streaming {
             app.scroll_back = 0;
         }
 
-        draw(&mut terminal, &app, runtime.model(), runtime.thinking_level()).unwrap();
+        let elapsed = last_frame.elapsed();
+        last_frame = Instant::now();
+        draw(&mut terminal, &app, runtime.model(), runtime.thinking_level(), &mut boot_fx, elapsed).unwrap();
 
         tokio::select! {
+            // Tick to keep redrawing during animations
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() => {
+                continue;
+            }
             maybe_event = event_reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => {
