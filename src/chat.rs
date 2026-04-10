@@ -7,7 +7,7 @@ use tokio;
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("💬 Terminal Chat with Thinking Blocks - type 'quit' to exit\n");
-    let mut runtime = Runtime::new().await?;
+    let runtime = Runtime::new().await?;
     let mut messages: Vec<Value> = Vec::new();
 
     loop {

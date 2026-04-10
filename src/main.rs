@@ -17,7 +17,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut runtime = Runtime::new().await?;
+    let runtime = Runtime::new().await?;
     
     match cli.command {
         Commands::Run { prompt } => {
