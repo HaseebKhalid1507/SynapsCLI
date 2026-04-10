@@ -2,9 +2,10 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use serde::{Deserialize};
 use std::path::Path;
+use std::sync::Arc;
 use crate::{Result, RuntimeError, ToolRegistry};
+use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -46,14 +47,19 @@ pub enum StreamEvent {
     Error(String),
 }
 
-pub struct Runtime {
-    client: Client,
+/// Shared mutable auth state. Lives behind `Arc<RwLock<_>>` so the spawned
+/// streaming task and the parent Runtime always see the same (freshest) token.
+#[derive(Debug, Clone)]
+struct AuthState {
     auth_token: String,
     auth_type: String,
-    /// Stored refresh token for auto-refresh (only set when auth_type == "oauth")
     refresh_token: Option<String>,
-    /// Token expiry in epoch millis (only set when auth_type == "oauth")
     token_expires: Option<u64>,
+}
+
+pub struct Runtime {
+    client: Client,
+    auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: ToolRegistry,
     system_prompt: Option<String>,
@@ -66,10 +72,12 @@ impl Runtime {
 
         Ok(Runtime {
             client: Client::new(),
-            auth_token,
-            auth_type,
-            refresh_token,
-            token_expires,
+            auth: Arc::new(RwLock::new(AuthState {
+                auth_token,
+                auth_type,
+                refresh_token,
+                token_expires,
+            })),
             model: "claude-opus-4-6".to_string(),
             tools: ToolRegistry::new(),
             system_prompt: None,
@@ -120,26 +128,30 @@ impl Runtime {
     /// Multiple SynapsCLI instances (or Avante/Jade) can safely call this
     /// simultaneously — they'll serialize on the lock and only one will
     /// actually hit the token endpoint.
-    pub async fn refresh_if_needed(&mut self) -> Result<()> {
-        if self.auth_type != "oauth" {
-            return Ok(());
-        }
-
-        // Fast path: if our in-memory token isn't expired, skip the lock entirely
-        let in_memory_expired = match self.token_expires {
-            Some(exp) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                now >= exp
+    pub async fn refresh_if_needed(&self) -> Result<()> {
+        // Fast path: read lock to check expiry without blocking writers
+        {
+            let auth = self.auth.read().await;
+            if auth.auth_type != "oauth" {
+                return Ok(());
             }
-            None => false,
-        };
 
-        if !in_memory_expired {
-            return Ok(());
+            let in_memory_expired = match auth.token_expires {
+                Some(exp) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    now >= exp
+                }
+                None => false,
+            };
+
+            if !in_memory_expired {
+                return Ok(());
+            }
         }
+        // Read lock dropped here
 
         eprintln!("\x1b[2m  ↻ checking / refreshing OAuth token...\x1b[0m");
 
@@ -151,12 +163,14 @@ impl Runtime {
                 "Token refresh failed: {}. Run `login` to re-authenticate.", e
             )))?;
 
-        // Update in-memory state with whatever ensure_fresh_token returned
-        // (either a freshly refreshed token, or the current one if another
-        // instance beat us to the refresh).
-        self.auth_token = creds.access;
-        self.refresh_token = Some(creds.refresh);
-        self.token_expires = Some(creds.expires);
+        // Update shared auth state so all clones (including spawned stream tasks)
+        // immediately see the fresh token.
+        {
+            let mut auth = self.auth.write().await;
+            auth.auth_token = creds.access;
+            auth.refresh_token = Some(creds.refresh);
+            auth.token_expires = Some(creds.expires);
+        }
 
         Ok(())
     }
@@ -203,7 +217,7 @@ impl Runtime {
         Err(RuntimeError::Tool("No Anthropic credentials found. Run `login` to authenticate.".to_string()))
     }
 
-    pub async fn run_single(&mut self, prompt: &str) -> Result<String> {
+    pub async fn run_single(&self, prompt: &str) -> Result<String> {
         // Refresh OAuth token if expired
         self.refresh_if_needed().await?;
 
@@ -284,25 +298,34 @@ impl Runtime {
         }
     }
 
-    pub async fn run_stream(&mut self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+    pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel).await
     }
 
-    pub async fn run_stream_with_messages(&mut self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+    pub async fn run_stream_with_messages(&self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Refresh OAuth token if expired BEFORE cloning into the task,
-        // so all subsequent API calls in the loop use the fresh token.
+        // Refresh OAuth token if expired before starting the stream.
         if let Err(e) = self.refresh_if_needed().await {
             let _ = tx.send(StreamEvent::Error(e.to_string()));
             let _ = tx.send(StreamEvent::Done);
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
 
-        let runtime = self.clone();
+        // Clone the Arc, not the whole Runtime — the spawned task shares the
+        // same AuthState so mid-loop token refreshes are visible immediately.
+        let auth = Arc::clone(&self.auth);
+        let client = self.client.clone();
+        let model = self.model.clone();
+        let tools = self.tools.clone();
+        let system_prompt = self.system_prompt.clone();
+        let thinking_budget = self.thinking_budget;
 
         tokio::spawn(async move {
-            if let Err(e) = runtime.run_stream_internal(messages, tx.clone(), cancel).await {
+            if let Err(e) = Self::run_stream_internal(
+                auth, client, model, tools, system_prompt, thinking_budget,
+                messages, tx.clone(), cancel,
+            ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
             let _ = tx.send(StreamEvent::Done);
@@ -311,7 +334,17 @@ impl Runtime {
         Box::pin(UnboundedReceiverStream::new(rx))
     }
 
-    async fn run_stream_internal(&self, initial_messages: Vec<Value>, tx: mpsc::UnboundedSender<StreamEvent>, cancel: CancellationToken) -> Result<()> {
+    async fn run_stream_internal(
+        auth: Arc<RwLock<AuthState>>,
+        client: Client,
+        model: String,
+        tools: ToolRegistry,
+        system_prompt: Option<String>,
+        thinking_budget: u32,
+        initial_messages: Vec<Value>,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
         let mut messages = initial_messages;
 
         loop {
@@ -321,7 +354,44 @@ impl Runtime {
                 return Ok(());
             }
 
-            let response = match self.call_api_stream(&messages, tx.clone()).await {
+            // Refresh token before each API call in the tool loop — this is
+            // the fix for stale tokens in long-running agentic sessions.
+            {
+                let auth_state = auth.read().await;
+                if auth_state.auth_type == "oauth" {
+                    let expired = match auth_state.token_expires {
+                        Some(exp) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            now >= exp
+                        }
+                        None => false,
+                    };
+                    if expired {
+                        // Drop read lock before acquiring write
+                        drop(auth_state);
+
+                        eprintln!("\x1b[2m  ↻ refreshing token mid-stream...\x1b[0m");
+                        let creds = crate::auth::ensure_fresh_token(&client)
+                            .await
+                            .map_err(|e| RuntimeError::Tool(format!(
+                                "Token refresh failed mid-stream: {}. Run `login` to re-authenticate.", e
+                            )))?;
+
+                        let mut auth_w = auth.write().await;
+                        auth_w.auth_token = creds.access;
+                        auth_w.refresh_token = Some(creds.refresh);
+                        auth_w.token_expires = Some(creds.expires);
+                    }
+                }
+            }
+
+            let response = match Self::call_api_stream_inner(
+                &auth, &client, &model, &tools, &system_prompt, thinking_budget,
+                &messages, tx.clone(),
+            ).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
@@ -387,7 +457,7 @@ impl Runtime {
                     // the call as part of the assistant's stream instead of only just
                     // before the result lands.
 
-                    let result = match self.tools.get(&tool_name) {
+                    let result = match tools.get(&tool_name) {
                         Some(tool) => {
                             // Race tool execution against cancellation
                             tokio::select! {
@@ -440,21 +510,43 @@ impl Runtime {
         }
     }
 
+    #[allow(dead_code)]
     async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
-        let auth_header = if self.auth_type == "oauth" {
-            ("authorization", format!("Bearer {}", self.auth_token))
+        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &self.tools, &self.system_prompt, self.thinking_budget, messages, tx).await
+    }
+
+    /// Static inner version — used by both `call_api_stream` (instance) and
+    /// `run_stream_internal` (spawned task) so there's one implementation.
+    async fn call_api_stream_inner(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        model: &str,
+        tools: &ToolRegistry,
+        system_prompt: &Option<String>,
+        thinking_budget: u32,
+        messages: &[Value],
+        tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<Value> {
+        // Read auth state for this API call
+        let (auth_token, auth_type) = {
+            let a = auth.read().await;
+            (a.auth_token.clone(), a.auth_type.clone())
+        };
+
+        let auth_header = if auth_type == "oauth" {
+            ("authorization", format!("Bearer {}", auth_token))
         } else {
-            ("x-api-key", self.auth_token.clone())
+            ("x-api-key", auth_token.clone())
         };
         
-        let mut request = self.client
+        let mut request = client
             .post("https://api.anthropic.com/v1/messages")
             .header(auth_header.0, auth_header.1)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
         
         // Add standard beta headers based on auth type
-        if self.auth_type == "oauth" {
+        if auth_type == "oauth" {
             request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
         }
         
@@ -462,31 +554,31 @@ impl Runtime {
         let cleaned_messages = Self::strip_old_thinking(messages);
 
         let mut body = json!({
-            "model": self.model,
+            "model": model,
             "max_tokens": 128000,
             "messages": cleaned_messages,
-            "tools": self.tools.tools_schema(),
+            "tools": tools.tools_schema(),
             "stream": true,
             "thinking": {
                 "type": "enabled",
-                "budget_tokens": self.thinking_budget,
+                "budget_tokens": thinking_budget,
                 "display": "summarized"
             }
         });
 
         // Prompt caching: mark the last tool so all tool schemas are cached
-        if let Some(tools) = body["tools"].as_array_mut() {
-            if let Some(last_tool) = tools.last_mut() {
+        if let Some(tool_list) = body["tools"].as_array_mut() {
+            if let Some(last_tool) = tool_list.last_mut() {
                 last_tool["cache_control"] = json!({"type": "ephemeral"});
             }
         }
         
-        if self.auth_type == "oauth" {
+        if auth_type == "oauth" {
             let mut system_blocks = vec![
                 json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
-            if let Some(ref prompt) = self.system_prompt {
+            if let Some(ref prompt) = system_prompt {
                 system_blocks.push(json!({"type": "text", "text": prompt}));
             }
             // Prompt caching: mark the last system block so entire system prompt is cached
@@ -494,7 +586,7 @@ impl Runtime {
                 last["cache_control"] = json!({"type": "ephemeral"});
             }
             body["system"] = json!(system_blocks);
-        } else if let Some(ref prompt) = self.system_prompt {
+        } else if let Some(ref prompt) = system_prompt {
             body["system"] = json!([
                 {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
             ]);
@@ -768,10 +860,16 @@ impl Runtime {
     }
     
     async fn call_api(&self, messages: &[Value]) -> Result<Value> {
-        let auth_header = if self.auth_type == "oauth" {
-            ("authorization", format!("Bearer {}", self.auth_token))
+        // Read auth state
+        let (auth_token, auth_type) = {
+            let a = self.auth.read().await;
+            (a.auth_token.clone(), a.auth_type.clone())
+        };
+
+        let auth_header = if auth_type == "oauth" {
+            ("authorization", format!("Bearer {}", auth_token))
         } else {
-            ("x-api-key", self.auth_token.clone())
+            ("x-api-key", auth_token.clone())
         };
         
         let mut request = self.client
@@ -781,7 +879,7 @@ impl Runtime {
             .header("content-type", "application/json");
         
         // Add standard beta headers based on auth type
-        if self.auth_type == "oauth" {
+        if auth_type == "oauth" {
             request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
         }
         
@@ -807,7 +905,7 @@ impl Runtime {
             }
         }
         
-        if self.auth_type == "oauth" {
+        if auth_type == "oauth" {
             let mut system_blocks = vec![
                 json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
@@ -845,10 +943,7 @@ impl Clone for Runtime {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            auth_token: self.auth_token.clone(),
-            auth_type: self.auth_type.clone(),
-            refresh_token: self.refresh_token.clone(),
-            token_expires: self.token_expires,
+            auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
