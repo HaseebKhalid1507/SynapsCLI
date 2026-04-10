@@ -89,6 +89,10 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    pub fn thinking_budget(&self) -> u32 {
+        self.thinking_budget
+    }
+
     pub fn thinking_level(&self) -> &str {
         match self.thinking_budget {
             0..=2048 => "low",
@@ -335,7 +339,7 @@ impl Runtime {
         
         let mut body = json!({
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": 128000,
             "messages": messages,
             "tools": self.tools.tools_schema(),
             "stream": true,
@@ -576,7 +580,7 @@ impl Runtime {
         
         let mut body = json!({
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": 128000,
             "messages": messages,
             "tools": self.tools.tools_schema(),
             "thinking": {

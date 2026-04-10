@@ -449,9 +449,43 @@ fn draw(
 async fn main() -> Result<()> {
     let mut runtime = Runtime::new().await?;
 
-    // Load system prompt: ~/.agent-runtime/system.md > default
+    // Load config from ~/.agent-runtime/
     let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".agent-runtime");
+    let config_path = config_dir.join("config");
+
+    // Parse config file (key=value, one per line)
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') { continue; }
+                if let Some((key, val)) = line.split_once('=') {
+                    let key = key.trim();
+                    let val = val.trim();
+                    match key {
+                        "model" => runtime.set_model(val.to_string()),
+                        "thinking" => {
+                            match val {
+                                "low" => runtime.set_thinking_budget(2048),
+                                "medium" => runtime.set_thinking_budget(4096),
+                                "high" => runtime.set_thinking_budget(16384),
+                                "xhigh" => runtime.set_thinking_budget(32768),
+                                _ => {
+                                    if let Ok(n) = val.parse::<u32>() {
+                                        runtime.set_thinking_budget(n);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Load system prompt: ~/.agent-runtime/system.md > default
     let system_prompt_path = config_dir.join("system.md");
     let system_prompt = if system_prompt_path.exists() {
         std::fs::read_to_string(&system_prompt_path)
@@ -564,6 +598,29 @@ async fn main() -> Result<()> {
                                                 ));
                                             }
                                         }
+                                        "thinking" => {
+                                            match arg {
+                                                "low" => { runtime.set_thinking_budget(2048); }
+                                                "medium" | "med" => { runtime.set_thinking_budget(4096); }
+                                                "high" => { runtime.set_thinking_budget(16384); }
+                                                "xhigh" => { runtime.set_thinking_budget(32768); }
+                                                "" => {
+                                                    app.messages.push(ChatMessage::System(
+                                                        format!("thinking: {} ({})", runtime.thinking_level(), runtime.thinking_budget())
+                                                    ));
+                                                }
+                                                _ => {
+                                                    app.messages.push(ChatMessage::Error(
+                                                        "usage: /thinking low|medium|high|xhigh".to_string()
+                                                    ));
+                                                }
+                                            }
+                                            if !arg.is_empty() && ["low", "medium", "med", "high", "xhigh"].contains(&arg) {
+                                                app.messages.push(ChatMessage::System(
+                                                    format!("thinking set to: {}", runtime.thinking_level())
+                                                ));
+                                            }
+                                        }
                                         "help" => {
                                             app.messages.push(ChatMessage::System(
                                                 "/clear — reset conversation".to_string()
@@ -572,7 +629,10 @@ async fn main() -> Result<()> {
                                                 "/model [name] — show or set model".to_string()
                                             ));
                                             app.messages.push(ChatMessage::System(
-                                                "/system <prompt> — set system prompt".to_string()
+                                                "/system <prompt|show|save> — system prompt".to_string()
+                                            ));
+                                            app.messages.push(ChatMessage::System(
+                                                "/thinking [low|medium|high|xhigh] — thinking budget".to_string()
                                             ));
                                             app.messages.push(ChatMessage::System(
                                                 "/help — show this".to_string()
