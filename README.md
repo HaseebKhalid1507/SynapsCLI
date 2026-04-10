@@ -1,17 +1,18 @@
 # SynapsCLI
 
-A minimal, terminal-native AI agent runtime built in Rust. It connects to the Anthropic API, streams responses with extended thinking, executes tools in an autonomous loop, and presents everything through a polished TUI.
+A minimal, terminal-native AI agent runtime built in Rust. It connects to the Anthropic API, streams responses with extended thinking, executes tools in an autonomous loop, and presents everything through a polished TUI — or serves multiple clients over WebSocket.
 
 ## Features
 
+- **Server/client architecture** — One server holds the runtime and session; multiple clients connect via WebSocket and share a persistent conversation
 - **Streaming SSE** — Real-time token streaming with thinking block display
 - **Tool use loop** — Autonomous multi-step tool execution with cancellation support
 - **7 built-in tools** — bash, read, write, edit, grep, find, ls
 - **TUI interface** — Full terminal UI with markdown rendering, syntax highlighting, and animations
+- **CLI client** — Lightweight WebSocket client with ANSI-colored streaming output
 - **Session persistence** — Auto-saved sessions with `--continue` to resume any conversation
 - **Extended thinking** — Configurable thinking budgets (low/medium/high/xhigh or custom token count)
-- **Cost tracking** — Per-model pricing with session totals shown in the footer
-- **API key auth** — Simple `ANTHROPIC_API_KEY` authentication
+- **Cost tracking** — Per-model pricing with session totals
 - **Prefix commands** — Type `/q` instead of `/quit`, unambiguous prefixes resolve automatically
 - **Tab completion** — Tab-complete slash commands with longest common prefix matching
 
@@ -42,20 +43,29 @@ echo "thinking = medium" >> ~/.synaps-cli/config
 ### Run
 
 ```bash
-# TUI mode (recommended)
-cargo run --bin chatui
+# ── Server/Client mode (recommended) ────────────────────────
 
-# With a custom system prompt (string or file path)
+# Start the server (holds runtime + session, listens for WebSocket clients)
+cargo run --bin server
+cargo run --bin server -- --port 3145 --system ./prompts/agent.md
+cargo run --bin server -- --continue                # resume latest session
+cargo run --bin server -- --continue 20260410-1430  # resume specific session
+
+# Connect a client (multiple clients can connect simultaneously)
+cargo run --bin client
+cargo run --bin client -- --url ws://localhost:3145/ws
+
+# ── Standalone TUI mode ─────────────────────────────────────
+
+# TUI mode (self-contained, no server needed)
+cargo run --bin chatui
 cargo run --bin chatui -- --system "You are a Rust expert."
 cargo run --bin chatui -- -s ./prompts/coding.md
-
-# Continue the most recent session
 cargo run --bin chatui -- --continue
 
-# Continue a specific session (partial ID match)
-cargo run --bin chatui -- --continue 20260410-1430
+# ── Other modes ─────────────────────────────────────────────
 
-# Plain streaming chat
+# Plain streaming chat (no TUI)
 cargo run --bin chat
 
 # Single prompt (non-streaming)
@@ -65,22 +75,112 @@ cargo run --bin synaps-cli run "explain quicksort"
 ## Architecture
 
 ```
+                    ┌──────────┐  ┌──────────┐  ┌──────────┐
+                    │ client   │  │ client   │  │ future:  │
+                    │ (CLI)    │  │ (CLI)    │  │ chatui   │
+                    └────┬─────┘  └────┬─────┘  └────┬─────┘
+                         │             │             │
+                         └─────────────┴──────┬──────┘
+                                              │ WebSocket
+                                        ┌─────┴─────┐
+                                        │  server    │
+                                        │            │
+                                        │  Runtime   │
+                                        │  Session   │
+                                        │  Tools     │
+                                        │  Broadcast │
+                                        └────────────┘
+
 src/
-├── lib.rs        # Module exports
-├── runtime.rs    # Core runtime: API calls, SSE parsing, tool loop, auth
-├── tools.rs      # Tool registry and 7 tool implementations
-├── session.rs    # Session persistence: save, load, list, find
-├── chatui.rs     # TUI binary (ratatui + crossterm)
-├── chat.rs       # Plain text streaming chat binary
-├── error.rs      # Error types
-└── main.rs       # CLI binary with run/chat subcommands
+├── lib.rs          # Module exports
+├── runtime.rs      # Core runtime: API calls, SSE parsing, tool loop, auth
+├── tools.rs        # Tool registry and 7 tool implementations
+├── session.rs      # Session persistence: save, load, list, find
+├── protocol.rs     # Shared client/server message types
+├── server.rs       # WebSocket server (axum): broadcast, commands, tool exec
+├── client.rs       # CLI WebSocket client with ANSI streaming
+├── chatui.rs       # Standalone TUI binary (ratatui + crossterm)
+├── chat.rs         # Plain text streaming chat binary
+├── error.rs        # Error types
+└── main.rs         # CLI binary with run subcommand
 ```
+
+### Server (`server.rs`)
+
+The server is a long-running daemon that owns the `Runtime` and session state. Clients connect via WebSocket and share one persistent conversation. All stream events are broadcast to every connected client.
+
+```bash
+# Start with defaults (port 3145, new session)
+cargo run --bin server
+
+# Custom port + system prompt + resume session
+cargo run --bin server -- -p 8080 -s ./system.md --continue
+```
+
+**Features:**
+- **Broadcast architecture** — When any client sends a message, all connected clients see the thinking, text, tool calls, and results in real time
+- **Shared session** — One conversation persisted to disk, accessible from any client
+- **Slash commands** — `/model`, `/thinking`, `/clear`, `/system` — all sent from any client, affect the shared state
+- **Health endpoint** — `GET /health` returns `ok`
+- **Concurrent safety** — Multiple clients can connect/disconnect freely; the server handles locking
+
+### Client (`client.rs`)
+
+A lightweight CLI client that connects to the server via WebSocket. Renders streaming responses with ANSI colors.
+
+```bash
+cargo run --bin client                               # connect to localhost:3145
+cargo run --bin client -- --url ws://remote:3145/ws   # connect to remote server
+```
+
+**On connect:**
+- Requests conversation history (displays a summary of past messages)
+- Requests server status (model, thinking level, tokens, cost, client count)
+
+**Commands:**
+| Command | Description |
+|---------|-------------|
+| `/quit`, `/exit`, `/q` | Disconnect |
+| `/cancel`, `/c` | Cancel current streaming response |
+| `/status`, `/s` | Show server status |
+| `/history`, `/h` | Show conversation history |
+| `/model [name]` | Show or set model (server-side) |
+| `/thinking [level]` | Set thinking budget (server-side) |
+| `/clear` | Clear session (server-side) |
+| `/system <prompt>` | Set system prompt (server-side) |
+
+### Protocol (`protocol.rs`)
+
+Shared message types for client↔server communication over WebSocket:
+
+```rust
+// Client → Server
+ClientMessage::Message { content }        // Send a user message
+ClientMessage::Command { name, args }     // Execute a slash command
+ClientMessage::Cancel                     // Cancel streaming
+ClientMessage::Status                     // Request server status
+ClientMessage::History                    // Request conversation history
+
+// Server → Client
+ServerMessage::Thinking { content }       // Thinking tokens (streamed)
+ServerMessage::Text { content }           // Text tokens (streamed)
+ServerMessage::ToolUse { tool_name, .. }  // Tool invocation
+ServerMessage::ToolResult { result, .. }  // Tool execution result
+ServerMessage::Usage { .. }              // Token counts
+ServerMessage::Done                       // Streaming complete
+ServerMessage::Error { message }          // Error
+ServerMessage::System { message }         // Info/command response
+ServerMessage::StatusResponse { .. }      // Server state
+ServerMessage::HistoryResponse { .. }     // Conversation history
+```
+
+All messages are JSON-serialized. The server→client messages map directly to the internal `StreamEvent` enum.
 
 ### Runtime (`runtime.rs`)
 
 The `Runtime` struct is the core engine. It handles:
 
-- **Authentication** — Reads `ANTHROPIC_API_KEY` from the environment
+- **Authentication** — Reads `ANTHROPIC_API_KEY` from the environment (or OAuth from `~/.pi/agent/auth.json`)
 - **SSE streaming** — Parses `content_block_start`, `content_block_delta`, `content_block_stop` events, accumulating thinking blocks (with signatures), text, and tool use blocks
 - **Tool loop** — When the model returns `tool_use` blocks, executes each tool, sends results back, and continues until the model responds with text only. Updated message history is sent after each iteration so the UI stays in sync.
 - **Cancellation** — Accepts a `CancellationToken` that can abort between API calls, between tool executions, or mid-tool via `tokio::select!`. Partial message history is preserved on cancellation.
@@ -144,9 +244,7 @@ Seven tools are registered by default:
 | **find** | Glob-based file search via `find`. Supports `type` filter (`f` for files, `d` for directories). Excludes noise directories. 10s timeout. |
 | **ls** | Directory listing via `ls -lah`. Shows permissions, size, and dates. |
 
-All tools expand `~` to `$HOME`. Tool results are streamed back to the TUI as they complete.
-
-#### Tool Parameters
+All tools expand `~` to `$HOME`. Tool results are streamed back as they complete.
 
 <details>
 <summary>Full parameter reference</summary>
@@ -210,9 +308,11 @@ Sessions are automatically titled from the first 80 characters of the first user
 ```bash
 # Continue the most recent session (no ID needed)
 cargo run --bin chatui -- --continue
+cargo run --bin server -- --continue
 
 # Continue a specific session (partial ID match)
 cargo run --bin chatui -- --continue 20260410-1430
+cargo run --bin server -- --continue 20260410-1430
 ```
 
 Session functions:
@@ -226,7 +326,9 @@ Session functions:
 
 ### TUI (`chatui.rs`)
 
-The terminal interface built with ratatui, crossterm, tachyonfx, and syntect.
+Standalone terminal interface built with ratatui, crossterm, tachyonfx, and syntect. Owns its own `Runtime` — no server needed.
+
+**Performance:** Syntax highlighting sets are loaded once via `LazyLock`. Rendered lines are cached and only rebuilt when messages change (not on every keypress or scroll).
 
 **Keyboard shortcuts:**
 
@@ -308,7 +410,7 @@ Loaded in priority order:
 2. `~/.synaps-cli/system.md` file
 3. Built-in default
 
-Can also be changed at runtime with `/system`.
+Can also be changed at runtime with `/system` (chatui) or `/system` command (client → server).
 
 Default (when no flag or file exists):
 > You are a helpful AI agent running in a terminal. You have access to bash, read, and write tools. Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.
@@ -316,6 +418,8 @@ Default (when no flag or file exists):
 ### Authentication
 
 Set `ANTHROPIC_API_KEY` in your environment. The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
+
+Also supports OAuth tokens from `~/.pi/agent/auth.json` (auto-detected).
 
 ## Cost Tracking
 
@@ -329,7 +433,7 @@ Session cost is calculated per API call using current Anthropic pricing:
 
 Model matching is substring-based (e.g. any model ID containing "opus" uses Opus pricing). Unknown models default to Sonnet pricing.
 
-The running total is displayed in the footer and persisted with each session.
+The running total is displayed in the TUI footer, client status response, and persisted with each session.
 
 ## Dependencies
 
@@ -339,6 +443,9 @@ The running total is displayed in the footer and persisted with each session.
 | reqwest | HTTP client with streaming |
 | serde / serde_json | Serialization |
 | clap | CLI argument parsing |
+| axum | HTTP/WebSocket server |
+| tokio-tungstenite | WebSocket client |
+| tower / tower-http | Server middleware |
 | ratatui | Terminal UI framework |
 | crossterm | Terminal backend + input events |
 | tachyonfx | Terminal animations (fade-in, dissolve) |
@@ -346,6 +453,7 @@ The running total is displayed in the footer and persisted with each session.
 | chrono | Timestamps |
 | uuid | Session ID generation |
 | tokio-util | CancellationToken for streaming abort |
+| futures-util | Stream combinators for WebSocket |
 | thiserror | Error derive macros |
 
 ## License
