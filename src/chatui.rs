@@ -448,12 +448,21 @@ fn draw(
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut runtime = Runtime::new().await?;
-    runtime.set_system_prompt(
+
+    // Load system prompt: ~/.agent-runtime/system.md > default
+    let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".agent-runtime");
+    let system_prompt_path = config_dir.join("system.md");
+    let system_prompt = if system_prompt_path.exists() {
+        std::fs::read_to_string(&system_prompt_path)
+            .unwrap_or_default()
+    } else {
         "You are a helpful AI agent running in a terminal. \
          You have access to bash, read, and write tools. \
          Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands."
         .to_string()
-    );
+    };
+    runtime.set_system_prompt(system_prompt);
 
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
@@ -533,8 +542,21 @@ async fn main() -> Result<()> {
                                         "system" => {
                                             if arg.is_empty() {
                                                 app.messages.push(ChatMessage::System(
-                                                    "usage: /system <prompt>".to_string()
+                                                    "usage: /system <prompt>  |  /system save  |  /system show".to_string()
                                                 ));
+                                            } else if arg == "save" {
+                                                let _ = std::fs::create_dir_all(&config_dir);
+                                                match std::fs::write(&system_prompt_path, runtime.system_prompt().unwrap_or("")) {
+                                                    Ok(_) => app.messages.push(ChatMessage::System(
+                                                        format!("saved to {}", system_prompt_path.display())
+                                                    )),
+                                                    Err(e) => app.messages.push(ChatMessage::Error(
+                                                        format!("failed to save: {}", e)
+                                                    )),
+                                                }
+                                            } else if arg == "show" {
+                                                let prompt = runtime.system_prompt().unwrap_or("(none)");
+                                                app.messages.push(ChatMessage::System(prompt.to_string()));
                                             } else {
                                                 runtime.set_system_prompt(arg.to_string());
                                                 app.messages.push(ChatMessage::System(

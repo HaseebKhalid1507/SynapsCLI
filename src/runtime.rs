@@ -73,6 +73,10 @@ impl Runtime {
         self.system_prompt = Some(prompt);
     }
 
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
     pub fn set_model(&mut self, model: String) {
         self.model = model;
     }
