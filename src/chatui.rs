@@ -33,42 +33,183 @@ use std::sync::LazyLock;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| SyntaxSet::load_defaults_newlines());
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| ThemeSet::load_defaults());
 
-// Markdown
-const CODE_FG: Color = Color::Rgb(180, 210, 160);
-const CODE_BG: Color = Color::Rgb(22, 26, 30);
-const HEADING_COLOR: Color = Color::Rgb(140, 220, 200);
-const QUOTE_COLOR: Color = Color::Rgb(100, 110, 130);
-const LIST_BULLET_COLOR: Color = Color::Rgb(80, 200, 160);
-const TABLE_BORDER_COLOR: Color = Color::Rgb(55, 75, 65);
-const TABLE_HEADER_COLOR: Color = Color::Rgb(140, 220, 200);
-const TABLE_CELL_COLOR: Color = Color::Rgb(180, 190, 205);
+/// All colors used by the TUI, grouped so they can be overridden from a
+/// user theme file. Defaults match the current built-in look.
+///
+/// Field names are what the theme file uses as keys. Unknown keys are
+/// ignored; missing keys keep the default. Colors are written as `#rrggbb`
+/// or `#rgb` hex.
+struct Theme {
+    // Markdown
+    code_fg: Color,
+    code_bg: Color,
+    heading_color: Color,
+    quote_color: Color,
+    list_bullet_color: Color,
+    table_border_color: Color,
+    table_header_color: Color,
+    table_cell_color: Color,
 
-// Base
-const BG: Color = Color::Rgb(12, 14, 18);
-const BORDER: Color = Color::Rgb(35, 40, 50);
-const BORDER_ACTIVE: Color = Color::Rgb(80, 180, 150);
-const MUTED: Color = Color::Rgb(55, 62, 75);
+    // Base
+    bg: Color,
+    border: Color,
+    border_active: Color,
+    muted: Color,
 
-// Messages
-const USER_COLOR: Color = Color::Rgb(190, 200, 220);
-const USER_BG: Color = Color::Rgb(20, 24, 32);
-const CLAUDE_LABEL: Color = Color::Rgb(80, 200, 160);
-const CLAUDE_TEXT: Color = Color::Rgb(195, 200, 210);
-const THINKING_COLOR: Color = Color::Rgb(65, 75, 95);
-const TOOL_LABEL: Color = Color::Rgb(100, 180, 220);
-const TOOL_PARAM: Color = Color::Rgb(80, 110, 140);
-const TOOL_RESULT_COLOR: Color = Color::Rgb(65, 130, 100);
-const TOOL_RESULT_OK: Color = Color::Rgb(60, 160, 110);
-const ERROR_COLOR: Color = Color::Rgb(220, 80, 80);
+    // Messages
+    user_color: Color,
+    user_bg: Color,
+    claude_label: Color,
+    claude_text: Color,
+    thinking_color: Color,
+    tool_label: Color,
+    tool_param: Color,
+    tool_result_color: Color,
+    tool_result_ok: Color,
+    error_color: Color,
 
-// UI
-const HEADER_FG: Color = Color::Rgb(120, 130, 150);
-const STATUS_STREAMING: Color = Color::Rgb(220, 170, 70);
-const STATUS_READY: Color = Color::Rgb(80, 200, 160);
-const HELP_FG: Color = Color::Rgb(50, 58, 70);
-const INPUT_FG: Color = Color::Rgb(190, 195, 205);
-const PROMPT_FG: Color = Color::Rgb(80, 180, 150);
-const SEPARATOR: Color = Color::Rgb(30, 35, 45);
+    // UI chrome
+    header_fg: Color,
+    status_streaming: Color,
+    status_ready: Color,
+    help_fg: Color,
+    input_fg: Color,
+    prompt_fg: Color,
+    separator: Color,
+    cost_color: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            code_fg: Color::Rgb(180, 210, 160),
+            code_bg: Color::Rgb(22, 26, 30),
+            heading_color: Color::Rgb(140, 220, 200),
+            quote_color: Color::Rgb(100, 110, 130),
+            list_bullet_color: Color::Rgb(80, 200, 160),
+            table_border_color: Color::Rgb(55, 75, 65),
+            table_header_color: Color::Rgb(140, 220, 200),
+            table_cell_color: Color::Rgb(180, 190, 205),
+
+            bg: Color::Rgb(12, 14, 18),
+            border: Color::Rgb(35, 40, 50),
+            border_active: Color::Rgb(80, 180, 150),
+            muted: Color::Rgb(55, 62, 75),
+
+            user_color: Color::Rgb(190, 200, 220),
+            user_bg: Color::Rgb(20, 24, 32),
+            claude_label: Color::Rgb(80, 200, 160),
+            claude_text: Color::Rgb(195, 200, 210),
+            thinking_color: Color::Rgb(65, 75, 95),
+            tool_label: Color::Rgb(100, 180, 220),
+            tool_param: Color::Rgb(80, 110, 140),
+            tool_result_color: Color::Rgb(65, 130, 100),
+            tool_result_ok: Color::Rgb(60, 160, 110),
+            error_color: Color::Rgb(220, 80, 80),
+
+            header_fg: Color::Rgb(120, 130, 150),
+            status_streaming: Color::Rgb(220, 170, 70),
+            status_ready: Color::Rgb(80, 200, 160),
+            help_fg: Color::Rgb(50, 58, 70),
+            input_fg: Color::Rgb(190, 195, 205),
+            prompt_fg: Color::Rgb(80, 180, 150),
+            separator: Color::Rgb(30, 35, 45),
+            cost_color: Color::Rgb(180, 140, 200),
+        }
+    }
+}
+
+impl Theme {
+    /// Load a theme from a simple `key = #hex` file. Lines starting with
+    /// `#` are comments; malformed lines and unknown keys are skipped
+    /// silently so a bad theme can never take down the UI.
+    fn load_from(path: &std::path::Path) -> Self {
+        let mut t = Self::default();
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return t;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            let val = val.trim();
+            let Some(color) = parse_hex_color(val) else { continue };
+            t.set(key, color);
+        }
+        t
+    }
+
+    fn set(&mut self, key: &str, c: Color) {
+        match key {
+            "code_fg" => self.code_fg = c,
+            "code_bg" => self.code_bg = c,
+            "heading_color" => self.heading_color = c,
+            "quote_color" => self.quote_color = c,
+            "list_bullet_color" => self.list_bullet_color = c,
+            "table_border_color" => self.table_border_color = c,
+            "table_header_color" => self.table_header_color = c,
+            "table_cell_color" => self.table_cell_color = c,
+
+            "bg" => self.bg = c,
+            "border" => self.border = c,
+            "border_active" => self.border_active = c,
+            "muted" => self.muted = c,
+
+            "user_color" => self.user_color = c,
+            "user_bg" => self.user_bg = c,
+            "claude_label" => self.claude_label = c,
+            "claude_text" => self.claude_text = c,
+            "thinking_color" => self.thinking_color = c,
+            "tool_label" => self.tool_label = c,
+            "tool_param" => self.tool_param = c,
+            "tool_result_color" => self.tool_result_color = c,
+            "tool_result_ok" => self.tool_result_ok = c,
+            "error_color" => self.error_color = c,
+
+            "header_fg" => self.header_fg = c,
+            "status_streaming" => self.status_streaming = c,
+            "status_ready" => self.status_ready = c,
+            "help_fg" => self.help_fg = c,
+            "input_fg" => self.input_fg = c,
+            "prompt_fg" => self.prompt_fg = c,
+            "separator" => self.separator = c,
+            "cost_color" => self.cost_color = c,
+            _ => {} // unknown key: ignore
+        }
+    }
+}
+
+/// Parse `#rrggbb` or `#rgb` into a `Color::Rgb`. Returns `None` for anything
+/// that doesn't match — malformed entries should be skipped, not crash.
+fn parse_hex_color(s: &str) -> Option<Color> {
+    let s = s.trim().trim_start_matches('#');
+    match s.len() {
+        6 => {
+            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+            Some(Color::Rgb(r, g, b))
+        }
+        3 => {
+            let r = u8::from_str_radix(&s[0..1], 16).ok()?;
+            let g = u8::from_str_radix(&s[1..2], 16).ok()?;
+            let b = u8::from_str_radix(&s[2..3], 16).ok()?;
+            Some(Color::Rgb(r * 17, g * 17, b * 17)) // 0xF -> 0xFF
+        }
+        _ => None,
+    }
+}
+
+/// Global theme, loaded from `~/.synaps-cli/theme` on first access.
+/// Falls back to defaults if the file is missing or malformed.
+static THEME: LazyLock<Theme> = LazyLock::new(|| {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join(".synaps-cli").join("theme");
+    Theme::load_from(&path)
+});
 
 // -- Data --------------------------------------------------------------------
 
@@ -87,8 +228,6 @@ struct TimestampedMsg {
     msg: ChatMessage,
     time: String,
 }
-
-const COST_COLOR: Color = Color::Rgb(180, 140, 200);
 
 struct App {
     messages: Vec<TimestampedMsg>,
@@ -248,7 +387,7 @@ impl App {
             let ts = &tmsg.time;
             match &tmsg.msg {
                 ChatMessage::User(text) => {
-                    let bg = Style::default().bg(USER_BG);
+                    let bg = Style::default().bg(THEME.user_bg);
                     // Top margin
                     lines.push(Line::from(""));
                     // Top padding
@@ -260,12 +399,12 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(USER_COLOR).bg(USER_BG).add_modifier(Modifier::BOLD),
+                            Style::default().fg(THEME.user_color).bg(THEME.user_bg).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(ts_str, Style::default().fg(MUTED).bg(USER_BG)),
+                        Span::styled(ts_str, Style::default().fg(THEME.muted).bg(THEME.user_bg)),
                     ]));
                     // Content
-                    let style = Style::default().fg(USER_COLOR).bg(USER_BG);
+                    let style = Style::default().fg(THEME.user_color).bg(THEME.user_bg);
                     for line in text.lines() {
                         for wline in wrap_text(&format!("{}  {}", m, line), width) {
                             lines.push(Line::from(Span::styled(
@@ -280,7 +419,7 @@ impl App {
                 }
 
                 ChatMessage::Thinking(text) => {
-                    let dim = Style::default().fg(THINKING_COLOR);
+                    let dim = Style::default().fg(THEME.thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
                     lines.push(Line::from(vec![
@@ -307,7 +446,7 @@ impl App {
                     if i > 0 {
                         let sep: String = "\u{2500}".repeat(width.min(40));
                         lines.push(Line::from(Span::styled(
-                            format!("{}{}", m, sep), Style::default().fg(SEPARATOR),
+                            format!("{}{}", m, sep), Style::default().fg(THEME.separator),
                         )));
                     }
                     // Header
@@ -317,14 +456,14 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(CLAUDE_LABEL).add_modifier(Modifier::BOLD),
+                            Style::default().fg(THEME.claude_label).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(ts_str, Style::default().fg(MUTED)),
+                        Span::styled(ts_str, Style::default().fg(THEME.muted)),
                     ]));
                     // Body
                     if text.is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!("{}   \u{2026}", m), Style::default().fg(MUTED),
+                            format!("{}   \u{2026}", m), Style::default().fg(THEME.muted),
                         )));
                     } else {
                         lines.extend(render_markdown(text, m, width));
@@ -344,11 +483,11 @@ impl App {
                         _       => "\u{2192}",
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(TOOL_LABEL)),
-                        Span::styled(tool_name.clone(), Style::default().fg(TOOL_LABEL).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
+                        Span::styled(tool_name.clone(), Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
                     ]));
                     // Params — key:value on one line each, dimmed
-                    let param_style = Style::default().fg(TOOL_PARAM);
+                    let param_style = Style::default().fg(THEME.tool_param);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
                             for (k, v) in obj {
@@ -373,9 +512,9 @@ impl App {
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
                     let style = if is_error {
-                        Style::default().fg(ERROR_COLOR)
+                        Style::default().fg(THEME.error_color)
                     } else {
-                        Style::default().fg(TOOL_RESULT_COLOR)
+                        Style::default().fg(THEME.tool_result_color)
                     };
 
                     let result_lines: Vec<&str> = result.lines().collect();
@@ -386,7 +525,7 @@ impl App {
                     if !is_error && show > 0 {
                         lines.push(Line::from(Span::styled(
                             format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                            Style::default().fg(TOOL_RESULT_OK),
+                            Style::default().fg(THEME.tool_result_ok),
                         )));
                     }
 
@@ -399,22 +538,22 @@ impl App {
                     if result_lines.len() > show {
                         lines.push(Line::from(Span::styled(
                             format!("{}       +{} lines", m, result_lines.len() - show),
-                            Style::default().fg(MUTED),
+                            Style::default().fg(THEME.muted),
                         )));
                     }
                 }
 
                 ChatMessage::Error(err) => {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(ERROR_COLOR)),
-                        Span::styled(err.clone(), Style::default().fg(ERROR_COLOR)),
+                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(THEME.error_color)),
+                        Span::styled(err.clone(), Style::default().fg(THEME.error_color)),
                     ]));
                 }
 
                 ChatMessage::System(msg) => {
                     lines.push(Line::from(Span::styled(
                         format!("{}  {}", m, msg),
-                        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                        Style::default().fg(THEME.muted).add_modifier(Modifier::DIM),
                     )));
                 }
             }
@@ -432,7 +571,7 @@ fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static>> {
 
     let bold_style = base_style.add_modifier(Modifier::BOLD);
     let italic_style = base_style.add_modifier(Modifier::ITALIC);
-    let code_style = Style::default().fg(CODE_FG).bg(CODE_BG);
+    let code_style = Style::default().fg(THEME.code_fg).bg(THEME.code_bg);
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -500,13 +639,13 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(
             format!("{}  \u{2502} ", prefix),
-            Style::default().fg(MUTED).bg(CODE_BG),
+            Style::default().fg(THEME.muted).bg(THEME.code_bg),
         ));
         for (style, text) in ranges {
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
             let content = text.trim_end_matches('\n').to_string();
             if !content.is_empty() {
-                spans.push(Span::styled(content, Style::default().fg(fg).bg(CODE_BG)));
+                spans.push(Span::styled(content, Style::default().fg(fg).bg(THEME.code_bg)));
             }
         }
         lines.push(Line::from(spans));
@@ -575,9 +714,9 @@ fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line
         }
     }
 
-    let border_style = Style::default().fg(TABLE_BORDER_COLOR);
-    let header_style = Style::default().fg(TABLE_HEADER_COLOR).add_modifier(ratatui::style::Modifier::BOLD);
-    let cell_style = Style::default().fg(TABLE_CELL_COLOR);
+    let border_style = Style::default().fg(THEME.table_border_color);
+    let header_style = Style::default().fg(THEME.table_header_color).add_modifier(ratatui::style::Modifier::BOLD);
+    let cell_style = Style::default().fg(THEME.table_cell_color);
 
     // Top border: ┌───┬───┐
     let mut top = format!("{}  \u{250C}", prefix);
@@ -640,7 +779,7 @@ fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line
 /// Render markdown text into Lines, handling code blocks, headings, lists, quotes, tables
 fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    let base_style = Style::default().fg(CLAUDE_TEXT);
+    let base_style = Style::default().fg(THEME.claude_text);
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
@@ -666,7 +805,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
                 } else {
                     format!("{}  \u{2500}\u{2500} {} \u{2500}\u{2500}", prefix, code_lang)
                 };
-                lines.push(Line::from(Span::styled(label, Style::default().fg(MUTED))));
+                lines.push(Line::from(Span::styled(label, Style::default().fg(THEME.muted))));
                 code_buf.clear();
             } else {
                 // End of code block — highlight and flush
@@ -674,7 +813,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
                 in_code_block = false;
                 lines.push(Line::from(Span::styled(
                     format!("{}  \u{2500}\u{2500}\u{2500}", prefix),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(THEME.muted),
                 )));
             }
             continue;
@@ -727,7 +866,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
             for wline in wrap_text(&full, width) {
                 lines.push(Line::from(Span::styled(
                     wline,
-                    Style::default().fg(HEADING_COLOR).add_modifier(Modifier::BOLD),
+                    Style::default().fg(THEME.heading_color).add_modifier(Modifier::BOLD),
                 )));
             }
             continue;
@@ -738,7 +877,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
             let quote_text = trimmed[1..].trim();
             let full = format!("{}  \u{2502} {}", prefix, quote_text);
             for wline in wrap_text(&full, width) {
-                lines.push(Line::from(Span::styled(wline, Style::default().fg(QUOTE_COLOR).add_modifier(Modifier::ITALIC))));
+                lines.push(Line::from(Span::styled(wline, Style::default().fg(THEME.quote_color).add_modifier(Modifier::ITALIC))));
             }
             continue;
         }
@@ -746,7 +885,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
         // List items
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let item_text = &trimmed[2..];
-            let bullet_span = Span::styled(format!("{}  \u{2022} ", prefix), Style::default().fg(LIST_BULLET_COLOR));
+            let bullet_span = Span::styled(format!("{}  \u{2022} ", prefix), Style::default().fg(THEME.list_bullet_color));
             let mut item_spans = parse_inline_md(item_text, base_style);
             let mut all_spans = vec![bullet_span];
             all_spans.append(&mut item_spans);
@@ -762,7 +901,7 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
                     let item_text = &trimmed[pos + 2..];
                     let num_span = Span::styled(
                         format!("{}  {}. ", prefix, &trimmed[..pos]),
-                        Style::default().fg(LIST_BULLET_COLOR),
+                        Style::default().fg(THEME.list_bullet_color),
                     );
                     let mut item_spans = parse_inline_md(item_text, base_style);
                     let mut all_spans = vec![num_span];
@@ -902,17 +1041,17 @@ fn draw(
 
         // -- Header ----------------------------------------------------------
         let status_span = if app.streaming {
-            Span::styled(" \u{25cf} streaming ", Style::default().fg(STATUS_STREAMING))
+            Span::styled(" \u{25cf} streaming ", Style::default().fg(THEME.status_streaming))
         } else {
-            Span::styled(" \u{25cb} ready ", Style::default().fg(STATUS_READY))
+            Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.status_ready))
         };
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(MUTED)),
-            Span::styled("\u{2502}", Style::default().fg(BORDER)),
+            Span::styled("  Synaps", Style::default().fg(THEME.header_fg).add_modifier(Modifier::BOLD)),
+            Span::styled("CLI ", Style::default().fg(THEME.muted)),
+            Span::styled("\u{2502}", Style::default().fg(THEME.border)),
             status_span,
         ]))
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(THEME.bg));
         frame.render_widget(header, outer[0]);
 
         // -- Messages --------------------------------------------------------
@@ -936,7 +1075,7 @@ fn draw(
         let msg_block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(BORDER))
+            .border_style(Style::default().fg(THEME.border))
             .padding(Padding::horizontal(1));
         let messages_widget = Paragraph::new(visible).block(msg_block);
         frame.render_widget(Clear, msg_area);
@@ -947,7 +1086,7 @@ fn draw(
             let indicator = format!(" \u{2191}{} ", app.scroll_back);
             let indicator_widget = Paragraph::new(Span::styled(
                 indicator,
-                Style::default().fg(MUTED),
+                Style::default().fg(THEME.muted),
             ))
             .alignment(Alignment::Right);
             let indicator_area = ratatui::layout::Rect {
@@ -960,15 +1099,15 @@ fn draw(
         }
 
         // -- Input -----------------------------------------------------------
-        let input_border_color = if app.streaming { BORDER } else { BORDER_ACTIVE };
+        let input_border_color = if app.streaming { THEME.border } else { THEME.border_active };
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(input_border_color))
-            .style(Style::default().bg(BG));
+            .style(Style::default().bg(THEME.bg));
         let input_widget = Paragraph::new(Line::from(vec![
-            Span::styled("\u{276f} ", Style::default().fg(PROMPT_FG)),
-            Span::styled(&app.input, Style::default().fg(INPUT_FG)),
+            Span::styled("\u{276f} ", Style::default().fg(THEME.prompt_fg)),
+            Span::styled(&app.input, Style::default().fg(THEME.input_fg)),
         ]))
         .block(input_block);
         frame.render_widget(input_widget, outer[2]);
@@ -989,18 +1128,18 @@ fn draw(
             .split(outer[3]);
 
         let keybinds = Paragraph::new(Line::from(vec![
-            Span::styled(" ctrl+c ", Style::default().fg(MUTED)),
-            Span::styled("quit", Style::default().fg(HELP_FG)),
-            Span::styled("  esc ", Style::default().fg(MUTED)),
-            Span::styled("abort", Style::default().fg(HELP_FG)),
-            Span::styled("  \u{2191}\u{2193} ", Style::default().fg(MUTED)),
-            Span::styled("history", Style::default().fg(HELP_FG)),
-            Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(MUTED)),
-            Span::styled("scroll", Style::default().fg(HELP_FG)),
-            Span::styled("  enter ", Style::default().fg(MUTED)),
-            Span::styled("send", Style::default().fg(HELP_FG)),
+            Span::styled(" ctrl+c ", Style::default().fg(THEME.muted)),
+            Span::styled("quit", Style::default().fg(THEME.help_fg)),
+            Span::styled("  esc ", Style::default().fg(THEME.muted)),
+            Span::styled("abort", Style::default().fg(THEME.help_fg)),
+            Span::styled("  \u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
+            Span::styled("history", Style::default().fg(THEME.help_fg)),
+            Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
+            Span::styled("scroll", Style::default().fg(THEME.help_fg)),
+            Span::styled("  enter ", Style::default().fg(THEME.muted)),
+            Span::styled("send", Style::default().fg(THEME.help_fg)),
         ]))
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(THEME.bg));
         frame.render_widget(keybinds, footer_chunks[0]);
 
         let cost_str = if app.session_cost > 0.0 {
@@ -1027,16 +1166,16 @@ fn draw(
             String::new()
         };
         let info = Paragraph::new(Line::from(vec![
-            Span::styled(&cost_str, Style::default().fg(COST_COLOR)),
-            Span::styled(&token_str, Style::default().fg(MUTED)),
-            Span::styled("thinking:", Style::default().fg(MUTED)),
-            Span::styled(format!("{} ", thinking), Style::default().fg(HELP_FG)),
-            Span::styled(" ", Style::default().fg(MUTED)),
-            Span::styled(model, Style::default().fg(HEADER_FG)),
+            Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
+            Span::styled(&token_str, Style::default().fg(THEME.muted)),
+            Span::styled("thinking:", Style::default().fg(THEME.muted)),
+            Span::styled(format!("{} ", thinking), Style::default().fg(THEME.help_fg)),
+            Span::styled(" ", Style::default().fg(THEME.muted)),
+            Span::styled(model, Style::default().fg(THEME.header_fg)),
             Span::styled(" ", Style::default()),
         ]))
         .alignment(Alignment::Right)
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(THEME.bg));
         frame.render_widget(info, footer_chunks[1]);
 
         if let Some(ref mut fx) = effect {
