@@ -551,7 +551,9 @@ impl Runtime {
         }
         
         // Strip thinking blocks from older turns to save tokens
-        let cleaned_messages = Self::strip_old_thinking(messages);
+        let mut cleaned_messages = Self::strip_old_thinking(messages);
+        // Microcompact: clear old tool results to slash input tokens
+        Self::microcompact(&mut cleaned_messages);
 
         let mut body = json!({
             "model": model,
@@ -845,6 +847,60 @@ impl Runtime {
         msgs
     }
 
+    /// Microcompact: clear old tool results to prevent context bloat.
+    ///
+    /// Inspired by Claude Code's microcompact system. Tool results (bash output,
+    /// file reads, grep results, etc.) are the biggest token hog — 48% of message
+    /// history in a typical session. The model already processed these results when
+    /// they were fresh; carrying them forward in full on every subsequent API call
+    /// is pure waste.
+    ///
+    /// Strategy: walk all user messages containing tool_result blocks. Keep the
+    /// most recent `KEEP_RECENT` tool results intact; replace older ones with a
+    /// stub marker. This preserves the tool_use/tool_result pairing the API
+    /// requires while slashing input tokens.
+    const MICROCOMPACT_KEEP_RECENT: usize = 6;
+    const MICROCOMPACT_STUB: &'static str = "[Old tool result cleared]";
+
+    fn microcompact(messages: &mut Vec<Value>) {
+        // Collect indices of all tool_result content blocks across user messages,
+        // in encounter order. Each entry is (message_index, block_index_within_content).
+        let mut tool_result_locations: Vec<(usize, usize)> = Vec::new();
+
+        for (msg_idx, msg) in messages.iter().enumerate() {
+            if msg["role"].as_str() != Some("user") {
+                continue;
+            }
+            if let Some(content) = msg["content"].as_array() {
+                for (block_idx, block) in content.iter().enumerate() {
+                    if block["type"].as_str() == Some("tool_result") {
+                        tool_result_locations.push((msg_idx, block_idx));
+                    }
+                }
+            }
+        }
+
+        // Nothing to compact, or too few to bother
+        if tool_result_locations.len() <= Self::MICROCOMPACT_KEEP_RECENT {
+            return;
+        }
+
+        // Clear all but the last KEEP_RECENT tool results
+        let clear_count = tool_result_locations.len() - Self::MICROCOMPACT_KEEP_RECENT;
+
+        for &(msg_idx, block_idx) in &tool_result_locations[..clear_count] {
+            // Only clear if the content isn't already a stub
+            if let Some(content) = messages[msg_idx]["content"].as_array_mut() {
+                if let Some(block) = content.get_mut(block_idx) {
+                    let current = block["content"].as_str().unwrap_or("");
+                    if current != Self::MICROCOMPACT_STUB {
+                        block["content"] = json!(Self::MICROCOMPACT_STUB);
+                    }
+                }
+            }
+        }
+    }
+
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
@@ -884,7 +940,9 @@ impl Runtime {
         }
         
         // Strip thinking blocks from older turns to save tokens
-        let cleaned_messages = Self::strip_old_thinking(messages);
+        let mut cleaned_messages = Self::strip_old_thinking(messages);
+        // Microcompact: clear old tool results to slash input tokens
+        Self::microcompact(&mut cleaned_messages);
 
         let mut body = json!({
             "model": self.model,
