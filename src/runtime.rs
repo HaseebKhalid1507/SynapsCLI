@@ -554,6 +554,9 @@ impl Runtime {
         let mut cleaned_messages = Self::strip_old_thinking(messages);
         // Microcompact: clear old tool results to slash input tokens
         Self::microcompact(&mut cleaned_messages);
+        // Conversation prefix caching: mark the second-to-last user message
+        // so the entire conversation prefix is cached between tool-loop iterations
+        Self::annotate_cache_breakpoint(&mut cleaned_messages);
 
         let mut body = json!({
             "model": model,
@@ -901,6 +904,63 @@ impl Runtime {
         }
     }
 
+    /// Annotate a cache breakpoint on the conversation prefix.
+    ///
+    /// Anthropic's prompt caching allows marking content blocks with
+    /// `cache_control: {type: "ephemeral"}`. Everything before and including
+    /// that block becomes a cacheable prefix — subsequent API calls that share
+    /// the same prefix pay cache-read rates (0.1x input price) instead of full
+    /// input price.
+    ///
+    /// Strategy: find the second-to-last user message and mark its last content
+    /// block. During a tool loop, the conversation looks like:
+    ///
+    ///   [system + tools + history + user_msg + asst₁ + tool_result₁ + asst₂ + tool_result₂ ...]
+    ///
+    /// Between iterations, only the latest assistant response + tool result are
+    /// new. Everything before that is identical — perfect for caching.
+    ///
+    /// We mark the second-to-last user message (not the last) because:
+    /// 1. The last user message contains the newest tool results (changes each call)
+    /// 2. The second-to-last is stable across tool-loop iterations
+    /// 3. This gives us max prefix coverage while staying within Anthropic's 4-breakpoint limit
+    ///    (system: 1, tools: 1, conversation: 1 = 3 total)
+    fn annotate_cache_breakpoint(messages: &mut Vec<Value>) {
+        // Collect indices of all user messages
+        let user_indices: Vec<usize> = messages.iter().enumerate()
+            .filter(|(_, m)| m["role"].as_str() == Some("user"))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Need at least 2 user messages for this to make sense
+        // (first call has no prefix to cache; second call onward benefits)
+        if user_indices.len() < 2 {
+            return;
+        }
+
+        // Target: second-to-last user message
+        let target_idx = user_indices[user_indices.len() - 2];
+
+        // First, clean any stale cache_control markers from previous calls.
+        // We mutate messages before each API call, so old markers must go.
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg["content"].as_array_mut() {
+                for block in content.iter_mut() {
+                    if block.get("cache_control").is_some() {
+                        block.as_object_mut().map(|obj| obj.remove("cache_control"));
+                    }
+                }
+            }
+        }
+
+        // Mark the last content block of the target user message
+        if let Some(content) = messages[target_idx]["content"].as_array_mut() {
+            if let Some(last_block) = content.last_mut() {
+                last_block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+    }
+
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
@@ -943,6 +1003,8 @@ impl Runtime {
         let mut cleaned_messages = Self::strip_old_thinking(messages);
         // Microcompact: clear old tool results to slash input tokens
         Self::microcompact(&mut cleaned_messages);
+        // Conversation prefix caching: mark the second-to-last user message
+        Self::annotate_cache_breakpoint(&mut cleaned_messages);
 
         let mut body = json!({
             "model": self.model,
