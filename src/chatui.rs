@@ -104,6 +104,8 @@ struct App {
     output_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
     session_cost: f64,
     session: Session,
     line_cache: Vec<Line<'static>>,
@@ -127,6 +129,8 @@ impl App {
             output_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             session_cost: 0.0,
             session,
             line_cache: Vec::new(),
@@ -148,11 +152,20 @@ impl App {
         let _ = self.session.save();
     }
 
-    fn add_usage(&mut self, input_tokens: u64, output_tokens: u64, model: &str) {
+    fn add_usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        model: &str,
+    ) {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
         self.total_input_tokens += input_tokens;
         self.total_output_tokens += output_tokens;
+        self.total_cache_read_tokens += cache_read;
+        self.total_cache_creation_tokens += cache_creation;
         // Pricing per million tokens (as of 2025)
         let (input_price, output_price) = match model {
             m if m.contains("opus") => (15.0, 75.0),
@@ -160,7 +173,10 @@ impl App {
             m if m.contains("haiku") => (0.80, 4.0),
             _ => (3.0, 15.0), // default to sonnet pricing
         };
+        // Cache reads bill at 0.1x input price; cache writes at 1.25x
         let cost = (input_tokens as f64 / 1_000_000.0) * input_price
+                 + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
+                 + (cache_creation as f64 / 1_000_000.0) * input_price * 1.25
                  + (output_tokens as f64 / 1_000_000.0) * output_price;
         self.session_cost += cost;
     }
@@ -842,6 +858,28 @@ fn format_tokens(n: u64) -> String {
     else { format!("{}", n) }
 }
 
+fn boot_effect() -> Effect {
+    use tachyonfx::fx::Direction as FxDir;
+    fx::parallel(&[
+        // CRT-style scanline reveal, top-to-bottom, clean (no randomness) with a tight gradient trail
+        fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(28, 28, 32), (750, Interpolation::QuintOut)),
+        // long, slow fade from pure black — elegant deceleration
+        fx::fade_from_fg(Color::Black, (750, Interpolation::QuintOut)),
+    ])
+}
+
+fn quit_effect() -> Effect {
+    use tachyonfx::fx::Direction as FxDir;
+    fx::sequence(&[
+        fx::hsl_shift_fg([180.0, -40.0, 0.0], (180, Interpolation::QuadOut)),
+        fx::parallel(&[
+            fx::sweep_out(FxDir::DownToUp, 18, 12, Color::Rgb(40, 40, 44), (650, Interpolation::QuadIn)),
+            fx::dissolve((650, Interpolation::QuadIn)),
+            fx::fade_to_fg(Color::Black, (650, Interpolation::QuadIn)),
+        ]),
+    ])
+}
+
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -971,7 +1009,20 @@ fn draw(
             String::new()
         };
         let token_str = if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
-            format!("{}in {}out  ", format_tokens(app.total_input_tokens), format_tokens(app.total_output_tokens))
+            let mut s = format!(
+                "{}in {}out",
+                format_tokens(app.total_input_tokens),
+                format_tokens(app.total_output_tokens),
+            );
+            if app.total_cache_read_tokens > 0 || app.total_cache_creation_tokens > 0 {
+                s.push_str(&format!(
+                    " {}cr {}cw",
+                    format_tokens(app.total_cache_read_tokens),
+                    format_tokens(app.total_cache_creation_tokens),
+                ));
+            }
+            s.push_str("  ");
+            s
         } else {
             String::new()
         };
@@ -1154,9 +1205,7 @@ async fn main() -> Result<()> {
     let mut event_reader = EventStream::new();
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let mut cancel_token: Option<CancellationToken> = None;
-    let mut boot_fx: Option<Effect> = Some(
-        fx::fade_from_fg(Color::Black, (300, Interpolation::QuadOut))
-    );
+    let mut boot_fx: Option<Effect> = Some(boot_effect());
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
@@ -1178,7 +1227,7 @@ async fn main() -> Result<()> {
                     Some(Ok(Event::Key(key))) => {
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) if exit_fx.is_none() => {
-                                exit_fx = Some(fx::dissolve((800, Interpolation::QuadIn)));
+                                exit_fx = Some(quit_effect());
                             }
                             (KeyCode::Esc, _) if app.streaming => {
                                 if let Some(ref ct) = cancel_token {
@@ -1222,6 +1271,8 @@ async fn main() -> Result<()> {
                                             app.api_messages.clear();
                                             app.total_input_tokens = 0;
                                             app.total_output_tokens = 0;
+                                            app.total_cache_read_tokens = 0;
+                                            app.total_cache_creation_tokens = 0;
                                             app.session_cost = 0.0;
                                             app.input_tokens = 0;
                                             app.output_tokens = 0;
@@ -1366,7 +1417,7 @@ async fn main() -> Result<()> {
                                             ));
                                         }
                                         "quit" | "exit" => {
-                                            exit_fx = Some(fx::dissolve((800, Interpolation::QuadIn)));
+                                            exit_fx = Some(quit_effect());
                                         }
                                         _ => {
                                             app.push_msg(ChatMessage::Error(
@@ -1537,8 +1588,19 @@ async fn main() -> Result<()> {
                             app.api_messages = history;
                             app.save_session();
                         }
-                        StreamEvent::Usage { input_tokens, output_tokens } => {
-                            app.add_usage(input_tokens, output_tokens, runtime.model());
+                        StreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                        } => {
+                            app.add_usage(
+                                input_tokens,
+                                output_tokens,
+                                cache_read_input_tokens,
+                                cache_creation_input_tokens,
+                                runtime.model(),
+                            );
                         }
                         StreamEvent::Done => {
                             app.streaming = false;

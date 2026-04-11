@@ -397,7 +397,12 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                 *state.api_messages.write().await = history;
                 state.save_session().await;
             }
-            StreamEvent::Usage { input_tokens, output_tokens } => {
+            StreamEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens: _,
+                cache_creation_input_tokens: _,
+            } => {
                 state.add_usage(input_tokens, output_tokens, &model).await;
                 let _ = broadcast.send(ServerMessage::Usage { input_tokens, output_tokens });
             }

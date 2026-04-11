@@ -42,7 +42,12 @@ pub enum StreamEvent {
     },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
-    Usage { input_tokens: u64, output_tokens: u64 },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    },
     Done,
     Error(String),
 }
@@ -753,8 +758,15 @@ impl Runtime {
                         if let Some(usage) = event.get("usage") {
                             let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
                             let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                            if input_t > 0 || output_t > 0 {
-                                let _ = tx.send(StreamEvent::Usage { input_tokens: input_t, output_tokens: output_t });
+                            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                            if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                let _ = tx.send(StreamEvent::Usage {
+                                    input_tokens: input_t,
+                                    output_tokens: output_t,
+                                    cache_read_input_tokens: cache_read,
+                                    cache_creation_input_tokens: cache_create,
+                                });
                             }
                         }
                     }
@@ -763,8 +775,15 @@ impl Runtime {
                             if let Some(usage) = msg.get("usage") {
                                 let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
                                 let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                                if input_t > 0 || output_t > 0 {
-                                    let _ = tx.send(StreamEvent::Usage { input_tokens: input_t, output_tokens: output_t });
+                                let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                                let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                                if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                    let _ = tx.send(StreamEvent::Usage {
+                                        input_tokens: input_t,
+                                        output_tokens: output_t,
+                                        cache_read_input_tokens: cache_read,
+                                        cache_creation_input_tokens: cache_create,
+                                    });
                                 }
                             }
                         }
@@ -824,20 +843,55 @@ impl Runtime {
         }))
     }
 
-    /// Strip thinking blocks from all assistant messages except the most recent one.
-    /// Thinking blocks can be 2K–32K tokens each and are re-sent with every API call.
-    /// The API only requires thinking blocks from the immediately previous assistant turn.
+    /// Strip thinking blocks from assistant messages that don't need them.
+    ///
+    /// The Anthropic API only requires thinking blocks (with their signatures)
+    /// on the assistant message whose `tool_use` blocks correspond to the
+    /// currently-pending `tool_result`. In other words: if the trailing user
+    /// message contains tool_result blocks, the immediately-preceding assistant
+    /// must keep its thinking intact. Everything else can be stripped.
+    ///
+    /// Being aggressive here matters for two reasons:
+    /// 1. Thinking blocks can be 2K–32K tokens each and are echoed back on every
+    ///    API call. Stripping them slashes input tokens.
+    /// 2. Stripping *consistently* across calls is what keeps the prompt prefix
+    ///    cache stable. The previous implementation kept thinking on whichever
+    ///    assistant was "last" at the time, so the same message flipped between
+    ///    kept and stripped across iterations — invalidating the cache prefix.
+    ///    With this version, a given assistant message is either always-kept
+    ///    (when it's the one right before the pending tool_result) or
+    ///    always-stripped, matching across calls.
     fn strip_old_thinking(messages: &[Value]) -> Vec<Value> {
         let mut msgs = messages.to_vec();
 
-        // Find the last assistant message — its thinking must stay intact
-        let last_asst = msgs.iter().rposition(|m| m["role"].as_str() == Some("assistant"));
+        // Determine which (if any) assistant message must preserve thinking.
+        // Rule: thinking is required iff the trailing user message contains
+        // tool_result blocks, in which case keep it on the assistant directly
+        // preceding that trailing user message.
+        let required_asst_idx: Option<usize> = (|| {
+            let last = msgs.last()?;
+            if last["role"].as_str() != Some("user") {
+                return None;
+            }
+            let has_tool_result = last["content"].as_array()
+                .map(|arr| arr.iter().any(|b| b["type"].as_str() == Some("tool_result")))
+                .unwrap_or(false);
+            if !has_tool_result || msgs.len() < 2 {
+                return None;
+            }
+            let prev_idx = msgs.len() - 2;
+            if msgs[prev_idx]["role"].as_str() == Some("assistant") {
+                Some(prev_idx)
+            } else {
+                None
+            }
+        })();
 
         for (i, msg) in msgs.iter_mut().enumerate() {
-            if Some(i) == last_asst || msg["role"].as_str() != Some("assistant") {
+            if Some(i) == required_asst_idx || msg["role"].as_str() != Some("assistant") {
                 continue;
             }
-            // Remove thinking blocks from older assistant messages
+            // Remove thinking blocks from assistants that don't need them
             if let Some(content) = msg["content"].as_array() {
                 let filtered: Vec<Value> = content.iter()
                     .filter(|b| b["type"].as_str() != Some("thinking"))
