@@ -33,42 +33,46 @@ use std::sync::LazyLock;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| SyntaxSet::load_defaults_newlines());
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| ThemeSet::load_defaults());
 
+// -- Palette: warm monochrome with a single amber accent --------------------
+// The guiding idea: hierarchy through weight and whitespace, not hue.
+// One signature accent used deliberately; everything else lives on a
+// warm neutral scale so the UI reads as quiet and deliberate.
+
+// Base — warm near-black, no blue cast
+const BG: Color           = Color::Rgb(13, 14, 16);   // main background
+const BORDER: Color       = Color::Rgb(32, 34, 38);   // dividers, inactive borders
+
+// Text scale — warm neutrals, from primary to ghost
+const TEXT: Color         = Color::Rgb(220, 218, 210); // primary text
+const TEXT_DIM: Color     = Color::Rgb(140, 138, 132); // labels, secondary text
+const TEXT_FAINT: Color   = Color::Rgb(90, 88, 82);    // hints, keybinds
+const TEXT_GHOST: Color   = Color::Rgb(60, 58, 54);    // ghost text, thinking
+
+// Signature accent — muted amber
+const ACCENT: Color       = Color::Rgb(198, 162, 108);
+const ACCENT_DIM: Color   = Color::Rgb(132, 108, 72);
+
+// Semantic
+const ERROR_COLOR: Color  = Color::Rgb(208, 110, 100); // desaturated red
+
+// Aliases kept for readability in helpers that still use semantic names
+const MUTED: Color              = TEXT_FAINT;
+const CLAUDE_TEXT: Color        = TEXT;
+const STATUS_STREAMING: Color   = ACCENT;
+const STATUS_READY: Color       = TEXT_DIM;
+const INPUT_FG: Color           = TEXT;
+const PROMPT_FG: Color          = ACCENT;
+const BORDER_ACTIVE: Color      = ACCENT_DIM;
+
 // Markdown
-const CODE_FG: Color = Color::Rgb(180, 210, 160);
-const CODE_BG: Color = Color::Rgb(22, 26, 30);
-const HEADING_COLOR: Color = Color::Rgb(140, 220, 200);
-const QUOTE_COLOR: Color = Color::Rgb(100, 110, 130);
-const LIST_BULLET_COLOR: Color = Color::Rgb(80, 200, 160);
-const TABLE_BORDER_COLOR: Color = Color::Rgb(55, 75, 65);
-const TABLE_HEADER_COLOR: Color = Color::Rgb(140, 220, 200);
-const TABLE_CELL_COLOR: Color = Color::Rgb(180, 190, 205);
-
-// Base
-const BG: Color = Color::Rgb(12, 14, 18);
-const BORDER: Color = Color::Rgb(35, 40, 50);
-const BORDER_ACTIVE: Color = Color::Rgb(80, 180, 150);
-const MUTED: Color = Color::Rgb(55, 62, 75);
-
-// Messages
-const USER_COLOR: Color = Color::Rgb(190, 200, 220);
-const USER_BG: Color = Color::Rgb(20, 24, 32);
-const CLAUDE_LABEL: Color = Color::Rgb(80, 200, 160);
-const CLAUDE_TEXT: Color = Color::Rgb(195, 200, 210);
-const THINKING_COLOR: Color = Color::Rgb(65, 75, 95);
-const TOOL_LABEL: Color = Color::Rgb(100, 180, 220);
-const TOOL_PARAM: Color = Color::Rgb(80, 110, 140);
-const TOOL_RESULT_COLOR: Color = Color::Rgb(65, 130, 100);
-const TOOL_RESULT_OK: Color = Color::Rgb(60, 160, 110);
-const ERROR_COLOR: Color = Color::Rgb(220, 80, 80);
-
-// UI
-const HEADER_FG: Color = Color::Rgb(120, 130, 150);
-const STATUS_STREAMING: Color = Color::Rgb(220, 170, 70);
-const STATUS_READY: Color = Color::Rgb(80, 200, 160);
-const HELP_FG: Color = Color::Rgb(50, 58, 70);
-const INPUT_FG: Color = Color::Rgb(190, 195, 205);
-const PROMPT_FG: Color = Color::Rgb(80, 180, 150);
-const SEPARATOR: Color = Color::Rgb(30, 35, 45);
+const CODE_FG: Color            = Color::Rgb(200, 195, 180);
+const CODE_BG: Color            = Color::Rgb(18, 20, 23);
+const HEADING_COLOR: Color      = TEXT;
+const QUOTE_COLOR: Color        = TEXT_DIM;
+const LIST_BULLET_COLOR: Color  = ACCENT;
+const TABLE_BORDER_COLOR: Color = TEXT_GHOST;
+const TABLE_HEADER_COLOR: Color = ACCENT;
+const TABLE_CELL_COLOR: Color   = TEXT;
 
 // -- Data --------------------------------------------------------------------
 
@@ -87,8 +91,6 @@ struct TimestampedMsg {
     msg: ChatMessage,
     time: String,
 }
-
-const COST_COLOR: Color = Color::Rgb(180, 140, 200);
 
 struct App {
     messages: Vec<TimestampedMsg>,
@@ -242,113 +244,115 @@ impl App {
 
     fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
-        let m = "   "; // margin
+        // Left margin: 2 spaces of breathing room before the accent bar + content.
+        let m = "  ";
+        // Vertical accent bar used by user blocks: a thin left-edge rule.
+        let bar = "\u{258F}"; // ▏ left one-eighth block (sits flush on the left of the cell)
 
         for (i, tmsg) in self.messages.iter().enumerate() {
             let ts = &tmsg.time;
             match &tmsg.msg {
+                // -- User ----------------------------------------------------
+                // No more boxy background. Just a quiet left accent bar and
+                // an understated "you" label with a right-aligned timestamp.
                 ChatMessage::User(text) => {
-                    let bg = Style::default().bg(USER_BG);
-                    // Top margin
+                    let bar_s = Style::default().fg(ACCENT);
+                    let label_s = Style::default().fg(TEXT_DIM);
+                    let body_s = Style::default().fg(TEXT);
+                    let ts_s = Style::default().fg(TEXT_GHOST);
+
+                    // Breathing room above
                     lines.push(Line::from(""));
-                    // Top padding
-                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
-                    // Header: chevron + name + timestamp right-aligned
-                    let label = format!("{}\u{276f} you", m);
+
+                    // Header: "  ▕ you                             14:32"
+                    let header_left = format!("{}{} you", m, bar);
                     let ts_str = format!("{} ", ts);
-                    let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
+                    let gap = width.saturating_sub(header_left.chars().count() + ts_str.chars().count());
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(USER_COLOR).bg(USER_BG).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(ts_str, Style::default().fg(MUTED).bg(USER_BG)),
+                        Span::styled(format!("{}{} ", m, bar), bar_s),
+                        Span::styled("you", label_s),
+                        Span::styled(" ".repeat(gap), Style::default()),
+                        Span::styled(ts_str, ts_s),
                     ]));
-                    // Content
-                    let style = Style::default().fg(USER_COLOR).bg(USER_BG);
+
+                    // Body lines — each prefixed by the same bar so the column reads as a block
                     for line in text.lines() {
-                        for wline in wrap_text(&format!("{}  {}", m, line), width) {
-                            lines.push(Line::from(Span::styled(
-                                format!("{:<width$}", wline, width = width), style,
-                            )));
+                        for wline in wrap_text(&format!("{}  {}", m, line), width.saturating_sub(2)) {
+                            // wline already includes the m prefix; strip it, re-emit with bar
+                            let content = wline.strip_prefix(m).unwrap_or(&wline);
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("{}{} ", m, bar), bar_s),
+                                Span::styled(content.trim_start().to_string(), body_s),
+                            ]));
                         }
                     }
-                    // Bottom padding
-                    lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
-                    // Bottom margin
+
+                    // Breathing room below
                     lines.push(Line::from(""));
                 }
 
+                // -- Thinking ------------------------------------------------
                 ChatMessage::Thinking(text) => {
-                    let dim = Style::default().fg(THINKING_COLOR);
-                    let dim_italic = dim.add_modifier(Modifier::ITALIC);
-                    // Header
+                    let ghost = Style::default().fg(TEXT_GHOST);
+                    let ghost_italic = ghost.add_modifier(Modifier::ITALIC);
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}\u{2502} ", m), dim),
-                        Span::styled("thinking", dim.add_modifier(Modifier::DIM)),
+                        Span::styled(format!("{}{} ", m, bar), ghost),
+                        Span::styled("thinking", ghost),
                     ]));
-                    // Body — filtered, capped
                     let tlines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                     let show = tlines.len().min(6);
                     for line in &tlines[..show] {
-                        for wline in wrap_text(&format!("{}\u{2502}  {}", m, line.trim()), width) {
-                            lines.push(Line::from(Span::styled(wline, dim_italic)));
+                        for wline in wrap_text(&format!("{}{}  {}", m, bar, line.trim()), width) {
+                            lines.push(Line::from(Span::styled(wline, ghost_italic)));
                         }
                     }
                     if tlines.len() > 6 {
                         lines.push(Line::from(Span::styled(
-                            format!("{}\u{2502}  +{} lines", m, tlines.len() - 6), dim,
+                            format!("{}{}  +{} lines", m, bar, tlines.len() - 6), ghost,
                         )));
                     }
                 }
 
+                // -- Assistant text ------------------------------------------
+                // No separator rule, no glyph. A single quiet "agent" label
+                // and content wrapped to width. Vertical whitespace frames it.
                 ChatMessage::Text(text) => {
-                    // Separator between user block and agent response
+                    let label_s = Style::default().fg(TEXT_DIM);
+                    let ts_s = Style::default().fg(TEXT_GHOST);
+
+                    // Add a blank line before the assistant block if this isn't
+                    // the very first message, for rhythm between turns.
                     if i > 0 {
-                        let sep: String = "\u{2500}".repeat(width.min(40));
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", m, sep), Style::default().fg(SEPARATOR),
-                        )));
+                        lines.push(Line::from(""));
                     }
-                    // Header
-                    let label = format!("{}\u{25c8} agent", m);
+
+                    let label = format!("{}agent", m);
                     let ts_str = format!("{} ", ts);
                     let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(CLAUDE_LABEL).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(ts_str, Style::default().fg(MUTED)),
+                        Span::styled(label, label_s),
+                        Span::styled(" ".repeat(gap), Style::default()),
+                        Span::styled(ts_str, ts_s),
                     ]));
-                    // Body
+
                     if text.is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!("{}   \u{2026}", m), Style::default().fg(MUTED),
+                            format!("{}\u{2026}", m), Style::default().fg(TEXT_GHOST),
                         )));
                     } else {
                         lines.extend(render_markdown(text, m, width));
                     }
                 }
 
+                // -- Tool use ------------------------------------------------
+                // Single consistent marker in the accent color. No per-tool
+                // icon switch. Params indented underneath in quiet neutral.
                 ChatMessage::ToolUse { tool_name, input } => {
-                    // Compact tool header
-                    let icon = match tool_name.as_str() {
-                        "bash"  => "\u{276f}",
-                        "read"  => "\u{25b8}",
-                        "write" => "\u{25c2}",
-                        "edit"  => "\u{0394}",
-                        "grep"  => "\u{2315}",
-                        "find"  => "\u{25cb}",
-                        "ls"    => "\u{2261}",
-                        _       => "\u{2192}",
-                    };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(TOOL_LABEL)),
-                        Span::styled(tool_name.clone(), Style::default().fg(TOOL_LABEL).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}\u{00b7} ", m), Style::default().fg(ACCENT)),
+                        Span::styled(tool_name.clone(), Style::default().fg(TEXT_DIM)),
                     ]));
-                    // Params — key:value on one line each, dimmed
-                    let param_style = Style::default().fg(TOOL_PARAM);
+                    let param_style = Style::default().fg(TEXT_FAINT);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
                             for (k, v) in obj {
@@ -360,7 +364,7 @@ impl App {
                                     Some(s) => s.to_string(),
                                     None => v.to_string(),
                                 };
-                                let line_str = format!("{}     {}: {}", m, k, val);
+                                let line_str = format!("{}    {} {}", m, k, val);
                                 for wline in wrap_text(&line_str, width) {
                                     lines.push(Line::from(Span::styled(wline, param_style)));
                                 }
@@ -369,52 +373,49 @@ impl App {
                     }
                 }
 
+                // -- Tool result ---------------------------------------------
+                // Drop the `└─ ok (N lines)` flourish. Just the content with a
+                // quiet left margin; truncation count only when it matters.
                 ChatMessage::ToolResult(result) => {
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
                     let style = if is_error {
                         Style::default().fg(ERROR_COLOR)
                     } else {
-                        Style::default().fg(TOOL_RESULT_COLOR)
+                        Style::default().fg(TEXT_DIM)
                     };
 
                     let result_lines: Vec<&str> = result.lines().collect();
                     let max_show = if result_lines.len() > 30 { 15 } else { 12 };
                     let show = result_lines.len().min(max_show);
 
-                    // Success/fail indicator
-                    if !is_error && show > 0 {
-                        lines.push(Line::from(Span::styled(
-                            format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                            Style::default().fg(TOOL_RESULT_OK),
-                        )));
-                    }
-
                     for line in &result_lines[..show] {
-                        let full = format!("{}       {}", m, line);
+                        let full = format!("{}    {}", m, line);
                         for wline in wrap_text(&full, width) {
                             lines.push(Line::from(Span::styled(wline, style)));
                         }
                     }
                     if result_lines.len() > show {
                         lines.push(Line::from(Span::styled(
-                            format!("{}       +{} lines", m, result_lines.len() - show),
-                            Style::default().fg(MUTED),
+                            format!("{}    +{} lines", m, result_lines.len() - show),
+                            Style::default().fg(TEXT_FAINT),
                         )));
                     }
                 }
 
+                // -- Error ---------------------------------------------------
                 ChatMessage::Error(err) => {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(ERROR_COLOR)),
+                        Span::styled(format!("{}\u{2718} ", m), Style::default().fg(ERROR_COLOR)),
                         Span::styled(err.clone(), Style::default().fg(ERROR_COLOR)),
                     ]));
                 }
 
+                // -- System --------------------------------------------------
                 ChatMessage::System(msg) => {
                     lines.push(Line::from(Span::styled(
-                        format!("{}  {}", m, msg),
-                        Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                        format!("{}{}", m, msg),
+                        Style::default().fg(TEXT_FAINT).add_modifier(Modifier::ITALIC),
                     )));
                 }
             }
@@ -662,20 +663,16 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
                 in_code_block = true;
                 code_lang = trimmed[3..].trim().to_string();
                 let label = if code_lang.is_empty() {
-                    format!("{}  \u{2500}\u{2500}\u{2500}", prefix)
+                    format!("{}  \u{2500}\u{2500}", prefix)
                 } else {
-                    format!("{}  \u{2500}\u{2500} {} \u{2500}\u{2500}", prefix, code_lang)
+                    format!("{}  \u{2500}\u{2500} {}", prefix, code_lang)
                 };
-                lines.push(Line::from(Span::styled(label, Style::default().fg(MUTED))));
+                lines.push(Line::from(Span::styled(label, Style::default().fg(TEXT_GHOST))));
                 code_buf.clear();
             } else {
-                // End of code block — highlight and flush
+                // End of code block — highlight, flush, no trailing rule.
                 lines.extend(highlight_code_block(&code_buf, &code_lang, prefix));
                 in_code_block = false;
-                lines.push(Line::from(Span::styled(
-                    format!("{}  \u{2500}\u{2500}\u{2500}", prefix),
-                    Style::default().fg(MUTED),
-                )));
             }
             continue;
         }
@@ -901,24 +898,26 @@ fn draw(
             .split(frame.area());
 
         // -- Header ----------------------------------------------------------
+        // A single bullet distinguishes status; its color is the only signal.
         let status_span = if app.streaming {
-            Span::styled(" \u{25cf} streaming ", Style::default().fg(STATUS_STREAMING))
+            Span::styled("\u{2022} streaming", Style::default().fg(STATUS_STREAMING))
         } else {
-            Span::styled(" \u{25cb} ready ", Style::default().fg(STATUS_READY))
+            Span::styled("\u{2022} ready", Style::default().fg(STATUS_READY))
         };
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(MUTED)),
-            Span::styled("\u{2502}", Style::default().fg(BORDER)),
+            Span::styled("  synaps", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(" cli", Style::default().fg(TEXT_FAINT)),
+            Span::styled("  \u{00b7}  ", Style::default().fg(TEXT_GHOST)),
             status_span,
         ]))
         .style(Style::default().bg(BG));
         frame.render_widget(header, outer[0]);
 
         // -- Messages --------------------------------------------------------
+        // No borders — whitespace alone frames the message column.
         let msg_area = outer[1];
-        let content_height = msg_area.height.saturating_sub(2) as usize;
-        let content_width = msg_area.width.saturating_sub(4) as usize; // borders + padding
+        let content_height = msg_area.height as usize;
+        let content_width = msg_area.width.saturating_sub(2) as usize; // padding only
 
         // Rebuild line cache only when content changed or width changed
         if app.dirty || app.cache_width != content_width {
@@ -934,10 +933,9 @@ fn draw(
         let visible: Vec<Line> = all_lines[start..end].to_vec();
 
         let msg_block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(BORDER))
-            .padding(Padding::horizontal(1));
+            .borders(Borders::NONE)
+            .padding(Padding::horizontal(1))
+            .style(Style::default().bg(BG));
         let messages_widget = Paragraph::new(visible).block(msg_block);
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
@@ -960,12 +958,14 @@ fn draw(
         }
 
         // -- Input -----------------------------------------------------------
+        // Idle: quiet neutral border. Active: muted amber accent.
         let input_border_color = if app.streaming { BORDER } else { BORDER_ACTIVE };
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(input_border_color))
-            .style(Style::default().bg(BG));
+            .style(Style::default().bg(BG))
+            .padding(Padding::horizontal(1));
         let input_widget = Paragraph::new(Line::from(vec![
             Span::styled("\u{276f} ", Style::default().fg(PROMPT_FG)),
             Span::styled(&app.input, Style::default().fg(INPUT_FG)),
@@ -973,9 +973,9 @@ fn draw(
         .block(input_block);
         frame.render_widget(input_widget, outer[2]);
 
-        // Cursor
+        // Cursor — border(1) + padding(1) + "❯ "(2) = 4
         frame.set_cursor_position((
-            outer[2].x + 3 + app.cursor_pos as u16,
+            outer[2].x + 4 + app.cursor_pos as u16,
             outer[2].y + 1,
         ));
 
@@ -988,17 +988,21 @@ fn draw(
             ])
             .split(outer[3]);
 
+        // Keybind hints: unified dim scale. Key labels in TEXT_FAINT, action
+        // names one step quieter in TEXT_GHOST so the whole line recedes.
+        let key_s  = Style::default().fg(TEXT_FAINT);
+        let act_s  = Style::default().fg(TEXT_GHOST);
         let keybinds = Paragraph::new(Line::from(vec![
-            Span::styled(" ctrl+c ", Style::default().fg(MUTED)),
-            Span::styled("quit", Style::default().fg(HELP_FG)),
-            Span::styled("  esc ", Style::default().fg(MUTED)),
-            Span::styled("abort", Style::default().fg(HELP_FG)),
-            Span::styled("  \u{2191}\u{2193} ", Style::default().fg(MUTED)),
-            Span::styled("history", Style::default().fg(HELP_FG)),
-            Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(MUTED)),
-            Span::styled("scroll", Style::default().fg(HELP_FG)),
-            Span::styled("  enter ", Style::default().fg(MUTED)),
-            Span::styled("send", Style::default().fg(HELP_FG)),
+            Span::styled("  ctrl+c ",   key_s),
+            Span::styled("quit",        act_s),
+            Span::styled("   esc ",     key_s),
+            Span::styled("abort",       act_s),
+            Span::styled("   \u{2191}\u{2193} ", key_s),
+            Span::styled("history",     act_s),
+            Span::styled("   \u{21e7}\u{2191}\u{2193} ", key_s),
+            Span::styled("scroll",      act_s),
+            Span::styled("   \u{21b5} ",     key_s),
+            Span::styled("send",        act_s),
         ]))
         .style(Style::default().bg(BG));
         frame.render_widget(keybinds, footer_chunks[0]);
@@ -1026,14 +1030,16 @@ fn draw(
         } else {
             String::new()
         };
+        // Stats: only cost wears the accent. Everything else is deep dim so
+        // the footer sits quietly under the content.
         let info = Paragraph::new(Line::from(vec![
-            Span::styled(&cost_str, Style::default().fg(COST_COLOR)),
-            Span::styled(&token_str, Style::default().fg(MUTED)),
-            Span::styled("thinking:", Style::default().fg(MUTED)),
-            Span::styled(format!("{} ", thinking), Style::default().fg(HELP_FG)),
-            Span::styled(" ", Style::default().fg(MUTED)),
-            Span::styled(model, Style::default().fg(HEADER_FG)),
-            Span::styled(" ", Style::default()),
+            Span::styled(&cost_str,  Style::default().fg(ACCENT)),
+            Span::styled(&token_str, Style::default().fg(TEXT_FAINT)),
+            Span::styled("thinking ", Style::default().fg(TEXT_GHOST)),
+            Span::styled(format!("{}", thinking), Style::default().fg(TEXT_FAINT)),
+            Span::styled("   \u{00b7}   ", Style::default().fg(TEXT_GHOST)),
+            Span::styled(model, Style::default().fg(TEXT_DIM)),
+            Span::styled("  ", Style::default()),
         ]))
         .alignment(Alignment::Right)
         .style(Style::default().bg(BG));
