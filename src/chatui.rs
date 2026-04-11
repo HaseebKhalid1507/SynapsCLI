@@ -38,6 +38,9 @@ const CODE_BG: Color = Color::Rgb(22, 26, 30);
 const HEADING_COLOR: Color = Color::Rgb(140, 220, 200);
 const QUOTE_COLOR: Color = Color::Rgb(100, 110, 130);
 const LIST_BULLET_COLOR: Color = Color::Rgb(80, 200, 160);
+const TABLE_BORDER_COLOR: Color = Color::Rgb(55, 75, 65);
+const TABLE_HEADER_COLOR: Color = Color::Rgb(140, 220, 200);
+const TABLE_CELL_COLOR: Color = Color::Rgb(180, 190, 205);
 
 // Base
 const BG: Color = Color::Rgb(12, 14, 18);
@@ -494,19 +497,147 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
     lines
 }
 
-/// Render markdown text into Lines, handling code blocks, headings, lists, quotes
+/// Render a markdown table into styled Lines with box-drawing borders.
+///
+/// Parses the collected table lines into a grid, calculates column widths,
+/// and renders with Unicode box-drawing characters. The separator row
+/// (|---|---|) is detected and skipped — it just confirms we have a header.
+fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line<'static>> {
+    let mut result: Vec<Line> = Vec::new();
+    if table_lines.is_empty() {
+        return result;
+    }
+
+    // Parse each line into cells
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut has_header = false;
+
+    for (i, line) in table_lines.iter().enumerate() {
+        let stripped = line.trim().trim_matches('|');
+        // Detect separator row: all cells are just dashes/colons/spaces
+        let is_separator = stripped.split('|').all(|cell| {
+            let c = cell.trim();
+            !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+        });
+
+        if is_separator {
+            // Separator after first row means row 0 is the header
+            if i == 1 {
+                has_header = true;
+            }
+            continue;
+        }
+
+        let cells: Vec<String> = stripped
+            .split('|')
+            .map(|c| c.trim().to_string())
+            .collect();
+        rows.push(cells);
+    }
+
+    if rows.is_empty() {
+        return result;
+    }
+
+    // Normalize column count
+    let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    for row in &mut rows {
+        while row.len() < num_cols {
+            row.push(String::new());
+        }
+    }
+
+    // Calculate column widths (min 3 for aesthetics)
+    let mut col_widths: Vec<usize> = vec![3; num_cols];
+    for row in &rows {
+        for (j, cell) in row.iter().enumerate() {
+            if j < num_cols {
+                col_widths[j] = col_widths[j].max(cell.len());
+            }
+        }
+    }
+
+    let border_style = Style::default().fg(TABLE_BORDER_COLOR);
+    let header_style = Style::default().fg(TABLE_HEADER_COLOR).add_modifier(ratatui::style::Modifier::BOLD);
+    let cell_style = Style::default().fg(TABLE_CELL_COLOR);
+
+    // Top border: ┌───┬───┐
+    let mut top = format!("{}  \u{250C}", prefix);
+    for (j, w) in col_widths.iter().enumerate() {
+        top.push_str(&"\u{2500}".repeat(w + 2));
+        if j < num_cols - 1 {
+            top.push('\u{252C}');
+        }
+    }
+    top.push('\u{2510}');
+    result.push(Line::from(Span::styled(top, border_style)));
+
+    for (i, row) in rows.iter().enumerate() {
+        // Data row: │ cell │ cell │
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(format!("{}  \u{2502}", prefix), border_style));
+
+        for (j, cell) in row.iter().enumerate() {
+            let w = col_widths[j];
+            let padded = format!(" {:<width$} ", cell, width = w);
+            let style = if has_header && i == 0 { header_style } else { cell_style };
+            spans.push(Span::styled(padded, style));
+            if j < num_cols - 1 {
+                spans.push(Span::styled("\u{2502}", border_style));
+            }
+        }
+        spans.push(Span::styled("\u{2502}", border_style));
+        result.push(Line::from(spans));
+
+        // After header row, draw separator: ├───┼───┤
+        if has_header && i == 0 {
+            let mut sep = format!("{}  \u{251C}", prefix);
+            for (j, w) in col_widths.iter().enumerate() {
+                sep.push_str(&"\u{2500}".repeat(w + 2));
+                if j < num_cols - 1 {
+                    sep.push('\u{253C}');
+                }
+            }
+            sep.push('\u{2524}');
+            result.push(Line::from(Span::styled(sep, border_style)));
+        }
+    }
+
+    // Bottom border: └───┴───┘
+    let mut bot = format!("{}  \u{2514}", prefix);
+    for (j, w) in col_widths.iter().enumerate() {
+        bot.push_str(&"\u{2500}".repeat(w + 2));
+        if j < num_cols - 1 {
+            bot.push('\u{2534}');
+        }
+    }
+    bot.push('\u{2518}');
+    result.push(Line::from(Span::styled(bot, border_style)));
+
+    result
+}
+
+/// Render markdown text into Lines, handling code blocks, headings, lists, quotes, tables
 fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let base_style = Style::default().fg(CLAUDE_TEXT);
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
+    let mut table_buf: Vec<String> = Vec::new();
 
-    for line in text.lines() {
+    let all_lines: Vec<&str> = text.lines().collect();
+
+    for (line_idx, line) in all_lines.iter().enumerate() {
         let trimmed = line.trim();
 
         // Code block toggle
         if trimmed.starts_with("```") {
+            // Flush any pending table
+            if !table_buf.is_empty() {
+                lines.extend(render_table(&table_buf, prefix, width));
+                table_buf.clear();
+            }
             if !in_code_block {
                 in_code_block = true;
                 code_lang = trimmed[3..].trim().to_string();
@@ -533,6 +664,39 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
             code_buf.push_str(line);
             code_buf.push('\n');
             continue;
+        }
+
+        // Table detection: line contains | and is not inside a code block
+        // A table line has at least one | that's not at the very start/end only
+        let is_table_line = trimmed.contains('|') && {
+            let stripped = trimmed.trim_matches('|').trim();
+            // Separator rows (|---|---|) or data rows (| foo | bar |)
+            !stripped.is_empty()
+        };
+
+        if is_table_line {
+            table_buf.push(trimmed.to_string());
+            // Check if next line is NOT a table line (or we're at the end) — flush
+            let next_is_table = if line_idx + 1 < all_lines.len() {
+                let next = all_lines[line_idx + 1].trim();
+                next.contains('|') && {
+                    let s = next.trim_matches('|').trim();
+                    !s.is_empty()
+                }
+            } else {
+                false
+            };
+            if !next_is_table {
+                lines.extend(render_table(&table_buf, prefix, width));
+                table_buf.clear();
+            }
+            continue;
+        }
+
+        // Flush any pending table (shouldn't happen, but safety)
+        if !table_buf.is_empty() {
+            lines.extend(render_table(&table_buf, prefix, width));
+            table_buf.clear();
         }
 
         // Headings
