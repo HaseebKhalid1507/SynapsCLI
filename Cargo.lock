@@ -1938,6 +1938,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
  "url",
  "urlencoding",
  "uuid",

@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
+use unicode_width::UnicodeWidthStr;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Alignment},
@@ -547,12 +548,13 @@ fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line
         }
     }
 
-    // Calculate column widths (min 3 for aesthetics)
+    // Calculate column widths using display width (not byte length)
+    // This correctly handles emojis, CJK chars, etc. that take 2 terminal columns
     let mut col_widths: Vec<usize> = vec![3; num_cols];
     for row in &rows {
         for (j, cell) in row.iter().enumerate() {
             if j < num_cols {
-                col_widths[j] = col_widths[j].max(cell.len());
+                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(cell.as_str()));
             }
         }
     }
@@ -579,7 +581,9 @@ fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line
 
         for (j, cell) in row.iter().enumerate() {
             let w = col_widths[j];
-            let padded = format!(" {:<width$} ", cell, width = w);
+            let display_w = UnicodeWidthStr::width(cell.as_str());
+            let padding = w.saturating_sub(display_w);
+            let padded = format!(" {}{} ", cell, " ".repeat(padding));
             let style = if has_header && i == 0 { header_style } else { cell_style };
             spans.push(Span::styled(padded, style));
             if j < num_cols - 1 {
