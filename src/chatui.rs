@@ -206,8 +206,7 @@ fn parse_hex_color(s: &str) -> Option<Color> {
 /// Global theme, loaded from `~/.synaps-cli/theme` on first access.
 /// Falls back to defaults if the file is missing or malformed.
 static THEME: LazyLock<Theme> = LazyLock::new(|| {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = std::path::PathBuf::from(home).join(".synaps-cli").join("theme");
+    let path = synaps_cli::config::resolve_read_path("theme");
     Theme::load_from(&path)
 });
 
@@ -1260,18 +1259,23 @@ struct Cli {
     /// System prompt: a string or a path to a file.
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
+
+    #[arg(long, global = true)]
+    profile: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _log_guard = synaps_cli::logging::init_logging();
     let cli = Cli::parse();
+    if let Some(ref prof) = cli.profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+
+    let _log_guard = synaps_cli::logging::init_logging();
     let mut runtime = Runtime::new().await?;
 
     // Load config from ~/.synaps-cli/
-    let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".synaps-cli");
-    let config_path = config_dir.join("config");
+    let config_path = synaps_cli::config::resolve_read_path("config");
 
     // Parse config file (key=value, one per line)
     if config_path.exists() {
@@ -1304,8 +1308,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load system prompt: --system flag > ~/.synaps-cli/system.md > default
-    let system_prompt_path = config_dir.join("system.md");
+    // Load system prompt: --system flag > ~/.synaps-cli/[NAME]/system.md > default
+    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
     let system_prompt = if let Some(ref val) = cli.system {
         let path = std::path::Path::new(val);
         if path.exists() && path.is_file() {
@@ -1457,7 +1461,7 @@ async fn main() -> Result<()> {
                                                     "usage: /system <prompt>  |  /system save  |  /system show".to_string()
                                                 ));
                                             } else if arg == "save" {
-                                                let _ = std::fs::create_dir_all(&config_dir);
+                                                let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
                                                 match std::fs::write(&system_prompt_path, runtime.system_prompt().unwrap_or("")) {
                                                     Ok(_) => app.push_msg(ChatMessage::System(
                                                         format!("saved to {}", system_prompt_path.display())
