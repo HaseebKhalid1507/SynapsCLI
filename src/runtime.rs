@@ -878,6 +878,14 @@ impl Runtime {
 
         if should_add && !existing_markers.contains(&target_idx) {
             existing_markers.push(target_idx);
+
+            // Convert raw string content to block array to allow adding cache_control
+            if messages[target_idx]["content"].is_string() {
+                if let Some(text) = messages[target_idx]["content"].as_str() {
+                    messages[target_idx]["content"] = json!([{"type": "text", "text": text}]);
+                }
+            }
+
             if let Some(content) = messages[target_idx]["content"].as_array_mut() {
                 if let Some(last_block) = content.last_mut() {
                     last_block["cache_control"] = json!({"type": "ephemeral"});
