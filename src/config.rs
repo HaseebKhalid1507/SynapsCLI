@@ -9,12 +9,10 @@ pub fn get_profile() -> Option<String> {
     PROFILE_NAME.get_or_init(|| std::env::var("SYNAPS_PROFILE").ok()).clone()
 }
 
+/// Sets the active profile name. Must be called before any `get_profile()` call
+/// (i.e., before config resolution begins). Uses OnceLock — first write wins,
+/// subsequent calls are no-ops. No env var mutation (unsafe under tokio).
 pub fn set_profile(name: Option<String>) {
-    if let Some(n) = &name {
-        std::env::set_var("SYNAPS_PROFILE", n);
-    } else {
-        std::env::remove_var("SYNAPS_PROFILE");
-    }
     let _ = PROFILE_NAME.set(name);
 }
 

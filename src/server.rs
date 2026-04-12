@@ -61,7 +61,9 @@ impl ServerState {
         session.session_cost = *self.session_cost.read().await;
         session.updated_at = chrono::Utc::now();
         session.auto_title();
-        let _ = session.save();
+        if let Err(e) = session.save() {
+            tracing::error!("Failed to save session: {}", e);
+        }
     }
 
     async fn push_history(&self, entry: HistoryEntry) {
