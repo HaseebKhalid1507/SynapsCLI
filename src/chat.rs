@@ -93,6 +93,19 @@ async fn main() -> Result<()> {
                     messages = history;
                 }
                 StreamEvent::Usage { .. } => {}
+                // Subagent lifecycle — print inline for non-TUI chat
+                StreamEvent::SubagentStart { agent_name, task_preview } => {
+                    println!("\n\x1b[35m🎭 [{}] dispatched: {}\x1b[0m", agent_name, task_preview);
+                    io::stdout().flush().unwrap();
+                }
+                StreamEvent::SubagentUpdate { agent_name, status } => {
+                    print!("\x1b[90m  [{}] {}\x1b[0m\r", agent_name, status);
+                    io::stdout().flush().unwrap();
+                }
+                StreamEvent::SubagentDone { agent_name, duration_secs, .. } => {
+                    println!("\x1b[32m✔ [{}] done ({:.1}s)\x1b[0m", agent_name, duration_secs);
+                    io::stdout().flush().unwrap();
+                }
                 StreamEvent::Done => {
                     if in_thinking {
                         print!("\n");

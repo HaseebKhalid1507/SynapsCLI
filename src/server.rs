@@ -425,6 +425,10 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             StreamEvent::Done => {
                 let _ = broadcast.send(ServerMessage::Done);
             }
+            // Subagent events — not yet wired to server protocol
+            StreamEvent::SubagentStart { .. }
+            | StreamEvent::SubagentUpdate { .. }
+            | StreamEvent::SubagentDone { .. } => {}
             StreamEvent::Error(err) => {
                 let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
                 state.push_history(HistoryEntry::Error {

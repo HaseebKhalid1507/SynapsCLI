@@ -28,6 +28,7 @@ pub enum ToolType {
     Grep,
     Find,
     Ls,
+    Subagent,
 }
 
 impl ToolType {
@@ -40,6 +41,7 @@ impl ToolType {
             ToolType::Grep => "grep",
             ToolType::Find => "find",
             ToolType::Ls => "ls",
+            ToolType::Subagent => "subagent",
         }
     }
 
@@ -52,6 +54,7 @@ impl ToolType {
             ToolType::Grep => "Search file contents using regex patterns. Returns matching lines with file paths and line numbers. Supports file type filtering and context lines.",
             ToolType::Find => "Find files by name using glob patterns. Searches recursively from the given path. Excludes .git directories.",
             ToolType::Ls => "List directory contents with details (permissions, size, modification date). Defaults to current directory.",
+            ToolType::Subagent => "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use for delegation — give a focused task to a specialist agent. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
         }
     }
 
@@ -171,10 +174,32 @@ impl ToolType {
                 },
                 "required": []
             }),
+            ToolType::Subagent => json!({
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt."
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "Inline system prompt for the subagent. Use when you don't have a named agent file."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The task/prompt to send to the subagent."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model override (default: claude-sonnet-4-20250514). Use claude-opus-4-6 for complex tasks."
+                    }
+                },
+                "required": ["task"]
+            }),
         }
     }
 
-    pub async fn execute(&self, params: Value, tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Result<String> {
+    pub async fn execute(&self, params: Value, tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>, tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>) -> Result<String> {
         let start_time = std::time::Instant::now();
         tracing::info!("Executing tool");
         let res = match self {
@@ -185,6 +210,7 @@ impl ToolType {
             ToolType::Grep => execute_grep(params).await,
             ToolType::Find => execute_find(params).await,
             ToolType::Ls => execute_ls(params).await,
+            ToolType::Subagent => execute_subagent(params, tx_events).await,
         };
         tracing::debug!("Tool execution finished in {:?}", start_time.elapsed());
         res
@@ -204,6 +230,7 @@ impl ToolRegistry {
         for tool in [
             ToolType::Bash, ToolType::Read, ToolType::Write,
             ToolType::Edit, ToolType::Grep, ToolType::Find, ToolType::Ls,
+            ToolType::Subagent,
         ] {
             tools.insert(tool.name().to_string(), tool);
         }
@@ -533,5 +560,216 @@ async fn execute_ls(params: Value) -> Result<String> {
         Ok("Directory is empty.".to_string())
     } else {
         Ok(stdout.to_string())
+    }
+}
+
+// ── Subagent ───────────────────────────────────────────────────────────────
+
+/// Resolve an agent name to a system prompt.
+/// Search order:
+///   1. ~/.synaps-cli/agents/<name>.md
+///   2. Absolute/relative path (if name contains '/')
+pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
+    // If it looks like a path, try it directly
+    if name.contains('/') {
+        let path = expand_path(name);
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read agent file '{}': {}", path.display(), e))?;
+        return Ok(strip_frontmatter(&content));
+    }
+
+    // Resolve from ~/.synaps-cli/agents/<name>.md
+    let agents_dir = crate::config::base_dir().join("agents");
+    let agent_path = agents_dir.join(format!("{}.md", name));
+
+    if agent_path.exists() {
+        let content = std::fs::read_to_string(&agent_path)
+            .map_err(|e| format!("Failed to read agent '{}': {}", agent_path.display(), e))?;
+        return Ok(strip_frontmatter(&content));
+    }
+
+    Err(format!(
+        "Agent '{}' not found. Searched:\n  - {}\nCreate the file or pass a system_prompt directly.",
+        name, agent_path.display()
+    ))
+}
+
+/// Strip YAML frontmatter (---...---) from markdown content.
+fn strip_frontmatter(content: &str) -> String {
+    if content.starts_with("---") {
+        if let Some(end) = content[3..].find("---") {
+            return content[end + 6..].trim().to_string();
+        }
+    }
+    content.to_string()
+}
+
+async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>) -> Result<String> {
+    let task = params["task"].as_str()
+        .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
+        .to_string();
+
+    let agent_name = params["agent"].as_str().map(|s| s.to_string());
+    let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
+    let model_override = params["model"].as_str().map(|s| s.to_string());
+
+    // Resolve system prompt
+    let system_prompt = match (&agent_name, &inline_prompt) {
+        (Some(name), _) => {
+            resolve_agent_prompt(name)
+                .map_err(|e| RuntimeError::Tool(e))?
+        }
+        (None, Some(prompt)) => prompt.clone(),
+        (None, None) => {
+            return Err(RuntimeError::Tool(
+                "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
+            ));
+        }
+    };
+
+    let label = agent_name.as_deref().unwrap_or("inline").to_string();
+    let model = model_override.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+    let task_preview: String = task.chars().take(80).collect();
+
+    tracing::info!("Dispatching subagent '{}' with model {}", label, model);
+
+    // Emit SubagentStart event for TUI
+    if let Some(ref tx) = tx_events {
+        let _ = tx.send(crate::StreamEvent::SubagentStart {
+            agent_name: label.clone(),
+            task_preview,
+        });
+    }
+
+    let start_time = std::time::Instant::now();
+
+    // Spawn on a dedicated thread with its own tokio runtime.
+    // run_stream futures aren't Send due to recursive async,
+    // so we isolate on a single-threaded runtime.
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    let label_inner = label.clone();
+    let tx_events_inner = tx_events.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = rt.block_on(async move {
+            use futures::StreamExt;
+
+            let mut runtime = match crate::Runtime::new().await {
+                Ok(r) => r,
+                Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+            };
+
+            runtime.set_system_prompt(system_prompt);
+            runtime.set_model(model);
+
+            let cancel = crate::CancellationToken::new();
+            let mut stream = runtime.run_stream(task, cancel).await;
+
+            let mut final_text = String::new();
+            let mut tool_count = 0u32;
+
+            let timeout_fut = tokio::time::sleep(Duration::from_secs(300));
+            tokio::pin!(timeout_fut);
+
+            loop {
+                tokio::select! {
+                    event = stream.next() => {
+                        let Some(event) = event else { break };
+                        match event {
+                            crate::StreamEvent::Thinking(_) => {
+                                if let Some(ref tx) = tx_events_inner {
+                                    let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        agent_name: label_inner.clone(),
+                                        status: "thinking...".to_string(),
+                                    });
+                                }
+                            }
+                            crate::StreamEvent::Text(text) => {
+                                final_text.push_str(&text);
+                            }
+                            crate::StreamEvent::ToolUseStart(name) => {
+                                tool_count += 1;
+                                if let Some(ref tx) = tx_events_inner {
+                                    let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        agent_name: label_inner.clone(),
+                                        status: format!("⚙ {} (tool #{})", name, tool_count),
+                                    });
+                                }
+                            }
+                            crate::StreamEvent::ToolUse { tool_name, .. } => {
+                                if let Some(ref tx) = tx_events_inner {
+                                    let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        agent_name: label_inner.clone(),
+                                        status: format!("running {}", tool_name),
+                                    });
+                                }
+                            }
+                            crate::StreamEvent::ToolResult { .. } => {
+                                if let Some(ref tx) = tx_events_inner {
+                                    let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        agent_name: label_inner.clone(),
+                                        status: format!("done tool #{}", tool_count),
+                                    });
+                                }
+                            }
+                            crate::StreamEvent::Error(e) => {
+                                return Err(e);
+                            }
+                            crate::StreamEvent::Done => break,
+                            _ => {}
+                        }
+                    }
+                    _ = &mut timeout_fut => {
+                        return Err("Subagent timed out after 300s".to_string());
+                    }
+                }
+            }
+
+            Ok(final_text)
+        });
+
+        let _ = result_tx.send(result);
+    });
+
+    let result = result_rx.await;
+    let elapsed = start_time.elapsed().as_secs_f64();
+
+    match result {
+        Ok(Ok(response)) => {
+            let preview: String = response.chars().take(120).collect();
+            if let Some(ref tx) = tx_events {
+                let _ = tx.send(crate::StreamEvent::SubagentDone {
+                    agent_name: label.clone(),
+                    result_preview: preview,
+                    duration_secs: elapsed,
+                });
+            }
+            Ok(format!("[subagent:{}] {}", label, response))
+        }
+        Ok(Err(e)) => {
+            if let Some(ref tx) = tx_events {
+                let _ = tx.send(crate::StreamEvent::SubagentDone {
+                    agent_name: label.clone(),
+                    result_preview: format!("ERROR: {}", e),
+                    duration_secs: elapsed,
+                });
+            }
+            Ok(format!("[subagent:{} ERROR] {}", label, e))
+        }
+        Err(_) => {
+            if let Some(ref tx) = tx_events {
+                let _ = tx.send(crate::StreamEvent::SubagentDone {
+                    agent_name: label.clone(),
+                    result_preview: "Task panicked or dropped".to_string(),
+                    duration_secs: elapsed,
+                });
+            }
+            Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
+        }
     }
 }
