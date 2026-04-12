@@ -62,3 +62,9 @@ path = "src/client.rs"
 name = "login"
 path = "src/login.rs"
 
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
