@@ -396,7 +396,7 @@ impl Runtime {
 
             let response = match Self::call_api_stream_inner(
                 &auth, &client, &model, &tools, &system_prompt, thinking_budget,
-                &messages, tx.clone(),
+                &messages, tx.clone(), &cancel,
             ).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -517,8 +517,8 @@ impl Runtime {
     }
 
     #[allow(dead_code)]
-    async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
-        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &self.tools, &self.system_prompt, self.thinking_budget, messages, tx).await
+    pub async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
+        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &self.tools, &self.system_prompt, self.thinking_budget, messages, tx, &CancellationToken::new()).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -532,6 +532,7 @@ impl Runtime {
         thinking_budget: u32,
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: &CancellationToken,
     ) -> Result<Value> {
         // Read auth state for this API call
         let (auth_token, auth_type) = {
@@ -629,6 +630,9 @@ impl Runtime {
         let mut line_buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
+            if cancel.is_cancelled() {
+                break;
+            }
             let chunk = chunk?;
             let chunk_str = String::from_utf8_lossy(&chunk);
             line_buffer.push_str(&chunk_str);
