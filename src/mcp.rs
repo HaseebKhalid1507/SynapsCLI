@@ -44,7 +44,7 @@ impl McpConnection {
         
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         
         let mut child = cmd.spawn()
@@ -54,6 +54,22 @@ impl McpConnection {
             .ok_or_else(|| "Failed to capture MCP server stdin".to_string())?;
         let stdout = child.stdout.take()
             .ok_or_else(|| "Failed to capture MCP server stdout".to_string())?;
+
+        // Pipe stderr to tracing so MCP server errors are visible in logs
+        if let Some(stderr) = child.stderr.take() {
+            let cmd_name = config.command.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    // Filter out noisy npm/npx output
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    if trimmed.starts_with("npm") || trimmed.starts_with("npx") { continue; }
+                    tracing::warn!(server = %cmd_name, "{}", trimmed);
+                }
+            });
+        }
         
         let mut conn = McpConnection {
             child,
@@ -68,7 +84,7 @@ impl McpConnection {
             "capabilities": {},
             "clientInfo": {
                 "name": "synaps-cli",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             }
         })).await?;
         
@@ -346,6 +362,11 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
 /// A tool that lazily connects to MCP servers on demand.
 /// Instead of spawning all servers at startup (burning tokens on 65 tool schemas),
 /// this registers ONE tool that the model calls to activate a specific server.
+///
+/// NOTE: This tool holds an Arc to the ToolRegistry it is registered in (circular Arc).
+/// This is safe because: the write lock on the registry is only acquired inside execute(),
+/// never nested with another lock on the same registry, and the tool loop in runtime.rs
+/// drops its read lock before executing tools.
 pub struct McpConnectTool {
     configs: HashMap<String, McpServerConfig>,
     registry: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
