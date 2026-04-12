@@ -139,10 +139,6 @@ impl Runtime {
         self.tools = Arc::new(RwLock::new(tools));
     }
 
-    pub fn tools_mut(&mut self) -> &Arc<RwLock<ToolRegistry>> {
-        &self.tools
-    }
-
     /// Get a shared reference to the tool registry (for MCP lazy loading).
     pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
         Arc::clone(&self.tools)
@@ -510,8 +506,9 @@ impl Runtime {
                 }
             }
 
+            let tools_snapshot = tools.read().await.clone();
             let response = match Self::call_api_stream_inner(
-                &auth, &client, &model, &*tools.read().await, &system_prompt, thinking_budget,
+                &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
                 &messages, tx.clone(), &cancel,
             ).await {
                 Ok(r) => r,
@@ -735,8 +732,8 @@ impl Runtime {
 
     #[allow(dead_code)]
     pub async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
-        let tools_guard = self.tools.read().await;
-        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &tools_guard, &self.system_prompt, self.thinking_budget, messages, tx, &CancellationToken::new()).await
+        let tools_snapshot = self.tools.read().await.clone();
+        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &tools_snapshot, &self.system_prompt, self.thinking_budget, messages, tx, &CancellationToken::new()).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and

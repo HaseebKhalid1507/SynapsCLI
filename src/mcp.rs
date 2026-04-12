@@ -392,12 +392,14 @@ impl Tool for McpConnectTool {
         let server_name = params["server"].as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'server' parameter".to_string()))?;
 
-        // Check if already connected
+        // Atomically check-and-mark to prevent double-connect from parallel calls
         {
-            let connected = self.connected.lock().await;
+            let mut connected = self.connected.lock().await;
             if connected.contains(server_name) {
                 return Ok(format!("Server '{}' is already connected.", server_name));
             }
+            // Mark now — if connection fails, we'll unmark
+            connected.insert(server_name.to_string());
         }
 
         let config = self.configs.get(server_name)
@@ -410,15 +412,26 @@ impl Tool for McpConnectTool {
 
         tracing::info!(server = %server_name, "Lazy-connecting to MCP server");
 
-        let mut conn = McpConnection::start(config).await
-            .map_err(|e| crate::RuntimeError::Tool(format!(
-                "Failed to connect to MCP server '{}': {}", server_name, e
-            )))?;
+        let mut conn = match McpConnection::start(config).await {
+            Ok(c) => c,
+            Err(e) => {
+                // Unmark on failure so retry is possible
+                self.connected.lock().await.remove(server_name);
+                return Err(crate::RuntimeError::Tool(format!(
+                    "Failed to connect to MCP server '{}': {}", server_name, e
+                )));
+            }
+        };
 
-        let tools = conn.list_tools().await
-            .map_err(|e| crate::RuntimeError::Tool(format!(
-                "Failed to list tools from '{}': {}", server_name, e
-            )))?;
+        let tools = match conn.list_tools().await {
+            Ok(t) => t,
+            Err(e) => {
+                self.connected.lock().await.remove(server_name);
+                return Err(crate::RuntimeError::Tool(format!(
+                    "Failed to list tools from '{}': {}", server_name, e
+                )));
+            }
+        };
 
         let tool_count = tools.len();
         let connection = Arc::new(Mutex::new(conn));
@@ -443,9 +456,6 @@ impl Tool for McpConnectTool {
                 registry.register(Arc::new(mcp_tool));
             }
         }
-
-        // Mark as connected
-        self.connected.lock().await.insert(server_name.to_string());
 
         tracing::info!(server = %server_name, tools = tool_count, "MCP server connected (lazy)");
 

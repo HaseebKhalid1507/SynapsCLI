@@ -1678,7 +1678,6 @@ async fn main() -> Result<()> {
     let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
     runtime.set_system_prompt(system_prompt);
 
-    // Connect to MCP servers (if configured in ~/.synaps-cli/mcp.json)
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
     // Only registers the mcp_connect gateway tool — servers connect on demand.
     let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
