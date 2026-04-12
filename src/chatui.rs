@@ -1119,48 +1119,124 @@ fn draw(
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
 
-        // Empty state: ASCII art SYNAPS
+        // Empty state: synaptic electric ASCII art
         if app.messages.is_empty() && visible.is_empty() {
-            let ascii_art = vec![
-                r"  ███████╗██╗   ██╗███╗   ██╗ █████╗ ██████╗ ███████╗",
-                r"  ██╔════╝╚██╗ ██╔╝████╗  ██║██╔══██╗██╔══██╗██╔════╝",
-                r"  ███████╗ ╚████╔╝ ██╔██╗ ██║███████║██████╔╝███████╗",
-                r"  ╚════██║  ╚██╔╝  ██║╚██╗██║██╔══██║██╔═══╝ ╚════██║",
-                r"  ███████║   ██║   ██║ ╚████║██║  ██║██║     ███████║",
-                r"  ╚══════╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝     ╚══════╝",
+            let ascii_art: Vec<&str> = vec![
+                "  ▄▄▄▄▄  ▄  ▄ ▄▄  ▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄",
+                " █     █ █  █ █ █ █ █   █ █    █ █     █",
+                "  ▀▀▀▀█  ▀▄▄▀ █ ▀██ █▀▀▀█ █▀▀▀   ▀▀▀▀█",
+                " █     █  ██  █  ▀█ █   █ █     █     █",
+                "  ▀▀▀▀▀   ▀▀  ▀   ▀ ▀   ▀ ▀      ▀▀▀▀▀",
             ];
+
+            // Use char count for proper width (Unicode-safe)
+            let art_char_widths: Vec<usize> = ascii_art.iter()
+                .map(|l| l.chars().count())
+                .collect();
+            let max_art_width = art_char_widths.iter().copied().max().unwrap_or(0);
+            let avail_w = msg_area.width as usize;
+            let avail_h = msg_area.height as usize;
+
             let art_height = ascii_art.len();
-            let sub_text = "type a message to begin";
-            let total_block = art_height + 2; // art + gap + subtitle
-            let start_y = msg_area.y + (msg_area.height.saturating_sub(total_block as u16)) / 2;
+            let sub_text = "⚡ neural interface ready ⚡";
+            let sub_width = sub_text.chars().count();
+            let total_block = art_height + 4; // sparks + art + gap + subtitle
 
-            // Animate: pulse opacity based on elapsed time
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let pulse = ((t % 3000) as f64 / 3000.0 * std::f64::consts::PI * 2.0).sin();
-            let base = 60.0;
-            let amp = 40.0;
-            let brightness = (base + amp * pulse) as u8;
+            if avail_h >= total_block && avail_w >= max_art_width + 4 {
+                let start_y = msg_area.y + (msg_area.height.saturating_sub(total_block as u16)) / 2;
 
-            let art_style = Style::default().fg(Color::Rgb(brightness, brightness + 20, brightness + 40));
-            let sub_style = Style::default().fg(Color::Rgb(brightness / 2, brightness / 2 + 10, brightness / 2 + 20));
+                // Time-based animation seeds
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
 
-            for (j, line) in ascii_art.iter().enumerate() {
-                let x = msg_area.x + msg_area.width.saturating_sub(line.len() as u16) / 2;
-                let y = start_y + j as u16;
-                if y < msg_area.y + msg_area.height {
-                    let area = ratatui::layout::Rect { x, y, width: line.len() as u16, height: 1 };
-                    frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                // Multi-wave pulse: fast electric flicker + slow breathe
+                let slow = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
+                let fast = ((t % 400) as f64 / 400.0 * std::f64::consts::PI * 2.0).sin();
+                let combined = slow * 0.7 + fast * 0.3;
+
+                // Electric color palette: cyan → blue → purple shift
+                let phase = (t % 6000) as f64 / 6000.0;
+                let r = (30.0 + 25.0 * (phase * std::f64::consts::PI * 2.0 + 2.0).sin()) as u8;
+                let g = (140.0 + 60.0 * combined) as u8;
+                let b = (200.0 + 55.0 * combined) as u8;
+
+                let art_style = Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD);
+
+                // Dim subtitle with softer glow
+                let sr = r / 2;
+                let sg = (g as f64 * 0.6) as u8;
+                let sb = (b as f64 * 0.7) as u8;
+                let sub_style = Style::default().fg(Color::Rgb(sr, sg, sb));
+
+                // Spark line above the art — random electric characters
+                let spark_chars = ['⚡', '✦', '·', '∙', '░', '▪', '╌', '─', '┄', '⋯', '⸬', '᛫'];
+                let spark_y = start_y;
+                if spark_y >= msg_area.y && spark_y < msg_area.y + msg_area.height {
+                    let mut spark_line = String::new();
+                    let spark_width = max_art_width.min(avail_w - 4);
+                    for ci in 0..spark_width {
+                        // Pseudo-random based on time + position
+                        let seed = ((t / 80) as usize).wrapping_add(ci * 7919);
+                        if seed % 5 == 0 {
+                            spark_line.push(spark_chars[seed % spark_chars.len()]);
+                        } else {
+                            spark_line.push(' ');
+                        }
+                    }
+                    let sx = msg_area.x + (avail_w as u16).saturating_sub(spark_width as u16) / 2;
+                    let spark_style = Style::default().fg(Color::Rgb(
+                        (60.0 + 40.0 * fast) as u8,
+                        (180.0 + 40.0 * fast) as u8,
+                        255,
+                    ));
+                    let area = ratatui::layout::Rect { x: sx, y: spark_y, width: spark_width as u16, height: 1 };
+                    frame.render_widget(Paragraph::new(Span::styled(spark_line, spark_style)), area);
                 }
-            }
-            // Subtitle
-            let sub_y = start_y + art_height as u16 + 1;
-            if sub_y < msg_area.y + msg_area.height {
-                let sub_x = msg_area.x + msg_area.width.saturating_sub(sub_text.len() as u16) / 2;
-                let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_text.len() as u16, height: 1 };
-                frame.render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
+
+                // Main ASCII art
+                for (j, line) in ascii_art.iter().enumerate() {
+                    let char_w = art_char_widths[j];
+                    let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
+                    let y = start_y + 1 + j as u16;
+                    if y >= msg_area.y && y < msg_area.y + msg_area.height {
+                        let clamped_w = char_w.min(avail_w);
+                        let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
+                        frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                    }
+                }
+
+                // Spark line below art
+                let spark_y2 = start_y + 1 + art_height as u16;
+                if spark_y2 >= msg_area.y && spark_y2 < msg_area.y + msg_area.height {
+                    let mut spark_line = String::new();
+                    let spark_width = max_art_width.min(avail_w - 4);
+                    for ci in 0..spark_width {
+                        let seed = ((t / 80) as usize).wrapping_add(ci * 6271 + 31);
+                        if seed % 5 == 0 {
+                            spark_line.push(spark_chars[seed % spark_chars.len()]);
+                        } else {
+                            spark_line.push(' ');
+                        }
+                    }
+                    let sx = msg_area.x + (avail_w as u16).saturating_sub(spark_width as u16) / 2;
+                    let spark_style = Style::default().fg(Color::Rgb(
+                        (60.0 + 40.0 * fast) as u8,
+                        (180.0 + 40.0 * fast) as u8,
+                        255,
+                    ));
+                    let area = ratatui::layout::Rect { x: sx, y: spark_y2, width: spark_width as u16, height: 1 };
+                    frame.render_widget(Paragraph::new(Span::styled(spark_line, spark_style)), area);
+                }
+
+                // Subtitle
+                let sub_y = start_y + 2 + art_height as u16 + 1;
+                if sub_y >= msg_area.y && sub_y < msg_area.y + msg_area.height && avail_w >= sub_width {
+                    let sub_x = msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
+                    let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_width as u16, height: 1 };
+                    frame.render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
+                }
             }
         }
 
