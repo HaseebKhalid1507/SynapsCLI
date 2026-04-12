@@ -2040,20 +2040,19 @@ async fn main() -> Result<()> {
                                 app.input.clear();
                                 app.cursor_pos = 0;
 
-                                // Try steering first (injects between tool rounds)
-                                // Fall back to queue (sends after stream finishes)
-                                if let Some(ref tx) = steer_tx {
-                                    if tx.send(input.clone()).is_ok() {
-                                        app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                                    } else {
-                                        // Channel closed — fall back to queue
-                                        app.queued_message = Some(input.clone());
-                                        app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                    }
+                                // Send to steering channel (injected between tool rounds)
+                                // AND queue as fallback (fires on Done if steering didn't deliver)
+                                let steered = steer_tx.as_ref()
+                                    .map(|tx| tx.send(input.clone()).is_ok())
+                                    .unwrap_or(false);
+
+                                if steered {
+                                    app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
                                 } else {
-                                    app.queued_message = Some(input.clone());
                                     app.push_msg(ChatMessage::System(format!("queued: {}", input)));
                                 }
+                                // Always set queue as fallback — last message wins
+                                app.queued_message = Some(input);
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
@@ -2305,10 +2304,11 @@ async fn main() -> Result<()> {
                             app.line_cache.clear();
                         }
                         StreamEvent::SteeringDelivered { message } => {
-                            // The runtime injected this as a user message into the conversation.
-                            // Show it in the TUI and keep api_messages in sync for session save.
                             app.push_msg(ChatMessage::User(message.clone()));
-                            // Note: api_messages will be synced via MessageHistory at stream end
+                            // Steering delivered — clear queue so Done doesn't double-send
+                            if app.queued_message.as_ref() == Some(&message) {
+                                app.queued_message = None;
+                            }
                             app.scroll_back = 0;
                             app.scroll_pinned = true;
                             app.dirty = true;
