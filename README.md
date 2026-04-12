@@ -1,12 +1,12 @@
 # SynapsCLI
 
-A terminal-native AI agent runtime built in Rust. Connect to any LLM, execute tools autonomously, dispatch parallel subagents, plug into the MCP ecosystem, and present everything through a polished TUI — in under 7,300 lines.
+A terminal-native AI agent runtime built in Rust. 4.8MB binary, 3ms startup, 8 built-in tools, unlimited MCP tools, parallel subagents, on-demand skills — all in ~7,700 lines.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust" />
-  <img src="https://img.shields.io/badge/lines-7.3K-blue" alt="7.3K lines" />
-  <img src="https://img.shields.io/badge/tools-8_built--in-green" alt="8 tools" />
-  <img src="https://img.shields.io/badge/MCP-supported-purple" alt="MCP" />
+  <img src="https://img.shields.io/badge/rust-4.8MB_binary-orange" alt="Rust" />
+  <img src="https://img.shields.io/badge/startup-3ms-blue" alt="3ms startup" />
+  <img src="https://img.shields.io/badge/MCP-lazy_loading-purple" alt="MCP" />
+  <img src="https://img.shields.io/badge/skills-on_demand-green" alt="Skills" />
   <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT" />
 </p>
 
@@ -14,11 +14,12 @@ A terminal-native AI agent runtime built in Rust. Connect to any LLM, execute to
 
 ## Why SynapsCLI?
 
-Most agent runtimes are 100K+ lines of TypeScript. SynapsCLI does the same in **7,300 lines of Rust** — instant startup, single binary, no runtime dependencies. It connects to the MCP ecosystem, runs parallel subagents, streams markdown with syntax highlighting, and stays out of your way.
+Most agent runtimes are 100K–450K lines of TypeScript. SynapsCLI does the same in **7,700 lines of Rust** — 3ms startup, 4.8MB binary, zero runtime dependencies.
 
 ```
-8 built-in tools + unlimited MCP tools
-Parallel subagent dispatch with live TUI panel  
+8 built-in tools + entire MCP ecosystem on demand
+Parallel subagent dispatch with live TUI panel
+Skills loaded on demand — zero tokens until needed
 Type while the agent streams (steering)
 Smart scroll, abort with context preservation
 OAuth + API key auth with auto-refresh
@@ -28,17 +29,13 @@ OAuth + API key auth with auto-refresh
 ## Quick Start
 
 ```bash
-# Build
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
-cargo build --release
+cargo build --release       # 4.8MB binary
 
-# Authenticate (OAuth — Claude Pro/Max/Team/Enterprise)
-./target/release/synaps-cli login
-
-# Or use an API key
-mkdir -p ~/.synaps-cli
-echo '{"anthropic":{"type":"api_key","key":"sk-ant-..."}}' > ~/.synaps-cli/auth.json
+# Auth (pick one)
+./target/release/synaps-cli login                    # OAuth (Claude Pro/Max)
+echo '{"anthropic":{"type":"api_key","key":"sk-ant-..."}}' > ~/.synaps-cli/auth.json  # API key
 
 # Run
 ./target/release/synaps-cli chatui
@@ -46,17 +43,9 @@ echo '{"anthropic":{"type":"api_key","key":"sk-ant-..."}}' > ~/.synaps-cli/auth.
 
 ## Features
 
-### Core Runtime
-- **Streaming SSE** with extended thinking display
-- **Agentic tool loop** — autonomous multi-step execution with cancellation
-- **Parallel tool execution** — multiple tool calls run concurrently via JoinSet
-- **Prompt caching** — automatic cache breakpoints for ~95% hit rates
-- **Configurable thinking** — `low` / `medium` / `high` / `xhigh` or raw token count
-- **Model-aware limits** — auto-detects max_tokens per model
-
 ### Tool System
 
-**Trait-based architecture** — tools implement an open `Tool` trait, not a closed enum. Add tools at runtime without touching core code.
+Open trait-based architecture. Add tools at runtime — no recompilation.
 
 ```rust
 #[async_trait]
@@ -68,52 +57,91 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-**8 built-in tools:** `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`, `subagent`
+**8 built-in:** `bash` `read` `write` `edit` `grep` `find` `ls` `subagent`
 
-**Runtime registration:** `registry.register(Arc::new(MyTool))` — MCP tools, custom tools, anything implementing the trait.
+**+ 2 gateway tools:** `mcp_connect` (lazy MCP server activation) · `load_skill` (on-demand skill loading)
 
-### MCP Integration
+**+ unlimited MCP tools** registered at runtime via `registry.register(Arc::new(tool))`
 
-Connect to any [Model Context Protocol](https://modelcontextprotocol.io/) server. Tools are auto-discovered and registered at startup.
+### MCP Integration — Lazy Loading
+
+Connect to the entire [MCP ecosystem](https://registry.modelcontextprotocol.io/) — 1,800+ servers. Tools load **on demand**, not at startup. Zero token overhead until you need them.
 
 ```json
 // ~/.synaps-cli/mcp.json
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
-    },
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": { "GITHUB_TOKEN": "ghp_..." }
     },
-    "memory": {
+    "deepwiki": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"]
+      "args": ["-y", "mcp-remote", "https://mcp.deepwiki.com/mcp"]
+    },
+    "exa": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp"]
     }
   }
 }
 ```
 
-Config format is compatible with Claude Code and Gemini CLI — drop in your existing `mcp.json`.
+**How it works:**
+1. Startup: parse config, register `mcp_connect` gateway tool (~200 tokens)
+2. Agent calls `mcp_connect("exa")` when it needs web search
+3. Server spawns, tools discovered via JSON-RPC, registered into live session
+4. Next API call includes the new tools — cached from that point forward
 
-On startup:
+**vs eager loading:** 65 tools × 9,500 tokens/msg → 10 tools × 1,200 tokens/msg. Saves ~830K tokens over 100 messages.
+
+Compatible with Claude Code and Gemini CLI config format. Remote servers work via `mcp-remote` bridge — any URL from the [MCP registry](https://registry.modelcontextprotocol.io/).
+
+TUI displays MCP tools cleanly:
 ```
-⚡ 13 MCP tools loaded
+⚡  read_pseudocode [byteray]
+    session_id: abc123
 ```
 
-The agent sees MCP tools as `mcp__<server>__<tool>` (e.g. `mcp__github__create_issue`).
+### Skills — On-Demand Loading
+
+Markdown skill files that load into conversation context when the agent needs them. Zero cost until activated.
+
+```
+~/.synaps-cli/skills/
+├── rust.md
+├── code-review.md
+├── security-review.md
+├── systematic-debugging.md
+├── test-driven-development.md
+└── verification-before-completion.md
+```
+
+```markdown
+---
+name: rust
+description: Rust development best practices
+---
+
+When writing Rust code:
+- Prefer `thiserror` for library errors...
+```
+
+**Two modes:**
+- **On-demand** (default): agent calls `load_skill("rust")` → skill content returned as tool result → cached for rest of conversation
+- **Auto-load** via config: `skills = rust, security-review` → injected into system prompt at launch
+
+Skills get cached after first load — full price once, then 0.1× on every subsequent message.
 
 ### Multi-Agent Orchestration
-- **Subagent dispatch** — spawn named agents or inline prompts as one-shot workers
+- **Subagent dispatch** — named agents or inline prompts as one-shot workers
 - **Parallel execution** — multiple subagents run concurrently
-- **Real-time TUI panel** — live status with animated spinners per agent
+- **Real-time TUI panel** — live status with animated spinners
 - **Agent files** — `~/.synaps-cli/agents/<name>.md` with YAML frontmatter
-- **Recursive safety** — subagents can't spawn subagents (no inception)
+- **Recursive safety** — subagents can't spawn subagents
 - **Zombie prevention** — shutdown signals via oneshot channel
-- **Token forwarding** — subagent costs tracked with correct per-model pricing
+- **Token forwarding** — costs tracked per-model
 
 ```
 ╭ ◈ 2 agents ─────────────────────────────────────────╮
@@ -123,137 +151,115 @@ The agent sees MCP tools as `mcp__<server>__<tool>` (e.g. `mcp__github__create_i
 ```
 
 ### TUI
-- **Markdown rendering** — headers, code blocks (syntax highlighted via syntect), tables, lists, blockquotes
+- **Markdown rendering** — headers, code blocks (syntax highlighted), tables, lists, blockquotes
 - **Smart scroll** — viewport stays still when scrolled up; auto-scrolls at bottom
-- **Steering** — type and send messages while the agent is streaming (injected between tool rounds)
-- **Message queue** — messages queued during no-tool responses auto-fire on completion
-- **Abort context** — Escape saves partial work; next message gets context of what was interrupted
-- **Tool elapsed time** — every tool result shows execution duration
-- **Subagent panel** — animated braille spinners, per-agent status, elapsed timers
+- **Steering** — type and send while the agent streams (injected between tool rounds)
+- **Message queue** — queued messages auto-fire on response completion
+- **Abort context** — Escape saves partial work; next message gets interrupted context
+- **Subagent panel** — animated spinners, per-agent status, elapsed timers
 - **Token tracking** — input/output/cache tokens with running cost in footer
 - **Input history** — arrow keys cycle through previous messages
-- **Mouse scroll** — scroll wheel for message history
 - **Boot/exit animations** — CRT effects via tachyonfx
 
 ### Infrastructure
-- **OAuth 2.0 PKCE** — browser-based auth flow, tokens stored with auto-refresh
-- **API key fallback** — direct Anthropic API key support
-- **Shared config** — `SynapsConfig` struct, single parse path, typed fields
-- **Expanded error types** — `Auth`, `Config`, `Session`, `Tool`, `Timeout`, `Cancelled`
-- **HTTP timeouts** — connect (10s) + request (300s), no silent hangs
-- **Structured tracing** — tool name, elapsed_ms, model, API request lifecycle
-- **Server/client** — Axum WebSocket server; multiple clients share a session
-- **Session persistence** — auto-saved, `--continue` to resume, partial ID match
-- **Profiles** — `--profile <name>` for separate config/auth/session namespaces
-- **Prefix commands** — `/q` resolves to `/quit`, unambiguous prefixes work
+- **OAuth 2.0 PKCE** — browser auth with auto-refresh
+- **API key fallback** — direct Anthropic API key
+- **Typed config** — `SynapsConfig` struct, single parse path
+- **Granular errors** — `Auth`, `Config`, `Session`, `Tool`, `Timeout`, `Cancelled`
+- **HTTP timeouts** — connect (10s) + request (300s)
+- **Structured tracing** — tool name, elapsed_ms, model, request lifecycle
+- **WebSocket server** — Axum-based, multiple clients share a session
+- **Session persistence** — auto-saved, `--continue` to resume
+- **Profiles** — `--profile <name>` for separate namespaces
 
 ## Configuration
 
-### Config file
 `~/.synaps-cli/config`:
-```
+```ini
 model = claude-sonnet-4-20250514
 thinking = high
+skills = rust, security-review    # auto-load these skills
 ```
 
-Thinking levels: `low` (2048), `medium` (4096), `high` (16384), `xhigh` (32768), or a raw number.
-
-### System prompt
-`~/.synaps-cli/system.md` — auto-loaded if present. Override with `--system "prompt"` or `--system /path/to/file.md`.
-
-### MCP servers
-`~/.synaps-cli/mcp.json` — see [MCP Integration](#mcp-integration) above.
-
-### Agents
-`~/.synaps-cli/agents/<name>.md`:
-```markdown
----
-name: spike
-description: Executor — clean, efficient, no-nonsense
----
-
-You are Spike — a subagent built for execution.
-Get the job done. Be concise.
-```
-
-### Theme
-`~/.synaps-cli/theme`:
-```
-bg = #0c0e12
-border = #232832
-claude_label = #50c8a0
-```
+| File | Purpose |
+|------|---------|
+| `config` | Model, thinking level, auto-loaded skills |
+| `system.md` | System prompt (auto-loaded) |
+| `mcp.json` | MCP server definitions |
+| `auth.json` | OAuth tokens / API key |
+| `theme` | TUI color customization |
+| `agents/<name>.md` | Subagent personalities |
+| `skills/<name>.md` | Loadable skill files |
 
 ## Usage
 
 ```bash
-# Interactive TUI
-synaps-cli chatui
-
-# One-shot
-synaps-cli run "explain quicksort"
-
-# With agent personality
-synaps-cli run "review this PR" --agent spike
-
-# Resume last session
-synaps-cli chatui --continue
-
-# Resume specific session (partial ID match)
-synaps-cli chatui --continue abc123
-
-# Custom system prompt
-synaps-cli chatui --system "You are a Rust expert"
-
-# Server mode
-synaps-cli server --port 3145
-
-# With profile
-synaps-cli chatui --profile work
+synaps-cli chatui                          # Interactive TUI
+synaps-cli run "explain quicksort"         # One-shot
+synaps-cli run "review this" --agent spike # With agent
+synaps-cli chatui --continue               # Resume session
+synaps-cli chatui --continue abc123        # Resume specific
+synaps-cli chatui --system "Be concise"    # Custom prompt
+synaps-cli chatui --profile work           # Profile
+synaps-cli server --port 3145              # WebSocket server
 ```
 
 ## Architecture
 
 ```
 src/
-├── main.rs       CLI entry point (clap)
-├── runtime.rs    Anthropic API, SSE streaming, agentic tool loop,
-│                 parallel execution, prompt cache management
-├── chatui.rs     TUI — ratatui, markdown, subagent panel, smart scroll,
-│                 abort context, steering, animations
-├── tools.rs      Tool trait + 8 implementations (bash, read, write,
-│                 edit, grep, find, ls, subagent)
-├── mcp.rs        MCP client — stdio transport, JSON-RPC 2.0,
-│                 auto-discovery, dynamic tool registration
-├── auth.rs       OAuth 2.0 PKCE, token refresh with flock
-├── session.rs    Session persistence (JSON)
-├── config.rs     SynapsConfig, profile system, path resolution,
-│                 system prompt resolution
-├── server.rs     Axum WebSocket server
-├── client.rs     WebSocket CLI client
-├── protocol.rs   Shared message types (client ↔ server)
-├── chat.rs       Simple REPL (non-TUI)
-├── login.rs      OAuth browser flow
-├── logging.rs    Tracing setup
-├── error.rs      RuntimeError (Auth, Config, Session, Tool, Timeout, Cancelled)
-└── lib.rs        Library root, re-exports
+├── chatui.rs    (2.4K)  TUI — ratatui, markdown, subagent panel, steering
+├── runtime.rs   (1.3K)  API client, SSE streaming, agentic tool loop
+├── tools.rs     (940)   Tool trait + 8 built-in implementations
+├── auth.rs      (655)   OAuth 2.0 PKCE, token refresh with flock
+├── server.rs    (559)   Axum WebSocket server
+├── mcp.rs       (515)   MCP client — JSON-RPC 2.0, lazy loading, gateway tool
+├── client.rs    (277)   WebSocket CLI client
+├── skills.rs    (223)   Skill loading, on-demand tool, config auto-load
+├── session.rs   (190)   Session persistence (JSON)
+├── config.rs    (160)   Typed config, profiles, system prompt resolution
+├── main.rs      (105)   CLI entry (clap)
+├── protocol.rs  (126)   Shared message types
+├── login.rs     (80)    OAuth browser flow
+├── error.rs     (21)    Error types
+├── logging.rs   (27)    Tracing setup
+├── chat.rs      (133)   Simple REPL (non-TUI)
+└── lib.rs       (18)    Module root
+                ─────
+                7,717 lines total
 ```
 
-### Key Design Decisions
+### Design Decisions
 
-**Tool trait over enum.** Tools implement an open `trait Tool`, not a closed `enum ToolType`. This enables MCP tools, custom tools, and future extensions without modifying core code. Tools are stored as `Arc<dyn Tool>` in the registry — Clone-friendly, Send+Sync, runtime-registerable.
+**Trait-based tools.** Open `Tool` trait with `Arc<dyn Tool>` storage. Runtime-registerable via `registry.register()`. Enables MCP, skills, and custom tools without modifying core code.
 
-**MCP via stdio.** MCP servers are spawned as child processes. Communication is JSON-RPC 2.0 over stdin/stdout. Each server connection is `Arc<Mutex<McpConnection>>`, shared across all tools from that server. Config format matches Claude Code / Gemini CLI.
+**Lazy everything.** MCP servers don't connect until called. Skills don't load until needed. Tool schemas use `Arc<Vec<Value>>` for zero-copy reads. You only pay for what you use.
 
-**Parallel tool execution.** Multiple tool calls in one response run concurrently via `tokio::task::JoinSet`. Single tool calls run inline (zero overhead). Results reassembled in original order.
+**Shared mutable registry.** `Arc<RwLock<ToolRegistry>>` allows `mcp_connect` to register new tools mid-conversation. Snapshot-before-await pattern prevents deadlocks — registry is cloned before long API calls, ensuring the write lock is always available for tool registration.
 
-**Subagent isolation.** Each subagent runs on a dedicated `std::thread` with its own `current_thread` tokio runtime. Solves recursive async `Send` bounds. Parent communicates via `oneshot` channels for results and shutdown.
+**Subagent isolation.** Each subagent runs on a dedicated OS thread with its own tokio runtime. Solves recursive async `Send` bounds. Parent communicates via oneshot channels.
 
-**Prompt caching.** Historical messages are never modified. Cache breakpoints annotated on the last user message every 4+ turns. System prompt and tool schemas get `cache_control: ephemeral`. Achieves ~95% cache hit rates.
+**Prompt caching.** Historical messages never modified. Cache breakpoints on last user message every 4+ turns. System prompt and tool schemas marked `ephemeral`. ~95% hit rates.
 
-**Steering.** Messages typed during streaming inject between tool execution rounds via unbounded channel. Drain happens after every tool batch and before every API call. Fallback queue fires on response completion. Mirrors pi's `steer` / `followUp` system.
+**Steering.** Messages typed during streaming inject between tool rounds via unbounded channel. Fallback queue fires on completion.
 
-**Smart scroll.** Viewport tracking via `scroll_pinned` + `last_line_count` delta compensation. Scrolled-up viewport stays stationary during streaming content growth.
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Binary | 4.8MB (stripped, LTO, single codegen unit) |
+| Startup | 3ms |
+| Tool schema | Zero-copy via `Arc<Vec<Value>>` |
+| Build (cold) | ~1m 45s |
+| Build (incremental) | ~22s |
+
+```toml
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+```
 
 ## Cost Tracking
 
@@ -263,28 +269,7 @@ src/
 | Sonnet | $3.00/MTok | $15.00/MTok | $0.30/MTok | $3.75/MTok |
 | Haiku | $0.80/MTok | $4.00/MTok | $0.08/MTok | $1.00/MTok |
 
-Subagent costs tracked with the subagent's model. Running total in TUI footer, persisted with session.
-
-## Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `tokio` | Async runtime |
-| `reqwest` | HTTP client (streaming, timeouts) |
-| `serde` / `serde_json` | Serialization |
-| `clap` | CLI argument parsing |
-| `axum` | HTTP/WebSocket server |
-| `ratatui` | Terminal UI framework |
-| `crossterm` | Terminal backend + input |
-| `tachyonfx` | Terminal animations |
-| `syntect` | Syntax highlighting |
-| `async-trait` | Async trait support |
-| `chrono` | Timestamps |
-| `uuid` | Session IDs |
-| `tokio-util` | CancellationToken |
-| `tracing` | Structured logging |
-| `fs4` | Cross-process file locking |
-| `sha2` | PKCE OAuth |
+Subagent costs tracked with the subagent's model. Running total in TUI footer.
 
 ## License
 
