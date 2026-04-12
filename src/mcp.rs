@@ -234,6 +234,8 @@ struct McpToolDef {
 /// The connection is shared (Arc<Mutex<>>) across all tools from the same server.
 pub struct McpTool {
     tool_name: String,
+    /// Original tool name as the MCP server knows it (without prefix).
+    server_tool_name: String,
     server_name: String,
     description: String,
     input_schema: Value,
@@ -256,7 +258,7 @@ impl Tool for McpTool {
     
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
         let mut conn = self.connection.lock().await;
-        conn.call_tool(&self.tool_name, params).await
+        conn.call_tool(&self.server_tool_name, params).await
             .map_err(|e| RuntimeError::Tool(format!(
                 "MCP tool '{}' (server '{}') failed: {}", self.tool_name, self.server_name, e
             )))
@@ -307,6 +309,7 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
                             
                             let mcp_tool = McpTool {
                                 tool_name: prefixed_name,
+                                server_tool_name: tool_def.name.clone(),
                                 server_name: server_name.clone(),
                                 description: format!("[MCP:{}] {}", server_name, tool_def.description),
                                 input_schema: tool_def.input_schema,
