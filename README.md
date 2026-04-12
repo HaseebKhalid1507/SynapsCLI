@@ -1,21 +1,47 @@
 # SynapsCLI
 
-A minimal, terminal-native AI agent runtime built in Rust. It connects to the Anthropic API, streams responses with extended thinking, executes tools in an autonomous loop, and presents everything through a polished TUI — or serves multiple clients over WebSocket.
+A terminal-native AI agent runtime built in Rust. Streams responses with extended thinking, executes tools autonomously, dispatches parallel subagents with real-time monitoring, and presents everything through a polished TUI.
 
 ## Features
 
-- **OAuth login** — Sign in with your Claude Pro/Max account via browser; tokens stored locally with auto-refresh (no API key needed)
-- **Server/client architecture** — One server holds the runtime and session; multiple clients connect via WebSocket and share a persistent conversation
+### Core Runtime
 - **Streaming SSE** — Real-time token streaming with thinking block display
-- **Tool use loop** — Autonomous multi-step tool execution with cancellation support
-- **7 built-in tools** — bash, read, write, edit, grep, find, ls
-- **TUI interface** — Full terminal UI with markdown rendering, syntax highlighting, and animations
-- **CLI client** — Lightweight WebSocket client with ANSI-colored streaming output
-- **Session persistence** — Auto-saved sessions with `--continue` to resume any conversation
-- **Extended thinking** — Configurable thinking budgets (low/medium/high/xhigh or custom token count)
-- **Cost tracking** — Per-model pricing with session totals
-- **Prefix commands** — Type `/q` instead of `/quit`, unambiguous prefixes resolve automatically
-- **Tab completion** — Tab-complete slash commands with longest common prefix matching
+- **Agentic tool loop** — Autonomous multi-step tool execution with cancellation
+- **8 built-in tools** — bash, read, write, edit, grep, find, ls, subagent
+- **Extended thinking** — Configurable thinking budgets (low/medium/high/xhigh or custom)
+- **Prompt caching** — Automatic cache breakpoint annotation for ~95% cache hit rates
+
+### Multi-Agent Orchestration
+- **Subagent dispatch** — Spawn named agents or inline system prompts as one-shot workers
+- **Parallel execution** — Multiple tool calls in one response run concurrently via JoinSet
+- **Real-time TUI panel** — Live status showing each agent's activity with animated spinners
+- **Agent resolution** — `~/.synaps-cli/agents/<name>.md` with YAML frontmatter stripping
+- **Recursive safety** — Subagents get full tools except the subagent tool (no inception)
+- **Zombie prevention** — Shutdown signal via oneshot channel; parent abort cancels child streams
+- **Token forwarding** — Subagent costs tracked in parent session with correct per-model pricing
+- **Subagent logging** — Every dispatch logged to `~/.synaps-cli/logs/subagents/<timestamp>-<agent>.md`
+
+### TUI
+- **Markdown rendering** — Headers, code blocks (syntax highlighted), tables, lists, blockquotes
+- **Smart scroll** — Viewport stays stationary when scrolled up during streaming; auto-scrolls at bottom
+- **Abort context** — Escape saves partial work; next message gets context of what was interrupted
+- **Tool elapsed time** — Every tool result shows execution duration
+- **Subagent panel** — Animated braille spinner, per-agent status, elapsed timers, running/done counts
+- **Boot/exit animations** — CRT-style effects via tachyonfx
+- **Themes** — Customizable via `~/.synaps-cli/theme` key-value file
+- **Mouse support** — Scroll wheel for message history
+- **Input history** — Arrow keys cycle through previous messages
+- **Token tracking** — Input/output/cache-read/cache-write tokens with cost in footer
+
+### Infrastructure
+- **OAuth login** — PKCE flow via browser; tokens stored locally with auto-refresh
+- **API key fallback** — Direct Anthropic API key support
+- **Server/client architecture** — Axum WebSocket server; multiple clients share a session
+- **Session persistence** — Auto-saved sessions with `--continue` to resume
+- **Model-aware limits** — Opus 128K / Sonnet 64K max_tokens automatically
+- **Prefix commands** — `/q` instead of `/quit`, unambiguous prefixes resolve
+- **Tab completion** — Tab-complete slash commands
+- **Profiles** — `--profile <name>` for separate config/auth/session namespaces
 
 ## Quick Start
 
@@ -28,460 +54,146 @@ A minimal, terminal-native AI agent runtime built in Rust. It connects to the An
 
 ```bash
 # Clone and build
-git clone <repo-url>
+git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
 cargo build --release
 
-# ── Authentication (pick one) ───────────────────────────────
+# The binary is at target/release/synaps-cli
+```
 
-# Option A: Sign in with your Claude account (Pro/Max/Team/Enterprise)
-cargo run --bin login
-# Opens your browser, saves tokens to ~/.synaps-cli/auth.json,
-# auto-refreshes before expiry. Shared format with Claude Code and Pi.
+### Authentication
 
-# Option B: Use an API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+**OAuth (recommended — Claude Pro/Max/Team/Enterprise):**
+```bash
+target/release/synaps-cli login
+# Opens browser → Anthropic OAuth → tokens saved to ~/.synaps-cli/auth.json
+```
 
-# ── Optional config ─────────────────────────────────────────
+**API key:**
+```bash
 mkdir -p ~/.synaps-cli
-echo "model = claude-opus-4-6" > ~/.synaps-cli/config
-echo "thinking = medium" >> ~/.synaps-cli/config
+echo '{"anthropic":{"type":"api_key","key":"sk-ant-..."}}' > ~/.synaps-cli/auth.json
 ```
 
 ### Run
 
 ```bash
-# ── First-time login (Claude Pro/Max accounts) ──────────────
+# Interactive TUI
+target/release/synaps-cli chatui
 
-cargo run --bin login                    # browser-based OAuth login
+# One-shot command
+target/release/synaps-cli run "explain quicksort"
 
-# ── Server/Client mode (recommended) ────────────────────────
+# One-shot with agent personality
+target/release/synaps-cli run "review this PR" --agent spike
 
-# Start the server (holds runtime + session, listens for WebSocket clients)
-cargo run --bin server
-cargo run --bin server -- --port 3145 --system ./prompts/agent.md
-cargo run --bin server -- --continue                # resume latest session
-cargo run --bin server -- --continue 20260410-1430  # resume specific session
+# Resume a session
+target/release/synaps-cli chatui --continue
 
-# Connect a client (multiple clients can connect simultaneously)
-cargo run --bin client
-cargo run --bin client -- --url ws://localhost:3145/ws
+# Server mode (WebSocket)
+target/release/synaps-cli server --port 3145
+```
 
-# ── Standalone TUI mode ─────────────────────────────────────
+## Agents
 
-# TUI mode (self-contained, no server needed)
-cargo run --bin chatui
-cargo run --bin chatui -- --system "You are a Rust expert."
-cargo run --bin chatui -- -s ./prompts/coding.md
-cargo run --bin chatui -- --continue
+Agents are markdown files with optional YAML frontmatter at `~/.synaps-cli/agents/`:
 
-# ── Other modes ─────────────────────────────────────────────
+```markdown
+---
+name: spike
+description: Executor — clean, efficient, no-nonsense
+model: claude-sonnet-4-20250514
+---
 
-# Plain streaming chat (no TUI)
-cargo run --bin chat
+You are **Spike** — a subagent channeling Spike Spiegel.
+Your specialty: **execution**. You get the job done.
+```
 
-# Single prompt (non-streaming)
-cargo run --bin synaps-cli run "explain quicksort"
+### CLI dispatch
+```bash
+synaps-cli run "fix the nginx config" --agent spike
+synaps-cli run "audit this code" --agent shady
+synaps-cli run "analyze architecture" -a zero
+```
+
+### In-conversation dispatch
+The model can call the `subagent` tool during a conversation:
+```
+dispatch spike with task "count lines in src/"
+send 3 agents in parallel to review each module
+```
+
+The TUI shows real-time status:
+```
+╭ ◈ 2 agents ─────────────────────────────────────────╮
+│  ⠹ spike   ⚙ bash (tool #3)                  4.2s  │
+│  ⠹ chrollo thinking...                        2.1s  │
+╰──────────────────────────────────────────────────────╯
 ```
 
 ## Architecture
 
 ```
-                    ┌──────────┐  ┌──────────┐  ┌──────────┐
-                    │ client   │  │ client   │  │ future:  │
-                    │ (CLI)    │  │ (CLI)    │  │ chatui   │
-                    └────┬─────┘  └────┬─────┘  └────┬─────┘
-                         │             │             │
-                         └─────────────┴──────┬──────┘
-                                              │ WebSocket
-                                        ┌─────┴─────┐
-                                        │  server    │
-                                        │            │
-                                        │  Runtime   │
-                                        │  Session   │
-                                        │  Tools     │
-                                        │  Broadcast │
-                                        └────────────┘
-
 src/
-├── lib.rs          # Module exports
-├── runtime.rs      # Core runtime: API calls, SSE parsing, tool loop, auth refresh
-├── auth.rs         # OAuth 2.0 + PKCE flow, callback server, locked token refresh
-├── login.rs        # `login` binary: browser-based OAuth login
-├── tools.rs        # Tool registry and 7 tool implementations
-├── session.rs      # Session persistence: save, load, list, find
-├── protocol.rs     # Shared client/server message types
-├── server.rs       # WebSocket server (axum): broadcast, commands, tool exec
-├── client.rs       # CLI WebSocket client with ANSI streaming
-├── chatui.rs       # Standalone TUI binary (ratatui + crossterm)
-├── chat.rs         # Plain text streaming chat binary
-├── error.rs        # Error types
-└── main.rs         # CLI binary with run subcommand
+├── main.rs          Entry point, CLI args (clap), --agent/--system flags
+├── runtime.rs       Anthropic API client, SSE streaming, agentic tool loop,
+│                    parallel execution (JoinSet), prompt cache management
+├── chatui.rs        TUI (ratatui), subagent panel, smart scroll, abort context,
+│                    markdown rendering, syntax highlighting, animations
+├── tools.rs         Tool system: bash, read, write, edit, grep, find, ls, subagent
+│                    Agent resolution, subagent streaming, zombie prevention
+├── auth.rs          OAuth 2.0 PKCE flow, token refresh with flock
+├── session.rs       Session persistence (JSON)
+├── config.rs        Profile system, path resolution
+├── server.rs        Axum WebSocket server, broadcast stream events
+├── client.rs        CLI WebSocket client, ANSI streaming output
+├── protocol.rs      Shared message types (client ↔ server)
+├── chat.rs          Simple REPL chat (non-TUI)
+├── login.rs         OAuth browser flow
+├── logging.rs       Tracing setup
+├── error.rs         Error types
+└── lib.rs           Library root, re-exports
 ```
 
-### Server (`server.rs`)
+### Key Design Decisions
 
-The server is a long-running daemon that owns the `Runtime` and session state. Clients connect via WebSocket and share one persistent conversation. All stream events are broadcast to every connected client.
+**Parallel tool execution:** When the model returns multiple tool calls in one response, they execute concurrently via `tokio::task::JoinSet`. Single tool calls run inline (zero overhead). Results are reassembled in original order.
 
-```bash
-# Start with defaults (port 3145, new session)
-cargo run --bin server
+**Subagent isolation:** Each subagent runs on a dedicated `std::thread` with its own `current_thread` tokio runtime. This solves the recursive async `Send` bound issue (`run_stream` → `tool.execute` → `run_stream`). Parent communicates via `oneshot` channels for results and shutdown signals.
 
-# Custom port + system prompt + resume session
-cargo run --bin server -- -p 8080 -s ./system.md --continue
-```
+**Prompt caching:** Historical messages are never modified. Cache breakpoints are annotated on the last user message every 4+ turns. System prompt and tool schemas get `cache_control: ephemeral`. This achieves ~95% cache hit rates on long conversations.
 
-**Features:**
-- **Broadcast architecture** — When any client sends a message, all connected clients see the thinking, text, tool calls, and results in real time
-- **Shared session** — One conversation persisted to disk, accessible from any client
-- **Slash commands** — `/model`, `/thinking`, `/clear`, `/system` — all sent from any client, affect the shared state
-- **Health endpoint** — `GET /health` returns `ok`
-- **Concurrent safety** — Multiple clients can connect/disconnect freely; the server handles locking
+**Smart scroll:** Viewport tracking via `scroll_pinned` flag + `last_line_count` delta compensation. When user scrolls up, `scroll_back` increases by content growth each frame so the viewport stays stationary.
 
-### Client (`client.rs`)
-
-A lightweight CLI client that connects to the server via WebSocket. Renders streaming responses with ANSI colors.
-
-```bash
-cargo run --bin client                               # connect to localhost:3145
-cargo run --bin client -- --url ws://remote:3145/ws   # connect to remote server
-```
-
-**On connect:**
-- Requests conversation history (displays a summary of past messages)
-- Requests server status (model, thinking level, tokens, cost, client count)
-
-**Commands:**
-| Command | Description |
-|---------|-------------|
-| `/quit`, `/exit`, `/q` | Disconnect |
-| `/cancel`, `/c` | Cancel current streaming response |
-| `/status`, `/s` | Show server status |
-| `/history`, `/h` | Show conversation history |
-| `/model [name]` | Show or set model (server-side) |
-| `/thinking [level]` | Set thinking budget (server-side) |
-| `/clear` | Clear session (server-side) |
-| `/system <prompt>` | Set system prompt (server-side) |
-
-### Protocol (`protocol.rs`)
-
-Shared message types for client↔server communication over WebSocket:
-
-```rust
-// Client → Server
-ClientMessage::Message { content }        // Send a user message
-ClientMessage::Command { name, args }     // Execute a slash command
-ClientMessage::Cancel                     // Cancel streaming
-ClientMessage::Status                     // Request server status
-ClientMessage::History                    // Request conversation history
-
-// Server → Client
-ServerMessage::Thinking { content }       // Thinking tokens (streamed)
-ServerMessage::Text { content }           // Text tokens (streamed)
-ServerMessage::ToolUse { tool_name, .. }  // Tool invocation
-ServerMessage::ToolResult { result, .. }  // Tool execution result
-ServerMessage::Usage { .. }              // Token counts
-ServerMessage::Done                       // Streaming complete
-ServerMessage::Error { message }          // Error
-ServerMessage::System { message }         // Info/command response
-ServerMessage::StatusResponse { .. }      // Server state
-ServerMessage::HistoryResponse { .. }     // Conversation history
-```
-
-All messages are JSON-serialized. The server→client messages map directly to the internal `StreamEvent` enum.
-
-### Runtime (`runtime.rs`)
-
-The `Runtime` struct is the core engine. It handles:
-
-- **Authentication** — Reads OAuth credentials from `~/.synaps-cli/auth.json` (created by the `login` binary) or falls back to `ANTHROPIC_API_KEY` from the environment. OAuth tokens are automatically refreshed before expiry with cross-process file locking (see [Authentication](#authentication) section below).
-- **SSE streaming** — Parses `content_block_start`, `content_block_delta`, `content_block_stop` events, accumulating thinking blocks (with signatures), text, and tool use blocks
-- **Tool loop** — When the model returns `tool_use` blocks, executes each tool, sends results back, and continues until the model responds with text only. Updated message history is sent after each iteration so the UI stays in sync.
-- **Cancellation** — Accepts a `CancellationToken` that can abort between API calls, between tool executions, or mid-tool via `tokio::select!`. Partial message history is preserved on cancellation.
-
-Public API:
-
-```rust
-let runtime = Runtime::new().await?;
-runtime.set_model("claude-opus-4-6".to_string());
-runtime.set_thinking_budget(16384);
-runtime.set_system_prompt("You are a helpful agent.".to_string());
-
-// Streaming with cancellation
-let cancel = CancellationToken::new();
-let mut stream = runtime.run_stream_with_messages(messages, cancel.clone());
-while let Some(event) = stream.next().await {
-    match event {
-        StreamEvent::Text(t) => print!("{}", t),
-        StreamEvent::Thinking(t) => { /* thinking tokens */ },
-        StreamEvent::ToolUse { tool_name, tool_id, input } => { /* tool called */ },
-        StreamEvent::ToolResult { tool_id, result } => { /* tool finished */ },
-        StreamEvent::MessageHistory(msgs) => { /* updated conversation */ },
-        StreamEvent::Usage { input_tokens, output_tokens } => { /* token counts */ },
-        StreamEvent::Done => break,
-        StreamEvent::Error(e) => eprintln!("{}", e),
-    }
-}
-
-// Non-streaming (blocks until complete, runs tool loop internally)
-let response = runtime.run_single("list files in src/").await?;
-```
-
-#### SSE Event Handling
-
-The streaming parser processes these SSE event types:
-
-| Event Type | Description |
-|------------|-------------|
-| `content_block_start` | Marks beginning of a thinking, text, or tool_use block |
-| `content_block_delta` | Incremental content: `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta` |
-| `content_block_stop` | Finalizes the block, flushes accumulated content |
-| `message_start` | Message envelope with initial usage data |
-| `message_delta` | Token usage updates |
-| `message_stop` | Final message marker |
-
-Thinking blocks accumulate both the thinking text and a `signature` field across separate deltas. Both are stored and echoed back in tool loop continuations.
-
-API requests use `max_tokens: 128000` and `thinking.display: "summarized"`.
-
-### Tools (`tools.rs`)
-
-Seven tools are registered by default:
-
-| Tool | Description |
-|------|-------------|
-| **bash** | Execute shell commands via `/bin/bash -c`. Configurable `timeout` (default 30s, max 300s). Captures stdout + stderr. |
-| **read** | Read file contents with line numbers. Supports `offset` (starting line, 0-indexed) and `limit` (max lines). Reports remaining lines when truncated. |
-| **write** | Create or overwrite files. Atomic writes via temp file (`.agent-tmp`) + rename. Auto-creates parent directories. Reports line and byte counts. |
-| **edit** | Surgical find-and-replace. `old_string` must match exactly once (errors on zero or multiple matches). Atomic write. |
-| **grep** | Regex search via `grep -rn`. Supports `include` glob filter (e.g. `*.rs`), `context` lines. Excludes `.git`/`node_modules`/`target`. 15s timeout, 50KB output cap. |
-| **find** | Glob-based file search via `find`. Supports `type` filter (`f` for files, `d` for directories). Excludes noise directories. 10s timeout. |
-| **ls** | Directory listing via `ls -lah`. Shows permissions, size, and dates. |
-
-All tools expand `~` to `$HOME`. Tool results are streamed back as they complete.
-
-<details>
-<summary>Full parameter reference</summary>
-
-**bash**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `command` | string | yes | Shell command to execute |
-| `timeout` | integer | no | Timeout in seconds (default: 30, max: 300) |
-
-**read**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | yes | File path to read |
-| `offset` | integer | no | Line number to start from (0-indexed) |
-| `limit` | integer | no | Maximum number of lines to read |
-
-**write**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | yes | File path to write |
-| `content` | string | yes | File content |
-
-**edit**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | yes | File path to edit |
-| `old_string` | string | yes | Exact text to find (must match once) |
-| `new_string` | string | yes | Replacement text |
-
-**grep**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `pattern` | string | yes | Regex pattern |
-| `path` | string | no | Search directory (default: `.`) |
-| `include` | string | no | Glob filter (e.g. `*.rs`) |
-| `context` | integer | no | Context lines before and after matches |
-
-**find**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `pattern` | string | yes | Glob pattern to match |
-| `path` | string | no | Search directory (default: `.`) |
-| `type` | string | no | `f` for files, `d` for directories |
-
-**ls**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | string | no | Directory to list (default: `.`) |
-
-</details>
-
-### Sessions (`session.rs`)
-
-Every conversation is automatically saved to `~/.synaps-cli/sessions/`. Session files are JSON containing the full API message history, model settings, token counts, and cost. Empty sessions (no user messages) are not saved.
-
-Session ID format: `YYYYMMDD-HHMMSS-XXXX` (4-character UUID suffix).
-
-Sessions are automatically titled from the first 80 characters of the first user message.
-
-```bash
-# Continue the most recent session (no ID needed)
-cargo run --bin chatui -- --continue
-cargo run --bin server -- --continue
-
-# Continue a specific session (partial ID match)
-cargo run --bin chatui -- --continue 20260410-1430
-cargo run --bin server -- --continue 20260410-1430
-```
-
-Session functions:
-
-- `Session::new()` — Create with current model/thinking/system prompt
-- `Session::save()` / `Session::load()` — Persist to / read from disk
-- `Session::auto_title()` — Set title from first user message
-- `list_sessions()` — All sessions sorted by last updated
-- `latest_session()` — Most recently active session
-- `find_session("partial_id")` — Exact match first, then substring match. Errors on ambiguous matches.
-
-### TUI (`chatui.rs`)
-
-Standalone terminal interface built with ratatui, crossterm, tachyonfx, and syntect. Owns its own `Runtime` — no server needed.
-
-**Performance:** Syntax highlighting sets are loaded once via `LazyLock`. Rendered lines are cached and only rebuilt when messages change (not on every keypress or scroll).
-
-**Keyboard shortcuts:**
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message |
-| `Esc` | Abort streaming (cancels tool execution too) |
-| `Ctrl+C` | Quit (with dissolve animation) |
-| `Ctrl+A` / `Home` | Move cursor to start |
-| `Ctrl+E` / `End` | Move cursor to end |
-| `Ctrl+W` | Delete word backward |
-| `Ctrl+U` | Delete to start of line |
-| `Alt+Left` / `Alt+Right` | Move cursor by word |
-| `Alt+Backspace` | Delete word backward |
-| `Up` / `Down` | Input history navigation |
-| `Shift+Up` / `Shift+Down` | Scroll message history |
-| `Mouse wheel` | Scroll messages (3 lines per tick) |
-| `Tab` | Autocomplete slash commands (longest common prefix) |
-
-**Slash commands:**
-
-Commands support unambiguous prefix matching — `/q` resolves to `/quit`, `/s` is ambiguous (sessions/system) so it won't resolve, but `/se` resolves to `/sessions`.
-
-| Command | Description |
-|---------|-------------|
-| `/clear` | Save current session and start a new one |
-| `/model [name]` | Show or set model |
-| `/system <prompt\|show\|save>` | Manage system prompt |
-| `/thinking [low\|medium\|high\|xhigh]` | Set thinking budget |
-| `/sessions` | List saved sessions (up to 20, with active marker) |
-| `/resume <id>` | Save current session and switch to another |
-| `/help` | Show available commands |
-| `/quit` | Exit |
-| `/exit` | Exit (alias for `/quit`) |
-
-**Rendering:**
-
-- Markdown: headings, bold, italic, inline code, blockquotes, ordered/unordered lists
-- Code blocks: syntax highlighted via syntect (base16-ocean.dark theme)
-- Tool calls: per-tool icons (❯ bash, ▸ read, ◂ write, Δ edit, ⌕ grep, ○ find, ≡ ls)
-- Tool results: compact "└─ ok (N lines)" summary with indented output, errors in red
-- Thinking: dimmed with │ left border, truncated to 6 lines
-- Animations: fade-in on boot (300ms, QuadOut), dissolve on exit (800ms, QuadIn) via tachyonfx
-
-**Theme:**
-
-Dark base (RGB 12,14,18) with teal accents (RGB 80,200,160). User messages have a subtle background highlight. The color palette is designed for high contrast on dark terminals.
+**Abort context:** On Escape, all partial output (thinking, text, tool calls, results) since the last user message is captured and injected into the next API call. The model sees what it was doing before the interrupt. Cache-safe — only the new user message is affected.
 
 ## Configuration
 
 ### Config file
 
-`~/.synaps-cli/config` — key=value format, supports `#` comments:
-
+`~/.synaps-cli/config` (or `~/.synaps-cli/<profile>/config`):
 ```
-# Model selection
 model = claude-opus-4-6
-
-# Thinking budget (named level or raw token count)
-thinking = xhigh
-# thinking = 8192
+thinking = high
 ```
 
-**Thinking levels:**
-
-| Level | Budget tokens |
-|-------|--------------|
-| `low` | 2,048 |
-| `medium` | 4,096 |
-| `high` | 16,384 |
-| `xhigh` | 32,768 |
-| `<number>` | Custom token count |
+Thinking levels: `low` (1024), `medium` (4096), `high` (8192), `xhigh` (16384), or a raw number.
 
 ### System prompt
 
-Loaded in priority order:
+`~/.synaps-cli/system.md` — loaded automatically if present.
 
-1. `--system` / `-s` CLI flag (string or file path — auto-detected)
-2. `~/.synaps-cli/system.md` file
-3. Built-in default
+### Theme
 
-Can also be changed at runtime with `/system` (chatui) or `/system` command (client → server).
-
-Default (when no flag or file exists):
-> You are a helpful AI agent running in a terminal. You have access to bash, read, and write tools. Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.
-
-### Authentication
-
-SynapsCLI supports two authentication modes:
-
-#### OAuth (recommended — Claude Pro/Max/Team/Enterprise)
-
-Run the `login` binary to start a browser-based OAuth flow:
-
-```bash
-cargo run --bin login
+`~/.synaps-cli/theme` — key-value pairs:
 ```
-
-**What happens:**
-
-1. Generates a PKCE verifier + S256 challenge
-2. Starts a local HTTP server on `127.0.0.1:53692` to capture the OAuth callback
-3. Opens your browser to `claude.ai/oauth/authorize`
-4. After you sign in, claude.ai redirects to `http://localhost:53692/callback?code=...&state=...`
-5. The server captures the code and exchanges it for access + refresh tokens at `platform.claude.com/v1/oauth/token`
-6. Tokens are saved to `~/.synaps-cli/auth.json` with `chmod 600`
-
-**Manual fallback (SSH / headless):** If the browser can't open or you're on a remote host, the login prompt also accepts pasted input — a full redirect URL, `code#state`, or just the raw code.
-
-**Auto-refresh:** Before every API call, the runtime checks if the token is expired. If so, it acquires an exclusive `flock` on `auth.json`, re-reads the file (in case another instance already refreshed), and only hits the token endpoint if still needed. This makes it safe to run multiple SynapsCLI instances simultaneously — they'll serialize on the lock rather than thundering the refresh endpoint. A 5-minute buffer is applied to `expires` to avoid mid-call failures.
-
-**File format** (compatible with Pi and Claude Code):
-
-```json
-{
-  "anthropic": {
-    "type": "oauth",
-    "access": "sk-ant-oat01-...",
-    "refresh": "sk-ant-ort01-...",
-    "expires": 1775832022076
-  }
-}
+bg = #0c0e12
+border = #232832
+claude_label = #50c8a0
+subagent_name = #b48cdc
 ```
-
-OAuth requests use the `Bearer` authorization header plus `anthropic-beta: claude-code-20250219,oauth-2025-04-20`. The system prompt is wrapped in a Claude Code header block required by the OAuth-authenticated endpoint.
-
-#### API key
-
-Set `ANTHROPIC_API_KEY` in your environment:
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-The runtime sends it via the `x-api-key` header with `anthropic-version: 2023-06-01`.
 
 ## Cost Tracking
-
-Session cost is calculated per API call using current Anthropic pricing:
 
 | Model | Input (per MTok) | Output (per MTok) |
 |-------|-----------------|-------------------|
@@ -489,9 +201,7 @@ Session cost is calculated per API call using current Anthropic pricing:
 | Sonnet | $3.00 | $15.00 |
 | Haiku | $0.80 | $4.00 |
 
-Model matching is substring-based (e.g. any model ID containing "opus" uses Opus pricing). Unknown models default to Sonnet pricing.
-
-The running total is displayed in the TUI footer, client status response, and persisted with each session.
+Cache reads bill at 0.1× input price; cache writes at 1.25×. Subagent costs are tracked with the subagent's model (not the parent's), so pricing is always accurate. Running total shown in the TUI footer and persisted with each session.
 
 ## Dependencies
 
@@ -501,23 +211,18 @@ The running total is displayed in the TUI footer, client status response, and pe
 | reqwest | HTTP client with streaming |
 | serde / serde_json | Serialization |
 | clap | CLI argument parsing |
-| axum | HTTP/WebSocket server + OAuth callback server |
+| axum | HTTP/WebSocket server + OAuth callback |
 | tokio-tungstenite | WebSocket client |
-| tower / tower-http | Server middleware |
 | ratatui | Terminal UI framework |
 | crossterm | Terminal backend + input events |
-| tachyonfx | Terminal animations (fade-in, dissolve) |
-| syntect | Syntax highlighting for code blocks |
-| sha2 | SHA-256 for PKCE code challenge |
-| rand | Cryptographic RNG for PKCE verifier and state |
-| base64 | URL-safe base64 encoding for PKCE |
-| url / urlencoding | URL parsing and query param encoding |
-| fs4 | Cross-process file locking for auth.json refresh |
+| tachyonfx | Terminal animations |
+| syntect | Syntax highlighting |
 | chrono | Timestamps |
 | uuid | Session ID generation |
 | tokio-util | CancellationToken for streaming abort |
-| futures-util | Stream combinators for WebSocket |
-| thiserror | Error derive macros |
+| futures | Stream combinators |
+| fs4 | Cross-process file locking for auth refresh |
+| sha2 / rand / base64 | PKCE OAuth challenge |
 
 ## License
 
