@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         io::stdout().flush().unwrap();
 
         let cancel = CancellationToken::new();
-        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel).await;
+        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None).await;
         let mut in_thinking = false;
 
         while let Some(event) = stream.next().await {
@@ -104,6 +104,10 @@ async fn main() -> Result<()> {
                 }
                 StreamEvent::SubagentDone { agent_name, duration_secs, .. } => {
                     println!("\x1b[32m✔ [{}] done ({:.1}s)\x1b[0m", agent_name, duration_secs);
+                    io::stdout().flush().unwrap();
+                }
+                StreamEvent::SteeringDelivered { message } => {
+                    println!("\n\x1b[33m→ [steering] {}\x1b[0m", message);
                     io::stdout().flush().unwrap();
                 }
                 StreamEvent::Done => {

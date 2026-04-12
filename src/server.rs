@@ -347,7 +347,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
     let mut stream = {
         let rt = state.runtime.lock().await;
-        rt.run_stream_with_messages(messages, cancel).await
+        rt.run_stream_with_messages(messages, cancel, None).await
     };
 
     let broadcast = state.broadcast_tx.clone();
@@ -429,7 +429,8 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             // Subagent events — not yet wired to server protocol
             StreamEvent::SubagentStart { .. }
             | StreamEvent::SubagentUpdate { .. }
-            | StreamEvent::SubagentDone { .. } => {}
+            | StreamEvent::SubagentDone { .. }
+            | StreamEvent::SteeringDelivered { .. } => {}
             StreamEvent::Error(err) => {
                 let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
                 state.push_history(HistoryEntry::Error {

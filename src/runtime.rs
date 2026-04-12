@@ -60,6 +60,10 @@ pub enum StreamEvent {
         result_preview: String,
         duration_secs: f64,
     },
+    /// A steering message was delivered mid-stream (between tool rounds)
+    SteeringDelivered {
+        message: String,
+    },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
     Usage {
@@ -392,10 +396,15 @@ impl Runtime {
     }
 
     pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel).await
+        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None).await
     }
 
-    pub async fn run_stream_with_messages(&self, messages: Vec<Value>, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+    pub async fn run_stream_with_messages(
+        &self,
+        messages: Vec<Value>,
+        cancel: CancellationToken,
+        steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Refresh OAuth token if expired before starting the stream.
@@ -417,7 +426,7 @@ impl Runtime {
         tokio::spawn(async move {
             if let Err(e) = Self::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
-                messages, tx.clone(), cancel,
+                messages, tx.clone(), cancel, steering_rx,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -437,6 +446,7 @@ impl Runtime {
         initial_messages: Vec<Value>,
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: CancellationToken,
+        mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -510,10 +520,17 @@ impl Runtime {
                     "content": content
                 }));
 
-                // If no tool uses, we're done
+                // If no tool uses, check for steering messages before finishing.
+                // Steering can redirect the model even when it has no more tool calls.
                 if tool_uses.is_empty() {
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
-                    return Ok(());
+                    let steered = Self::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    if !steered {
+                        // No steering, truly done
+                        let _ = tx.send(StreamEvent::MessageHistory(messages));
+                        return Ok(());
+                    }
+                    // Steering message injected — continue the loop for another LLM call
+                    continue;
                 }
 
                 // Execute tools and add results. We must always produce a tool_result for
@@ -683,6 +700,11 @@ impl Runtime {
                     let _ = tx.send(StreamEvent::MessageHistory(messages));
                     return Ok(());
                 }
+
+                // Check for steering messages between tool rounds.
+                // These get injected as user messages before the next LLM call,
+                // allowing the user to redirect the agent mid-work.
+                Self::drain_steering(&mut steering_rx, &mut messages, &tx);
 
                 // Continue the loop to get Claude's response with tool results
             } else {
@@ -1050,6 +1072,28 @@ impl Runtime {
 
     // Helper methods for token optimization have been replaced 
     // by static-marker prompt caching to prevent history mutations.
+
+    /// Drain all pending steering messages from the channel and inject them
+    /// into the conversation as user messages. Returns true if any were injected.
+    fn drain_steering(
+        steering_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
+        messages: &mut Vec<Value>,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+    ) -> bool {
+        let rx = match steering_rx.as_mut() {
+            Some(rx) => rx,
+            None => return false,
+        };
+
+        let mut injected = false;
+        while let Ok(msg) = rx.try_recv() {
+            tracing::info!("Steering message injected: {}", &msg[..msg.len().min(80)]);
+            let _ = tx.send(StreamEvent::SteeringDelivered { message: msg.clone() });
+            messages.push(json!({"role": "user", "content": msg}));
+            injected = true;
+        }
+        injected
+    }
 
     /// Annotate a cache breakpoint on the conversation prefix.
     /// To maximize cache hits, we must place stationary boundaries. Modifying an old marker
