@@ -322,7 +322,8 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.get(tool_name) {
                             Some(tool) => {
-                                match tool.execute(input.clone(), None, None).await {
+                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None };
+                                match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
                                 }
@@ -350,7 +351,8 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        match t.execute(input, None, None).await {
+                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None };
+                                        match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         }
@@ -585,7 +587,7 @@ impl Runtime {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, Some(tx_d), Some(tx.clone())) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -645,7 +647,7 @@ impl Runtime {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, Some(tx_d), Some(tx_stream.clone())) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
