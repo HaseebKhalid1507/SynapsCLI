@@ -93,7 +93,7 @@ pub struct Runtime {
     client: Client,
     auth: Arc<RwLock<AuthState>>,
     model: String,
-    tools: ToolRegistry,
+    tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
     thinking_budget: u32,
 }
@@ -117,7 +117,7 @@ impl Runtime {
                 token_expires,
             })),
             model: "claude-opus-4-6".to_string(),
-            tools: ToolRegistry::new(),
+            tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
         })
@@ -136,11 +136,16 @@ impl Runtime {
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
-        self.tools = tools;
+        self.tools = Arc::new(RwLock::new(tools));
     }
 
-    pub fn tools_mut(&mut self) -> &mut ToolRegistry {
-        &mut self.tools
+    pub fn tools_mut(&mut self) -> &Arc<RwLock<ToolRegistry>> {
+        &self.tools
+    }
+
+    /// Get a shared reference to the tool registry (for MCP lazy loading).
+    pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
+        Arc::clone(&self.tools)
     }
 
     pub fn model(&self) -> &str {
@@ -324,7 +329,7 @@ impl Runtime {
                         tool_use["id"].as_str()
                     ) {
                         let input = &tool_use["input"];
-                        let result = match self.tools.get(tool_name) {
+                        let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
                                 let ctx = crate::ToolContext { tx_delta: None, tx_events: None };
                                 match tool.execute(input.clone(), ctx).await {
@@ -350,7 +355,7 @@ impl Runtime {
                             tool_use["id"].as_str().map(|s| s.to_string()),
                         ) {
                             let input = tool_use["input"].clone();
-                            let tool = self.tools.get(&tool_name).cloned();
+                            let tool = self.tools.read().await.get(&tool_name).cloned();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -454,7 +459,7 @@ impl Runtime {
         auth: Arc<RwLock<AuthState>>,
         client: Client,
         model: String,
-        tools: ToolRegistry,
+        tools: Arc<RwLock<ToolRegistry>>,
         system_prompt: Option<String>,
         thinking_budget: u32,
         initial_messages: Vec<Value>,
@@ -506,7 +511,7 @@ impl Runtime {
             }
 
             let response = match Self::call_api_stream_inner(
-                &auth, &client, &model, &tools, &system_prompt, thinking_budget,
+                &auth, &client, &model, &*tools.read().await, &system_prompt, thinking_budget,
                 &messages, tx.clone(), &cancel,
             ).await {
                 Ok(r) => r,
@@ -576,7 +581,7 @@ impl Runtime {
                     let input = tool_use["input"].clone();
 
                     if !tool_id.is_empty() && !tool_name.is_empty() {
-                        let result = match tools.get(&tool_name) {
+                        let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
                                 let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 let tx_k = tx.clone();
@@ -631,7 +636,7 @@ impl Runtime {
                             continue;
                         }
 
-                        let tool = tools.get(&tool_name).cloned();
+                        let tool = tools.read().await.get(&tool_name).cloned();
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
 
@@ -730,7 +735,8 @@ impl Runtime {
 
     #[allow(dead_code)]
     pub async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
-        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &self.tools, &self.system_prompt, self.thinking_budget, messages, tx, &CancellationToken::new()).await
+        let tools_guard = self.tools.read().await;
+        Self::call_api_stream_inner(&self.auth, &self.client, &self.model, &tools_guard, &self.system_prompt, self.thinking_budget, messages, tx, &CancellationToken::new()).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -1218,7 +1224,7 @@ impl Runtime {
             "model": self.model,
             "max_tokens": Self::max_tokens_for_model(&self.model),
             "messages": cleaned_messages,
-            "tools": self.tools.tools_schema(),
+            "tools": self.tools.read().await.tools_schema(),
             "thinking": {
                 "type": "enabled",
                 "budget_tokens": self.thinking_budget,

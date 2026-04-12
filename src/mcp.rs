@@ -340,3 +340,145 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
     
     total_tools
 }
+
+// ── Lazy Loading ────────────────────────────────────────────────────────
+
+/// A tool that lazily connects to MCP servers on demand.
+/// Instead of spawning all servers at startup (burning tokens on 65 tool schemas),
+/// this registers ONE tool that the model calls to activate a specific server.
+pub struct McpConnectTool {
+    configs: HashMap<String, McpServerConfig>,
+    registry: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    connected: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl McpConnectTool {
+    pub fn new(
+        configs: HashMap<String, McpServerConfig>,
+        registry: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    ) -> Self {
+        Self {
+            configs,
+            registry,
+            connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for McpConnectTool {
+    fn name(&self) -> &str { "mcp_connect" }
+
+    fn description(&self) -> &str {
+        "Connect to an MCP server and load its tools. Call this before using tools from an external MCP server. Available servers are listed in the description below. Once connected, the server's tools become available for the rest of the session."
+    }
+
+    fn parameters(&self) -> Value {
+        let server_names: Vec<&str> = self.configs.keys().map(|s| s.as_str()).collect();
+        let server_list = server_names.join(", ");
+        json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": format!("Name of the MCP server to connect to. Available: {}", server_list)
+                }
+            },
+            "required": ["server"]
+        })
+    }
+
+    async fn execute(&self, params: Value, _ctx: crate::ToolContext) -> crate::Result<String> {
+        let server_name = params["server"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'server' parameter".to_string()))?;
+
+        // Check if already connected
+        {
+            let connected = self.connected.lock().await;
+            if connected.contains(server_name) {
+                return Ok(format!("Server '{}' is already connected.", server_name));
+            }
+        }
+
+        let config = self.configs.get(server_name)
+            .ok_or_else(|| {
+                let available: Vec<&str> = self.configs.keys().map(|s| s.as_str()).collect();
+                crate::RuntimeError::Tool(format!(
+                    "Unknown MCP server '{}'. Available: {}", server_name, available.join(", ")
+                ))
+            })?;
+
+        tracing::info!(server = %server_name, "Lazy-connecting to MCP server");
+
+        let mut conn = McpConnection::start(config).await
+            .map_err(|e| crate::RuntimeError::Tool(format!(
+                "Failed to connect to MCP server '{}': {}", server_name, e
+            )))?;
+
+        let tools = conn.list_tools().await
+            .map_err(|e| crate::RuntimeError::Tool(format!(
+                "Failed to list tools from '{}': {}", server_name, e
+            )))?;
+
+        let tool_count = tools.len();
+        let connection = Arc::new(Mutex::new(conn));
+        let mut tool_names = Vec::new();
+
+        {
+            let mut registry = self.registry.write().await;
+            for tool_def in tools {
+                let prefixed_name = format!("mcp__{}__{}", server_name, tool_def.name);
+                tool_names.push(format!("{} — {}", tool_def.name,
+                    tool_def.description.chars().take(60).collect::<String>()));
+
+                let mcp_tool = McpTool {
+                    tool_name: prefixed_name,
+                    server_tool_name: tool_def.name.clone(),
+                    server_name: server_name.to_string(),
+                    description: format!("[MCP:{}] {}", server_name, tool_def.description),
+                    input_schema: tool_def.input_schema,
+                    connection: Arc::clone(&connection),
+                };
+
+                registry.register(Arc::new(mcp_tool));
+            }
+        }
+
+        // Mark as connected
+        self.connected.lock().await.insert(server_name.to_string());
+
+        tracing::info!(server = %server_name, tools = tool_count, "MCP server connected (lazy)");
+
+        let tool_list = tool_names.join("\n  • ");
+        Ok(format!(
+            "Connected to '{}' — {} tools now available:\n  • {}",
+            server_name, tool_count, tool_list
+        ))
+    }
+}
+
+/// Set up lazy MCP loading: parse config, register the mcp_connect gateway tool.
+/// Returns the number of available (but not yet connected) servers.
+pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>) -> usize {
+    let config = match load_mcp_config() {
+        Some(c) => c,
+        None => return 0,
+    };
+
+    let server_count = config.mcp_servers.len();
+    if server_count == 0 {
+        return 0;
+    }
+
+    let server_names: Vec<&str> = config.mcp_servers.keys().map(|s| s.as_str()).collect();
+    tracing::info!(servers = ?server_names, "MCP lazy loading: {} servers available", server_count);
+
+    let connect_tool = McpConnectTool::new(
+        config.mcp_servers,
+        Arc::clone(registry),
+    );
+
+    registry.write().await.register(Arc::new(connect_tool));
+
+    server_count
+}
