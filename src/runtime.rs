@@ -196,7 +196,7 @@ impl Runtime {
         }
 
         // Legacy: try the old PiAuth struct format (in case auth.json has optional fields)
-        let home = std::env::var("HOME").unwrap();
+        let home = std::env::var("HOME").unwrap_or_default();
         let auth_path = Path::new(&home).join(".synaps-cli/auth.json");
 
         if auth_path.exists() {
