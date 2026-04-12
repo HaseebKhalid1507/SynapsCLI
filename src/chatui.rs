@@ -77,6 +77,13 @@ struct Theme {
     prompt_fg: Color,
     separator: Color,
     cost_color: Color,
+
+    // Subagent panel
+    subagent_border: Color,
+    subagent_name: Color,
+    subagent_status: Color,
+    subagent_done: Color,
+    subagent_time: Color,
 }
 
 impl Default for Theme {
@@ -115,6 +122,12 @@ impl Default for Theme {
             prompt_fg: Color::Rgb(80, 180, 150),
             separator: Color::Rgb(30, 35, 45),
             cost_color: Color::Rgb(180, 140, 200),
+
+            subagent_border: Color::Rgb(60, 50, 90),
+            subagent_name: Color::Rgb(180, 140, 220),
+            subagent_status: Color::Rgb(140, 160, 180),
+            subagent_done: Color::Rgb(80, 200, 160),
+            subagent_time: Color::Rgb(100, 110, 130),
         }
     }
 }
@@ -253,6 +266,17 @@ struct App {
     show_full_output: bool,
     logo_dismiss_t: Option<f64>,
     logo_build_t: Option<f64>,
+    /// Active subagent status for the live panel
+    subagents: Vec<SubagentState>,
+}
+
+#[derive(Clone)]
+struct SubagentState {
+    name: String,
+    status: String,
+    start_time: std::time::Instant,
+    done: bool,
+    duration_secs: Option<f64>,
 }
 
 impl App {
@@ -281,6 +305,7 @@ impl App {
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
+            subagents: Vec::new(),
         }
     }
 
@@ -485,6 +510,7 @@ impl App {
                         "grep"  => "\u{2315}",
                         "find"  => "\u{25cb}",
                         "ls"    => "\u{2261}",
+                        "subagent" => "\u{25c8}",
                         _       => "\u{2192}",
                     };
                     lines.push(Line::from(vec![
@@ -517,6 +543,7 @@ impl App {
                         "grep"  => "\u{2315}",
                         "find"  => "\u{25cb}",
                         "ls"    => "\u{2261}",
+                        "subagent" => "\u{25c8}",
                         _       => "\u{2192}",
                     };
                     lines.push(Line::from(vec![
@@ -1071,18 +1098,34 @@ fn draw(
     elapsed: std::time::Duration,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
+        // Subagent panel height: 2 (border top/bottom) + 1 per active agent
+        let has_subagents = !app.subagents.is_empty();
+        let subagent_height = if has_subagents {
+            (app.subagents.len() as u16 + 2).min(8) // cap at 6 agents visible
+        } else {
+            0
+        };
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // header
-                Constraint::Min(1),    // messages
-                Constraint::Length(3), // input
-                Constraint::Length(1), // footer
+                Constraint::Length(1),              // header
+                Constraint::Min(1),                 // messages
+                Constraint::Length(subagent_height), // subagent panel (0 when inactive)
+                Constraint::Length(3),              // input
+                Constraint::Length(1),              // footer
             ])
             .split(frame.area());
 
         // -- Header ----------------------------------------------------------
-        let status_span = if app.streaming {
+        let status_span = if !app.subagents.is_empty() {
+            let active = app.subagents.iter().filter(|s| !s.done).count();
+            let done = app.subagents.iter().filter(|s| s.done).count();
+            Span::styled(
+                format!(" \u{25c8} {} agent{} ({} done) ", active, if active != 1 { "s" } else { "" }, done),
+                Style::default().fg(THEME.subagent_name),
+            )
+        } else if app.streaming {
             Span::styled(" \u{25cf} streaming ", Style::default().fg(THEME.status_streaming))
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.status_ready))
@@ -1264,6 +1307,48 @@ fn draw(
             frame.render_widget(indicator_widget, indicator_area);
         }
 
+        // -- Subagent Panel ---------------------------------------------------
+        if has_subagents {
+            let mut agent_lines: Vec<Line> = Vec::new();
+            for sa in &app.subagents {
+                let elapsed = sa.duration_secs.unwrap_or_else(|| sa.start_time.elapsed().as_secs_f64());
+                let time_str = format!("{:.1}s", elapsed);
+
+                let (icon, status_style) = if sa.done {
+                    ("\u{2714}", Style::default().fg(THEME.subagent_done))  // ✔
+                } else {
+                    ("\u{25cf}", Style::default().fg(THEME.subagent_status))  // ●
+                };
+
+                agent_lines.push(Line::from(vec![
+                    Span::styled(format!(" {} ", icon), status_style),
+                    Span::styled(
+                        format!("{:<12}", sa.name),
+                        Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {:<30}", sa.status),
+                        status_style,
+                    ),
+                    Span::styled(
+                        format!(" {}", time_str),
+                        Style::default().fg(THEME.subagent_time),
+                    ),
+                ]));
+            }
+            let agent_block = Block::default()
+                .title(Span::styled(
+                    " subagents ",
+                    Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(THEME.subagent_border))
+                .style(Style::default().bg(THEME.bg));
+            let agent_widget = Paragraph::new(agent_lines).block(agent_block);
+            frame.render_widget(agent_widget, outer[2]);
+        }
+
         // -- Input -----------------------------------------------------------
         let input_border_color = if app.streaming { THEME.border } else { THEME.border_active };
         let input_block = Block::default()
@@ -1276,12 +1361,12 @@ fn draw(
             Span::styled(&app.input, Style::default().fg(THEME.input_fg)),
         ]))
         .block(input_block);
-        frame.render_widget(input_widget, outer[2]);
+        frame.render_widget(input_widget, outer[3]);
 
         // Cursor
         frame.set_cursor_position((
-            outer[2].x + 3 + app.cursor_pos as u16,
-            outer[2].y + 1,
+            outer[3].x + 3 + app.cursor_pos as u16,
+            outer[3].y + 1,
         ));
 
         // -- Footer ----------------------------------------------------------
@@ -1291,7 +1376,7 @@ fn draw(
                 Constraint::Min(1),
                 Constraint::Length(model.len() as u16 + 50),
             ])
-            .split(outer[3]);
+            .split(outer[4]);
 
         let keybinds = Paragraph::new(Line::from(vec![
             Span::styled(" ctrl+c ", Style::default().fg(THEME.muted)),
@@ -1903,6 +1988,9 @@ async fn main() -> Result<()> {
                     let needs_immediate_draw = matches!(&event,
                         StreamEvent::ToolUse { .. }
                         | StreamEvent::ToolResult { .. }
+                        | StreamEvent::SubagentStart { .. }
+                        | StreamEvent::SubagentUpdate { .. }
+                        | StreamEvent::SubagentDone { .. }
                         | StreamEvent::Done
                         | StreamEvent::Error(_)
                     );
@@ -1967,6 +2055,34 @@ async fn main() -> Result<()> {
                             app.api_messages = history;
                             app.save_session();
                         }
+                        StreamEvent::SubagentStart { agent_name, task_preview } => {
+                            app.subagents.push(SubagentState {
+                                name: agent_name,
+                                status: format!("starting: {}", task_preview),
+                                start_time: std::time::Instant::now(),
+                                done: false,
+                                duration_secs: None,
+                            });
+                            app.dirty = true;
+                            app.line_cache.clear();
+                        }
+                        StreamEvent::SubagentUpdate { agent_name, status } => {
+                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.name == agent_name && !s.done) {
+                                sa.status = status;
+                            }
+                            app.dirty = true;
+                            app.line_cache.clear();
+                        }
+                        StreamEvent::SubagentDone { agent_name, result_preview, duration_secs } => {
+                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.name == agent_name && !s.done) {
+                                sa.done = true;
+                                sa.duration_secs = Some(duration_secs);
+                                let preview: String = result_preview.chars().take(40).collect();
+                                sa.status = format!("\u{2714} {}", preview);
+                            }
+                            app.dirty = true;
+                            app.line_cache.clear();
+                        }
                         StreamEvent::Usage {
                             input_tokens,
                             output_tokens,
@@ -1983,12 +2099,15 @@ async fn main() -> Result<()> {
                         }
                         StreamEvent::Done => {
                             app.streaming = false;
+                            // Clear completed subagents panel
+                            app.subagents.clear();
                             stream = None;
                             cancel_token = None;
                         }
                         StreamEvent::Error(err) => {
                             app.push_msg(ChatMessage::Error(err));
                             app.streaming = false;
+                            app.subagents.clear();
                             stream = None;
                             cancel_token = None;
                             // Restore a valid trailing state. The runtime guarantees that

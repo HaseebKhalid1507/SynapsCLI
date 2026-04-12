@@ -46,6 +46,20 @@ pub enum StreamEvent {
         tool_id: String,
         delta: String,
     },
+    /// Subagent lifecycle events — rendered as a live status panel in the TUI
+    SubagentStart {
+        agent_name: String,
+        task_preview: String,
+    },
+    SubagentUpdate {
+        agent_name: String,
+        status: String,
+    },
+    SubagentDone {
+        agent_name: String,
+        result_preview: String,
+        duration_secs: f64,
+    },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
     Usage {
@@ -110,6 +124,16 @@ impl Runtime {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Returns the max output tokens for a given model.
+    /// Opus-class models support 128K, Sonnet/Haiku cap at 64K.
+    fn max_tokens_for_model(model: &str) -> u64 {
+        if model.contains("opus") {
+            128000
+        } else {
+            64000
+        }
     }
 
     pub fn set_thinking_budget(&mut self, budget: u32) {
@@ -267,31 +291,78 @@ impl Runtime {
                     "content": content
                 }));
                 
-                // Execute tools and add results
+                // Execute tools — parallel when multiple are requested
                 let mut tool_results = Vec::new();
                 
-                for tool_use in tool_uses {
+                if tool_uses.len() == 1 {
+                    // Single tool — run inline, no spawn overhead
+                    let tool_use = &tool_uses[0];
                     if let (Some(tool_name), Some(tool_id)) = (
                         tool_use["name"].as_str(),
                         tool_use["id"].as_str()
                     ) {
                         let input = &tool_use["input"];
-                        
                         let result = match self.tools.get(tool_name) {
                             Some(tool) => {
-                                match tool.execute(input.clone(), None).await {
+                                match tool.execute(input.clone(), None, None).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
                         };
-                        
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
                             "content": Self::truncate_tool_result(&result)
                         }));
+                    }
+                } else {
+                    // Multiple tools — run in parallel with JoinSet
+                    let mut join_set = tokio::task::JoinSet::new();
+                    
+                    for tool_use in &tool_uses {
+                        if let (Some(tool_name), Some(tool_id)) = (
+                            tool_use["name"].as_str().map(|s| s.to_string()),
+                            tool_use["id"].as_str().map(|s| s.to_string()),
+                        ) {
+                            let input = tool_use["input"].clone();
+                            let tool = self.tools.get(&tool_name).cloned();
+                            
+                            join_set.spawn(async move {
+                                let result = match tool {
+                                    Some(t) => {
+                                        match t.execute(input, None, None).await {
+                                            Ok(output) => output,
+                                            Err(e) => format!("Tool execution failed: {}", e),
+                                        }
+                                    }
+                                    None => format!("Unknown tool: {}", tool_name),
+                                };
+                                (tool_id, result)
+                            });
+                        }
+                    }
+                    
+                    // Collect results, preserving order by tool_id
+                    let mut results_map = std::collections::HashMap::new();
+                    while let Some(res) = join_set.join_next().await {
+                        if let Ok((tool_id, result)) = res {
+                            results_map.insert(tool_id, result);
+                        }
+                    }
+                    
+                    // Build tool_results in original order
+                    for tool_use in &tool_uses {
+                        if let Some(tool_id) = tool_use["id"].as_str() {
+                            if let Some(result) = results_map.remove(tool_id) {
+                                tool_results.push(json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": Self::truncate_tool_result(&result)
+                                }));
+                            }
+                        }
                     }
                 }
                 
@@ -441,74 +512,146 @@ impl Runtime {
                 let mut tool_results = Vec::new();
                 let mut cancelled = false;
 
-                for tool_use in tool_uses {
+                if cancel.is_cancelled() {
+                    // Already cancelled before tool execution — fill all with cancel results
+                    for tool_use in &tool_uses {
+                        let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
+                        if !tool_id.is_empty() {
+                            tool_results.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": "Cancelled by user"
+                            }));
+                        }
+                    }
+                    cancelled = true;
+                } else if tool_uses.len() == 1 {
+                    // Single tool — run inline with delta streaming + cancellation
+                    let tool_use = &tool_uses[0];
                     let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
                     let tool_name = tool_use["name"].as_str().unwrap_or("").to_string();
                     let input = tool_use["input"].clone();
 
-                    if tool_id.is_empty() || tool_name.is_empty() {
-                        continue;
-                    }
+                    if !tool_id.is_empty() && !tool_name.is_empty() {
+                        let result = match tools.get(&tool_name) {
+                            Some(tool) => {
+                                let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                let tx_k = tx.clone();
+                                let t_id = tool_id.clone();
+                                tokio::spawn(async move {
+                                    while let Some(msg) = rx_d.recv().await {
+                                        let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                            tool_id: t_id.clone(),
+                                            delta: msg,
+                                        });
+                                    }
+                                });
 
-                    // If cancellation already happened, fill in remaining slots with a
-                    // synthetic cancelled result rather than breaking out of the loop.
-                    if cancelled || cancel.is_cancelled() {
-                        cancelled = true;
+                                tokio::select! {
+                                    res = tool.execute(input, Some(tx_d), Some(tx.clone())) => {
+                                        match res {
+                                            Ok(output) => output,
+                                            Err(e) => format!("Tool execution failed: {}", e),
+                                        }
+                                    }
+                                    _ = cancel.cancelled() => {
+                                        cancelled = true;
+                                        "Cancelled by user".to_string()
+                                    }
+                                }
+                            }
+                            None => format!("Unknown tool: {}", tool_name),
+                        };
+
+                        let _ = tx.send(StreamEvent::ToolResult {
+                            tool_id: tool_id.clone(),
+                            result: result.clone(),
+                        });
+
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": "Cancelled by user"
+                            "content": Self::truncate_tool_result(&result)
                         }));
-                        continue;
                     }
+                } else {
+                    // Multiple tools — run in parallel with JoinSet
+                    // Delta streaming is per-tool so each gets its own channel
+                    let mut join_set = tokio::task::JoinSet::new();
 
-                    // Note: StreamEvent::ToolUse is already emitted inside call_api_stream
-                    // the moment the tool_use content block closes, so the UI can render
-                    // the call as part of the assistant's stream instead of only just
-                    // before the result lands.
+                    for tool_use in &tool_uses {
+                        let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
+                        let tool_name = tool_use["name"].as_str().unwrap_or("").to_string();
+                        let input = tool_use["input"].clone();
 
-                    let result = match tools.get(&tool_name) {
-                        Some(tool) => {
-                            let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            let tx_k = tx.clone();
-                            let t_id = tool_id.clone();
-                            tokio::spawn(async move {
-                                while let Some(msg) = rx_d.recv().await {
-                                    let _ = tx_k.send(StreamEvent::ToolResultDelta {
-                                        tool_id: t_id.clone(),
-                                        delta: msg,
+                        if tool_id.is_empty() || tool_name.is_empty() {
+                            continue;
+                        }
+
+                        let tool = tools.get(&tool_name).cloned();
+                        let tx_stream = tx.clone();
+                        let cancel_token = cancel.clone();
+
+                        join_set.spawn(async move {
+                            let result = match tool {
+                                Some(t) => {
+                                    let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                    let tx_k = tx_stream.clone();
+                                    let t_id = tool_id.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(msg) = rx_d.recv().await {
+                                            let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                                tool_id: t_id.clone(),
+                                                delta: msg,
+                                            });
+                                        }
                                     });
-                                }
-                            });
 
-                            // Race tool execution against cancellation
-                            tokio::select! {
-                                res = tool.execute(input.clone(), Some(tx_d)) => {
-                                    match res {
-                                        Ok(output) => output,
-                                        Err(e) => format!("Tool execution failed: {}", e),
+                                    tokio::select! {
+                                        res = t.execute(input, Some(tx_d), Some(tx_stream.clone())) => {
+                                            match res {
+                                                Ok(output) => (false, output),
+                                                Err(e) => (false, format!("Tool execution failed: {}", e)),
+                                            }
+                                        }
+                                        _ = cancel_token.cancelled() => {
+                                            (true, "Cancelled by user".to_string())
+                                        }
                                     }
                                 }
-                                _ = cancel.cancelled() => {
-                                    cancelled = true;
-                                    "Cancelled by user".to_string()
-                                }
-                            }
+                                None => (false, format!("Unknown tool: {}", tool_name)),
+                            };
+
+                            let _ = tx_stream.send(StreamEvent::ToolResult {
+                                tool_id: tool_id.clone(),
+                                result: result.1.clone(),
+                            });
+
+                            (tool_id, result.0, result.1)
+                        });
+                    }
+
+                    // Collect results
+                    let mut results_map = std::collections::HashMap::new();
+                    while let Some(res) = join_set.join_next().await {
+                        if let Ok((tool_id, was_cancelled, result)) = res {
+                            if was_cancelled { cancelled = true; }
+                            results_map.insert(tool_id, result);
                         }
-                        None => format!("Unknown tool: {}", tool_name),
-                    };
+                    }
 
-                    // Send tool result event
-                    let _ = tx.send(StreamEvent::ToolResult {
-                        tool_id: tool_id.clone(),
-                        result: result.clone(),
-                    });
-
-                    tool_results.push(json!({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": Self::truncate_tool_result(&result)
-                    }));
+                    // Build tool_results in original order
+                    for tool_use in &tool_uses {
+                        if let Some(tool_id) = tool_use["id"].as_str() {
+                            let result = results_map.remove(tool_id)
+                                .unwrap_or_else(|| "Cancelled by user".to_string());
+                            tool_results.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": Self::truncate_tool_result(&result)
+                            }));
+                        }
+                    }
                 }
 
                 // Add tool results to conversation — always, so the assistant's tool_use
@@ -582,7 +725,7 @@ impl Runtime {
 
         let mut body = json!({
             "model": model,
-            "max_tokens": 128000,
+            "max_tokens": Self::max_tokens_for_model(model),
             "messages": cleaned_messages,
             "tools": tools.tools_schema(),
             "stream": true,
@@ -995,7 +1138,7 @@ impl Runtime {
 
         let mut body = json!({
             "model": self.model,
-            "max_tokens": 128000,
+            "max_tokens": Self::max_tokens_for_model(&self.model),
             "messages": cleaned_messages,
             "tools": self.tools.tools_schema(),
             "thinking": {

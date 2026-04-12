@@ -13,8 +13,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Run { prompt: String },
+    Run {
+        prompt: String,
+        /// Load agent system prompt by name (from ~/.synaps-cli/agents/<name>.md) or file path
+        #[arg(long, short)]
+        agent: Option<String>,
+        /// Load system prompt from a file path
+        #[arg(long, short)]
+        system: Option<String>,
+    },
     Chat,
+}
+
+fn load_agent_prompt(name: &str) -> std::result::Result<String, String> {
+    // Reuse the same resolution logic as the subagent tool
+    synaps_cli::tools::resolve_agent_prompt(name)
 }
 
 #[tokio::main]
@@ -25,10 +38,35 @@ async fn main() -> Result<()> {
     }
 
     let _log_guard = synaps_cli::logging::init_logging();
-    let runtime = Runtime::new().await?;
+    let mut runtime = Runtime::new().await?;
     
     match cli.command {
-        Commands::Run { prompt } => {
+        Commands::Run { prompt, agent, system } => {
+            // Load system prompt: --agent takes priority over --system
+            if let Some(ref agent_name) = agent {
+                match load_agent_prompt(agent_name) {
+                    Ok(prompt) => {
+                        eprintln!("🎭 Agent: {}", agent_name);
+                        runtime.set_system_prompt(prompt);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(ref path) = system {
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        eprintln!("📋 System prompt: {}", path);
+                        runtime.set_system_prompt(content);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to read {}: {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             println!("🤖 Calling Claude...");
             let response = runtime.run_single(&prompt).await?;
             println!("{}", response);
