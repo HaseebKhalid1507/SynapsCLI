@@ -269,6 +269,8 @@ struct App {
     show_full_output: bool,
     logo_dismiss_t: Option<f64>,
     logo_build_t: Option<f64>,
+    /// Previous rendered line count — used to stabilize scroll when not pinned
+    last_line_count: usize,
     /// Active subagent status for the live panel
     subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
@@ -321,6 +323,7 @@ impl App {
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
+            last_line_count: 0,
             subagents: Vec::new(),
             next_subagent_id: 0,
             tool_start_time: None,
@@ -1242,12 +1245,24 @@ fn draw(
         let total = all_lines.len();
 
         // When pinned, always show the latest content (scroll_back = 0).
-        // When unpinned, hold position — but clamp so we don't over-scroll.
+        // When unpinned, compensate for new content so viewport stays stationary.
         if app.scroll_pinned {
             app.scroll_back = 0;
-        } else if (app.scroll_back as usize) > total.saturating_sub(content_height) {
-            app.scroll_back = (total.saturating_sub(content_height)).min(u16::MAX as usize) as u16;
+        } else {
+            // Content grew while user was scrolled up — increase scroll_back
+            // by the delta so the viewport doesn't slide down.
+            let prev = app.last_line_count;
+            if total > prev && prev > 0 {
+                let growth = (total - prev) as u16;
+                app.scroll_back = app.scroll_back.saturating_add(growth);
+            }
+            // Clamp so we don't scroll past the beginning
+            let max_back = total.saturating_sub(content_height).min(u16::MAX as usize) as u16;
+            if app.scroll_back > max_back {
+                app.scroll_back = max_back;
+            }
         }
+        app.last_line_count = total;
 
         let end = total.saturating_sub(app.scroll_back as usize);
         let start = end.saturating_sub(content_height);
