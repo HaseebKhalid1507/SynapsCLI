@@ -48,8 +48,8 @@ pub trait Tool: Send + Sync {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
-    /// Cached schema — built once at construction, returned on every API call.
-    cached_schema: Vec<Value>,
+    /// Cached schema — rebuilt on register(), shared via Arc for zero-copy reads.
+    cached_schema: Arc<Vec<Value>>,
 }
 
 impl ToolRegistry {
@@ -95,7 +95,7 @@ impl ToolRegistry {
             })
         }).collect();
 
-        ToolRegistry { tools, cached_schema }
+        ToolRegistry { tools, cached_schema: Arc::new(cached_schema) }
     }
 
     /// Register an additional tool at runtime (e.g. MCP tools, custom tools).
@@ -103,12 +103,15 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
 
+        // Get mutable access to schema (Arc::make_mut clones only if shared)
+        let schema = Arc::make_mut(&mut self.cached_schema);
+
         // Remove existing schema entry if replacing
         if self.tools.contains_key(&name) {
-            self.cached_schema.retain(|s| s["name"].as_str() != Some(&name));
+            schema.retain(|s| s["name"].as_str() != Some(&name));
         }
 
-        self.cached_schema.push(json!({
+        schema.push(json!({
             "name": tool.name(),
             "description": tool.description(),
             "input_schema": tool.parameters()
@@ -120,8 +123,8 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    pub fn tools_schema(&self) -> Vec<Value> {
-        self.cached_schema.clone()
+    pub fn tools_schema(&self) -> Arc<Vec<Value>> {
+        Arc::clone(&self.cached_schema)
     }
 }
 

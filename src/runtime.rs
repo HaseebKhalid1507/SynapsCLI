@@ -783,7 +783,7 @@ impl Runtime {
             "model": model,
             "max_tokens": Self::max_tokens_for_model(model),
             "messages": cleaned_messages,
-            "tools": tools.tools_schema(),
+            "tools": &*tools.tools_schema(),
             "stream": true,
             "thinking": {
                 "type": "enabled",
@@ -1221,7 +1221,7 @@ impl Runtime {
             "model": self.model,
             "max_tokens": Self::max_tokens_for_model(&self.model),
             "messages": cleaned_messages,
-            "tools": self.tools.read().await.tools_schema(),
+            "tools": &*self.tools.read().await.tools_schema(),
             "thinking": {
                 "type": "enabled",
                 "budget_tokens": self.thinking_budget,
