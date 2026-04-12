@@ -16,6 +16,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _log_guard = synaps_cli::logging::init_logging();
     let cli = Cli::parse();
     let runtime = Runtime::new().await?;
     

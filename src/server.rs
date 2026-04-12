@@ -87,7 +87,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let _log_guard = synaps_cli::logging::init_logging();
 
     let cli = Cli::parse();
     let mut runtime = Runtime::new().await?;

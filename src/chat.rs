@@ -6,6 +6,7 @@ use tokio;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _log_guard = synaps_cli::logging::init_logging();
     println!("💬 Terminal Chat with Thinking Blocks - type 'quit' to exit\n");
     let runtime = Runtime::new().await?;
     let mut messages: Vec<Value> = Vec::new();

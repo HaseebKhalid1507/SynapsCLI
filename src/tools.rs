@@ -175,7 +175,9 @@ impl ToolType {
     }
 
     pub async fn execute(&self, params: Value) -> Result<String> {
-        match self {
+        let start_time = std::time::Instant::now();
+        tracing::info!("Executing tool");
+        let res = match self {
             ToolType::Bash => execute_bash(params).await,
             ToolType::Read => execute_read(params).await,
             ToolType::Write => execute_write(params).await,
@@ -183,7 +185,9 @@ impl ToolType {
             ToolType::Grep => execute_grep(params).await,
             ToolType::Find => execute_find(params).await,
             ToolType::Ls => execute_ls(params).await,
-        }
+        };
+        tracing::debug!("Tool execution finished in {:?}", start_time.elapsed());
+        res
     }
 }
 

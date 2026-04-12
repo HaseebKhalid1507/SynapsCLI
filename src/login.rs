@@ -7,6 +7,7 @@ use synaps_cli::auth;
 
 #[tokio::main]
 async fn main() {
+    let _log_guard = synaps_cli::logging::init_logging();
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
