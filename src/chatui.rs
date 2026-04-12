@@ -275,6 +275,8 @@ struct App {
     next_subagent_id: u32,
     /// Tracks when the current tool started executing (for elapsed time display)
     tool_start_time: Option<std::time::Instant>,
+    /// Saved context from an aborted response — injected into the next user message
+    abort_context: Option<String>,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
 }
@@ -322,6 +324,7 @@ impl App {
             subagents: Vec::new(),
             next_subagent_id: 0,
             tool_start_time: None,
+            abort_context: None,
             spinner_frame: 0,
         }
     }
@@ -378,6 +381,55 @@ impl App {
             self.scroll_back = 0;
         }
         self.dirty = true;
+    }
+
+    /// Capture all assistant output since the last user message as abort context.
+    /// This gets injected into the next user message so the model knows what it
+    /// was doing before the abort.
+    fn capture_abort_context(&mut self) {
+        let mut parts: Vec<String> = Vec::new();
+
+        // Walk backwards from the end to find content since last user message
+        for tmsg in self.messages.iter().rev() {
+            match &tmsg.msg {
+                ChatMessage::User(_) => break, // stop at the last user message
+                ChatMessage::Thinking(t) => {
+                    if !t.is_empty() {
+                        // Truncate thinking to avoid bloating context
+                        let preview: String = t.chars().take(500).collect();
+                        parts.push(format!("[thinking]: {}", preview));
+                    }
+                }
+                ChatMessage::Text(t) => {
+                    if !t.is_empty() {
+                        parts.push(format!("[response]: {}", t));
+                    }
+                }
+                ChatMessage::ToolUse { tool_name, input } => {
+                    // Truncate input to keep context lean
+                    let input_preview: String = input.chars().take(200).collect();
+                    parts.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
+                }
+                ChatMessage::ToolResult { content, .. } => {
+                    if !content.is_empty() {
+                        let preview: String = content.chars().take(300).collect();
+                        parts.push(format!("[tool_result]: {}", preview));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if parts.is_empty() {
+            self.abort_context = None;
+            return;
+        }
+
+        parts.reverse(); // chronological order
+        self.abort_context = Some(format!(
+            "[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]",
+            parts.join("\n")
+        ));
     }
 
     fn history_up(&mut self) {
@@ -1732,11 +1784,18 @@ async fn main() -> Result<()> {
                                 if let Some(ref ct) = cancel_token {
                                     ct.cancel();
                                 }
+                                // Capture partial work before clearing state
+                                app.capture_abort_context();
                                 stream = None;
                                 cancel_token = None;
                                 app.streaming = false;
                                 app.subagents.clear();
-                                app.push_msg(ChatMessage::Error("aborted".to_string()));
+                                let abort_msg = if app.abort_context.is_some() {
+                                    "aborted — context saved for next message"
+                                } else {
+                                    "aborted"
+                                };
+                                app.push_msg(ChatMessage::Error(abort_msg.to_string()));
                             }
                             (KeyCode::Enter, _) if !app.streaming && !app.input.is_empty() => {
                                 // Trigger CRT dismiss if this is the first message
@@ -1932,7 +1991,15 @@ async fn main() -> Result<()> {
                                     }
                                 } else {
                                     app.push_msg(ChatMessage::User(input.clone()));
-                                    app.api_messages.push(json!({"role": "user", "content": input}));
+                                    // Inject abort context if previous response was interrupted
+                                    let api_content = if let Some(ref ctx) = app.abort_context {
+                                        let combined = format!("{}\n\n{}", ctx, input);
+                                        app.abort_context = None;
+                                        combined
+                                    } else {
+                                        input
+                                    };
+                                    app.api_messages.push(json!({"role": "user", "content": api_content}));
                                     let ct = CancellationToken::new();
                                     stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()).await);
                                     cancel_token = Some(ct);
