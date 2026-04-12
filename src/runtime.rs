@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use serde::{Deserialize};
-use std::path::Path;
+
 use std::sync::Arc;
 use crate::{Result, RuntimeError, ToolRegistry};
 use tokio::sync::{mpsc, RwLock};
@@ -196,8 +196,7 @@ impl Runtime {
         }
 
         // Legacy: try the old PiAuth struct format (in case auth.json has optional fields)
-        let home = std::env::var("HOME").unwrap_or_default();
-        let auth_path = Path::new(&home).join(".synaps-cli/auth.json");
+        let auth_path = crate::config::resolve_read_path("auth.json");
 
         if auth_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&auth_path) {

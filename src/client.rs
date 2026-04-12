@@ -3,7 +3,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use std::io::{self, Write};
+use std::io::Write;
 
 #[derive(Parser)]
 #[command(name = "client", about = "SynapsCLI terminal client")]
@@ -11,13 +11,20 @@ struct Cli {
     /// Server URL
     #[arg(long, short, default_value = "ws://localhost:3145/ws")]
     url: String,
+
+    #[arg(long, global = true)]
+    profile: Option<String>,
 }
 
 #[allow(unused_assignments)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _log_guard = synaps_cli::logging::init_logging();
     let cli = Cli::parse();
+    if let Some(ref prof) = cli.profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+    
+    let _log_guard = synaps_cli::logging::init_logging();
 
     eprintln!("Connecting to {}...", cli.url);
 

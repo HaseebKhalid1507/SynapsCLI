@@ -1,12 +1,8 @@
 use tracing_appender::non_blocking::WorkerGuard;
-use std::path::Path;
+
 
 pub fn init_logging() -> Option<WorkerGuard> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-
-    let log_dir = Path::new(&home).join(".synaps-cli");
+    let log_dir = crate::config::get_active_config_dir();
     if !log_dir.exists() {
         let _ = std::fs::create_dir_all(&log_dir);
     }

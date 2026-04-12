@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use rand::Rng;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::oneshot;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -324,8 +324,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> std::result::Resul
 
 /// Get the path to auth.json (~/.synaps-cli/auth.json).
 pub fn auth_file_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".synaps-cli/auth.json")
+    crate::config::resolve_read_path("auth.json")
 }
 
 /// Load credentials from auth.json.
@@ -343,7 +342,7 @@ pub fn load_auth() -> std::result::Result<Option<AuthFile>, String> {
 
 /// Save credentials to auth.json.
 pub fn save_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
-    let path = auth_file_path();
+    let path = crate::config::resolve_write_path("auth.json");
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {

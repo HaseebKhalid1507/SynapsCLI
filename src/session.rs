@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
-const SESSIONS_DIR: &str = ".synaps-cli/sessions";
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
