@@ -839,7 +839,25 @@ impl Runtime {
         }
 
         // Return accumulated content in the expected format
-        if !current_text.is_empty() {
+        if in_thinking {
+            accumulated_content.push(json!({
+                "type": "thinking",
+                "thinking": current_thinking,
+                "signature": current_thinking_signature
+            }));
+        } else if in_tool_use {
+            let input: Value = if current_tool_input_json.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
+            };
+            accumulated_content.push(json!({
+                "type": "tool_use",
+                "id": current_tool_id,
+                "name": current_tool_name,
+                "input": input
+            }));
+        } else if !current_text.is_empty() {
             accumulated_content.push(json!({
                 "type": "text",
                 "text": current_text
