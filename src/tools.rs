@@ -226,13 +226,25 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut tools = HashMap::new();
-        for tool in [
+        Self::build(&[
             ToolType::Bash, ToolType::Read, ToolType::Write,
             ToolType::Edit, ToolType::Grep, ToolType::Find, ToolType::Ls,
             ToolType::Subagent,
-        ] {
-            tools.insert(tool.name().to_string(), tool);
+        ])
+    }
+
+    /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
+    pub fn without_subagent() -> Self {
+        Self::build(&[
+            ToolType::Bash, ToolType::Read, ToolType::Write,
+            ToolType::Edit, ToolType::Grep, ToolType::Find, ToolType::Ls,
+        ])
+    }
+
+    fn build(tool_list: &[ToolType]) -> Self {
+        let mut tools = HashMap::new();
+        for tool in tool_list {
+            tools.insert(tool.name().to_string(), tool.clone());
         }
 
         let cached_schema = tools.values().map(|tool| {
@@ -668,6 +680,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
 
             runtime.set_system_prompt(system_prompt);
             runtime.set_model(model);
+            runtime.set_tools(crate::ToolRegistry::without_subagent());
 
             let cancel = crate::CancellationToken::new();
             let cancel_inner = cancel.clone();

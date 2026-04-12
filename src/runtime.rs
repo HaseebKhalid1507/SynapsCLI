@@ -122,6 +122,10 @@ impl Runtime {
         self.model = model;
     }
 
+    pub fn set_tools(&mut self, tools: ToolRegistry) {
+        self.tools = tools;
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }
