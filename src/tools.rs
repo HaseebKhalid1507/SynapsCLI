@@ -99,13 +99,21 @@ impl ToolRegistry {
     }
 
     /// Register an additional tool at runtime (e.g. MCP tools, custom tools).
+    /// If a tool with the same name exists, it is replaced.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        let name = tool.name().to_string();
+
+        // Remove existing schema entry if replacing
+        if self.tools.contains_key(&name) {
+            self.cached_schema.retain(|s| s["name"].as_str() != Some(&name));
+        }
+
         self.cached_schema.push(json!({
             "name": tool.name(),
             "description": tool.description(),
             "input_schema": tool.parameters()
         }));
-        self.tools.insert(tool.name().to_string(), tool);
+        self.tools.insert(name, tool);
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -114,16 +122,6 @@ impl ToolRegistry {
 
     pub fn tools_schema(&self) -> Vec<Value> {
         self.cached_schema.clone()
-    }
-
-    /// Execute a tool by name with tracing and timing.
-    pub async fn execute(&self, name: &str, params: Value, ctx: ToolContext) -> Option<Result<String>> {
-        let tool = self.tools.get(name)?;
-        let start_time = std::time::Instant::now();
-        tracing::info!(tool = %name, "Executing tool");
-        let result = tool.execute(params, ctx).await;
-        tracing::info!(tool = %name, elapsed_ms = %start_time.elapsed().as_millis(), "Tool completed");
-        Some(result)
     }
 }
 
