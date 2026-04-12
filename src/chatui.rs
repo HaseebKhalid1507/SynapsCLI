@@ -271,6 +271,8 @@ struct App {
     logo_build_t: Option<f64>,
     /// Active subagent status for the live panel
     subagents: Vec<SubagentState>,
+    /// Counter for unique subagent IDs within a session
+    next_subagent_id: u32,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
 }
@@ -278,7 +280,9 @@ struct App {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SubagentState {
+    id: u32,
     name: String,
     status: String,
     start_time: std::time::Instant,
@@ -314,6 +318,7 @@ impl App {
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
             subagents: Vec::new(),
+            next_subagent_id: 0,
             spinner_frame: 0,
         }
     }
@@ -1174,7 +1179,7 @@ fn draw(
         if app.scroll_pinned {
             app.scroll_back = 0;
         } else if (app.scroll_back as usize) > total.saturating_sub(content_height) {
-            app.scroll_back = total.saturating_sub(content_height) as u16;
+            app.scroll_back = (total.saturating_sub(content_height)).min(u16::MAX as usize) as u16;
         }
 
         let end = total.saturating_sub(app.scroll_back as usize);
@@ -2131,7 +2136,10 @@ async fn main() -> Result<()> {
                             app.save_session();
                         }
                         StreamEvent::SubagentStart { agent_name, task_preview } => {
+                            let id = app.next_subagent_id;
+                            app.next_subagent_id += 1;
                             app.subagents.push(SubagentState {
+                                id,
                                 name: agent_name,
                                 status: format!("starting: {}", task_preview),
                                 start_time: std::time::Instant::now(),
@@ -2142,14 +2150,15 @@ async fn main() -> Result<()> {
                             app.line_cache.clear();
                         }
                         StreamEvent::SubagentUpdate { agent_name, status } => {
-                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.name == agent_name && !s.done) {
+                            // Find the last (most recent) non-done agent with this name
+                            if let Some(sa) = app.subagents.iter_mut().rev().find(|s| s.name == agent_name && !s.done) {
                                 sa.status = status;
                             }
                             app.dirty = true;
                             app.line_cache.clear();
                         }
                         StreamEvent::SubagentDone { agent_name, result_preview, duration_secs } => {
-                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.name == agent_name && !s.done) {
+                            if let Some(sa) = app.subagents.iter_mut().rev().find(|s| s.name == agent_name && !s.done) {
                                 sa.done = true;
                                 sa.duration_secs = Some(duration_secs);
                                 let preview: String = result_preview.chars().take(40).collect();

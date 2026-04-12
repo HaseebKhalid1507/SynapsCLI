@@ -351,21 +351,27 @@ impl Runtime {
                     // Collect results, preserving order by tool_id
                     let mut results_map = std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
-                        if let Ok((tool_id, result)) = res {
-                            results_map.insert(tool_id, result);
+                        match res {
+                            Ok((tool_id, result)) => {
+                                results_map.insert(tool_id, result);
+                            }
+                            Err(e) => {
+                                // Task panicked — log it but don't crash
+                                tracing::error!("Parallel tool task panicked: {}", e);
+                            }
                         }
                     }
                     
-                    // Build tool_results in original order
+                    // Build tool_results in original order — every tool_use MUST have a result
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            if let Some(result) = results_map.remove(tool_id) {
-                                tool_results.push(json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_id,
-                                    "content": Self::truncate_tool_result(&result)
-                                }));
-                            }
+                            let result = results_map.remove(tool_id)
+                                .unwrap_or_else(|| "Tool execution failed: task panicked".to_string());
+                            tool_results.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": Self::truncate_tool_result(&result)
+                            }));
                         }
                     }
                 }
@@ -638,9 +644,14 @@ impl Runtime {
                     // Collect results
                     let mut results_map = std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
-                        if let Ok((tool_id, was_cancelled, result)) = res {
-                            if was_cancelled { cancelled = true; }
-                            results_map.insert(tool_id, result);
+                        match res {
+                            Ok((tool_id, was_cancelled, result)) => {
+                                if was_cancelled { cancelled = true; }
+                                results_map.insert(tool_id, result);
+                            }
+                            Err(e) => {
+                                tracing::error!("Parallel tool task panicked: {}", e);
+                            }
                         }
                     }
 
