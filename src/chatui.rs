@@ -1675,18 +1675,25 @@ async fn main() -> Result<()> {
     synaps_cli::config::apply_config(&mut runtime, &config);
 
     // Load system prompt
-    let mut system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
 
-    // Load and inject skills into system prompt
-    let filter = config.skills.as_deref();
-    let skills = synaps_cli::skills::load_skills(filter);
-    if !skills.is_empty() {
-        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        eprintln!("\x1b[2m  📚 {} skills loaded: {}\x1b[0m", skills.len(), names.join(", "));
-        system_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&skills));
+    // Auto-load skills specified in config (injected into system prompt)
+    let mut final_prompt = system_prompt;
+    if let Some(ref skill_names) = config.skills {
+        let auto_skills = synaps_cli::skills::load_skills(Some(skill_names));
+        if !auto_skills.is_empty() {
+            let names: Vec<&str> = auto_skills.iter().map(|s| s.name.as_str()).collect();
+            eprintln!("\x1b[2m  📚 {} skills auto-loaded: {}\x1b[0m", auto_skills.len(), names.join(", "));
+            final_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&auto_skills));
+        }
     }
+    runtime.set_system_prompt(final_prompt);
 
-    runtime.set_system_prompt(system_prompt);
+    // Register load_skill tool for on-demand activation of any skill
+    let skill_count = synaps_cli::skills::setup_skill_tool(&runtime.tools_shared()).await;
+    if skill_count > 0 {
+        eprintln!("\x1b[2m  📚 {} skills available on demand (load_skill tool)\x1b[0m", skill_count);
+    }
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
     // Only registers the mcp_connect gateway tool — servers connect on demand.

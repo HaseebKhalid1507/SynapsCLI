@@ -148,3 +148,76 @@ pub fn parse_skills_config(val: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
+
+// ── On-Demand Skill Loading ─────────────────────────────────────────────
+
+use std::sync::Arc;
+use serde_json::json;
+
+/// A tool that loads skills on demand. Returns skill content as the tool result.
+/// The model reads the content and follows it for the rest of the conversation.
+pub struct LoadSkillTool {
+    skills: Vec<Skill>,
+}
+
+#[async_trait::async_trait]
+impl crate::Tool for LoadSkillTool {
+    fn name(&self) -> &str { "load_skill" }
+
+    fn description(&self) -> &str {
+        "Load a skill to guide your behavior for the current conversation. Skills provide structured guidelines, checklists, and best practices. Call this when a task would benefit from a specific methodology."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        let skill_list: Vec<String> = self.skills.iter()
+            .map(|s| format!("{} — {}", s.name, s.description))
+            .collect();
+        json!({
+            "type": "object",
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": format!("Name of the skill to load. Available:\n{}", skill_list.join("\n"))
+                }
+            },
+            "required": ["skill"]
+        })
+    }
+
+    async fn execute(&self, params: serde_json::Value, _ctx: crate::ToolContext) -> crate::Result<String> {
+        let skill_name = params["skill"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'skill' parameter".to_string()))?;
+
+        let skill = self.skills.iter()
+            .find(|s| s.name == skill_name)
+            .ok_or_else(|| {
+                let available: Vec<&str> = self.skills.iter().map(|s| s.name.as_str()).collect();
+                crate::RuntimeError::Tool(format!(
+                    "Unknown skill '{}'. Available: {}", skill_name, available.join(", ")
+                ))
+            })?;
+
+        Ok(format!(
+            "# Skill: {} — {}\n\nFollow these guidelines for the rest of this conversation.\n\n{}",
+            skill.name, skill.description, skill.content
+        ))
+    }
+}
+
+/// Register the load_skill tool with all available skills.
+/// Returns the number of available skills.
+pub async fn setup_skill_tool(registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>) -> usize {
+    let skills = load_skills(None);
+    if skills.is_empty() {
+        return 0;
+    }
+
+    let count = skills.len();
+    let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    tracing::info!(skills = ?names, "Skills available for on-demand loading");
+
+    let tool = LoadSkillTool { skills };
+    registry.write().await.register(Arc::new(tool));
+
+    count
+}
