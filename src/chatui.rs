@@ -247,6 +247,9 @@ struct App {
     input: String,
     cursor_pos: usize,
     scroll_back: u16,
+    /// When true, viewport stays pinned to the bottom (auto-scroll).
+    /// Set to false when user scrolls up, true when they scroll back to bottom.
+    scroll_pinned: bool,
     api_messages: Vec<Value>,
     streaming: bool,
     input_history: Vec<String>,
@@ -290,6 +293,7 @@ impl App {
             input: String::new(),
             cursor_pos: 0,
             scroll_back: 0,
+            scroll_pinned: true,
             api_messages: Vec::new(),
             streaming: false,
             input_history: Vec::new(),
@@ -361,6 +365,10 @@ impl App {
             msg,
             time: Local::now().format("%H:%M").to_string(),
         });
+        // Auto-scroll only when pinned to bottom
+        if self.scroll_pinned {
+            self.scroll_back = 0;
+        }
         self.dirty = true;
     }
 
@@ -1160,6 +1168,15 @@ fn draw(
 
         let all_lines = &app.line_cache;
         let total = all_lines.len();
+
+        // When pinned, always show the latest content (scroll_back = 0).
+        // When unpinned, hold position — but clamp so we don't over-scroll.
+        if app.scroll_pinned {
+            app.scroll_back = 0;
+        } else if (app.scroll_back as usize) > total.saturating_sub(content_height) {
+            app.scroll_back = total.saturating_sub(content_height) as u16;
+        }
+
         let end = total.saturating_sub(app.scroll_back as usize);
         let start = end.saturating_sub(content_height);
         let visible: Vec<Line> = all_lines[start..end].to_vec();
@@ -1712,6 +1729,7 @@ async fn main() -> Result<()> {
                                 app.input.clear();
                                 app.cursor_pos = 0;
                                 app.scroll_back = 0;
+                                app.scroll_pinned = true;
 
                                 if input.starts_with('/') {
                                     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
@@ -1994,9 +2012,13 @@ async fn main() -> Result<()> {
                             }
                             (KeyCode::Up, KeyModifiers::SHIFT) => {
                                 app.scroll_back = app.scroll_back.saturating_add(1);
+                                app.scroll_pinned = false;
                             }
                             (KeyCode::Down, KeyModifiers::SHIFT) => {
                                 app.scroll_back = app.scroll_back.saturating_sub(1);
+                                if app.scroll_back == 0 {
+                                    app.scroll_pinned = true;
+                                }
                             }
                             (KeyCode::Up, _) => {
                                 app.history_up();
@@ -2011,9 +2033,13 @@ async fn main() -> Result<()> {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {
                                 app.scroll_back = app.scroll_back.saturating_add(3);
+                                app.scroll_pinned = false;
                             }
                             MouseEventKind::ScrollDown => {
                                 app.scroll_back = app.scroll_back.saturating_sub(3);
+                                if app.scroll_back == 0 {
+                                    app.scroll_pinned = true;
+                                }
                             }
                             _ => {}
                         }
