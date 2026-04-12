@@ -972,9 +972,10 @@ fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>>
 }
 
 #[allow(unused_assignments)]
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
+    let text = raw_text.replace('\t', "    ");
     if width == 0 || text.chars().count() <= width {
-        return vec![text.to_string()];
+        return vec![text];
     }
 
     let mut lines = Vec::new();
