@@ -77,6 +77,7 @@ pub fn get_active_config_dir() -> PathBuf {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
+    pub skills: Option<Vec<String>>,
 }
 
 impl Default for SynapsConfig {
@@ -84,6 +85,7 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
+            skills: None,
         }
     }
 }
@@ -117,6 +119,7 @@ pub fn load_config() -> SynapsConfig {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => config.thinking_budget = parse_thinking_budget(val),
+            "skills" => config.skills = Some(crate::skills::parse_skills_config(val)),
             _ => {} // Unknown keys silently ignored
         }
     }

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod logging;
 pub mod config;
 pub mod mcp;
+pub mod skills;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};

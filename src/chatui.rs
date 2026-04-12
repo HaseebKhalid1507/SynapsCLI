@@ -1675,7 +1675,17 @@ async fn main() -> Result<()> {
     synaps_cli::config::apply_config(&mut runtime, &config);
 
     // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+    let mut system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+
+    // Load and inject skills into system prompt
+    let filter = config.skills.as_deref();
+    let skills = synaps_cli::skills::load_skills(filter);
+    if !skills.is_empty() {
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        eprintln!("\x1b[2m  📚 {} skills loaded: {}\x1b[0m", skills.len(), names.join(", "));
+        system_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&skills));
+    }
+
     runtime.set_system_prompt(system_prompt);
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
