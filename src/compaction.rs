@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
-use crate::{Runtime, Result, RuntimeError, StreamEvent};
+use serde_json::Value;
+use crate::{Result, RuntimeError};
 
 /// Compaction configuration — loaded from ~/.synaps-cli/config
 #[derive(Debug, Clone)]
@@ -132,27 +132,13 @@ STYLE:
 OUTPUT FORMAT:
 Respond with ONLY the summary text. No headers, no markers, no metadata. Just the dense summary paragraph(s)."#;
 
-/// Run compaction on old messages. Returns new message array with old turns replaced by summary.
-///
-/// Layout after compaction:
-/// [system_context_msg (summary of old turns)] + [recent_turns (kept intact)]
-pub async fn compact_messages(
+/// Summarize a slice of messages into a dense state summary.
+/// Returns the summary text. The caller is responsible for building the
+/// compacted message array — this function only does the LLM call.
+pub async fn summarize_messages(
     config: &CompactionConfig,
-    messages: &[Value],
-    tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
-) -> Result<Vec<Value>> {
-    let total = messages.len();
-    let keep = config.keep_recent.min(total);
-    let compact_end = total - keep;
-
-    if compact_end < 2 {
-        // Nothing meaningful to compact
-        return Ok(messages.to_vec());
-    }
-
-    let old_messages = &messages[..compact_end];
-    let recent_messages = &messages[compact_end..];
-
+    old_messages: &[Value],
+) -> Result<String> {
     // Build the conversation text to summarize
     let mut conversation_text = String::new();
     for msg in old_messages {
@@ -170,7 +156,6 @@ pub async fn compact_messages(
                     }
                     Some("thinking") => {
                         if let Some(text) = block["thinking"].as_str() {
-                            // Truncate thinking to avoid blowing up the summarization context
                             let preview: String = text.chars().take(500).collect();
                             conversation_text.push_str(&format!("  [thinking]: {}...\n", preview));
                         }
@@ -178,7 +163,6 @@ pub async fn compact_messages(
                     Some("tool_use") => {
                         let name = block["name"].as_str().unwrap_or("?");
                         let input = serde_json::to_string(&block["input"]).unwrap_or_default();
-                        // Truncate long tool inputs
                         let input_preview: String = input.chars().take(300).collect();
                         conversation_text.push_str(&format!("  [tool_use: {}] {}\n", name, input_preview));
                     }
@@ -195,60 +179,41 @@ pub async fn compact_messages(
         }
     }
 
-    let before_tokens = estimate_tokens(messages);
-    tracing::info!("Compaction: summarizing {} messages ({} est tokens), keeping {} recent",
-        compact_end, before_tokens, keep);
+    tracing::info!("Compaction: summarizing {} messages", old_messages.len());
 
-    // Call the summarization model
-    let mut summarizer = Runtime::new().await
-        .map_err(|e| RuntimeError::Tool(format!("Compaction: failed to create runtime: {}", e)))?;
-    summarizer.set_model(config.model.clone());
-    summarizer.set_thinking_budget(config.thinking_budget);
-    summarizer.set_system_prompt(COMPACTION_SYSTEM_PROMPT.to_string());
-    // Summarizer doesn't need tools
-    summarizer.set_tools(crate::ToolRegistry::without_subagent());
+    // Call the summarization model on a separate thread (same pattern as subagent)
+    let model = config.model.clone();
+    let thinking = config.thinking_budget;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
 
-    let prompt = format!(
-        "Summarize the following conversation segment. This is turns 1-{} of a longer session. \
-         Capture all state needed for an agent to continue the work.\n\n{}",
-        compact_end, conversation_text
-    );
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    let summary = summarizer.run_single(&prompt).await
-        .map_err(|e| RuntimeError::Tool(format!("Compaction: summarization failed: {}", e)))?;
+        let result = rt.block_on(async move {
+            let mut summarizer = crate::Runtime::new().await
+                .map_err(|e| format!("Compaction runtime: {}", e))?;
+            summarizer.set_model(model);
+            summarizer.set_thinking_budget(thinking);
+            summarizer.set_system_prompt(COMPACTION_SYSTEM_PROMPT.to_string());
+            summarizer.set_tools(crate::ToolRegistry::without_subagent());
 
-    // Build the compacted message array
-    let mut compacted = Vec::new();
+            let prompt = format!(
+                "Summarize the following conversation segment. Capture all state needed for an agent to continue.\n\n{}",
+                conversation_text
+            );
 
-    // Insert summary as a user message with clear framing
-    compacted.push(json!({
-        "role": "user",
-        "content": format!(
-            "[COMPACTED SESSION CONTEXT — turns 1-{}, summarized to save context space]\n\n{}\n\n[END COMPACTED CONTEXT]",
-            compact_end, summary
-        )
-    }));
-
-    // Placeholder assistant ack so message alternation is valid
-    compacted.push(json!({
-        "role": "assistant",
-        "content": "Understood. I have the full context from the compacted session history and will continue seamlessly."
-    }));
-
-    // Append recent messages intact
-    compacted.extend_from_slice(recent_messages);
-
-    let after_tokens = estimate_tokens(&compacted);
-    let saved = before_tokens.saturating_sub(after_tokens);
-    tracing::info!("Compaction complete: {} → {} est tokens (saved ~{})", before_tokens, after_tokens, saved);
-
-    // Notify TUI
-    if let Some(tx) = tx {
-        let _ = tx.send(StreamEvent::CompactionDone {
-            before_tokens,
-            after_tokens,
+            summarizer.run_single(&prompt).await.map_err(|e| e.to_string())
         });
-    }
 
-    Ok(compacted)
+        let _ = result_tx.send(result);
+    });
+
+    match result_rx.await {
+        Ok(Ok(summary)) => Ok(summary),
+        Ok(Err(e)) => Err(RuntimeError::Tool(format!("Compaction summarization failed: {}", e))),
+        Err(_) => Err(RuntimeError::Tool("Compaction task panicked".to_string())),
+    }
 }

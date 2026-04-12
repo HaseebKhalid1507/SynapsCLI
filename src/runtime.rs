@@ -462,11 +462,14 @@ impl Runtime {
         compaction_config: Option<crate::compaction::CompactionConfig>,
     ) -> Result<()> {
         let mut messages = initial_messages;
+        // Cached compaction: (num_messages_compacted, summary_text)
+        // Avoids re-summarizing on every API call.
+        let mut compaction_cache: Option<(usize, String)> = None;
 
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
-                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                let _ = tx.send(StreamEvent::MessageHistory(messages.clone()));
                 return Ok(());
             }
 
@@ -504,9 +507,64 @@ impl Runtime {
                 }
             }
 
+            // Build the API-visible messages: apply compaction as a view if needed.
+            // Full history (`messages`) is never mutated by compaction.
+            let api_messages = if let Some(ref cc) = compaction_config {
+                if crate::compaction::should_compact(cc, &messages) {
+                    // Check if we need to re-summarize (more messages than cache covers)
+                    let keep = cc.keep_recent.min(messages.len());
+                    let compact_end = messages.len() - keep;
+
+                    let needs_resummarize = match &compaction_cache {
+                        Some((cached_count, _)) => compact_end > *cached_count,
+                        None => true,
+                    };
+
+                    if needs_resummarize {
+                        tracing::info!("Compacting {} messages (keeping {} recent)", compact_end, keep);
+                        match crate::compaction::summarize_messages(cc, &messages[..compact_end]).await {
+                            Ok(summary) => {
+                                let _ = tx.send(StreamEvent::CompactionDone {
+                                    before_tokens: crate::compaction::estimate_tokens(&messages),
+                                    after_tokens: crate::compaction::estimate_tokens(&messages[compact_end..]) + summary.len() / 4,
+                                });
+                                compaction_cache = Some((compact_end, summary));
+                            }
+                            Err(e) => {
+                                tracing::error!("Compaction failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Build compacted view from cache
+                    if let Some((cached_count, ref summary)) = compaction_cache {
+                        let mut view = Vec::new();
+                        view.push(json!({
+                            "role": "user",
+                            "content": format!(
+                                "[COMPACTED SESSION CONTEXT — turns 1-{}, summarized]\n\n{}\n\n[END COMPACTED CONTEXT]",
+                                cached_count, summary
+                            )
+                        }));
+                        view.push(json!({
+                            "role": "assistant",
+                            "content": "Understood. I have the compacted context and will continue seamlessly."
+                        }));
+                        view.extend_from_slice(&messages[cached_count..]);
+                        view
+                    } else {
+                        messages.clone()
+                    }
+                } else {
+                    messages.clone()
+                }
+            } else {
+                messages.clone()
+            };
+
             let response = match Self::call_api_stream_inner(
                 &auth, &client, &model, &tools, &system_prompt, thinking_budget,
-                &messages, tx.clone(), &cancel,
+                &api_messages, tx.clone(), &cancel,
             ).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -718,22 +776,6 @@ impl Runtime {
                 // These get injected as user messages before the next LLM call,
                 // allowing the user to redirect the agent mid-work.
                 Self::drain_steering(&mut steering_rx, &mut messages, &tx);
-
-                // Check if compaction is needed before next API call
-                if let Some(ref cc) = compaction_config {
-                    if crate::compaction::should_compact(cc, &messages) {
-                        tracing::info!("Compaction triggered at {} est tokens", crate::compaction::estimate_tokens(&messages));
-                        match crate::compaction::compact_messages(cc, &messages, Some(&tx)).await {
-                            Ok(compacted) => {
-                                messages = compacted;
-                            }
-                            Err(e) => {
-                                tracing::error!("Compaction failed: {}", e);
-                                // Continue without compaction — don't break the session
-                            }
-                        }
-                    }
-                }
 
                 // Continue the loop to get Claude's response with tool results
             } else {
