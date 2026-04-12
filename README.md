@@ -25,6 +25,8 @@ A terminal-native AI agent runtime built in Rust. Streams responses with extende
 - **Markdown rendering** — Headers, code blocks (syntax highlighted), tables, lists, blockquotes
 - **Smart scroll** — Viewport stays stationary when scrolled up during streaming; auto-scrolls at bottom
 - **Abort context** — Escape saves partial work; next message gets context of what was interrupted
+- **Steering** — Type and send messages while the agent is streaming; injected between tool rounds (pi-style)
+- **Message queue** — If steering can't deliver (no tool calls), message auto-fires when response finishes
 - **Tool elapsed time** — Every tool result shows execution duration
 - **Subagent panel** — Animated braille spinner, per-agent status, elapsed timers, running/done counts
 - **Boot/exit animations** — CRT-style effects via tachyonfx
@@ -166,6 +168,8 @@ src/
 **Smart scroll:** Viewport tracking via `scroll_pinned` flag + `last_line_count` delta compensation. When user scrolls up, `scroll_back` increases by content growth each frame so the viewport stays stationary.
 
 **Abort context:** On Escape, all partial output (thinking, text, tool calls, results) since the last user message is captured and injected into the next API call. The model sees what it was doing before the interrupt. Cache-safe — only the new user message is affected.
+
+**Steering:** Messages typed during streaming are injected between tool execution rounds via an unbounded channel. The runtime's `drain_steering()` checks the channel after every tool batch and before every API call. If the response has no tool calls, messages fall back to a queue that auto-fires on completion. Mirrors pi's `steer` / `followUp` two-tier system.
 
 ## Configuration
 
