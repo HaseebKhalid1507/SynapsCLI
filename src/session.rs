@@ -67,7 +67,7 @@ impl Session {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let dir = sessions_dir();
+        let dir = crate::config::resolve_write_path("sessions");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", self.id));
         let json = serde_json::to_string(self)
@@ -186,6 +186,5 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
 }
 
 fn sessions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(SESSIONS_DIR)
+    crate::config::get_active_config_dir().join("sessions")
 }
