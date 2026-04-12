@@ -279,6 +279,8 @@ struct App {
     tool_start_time: Option<std::time::Instant>,
     /// Saved context from an aborted response — injected into the next user message
     abort_context: Option<String>,
+    /// Message queued while streaming — auto-sent when current response finishes
+    queued_message: Option<String>,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
 }
@@ -328,6 +330,7 @@ impl App {
             next_subagent_id: 0,
             tool_start_time: None,
             abort_context: None,
+            queued_message: None,
             spinner_frame: 0,
         }
     }
@@ -1801,6 +1804,10 @@ async fn main() -> Result<()> {
                                 }
                                 // Capture partial work before clearing state
                                 app.capture_abort_context();
+                                // Clear queued message — user can retype or use input history
+                                if let Some(ref q) = app.queued_message.take() {
+                                    app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
+                                }
                                 stream = None;
                                 cancel_token = None;
                                 app.streaming = false;
@@ -2020,6 +2027,17 @@ async fn main() -> Result<()> {
                                     cancel_token = Some(ct);
                                     app.streaming = true;
                                 }
+                            }
+                            (KeyCode::Enter, _) if app.streaming && !app.input.is_empty() => {
+                                // Queue message to send after current stream finishes
+                                let input = app.input.clone();
+                                app.input_history.push(input.clone());
+                                app.history_index = None;
+                                app.input_stash.clear();
+                                app.input.clear();
+                                app.cursor_pos = 0;
+                                app.queued_message = Some(input.clone());
+                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
@@ -2291,6 +2309,26 @@ async fn main() -> Result<()> {
                             app.subagents.clear();
                             stream = None;
                             cancel_token = None;
+
+                            // Auto-send queued message if one was typed during streaming
+                            if let Some(queued) = app.queued_message.take() {
+                                app.push_msg(ChatMessage::User(queued.clone()));
+                                app.scroll_back = 0;
+                                app.scroll_pinned = true;
+
+                                let api_content = if let Some(ref ctx) = app.abort_context {
+                                    let combined = format!("{}\n\n{}", ctx, queued);
+                                    app.abort_context = None;
+                                    combined
+                                } else {
+                                    queued
+                                };
+                                app.api_messages.push(json!({"role": "user", "content": api_content}));
+                                let ct = CancellationToken::new();
+                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()).await);
+                                cancel_token = Some(ct);
+                                app.streaming = true;
+                            }
                         }
                         StreamEvent::Error(err) => {
                             app.push_msg(ChatMessage::Error(err));
