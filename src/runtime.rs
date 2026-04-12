@@ -544,6 +544,7 @@ impl Runtime {
             ("x-api-key", auth_token.clone())
         };
         
+        tracing::debug!("Dispatching streaming API request to Anthropic...");
         let mut request = client
             .post("https://api.anthropic.com/v1/messages")
             .header(auth_header.0, auth_header.1)
@@ -600,6 +601,7 @@ impl Runtime {
             ]);
         }
 
+        tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
         let response = request.json(&body).send().await?;
 
         if !response.status().is_success() {
@@ -759,6 +761,7 @@ impl Runtime {
                             let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                             let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                 let _ = tx.send(StreamEvent::Usage {
                                     input_tokens: input_t,
                                     output_tokens: output_t,
@@ -776,6 +779,7 @@ impl Runtime {
                                 let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                                 let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                     let _ = tx.send(StreamEvent::Usage {
                                         input_tokens: input_t,
                                         output_tokens: output_t,
