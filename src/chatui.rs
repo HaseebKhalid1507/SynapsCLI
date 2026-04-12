@@ -251,6 +251,8 @@ struct App {
     cache_width: usize,
     dirty: bool,
     show_full_output: bool,
+    logo_dismiss_t: Option<f64>,
+    logo_build_t: Option<f64>,
 }
 
 impl App {
@@ -277,6 +279,8 @@ impl App {
             cache_width: 0,
             dirty: true,
             show_full_output: false,
+            logo_dismiss_t: None,
+            logo_build_t: Some(0.0),
         }
     }
 
@@ -1119,8 +1123,9 @@ fn draw(
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
 
-        // Empty state: SYNAPS with subtle breathing aura
-        if app.messages.is_empty() && visible.is_empty() {
+        // Empty state: SYNAPS with CRT dismiss animation
+        let show_logo = app.messages.is_empty() || app.logo_dismiss_t.is_some();
+        if show_logo && visible.is_empty() {
             let ascii_art: Vec<&str> = vec![
                 r" ███████ ██    ██ ███    ██  █████  ██████  ███████",
                 r" ██       ██  ██  ████   ██ ██   ██ ██   ██ ██    ",
@@ -1142,41 +1147,102 @@ fn draw(
             let total_block = art_height + 3;
 
             if avail_h >= total_block && avail_w >= max_art_width + 2 {
-                let start_y = msg_area.y + (msg_area.height.saturating_sub(total_block as u16)) / 2;
+                let center_y = msg_area.y + msg_area.height / 2;
+                let dismiss_t = app.logo_dismiss_t.unwrap_or(0.0);
 
-                // Slow breathing pulse
+                // Time for breathing (only when not dismissing)
                 let t = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                let breathe = ((t % 5000) as f64 / 5000.0 * std::f64::consts::PI * 2.0).sin();
 
-                // Subtle cyan aura — breathes between dim and bright
-                let g = (100.0 + 50.0 * breathe) as u8;
-                let b = (160.0 + 60.0 * breathe) as u8;
-                let art_style = Style::default().fg(Color::Rgb(30, g, b)).add_modifier(Modifier::BOLD);
+                if dismiss_t < 0.001 {
+                    // Normal state / Boot-in
+                    let breathe = ((t % 5000) as f64 / 5000.0 * std::f64::consts::PI * 2.0).sin();
+                    let g = (100.0 + 50.0 * breathe) as u8;
+                    let b = (160.0 + 60.0 * breathe) as u8;
+                    let art_style = Style::default().fg(Color::Rgb(30, g, b)).add_modifier(Modifier::BOLD);
+                    let sub_style = Style::default().fg(Color::Rgb(15, g / 2, b / 2));
 
-                // Even dimmer subtitle
-                let sub_style = Style::default().fg(Color::Rgb(15, g / 2, b / 2));
+                    let build_t = app.logo_build_t.unwrap_or(1.0);
+                    let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
-                // Render art lines
-                for (j, line) in ascii_art.iter().enumerate() {
-                    let char_w = art_char_widths[j];
-                    let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
-                    let y = start_y + j as u16;
-                    if y >= msg_area.y && y < msg_area.y + msg_area.height {
-                        let clamped_w = char_w.min(avail_w);
-                        let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
-                        frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                    for (j, line) in ascii_art.iter().enumerate() {
+                        let char_w = art_char_widths[j];
+                        let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
+                        let y = start_y + j as u16;
+                        if y >= msg_area.y && y < msg_area.y + msg_area.height {
+                            let clamped_w = char_w.min(avail_w);
+
+                            if build_t >= 1.0 {
+                                let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
+                                frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                            } else {
+                                // Diagonal assemby: Bottom-Right to Top-Left
+                                let mut built = String::with_capacity(clamped_w);
+                                let build_chars: &[char] = &['░', '▒', '▓'];
+                                for (ci, ch) in line.chars().take(clamped_w).enumerate() {
+                                    let inv_row = (art_height - 1 - j) as f64;
+                                    let inv_col = (max_art_width.saturating_sub(ci + 1)) as f64;
+                                    let diag = (inv_row + inv_col) / (art_height as f64 + max_art_width as f64);
+                                    
+                                    if build_t >= diag {
+                                        let lp = ((build_t - diag) / 0.15).min(1.0);
+                                        if lp < 1.0 && ch != ' ' {
+                                            built.push(build_chars[(lp * build_chars.len() as f64) as usize]);
+                                        } else { built.push(ch); }
+                                    } else { built.push(' '); }
+                                }
+                                let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
+                                frame.render_widget(Paragraph::new(Span::styled(built, art_style)), area);
+                            }
+                        }
                     }
-                }
 
-                // Subtitle
-                let sub_y = start_y + art_height as u16 + 1;
-                if sub_y >= msg_area.y && sub_y < msg_area.y + msg_area.height && avail_w >= sub_width {
-                    let sub_x = msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
-                    let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_width as u16, height: 1 };
-                    frame.render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
+                    if build_t >= 1.0 {
+                        let sub_y = start_y + art_height as u16 + 1;
+                        if sub_y >= msg_area.y && sub_y < msg_area.y + msg_area.height && avail_w >= sub_width {
+                            let sub_x = msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
+                            let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_width as u16, height: 1 };
+                            frame.render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
+                        }
+                    }
+                } else {
+                    // Clean Dismiss: Top-Left to Bottom-Right (reverse of build-in)
+                    let art_style = Style::default().fg(Color::Rgb(30, 80, 120)).add_modifier(Modifier::BOLD);
+                    let start_y = center_y.saturating_sub((total_block as u16) / 2);
+
+                    for (j, line) in ascii_art.iter().enumerate() {
+                        let char_w = art_char_widths[j];
+                        let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
+                        let y = start_y + j as u16;
+                        
+                        if y >= msg_area.y && y < msg_area.y + msg_area.height {
+                            let clamped_w = char_w.min(avail_w);
+                            let mut dis = String::with_capacity(clamped_w);
+                            let dis_chars: &[char] = &['▓', '▒', '░'];
+
+                            for (ci, ch) in line.chars().take(clamped_w).enumerate() {
+                                // Diagonal dismantling: Top-Left to Bottom-Right
+                                let row = j as f64;
+                                let col = ci as f64;
+                                let diag = (row + col) / (art_height as f64 + max_art_width as f64);
+                                
+                                // dismiss_t goes 0 -> 1. 1.0 - diag is when it starts dismantled.
+                                let threshold = diag; 
+                                if dismiss_t < (1.0 - threshold) {
+                                    // Still visible, but check if starting to fade
+                                    let rem = (1.0 - threshold) - dismiss_t;
+                                    if rem < 0.15 && ch != ' ' {
+                                        let idx = ((1.0 - rem/0.15) * dis_chars.len() as f64) as usize;
+                                        dis.push(dis_chars[idx.min(dis_chars.len()-1)]);
+                                    } else { dis.push(ch); }
+                                } else { dis.push(' '); }
+                            }
+                            let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
+                            frame.render_widget(Paragraph::new(Span::styled(dis, art_style)), area);
+                        }
+                    }
                 }
             }
         }
@@ -1464,7 +1530,21 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             // Tick: redraws during animations AND during streaming (~60fps throttle)
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() => {
+                // Progress logo build-in animation
+                if let Some(ref mut t) = app.logo_build_t {
+                    *t += 0.025; // ~40 frames = ~0.66s
+                    if *t >= 1.0 {
+                        app.logo_build_t = None;
+                    }
+                }
+                // Progress logo dismiss animation
+                if let Some(ref mut t) = app.logo_dismiss_t {
+                    *t += 0.04; // ~25 frames at 60fps = ~0.4s
+                    if *t >= 1.0 {
+                        app.logo_dismiss_t = None;
+                    }
+                }
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
                 }
@@ -1487,6 +1567,10 @@ async fn main() -> Result<()> {
                                 app.push_msg(ChatMessage::Error("aborted".to_string()));
                             }
                             (KeyCode::Enter, _) if !app.streaming && !app.input.is_empty() => {
+                                // Trigger CRT dismiss if this is the first message
+                                if app.messages.is_empty() {
+                                    app.logo_dismiss_t = Some(0.001);
+                                }
                                 let input = app.input.clone();
                                 app.input_history.push(input.clone());
                                 app.history_index = None;
