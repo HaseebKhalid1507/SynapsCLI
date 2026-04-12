@@ -1666,6 +1666,12 @@ async fn main() -> Result<()> {
     let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
     runtime.set_system_prompt(system_prompt);
 
+    // Connect to MCP servers (if configured in ~/.synaps-cli/mcp.json)
+    let mcp_tool_count = synaps_cli::mcp::connect_mcp_servers(runtime.tools_mut()).await;
+    if mcp_tool_count > 0 {
+        eprintln!("\x1b[2m  ⚡ {} MCP tools loaded\x1b[0m", mcp_tool_count);
+    }
+
     // Keep reference to system prompt path for save functionality
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
 
