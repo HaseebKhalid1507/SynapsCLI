@@ -1751,6 +1751,7 @@ async fn main() -> Result<()> {
     let mut event_reader = EventStream::new();
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let mut cancel_token: Option<CancellationToken> = None;
+    let mut steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
     let mut boot_fx: Option<Effect> = Some(boot_effect());
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
@@ -1810,6 +1811,7 @@ async fn main() -> Result<()> {
                                 }
                                 stream = None;
                                 cancel_token = None;
+                                steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
                                 let abort_msg = if app.abort_context.is_some() {
@@ -2023,21 +2025,35 @@ async fn main() -> Result<()> {
                                     };
                                     app.api_messages.push(json!({"role": "user", "content": api_content}));
                                     let ct = CancellationToken::new();
-                                    stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()).await);
+                                    let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                    stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                     cancel_token = Some(ct);
+                                    steer_tx = Some(s_tx);
                                     app.streaming = true;
                                 }
                             }
                             (KeyCode::Enter, _) if app.streaming && !app.input.is_empty() => {
-                                // Queue message to send after current stream finishes
                                 let input = app.input.clone();
                                 app.input_history.push(input.clone());
                                 app.history_index = None;
                                 app.input_stash.clear();
                                 app.input.clear();
                                 app.cursor_pos = 0;
-                                app.queued_message = Some(input.clone());
-                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+
+                                // Try steering first (injects between tool rounds)
+                                // Fall back to queue (sends after stream finishes)
+                                if let Some(ref tx) = steer_tx {
+                                    if tx.send(input.clone()).is_ok() {
+                                        app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                    } else {
+                                        // Channel closed — fall back to queue
+                                        app.queued_message = Some(input.clone());
+                                        app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                    }
+                                } else {
+                                    app.queued_message = Some(input.clone());
+                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                }
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
@@ -2187,6 +2203,7 @@ async fn main() -> Result<()> {
                         | StreamEvent::SubagentStart { .. }
                         | StreamEvent::SubagentUpdate { .. }
                         | StreamEvent::SubagentDone { .. }
+                        | StreamEvent::SteeringDelivered { .. }
                         | StreamEvent::Done
                         | StreamEvent::Error(_)
                     );
@@ -2287,6 +2304,16 @@ async fn main() -> Result<()> {
                             app.dirty = true;
                             app.line_cache.clear();
                         }
+                        StreamEvent::SteeringDelivered { message } => {
+                            // The runtime injected this as a user message into the conversation.
+                            // Show it in the TUI and keep api_messages in sync for session save.
+                            app.push_msg(ChatMessage::User(message.clone()));
+                            // Note: api_messages will be synced via MessageHistory at stream end
+                            app.scroll_back = 0;
+                            app.scroll_pinned = true;
+                            app.dirty = true;
+                            app.line_cache.clear();
+                        }
                         StreamEvent::Usage {
                             input_tokens,
                             output_tokens,
@@ -2309,6 +2336,7 @@ async fn main() -> Result<()> {
                             app.subagents.clear();
                             stream = None;
                             cancel_token = None;
+                            steer_tx = None;
 
                             // Auto-send queued message if one was typed during streaming
                             if let Some(queued) = app.queued_message.take() {
@@ -2325,8 +2353,10 @@ async fn main() -> Result<()> {
                                 };
                                 app.api_messages.push(json!({"role": "user", "content": api_content}));
                                 let ct = CancellationToken::new();
-                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone()).await);
+                                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                 cancel_token = Some(ct);
+                                steer_tx = Some(s_tx);
                                 app.streaming = true;
                             }
                         }
@@ -2336,6 +2366,7 @@ async fn main() -> Result<()> {
                             app.subagents.clear();
                             stream = None;
                             cancel_token = None;
+                            steer_tx = None;
                             // Restore a valid trailing state. The runtime guarantees that
                             // each tool_use has a matching tool_result, so we only need to
                             // drop an unmatched trailing assistant message or a trailing
