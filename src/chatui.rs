@@ -345,7 +345,9 @@ impl App {
         self.session.session_cost = self.session_cost;
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
-        let _ = self.session.save();
+        if let Err(e) = self.session.save() {
+            eprintln!("\x1b[31m[ERROR] Failed to save session: {}\x1b[0m", e);
+        }
     }
 
     fn add_usage(

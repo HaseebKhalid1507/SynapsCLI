@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use serde::{Deserialize};
 
 use std::sync::Arc;
+use std::time::Duration;
 use crate::{Result, RuntimeError, ToolRegistry};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -101,8 +102,14 @@ impl Runtime {
     pub async fn new() -> Result<Self> {
         let (auth_token, auth_type, refresh_token, token_expires) = Self::get_auth_token()?;
 
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| RuntimeError::Tool(format!("Failed to build HTTP client: {}", e)))?;
+
         Ok(Runtime {
-            client: Client::new(),
+            client,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
                 auth_type,
