@@ -637,20 +637,22 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
     if let Some(ref tx) = tx_events {
         let _ = tx.send(crate::StreamEvent::SubagentStart {
             agent_name: label.clone(),
-            task_preview,
+            task_preview: task_preview.clone(),
         });
     }
 
     let start_time = std::time::Instant::now();
 
-    // Spawn on a dedicated thread with its own tokio runtime.
-    // run_stream futures aren't Send due to recursive async,
-    // so we isolate on a single-threaded runtime.
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    // Channels for results and token usage
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
     let label_inner = label.clone();
     let tx_events_inner = tx_events.clone();
 
-    std::thread::spawn(move || {
+    // Shutdown signal — when this sender is dropped (parent cancelled/abort),
+    // the receiver in the subagent thread sees it and cancels the stream.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let thread_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -668,10 +670,22 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
             runtime.set_model(model);
 
             let cancel = crate::CancellationToken::new();
+            let cancel_inner = cancel.clone();
+
+            // Watch for parent shutdown signal — cancel the stream if parent drops us
+            tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+                cancel_inner.cancel();
+            });
+
             let mut stream = runtime.run_stream(task, cancel).await;
 
             let mut final_text = String::new();
             let mut tool_count = 0u32;
+            let mut total_input_tokens = 0u64;
+            let mut total_output_tokens = 0u64;
+            let mut total_cache_read = 0u64;
+            let mut total_cache_creation = 0u64;
 
             let timeout_fut = tokio::time::sleep(Duration::from_secs(300));
             tokio::pin!(timeout_fut);
@@ -717,6 +731,15 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                                     });
                                 }
                             }
+                            crate::StreamEvent::Usage {
+                                input_tokens, output_tokens,
+                                cache_read_input_tokens, cache_creation_input_tokens,
+                            } => {
+                                total_input_tokens += input_tokens;
+                                total_output_tokens += output_tokens;
+                                total_cache_read += cache_read_input_tokens;
+                                total_cache_creation += cache_creation_input_tokens;
+                            }
                             crate::StreamEvent::Error(e) => {
                                 return Err(e);
                             }
@@ -730,7 +753,14 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                 }
             }
 
-            Ok(final_text)
+            Ok(SubagentResult {
+                text: final_text,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+                cache_read: total_cache_read,
+                cache_creation: total_cache_creation,
+                tool_count,
+            })
         });
 
         let _ = result_tx.send(result);
@@ -739,17 +769,47 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
     let result = result_rx.await;
     let elapsed = start_time.elapsed().as_secs_f64();
 
+    // Drop shutdown_tx — if the subagent is still running, this signals it to cancel.
+    // (If it already finished, this is a no-op.)
+    drop(shutdown_tx);
+
+    // Log subagent result
+    let log_dir = crate::config::base_dir().join("logs").join("subagents");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+
     match result {
-        Ok(Ok(response)) => {
-            let preview: String = response.chars().take(120).collect();
+        Ok(Ok(sa_result)) => {
+            let preview: String = sa_result.text.chars().take(120).collect();
+
+            // Forward token usage to parent session
             if let Some(ref tx) = tx_events {
+                let _ = tx.send(crate::StreamEvent::Usage {
+                    input_tokens: sa_result.input_tokens,
+                    output_tokens: sa_result.output_tokens,
+                    cache_read_input_tokens: sa_result.cache_read,
+                    cache_creation_input_tokens: sa_result.cache_creation,
+                });
                 let _ = tx.send(crate::StreamEvent::SubagentDone {
                     agent_name: label.clone(),
                     result_preview: preview,
                     duration_secs: elapsed,
                 });
             }
-            Ok(format!("[subagent:{}] {}", label, response))
+
+            // Write log
+            let log_content = format!(
+                "# Subagent: {}\nDate: {}\nModel: {}\nTask: {}\nDuration: {:.1}s\nTokens: {}in/{}out ({}cr/{}cw)\nTools used: {}\n\n## Result\n\n{}\n",
+                label, timestamp, params["model"].as_str().unwrap_or("sonnet"),
+                task_preview, elapsed,
+                sa_result.input_tokens, sa_result.output_tokens,
+                sa_result.cache_read, sa_result.cache_creation,
+                sa_result.tool_count, sa_result.text,
+            );
+            let log_path = log_dir.join(format!("{}-{}.md", timestamp, label));
+            let _ = std::fs::write(&log_path, &log_content);
+
+            Ok(format!("[subagent:{}] {}", label, sa_result.text))
         }
         Ok(Err(e)) => {
             if let Some(ref tx) = tx_events {
@@ -759,6 +819,8 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                     duration_secs: elapsed,
                 });
             }
+            let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
+            let _ = std::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e));
             Ok(format!("[subagent:{} ERROR] {}", label, e))
         }
         Err(_) => {
@@ -769,7 +831,18 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                     duration_secs: elapsed,
                 });
             }
+            // Signal the thread to stop (in case it's still alive)
+            drop(thread_handle);
             Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
         }
     }
+}
+
+struct SubagentResult {
+    text: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    tool_count: u32,
 }
