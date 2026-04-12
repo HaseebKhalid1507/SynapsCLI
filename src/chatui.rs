@@ -1839,7 +1839,7 @@ async fn main() -> Result<()> {
                                 app.input.drain(pos..app.cursor_pos);
                                 app.cursor_pos = pos;
                             }
-                            (KeyCode::Char('O'), KeyModifiers::SHIFT) => {
+                            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                                 app.show_full_output = !app.show_full_output;
                                 app.dirty = true;
                                 app.line_cache.clear();
