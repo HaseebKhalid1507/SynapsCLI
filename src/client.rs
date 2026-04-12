@@ -143,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
                                         "ls"    => "≡",
                                         _       => "→",
                                     };
-                                    eprint!("  {} {} (streaming args...)\r", icon, tool_name);
+                                    eprint!("\x1b[38;2;100;180;220m  {} {}\x1b[0m ", icon, tool_name);
+                                    std::io::stderr().flush().unwrap();
+                                }
+                                ServerMessage::ToolUseDelta(delta) => {
+                                    eprint!("\x1b[38;2;80;110;140m{}\x1b[0m", delta);
                                     std::io::stderr().flush().unwrap();
                                 }
                                 ServerMessage::ToolUse { tool_name, input, .. } => {

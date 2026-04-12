@@ -378,6 +378,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
             StreamEvent::ToolUseStart(tool_name) => {
                 let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
             }
+            StreamEvent::ToolUseDelta(delta) => {
+                let _ = broadcast.send(ServerMessage::ToolUseDelta(delta));
+            }
             StreamEvent::ToolUse { tool_name, tool_id, input } => {
                 let _ = broadcast.send(ServerMessage::ToolUse {
                     tool_name: tool_name.clone(),

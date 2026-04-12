@@ -42,6 +42,10 @@ pub enum ServerMessage {
     #[serde(rename = "tool_use_start")]
     ToolUseStart { tool_name: String },
 
+    /// Streaming chunk of the tool's JSON arguments
+    #[serde(rename = "tool_use_delta")]
+    ToolUseDelta(String),
+
     /// A tool was invoked (JSON finished)
     #[serde(rename = "tool_use")]
     ToolUse {

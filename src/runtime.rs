@@ -32,6 +32,7 @@ pub enum StreamEvent {
     Thinking(String),
     Text(String),
     ToolUseStart(String),
+    ToolUseDelta(String),
     ToolUse {
         tool_name: String,
         tool_id: String,
@@ -725,6 +726,7 @@ impl Runtime {
                                 Some("input_json_delta") => {
                                     if let Some(json_chunk) = delta["partial_json"].as_str() {
                                         current_tool_input_json.push_str(json_chunk);
+                                        let _ = tx.send(StreamEvent::ToolUseDelta(json_chunk.to_string()));
                                     }
                                 }
                                 _ => {}

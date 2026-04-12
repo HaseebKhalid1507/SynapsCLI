@@ -63,11 +63,15 @@ async fn main() -> Result<()> {
                         print!("\n");
                         in_thinking = false;
                     }
-                    print!("⚙️  Using tool: {} (streaming args...)\r", tool_name);
+                    print!("⚙️  Using tool: {} (args: ", tool_name);
+                    io::stdout().flush().unwrap();
+                }
+                StreamEvent::ToolUseDelta(delta) => {
+                    print!("{}", delta);
                     io::stdout().flush().unwrap();
                 }
                 StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
-                    print!("                                                                                          \r");
+                    print!(")                                                                                          \r");
                     if in_thinking {
                         print!("\n");
                         in_thinking = false;

@@ -217,7 +217,7 @@ enum ChatMessage {
     User(String),
     Thinking(String),
     Text(String),
-    ToolUseStart(String),
+    ToolUseStart(String, String),  // (tool_name, partial_input)
     ToolUse { tool_name: String, input: String },
     ToolResult(String),
     Error(String),
@@ -470,7 +470,7 @@ impl App {
                     }
                 }
 
-                ChatMessage::ToolUseStart(tool_name) => {
+                ChatMessage::ToolUseStart(tool_name, partial_input) => {
                     let icon = match tool_name.as_str() {
                         "bash"  => "\u{276f}",
                         "read"  => "\u{25b8}",
@@ -486,6 +486,19 @@ impl App {
                         Span::styled(tool_name.clone(), Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
                         Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)),
                     ]));
+                    // Show accumulated partial input if any
+                    if !partial_input.is_empty() {
+                        let param_style = Style::default().fg(THEME.tool_param);
+                        let preview: String = if partial_input.len() > 200 {
+                            let tail: String = partial_input.chars().rev().take(200).collect::<String>().chars().rev().collect();
+                            format!("\u{2026}{}", tail)
+                        } else {
+                            partial_input.clone()
+                        };
+                        for wline in wrap_text(&format!("{}     {}", m, preview), width) {
+                            lines.push(Line::from(Span::styled(wline, param_style)));
+                        }
+                    }
                 }
 
                 ChatMessage::ToolUse { tool_name, input } => {
@@ -1742,12 +1755,22 @@ async fn main() -> Result<()> {
                             app.append_or_update_text(&text);
                         }
                         StreamEvent::ToolUseStart(name) => {
-                            app.push_msg(ChatMessage::ToolUseStart(name));
+                            app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
+                        }
+                        StreamEvent::ToolUseDelta(delta) => {
+                            if let Some(last) = app.messages.last_mut() {
+                                if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
+                                    partial.push_str(&delta);
+                                    app.dirty = true;
+                                    app.line_cache.clear();
+                                    continue;
+                                }
+                            }
                         }
                         StreamEvent::ToolUse { tool_name, input, .. } => {
                             let input_str = serde_json::to_string(&input).unwrap_or_default();
                             if let Some(last) = app.messages.last_mut() {
-                                if let ChatMessage::ToolUseStart(name) = &last.msg {
+                                if let ChatMessage::ToolUseStart(name, _) = &last.msg {
                                     if name == &tool_name {
                                         last.msg = ChatMessage::ToolUse { tool_name, input: input_str };
                                         app.dirty = true;
