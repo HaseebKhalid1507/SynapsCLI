@@ -250,6 +250,7 @@ struct App {
     line_cache: Vec<Line<'static>>,
     cache_width: usize,
     dirty: bool,
+    show_full_output: bool,
 }
 
 impl App {
@@ -275,6 +276,7 @@ impl App {
             line_cache: Vec::new(),
             cache_width: 0,
             dirty: true,
+            show_full_output: false,
         }
     }
 
@@ -549,8 +551,12 @@ impl App {
                     };
 
                     let result_lines: Vec<&str> = result.lines().collect();
-                    let max_show = if result_lines.len() > 30 { 15 } else { 12 };
-                    let show = result_lines.len().min(max_show);
+                    let show = if self.show_full_output {
+                        result_lines.len()
+                    } else {
+                        let max_show = if result_lines.len() > 30 { 15 } else { 12 };
+                        result_lines.len().min(max_show)
+                    };
 
                     // Success/fail indicator
                     if !is_error && show > 0 {
@@ -1109,9 +1115,54 @@ fn draw(
             .border_type(BorderType::Plain)
             .border_style(Style::default().fg(THEME.border))
             .padding(Padding::horizontal(1));
-        let messages_widget = Paragraph::new(visible).block(msg_block);
+        let messages_widget = Paragraph::new(visible.clone()).block(msg_block);
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
+
+        // Empty state: ASCII art SYNAPS
+        if app.messages.is_empty() && visible.is_empty() {
+            let ascii_art = vec![
+                r"  ███████╗██╗   ██╗███╗   ██╗ █████╗ ██████╗ ███████╗",
+                r"  ██╔════╝╚██╗ ██╔╝████╗  ██║██╔══██╗██╔══██╗██╔════╝",
+                r"  ███████╗ ╚████╔╝ ██╔██╗ ██║███████║██████╔╝███████╗",
+                r"  ╚════██║  ╚██╔╝  ██║╚██╗██║██╔══██║██╔═══╝ ╚════██║",
+                r"  ███████║   ██║   ██║ ╚████║██║  ██║██║     ███████║",
+                r"  ╚══════╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝     ╚══════╝",
+            ];
+            let art_height = ascii_art.len();
+            let sub_text = "type a message to begin";
+            let total_block = art_height + 2; // art + gap + subtitle
+            let start_y = msg_area.y + (msg_area.height.saturating_sub(total_block as u16)) / 2;
+
+            // Animate: pulse opacity based on elapsed time
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let pulse = ((t % 3000) as f64 / 3000.0 * std::f64::consts::PI * 2.0).sin();
+            let base = 60.0;
+            let amp = 40.0;
+            let brightness = (base + amp * pulse) as u8;
+
+            let art_style = Style::default().fg(Color::Rgb(brightness, brightness + 20, brightness + 40));
+            let sub_style = Style::default().fg(Color::Rgb(brightness / 2, brightness / 2 + 10, brightness / 2 + 20));
+
+            for (j, line) in ascii_art.iter().enumerate() {
+                let x = msg_area.x + msg_area.width.saturating_sub(line.len() as u16) / 2;
+                let y = start_y + j as u16;
+                if y < msg_area.y + msg_area.height {
+                    let area = ratatui::layout::Rect { x, y, width: line.len() as u16, height: 1 };
+                    frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                }
+            }
+            // Subtitle
+            let sub_y = start_y + art_height as u16 + 1;
+            if sub_y < msg_area.y + msg_area.height {
+                let sub_x = msg_area.x + msg_area.width.saturating_sub(sub_text.len() as u16) / 2;
+                let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_text.len() as u16, height: 1 };
+                frame.render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
+            }
+        }
 
         // Scroll indicator
         if app.scroll_back > 0 {
@@ -1164,10 +1215,13 @@ fn draw(
             Span::styled("quit", Style::default().fg(THEME.help_fg)),
             Span::styled("  esc ", Style::default().fg(THEME.muted)),
             Span::styled("abort", Style::default().fg(THEME.help_fg)),
-            Span::styled("  \u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
-            Span::styled("history", Style::default().fg(THEME.help_fg)),
             Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
             Span::styled("scroll", Style::default().fg(THEME.help_fg)),
+            Span::styled("  O ", Style::default().fg(THEME.muted)),
+            Span::styled(
+                if app.show_full_output { "full" } else { "compact" },
+                Style::default().fg(THEME.help_fg),
+            ),
             Span::styled("  enter ", Style::default().fg(THEME.muted)),
             Span::styled("send", Style::default().fg(THEME.help_fg)),
         ]))
@@ -1393,7 +1447,7 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             // Tick: redraws during animations AND during streaming (~60fps throttle)
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() => {
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
                 }
@@ -1683,6 +1737,11 @@ async fn main() -> Result<()> {
                                 while pos > 0 && bytes[pos - 1] != b' ' { pos -= 1; }
                                 app.input.drain(pos..app.cursor_pos);
                                 app.cursor_pos = pos;
+                            }
+                            (KeyCode::Char('O'), KeyModifiers::SHIFT) => {
+                                app.show_full_output = !app.show_full_output;
+                                app.dirty = true;
+                                app.line_cache.clear();
                             }
                             (KeyCode::Char(c), _) => {
                                 app.input.insert(app.cursor_pos, c);
