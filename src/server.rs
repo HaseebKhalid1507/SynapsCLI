@@ -100,47 +100,12 @@ async fn main() -> anyhow::Result<()> {
     let _log_guard = synaps_cli::logging::init_logging();
     let mut runtime = Runtime::new().await?;
 
-    // Load config
-    let config_path = synaps_cli::config::resolve_read_path("config");
-
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
-                if let Some((key, val)) = line.split_once('=') {
-                    match key.trim() {
-                        "model" => runtime.set_model(val.trim().to_string()),
-                        "thinking" => {
-                            match val.trim() {
-                                "low" => runtime.set_thinking_budget(2048),
-                                "medium" => runtime.set_thinking_budget(4096),
-                                "high" => runtime.set_thinking_budget(16384),
-                                "xhigh" => runtime.set_thinking_budget(32768),
-                                v => { if let Ok(n) = v.parse::<u32>() { runtime.set_thinking_budget(n); } }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
+    // Load config and apply
+    let config = synaps_cli::config::load_config();
+    synaps_cli::config::apply_config(&mut runtime, &config);
 
     // Load system prompt
-    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-    let system_prompt = if let Some(ref val) = cli.system {
-        let path = std::path::Path::new(val);
-        if path.exists() && path.is_file() {
-            std::fs::read_to_string(path).unwrap_or_else(|_| val.clone())
-        } else {
-            val.clone()
-        }
-    } else if system_prompt_path.exists() {
-        std::fs::read_to_string(&system_prompt_path).unwrap_or_default()
-    } else {
-        "You are a helpful AI agent running in a terminal. You have access to bash, read, and write tools. Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.".to_string()
-    };
+    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
     runtime.set_system_prompt(system_prompt);
 
     // Session: continue existing or create new

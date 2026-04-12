@@ -201,7 +201,7 @@ impl ToolType {
 
     pub async fn execute(&self, params: Value, tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>, tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>) -> Result<String> {
         let start_time = std::time::Instant::now();
-        tracing::info!("Executing tool");
+        tracing::info!(tool = %self.name(), "Executing tool");
         let res = match self {
             ToolType::Bash => execute_bash(params, tx_delta).await,
             ToolType::Read => execute_read(params).await,
@@ -212,7 +212,7 @@ impl ToolType {
             ToolType::Ls => execute_ls(params).await,
             ToolType::Subagent => execute_subagent(params, tx_events).await,
         };
-        tracing::debug!("Tool execution finished in {:?}", start_time.elapsed());
+        tracing::info!(tool = %self.name(), elapsed_ms = %start_time.elapsed().as_millis(), "Tool completed");
         res
     }
 }

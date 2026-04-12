@@ -71,3 +71,88 @@ pub fn get_active_config_dir() -> PathBuf {
     }
     base
 }
+
+/// Parsed configuration from the config file.
+#[derive(Debug, Clone)]
+pub struct SynapsConfig {
+    pub model: Option<String>,
+    pub thinking_budget: Option<u32>,
+}
+
+impl Default for SynapsConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            thinking_budget: None,
+        }
+    }
+}
+
+fn parse_thinking_budget(val: &str) -> Option<u32> {
+    match val {
+        "low" => Some(2048),
+        "medium" => Some(4096),
+        "high" => Some(16384),
+        "xhigh" => Some(32768),
+        _ => val.parse::<u32>().ok(),
+    }
+}
+
+/// Parse the config file at ~/.synaps-cli/config (or profile variant).
+/// Returns default config if file doesn't exist or can't be read.
+pub fn load_config() -> SynapsConfig {
+    let path = resolve_read_path("config");
+    let mut config = SynapsConfig::default();
+    
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return config;
+    };
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((key, val)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let val = val.trim();
+        match key {
+            "model" => config.model = Some(val.to_string()),
+            "thinking" => config.thinking_budget = parse_thinking_budget(val),
+            _ => {} // Unknown keys silently ignored
+        }
+    }
+    
+    config
+}
+
+/// Resolve the system prompt from CLI flag, config file, or default.
+/// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
+pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
+    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal. \
+        You have access to bash, read, and write tools. \
+        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
+
+    if let Some(val) = explicit {
+        let path = std::path::Path::new(val);
+        if path.exists() && path.is_file() {
+            return std::fs::read_to_string(path).unwrap_or_else(|_| val.to_string());
+        }
+        return val.to_string();
+    }
+
+    let system_path = resolve_read_path("system.md");
+    if system_path.exists() {
+        return std::fs::read_to_string(&system_path).unwrap_or_default();
+    }
+
+    DEFAULT_PROMPT.to_string()
+}
+
+/// Apply a parsed config to a Runtime instance.
+pub fn apply_config(runtime: &mut crate::Runtime, config: &SynapsConfig) {
+    if let Some(ref model) = config.model {
+        runtime.set_model(model.clone());
+    }
+    if let Some(budget) = config.thinking_budget {
+        runtime.set_thinking_budget(budget);
+    }
+}
