@@ -664,7 +664,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
     // the receiver in the subagent thread sees it and cancels the stream.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let thread_handle = std::thread::spawn(move || {
+    let _thread_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -844,8 +844,8 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                     duration_secs: elapsed,
                 });
             }
-            // Signal the thread to stop (in case it's still alive)
-            drop(thread_handle);
+            // shutdown_tx was already dropped above, which signals the subagent
+            // thread's CancellationToken to cancel. The thread will exit on its own.
             Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
         }
     }
