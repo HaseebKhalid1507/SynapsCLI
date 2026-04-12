@@ -57,6 +57,13 @@ pub enum ServerMessage {
         result: String,
     },
 
+    /// Tool execution incremental delta
+    #[serde(rename = "tool_result_delta")]
+    ToolResultDelta {
+        tool_id: String,
+        delta: String,
+    },
+
     /// Token usage update
     #[serde(rename = "usage")]
     Usage {

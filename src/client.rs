@@ -175,6 +175,9 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                ServerMessage::ToolResultDelta { delta, .. } => {
+                                    eprint!("\x1b[38;2;140;180;150m{}\x1b[0m", delta);
+                                }
                                 ServerMessage::ToolResult { result, .. } => {
                                     let lines: Vec<&str> = result.lines().collect();
                                     let is_error = result.starts_with("Tool execution failed");

@@ -1758,7 +1758,26 @@ async fn main() -> Result<()> {
                             }
                             app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
                         }
+                        StreamEvent::ToolResultDelta { delta, .. } => {
+                            if let Some(last) = app.messages.last_mut() {
+                                if let ChatMessage::ToolResult(ref mut current) = last.msg {
+                                    current.push_str(&delta);
+                                    app.dirty = true;
+                                    app.line_cache.clear();
+                                    continue;
+                                }
+                            }
+                            app.push_msg(ChatMessage::ToolResult(delta));
+                        }
                         StreamEvent::ToolResult { result, .. } => {
+                            if let Some(last) = app.messages.last_mut() {
+                                if let ChatMessage::ToolResult(ref mut current) = last.msg {
+                                    *current = result;
+                                    app.dirty = true;
+                                    app.line_cache.clear();
+                                    continue;
+                                }
+                            }
                             app.push_msg(ChatMessage::ToolResult(result));
                         }
                         StreamEvent::MessageHistory(history) => {

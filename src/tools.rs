@@ -174,11 +174,11 @@ impl ToolType {
         }
     }
 
-    pub async fn execute(&self, params: Value) -> Result<String> {
+    pub async fn execute(&self, params: Value, tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Result<String> {
         let start_time = std::time::Instant::now();
         tracing::info!("Executing tool");
         let res = match self {
-            ToolType::Bash => execute_bash(params).await,
+            ToolType::Bash => execute_bash(params, tx_delta).await,
             ToolType::Read => execute_read(params).await,
             ToolType::Write => execute_write(params).await,
             ToolType::Edit => execute_edit(params).await,
@@ -230,41 +230,77 @@ impl ToolRegistry {
 
 // ── Bash ────────────────────────────────────────────────────────────────────
 
-async fn execute_bash(params: Value) -> Result<String> {
+async fn execute_bash(params: Value, tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Result<String> {
     let command = params["command"].as_str()
         .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
     let timeout_secs = params["timeout"].as_u64().unwrap_or(30).min(300);
 
-    let result = timeout(Duration::from_secs(timeout_secs), async {
-        Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .kill_on_drop(true)
-            .output()
-            .await
+    // Spawn child
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let tx_o = tx_inter.clone();
+    let txd1 = tx_delta.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let msg = format!("{}\n", line);
+            let _ = tx_o.send(msg.clone());
+            if let Some(ref t) = txd1 { let _ = t.send(msg); }
+        }
+    });
+
+    let tx_e = tx_inter.clone();
+    let txd2 = tx_delta.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let msg = format!("{}\n", line);
+            let _ = tx_e.send(msg.clone());
+            if let Some(ref t) = txd2 { let _ = t.send(msg); }
+        }
+    });
+
+    // Drop the local sender so rx_inter terminates when the tasks complete
+    drop(tx_inter);
+
+    let result = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), async {
+        let mut full_output = String::new();
+        while let Some(line) = rx_inter.recv().await {
+            full_output.push_str(&line);
+            // Cap output to avoid bloating message history
+            if full_output.len() > 30_000 {
+                full_output.truncate(30_000);
+                full_output.push_str("\n\n[output truncated at 30KB]");
+                break;
+            }
+        }
+        let status = child.wait().await.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        Ok::<_, RuntimeError>((status, full_output))
     }).await;
 
     match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if output.status.success() {
-                let mut result = stdout.to_string();
-                if !stderr.is_empty() {
-                    result.push_str("\n[stderr]: ");
-                    result.push_str(&stderr);
-                }
-                // Cap output to avoid bloating message history
-                if result.len() > 30_000 {
-                    result.truncate(30_000);
-                    result.push_str("\n\n[output truncated at 30KB]");
-                }
-                Ok(result)
+        Ok(Ok((status, output))) => {
+            if status.success() {
+                Ok(output)
             } else {
                 Err(RuntimeError::Tool(format!(
-                    "Command failed (exit {}):\n[stdout]: {}\n[stderr]: {}",
-                    output.status.code().unwrap_or(-1), stdout, stderr
+                    "Command failed (exit {}):\n{}",
+                    status.code().unwrap_or(-1), output
                 )))
             }
         }

@@ -76,6 +76,10 @@ async fn main() -> Result<()> {
                     println!("📝 Input: {}", serde_json::to_string_pretty(&tool_input).unwrap_or_default());
                     io::stdout().flush().unwrap();
                 }
+                StreamEvent::ToolResultDelta { delta, .. } => {
+                    print!("\x1b[38;2;140;180;150m{}\x1b[0m", delta);
+                    io::stdout().flush().unwrap();
+                }
                 StreamEvent::ToolResult { tool_id, result } => {
                     println!("✅ Tool result ({}): {}", tool_id, result);
                     print!("💬 ");

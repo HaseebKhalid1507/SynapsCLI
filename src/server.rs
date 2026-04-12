@@ -83,19 +83,23 @@ struct Cli {
     /// Continue a previous session
     #[arg(long = "continue", value_name = "SESSION_ID")]
     continue_session: Option<Option<String>>,
+
+    #[arg(long, global = true)]
+    profile: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _log_guard = synaps_cli::logging::init_logging();
-
     let cli = Cli::parse();
+    if let Some(ref prof) = cli.profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+
+    let _log_guard = synaps_cli::logging::init_logging();
     let mut runtime = Runtime::new().await?;
 
     // Load config
-    let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".synaps-cli");
-    let config_path = config_dir.join("config");
+    let config_path = synaps_cli::config::resolve_read_path("config");
 
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -122,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Load system prompt
-    let system_prompt_path = config_dir.join("system.md");
+    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
     let system_prompt = if let Some(ref val) = cli.system {
         let path = std::path::Path::new(val);
         if path.exists() && path.is_file() {
@@ -385,6 +389,12 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     input: serde_json::to_string(&input).unwrap_or_default(),
                     time: ts,
                 }).await;
+            }
+            StreamEvent::ToolResultDelta { tool_id, delta } => {
+                let _ = broadcast.send(ServerMessage::ToolResultDelta {
+                    tool_id,
+                    delta,
+                });
             }
             StreamEvent::ToolResult { tool_id: _, result } => {
                 let _ = broadcast.send(ServerMessage::ToolResult {

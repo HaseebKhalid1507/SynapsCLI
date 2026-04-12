@@ -4,6 +4,9 @@ use std::io::{self, Write};
 
 #[derive(Parser)]
 struct Cli {
+    #[arg(long, global = true)]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -16,8 +19,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _log_guard = synaps_cli::logging::init_logging();
     let cli = Cli::parse();
+    if let Some(ref prof) = cli.profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+
+    let _log_guard = synaps_cli::logging::init_logging();
     let runtime = Runtime::new().await?;
     
     match cli.command {

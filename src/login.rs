@@ -4,9 +4,22 @@
 //! exchanges code for tokens, and saves to ~/.pi/agent/auth.json.
 
 use synaps_cli::auth;
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "login", about = "OAuth login for SynapsCLI")]
+struct Cli {
+    #[arg(long, global = true)]
+    profile: Option<String>,
+}
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    if let Some(ref prof) = cli.profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+
     let _log_guard = synaps_cli::logging::init_logging();
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");

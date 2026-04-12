@@ -41,6 +41,10 @@ pub enum StreamEvent {
         tool_id: String,
         result: String,
     },
+    ToolResultDelta {
+        tool_id: String,
+        delta: String,
+    },
     /// Full message history after the tool loop completes, for multi-turn context
     MessageHistory(Vec<Value>),
     Usage {
@@ -274,7 +278,7 @@ impl Runtime {
                         
                         let result = match self.tools.get(tool_name) {
                             Some(tool) => {
-                                match tool.execute(input.clone()).await {
+                                match tool.execute(input.clone(), None).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
                                 }
@@ -464,9 +468,21 @@ impl Runtime {
 
                     let result = match tools.get(&tool_name) {
                         Some(tool) => {
+                            let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            let tx_k = tx.clone();
+                            let t_id = tool_id.clone();
+                            tokio::spawn(async move {
+                                while let Some(msg) = rx_d.recv().await {
+                                    let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                        tool_id: t_id.clone(),
+                                        delta: msg,
+                                    });
+                                }
+                            });
+
                             // Race tool execution against cancellation
                             tokio::select! {
-                                res = tool.execute(input.clone()) => {
+                                res = tool.execute(input.clone(), Some(tx_d)) => {
                                     match res {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
