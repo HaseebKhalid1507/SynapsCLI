@@ -287,6 +287,30 @@ struct App {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Format a tool name for display. Returns (icon, display_name, optional_server_tag).
+/// MCP tools like "mcp__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
+fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
+    if tool_name.starts_with("mcp__") {
+        let parts: Vec<&str> = tool_name.splitn(3, "__").collect();
+        let server = parts.get(1).unwrap_or(&"mcp").to_string();
+        let tool = parts.get(2).unwrap_or(&tool_name).to_string();
+        ("\u{26a1}", tool, Some(server)) // ⚡
+    } else {
+        let icon = match tool_name {
+            "bash"     => "\u{276f}",   // ❯
+            "read"     => "\u{25b8}",   // ▸
+            "write"    => "\u{25c2}",   // ◂
+            "edit"     => "\u{0394}",   // Δ
+            "grep"     => "\u{2315}",   // ⌕
+            "find"     => "\u{25cb}",   // ○
+            "ls"       => "\u{2261}",   // ≡
+            "subagent" => "\u{25c8}",   // ◈
+            _          => "\u{2192}",   // →
+        };
+        (icon, tool_name.to_string(), None)
+    }
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 struct SubagentState {
@@ -583,22 +607,16 @@ impl App {
                 }
 
                 ChatMessage::ToolUseStart(tool_name, partial_input) => {
-                    let icon = match tool_name.as_str() {
-                        "bash"  => "\u{276f}",
-                        "read"  => "\u{25b8}",
-                        "write" => "\u{25c2}",
-                        "edit"  => "\u{0394}",
-                        "grep"  => "\u{2315}",
-                        "find"  => "\u{25cb}",
-                        "ls"    => "\u{2261}",
-                        "subagent" => "\u{25c8}",
-                        _       => "\u{2192}",
-                    };
-                    lines.push(Line::from(vec![
+                    let (icon, display_name, server_tag) = format_tool_name(tool_name);
+                    let mut header = vec![
                         Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
-                        Span::styled(tool_name.clone(), Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
-                        Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)),
-                    ]));
+                        Span::styled(display_name, Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
+                    ];
+                    if let Some(tag) = server_tag {
+                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
+                    }
+                    header.push(Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)));
+                    lines.push(Line::from(header));
                     // Show accumulated partial input if any
                     if !partial_input.is_empty() {
                         let param_style = Style::default().fg(THEME.tool_param);
@@ -616,21 +634,15 @@ impl App {
 
                 ChatMessage::ToolUse { tool_name, input } => {
                     // Compact tool header
-                    let icon = match tool_name.as_str() {
-                        "bash"  => "\u{276f}",
-                        "read"  => "\u{25b8}",
-                        "write" => "\u{25c2}",
-                        "edit"  => "\u{0394}",
-                        "grep"  => "\u{2315}",
-                        "find"  => "\u{25cb}",
-                        "ls"    => "\u{2261}",
-                        "subagent" => "\u{25c8}",
-                        _       => "\u{2192}",
-                    };
-                    lines.push(Line::from(vec![
+                    let (icon, display_name, server_tag) = format_tool_name(tool_name);
+                    let mut header = vec![
                         Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
-                        Span::styled(tool_name.clone(), Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
-                    ]));
+                        Span::styled(display_name, Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
+                    ];
+                    if let Some(tag) = server_tag {
+                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
+                    }
+                    lines.push(Line::from(header));
                     // Params — key:value on one line each, dimmed
                     let param_style = Style::default().fg(THEME.tool_param);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
