@@ -1,7 +1,7 @@
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, list_sessions, latest_session, find_session};
 use clap::Parser;
 use crossterm::{
-    event::{Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture, EventStream},
+    event::{Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste, EventStream},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -245,6 +245,8 @@ struct TimestampedMsg {
 struct App {
     messages: Vec<TimestampedMsg>,
     input: String,
+    /// Cursor position as a **char index** (not byte index).
+    /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
     cursor_pos: usize,
     scroll_back: u16,
     /// When true, viewport stays pinned to the bottom (auto-scroll).
@@ -281,6 +283,9 @@ struct App {
     abort_context: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
     queued_message: Option<String>,
+    /// Tracks paste state: snapshot of input before first paste, and total pasted char count
+    input_before_paste: Option<String>,
+    pasted_char_count: usize,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
 }
@@ -355,8 +360,68 @@ impl App {
             tool_start_time: None,
             abort_context: None,
             queued_message: None,
+            input_before_paste: None,
+            pasted_char_count: 0,
             spinner_frame: 0,
         }
+    }
+
+    /// Convert char-based cursor_pos to byte offset in self.input.
+    fn cursor_byte_pos(&self) -> usize {
+        self.input.char_indices()
+            .nth(self.cursor_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Number of chars in self.input (for bounds checking cursor_pos).
+    fn input_char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    /// Calculate the number of visual lines the input needs, given an inner width.
+    /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
+    fn input_wrap_info(&self, inner_width: u16) -> (u16, u16, u16) {
+        use unicode_width::UnicodeWidthChar;
+        let w = inner_width.max(1) as usize;
+        // prefix "❯ " is 2 display columns (only on first line)
+        let prefix_width: usize = 2;
+
+        let mut row: u16 = 0;
+        let mut col: usize = prefix_width;
+        let mut cursor_row: u16 = 0;
+        let mut cursor_col: u16 = prefix_width as u16;
+
+        for (i, ch) in self.input.chars().enumerate() {
+            if i == self.cursor_pos {
+                cursor_row = row;
+                cursor_col = col as u16;
+            }
+            if ch == '\n' {
+                row += 1;
+                col = prefix_width; // continuation lines also have 2-char indent
+                continue;
+            }
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col + cw > w {
+                row += 1;
+                col = 0;
+            }
+            col += cw;
+        }
+        // If cursor is at the end
+        if self.cursor_pos == self.input_char_count() {
+            cursor_row = row;
+            cursor_col = col as u16;
+            // If cursor is exactly at the wrap boundary
+            if col >= w {
+                cursor_row += 1;
+                cursor_col = 0;
+            }
+        }
+
+        let total_lines = row + 1;
+        (total_lines, cursor_row, cursor_col)
     }
 
     fn save_session(&mut self) {
@@ -477,7 +542,7 @@ impl App {
             _ => return,
         }
         self.input = self.input_history[self.history_index.unwrap()].clone();
-        self.cursor_pos = self.input.len();
+        self.cursor_pos = self.input.chars().count();
     }
 
     fn history_down(&mut self) {
@@ -491,7 +556,7 @@ impl App {
                     self.input = self.input_stash.clone();
                     self.input_stash.clear();
                 }
-                self.cursor_pos = self.input.len();
+                self.cursor_pos = self.input.chars().count();
             }
             None => {}
         }
@@ -539,7 +604,7 @@ impl App {
                         ),
                         Span::styled(ts_str, Style::default().fg(THEME.muted).bg(THEME.user_bg)),
                     ]));
-                    // Content
+                    // Content — just render the text (pasted messages already contain "[Pasted N lines]")
                     let style = Style::default().fg(THEME.user_color).bg(THEME.user_bg);
                     for line in text.lines() {
                         for wline in wrap_text(&format!("{}  {}", m, line), width) {
@@ -1211,13 +1276,20 @@ fn draw(
             0
         };
 
+        // Dynamic input height: borders (2) + wrapped text lines, capped at 10
+        let frame_width = frame.area().width;
+        let input_inner_width = frame_width.saturating_sub(2); // subtract border left+right
+        let (input_lines, _, _) = app.input_wrap_info(input_inner_width);
+        let max_input_lines: u16 = 10;
+        let input_height = (input_lines.min(max_input_lines)) + 2; // +2 for borders
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),              // header
                 Constraint::Min(1),                 // messages
                 Constraint::Length(subagent_height), // subagent panel (0 when inactive)
-                Constraint::Length(3),              // input
+                Constraint::Length(input_height),   // input (expands with content)
                 Constraint::Length(1),              // footer
             ])
             .split(frame.area());
@@ -1249,7 +1321,7 @@ fn draw(
         // -- Messages --------------------------------------------------------
         let msg_area = outer[1];
         let content_height = msg_area.height.saturating_sub(2) as usize;
-        let content_width = msg_area.width.saturating_sub(4) as usize; // borders + padding
+        let content_width = msg_area.width.saturating_sub(2) as usize; // horizontal padding only (no left/right borders)
 
         // Rebuild line cache only when content changed or width changed
         if app.dirty || app.cache_width != content_width {
@@ -1517,17 +1589,59 @@ fn draw(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(input_border_color))
             .style(Style::default().bg(THEME.bg));
-        let input_widget = Paragraph::new(Line::from(vec![
-            Span::styled("\u{276f} ", Style::default().fg(THEME.prompt_fg)),
-            Span::styled(&app.input, Style::default().fg(THEME.input_fg)),
-        ]))
+        // Build pre-wrapped input lines using char-level wrapping (must match input_wrap_info exactly)
+        let input_lines_vec: Vec<Line> = {
+            use unicode_width::UnicodeWidthChar;
+            let w = input_inner_width.max(1) as usize;
+            let prefix_width: usize = 2;
+            let prompt_style = Style::default().fg(THEME.prompt_fg);
+            let input_style = Style::default().fg(THEME.input_fg);
+
+            let mut rows: Vec<Vec<Span>> = Vec::new();
+            let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
+            let mut col: usize = prefix_width;
+
+            for ch in app.input.chars() {
+                if ch == '\n' {
+                    rows.push(std::mem::take(&mut current_row));
+                    current_row = vec![Span::styled("  ", prompt_style)];
+                    col = prefix_width;
+                    continue;
+                }
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + cw > w {
+                    rows.push(std::mem::take(&mut current_row));
+                    current_row = Vec::new();
+                    col = 0;
+                }
+                // Accumulate character into a string span
+                let mut s = String::new();
+                s.push(ch);
+                current_row.push(Span::styled(s, input_style));
+                col += cw;
+            }
+            rows.push(current_row);
+            rows.into_iter().map(Line::from).collect()
+        };
+
+        // Scroll offset: keep cursor visible when input exceeds max visible lines
+        let (_, cursor_row, cursor_col) = app.input_wrap_info(input_inner_width);
+        let visible_lines = max_input_lines;
+        let input_scroll: u16 = if cursor_row >= visible_lines {
+            cursor_row - visible_lines + 1
+        } else {
+            0
+        };
+
+        let input_widget = Paragraph::new(input_lines_vec)
+        .scroll((input_scroll, 0))
         .block(input_block);
         frame.render_widget(input_widget, outer[3]);
 
-        // Cursor
+        // Cursor — position relative to scroll offset
         frame.set_cursor_position((
-            outer[3].x + 3 + app.cursor_pos as u16,
-            outer[3].y + 1,
+            outer[3].x + 1 + cursor_col,
+            outer[3].y + 1 + cursor_row - input_scroll,
         ));
 
         // -- Footer ----------------------------------------------------------
@@ -1740,7 +1854,7 @@ async fn main() -> Result<()> {
 
     enable_raw_mode().unwrap();
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).unwrap();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).unwrap();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut event_reader = EventStream::new();
@@ -1815,6 +1929,12 @@ async fn main() -> Result<()> {
                                     "aborted"
                                 };
                                 app.push_msg(ChatMessage::Error(abort_msg.to_string()));
+                            }
+                            (KeyCode::Enter, KeyModifiers::SHIFT) if !app.streaming => {
+                                // Shift+Enter inserts a literal newline
+                                let byte_pos = app.cursor_byte_pos();
+                                app.input.insert(byte_pos, '\n');
+                                app.cursor_pos += 1;
                             }
                             (KeyCode::Enter, _) if !app.streaming && !app.input.is_empty() => {
                                 // Trigger CRT dismiss if this is the first message
@@ -2009,7 +2129,28 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 } else {
-                                    app.push_msg(ChatMessage::User(input.clone()));
+                                    // Display: typed text + paste indicator
+                                    let display_text = if app.pasted_char_count > 0 {
+                                        let typed = app.input_before_paste.as_deref().unwrap_or("");
+                                        let pasted_lines = input.chars().count().saturating_sub(typed.chars().count());
+                                        let paste_content = &input[input.floor_char_boundary(typed.len())..];
+                                        let line_count = paste_content.lines().count();
+                                        let paste_label = if line_count > 1 {
+                                            format!("[Pasted {} lines]", line_count)
+                                        } else {
+                                            format!("[Pasted {} chars]", pasted_lines)
+                                        };
+                                        if typed.is_empty() {
+                                            paste_label
+                                        } else {
+                                            format!("{} {}", typed.trim(), paste_label)
+                                        }
+                                    } else {
+                                        input.clone()
+                                    };
+                                    app.push_msg(ChatMessage::User(display_text));
+                                    app.input_before_paste = None;
+                                    app.pasted_char_count = 0;
                                     // Inject abort context if previous response was interrupted
                                     let api_content = if let Some(ref ctx) = app.abort_context {
                                         let combined = format!("{}\n\n{}", ctx, input);
@@ -2034,6 +2175,8 @@ async fn main() -> Result<()> {
                                 app.input_stash.clear();
                                 app.input.clear();
                                 app.cursor_pos = 0;
+                                app.input_before_paste = None;
+                                app.pasted_char_count = 0;
 
                                 // Send to steering channel (injected between tool rounds)
                                 // AND queue as fallback (fires on Done if steering didn't deliver)
@@ -2057,7 +2200,7 @@ async fn main() -> Result<()> {
                                     .collect();
                                 if matches.len() == 1 {
                                     app.input = format!("/{}", matches[0]);
-                                    app.cursor_pos = app.input.len();
+                                    app.cursor_pos = app.input.chars().count();
                                 } else if matches.len() > 1 {
                                     // Find common prefix
                                     let first = matches[0];
@@ -2066,7 +2209,7 @@ async fn main() -> Result<()> {
                                         .count();
                                     if common_len > partial.len() {
                                         app.input = format!("/{}", &first[..common_len]);
-                                        app.cursor_pos = app.input.len();
+                                        app.cursor_pos = app.input.chars().count();
                                     }
                                 }
                             }
@@ -2074,15 +2217,17 @@ async fn main() -> Result<()> {
                                 app.cursor_pos = 0;
                             }
                             (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                                app.cursor_pos = app.input.len();
+                                app.cursor_pos = app.input.chars().count();
                             }
                             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                                 // Delete word backward (same as Alt+Backspace)
+                                let chars: Vec<char> = app.input.chars().collect();
                                 let mut pos = app.cursor_pos;
-                                let bytes = app.input.as_bytes();
-                                while pos > 0 && bytes[pos - 1] == b' ' { pos -= 1; }
-                                while pos > 0 && bytes[pos - 1] != b' ' { pos -= 1; }
-                                app.input.drain(pos..app.cursor_pos);
+                                while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
+                                while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
+                                let byte_start = app.input.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(app.input.len());
+                                let byte_end = app.cursor_byte_pos();
+                                app.input.drain(byte_start..byte_end);
                                 app.cursor_pos = pos;
                             }
                             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -2094,32 +2239,34 @@ async fn main() -> Result<()> {
                                 app.cursor_pos = 0;
                             }
                             (KeyCode::End, _) => {
-                                app.cursor_pos = app.input.len();
+                                app.cursor_pos = app.input.chars().count();
                             }
                             (KeyCode::Left, KeyModifiers::ALT) => {
                                 // Jump word left
-                                let bytes = app.input.as_bytes();
+                                let chars: Vec<char> = app.input.chars().collect();
                                 let mut pos = app.cursor_pos;
-                                while pos > 0 && bytes[pos - 1] == b' ' { pos -= 1; }
-                                while pos > 0 && bytes[pos - 1] != b' ' { pos -= 1; }
+                                while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
+                                while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
                                 app.cursor_pos = pos;
                             }
                             (KeyCode::Right, KeyModifiers::ALT) => {
                                 // Jump word right
-                                let bytes = app.input.as_bytes();
-                                let len = bytes.len();
+                                let chars: Vec<char> = app.input.chars().collect();
+                                let len = chars.len();
                                 let mut pos = app.cursor_pos;
-                                while pos < len && bytes[pos] != b' ' { pos += 1; }
-                                while pos < len && bytes[pos] == b' ' { pos += 1; }
+                                while pos < len && chars[pos] != ' ' { pos += 1; }
+                                while pos < len && chars[pos] == ' ' { pos += 1; }
                                 app.cursor_pos = pos;
                             }
                             (KeyCode::Backspace, KeyModifiers::ALT) => {
                                 // Delete word backward
+                                let chars: Vec<char> = app.input.chars().collect();
                                 let mut pos = app.cursor_pos;
-                                let bytes = app.input.as_bytes();
-                                while pos > 0 && bytes[pos - 1] == b' ' { pos -= 1; }
-                                while pos > 0 && bytes[pos - 1] != b' ' { pos -= 1; }
-                                app.input.drain(pos..app.cursor_pos);
+                                while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
+                                while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
+                                let byte_start = app.input.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(app.input.len());
+                                let byte_end = app.cursor_byte_pos();
+                                app.input.drain(byte_start..byte_end);
                                 app.cursor_pos = pos;
                             }
                             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
@@ -2128,17 +2275,19 @@ async fn main() -> Result<()> {
                                 app.line_cache.clear();
                             }
                             (KeyCode::Char(c), _) => {
-                                app.input.insert(app.cursor_pos, c);
+                                let byte_pos = app.cursor_byte_pos();
+                                app.input.insert(byte_pos, c);
                                 app.cursor_pos += 1;
                             }
                             (KeyCode::Backspace, _) if app.cursor_pos > 0 => {
                                 app.cursor_pos -= 1;
-                                app.input.remove(app.cursor_pos);
+                                let byte_pos = app.cursor_byte_pos();
+                                app.input.remove(byte_pos);
                             }
                             (KeyCode::Left, _) if app.cursor_pos > 0 => {
                                 app.cursor_pos -= 1;
                             }
-                            (KeyCode::Right, _) if app.cursor_pos < app.input.len() => {
+                            (KeyCode::Right, _) if app.cursor_pos < app.input_char_count() => {
                                 app.cursor_pos += 1;
                             }
                             (KeyCode::Up, KeyModifiers::SHIFT) => {
@@ -2173,6 +2322,20 @@ async fn main() -> Result<()> {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        // Bracketed paste — insert the full text (newlines included)
+                        // into the input buffer at cursor position
+                        if !app.streaming || !app.input.is_empty() {
+                            // Snapshot input before first paste so we can show typed text separately
+                            if app.input_before_paste.is_none() {
+                                app.input_before_paste = Some(app.input.clone());
+                            }
+                            let byte_pos = app.cursor_byte_pos();
+                            app.input.insert_str(byte_pos, &text);
+                            app.cursor_pos += text.chars().count();
+                            app.pasted_char_count += text.chars().count();
                         }
                     }
                     Some(Ok(_)) => {}
@@ -2392,7 +2555,7 @@ async fn main() -> Result<()> {
     app.save_session();
 
     disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen).unwrap();
+    execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).unwrap();
     terminal.show_cursor().unwrap();
 
     Ok(())

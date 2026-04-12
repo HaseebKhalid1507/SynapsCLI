@@ -663,8 +663,10 @@ pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
 
 fn strip_frontmatter(content: &str) -> String {
     if content.starts_with("---") {
-        if let Some(end) = content[3..].find("---") {
-            return content[end + 6..].trim().to_string();
+        if let Some(end) = content[3..].find("\n---") {
+            // end is relative to content[3..], so closing "---" starts at 3+end+1
+            // skip past the "\n---" (4 bytes) to get the body
+            return content[3 + end + 4..].trim().to_string();
         }
     }
     content.to_string()

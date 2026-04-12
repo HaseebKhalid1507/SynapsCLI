@@ -78,6 +78,10 @@ struct Cli {
     #[arg(long, short, default_value = "3145")]
     port: u16,
 
+    /// Host/IP to bind to (default: 127.0.0.1, use 0.0.0.0 for all interfaces)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
     /// System prompt: a string or a path to a file
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
@@ -155,13 +159,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .with_state(state.clone());
 
-    let addr = format!("0.0.0.0:{}", cli.port);
+    let addr = format!("{}:{}", cli.host, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI Server v0.2         ║");
     eprintln!("╠══════════════════════════════════════╣");
-    eprintln!("║  Listening: ws://localhost:{:<10}║", cli.port);
+    eprintln!("║  Listening: ws://{}:{:<5}      ║", cli.host, cli.port);
     eprintln!("║  Session:   {:<24}║", &session_id);
     eprintln!("╚══════════════════════════════════════╝");
 
