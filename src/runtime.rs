@@ -31,6 +31,7 @@ struct AnthropicAuth {
 pub enum StreamEvent {
     Thinking(String),
     Text(String),
+    ToolUseStart(String),
     ToolUse {
         tool_name: String,
         tool_id: String,
@@ -666,6 +667,7 @@ impl Runtime {
                                     current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
                                     current_tool_input_json.clear();
                                     in_tool_use = true;
+                                    let _ = tx.send(StreamEvent::ToolUseStart(current_tool_name.clone()));
                                 }
                                 Some("text") => {
                                     if !current_text.is_empty() {

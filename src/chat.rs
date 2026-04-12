@@ -58,12 +58,21 @@ async fn main() -> Result<()> {
                     print!("{}", text);
                     io::stdout().flush().unwrap();
                 }
-                StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
+                StreamEvent::ToolUseStart(tool_name) => {
                     if in_thinking {
                         print!("\n");
                         in_thinking = false;
                     }
-                    println!("\n⚙️  Using tool: {} ({})", tool_name, tool_id);
+                    print!("⚙️  Using tool: {} (streaming args...)\r", tool_name);
+                    io::stdout().flush().unwrap();
+                }
+                StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
+                    print!("                                                                                          \r");
+                    if in_thinking {
+                        print!("\n");
+                        in_thinking = false;
+                    }
+                    println!("⚙️  Using tool: {} ({})", tool_name, tool_id);
                     println!("📝 Input: {}", serde_json::to_string_pretty(&tool_input).unwrap_or_default());
                     io::stdout().flush().unwrap();
                 }

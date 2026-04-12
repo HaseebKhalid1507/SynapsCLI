@@ -371,6 +371,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     history.push(HistoryEntry::Text { content: text, time: ts });
                 }
             }
+            StreamEvent::ToolUseStart(tool_name) => {
+                let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
+            }
             StreamEvent::ToolUse { tool_name, tool_id, input } => {
                 let _ = broadcast.send(ServerMessage::ToolUse {
                     tool_name: tool_name.clone(),

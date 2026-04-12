@@ -3,6 +3,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "client", about = "SynapsCLI terminal client")]
@@ -120,7 +121,26 @@ async fn main() -> anyhow::Result<()> {
                                     print!("{}", content);
                                     needs_newline = !content.ends_with('\n');
                                 }
+                                ServerMessage::ToolUseStart { tool_name } => {
+                                    if needs_newline {
+                                        println!();
+                                        needs_newline = false;
+                                    }
+                                    let icon = match tool_name.as_str() {
+                                        "bash"  => "❯",
+                                        "read"  => "▸",
+                                        "write" => "◂",
+                                        "edit"  => "Δ",
+                                        "grep"  => "⌕",
+                                        "find"  => "○",
+                                        "ls"    => "≡",
+                                        _       => "→",
+                                    };
+                                    eprint!("  {} {} (streaming args...)\r", icon, tool_name);
+                                    std::io::stderr().flush().unwrap();
+                                }
                                 ServerMessage::ToolUse { tool_name, input, .. } => {
+                                    eprint!("                                                                                          \r");
                                     if needs_newline {
                                         println!();
                                         needs_newline = false;

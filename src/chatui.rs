@@ -218,6 +218,7 @@ enum ChatMessage {
     User(String),
     Thinking(String),
     Text(String),
+    ToolUseStart(String),
     ToolUse { tool_name: String, input: String },
     ToolResult(String),
     Error(String),
@@ -468,6 +469,24 @@ impl App {
                     } else {
                         lines.extend(render_markdown(text, m, width));
                     }
+                }
+
+                ChatMessage::ToolUseStart(tool_name) => {
+                    let icon = match tool_name.as_str() {
+                        "bash"  => "\u{276f}",
+                        "read"  => "\u{25b8}",
+                        "write" => "\u{25c2}",
+                        "edit"  => "\u{0394}",
+                        "grep"  => "\u{2315}",
+                        "find"  => "\u{25cb}",
+                        "ls"    => "\u{2261}",
+                        _       => "\u{2192}",
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
+                        Span::styled(tool_name.clone(), Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)),
+                    ]));
                 }
 
                 ChatMessage::ToolUse { tool_name, input } => {
@@ -1717,8 +1736,21 @@ async fn main() -> Result<()> {
                         StreamEvent::Text(text) => {
                             app.append_or_update_text(&text);
                         }
+                        StreamEvent::ToolUseStart(name) => {
+                            app.push_msg(ChatMessage::ToolUseStart(name));
+                        }
                         StreamEvent::ToolUse { tool_name, input, .. } => {
                             let input_str = serde_json::to_string(&input).unwrap_or_default();
+                            if let Some(last) = app.messages.last_mut() {
+                                if let ChatMessage::ToolUseStart(name) = &last.msg {
+                                    if name == &tool_name {
+                                        last.msg = ChatMessage::ToolUse { tool_name, input: input_str };
+                                        app.dirty = true;
+                                        app.line_cache.clear();
+                                        continue;
+                                    }
+                                }
+                            }
                             app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
                         }
                         StreamEvent::ToolResult { result, .. } => {

@@ -38,7 +38,11 @@ pub enum ServerMessage {
     #[serde(rename = "text")]
     Text { content: String },
 
-    /// A tool was invoked
+    /// A tool is ABOUT to be invoked (streaming JSON args)
+    #[serde(rename = "tool_use_start")]
+    ToolUseStart { tool_name: String },
+
+    /// A tool was invoked (JSON finished)
     #[serde(rename = "tool_use")]
     ToolUse {
         tool_name: String,
