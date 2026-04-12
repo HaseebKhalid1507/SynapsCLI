@@ -106,7 +106,7 @@ impl Runtime {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|e| RuntimeError::Tool(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
         Ok(Runtime {
             client,
@@ -209,9 +209,10 @@ impl Runtime {
 
         // Slow path: delegate to auth.rs which handles locking, re-read,
         // conditional refresh, and persistence.
+        tracing::info!("Refreshing auth token");
         let creds = crate::auth::ensure_fresh_token(&self.client)
             .await
-            .map_err(|e| RuntimeError::Tool(format!(
+            .map_err(|e| RuntimeError::Auth(format!(
                 "Token refresh failed: {}. Run `login` to re-authenticate.", e
             )))?;
 
@@ -265,7 +266,7 @@ impl Runtime {
             return Ok((api_key, "api_key".to_string(), None, None));
         }
         
-        Err(RuntimeError::Tool("No Anthropic credentials found. Run `login` to authenticate.".to_string()))
+        Err(RuntimeError::Auth("No Anthropic credentials found. Run `login` to authenticate.".to_string()))
     }
 
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
@@ -486,7 +487,7 @@ impl Runtime {
                         eprintln!("\x1b[2m  ↻ refreshing token mid-stream...\x1b[0m");
                         let creds = crate::auth::ensure_fresh_token(&client)
                             .await
-                            .map_err(|e| RuntimeError::Tool(format!(
+                            .map_err(|e| RuntimeError::Auth(format!(
                                 "Token refresh failed mid-stream: {}. Run `login` to re-authenticate.", e
                             )))?;
 
@@ -751,7 +752,7 @@ impl Runtime {
             ("x-api-key", auth_token.clone())
         };
         
-        tracing::debug!("Dispatching streaming API request to Anthropic...");
+        tracing::info!(model = %model, "Starting API request");
         let mut request = client
             .post("https://api.anthropic.com/v1/messages")
             .header(auth_header.0, auth_header.1)
@@ -817,6 +818,7 @@ impl Runtime {
         }
         
         let mut stream = response.bytes_stream();
+        tracing::debug!("Stream opened");
         let mut accumulated_content: Vec<Value> = Vec::new();
         let mut current_text = String::new();
 

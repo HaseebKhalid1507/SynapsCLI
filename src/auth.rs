@@ -250,7 +250,11 @@ pub async fn exchange_code_for_tokens(
         "code_verifier": verifier,
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     let resp = client
         .post(TOKEN_URL)
         .header("Content-Type", "application/json")
