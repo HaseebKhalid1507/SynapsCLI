@@ -268,7 +268,11 @@ struct App {
     logo_build_t: Option<f64>,
     /// Active subagent status for the live panel
     subagents: Vec<SubagentState>,
+    /// Spinner frame counter (incremented on tick)
+    spinner_frame: usize,
 }
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone)]
 struct SubagentState {
@@ -306,6 +310,7 @@ impl App {
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
             subagents: Vec::new(),
+            spinner_frame: 0,
         }
     }
 
@@ -1121,8 +1126,10 @@ fn draw(
         let status_span = if !app.subagents.is_empty() {
             let active = app.subagents.iter().filter(|s| !s.done).count();
             let done = app.subagents.iter().filter(|s| s.done).count();
+            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
+            let spinner = if active > 0 { SPINNER_FRAMES[spinner_idx] } else { "\u{2714}" };
             Span::styled(
-                format!(" \u{25c8} {} agent{} ({} done) ", active, if active != 1 { "s" } else { "" }, done),
+                format!(" {} {} agent{} ({} done) ", spinner, active, if active != 1 { "s" } else { "" }, done),
                 Style::default().fg(THEME.subagent_name),
             )
         } else if app.streaming {
@@ -1309,36 +1316,69 @@ fn draw(
 
         // -- Subagent Panel ---------------------------------------------------
         if has_subagents {
+            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
             let mut agent_lines: Vec<Line> = Vec::new();
+
             for sa in &app.subagents {
                 let elapsed = sa.duration_secs.unwrap_or_else(|| sa.start_time.elapsed().as_secs_f64());
-                let time_str = format!("{:.1}s", elapsed);
-
-                let (icon, status_style) = if sa.done {
-                    ("\u{2714}", Style::default().fg(THEME.subagent_done))  // ✔
+                let time_str = if elapsed < 60.0 {
+                    format!("{:.1}s", elapsed)
                 } else {
-                    ("\u{25cf}", Style::default().fg(THEME.subagent_status))  // ●
+                    format!("{}m{:.0}s", (elapsed / 60.0) as u32, elapsed % 60.0)
                 };
 
-                agent_lines.push(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), status_style),
-                    Span::styled(
-                        format!("{:<12}", sa.name),
-                        Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" {:<30}", sa.status),
-                        status_style,
-                    ),
-                    Span::styled(
-                        format!(" {}", time_str),
-                        Style::default().fg(THEME.subagent_time),
-                    ),
-                ]));
+                if sa.done {
+                    agent_lines.push(Line::from(vec![
+                        Span::styled("  \u{2714} ", Style::default().fg(THEME.subagent_done)),
+                        Span::styled(
+                            format!("{} ", sa.name),
+                            Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            &sa.status,
+                            Style::default().fg(THEME.subagent_done).add_modifier(Modifier::DIM),
+                        ),
+                        Span::styled(
+                            format!("  {}", time_str),
+                            Style::default().fg(THEME.subagent_time),
+                        ),
+                    ]));
+                } else {
+                    let spinner = SPINNER_FRAMES[spinner_idx];
+                    agent_lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {} ", spinner),
+                            Style::default().fg(THEME.subagent_name),
+                        ),
+                        Span::styled(
+                            format!("{} ", sa.name),
+                            Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            &sa.status,
+                            Style::default().fg(THEME.subagent_status),
+                        ),
+                        Span::styled(
+                            format!("  {}", time_str),
+                            Style::default().fg(THEME.subagent_time),
+                        ),
+                    ]));
+                }
             }
+
+            let active = app.subagents.iter().filter(|s| !s.done).count();
+            let done = app.subagents.iter().filter(|s| s.done).count();
+            let title = if done > 0 && active > 0 {
+                format!(" \u{25c8} {} running, {} done ", active, done)
+            } else if active > 0 {
+                format!(" \u{25c8} {} agent{} ", active, if active != 1 { "s" } else { "" })
+            } else {
+                format!(" \u{2714} {} done ", done)
+            };
+
             let agent_block = Block::default()
                 .title(Span::styled(
-                    " subagents ",
+                    title,
                     Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
@@ -1385,7 +1425,7 @@ fn draw(
             Span::styled("abort", Style::default().fg(THEME.help_fg)),
             Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
             Span::styled("scroll", Style::default().fg(THEME.help_fg)),
-            Span::styled("  O ", Style::default().fg(THEME.muted)),
+            Span::styled("  ctrl+o ", Style::default().fg(THEME.muted)),
             Span::styled(
                 if app.show_full_output { "full" } else { "compact" },
                 Style::default().fg(THEME.help_fg),
@@ -1628,6 +1668,15 @@ async fn main() -> Result<()> {
                     *t += 0.04; // ~25 frames at 60fps = ~0.4s
                     if *t >= 1.0 {
                         app.logo_dismiss_t = None;
+                    }
+                }
+                // Advance spinner for active subagents (~6 fps visual)
+                if !app.subagents.is_empty() {
+                    app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                    // Only dirty every 3rd tick (~20fps spinner, smooth but not crazy)
+                    if app.spinner_frame % 3 == 0 {
+                        app.dirty = true;
+                        app.line_cache.clear();
                     }
                 }
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
