@@ -232,7 +232,7 @@ enum ChatMessage {
     Text(String),
     ToolUseStart(String, String),  // (tool_name, partial_input)
     ToolUse { tool_name: String, input: String },
-    ToolResult(String),
+    ToolResult { content: String, elapsed_ms: Option<u64> },
     Error(String),
     System(String),
 }
@@ -273,6 +273,8 @@ struct App {
     subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
     next_subagent_id: u32,
+    /// Tracks when the current tool started executing (for elapsed time display)
+    tool_start_time: Option<std::time::Instant>,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
 }
@@ -319,6 +321,7 @@ impl App {
             logo_build_t: Some(0.0),
             subagents: Vec::new(),
             next_subagent_id: 0,
+            tool_start_time: None,
             spinner_frame: 0,
         }
     }
@@ -590,7 +593,8 @@ impl App {
                     }
                 }
 
-                ChatMessage::ToolResult(result) => {
+                ChatMessage::ToolResult { ref content, elapsed_ms } => {
+                    let result = content;
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
                     let style = if is_error {
@@ -607,12 +611,23 @@ impl App {
                         result_lines.len().min(max_show)
                     };
 
-                    // Success/fail indicator
+                    // Success/fail indicator with elapsed time
                     if !is_error && show > 0 {
-                        lines.push(Line::from(Span::styled(
-                            format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                            Style::default().fg(THEME.tool_result_ok),
-                        )));
+                        let elapsed_str = match elapsed_ms {
+                            Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                            Some(ms) => format!(" {}ms", ms),
+                            None => String::new(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
+                                Style::default().fg(THEME.tool_result_ok),
+                            ),
+                            Span::styled(
+                                elapsed_str,
+                                Style::default().fg(THEME.subagent_time),
+                            ),
+                        ]));
                     }
 
                     for line in &result_lines[..show] {
@@ -1720,6 +1735,7 @@ async fn main() -> Result<()> {
                                 stream = None;
                                 cancel_token = None;
                                 app.streaming = false;
+                                app.subagents.clear();
                                 app.push_msg(ChatMessage::Error("aborted".to_string()));
                             }
                             (KeyCode::Enter, _) if !app.streaming && !app.input.is_empty() => {
@@ -2096,6 +2112,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         StreamEvent::ToolUse { tool_name, input, .. } => {
+                            app.tool_start_time = Some(std::time::Instant::now());
                             let input_str = serde_json::to_string(&input).unwrap_or_default();
                             if let Some(last) = app.messages.last_mut() {
                                 if let ChatMessage::ToolUseStart(name, _) = &last.msg {
@@ -2111,25 +2128,28 @@ async fn main() -> Result<()> {
                         }
                         StreamEvent::ToolResultDelta { delta, .. } => {
                             if let Some(last) = app.messages.last_mut() {
-                                if let ChatMessage::ToolResult(ref mut current) = last.msg {
-                                    current.push_str(&delta);
+                                if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
+                                    content.push_str(&delta);
                                     app.dirty = true;
                                     app.line_cache.clear();
                                     continue;
                                 }
                             }
-                            app.push_msg(ChatMessage::ToolResult(delta));
+                            app.push_msg(ChatMessage::ToolResult { content: delta, elapsed_ms: None });
                         }
                         StreamEvent::ToolResult { result, .. } => {
+                            let elapsed = app.tool_start_time.take()
+                                .map(|t| t.elapsed().as_millis() as u64);
                             if let Some(last) = app.messages.last_mut() {
-                                if let ChatMessage::ToolResult(ref mut current) = last.msg {
-                                    *current = result;
+                                if let ChatMessage::ToolResult { ref mut content, elapsed_ms: ref mut el, .. } = last.msg {
+                                    *content = result;
+                                    *el = elapsed;
                                     app.dirty = true;
                                     app.line_cache.clear();
                                     continue;
                                 }
                             }
-                            app.push_msg(ChatMessage::ToolResult(result));
+                            app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms: elapsed });
                         }
                         StreamEvent::MessageHistory(history) => {
                             app.api_messages = history;
@@ -2172,13 +2192,15 @@ async fn main() -> Result<()> {
                             output_tokens,
                             cache_read_input_tokens,
                             cache_creation_input_tokens,
+                            model: usage_model,
                         } => {
+                            let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
                             app.add_usage(
                                 input_tokens,
                                 output_tokens,
                                 cache_read_input_tokens,
                                 cache_creation_input_tokens,
-                                runtime.model(),
+                                model_for_pricing,
                             );
                         }
                         StreamEvent::Done => {

@@ -67,6 +67,8 @@ pub enum StreamEvent {
         output_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        /// Model that generated this usage. None = use parent runtime's model.
+        model: Option<String>,
     },
     Done,
     Error(String),
@@ -948,6 +950,7 @@ impl Runtime {
                                     output_tokens: output_t,
                                     cache_read_input_tokens: cache_read,
                                     cache_creation_input_tokens: cache_create,
+                                    model: None,
                                 });
                             }
                         }
@@ -966,6 +969,7 @@ impl Runtime {
                                         output_tokens: output_t,
                                         cache_read_input_tokens: cache_read,
                                         cache_creation_input_tokens: cache_create,
+                                        model: None,
                                     });
                                 }
                             }

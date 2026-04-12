@@ -418,6 +418,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                 output_tokens,
                 cache_read_input_tokens: _,
                 cache_creation_input_tokens: _,
+                model: _,
             } => {
                 state.add_usage(input_tokens, output_tokens, &model).await;
                 let _ = broadcast.send(ServerMessage::Usage { input_tokens, output_tokens });

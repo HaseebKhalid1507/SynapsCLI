@@ -658,6 +658,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
     // Channels for results and token usage
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
     let label_inner = label.clone();
+    let model_inner = model.clone();
     let tx_events_inner = tx_events.clone();
 
     // Shutdown signal — when this sender is dropped (parent cancelled/abort),
@@ -747,6 +748,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
                             crate::StreamEvent::Usage {
                                 input_tokens, output_tokens,
                                 cache_read_input_tokens, cache_creation_input_tokens,
+                                model: _,
                             } => {
                                 total_input_tokens += input_tokens;
                                 total_output_tokens += output_tokens;
@@ -768,6 +770,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
 
             Ok(SubagentResult {
                 text: final_text,
+                model: model_inner,
                 input_tokens: total_input_tokens,
                 output_tokens: total_output_tokens,
                 cache_read: total_cache_read,
@@ -795,13 +798,14 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
         Ok(Ok(sa_result)) => {
             let preview: String = sa_result.text.chars().take(120).collect();
 
-            // Forward token usage to parent session
+            // Forward token usage to parent session with subagent's model for correct pricing
             if let Some(ref tx) = tx_events {
                 let _ = tx.send(crate::StreamEvent::Usage {
                     input_tokens: sa_result.input_tokens,
                     output_tokens: sa_result.output_tokens,
                     cache_read_input_tokens: sa_result.cache_read,
                     cache_creation_input_tokens: sa_result.cache_creation,
+                    model: Some(sa_result.model),
                 });
                 let _ = tx.send(crate::StreamEvent::SubagentDone {
                     agent_name: label.clone(),
@@ -853,6 +857,7 @@ async fn execute_subagent(params: Value, tx_events: Option<tokio::sync::mpsc::Un
 
 struct SubagentResult {
     text: String,
+    model: String,
     input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
