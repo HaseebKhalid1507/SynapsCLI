@@ -1093,4 +1093,211 @@ mod tests {
         assert!(params["properties"].is_object());
         assert!(params["required"].is_array());
     }
+
+    // ── Async Integration Tests ──────────────────────────────────────────
+
+    use tokio;
+
+    fn create_tool_context() -> ToolContext {
+        ToolContext {
+            tx_delta: None,
+            tx_events: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("read_tool_test.txt");
+        
+        // Create temp file with known content
+        let content = "line 1\nline 2\nline 3\nline 4\nline 5";
+        std::fs::write(&test_file, content).unwrap();
+        
+        let tool = ReadTool;
+        let ctx = create_tool_context();
+        
+        // Test basic read
+        let params = json!({
+            "path": test_file.to_string_lossy()
+        });
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // Verify line numbers and content
+        assert!(result.contains("1\tline 1"));
+        assert!(result.contains("2\tline 2"));
+        assert!(result.contains("5\tline 5"));
+        
+        // Test with offset and limit
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "offset": 2,
+            "limit": 2
+        });
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        assert!(result.contains("3\tline 3"));
+        assert!(result.contains("4\tline 4"));
+        assert!(!result.contains("1\tline 1"));
+        assert!(!result.contains("5\tline 5"));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("write_tool_test.txt");
+        
+        let tool = WriteTool;
+        let ctx = create_tool_context();
+        
+        let content = "Hello, world!\nThis is a test file.";
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "content": content
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // Verify success message
+        assert!(result.contains("Wrote 2 lines"));
+        assert!(result.contains("bytes"));
+        
+        // Verify file was created with correct content
+        let written_content = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(written_content, content);
+        
+        // Test parent directory creation
+        let nested_file = temp_dir.join("nested").join("dir").join("test.txt");
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": nested_file.to_string_lossy(),
+            "content": "nested content"
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        assert!(result.contains("Wrote"));
+        
+        let nested_content = std::fs::read_to_string(&nested_file).unwrap();
+        assert_eq!(nested_content, "nested content");
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+        let _ = std::fs::remove_dir_all(temp_dir.join("nested"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("edit_tool_test.txt");
+        
+        // Create file with known content
+        let initial_content = "Hello world\nThis is a test\nEnd of file";
+        std::fs::write(&test_file, initial_content).unwrap();
+        
+        let tool = EditTool;
+        
+        // Test successful replacement
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "This is a test",
+            "new_string": "This is modified"
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        assert!(result.contains("Edited"));
+        assert!(result.contains("replaced 1 line(s) with 1 line(s)"));
+        
+        let modified_content = std::fs::read_to_string(&test_file).unwrap();
+        assert!(modified_content.contains("This is modified"));
+        assert!(!modified_content.contains("This is a test"));
+        
+        // Test old_string not found
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "nonexistent string",
+            "new_string": "replacement"
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("old_string not found"));
+        
+        // Test old_string found multiple times
+        std::fs::write(&test_file, "test\ntest\nother").unwrap();
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "test",
+            "new_string": "replacement"
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("found 2 times"));
+        assert!(error_msg.contains("must be unique"));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_ls_tool_execution() {
+        let tool = LsTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "path": "/tmp"
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // Verify output is non-empty (should contain at least total line)
+        assert!(!result.is_empty());
+        // ls -lah should include total line or files/directories
+        assert!(result.contains("total") || result.len() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_execution() {
+        let tool = BashTool;
+        
+        // Test simple echo command
+        let ctx = create_tool_context();
+        let params = json!({
+            "command": "echo hello"
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        assert!(result.contains("hello"));
+        
+        // Test timeout parameter with quick command
+        let ctx = create_tool_context();
+        let params = json!({
+            "command": "sleep 1",
+            "timeout": 2
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        // Should succeed (1 second sleep with 2 second timeout)
+        assert!(result.is_ok());
+        
+        // Test timeout with longer command
+        let ctx = create_tool_context();
+        let params = json!({
+            "command": "sleep 3",
+            "timeout": 1
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        // Should timeout
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
 }

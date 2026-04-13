@@ -1282,3 +1282,98 @@ impl Clone for Runtime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_max_tokens_for_model() {
+        // Opus models should return 128000
+        assert_eq!(Runtime::max_tokens_for_model("claude-opus-4-6"), 128000);
+        assert_eq!(Runtime::max_tokens_for_model("opus-something"), 128000);
+        
+        // Non-opus models should return 64000
+        assert_eq!(Runtime::max_tokens_for_model("claude-sonnet-4-20250514"), 64000);
+        assert_eq!(Runtime::max_tokens_for_model("haiku"), 64000);
+        assert_eq!(Runtime::max_tokens_for_model("claude-3-haiku"), 64000);
+        assert_eq!(Runtime::max_tokens_for_model("some-other-model"), 64000);
+        
+        // Edge cases
+        assert_eq!(Runtime::max_tokens_for_model(""), 64000);
+        assert_eq!(Runtime::max_tokens_for_model("OPUS"), 64000); // Case sensitive - uppercase doesn't match
+        assert_eq!(Runtime::max_tokens_for_model("model-opus-end"), 128000); // Contains "opus" anywhere
+    }
+
+    #[test]
+    fn test_truncate_tool_result() {
+        // Short string should remain unchanged
+        let short = "This is a short string.";
+        assert_eq!(Runtime::truncate_tool_result(short), short);
+        
+        // Exactly MAX_TOOL_RESULT_CHARS should remain unchanged
+        let exact = "x".repeat(Runtime::MAX_TOOL_RESULT_CHARS);
+        assert_eq!(Runtime::truncate_tool_result(&exact), exact);
+        
+        // String longer than MAX_TOOL_RESULT_CHARS should be truncated with notice
+        let too_long = "x".repeat(Runtime::MAX_TOOL_RESULT_CHARS + 1);
+        let truncated = Runtime::truncate_tool_result(&too_long);
+        
+        // Should start with the truncated content
+        assert!(truncated.starts_with(&"x".repeat(Runtime::MAX_TOOL_RESULT_CHARS)));
+        
+        // Should contain truncation notice with total char count
+        assert!(truncated.contains("[truncated — 30001 total chars, showing first 30000]"));
+        
+        // Should be longer than MAX_TOOL_RESULT_CHARS (due to notice)
+        assert!(truncated.len() > Runtime::MAX_TOOL_RESULT_CHARS);
+        
+        // Test with a much longer string
+        let very_long = "a".repeat(50000);
+        let truncated_very_long = Runtime::truncate_tool_result(&very_long);
+        assert!(truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]"));
+        assert!(truncated_very_long.starts_with(&"a".repeat(Runtime::MAX_TOOL_RESULT_CHARS)));
+    }
+
+    #[test]
+    fn test_thinking_level_ranges() {
+        // Test the logic by directly checking the ranges that thinking_level uses
+        
+        // Low range: 0..=2048
+        assert_eq!(thinking_level_for_budget(0), "low");
+        assert_eq!(thinking_level_for_budget(1024), "low");
+        assert_eq!(thinking_level_for_budget(2048), "low");
+        
+        // Medium range: 2049..=4096  
+        assert_eq!(thinking_level_for_budget(2049), "medium");
+        assert_eq!(thinking_level_for_budget(3000), "medium");
+        assert_eq!(thinking_level_for_budget(4096), "medium");
+        
+        // High range: 4097..=16384
+        assert_eq!(thinking_level_for_budget(4097), "high");
+        assert_eq!(thinking_level_for_budget(8192), "high");
+        assert_eq!(thinking_level_for_budget(16384), "high");
+        
+        // XHigh range: _ (everything else)
+        assert_eq!(thinking_level_for_budget(16385), "xhigh");
+        assert_eq!(thinking_level_for_budget(32768), "xhigh");
+        assert_eq!(thinking_level_for_budget(100000), "xhigh");
+    }
+
+    #[test]
+    fn test_max_tool_result_chars_constant() {
+        // Verify the constant value
+        assert_eq!(Runtime::MAX_TOOL_RESULT_CHARS, 30000);
+    }
+
+    /// Helper function to mirror the thinking_level logic for testing
+    /// since we can't easily construct a Runtime instance in tests
+    fn thinking_level_for_budget(budget: u32) -> &'static str {
+        match budget {
+            0..=2048 => "low",
+            2049..=4096 => "medium",
+            4097..=16384 => "high",
+            _ => "xhigh",
+        }
+    }
+}

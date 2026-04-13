@@ -653,3 +653,102 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
 
     (None, None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_code_verifier() {
+        // Test that result is non-empty
+        let verifier = generate_code_verifier();
+        assert!(!verifier.is_empty(), "Code verifier should not be empty");
+
+        // Test that length is reasonable (>20 chars)
+        assert!(verifier.len() > 20, "Code verifier should be longer than 20 characters");
+
+        // Test that two calls produce different values
+        let verifier2 = generate_code_verifier();
+        assert_ne!(verifier, verifier2, "Two calls should produce different verifiers");
+    }
+
+    #[test]
+    fn test_generate_code_challenge() {
+        let verifier = "test_verifier_123";
+        
+        // Test that result is non-empty
+        let challenge = generate_code_challenge(verifier);
+        assert!(!challenge.is_empty(), "Code challenge should not be empty");
+
+        // Test that same verifier produces same challenge (deterministic)
+        let challenge2 = generate_code_challenge(verifier);
+        assert_eq!(challenge, challenge2, "Same verifier should produce same challenge");
+
+        // Test that different verifiers produce different challenges
+        let different_verifier = "different_verifier_456";
+        let different_challenge = generate_code_challenge(different_verifier);
+        assert_ne!(challenge, different_challenge, "Different verifiers should produce different challenges");
+    }
+
+    #[test]
+    fn test_generate_state() {
+        // Test that result is non-empty
+        let state = generate_state();
+        assert!(!state.is_empty(), "State should not be empty");
+
+        // Test that two calls produce different values
+        let state2 = generate_state();
+        assert_ne!(state, state2, "Two calls should produce different states");
+    }
+
+    #[test]
+    fn test_build_auth_url() {
+        let challenge = "test_challenge";
+        let state = "test_state";
+        let port = 8080;
+
+        let url = build_auth_url(challenge, state, port);
+
+        // Test that URL contains "claude.ai/oauth/authorize"
+        assert!(url.contains("claude.ai/oauth/authorize"), "URL should contain claude.ai/oauth/authorize");
+
+        // Test that URL contains client_id
+        assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"), "URL should contain client_id");
+
+        // Test that URL contains the challenge parameter
+        assert!(url.contains(&format!("code_challenge={}", challenge)), "URL should contain code_challenge parameter");
+
+        // Test that URL contains the state parameter
+        assert!(url.contains(&format!("state={}", state)), "URL should contain state parameter");
+
+        // Test that URL contains redirect_uri with the port (checking for the localhost part)
+        assert!(url.contains("localhost"), "URL should contain localhost");
+        assert!(url.contains(&port.to_string()), "URL should contain the port number");
+        assert!(url.contains("redirect_uri="), "URL should contain redirect_uri parameter");
+    }
+
+    #[test]
+    fn test_is_token_expired() {
+        // Test with expires=0 (expired)
+        let expired_creds = OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: "test_refresh".to_string(),
+            access: "test_access".to_string(),
+            expires: 0, // Definitely expired
+        };
+        assert!(is_token_expired(&expired_creds), "Token with expires=0 should be expired");
+
+        // Test with expires far in future (not expired)
+        let future_time = now_millis() + 3600000; // 1 hour from now
+        let fresh_creds = OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: "test_refresh".to_string(),
+            access: "test_access".to_string(),
+            expires: future_time,
+        };
+        assert!(!is_token_expired(&fresh_creds), "Token with future expires should not be expired");
+
+        // Test with auth_type="oauth" (just to verify the struct works correctly)
+        assert_eq!(fresh_creds.auth_type, "oauth", "Auth type should be oauth");
+    }
+}
