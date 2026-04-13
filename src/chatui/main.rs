@@ -916,7 +916,13 @@ async fn main() -> Result<()> {
                                 sa.done = true;
                                 sa.duration_secs = Some(duration_secs);
                                 let preview: String = result_preview.chars().take(40).collect();
-                                sa.status = format!("\u{2714} {}", preview);
+                                if result_preview.starts_with("[TIMED OUT") {
+                                    sa.status = format!("\u{26a0} timed out");
+                                } else if result_preview.starts_with("ERROR") {
+                                    sa.status = format!("\u{2718} {}", preview);
+                                } else {
+                                    sa.status = format!("\u{2714} {}", preview);
+                                }
                             }
                             app.dirty = true;
                             app.line_cache.clear();

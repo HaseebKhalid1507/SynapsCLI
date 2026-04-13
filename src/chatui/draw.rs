@@ -369,15 +369,25 @@ pub(crate) fn draw(
                 };
 
                 if sa.done {
+                    let is_timeout = sa.status.contains("timed out");
+                    let is_error = sa.status.starts_with("\u{2718}");
+                    let done_color = if is_timeout {
+                        THEME.warning_color
+                    } else if is_error {
+                        THEME.error_color
+                    } else {
+                        THEME.subagent_done
+                    };
+                    let icon = if is_timeout { "  \u{26a0} " } else if is_error { "  \u{2718} " } else { "  \u{2714} " };
                     agent_lines.push(Line::from(vec![
-                        Span::styled("  \u{2714} ", Style::default().fg(THEME.subagent_done)),
+                        Span::styled(icon, Style::default().fg(done_color)),
                         Span::styled(
                             format!("{} ", sa.name),
                             Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             &sa.status,
-                            Style::default().fg(THEME.subagent_done).add_modifier(Modifier::DIM),
+                            Style::default().fg(done_color).add_modifier(Modifier::DIM),
                         ),
                         Span::styled(
                             format!("  {}", time_str),

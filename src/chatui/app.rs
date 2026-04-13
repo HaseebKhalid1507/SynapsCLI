@@ -790,8 +790,11 @@ impl App {
                     let result = content;
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
+                    let is_timeout = result.contains("[TIMED OUT");
                     let style = if is_error {
                         Style::default().fg(THEME.error_color)
+                    } else if is_timeout {
+                        Style::default().fg(THEME.warning_color)
                     } else {
                         Style::default().fg(THEME.tool_result_color)
                     };
@@ -806,7 +809,23 @@ impl App {
 
                     // Success/fail indicator with elapsed time
                     if !is_error && show > 0 {
-                        if elapsed_ms.is_none() && self.tool_start_time.is_some() {
+                        if is_timeout {
+                            let elapsed_str = match elapsed_ms {
+                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                                Some(ms) => format!(" {}ms", ms),
+                                None => String::new(),
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
+                                    Style::default().fg(THEME.warning_color),
+                                ),
+                                Span::styled(
+                                    elapsed_str,
+                                    Style::default().fg(THEME.subagent_time),
+                                ),
+                            ]));
+                        } else if elapsed_ms.is_none() && self.tool_start_time.is_some() {
                             // Tool still executing — show animation
                             let preceding_tool_name = self.find_preceding_tool_name(i);
                             let elapsed_str = if let Some(start) = self.tool_start_time {
