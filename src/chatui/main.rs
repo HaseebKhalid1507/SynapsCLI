@@ -923,11 +923,9 @@ async fn main() -> Result<()> {
                             app.api_messages = history;
                             app.save_session();
                         }
-                        StreamEvent::SubagentStart { agent_name, task_preview } => {
-                            let id = app.next_subagent_id;
-                            app.next_subagent_id += 1;
+                        StreamEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
                             app.subagents.push(SubagentState {
-                                _id: id,
+                                id: subagent_id,
                                 name: agent_name,
                                 status: format!("starting: {}", task_preview),
                                 start_time: std::time::Instant::now(),
@@ -937,16 +935,15 @@ async fn main() -> Result<()> {
                             app.dirty = true;
                             app.line_cache.clear();
                         }
-                        StreamEvent::SubagentUpdate { agent_name, status } => {
-                            // Find the last (most recent) non-done agent with this name
-                            if let Some(sa) = app.subagents.iter_mut().rev().find(|s| s.name == agent_name && !s.done) {
+                        StreamEvent::SubagentUpdate { subagent_id, status, .. } => {
+                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                                 sa.status = status;
                             }
                             app.dirty = true;
                             app.line_cache.clear();
                         }
-                        StreamEvent::SubagentDone { agent_name, result_preview, duration_secs } => {
-                            if let Some(sa) = app.subagents.iter_mut().rev().find(|s| s.name == agent_name && !s.done) {
+                        StreamEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
+                            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                                 sa.done = true;
                                 sa.duration_secs = Some(duration_secs);
                                 let preview: String = result_preview.chars().take(40).collect();

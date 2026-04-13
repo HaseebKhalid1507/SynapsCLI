@@ -2,9 +2,13 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use crate::{Result, RuntimeError};
+
+/// Global counter for unique subagent IDs across all dispatches
+static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn expand_path(path: &str) -> PathBuf {
     if path.starts_with("~/") {
@@ -739,11 +743,13 @@ impl Tool for SubagentTool {
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
         let model = model_override.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
         let task_preview: String = task.chars().take(80).collect();
+        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
 
-        tracing::info!("Dispatching subagent '{}' with model {}", label, model);
+        tracing::info!("Dispatching subagent '{}' (id={}) with model {}", label, subagent_id, model);
 
         if let Some(ref tx) = ctx.tx_events {
             let _ = tx.send(crate::StreamEvent::SubagentStart {
+                subagent_id,
                 agent_name: label.clone(),
                 task_preview: task_preview.clone(),
             });
@@ -805,6 +811,7 @@ impl Tool for SubagentTool {
                                 crate::StreamEvent::Thinking(_) => {
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: "thinking...".to_string(),
                                         });
@@ -817,6 +824,7 @@ impl Tool for SubagentTool {
                                     tool_count += 1;
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: format!("⚙ {} (tool #{})", name, tool_count),
                                         });
@@ -828,6 +836,7 @@ impl Tool for SubagentTool {
                                     tool_log.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: format!("running {}", tool_name),
                                         });
@@ -838,6 +847,7 @@ impl Tool for SubagentTool {
                                     tool_log.push(format!("[tool_result]: {}", preview));
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: format!("done tool #{}", tool_count),
                                         });
@@ -920,6 +930,7 @@ impl Tool for SubagentTool {
                         model: Some(sa_result.model),
                     });
                     let _ = tx.send(crate::StreamEvent::SubagentDone {
+                        subagent_id,
                         agent_name: label.clone(),
                         result_preview: preview,
                         duration_secs: elapsed,
@@ -942,6 +953,7 @@ impl Tool for SubagentTool {
             Ok(Err(e)) => {
                 if let Some(ref tx) = ctx.tx_events {
                     let _ = tx.send(crate::StreamEvent::SubagentDone {
+                        subagent_id,
                         agent_name: label.clone(),
                         result_preview: format!("ERROR: {}", e),
                         duration_secs: elapsed,
@@ -954,6 +966,7 @@ impl Tool for SubagentTool {
             Err(_) => {
                 if let Some(ref tx) = ctx.tx_events {
                     let _ = tx.send(crate::StreamEvent::SubagentDone {
+                        subagent_id,
                         agent_name: label.clone(),
                         result_preview: "Task panicked or dropped".to_string(),
                         duration_secs: elapsed,

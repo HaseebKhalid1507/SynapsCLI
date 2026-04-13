@@ -62,7 +62,6 @@ pub(crate) struct App {
     /// Active subagent status for the live panel
     pub(crate) subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
-    pub(crate) next_subagent_id: u32,
     /// Tracks when the current tool started executing (for elapsed time display)
     pub(crate) tool_start_time: Option<std::time::Instant>,
     /// Saved context from an aborted response — injected into the next user message
@@ -85,7 +84,7 @@ pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", 
 
 #[derive(Clone)]
 pub(crate) struct SubagentState {
-    pub(crate) _id: u32,
+    pub(crate) id: u64,
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) start_time: std::time::Instant,
@@ -122,7 +121,6 @@ impl App {
             logo_build_t: Some(0.0),
             last_line_count: 0,
             subagents: Vec::new(),
-            next_subagent_id: 0,
             tool_start_time: None,
             abort_context: None,
             queued_message: None,

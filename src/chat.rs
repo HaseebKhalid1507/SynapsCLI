@@ -94,11 +94,11 @@ async fn main() -> Result<()> {
                 }
                 StreamEvent::Usage { .. } => {}
                 // Subagent lifecycle — print inline for non-TUI chat
-                StreamEvent::SubagentStart { agent_name, task_preview } => {
+                StreamEvent::SubagentStart { agent_name, task_preview, .. } => {
                     println!("\n\x1b[35m🎭 [{}] dispatched: {}\x1b[0m", agent_name, task_preview);
                     io::stdout().flush().unwrap();
                 }
-                StreamEvent::SubagentUpdate { agent_name, status } => {
+                StreamEvent::SubagentUpdate { agent_name, status, .. } => {
                     print!("\x1b[90m  [{}] {}\x1b[0m\r", agent_name, status);
                     io::stdout().flush().unwrap();
                 }

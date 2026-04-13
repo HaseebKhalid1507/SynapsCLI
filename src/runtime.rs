@@ -49,14 +49,17 @@ pub enum StreamEvent {
     },
     /// Subagent lifecycle events — rendered as a live status panel in the TUI
     SubagentStart {
+        subagent_id: u64,
         agent_name: String,
         task_preview: String,
     },
     SubagentUpdate {
+        subagent_id: u64,
         agent_name: String,
         status: String,
     },
     SubagentDone {
+        subagent_id: u64,
         agent_name: String,
         result_preview: String,
         duration_secs: f64,
