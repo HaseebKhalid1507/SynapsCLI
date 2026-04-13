@@ -145,9 +145,13 @@ async fn main() -> Result<()> {
             app.total_input_tokens = session.total_input_tokens;
             app.total_output_tokens = session.total_output_tokens;
             app.session_cost = session.session_cost;
+            app.abort_context = session.abort_context.clone();
             // Rebuild display messages from api_messages
             rebuild_display_messages(&session.api_messages, &mut app);
             app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
+            if app.abort_context.is_some() {
+                app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
+            }
             app
         }
         None => {
