@@ -945,3 +945,152 @@ struct SubagentResult {
     cache_creation: u64,
     tool_count: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_expand_path_home_prefix() {
+        let home = env::var("HOME").expect("HOME env var should be set");
+        let result = expand_path("~/foo");
+        assert_eq!(result, PathBuf::from(home).join("foo"));
+    }
+
+    #[test]
+    fn test_expand_path_tilde_alone() {
+        let home = env::var("HOME").expect("HOME env var should be set");
+        let result = expand_path("~");
+        assert_eq!(result, PathBuf::from(home));
+    }
+
+    #[test]
+    fn test_expand_path_absolute_unchanged() {
+        let result = expand_path("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_expand_path_relative_unchanged() {
+        let result = expand_path("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_strip_frontmatter_removes_frontmatter() {
+        let content = "---\ntitle: test\ndate: 2023-01-01\n---\nThis is the content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, "This is the content.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_without_frontmatter() {
+        let content = "This is just plain content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_only_opening_delimiter() {
+        let content = "---\ntitle: test\nno closing delimiter";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_bash_tool_schema() {
+        let tool = BashTool;
+        assert_eq!(tool.name(), "bash");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_read_tool_schema() {
+        let tool = ReadTool;
+        assert_eq!(tool.name(), "read");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_write_tool_schema() {
+        let tool = WriteTool;
+        assert_eq!(tool.name(), "write");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_edit_tool_schema() {
+        let tool = EditTool;
+        assert_eq!(tool.name(), "edit");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_grep_tool_schema() {
+        let tool = GrepTool;
+        assert_eq!(tool.name(), "grep");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_find_tool_schema() {
+        let tool = FindTool;
+        assert_eq!(tool.name(), "find");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_ls_tool_schema() {
+        let tool = LsTool;
+        assert_eq!(tool.name(), "ls");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[test]
+    fn test_subagent_tool_schema() {
+        let tool = SubagentTool;
+        assert_eq!(tool.name(), "subagent");
+        assert!(!tool.description().is_empty());
+        
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+}

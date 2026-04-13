@@ -188,3 +188,140 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
 fn sessions_dir() -> PathBuf {
     crate::config::get_active_config_dir().join("sessions")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_session_new() {
+        let session = Session::new("gpt-4", "brief", Some("test prompt"));
+        
+        // Check model and thinking_level are set correctly
+        assert_eq!(session.model, "gpt-4");
+        assert_eq!(session.thinking_level, "brief");
+        assert_eq!(session.system_prompt, Some("test prompt".to_string()));
+        
+        // Check ID is non-empty
+        assert!(!session.id.is_empty());
+        
+        // Check title starts empty
+        assert_eq!(session.title, "");
+        
+        // Check tokens are 0
+        assert_eq!(session.total_input_tokens, 0);
+        assert_eq!(session.total_output_tokens, 0);
+        
+        // Check cost is 0
+        assert_eq!(session.session_cost, 0.0);
+        
+        // Check api_messages is empty
+        assert!(session.api_messages.is_empty());
+        
+        // Test without system prompt
+        let session_no_prompt = Session::new("gpt-3.5-turbo", "normal", None);
+        assert_eq!(session_no_prompt.model, "gpt-3.5-turbo");
+        assert_eq!(session_no_prompt.thinking_level, "normal");
+        assert_eq!(session_no_prompt.system_prompt, None);
+    }
+
+    #[test]
+    fn test_session_auto_title() {
+        let mut session = Session::new("gpt-4", "brief", None);
+        
+        // Add a user message
+        session.api_messages.push(json!({
+            "role": "user",
+            "content": "hello world"
+        }));
+        
+        // Call auto_title
+        session.auto_title();
+        
+        // Check title is set to message content
+        assert_eq!(session.title, "hello world");
+        
+        // Test it doesn't overwrite existing title
+        session.title = "existing title".to_string();
+        session.auto_title();
+        assert_eq!(session.title, "existing title");
+        
+        // Test with empty session (no messages)
+        let mut empty_session = Session::new("gpt-4", "brief", None);
+        empty_session.auto_title();
+        assert_eq!(empty_session.title, "");
+        
+        // Test with non-user message
+        let mut session_no_user = Session::new("gpt-4", "brief", None);
+        session_no_user.api_messages.push(json!({
+            "role": "assistant",
+            "content": "response"
+        }));
+        session_no_user.auto_title();
+        assert_eq!(session_no_user.title, "");
+        
+        // Test with long content (should truncate to 80 chars)
+        let mut session_long = Session::new("gpt-4", "brief", None);
+        let long_content = "a".repeat(100);
+        session_long.api_messages.push(json!({
+            "role": "user",
+            "content": long_content
+        }));
+        session_long.auto_title();
+        assert_eq!(session_long.title.len(), 80);
+        assert_eq!(session_long.title, "a".repeat(80));
+    }
+
+    #[test]
+    fn test_session_info() {
+        let mut session = Session::new("gpt-4", "brief", Some("system prompt"));
+        
+        // Add some messages to test message count
+        session.api_messages.push(json!({
+            "role": "user",
+            "content": "test message"
+        }));
+        session.api_messages.push(json!({
+            "role": "assistant",
+            "content": "test response"
+        }));
+        
+        session.title = "Test Title".to_string();
+        session.session_cost = 0.05;
+        
+        let info = session.info();
+        
+        assert_eq!(info.id, session.id);
+        assert_eq!(info.title, "Test Title");
+        assert_eq!(info.model, "gpt-4");
+        assert_eq!(info.created_at, session.created_at);
+        assert_eq!(info.updated_at, session.updated_at);
+        assert_eq!(info.session_cost, 0.05);
+        assert_eq!(info.message_count, 2);
+    }
+
+    #[test]
+    fn test_session_info_struct() {
+        let now = Utc::now();
+        
+        let session_info = SessionInfo {
+            id: "test-id".to_string(),
+            title: "Test Title".to_string(),
+            model: "gpt-4".to_string(),
+            created_at: now,
+            updated_at: now,
+            session_cost: 1.23,
+            message_count: 5,
+        };
+        
+        // Verify all fields are accessible
+        assert_eq!(session_info.id, "test-id");
+        assert_eq!(session_info.title, "Test Title");
+        assert_eq!(session_info.model, "gpt-4");
+        assert_eq!(session_info.created_at, now);
+        assert_eq!(session_info.updated_at, now);
+        assert_eq!(session_info.session_cost, 1.23);
+        assert_eq!(session_info.message_count, 5);
+    }
+}
