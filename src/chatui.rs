@@ -1414,7 +1414,7 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
 
     // Determine tint based on marker (red for old, green for new, neutral for content)
     let tint = match marker {
-        "−" => (-30i16, -15i16, -15i16),    // shift toward red: reduce green/blue
+        "−" => (40i16, -60i16, -60i16),     // shift toward red: boost red, crush green/blue
         "+" => (-15i16, 10i16, -15i16),      // shift toward green: reduce red/blue
         _ => (0i16, 0i16, 0i16),             // neutral for write content
     };
