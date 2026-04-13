@@ -1,6 +1,36 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Commands sent from CLI to supervisor
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SentinelCommand {
+    Deploy { name: String },
+    Stop { name: String },
+    Status,
+    AgentStatus { name: String },
+}
+
+/// Responses from supervisor to CLI
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SentinelResponse {
+    Ok { message: String },
+    Error { message: String },
+    Status { agents: Vec<AgentStatusInfo> },
+    AgentDetail { info: AgentStatusInfo },
+}
+
+/// Runtime info for a single agent (for status display)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStatusInfo {
+    pub name: String,
+    pub trigger: String,
+    pub status: String,        // "running", "sleeping", "stopped", "crashed"
+    pub session_count: u64,
+    pub uptime_secs: Option<f64>,
+    pub pid: Option<u32>,
+    pub consecutive_crashes: u32,
+}
+
 /// Agent configuration parsed from config.toml
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
