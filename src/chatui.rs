@@ -1227,16 +1227,14 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
 /// Try to syntax-highlight a single tool output line.
 /// Returns Some(spans) if the line looks like code (from read tool), None otherwise.
 fn try_highlight_tool_line(line: &str) -> Option<Vec<Span<'static>>> {
-    // Detect read tool output pattern: "  42 | code here"
-    // The line number + pipe separator is the giveaway
-    let trimmed = line.trim_start();
-    let pipe_idx = trimmed.find('|');
-    if let Some(idx) = pipe_idx {
-        let before = trimmed[..idx].trim();
-        // Check if everything before the pipe is a number (line number)
+    // Detect read tool output pattern: "42\tcode here" (line number + tab)
+    let tab_idx = line.find('\t');
+    if let Some(idx) = tab_idx {
+        let before = line[..idx].trim();
+        // Check if everything before the tab is a number (line number)
         if before.chars().all(|c| c.is_ascii_digit()) && !before.is_empty() {
             let line_num = before;
-            let code = if idx + 1 < trimmed.len() { &trimmed[idx + 1..] } else { "" };
+            let code = &line[idx + 1..];
 
             let ss = &*SYNTAX_SET;
             let ts = &*THEME_SET;
