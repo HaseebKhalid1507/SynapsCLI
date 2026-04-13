@@ -2674,6 +2674,10 @@ async fn main() -> Result<()> {
                     app.push_msg(ChatMessage::System(msg));
                     app.dirty = true;
                     app.line_cache.clear();
+                    // Force immediate redraw so user doesn't see bare tmux
+                    let elapsed = last_frame.elapsed();
+                    last_frame = Instant::now();
+                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                 }
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
@@ -3391,6 +3395,11 @@ async fn main() -> Result<()> {
                             if let Some(msg) = app.reclaim_gamba() {
                                 terminal.clear().ok();
                                 app.push_msg(ChatMessage::System(msg));
+                                app.dirty = true;
+                                app.line_cache.clear();
+                                let elapsed = last_frame.elapsed();
+                                last_frame = Instant::now();
+                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                             }
 
                             // Auto-send queued message if one was typed during streaming
@@ -3435,6 +3444,11 @@ async fn main() -> Result<()> {
                             if let Some(msg) = app.reclaim_gamba() {
                                 terminal.clear().ok();
                                 app.push_msg(ChatMessage::System(msg));
+                                app.dirty = true;
+                                app.line_cache.clear();
+                                let elapsed = last_frame.elapsed();
+                                last_frame = Instant::now();
+                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                             }
                             // Restore a valid trailing state. The runtime guarantees that
                             // each tool_use has a matching tool_result, so we only need to
