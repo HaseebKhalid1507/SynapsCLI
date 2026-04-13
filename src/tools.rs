@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use crate::{Result, RuntimeError};
+use crate::sentinel_types::HandoffState;
 
 /// Global counter for unique subagent IDs across all dispatches
 static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -67,6 +68,7 @@ fn expand_path(path: &str) -> PathBuf {
 pub struct ToolContext {
     pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    pub sentinel_exit_path: Option<PathBuf>,
 }
 
 /// The core trait for all tools. Implement this to add a new tool.
@@ -1071,6 +1073,89 @@ struct SubagentResult {
     tool_count: u32,
 }
 
+// ── Sentinel Exit Tool ─────────────────────────────────────────────────────
+
+pub struct SentinelExitTool;
+
+#[async_trait::async_trait]
+impl Tool for SentinelExitTool {
+    fn name(&self) -> &str { "sentinel_exit" }
+
+    fn description(&self) -> &str {
+        "Signal that you've completed your work. Call this when you're done or at a natural stopping point. Provide a handoff summary for your next session."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "why you're exiting"
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "what you accomplished this session"
+                },
+                "pending": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "tasks still pending"
+                },
+                "context": {
+                    "type": "object",
+                    "description": "any structured data for next session"
+                }
+            },
+            "required": ["reason", "summary"]
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let reason = params["reason"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing reason parameter".to_string()))?;
+        let summary = params["summary"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing summary parameter".to_string()))?;
+        
+        let pending = params["pending"].as_array()
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>())
+            .unwrap_or_default();
+        
+        let context = if params["context"].is_null() {
+            serde_json::Value::Null
+        } else {
+            params["context"].clone()
+        };
+
+        let handoff = HandoffState {
+            summary: summary.to_string(),
+            pending,
+            context,
+        };
+
+        // Write handoff state to the specified path if provided
+        if let Some(ref path) = ctx.sentinel_exit_path {
+            let json_content = serde_json::to_string_pretty(&handoff)
+                .map_err(|e| RuntimeError::Tool(format!("Failed to serialize handoff: {}", e)))?;
+            
+            // Ensure parent directory exists
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    tokio::fs::create_dir_all(parent).await
+                        .map_err(|e| RuntimeError::Tool(format!("Failed to create directories: {}", e)))?;
+                }
+            }
+
+            tokio::fs::write(&path, &json_content).await
+                .map_err(|e| RuntimeError::Tool(format!("Failed to write handoff to '{}': {}", path.display(), e)))?;
+        }
+
+        Ok(format!("Shutdown acknowledged. Handoff saved. Reason: {}", reason))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,6 +1312,7 @@ mod tests {
         ToolContext {
             tx_delta: None,
             tx_events: None,
+            sentinel_exit_path: None,
         }
     }
 
