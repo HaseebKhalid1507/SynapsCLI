@@ -133,6 +133,244 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Built-in theme: "neon-rain" — Cyberpunk/Akira/Blade Runner palette
+    fn neon_rain() -> Self {
+        Self {
+            code_fg: Color::Rgb(0, 240, 255),
+            code_bg: Color::Rgb(10, 6, 18),
+            heading_color: Color::Rgb(255, 46, 136),
+            quote_color: Color::Rgb(106, 90, 122),
+            list_bullet_color: Color::Rgb(252, 238, 10),
+            table_border_color: Color::Rgb(48, 32, 74),
+            table_header_color: Color::Rgb(255, 46, 136),
+            table_cell_color: Color::Rgb(216, 210, 224),
+
+            bg: Color::Rgb(8, 6, 12),
+            border: Color::Rgb(30, 21, 48),
+            border_active: Color::Rgb(255, 46, 136),
+            muted: Color::Rgb(74, 58, 90),
+
+            user_color: Color::Rgb(232, 224, 255),
+            user_bg: Color::Rgb(13, 8, 24),
+            claude_label: Color::Rgb(0, 240, 255),
+            claude_text: Color::Rgb(216, 210, 224),
+            thinking_color: Color::Rgb(58, 42, 74),
+            tool_label: Color::Rgb(255, 46, 136),
+            tool_param: Color::Rgb(106, 74, 122),
+            tool_result_color: Color::Rgb(138, 154, 204),
+            tool_result_ok: Color::Rgb(0, 240, 255),
+            error_color: Color::Rgb(255, 23, 68),
+
+            header_fg: Color::Rgb(255, 46, 136),
+            status_streaming: Color::Rgb(252, 238, 10),
+            status_ready: Color::Rgb(0, 240, 255),
+            help_fg: Color::Rgb(42, 26, 58),
+            input_fg: Color::Rgb(232, 224, 255),
+            prompt_fg: Color::Rgb(255, 46, 136),
+            separator: Color::Rgb(26, 15, 40),
+            cost_color: Color::Rgb(252, 238, 10),
+
+            subagent_border: Color::Rgb(80, 20, 80),
+            subagent_name: Color::Rgb(255, 46, 136),
+            subagent_status: Color::Rgb(160, 120, 200),
+            subagent_done: Color::Rgb(0, 240, 255),
+            subagent_time: Color::Rgb(106, 90, 122),
+        }
+    }
+
+    /// Built-in theme: "amber" — warm CRT/retro terminal
+    fn amber() -> Self {
+        Self {
+            code_fg: Color::Rgb(255, 200, 50),
+            code_bg: Color::Rgb(16, 12, 8),
+            heading_color: Color::Rgb(255, 176, 0),
+            quote_color: Color::Rgb(120, 100, 60),
+            list_bullet_color: Color::Rgb(255, 176, 0),
+            table_border_color: Color::Rgb(60, 45, 20),
+            table_header_color: Color::Rgb(255, 176, 0),
+            table_cell_color: Color::Rgb(200, 180, 140),
+
+            bg: Color::Rgb(10, 8, 5),
+            border: Color::Rgb(40, 30, 15),
+            border_active: Color::Rgb(255, 176, 0),
+            muted: Color::Rgb(80, 65, 35),
+
+            user_color: Color::Rgb(220, 200, 160),
+            user_bg: Color::Rgb(18, 14, 8),
+            claude_label: Color::Rgb(255, 200, 50),
+            claude_text: Color::Rgb(200, 185, 150),
+            thinking_color: Color::Rgb(60, 50, 30),
+            tool_label: Color::Rgb(255, 176, 0),
+            tool_param: Color::Rgb(140, 110, 50),
+            tool_result_color: Color::Rgb(180, 150, 80),
+            tool_result_ok: Color::Rgb(200, 170, 50),
+            error_color: Color::Rgb(255, 80, 40),
+
+            header_fg: Color::Rgb(255, 176, 0),
+            status_streaming: Color::Rgb(255, 220, 100),
+            status_ready: Color::Rgb(200, 170, 50),
+            help_fg: Color::Rgb(50, 40, 20),
+            input_fg: Color::Rgb(220, 200, 160),
+            prompt_fg: Color::Rgb(255, 176, 0),
+            separator: Color::Rgb(30, 22, 10),
+            cost_color: Color::Rgb(255, 200, 50),
+
+            subagent_border: Color::Rgb(60, 45, 20),
+            subagent_name: Color::Rgb(255, 176, 0),
+            subagent_status: Color::Rgb(160, 140, 90),
+            subagent_done: Color::Rgb(200, 170, 50),
+            subagent_time: Color::Rgb(120, 100, 60),
+        }
+    }
+
+    /// Built-in theme: "phosphor" — green monochrome CRT
+    fn phosphor() -> Self {
+        Self {
+            code_fg: Color::Rgb(50, 255, 80),
+            code_bg: Color::Rgb(5, 15, 8),
+            heading_color: Color::Rgb(80, 255, 120),
+            quote_color: Color::Rgb(30, 100, 50),
+            list_bullet_color: Color::Rgb(50, 220, 80),
+            table_border_color: Color::Rgb(20, 60, 30),
+            table_header_color: Color::Rgb(80, 255, 120),
+            table_cell_color: Color::Rgb(60, 200, 90),
+
+            bg: Color::Rgb(3, 8, 5),
+            border: Color::Rgb(15, 40, 20),
+            border_active: Color::Rgb(50, 255, 80),
+            muted: Color::Rgb(25, 70, 35),
+
+            user_color: Color::Rgb(60, 220, 90),
+            user_bg: Color::Rgb(5, 14, 8),
+            claude_label: Color::Rgb(80, 255, 120),
+            claude_text: Color::Rgb(55, 200, 80),
+            thinking_color: Color::Rgb(15, 50, 25),
+            tool_label: Color::Rgb(50, 255, 80),
+            tool_param: Color::Rgb(30, 120, 50),
+            tool_result_color: Color::Rgb(40, 160, 60),
+            tool_result_ok: Color::Rgb(50, 220, 80),
+            error_color: Color::Rgb(255, 60, 60),
+
+            header_fg: Color::Rgb(50, 255, 80),
+            status_streaming: Color::Rgb(80, 255, 120),
+            status_ready: Color::Rgb(50, 220, 80),
+            help_fg: Color::Rgb(15, 40, 20),
+            input_fg: Color::Rgb(60, 220, 90),
+            prompt_fg: Color::Rgb(50, 255, 80),
+            separator: Color::Rgb(10, 25, 12),
+            cost_color: Color::Rgb(80, 255, 120),
+
+            subagent_border: Color::Rgb(20, 60, 30),
+            subagent_name: Color::Rgb(50, 255, 80),
+            subagent_status: Color::Rgb(40, 160, 60),
+            subagent_done: Color::Rgb(80, 255, 120),
+            subagent_time: Color::Rgb(30, 100, 50),
+        }
+    }
+
+    /// Built-in theme: "solarized-dark" — Ethan Schoonover's classic
+    fn solarized_dark() -> Self {
+        Self {
+            code_fg: Color::Rgb(133, 153, 0),   // green
+            code_bg: Color::Rgb(0, 36, 43),      // base03
+            heading_color: Color::Rgb(38, 139, 210), // blue
+            quote_color: Color::Rgb(88, 110, 117),   // base01
+            list_bullet_color: Color::Rgb(42, 161, 152), // cyan
+            table_border_color: Color::Rgb(7, 54, 66),   // base02
+            table_header_color: Color::Rgb(38, 139, 210),
+            table_cell_color: Color::Rgb(147, 161, 161), // base1
+
+            bg: Color::Rgb(0, 43, 54),           // base03
+            border: Color::Rgb(7, 54, 66),       // base02
+            border_active: Color::Rgb(38, 139, 210),
+            muted: Color::Rgb(88, 110, 117),     // base01
+
+            user_color: Color::Rgb(253, 246, 227), // base3
+            user_bg: Color::Rgb(7, 54, 66),
+            claude_label: Color::Rgb(42, 161, 152), // cyan
+            claude_text: Color::Rgb(147, 161, 161),
+            thinking_color: Color::Rgb(7, 54, 66),
+            tool_label: Color::Rgb(38, 139, 210),
+            tool_param: Color::Rgb(88, 110, 117),
+            tool_result_color: Color::Rgb(133, 153, 0),
+            tool_result_ok: Color::Rgb(42, 161, 152),
+            error_color: Color::Rgb(220, 50, 47),   // red
+
+            header_fg: Color::Rgb(131, 148, 150),   // base0
+            status_streaming: Color::Rgb(181, 137, 0), // yellow
+            status_ready: Color::Rgb(42, 161, 152),
+            help_fg: Color::Rgb(7, 54, 66),
+            input_fg: Color::Rgb(238, 232, 213),    // base2
+            prompt_fg: Color::Rgb(42, 161, 152),
+            separator: Color::Rgb(7, 54, 66),
+            cost_color: Color::Rgb(181, 137, 0),
+
+            subagent_border: Color::Rgb(7, 54, 66),
+            subagent_name: Color::Rgb(108, 113, 196), // violet
+            subagent_status: Color::Rgb(88, 110, 117),
+            subagent_done: Color::Rgb(42, 161, 152),
+            subagent_time: Color::Rgb(88, 110, 117),
+        }
+    }
+
+    /// Built-in theme: "blood" — dark red, Doom/horror aesthetic
+    fn blood() -> Self {
+        Self {
+            code_fg: Color::Rgb(255, 100, 80),
+            code_bg: Color::Rgb(15, 5, 5),
+            heading_color: Color::Rgb(255, 50, 50),
+            quote_color: Color::Rgb(100, 50, 50),
+            list_bullet_color: Color::Rgb(200, 60, 60),
+            table_border_color: Color::Rgb(60, 20, 20),
+            table_header_color: Color::Rgb(255, 50, 50),
+            table_cell_color: Color::Rgb(200, 160, 160),
+
+            bg: Color::Rgb(8, 3, 3),
+            border: Color::Rgb(40, 15, 15),
+            border_active: Color::Rgb(255, 50, 50),
+            muted: Color::Rgb(80, 40, 40),
+
+            user_color: Color::Rgb(220, 180, 180),
+            user_bg: Color::Rgb(15, 5, 5),
+            claude_label: Color::Rgb(255, 80, 60),
+            claude_text: Color::Rgb(200, 170, 170),
+            thinking_color: Color::Rgb(50, 25, 25),
+            tool_label: Color::Rgb(255, 50, 50),
+            tool_param: Color::Rgb(140, 70, 70),
+            tool_result_color: Color::Rgb(180, 100, 80),
+            tool_result_ok: Color::Rgb(200, 80, 60),
+            error_color: Color::Rgb(255, 30, 30),
+
+            header_fg: Color::Rgb(255, 50, 50),
+            status_streaming: Color::Rgb(255, 150, 50),
+            status_ready: Color::Rgb(200, 80, 60),
+            help_fg: Color::Rgb(50, 25, 25),
+            input_fg: Color::Rgb(220, 180, 180),
+            prompt_fg: Color::Rgb(255, 50, 50),
+            separator: Color::Rgb(30, 10, 10),
+            cost_color: Color::Rgb(255, 150, 50),
+
+            subagent_border: Color::Rgb(60, 20, 20),
+            subagent_name: Color::Rgb(255, 50, 50),
+            subagent_status: Color::Rgb(160, 80, 80),
+            subagent_done: Color::Rgb(200, 80, 60),
+            subagent_time: Color::Rgb(100, 50, 50),
+        }
+    }
+
+    /// Get a built-in theme by name. Returns None if not found.
+    fn builtin(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::default()),
+            "neon-rain" | "neon_rain" | "neonrain" => Some(Self::neon_rain()),
+            "amber" => Some(Self::amber()),
+            "phosphor" | "green" => Some(Self::phosphor()),
+            "solarized" | "solarized-dark" | "solarized_dark" => Some(Self::solarized_dark()),
+            "blood" | "doom" => Some(Self::blood()),
+            _ => None,
+        }
+    }
+
     /// Load a theme from a simple `key = #hex` file. Lines starting with
     /// `#` are comments; malformed lines and unknown keys are skipped
     /// silently so a bad theme can never take down the UI.
@@ -216,11 +454,34 @@ fn parse_hex_color(s: &str) -> Option<Color> {
     }
 }
 
-/// Global theme, loaded from `~/.synaps-cli/theme` on first access.
-/// Falls back to defaults if the file is missing or malformed.
+/// Global theme, loaded in this order:
+/// 1. `~/.synaps-cli/theme` file (if exists) — overrides everything
+/// 2. `theme = <name>` in config — selects a built-in theme
+/// 3. Falls back to default
 static THEME: LazyLock<Theme> = LazyLock::new(|| {
+    // First check for a theme file (highest priority)
     let path = synaps_cli::config::resolve_read_path("theme");
-    Theme::load_from(&path)
+    if path.exists() {
+        return Theme::load_from(&path);
+    }
+
+    // Then check config for a named built-in theme
+    if let Ok(content) = std::fs::read_to_string(synaps_cli::config::resolve_read_path("config")) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() { continue; }
+            if let Some((key, val)) = line.split_once('=') {
+                if key.trim() == "theme" {
+                    let name = val.trim();
+                    if let Some(theme) = Theme::builtin(name) {
+                        return theme;
+                    }
+                }
+            }
+        }
+    }
+
+    Theme::default()
 });
 
 // -- Data --------------------------------------------------------------------
@@ -2009,7 +2270,7 @@ async fn main() -> Result<()> {
                                     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
                                     let raw_cmd = parts[0];
                                     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-                                    let all_cmds = ["clear", "model", "system", "thinking", "sessions", "resume", "help", "quit", "exit"];
+                                    let all_cmds = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "help", "quit", "exit"];
                                     // Resolve prefix: exact match first, then unique prefix
                                     let cmd = if all_cmds.contains(&raw_cmd) {
                                         raw_cmd.to_string()
@@ -2173,9 +2434,44 @@ async fn main() -> Result<()> {
                                             app.push_msg(ChatMessage::System(
                                                 "/help — show this".to_string()
                                             ));
+                                            app.push_msg(ChatMessage::System(
+                                                "/theme — list available themes".to_string()
+                                            ));
                                         }
                                         "quit" | "exit" => {
                                             exit_fx = Some(quit_effect());
+                                        }
+                                        "theme" => {
+                                            app.push_msg(ChatMessage::System(
+                                                "Available built-in themes:".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  default       — cool teal/green on dark blue-gray".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  neon-rain     — cyberpunk magenta/cyan/yellow (Akira, Blade Runner)".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  amber         — warm CRT amber on black (retro terminal)".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  phosphor      — green monochrome CRT (classic hacker)".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  solarized     — Ethan Schoonover's solarized dark".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "  blood         — dark red, Doom/horror aesthetic".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "Set in ~/.synaps-cli/config: theme = neon-rain".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "Or create ~/.synaps-cli/theme for custom colors (overrides config).".to_string()
+                                            ));
+                                            app.push_msg(ChatMessage::System(
+                                                "Restart to apply.".to_string()
+                                            ));
                                         }
                                         _ => {
                                             app.push_msg(ChatMessage::Error(
@@ -2262,7 +2558,7 @@ async fn main() -> Result<()> {
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
-                                let commands = ["clear", "model", "system", "thinking", "sessions", "resume", "help", "quit", "exit"];
+                                let commands = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "help", "quit", "exit"];
                                 let matches: Vec<&&str> = commands.iter()
                                     .filter(|c| c.starts_with(partial))
                                     .collect();
