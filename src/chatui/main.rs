@@ -398,7 +398,7 @@ async fn main() -> Result<()> {
                                                         let old_id = app.session.id.clone();
                                                         // Rebuild app state from loaded session
                                                         app.messages.clear();
-                                            app.dirty = true;
+                                                        app.dirty = true;
                                                         app.api_messages = session.api_messages.clone();
                                                         app.total_input_tokens = session.total_input_tokens;
                                                         app.total_output_tokens = session.total_output_tokens;
