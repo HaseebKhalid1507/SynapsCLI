@@ -1449,19 +1449,37 @@ fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'static>> {
                         let after_slash = &remaining[path_start..];
                         let path_end = after_slash.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
                             .unwrap_or(after_slash.len());
-                        spans.push(Span::styled(
-                            after_slash[..path_end].to_string(),
-                            Style::default().fg(Color::Rgb(80, 160, 220)),
-                        ));
-                        remaining = &after_slash[path_end..];
+                        // Guard: if path_end is 0, we'd loop forever — consume at least 1 char
+                        if path_end == 0 {
+                            spans.push(Span::styled(
+                                after_slash[..1].to_string(),
+                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                            ));
+                            remaining = &after_slash[1..];
+                        } else {
+                            spans.push(Span::styled(
+                                after_slash[..path_end].to_string(),
+                                Style::default().fg(Color::Rgb(80, 160, 220)),
+                            ));
+                            remaining = &after_slash[path_end..];
+                        }
                     } else {
                         let path_end = remaining.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
                             .unwrap_or(remaining.len());
-                        spans.push(Span::styled(
-                            remaining[..path_end].to_string(),
-                            Style::default().fg(Color::Rgb(80, 160, 220)),
-                        ));
-                        remaining = &remaining[path_end..];
+                        // Guard: if path_end is 0, consume at least 1 char to avoid infinite loop
+                        if path_end == 0 {
+                            spans.push(Span::styled(
+                                remaining[..1].to_string(),
+                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                            ));
+                            remaining = &remaining[1..];
+                        } else {
+                            spans.push(Span::styled(
+                                remaining[..path_end].to_string(),
+                                Style::default().fg(Color::Rgb(80, 160, 220)),
+                            ));
+                            remaining = &remaining[path_end..];
+                        }
                     }
                 } else {
                     // No more paths — output the rest with blue tint
