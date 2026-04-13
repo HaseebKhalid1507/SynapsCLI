@@ -94,7 +94,9 @@ pub(crate) fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marke
 pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'static>> {
     let mut result = Vec::new();
 
-    for line in lines {
+    for raw_line in lines {
+        // Replace tabs with spaces — ratatui doesn't handle \t correctly and causes overlap artifacts
+        let line = raw_line.replace('\t', "    ");
         let trimmed = line.trim();
         let mut spans = vec![
             Span::styled(format!("{}       ", margin), Style::default().fg(THEME.tool_result_color)),
@@ -119,7 +121,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
             spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.tool_result_ok)));
         } else {
             // Default: blue-tinted with smart coloring
-            let mut remaining = *line;
+            let mut remaining = line.as_str();
             while !remaining.is_empty() {
                 // Find paths (contain /)
                 if let Some(slash_pos) = remaining.find('/') {
