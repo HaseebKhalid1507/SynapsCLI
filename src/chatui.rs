@@ -551,6 +551,8 @@ struct App {
     spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     status_text: Option<String>,
+    /// GamblersDen child process — spawned by /gamba, killed when streaming finishes
+    gamba_child: Option<std::process::Child>,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -627,6 +629,48 @@ impl App {
             pasted_char_count: 0,
             spinner_frame: 0,
             status_text: None,
+            gamba_child: None,
+        }
+    }
+
+    /// Kill the GamblersDen child process and reclaim the terminal.
+    /// Returns a message to display, or None if no casino was running.
+    fn reclaim_gamba(&mut self) -> Option<String> {
+        if let Some(mut child) = self.gamba_child.take() {
+            // Kill it (SIGKILL) and wait to reap
+            child.kill().ok();
+            child.wait().ok();
+            // Reclaim terminal
+            crossterm::terminal::enable_raw_mode().ok();
+            crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::EnterAlternateScreen
+            ).ok();
+            Some("🎰 Back from the casino. Response ready.".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Check if the GamblersDen child exited on its own (user quit the casino).
+    /// Returns a message if it did.
+    fn check_gamba_exited(&mut self) -> Option<String> {
+        if let Some(ref mut child) = self.gamba_child {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    self.gamba_child = None;
+                    // Reclaim terminal
+                    crossterm::terminal::enable_raw_mode().ok();
+                    crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::EnterAlternateScreen
+                    ).ok();
+                    Some("🎰 Back from the casino. How'd you do, degen?".to_string())
+                }
+                _ => None,
+            }
+        } else {
+            None
         }
     }
 
@@ -2624,6 +2668,13 @@ async fn main() -> Result<()> {
                         app.line_cache.clear();
                     }
                 }
+                // Check if casino exited on its own (user quit)
+                if let Some(msg) = app.check_gamba_exited() {
+                    terminal.clear().ok();
+                    app.push_msg(ChatMessage::System(msg));
+                    app.dirty = true;
+                    app.line_cache.clear();
+                }
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
                 }
@@ -2889,46 +2940,50 @@ async fn main() -> Result<()> {
                                             ));
                                         }
                                         "gamba" => {
-                                            // Spawn GamblersDen casino — yield terminal, reclaim on exit
-                                            let gamba_bin = std::env::var("HOME").ok()
-                                                .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
-                                                .filter(|p| p.exists());
-                                            if let Some(bin) = gamba_bin {
-                                                // Tear down our TUI
-                                                crossterm::terminal::disable_raw_mode().ok();
-                                                crossterm::execute!(
-                                                    std::io::stdout(),
-                                                    crossterm::terminal::LeaveAlternateScreen
-                                                ).ok();
-                                                // Run the casino
-                                                let status = std::process::Command::new(&bin)
-                                                    .stdin(std::process::Stdio::inherit())
-                                                    .stdout(std::process::Stdio::inherit())
-                                                    .stderr(std::process::Stdio::inherit())
-                                                    .status();
-                                                // Reclaim terminal
-                                                crossterm::terminal::enable_raw_mode().ok();
-                                                crossterm::execute!(
-                                                    std::io::stdout(),
-                                                    crossterm::terminal::EnterAlternateScreen
-                                                ).ok();
-                                                terminal.clear().ok();
-                                                match status {
-                                                    Ok(s) if s.success() => {
-                                                        app.push_msg(ChatMessage::System(
-                                                            "🎰 Back from the casino. How'd you do, degen?".to_string()
-                                                        ));
-                                                    }
-                                                    _ => {
-                                                        app.push_msg(ChatMessage::System(
-                                                            "🎰 Casino closed unexpectedly. House always wins.".to_string()
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                app.push_msg(ChatMessage::Error(
-                                                    "GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()
+                                            // Spawn GamblersDen casino — yield terminal, reclaim on stream done or manual exit
+                                            if app.gamba_child.is_some() {
+                                                app.push_msg(ChatMessage::System(
+                                                    "🎰 Casino already running!".to_string()
                                                 ));
+                                            } else {
+                                                let gamba_bin = std::env::var("HOME").ok()
+                                                    .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+                                                    .filter(|p| p.exists());
+                                                if let Some(bin) = gamba_bin {
+                                                    // Tear down our TUI
+                                                    crossterm::terminal::disable_raw_mode().ok();
+                                                    crossterm::execute!(
+                                                        std::io::stdout(),
+                                                        crossterm::terminal::LeaveAlternateScreen
+                                                    ).ok();
+                                                    // Spawn the casino (non-blocking)
+                                                    match std::process::Command::new(&bin)
+                                                        .stdin(std::process::Stdio::inherit())
+                                                        .stdout(std::process::Stdio::inherit())
+                                                        .stderr(std::process::Stdio::inherit())
+                                                        .spawn()
+                                                    {
+                                                        Ok(child) => {
+                                                            app.gamba_child = Some(child);
+                                                        }
+                                                        Err(e) => {
+                                                            // Failed to spawn — reclaim terminal
+                                                            crossterm::terminal::enable_raw_mode().ok();
+                                                            crossterm::execute!(
+                                                                std::io::stdout(),
+                                                                crossterm::terminal::EnterAlternateScreen
+                                                            ).ok();
+                                                            terminal.clear().ok();
+                                                            app.push_msg(ChatMessage::Error(
+                                                                format!("Failed to launch casino: {}", e)
+                                                            ));
+                                                        }
+                                                    }
+                                                } else {
+                                                    app.push_msg(ChatMessage::Error(
+                                                        "GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()
+                                                    ));
+                                                }
                                             }
                                         }
                                         _ => {
@@ -3332,6 +3387,12 @@ async fn main() -> Result<()> {
                             cancel_token = None;
                             steer_tx = None;
 
+                            // Reclaim terminal from casino if running
+                            if let Some(msg) = app.reclaim_gamba() {
+                                terminal.clear().ok();
+                                app.push_msg(ChatMessage::System(msg));
+                            }
+
                             // Auto-send queued message if one was typed during streaming
                             if let Some(queued) = app.queued_message.take() {
                                 app.push_msg(ChatMessage::User(queued.clone()));
@@ -3370,6 +3431,11 @@ async fn main() -> Result<()> {
                             stream = None;
                             cancel_token = None;
                             steer_tx = None;
+                            // Reclaim terminal from casino if running
+                            if let Some(msg) = app.reclaim_gamba() {
+                                terminal.clear().ok();
+                                app.push_msg(ChatMessage::System(msg));
+                            }
                             // Restore a valid trailing state. The runtime guarantees that
                             // each tool_use has a matching tool_result, so we only need to
                             // drop an unmatched trailing assistant message or a trailing
