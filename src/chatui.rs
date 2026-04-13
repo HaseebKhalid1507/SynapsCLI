@@ -2132,13 +2132,19 @@ async fn main() -> Result<()> {
                                     // Display: typed text + paste indicator
                                     let display_text = if app.pasted_char_count > 0 {
                                         let typed = app.input_before_paste.as_deref().unwrap_or("");
-                                        let pasted_lines = input.chars().count().saturating_sub(typed.chars().count());
-                                        let paste_content = &input[input.floor_char_boundary(typed.len())..];
+                                        // Use char boundary from char count, not byte len
+                                        let typed_char_count = typed.chars().count();
+                                        let pasted_char_count = input.chars().count().saturating_sub(typed_char_count);
+                                        let paste_byte_start = input.char_indices()
+                                            .nth(typed_char_count)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(input.len());
+                                        let paste_content = &input[paste_byte_start..];
                                         let line_count = paste_content.lines().count();
                                         let paste_label = if line_count > 1 {
                                             format!("[Pasted {} lines]", line_count)
                                         } else {
-                                            format!("[Pasted {} chars]", pasted_lines)
+                                            format!("[Pasted {} chars]", pasted_char_count)
                                         };
                                         if typed.is_empty() {
                                             paste_label
@@ -2327,7 +2333,18 @@ async fn main() -> Result<()> {
                     Some(Ok(Event::Paste(text))) => {
                         // Bracketed paste — insert the full text (newlines included)
                         // into the input buffer at cursor position
+                        const MAX_PASTE_CHARS: usize = 100_000;
                         if !app.streaming || !app.input.is_empty() {
+                            // Cap paste size to prevent OOM
+                            let text = if text.chars().count() > MAX_PASTE_CHARS {
+                                let truncated: String = text.chars().take(MAX_PASTE_CHARS).collect();
+                                app.push_msg(ChatMessage::System(
+                                    format!("Paste truncated to {} chars (was {})", MAX_PASTE_CHARS, text.chars().count())
+                                ));
+                                truncated
+                            } else {
+                                text
+                            };
                             // Snapshot input before first paste so we can show typed text separately
                             if app.input_before_paste.is_none() {
                                 app.input_before_paste = Some(app.input.clone());
