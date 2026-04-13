@@ -2070,6 +2070,10 @@ fn draw(
     exit_effect: &mut Option<Effect>,
     elapsed: std::time::Duration,
 ) -> io::Result<()> {
+    // Don't draw while casino owns the terminal
+    if app.gamba_child.is_some() {
+        return Ok(());
+    }
     terminal.draw(|frame| {
         // Subagent panel height: 2 (border top/bottom) + 1 per active agent
         let has_subagents = !app.subagents.is_empty();
