@@ -243,6 +243,8 @@ async fn main() -> Result<()> {
                                     "aborted"
                                 };
                                 app.push_msg(ChatMessage::Error(abort_msg.to_string()));
+                                // Save session so partial work survives /continue
+                                app.save_session();
                             }
                             (KeyCode::Enter, KeyModifiers::SHIFT) if !app.streaming => {
                                 // Shift+Enter inserts a literal newline
