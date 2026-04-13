@@ -813,7 +813,7 @@ impl Tool for SubagentTool {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
                                             subagent_id,
                                             agent_name: label_inner.clone(),
-                                            status: "thinking...".to_string(),
+                                            status: "💭 thinking...".to_string(),
                                         });
                                     }
                                 }
@@ -834,24 +834,69 @@ impl Tool for SubagentTool {
                                     let input_str = input.to_string();
                                     let input_preview: String = input_str.chars().take(200).collect();
                                     tool_log.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
+                                    // Build a rich status from the tool input
+                                    let detail = match tool_name.as_str() {
+                                        "bash" => {
+                                            let cmd = input["command"].as_str().unwrap_or("");
+                                            let preview: String = cmd.chars().take(60).collect();
+                                            format!("$ {}", preview)
+                                        }
+                                        "read" => {
+                                            let path = input["path"].as_str().unwrap_or("?");
+                                            let short = path.rsplit('/').next().unwrap_or(path);
+                                            format!("reading {}", short)
+                                        }
+                                        "write" => {
+                                            let path = input["path"].as_str().unwrap_or("?");
+                                            let short = path.rsplit('/').next().unwrap_or(path);
+                                            format!("writing {}", short)
+                                        }
+                                        "edit" => {
+                                            let path = input["path"].as_str().unwrap_or("?");
+                                            let short = path.rsplit('/').next().unwrap_or(path);
+                                            format!("editing {}", short)
+                                        }
+                                        "grep" => {
+                                            let pat = input["pattern"].as_str().unwrap_or("?");
+                                            let preview: String = pat.chars().take(30).collect();
+                                            format!("grep /{}/", preview)
+                                        }
+                                        "find" => {
+                                            let pat = input["pattern"].as_str().unwrap_or("?");
+                                            format!("find {}", pat)
+                                        }
+                                        "ls" => {
+                                            let path = input["path"].as_str().unwrap_or(".");
+                                            let short = path.rsplit('/').next().unwrap_or(path);
+                                            format!("ls {}", short)
+                                        }
+                                        "subagent" => {
+                                            let name = input["agent"].as_str()
+                                                .or_else(|| input["system_prompt"].as_str().map(|s| if s.len() > 20 { "inline" } else { s }))
+                                                .unwrap_or("?");
+                                            format!("spawning {}", name)
+                                        }
+                                        other => {
+                                            // MCP or unknown tools — show tool name + first param
+                                            let short_name = if other.starts_with("mcp__") {
+                                                other.splitn(3, "__").last().unwrap_or(other)
+                                            } else {
+                                                other
+                                            };
+                                            format!("{}", short_name)
+                                        }
+                                    };
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
                                             subagent_id,
                                             agent_name: label_inner.clone(),
-                                            status: format!("running {}", tool_name),
+                                            status: detail,
                                         });
                                     }
                                 }
                                 crate::StreamEvent::ToolResult { result, .. } => {
                                     let preview: String = result.chars().take(300).collect();
                                     tool_log.push(format!("[tool_result]: {}", preview));
-                                    if let Some(ref tx) = tx_events_inner {
-                                        let _ = tx.send(crate::StreamEvent::SubagentUpdate {
-                                            subagent_id,
-                                            agent_name: label_inner.clone(),
-                                            status: format!("done tool #{}", tool_count),
-                                        });
-                                    }
                                 }
                                 crate::StreamEvent::Usage {
                                     input_tokens, output_tokens,
