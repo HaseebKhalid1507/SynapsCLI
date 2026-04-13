@@ -10,6 +10,44 @@ use crate::{Result, RuntimeError};
 /// Global counter for unique subagent IDs across all dispatches
 static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Strip ANSI escape sequences from a string.
+/// Handles CSI sequences (\x1b[...X), OSC sequences (\x1b]...\x07), and simple \x1b(X) escapes.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // CSI: consume until a letter (0x40-0x7E)
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c.is_ascii_alphabetic() || c == '~' || c == '@' { break; }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC: consume until BEL (\x07) or ST (\x1b\\)
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c == '\x07' { break; }
+                        if c == '\x1b' {
+                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            break;
+                        }
+                    }
+                }
+                Some(_) => { chars.next(); } // simple two-char escape
+                None => {}
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 fn expand_path(path: &str) -> PathBuf {
     if path.starts_with("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -189,7 +227,7 @@ impl Tool for BashTool {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let msg = format!("{}\n", line);
+                let msg = format!("{}\n", strip_ansi(&line));
                 let _ = tx_o.send(msg.clone());
                 if let Some(ref t) = txd1 { let _ = t.send(msg); }
             }
@@ -201,7 +239,7 @@ impl Tool for BashTool {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let msg = format!("{}\n", line);
+                let msg = format!("{}\n", strip_ansi(&line));
                 let _ = tx_e.send(msg.clone());
                 if let Some(ref t) = txd2 { let _ = t.send(msg); }
             }
