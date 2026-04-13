@@ -39,6 +39,14 @@ fn log(msg: &str) {
     eprintln!("[{}] [sentinel] {}", ts, msg);
 }
 
+fn load_agent_stats(agent_dir: &std::path::Path) -> synaps_cli::sentinel_types::AgentStats {
+    let path = agent_dir.join("stats.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 /// State for a managed agent
 struct ManagedAgent {
     name: String,
@@ -83,16 +91,6 @@ impl ManagedAgent {
         }
     }
 
-    fn uptime_str(&self) -> String {
-        if let Some(start) = self.last_start {
-            if self.is_running() {
-                let secs = start.elapsed().as_secs();
-                if secs < 60 { format!("{}s", secs) }
-                else if secs < 3600 { format!("{}m {}s", secs / 60, secs % 60) }
-                else { format!("{}h {}m", secs / 3600, (secs % 3600) / 60) }
-            } else { "—".to_string() }
-        } else { "—".to_string() }
-    }
 
     fn current_uptime_secs(&self) -> Option<f64> {
         if self.is_running() {
@@ -103,6 +101,9 @@ impl ManagedAgent {
     }
 
     fn to_status_info(&self) -> AgentStatusInfo {
+        let agent_dir = AgentConfig::agent_dir(&self.config_path);
+        let stats = load_agent_stats(&agent_dir);
+        
         AgentStatusInfo {
             name: self.name.clone(),
             trigger: self.config.agent.trigger.clone(),
@@ -111,6 +112,11 @@ impl ManagedAgent {
             uptime_secs: self.current_uptime_secs(),
             pid: self.pid,
             consecutive_crashes: self.consecutive_crashes,
+            cost_today: stats.today.cost_usd,
+            cost_limit: self.config.limits.max_daily_cost_usd,
+            tokens_today: stats.today.tokens,
+            total_sessions: stats.total_sessions,
+            model: self.config.agent.model.clone(),
         }
     }
 }
@@ -329,25 +335,25 @@ fn print_status_table(agents: Vec<AgentStatusInfo>) {
         return;
     }
     
-    println!("{:<15} {:<10} {:<10} {:<10} {:<10} {:<10}", "AGENT", "TRIGGER", "STATUS", "SESSION", "UPTIME", "PID");
-    println!("{}", "─".repeat(75));
+    println!("{:<15} {:<10} {:<10} {:<10} {:<10} {:<12}", "AGENT", "TRIGGER", "STATUS", "SESSION", "UPTIME", "COST TODAY");
+    println!("{}", "─".repeat(80));
     
     for agent in agents {
         let uptime = agent.uptime_secs.map(format_uptime).unwrap_or_else(|| "—".to_string());
-        let pid = agent.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".to_string());
         let session = if agent.session_count > 0 { 
             format!("#{}", agent.session_count) 
         } else { 
             "—".to_string() 
         };
+        let cost = format!("${:.2}/${:.2}", agent.cost_today, agent.cost_limit);
         
-        println!("{:<15} {:<10} {:<10} {:<10} {:<10} {:<10}",
+        println!("{:<15} {:<10} {:<10} {:<10} {:<10} {:<12}",
             agent.name,
             agent.trigger,
             agent.status,
             session,
             uptime,
-            pid
+            cost
         );
     }
 }
@@ -363,6 +369,7 @@ fn print_agent_detail(info: AgentStatusInfo) {
         info.status
     };
     println!("Status: {}", session_str);
+    println!("Model: {}", info.model);
     
     if let Some(pid) = info.pid {
         println!("PID: {}", pid);
@@ -370,8 +377,29 @@ fn print_agent_detail(info: AgentStatusInfo) {
     if let Some(uptime) = info.uptime_secs {
         println!("Uptime: {}", format_uptime(uptime));
     }
-    println!("Sessions: {}", info.session_count);
+    
+    println!("Sessions: {} (total) / {} (today)", info.total_sessions, 
+        if info.session_count > 0 { info.session_count } else { 0 });
+    println!("Cost: ${:.2} today / ${:.2} limit", info.cost_today, info.cost_limit);
+    
+    // Format tokens with commas
+    let tokens_formatted = format_number_with_commas(info.tokens_today);
+    println!("Tokens: {} today", tokens_formatted);
+    
     println!("Crashes: {}", info.consecutive_crashes);
+}
+
+/// Format numbers with commas for readability
+fn format_number_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+    }
+    result
 }
 fn discover_agents() -> Vec<(String, PathBuf)> {
     let dir = sentinel_dir();
@@ -643,6 +671,7 @@ stale_threshold_secs = 120
     std::fs::write(dir.join("config.toml"), config).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("soul.md"), soul).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("handoff.json"), "{}").map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("stats.json"), "{}").map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir.join("logs")).map_err(|e| e.to_string())?;
 
     println!("✓ Agent '{}' created at {}", name, dir.display());
@@ -657,17 +686,8 @@ fn print_status(agents: &HashMap<String, ManagedAgent>) {
         println!("No agents configured. Run: sentinel init <name>");
         return;
     }
-    println!("{:<15} {:<10} {:<10} {:<10} {:<10}", "AGENT", "TRIGGER", "STATUS", "SESSION", "UPTIME");
-    println!("{}", "─".repeat(55));
-    for (_, agent) in agents.iter() {
-        println!("{:<15} {:<10} {:<10} {:<10} {:<10}",
-            agent.name,
-            agent.config.agent.trigger,
-            agent.status_str(),
-            if agent.session_count > 0 { format!("#{}", agent.session_count) } else { "—".to_string() },
-            agent.uptime_str(),
-        );
-    }
+    let infos: Vec<AgentStatusInfo> = agents.values().map(|a| a.to_status_info()).collect();
+    print_status_table(infos);
 }
 
 #[tokio::main]
@@ -813,6 +833,10 @@ async fn main() {
                                     if code == 0 {
                                         log(&format!("[{}] session #{} completed cleanly ({:.0}s)", name, agent.session_count, elapsed));
                                         agent.consecutive_crashes = 0;
+                                    } else if code == 2 {
+                                        log(&format!("[{}] daily cost limit reached — pausing until midnight", name));
+                                        agent.stopped = true;  // Don't restart
+                                        // TODO: could add a midnight reset timer later
                                     } else {
                                         agent.consecutive_crashes += 1;
                                         log(&format!("[{}] session #{} crashed (code: {}, consecutive: {})",
@@ -914,9 +938,16 @@ async fn main() {
                         eprintln!("Error: {}", message);
                         std::process::exit(1);
                     }
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
+                    Err(_e) => {
+                        // Fallback to static detailed status
+                        let config_path = sentinel_dir().join(&*agent_name).join("config.toml");
+                        if let Ok(config) = AgentConfig::load(&config_path) {
+                            let agent = ManagedAgent::new(agent_name.clone(), config_path, config);
+                            print_agent_detail(agent.to_status_info());
+                        } else {
+                            eprintln!("Agent '{}' not found", agent_name);
+                            std::process::exit(1);
+                        }
                     }
                     _ => {
                         eprintln!("Unexpected response from supervisor");

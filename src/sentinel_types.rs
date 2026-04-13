@@ -29,6 +29,12 @@ pub struct AgentStatusInfo {
     pub uptime_secs: Option<f64>,
     pub pid: Option<u32>,
     pub consecutive_crashes: u32,
+    // NEW fields:
+    pub cost_today: f64,
+    pub cost_limit: f64,
+    pub tokens_today: u64,
+    pub total_sessions: u64,
+    pub model: String,
 }
 
 /// Agent configuration parsed from config.toml

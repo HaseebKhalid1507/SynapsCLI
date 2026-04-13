@@ -5,7 +5,7 @@
 //!
 //! Usage: synaps-agent --config <path/to/config.toml>
 
-use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState};
+use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState, sentinel_types::{AgentStats, DailyStats}};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -56,6 +56,14 @@ fn get_session_number(logs_dir: &Path) -> u64 {
     max_session + 1
 }
 
+fn load_stats(agent_dir: &Path) -> AgentStats {
+    let path = agent_dir.join("stats.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() {
     // Parse args
@@ -84,6 +92,15 @@ async fn main() {
 
     let agent_dir = AgentConfig::agent_dir(&config_path);
     let agent_name = &config.agent.name;
+
+    // Load stats and check daily cost limit
+    let stats = load_stats(&agent_dir);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if stats.today.date == today && stats.today.cost_usd >= config.limits.max_daily_cost_usd {
+        log(agent_name, &format!("daily cost limit reached (${:.2}/${:.2}) — exiting", 
+            stats.today.cost_usd, config.limits.max_daily_cost_usd));
+        std::process::exit(2);
+    }
 
     // Setup session logging
     let logs_dir = agent_dir.join("logs");
@@ -412,6 +429,39 @@ async fn main() {
         "session complete — {:.0}s, {} tokens, {} tool calls, ${:.4}",
         elapsed, total_tokens, total_tool_calls, total_cost
     ));
+
+    // Update stats before exit
+    let mut stats = load_stats(&agent_dir);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    
+    // Reset daily stats if it's a new day
+    if stats.today.date != today {
+        stats.today = DailyStats { date: today, sessions: 0, cost_usd: 0.0, tokens: 0 };
+    }
+    
+    // Update
+    stats.total_sessions += 1;
+    stats.total_tokens += total_tokens;
+    stats.total_cost_usd += total_cost;
+    stats.total_uptime_secs += session_start.elapsed().as_secs_f64();
+    stats.today.sessions += 1;
+    stats.today.cost_usd += total_cost;
+    stats.today.tokens += total_tokens;
+    
+    // If we crashed (non-clean exit), record it
+    if !sentinel_exit_called && !interrupted.load(Ordering::Relaxed) {
+        stats.crashes += 1;
+        stats.last_crash = Some(format!("{}: {}", 
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            exit_reason
+        ));
+    }
+    
+    // Write stats
+    let _ = std::fs::write(
+        agent_dir.join("stats.json"),
+        serde_json::to_string_pretty(&stats).unwrap_or_default()
+    );
 
     std::process::exit(0);
 }
