@@ -458,6 +458,90 @@ impl App {
         self.dirty = true;
     }
 
+    pub(crate) fn handle_theme_command(&mut self, arg: &str) {
+        let descriptions: &[(&str, &str)] = &[
+            ("default",        "cool teal on dark blue-gray"),
+            ("neon-rain",      "cyberpunk hot pink + cyan"),
+            ("amber",          "warm CRT retro terminal"),
+            ("phosphor",       "green monochrome CRT"),
+            ("solarized-dark", "Ethan Schoonover's classic"),
+            ("blood",          "dark red, Doom/horror"),
+            ("ocean",          "deep sea bioluminescence"),
+            ("rose-pine",      "elegant muted purples/pinks"),
+            ("nord",           "arctic frost blues"),
+            ("dracula",        "purple/pink/cyan vibrant"),
+            ("monokai",        "classic orange/pink/green"),
+            ("gruvbox",        "warm earthy tones"),
+            ("catppuccin",     "soft pastels, cozy dark"),
+            ("tokyo-night",    "dark blue-purple, soft accents"),
+            ("sunset",         "warm oranges/pinks dusk"),
+            ("ice",            "frozen arctic pale blues"),
+            ("forest",         "deep greens and browns"),
+            ("lavender",       "rich purple/violet"),
+        ];
+
+        if arg.is_empty() {
+            self.push_msg(ChatMessage::System("Available themes:".to_string()));
+            for (name, desc) in descriptions {
+                self.push_msg(ChatMessage::System(format!("  {:<15} — {}", name, desc)));
+            }
+            let themes_dir = synaps_cli::config::base_dir().join("themes");
+            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                let mut custom: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| !descriptions.iter().any(|(d, _)| *d == n.as_str()))
+                    .collect();
+                custom.sort();
+                for name in &custom {
+                    self.push_msg(ChatMessage::System(format!("  {:<15} — custom", name)));
+                }
+            }
+            self.push_msg(ChatMessage::System(String::new()));
+            self.push_msg(ChatMessage::System("Usage: /theme <name> to set. Restart to apply.".to_string()));
+        } else {
+            let name = arg.trim();
+            let is_valid = descriptions.iter().any(|(n, _)| *n == name)
+                || synaps_cli::config::base_dir().join("themes").join(name).exists();
+
+            if is_valid {
+                let config_path = synaps_cli::config::resolve_read_path("config");
+                let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                let mut found = false;
+                let new_content: String = content.lines().map(|line| {
+                    if line.trim().starts_with("theme") && line.contains('=') {
+                        found = true;
+                        format!("theme = {}", name)
+                    } else {
+                        line.to_string()
+                    }
+                }).collect::<Vec<_>>().join("\n");
+                let final_content = if found {
+                    new_content
+                } else {
+                    format!("{}\ntheme = {}", content.trim_end(), name)
+                };
+                let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
+                match std::fs::write(&config_path, final_content) {
+                    Ok(_) => {
+                        self.push_msg(ChatMessage::System(
+                            format!("theme set to: {}. Restart to apply.", name)
+                        ));
+                    }
+                    Err(e) => {
+                        self.push_msg(ChatMessage::Error(
+                            format!("failed to write config: {}", e)
+                        ));
+                    }
+                }
+            } else {
+                self.push_msg(ChatMessage::Error(
+                    format!("unknown theme: '{}'. Use /theme to list available themes.", name)
+                ));
+            }
+        }
+    }
+
     pub(crate) fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
         let m = "   "; // margin
