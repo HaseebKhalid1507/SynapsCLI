@@ -788,6 +788,7 @@ impl Tool for SubagentTool {
 
                 let mut final_text = String::new();
                 let mut tool_count = 0u32;
+                let mut tool_log: Vec<String> = Vec::new();
                 let mut total_input_tokens = 0u64;
                 let mut total_output_tokens = 0u64;
                 let mut total_cache_read = 0u64;
@@ -821,7 +822,10 @@ impl Tool for SubagentTool {
                                         });
                                     }
                                 }
-                                crate::StreamEvent::ToolUse { tool_name, .. } => {
+                                crate::StreamEvent::ToolUse { tool_name, input, .. } => {
+                                    let input_str = input.to_string();
+                                    let input_preview: String = input_str.chars().take(200).collect();
+                                    tool_log.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
                                             agent_name: label_inner.clone(),
@@ -829,7 +833,9 @@ impl Tool for SubagentTool {
                                         });
                                     }
                                 }
-                                crate::StreamEvent::ToolResult { .. } => {
+                                crate::StreamEvent::ToolResult { result, .. } => {
+                                    let preview: String = result.chars().take(300).collect();
+                                    tool_log.push(format!("[tool_result]: {}", preview));
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::SubagentUpdate {
                                             agent_name: label_inner.clone(),
@@ -855,7 +861,25 @@ impl Tool for SubagentTool {
                             }
                         }
                         _ = &mut timeout_fut => {
-                            return Err(format!("Subagent timed out after {}s", timeout_secs));
+                            // Return partial work instead of just an error
+                            let mut partial = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
+                            if !tool_log.is_empty() {
+                                partial.push_str(&tool_log.join("\n"));
+                                partial.push('\n');
+                            }
+                            if !final_text.is_empty() {
+                                partial.push_str("\n[partial response]:\n");
+                                partial.push_str(&final_text);
+                            }
+                            return Ok(SubagentResult {
+                                text: partial,
+                                model: model_inner,
+                                input_tokens: total_input_tokens,
+                                output_tokens: total_output_tokens,
+                                cache_read: total_cache_read,
+                                cache_creation: total_cache_creation,
+                                tool_count,
+                            });
                         }
                     }
                 }
