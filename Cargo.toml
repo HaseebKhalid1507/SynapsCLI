@@ -55,7 +55,7 @@ path = "src/chat.rs"
 
 [[bin]]
 name = "chatui"
-path = "src/chatui.rs"
+path = "src/chatui/main.rs"
 
 [[bin]]
 name = "server"
