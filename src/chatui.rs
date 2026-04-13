@@ -923,20 +923,42 @@ impl App {
                         "thinking".to_string()
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}\u{2502} ", m), dim),
+                        Span::styled(format!("{}╭─ ", m), dim),
                         Span::styled(thinking_label, dim.add_modifier(Modifier::DIM)),
                     ]));
-                    // Body — filtered, capped
-                    let tlines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                    let show = tlines.len().min(6);
-                    for line in &tlines[..show] {
-                        for wline in wrap_text(&format!("{}\u{2502}  {}", m, line.trim()), width) {
-                            lines.push(Line::from(Span::styled(wline, dim_italic)));
+                    // Body — structured with visual hierarchy
+                    let tlines: Vec<&str> = text.lines().collect();
+                    let non_empty: Vec<&&str> = tlines.iter().filter(|l| !l.trim().is_empty()).collect();
+                    let show = non_empty.len().min(8);
+                    for (i, line) in non_empty[..show].iter().enumerate() {
+                        let trimmed = line.trim();
+                        let is_last = i == show - 1 && non_empty.len() <= 8;
+                        let connector = if is_last { "╰" } else { "│" };
+
+                        // Detect structure in thinking
+                        let (prefix_char, line_style) = if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                            ("·", dim_italic)
+                        } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
+                            ("", dim.add_modifier(Modifier::BOLD))
+                        } else if trimmed.starts_with("```") {
+                            ("", dim.add_modifier(Modifier::DIM))
+                        } else {
+                            ("", dim_italic)
+                        };
+
+                        let display = if !prefix_char.is_empty() {
+                            format!("{}{} {} {}", m, connector, prefix_char, trimmed)
+                        } else {
+                            format!("{}{} {}", m, connector, trimmed)
+                        };
+
+                        for wline in wrap_text(&display, width) {
+                            lines.push(Line::from(Span::styled(wline, line_style)));
                         }
                     }
-                    if tlines.len() > 6 {
+                    if non_empty.len() > 8 {
                         lines.push(Line::from(Span::styled(
-                            format!("{}\u{2502}  +{} lines", m, tlines.len() - 6), dim,
+                            format!("{}╰ +{} lines", m, non_empty.len() - 8), dim,
                         )));
                     }
                 }
@@ -1290,6 +1312,13 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
     let mut h = HighlightLines::new(syntax, theme);
     let mut result = Vec::new();
 
+    // Determine tint based on marker (red for old, green for new, neutral for content)
+    let tint = match marker {
+        "−" => (-30i16, -15i16, -15i16),    // shift toward red: reduce green/blue
+        "+" => (-15i16, 10i16, -15i16),      // shift toward green: reduce red/blue
+        _ => (0i16, 0i16, 0i16),             // neutral for write content
+    };
+
     for (i, line) in lines.iter().enumerate() {
         let code_with_nl = format!("{}\n", line);
         let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
@@ -1301,7 +1330,10 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
             ),
         ];
         for (sty, text) in ranges {
-            let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+            let r = (sty.foreground.r as i16 + tint.0).clamp(0, 255) as u8;
+            let g = (sty.foreground.g as i16 + tint.1).clamp(0, 255) as u8;
+            let b = (sty.foreground.b as i16 + tint.2).clamp(0, 255) as u8;
+            let fg = Color::Rgb(r, g, b);
             let content = text.trim_end_matches('\n').to_string();
             if !content.is_empty() {
                 spans.push(Span::styled(content, Style::default().fg(fg)));
@@ -1370,7 +1402,11 @@ fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> Option<Vec<
             ),
         ];
         for (sty, text) in ranges {
-            let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+            // Slight cool tint for read output to differentiate from edit
+            let r = (sty.foreground.r as i16 - 5).clamp(0, 255) as u8;
+            let g = (sty.foreground.g as i16).clamp(0, 255) as u8;
+            let b = (sty.foreground.b as i16 + 10).clamp(0, 255) as u8;
+            let fg = Color::Rgb(r, g, b);
             let content = text.trim_end_matches('\n').to_string();
             if !content.is_empty() {
                 spans.push(Span::styled(content, Style::default().fg(fg)));
