@@ -40,6 +40,7 @@ base64 = "0.22"
 urlencoding = "2"
 url = "2"
 fs4 = "0.13"
+toml = "0.8"
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
@@ -68,6 +69,14 @@ path = "src/client.rs"
 [[bin]]
 name = "login"
 path = "src/login.rs"
+
+[[bin]]
+name = "synaps-agent"
+path = "src/agent.rs"
+
+[[bin]]
+name = "sentinel"
+path = "src/sentinel.rs"
 
 
 [profile.release]
