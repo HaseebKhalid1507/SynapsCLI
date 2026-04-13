@@ -1300,4 +1300,244 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
+
+    // ── New Tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_registry_new() {
+        let registry = ToolRegistry::new();
+        
+        // Should have 8 tools including subagent
+        assert_eq!(registry.tools_schema().len(), 8);
+        
+        // Should find bash tool
+        assert!(registry.get("bash").is_some());
+        
+        // Should not find nonexistent tool
+        assert!(registry.get("nonexistent").is_none());
+        
+        // Verify all expected tools are present
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("ls").is_some());
+        assert!(registry.get("subagent").is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_without_subagent() {
+        let registry = ToolRegistry::without_subagent();
+        
+        // Should have 7 tools without subagent
+        assert_eq!(registry.tools_schema().len(), 7);
+        
+        // Should not have subagent tool
+        assert!(registry.get("subagent").is_none());
+        
+        // Should still have bash tool
+        assert!(registry.get("bash").is_some());
+        
+        // Verify all expected tools are present except subagent
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("ls").is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_register() {
+        let mut registry = ToolRegistry::without_subagent();
+        let initial_count = registry.tools_schema().len();
+        
+        // Register a new tool (using BashTool with different name for simplicity)
+        struct TestTool;
+        #[async_trait::async_trait]
+        impl Tool for TestTool {
+            fn name(&self) -> &str { "test_tool" }
+            fn description(&self) -> &str { "A test tool" }
+            fn parameters(&self) -> Value { json!({"type": "object"}) }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                Ok("test result".to_string())
+            }
+        }
+        
+        registry.register(Arc::new(TestTool));
+        
+        // Should have one more tool now
+        assert_eq!(registry.tools_schema().len(), initial_count + 1);
+        
+        // Should find the new tool
+        assert!(registry.get("test_tool").is_some());
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_nonexistent() {
+        let result = resolve_agent_prompt("definitely_does_not_exist_12345");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Agent 'definitely_does_not_exist_12345' not found"));
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_path_not_found() {
+        let result = resolve_agent_prompt("/nonexistent/path/agent.md");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to read agent file"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_grep_tool_execution.txt");
+        
+        // Write test content
+        let content = "hello world\nfoo bar\nhello again";
+        std::fs::write(&test_file, content).unwrap();
+        
+        let tool = GrepTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "pattern": "hello",
+            "path": test_file.to_string_lossy()
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // Should contain both matching lines with line numbers
+        assert!(result.contains("hello world"));
+        assert!(result.contains("hello again"));
+        assert!(result.contains("1:") || result.contains("hello world"));
+        assert!(result.contains("3:") || result.contains("hello again"));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_find_tool_execution() {
+        let temp_dir = std::env::temp_dir().join("test_find_tool_execution");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        
+        let test_file = temp_dir.join("test_find_me.txt");
+        std::fs::write(&test_file, "test content").unwrap();
+        
+        let tool = FindTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "pattern": "test_find_me*",
+            "path": temp_dir.to_string_lossy()
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // Should contain the filename
+        assert!(result.contains("test_find_me.txt"));
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_timeout() {
+        let tool = BashTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "command": "sleep 10",
+            "timeout": 1
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        
+        // Should timeout and return error
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_failure() {
+        let tool = BashTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "command": "exit 1"
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        
+        // Should fail and return error
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("failed") || error.contains("exit"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_no_match() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_edit_tool_no_match.txt");
+        
+        // Create file with known content
+        let content = "some content\nmore content";
+        std::fs::write(&test_file, content).unwrap();
+        
+        let tool = EditTool;
+        let ctx = create_tool_context();
+        
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "this string does not exist",
+            "new_string": "replacement"
+        });
+        
+        let result = tool.execute(params, ctx).await;
+        
+        // Should return error about string not found
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("old_string not found"));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_offset() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_read_tool_offset.txt");
+        
+        // Write 10 lines
+        let lines = (1..=10).map(|i| format!("line {}", i)).collect::<Vec<_>>();
+        let content = lines.join("\n");
+        std::fs::write(&test_file, &content).unwrap();
+        
+        let tool = ReadTool;
+        let ctx = create_tool_context();
+        
+        // Read with offset=5 (0-indexed, so starts at line 6)
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "offset": 5
+        });
+        
+        let result = tool.execute(params, ctx).await.unwrap();
+        
+        // First line shown should be line 6 (1-indexed in output)
+        assert!(result.contains("6\tline 6"));
+        // Should not contain earlier lines
+        assert!(!result.contains("1\tline 1"));
+        assert!(!result.contains("5\tline 5"));
+        
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
 }

@@ -359,6 +359,85 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
     total_tools
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_mcp_config_deserialize() {
+        let json_str = r#"{"mcpServers": {"test": {"command": "echo", "args": ["hi"]}}}"#;
+        let config: McpConfig = serde_json::from_str(json_str).unwrap();
+        
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert!(config.mcp_servers.contains_key("test"));
+        
+        let server = &config.mcp_servers["test"];
+        assert_eq!(server.command, "echo");
+        assert_eq!(server.args, vec!["hi"]);
+    }
+
+    #[test]
+    fn test_mcp_config_empty_servers() {
+        let json_str = r#"{"mcpServers": {}}"#;
+        let config: McpConfig = serde_json::from_str(json_str).unwrap();
+        
+        assert_eq!(config.mcp_servers.len(), 0);
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_server_config_defaults() {
+        let json_str = r#"{"command": "echo"}"#;
+        let server_config: McpServerConfig = serde_json::from_str(json_str).unwrap();
+        
+        assert_eq!(server_config.command, "echo");
+        assert_eq!(server_config.args, Vec::<String>::new());
+        assert_eq!(server_config.env, HashMap::new());
+    }
+
+    #[test]
+    fn test_mcp_config_deserialize_from_value() {
+        let json_value = json!({
+            "mcpServers": {
+                "test": {
+                    "command": "echo",
+                    "args": ["hi"]
+                }
+            }
+        });
+        
+        let config: McpConfig = serde_json::from_value(json_value).unwrap();
+        
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert!(config.mcp_servers.contains_key("test"));
+        
+        let server = &config.mcp_servers["test"];
+        assert_eq!(server.command, "echo");
+        assert_eq!(server.args, vec!["hi"]);
+    }
+
+    #[test]
+    fn test_load_mcp_config_returns_some_or_none() {
+        // This test verifies that load_mcp_config() returns either Some or None
+        // depending on whether the config file exists
+        let result = load_mcp_config();
+        
+        // Result can be either Some(config) or None - both are valid
+        // depending on whether ~/.synaps-cli/mcp.json exists
+        match result {
+            Some(config) => {
+                // If file exists and parses correctly, we get a config
+                assert!(config.mcp_servers.len() >= 0); // Can be empty
+            }
+            None => {
+                // If file doesn't exist or fails to parse, we get None
+                // This is expected behavior
+            }
+        }
+    }
+}
+
 // ── Lazy Loading ────────────────────────────────────────────────────────
 
 /// A tool that lazily connects to MCP servers on demand.

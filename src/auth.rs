@@ -751,4 +751,106 @@ mod tests {
         // Test with auth_type="oauth" (just to verify the struct works correctly)
         assert_eq!(fresh_creds.auth_type, "oauth", "Auth type should be oauth");
     }
+
+    #[test]
+    fn test_pkce_challenge_sha256() {
+        // Generate a known verifier and verify challenge is correct SHA256
+        let verifier = "test_verifier_string";
+        let challenge = generate_code_challenge(verifier);
+        
+        // Manually compute expected SHA256 of "test_verifier_string"
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        let hash = hasher.finalize();
+        let expected = URL_SAFE_NO_PAD.encode(hash);
+        
+        assert_eq!(challenge, expected, "PKCE challenge should be SHA256 of verifier, base64url-encoded");
+    }
+
+    #[test]
+    fn test_code_verifier_length() {
+        let verifier = generate_code_verifier();
+        assert_eq!(verifier.len(), 43, "Code verifier should be exactly 43 characters (32 bytes base64url without padding)");
+    }
+
+    #[test]
+    fn test_state_length() {
+        let state = generate_state();
+        assert_eq!(state.len(), 43, "State should be exactly 43 characters (32 bytes base64url without padding)");
+    }
+
+    #[test]
+    fn test_build_auth_url_required_params() {
+        let challenge = "test_challenge";
+        let state = "test_state";
+        let port = 8080;
+        
+        let url = build_auth_url(challenge, state, port);
+        
+        // Test that URL contains response_type=code
+        assert!(url.contains("response_type=code"), "URL should contain response_type=code");
+        
+        // Test that URL contains code_challenge_method=S256
+        assert!(url.contains("code_challenge_method=S256"), "URL should contain code_challenge_method=S256");
+        
+        // Test that URL contains scope (URL-encoded)
+        assert!(url.contains("scope="), "URL should contain scope parameter");
+        
+        // Test that URL contains redirect_uri with correct port (URL encoded)
+        assert!(url.contains("redirect_uri="), "URL should contain redirect_uri parameter");
+        assert!(url.contains(&port.to_string()), "URL should contain the port number");
+    }
+
+    #[test]
+    fn test_is_token_expired_edge_cases() {
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        
+        // Test with expires exactly at current time (should be expired)
+        let exactly_now_creds = OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: "test_refresh".to_string(),
+            access: "test_access".to_string(),
+            expires: current_time,
+        };
+        assert!(is_token_expired(&exactly_now_creds), "Token that expires exactly now should be expired");
+        
+        // Test with expires 1ms in the future (should not be expired)
+        let one_ms_future_creds = OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: "test_refresh".to_string(),
+            access: "test_access".to_string(),
+            expires: current_time + 1,
+        };
+        assert!(!is_token_expired(&one_ms_future_creds), "Token that expires 1ms in the future should not be expired");
+    }
+
+    #[test]
+    fn test_auth_file_path() {
+        let path = auth_file_path();
+        let path_str = path.to_string_lossy();
+        assert!(path_str.ends_with("auth.json"), "Auth file path should end with auth.json, got: {}", path_str);
+    }
+
+    #[test]
+    fn test_oauth_credentials_serialization_roundtrip() {
+        let original_creds = OAuthCredentials {
+            auth_type: "oauth".to_string(),
+            refresh: "test_refresh_token".to_string(),
+            access: "test_access_token".to_string(),
+            expires: 1234567890,
+        };
+        
+        // Serialize to JSON
+        let json = serde_json::to_string(&original_creds).expect("Should serialize to JSON");
+        
+        // Deserialize back
+        let deserialized_creds: OAuthCredentials = serde_json::from_str(&json).expect("Should deserialize from JSON");
+        
+        // Verify fields match
+        assert_eq!(original_creds.auth_type, deserialized_creds.auth_type, "Auth type should match after roundtrip");
+        assert_eq!(original_creds.refresh, deserialized_creds.refresh, "Refresh token should match after roundtrip");
+        assert_eq!(original_creds.access, deserialized_creds.access, "Access token should match after roundtrip");
+        assert_eq!(original_creds.expires, deserialized_creds.expires, "Expires timestamp should match after roundtrip");
+    }
 }
