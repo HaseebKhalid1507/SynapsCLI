@@ -633,19 +633,60 @@ impl App {
         }
     }
 
+    /// Restore SynapsCLI's TUI after casino (or failed spawn).
+    fn restore_terminal(&self) {
+        crossterm::terminal::enable_raw_mode().ok();
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen
+        ).ok();
+    }
+
+    /// Yield terminal to casino — tears down TUI, spawns GamblersDen.
+    /// Returns Ok(()) if launched, Err(msg) if failed.
+    fn launch_gamba(&mut self) -> std::result::Result<(), String> {
+        if self.gamba_child.is_some() {
+            return Err("🎰 Casino already running!".to_string());
+        }
+        let bin = match std::env::var("HOME").ok()
+            .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+            .filter(|p| p.exists())
+        {
+            Some(b) => b,
+            None => return Err("GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()),
+        };
+
+        // Tear down our TUI
+        crossterm::terminal::disable_raw_mode().ok();
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen
+        ).ok();
+        // Spawn the casino (non-blocking)
+        match std::process::Command::new(&bin)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => {
+                self.gamba_child = Some(child);
+                Ok(())
+            }
+            Err(e) => {
+                self.restore_terminal();
+                Err(format!("Failed to launch casino: {}", e))
+            }
+        }
+    }
+
     /// Kill the GamblersDen child process and reclaim the terminal.
     /// Returns a message to display, or None if no casino was running.
     fn reclaim_gamba(&mut self) -> Option<String> {
         if let Some(mut child) = self.gamba_child.take() {
-            // Kill it (SIGKILL) and wait to reap
             child.kill().ok();
             child.wait().ok();
-            // Reclaim terminal
-            crossterm::terminal::enable_raw_mode().ok();
-            crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::EnterAlternateScreen
-            ).ok();
+            self.restore_terminal();
             Some("🎰 Back from the casino. Response ready.".to_string())
         } else {
             None
@@ -659,12 +700,7 @@ impl App {
             match child.try_wait() {
                 Ok(Some(_status)) => {
                     self.gamba_child = None;
-                    // Reclaim terminal
-                    crossterm::terminal::enable_raw_mode().ok();
-                    crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::EnterAlternateScreen
-                    ).ok();
+                    self.restore_terminal();
                     Some("🎰 Back from the casino. How'd you do, degen?".to_string())
                 }
                 _ => None,
@@ -2944,49 +2980,11 @@ async fn main() -> Result<()> {
                                             ));
                                         }
                                         "gamba" => {
-                                            // Spawn GamblersDen casino — yield terminal, reclaim on stream done or manual exit
-                                            if app.gamba_child.is_some() {
-                                                app.push_msg(ChatMessage::System(
-                                                    "🎰 Casino already running!".to_string()
-                                                ));
-                                            } else {
-                                                let gamba_bin = std::env::var("HOME").ok()
-                                                    .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
-                                                    .filter(|p| p.exists());
-                                                if let Some(bin) = gamba_bin {
-                                                    // Tear down our TUI
-                                                    crossterm::terminal::disable_raw_mode().ok();
-                                                    crossterm::execute!(
-                                                        std::io::stdout(),
-                                                        crossterm::terminal::LeaveAlternateScreen
-                                                    ).ok();
-                                                    // Spawn the casino (non-blocking)
-                                                    match std::process::Command::new(&bin)
-                                                        .stdin(std::process::Stdio::inherit())
-                                                        .stdout(std::process::Stdio::inherit())
-                                                        .stderr(std::process::Stdio::inherit())
-                                                        .spawn()
-                                                    {
-                                                        Ok(child) => {
-                                                            app.gamba_child = Some(child);
-                                                        }
-                                                        Err(e) => {
-                                                            // Failed to spawn — reclaim terminal
-                                                            crossterm::terminal::enable_raw_mode().ok();
-                                                            crossterm::execute!(
-                                                                std::io::stdout(),
-                                                                crossterm::terminal::EnterAlternateScreen
-                                                            ).ok();
-                                                            terminal.clear().ok();
-                                                            app.push_msg(ChatMessage::Error(
-                                                                format!("Failed to launch casino: {}", e)
-                                                            ));
-                                                        }
-                                                    }
-                                                } else {
-                                                    app.push_msg(ChatMessage::Error(
-                                                        "GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()
-                                                    ));
+                                            match app.launch_gamba() {
+                                                Ok(()) => {} // casino running, terminal yielded
+                                                Err(msg) => {
+                                                    terminal.clear().ok();
+                                                    app.push_msg(ChatMessage::Error(msg));
                                                 }
                                             }
                                         }
@@ -3053,81 +3051,6 @@ async fn main() -> Result<()> {
                             }
                             (KeyCode::Enter, _) if app.streaming && !app.input.is_empty() => {
                                 let input = app.input.clone();
-
-                                // Check for slash commands even while streaming
-                                if input.starts_with('/') {
-                                    let trimmed = input[1..].trim();
-                                    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-                                    let raw_cmd = parts[0];
-                                    // Only handle commands that make sense during streaming
-                                    if raw_cmd == "gamba" || raw_cmd.starts_with("gamb") {
-                                        app.input_history.push(input.clone());
-                                        app.history_index = None;
-                                        app.input_stash.clear();
-                                        app.input.clear();
-                                        app.cursor_pos = 0;
-                                        // Launch casino
-                                        if app.gamba_child.is_some() {
-                                            app.push_msg(ChatMessage::System(
-                                                "🎰 Casino already running!".to_string()
-                                            ));
-                                        } else {
-                                            let gamba_bin = std::env::var("HOME").ok()
-                                                .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
-                                                .filter(|p| p.exists());
-                                            if let Some(bin) = gamba_bin {
-                                                crossterm::terminal::disable_raw_mode().ok();
-                                                crossterm::execute!(
-                                                    std::io::stdout(),
-                                                    crossterm::terminal::LeaveAlternateScreen
-                                                ).ok();
-                                                match std::process::Command::new(&bin)
-                                                    .stdin(std::process::Stdio::inherit())
-                                                    .stdout(std::process::Stdio::inherit())
-                                                    .stderr(std::process::Stdio::inherit())
-                                                    .spawn()
-                                                {
-                                                    Ok(child) => {
-                                                        app.gamba_child = Some(child);
-                                                    }
-                                                    Err(e) => {
-                                                        crossterm::terminal::enable_raw_mode().ok();
-                                                        crossterm::execute!(
-                                                            std::io::stdout(),
-                                                            crossterm::terminal::EnterAlternateScreen
-                                                        ).ok();
-                                                        terminal.clear().ok();
-                                                        app.push_msg(ChatMessage::Error(
-                                                            format!("Failed to launch casino: {}", e)
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                app.push_msg(ChatMessage::Error(
-                                                    "GamblersDen binary not found.".to_string()
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        // Other slash commands during streaming — just queue/steer as normal
-                                        app.input_history.push(input.clone());
-                                        app.history_index = None;
-                                        app.input_stash.clear();
-                                        app.input.clear();
-                                        app.cursor_pos = 0;
-                                        app.input_before_paste = None;
-                                        app.pasted_char_count = 0;
-                                        let steered = steer_tx.as_ref()
-                                            .map(|tx| tx.send(input.clone()).is_ok())
-                                            .unwrap_or(false);
-                                        if steered {
-                                            app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
-                                        } else {
-                                            app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                        }
-                                        app.queued_message = Some(input);
-                                    }
-                                } else {
                                 app.input_history.push(input.clone());
                                 app.history_index = None;
                                 app.input_stash.clear();
@@ -3136,19 +3059,54 @@ async fn main() -> Result<()> {
                                 app.input_before_paste = None;
                                 app.pasted_char_count = 0;
 
-                                // Send to steering channel (injected between tool rounds)
-                                // AND queue as fallback (fires on Done if steering didn't deliver)
-                                let steered = steer_tx.as_ref()
-                                    .map(|tx| tx.send(input.clone()).is_ok())
-                                    .unwrap_or(false);
-
-                                if steered {
-                                    app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                // Intercept slash commands during streaming
+                                if input.starts_with('/') {
+                                    let raw_cmd = input[1..].split_whitespace().next().unwrap_or("");
+                                    // Use same prefix resolution as non-streaming path
+                                    let streaming_cmds = ["gamba", "quit", "exit"];
+                                    let cmd = if streaming_cmds.contains(&raw_cmd) {
+                                        raw_cmd.to_string()
+                                    } else {
+                                        let matches: Vec<&&str> = streaming_cmds.iter().filter(|c| c.starts_with(raw_cmd)).collect();
+                                        if matches.len() == 1 { matches[0].to_string() } else { raw_cmd.to_string() }
+                                    };
+                                    match cmd.as_str() {
+                                        "gamba" => {
+                                            match app.launch_gamba() {
+                                                Ok(()) => {}
+                                                Err(msg) => {
+                                                    terminal.clear().ok();
+                                                    app.push_msg(ChatMessage::Error(msg));
+                                                }
+                                            }
+                                        }
+                                        "quit" | "exit" => {
+                                            exit_fx = Some(quit_effect());
+                                        }
+                                        _ => {
+                                            // Unknown slash — steer/queue as normal
+                                            let steered = steer_tx.as_ref()
+                                                .map(|tx| tx.send(input.clone()).is_ok())
+                                                .unwrap_or(false);
+                                            if steered {
+                                                app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                            } else {
+                                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                            }
+                                            app.queued_message = Some(input);
+                                        }
+                                    }
                                 } else {
-                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                }
-                                // Always set queue as fallback — last message wins
-                                app.queued_message = Some(input);
+                                    // Normal text — steer/queue
+                                    let steered = steer_tx.as_ref()
+                                        .map(|tx| tx.send(input.clone()).is_ok())
+                                        .unwrap_or(false);
+                                    if steered {
+                                        app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                    } else {
+                                        app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                    }
+                                    app.queued_message = Some(input);
                                 }
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
