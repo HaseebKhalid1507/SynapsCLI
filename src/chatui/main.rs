@@ -463,39 +463,79 @@ async fn main() -> Result<()> {
                                                 ("forest",         "deep greens and browns"),
                                                 ("lavender",       "rich purple/violet"),
                                             ];
-                                            app.push_msg(ChatMessage::System(
-                                                "Available themes:".to_string()
-                                            ));
-                                            for (name, desc) in descriptions {
+
+                                            if arg.is_empty() {
+                                                // No arg — list themes
                                                 app.push_msg(ChatMessage::System(
-                                                    format!("  {:<15} — {}", name, desc)
+                                                    "Available themes:".to_string()
                                                 ));
-                                            }
-                                            // Also list any custom user themes
-                                            let themes_dir = synaps_cli::config::base_dir().join("themes");
-                                            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-                                                let mut custom: Vec<String> = entries
-                                                    .filter_map(|e| e.ok())
-                                                    .map(|e| e.file_name().to_string_lossy().to_string())
-                                                    .filter(|n| !descriptions.iter().any(|(d, _)| *d == n.as_str()))
-                                                    .collect();
-                                                custom.sort();
-                                                for name in &custom {
+                                                for (name, desc) in descriptions {
                                                     app.push_msg(ChatMessage::System(
-                                                        format!("  {:<15} — custom", name)
+                                                        format!("  {:<15} — {}", name, desc)
+                                                    ));
+                                                }
+                                                let themes_dir = synaps_cli::config::base_dir().join("themes");
+                                                if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                                                    let mut custom: Vec<String> = entries
+                                                        .filter_map(|e| e.ok())
+                                                        .map(|e| e.file_name().to_string_lossy().to_string())
+                                                        .filter(|n| !descriptions.iter().any(|(d, _)| *d == n.as_str()))
+                                                        .collect();
+                                                    custom.sort();
+                                                    for name in &custom {
+                                                        app.push_msg(ChatMessage::System(
+                                                            format!("  {:<15} — custom", name)
+                                                        ));
+                                                    }
+                                                }
+                                                app.push_msg(ChatMessage::System(String::new()));
+                                                app.push_msg(ChatMessage::System(
+                                                    "Usage: /theme <name> to set. Restart to apply.".to_string()
+                                                ));
+                                            } else {
+                                                // Arg provided — set theme
+                                                let name = arg.trim();
+                                                // Validate: check builtin names or theme file
+                                                let is_valid = descriptions.iter().any(|(n, _)| *n == name)
+                                                    || synaps_cli::config::base_dir().join("themes").join(name).exists();
+
+                                                if is_valid {
+                                                    // Update config file
+                                                    let config_path = synaps_cli::config::resolve_read_path("config");
+                                                    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                                                    let mut found = false;
+                                                    let new_content: String = content.lines().map(|line| {
+                                                        if line.trim().starts_with("theme") && line.contains('=') {
+                                                            found = true;
+                                                            format!("theme = {}", name)
+                                                        } else {
+                                                            line.to_string()
+                                                        }
+                                                    }).collect::<Vec<_>>().join("\n");
+                                                    let final_content = if found {
+                                                        new_content
+                                                    } else {
+                                                        format!("{}\ntheme = {}", content.trim_end(), name)
+                                                    };
+                                                    let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
+                                                    match std::fs::write(&config_path, final_content) {
+                                                        Ok(_) => {
+                                                            app.push_msg(ChatMessage::System(
+                                                                format!("theme set to: {}. Restart to apply.", name)
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            app.push_msg(ChatMessage::Error(
+                                                                format!("failed to write config: {}", e)
+                                                            ));
+                                                        }
+                                                    }
+                                                } else {
+                                                    app.push_msg(ChatMessage::Error(
+                                                        format!("unknown theme: '{}'. Use /theme to list available themes.", name)
                                                     ));
                                                 }
                                             }
-                                            app.push_msg(ChatMessage::System(String::new()));
-                                            app.push_msg(ChatMessage::System(
-                                                "Set in ~/.synaps-cli/config: theme = <name>".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "Edit themes in ~/.synaps-cli/themes/ — no rebuild needed.".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "Restart to apply.".to_string()
-                                            ));
                                         }
                                         "gamba" => {
                                             // Drop event reader so crossterm stops consuming stdin
