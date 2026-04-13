@@ -1068,9 +1068,9 @@ impl App {
                                             let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, &m, marker, marker_color);
                                             lines.extend(hl_lines);
                                         } else {
-                                            for cline in content_lines.iter().take(show) {
+                                            for (ci, cline) in content_lines.iter().take(show).enumerate() {
                                                 lines.push(Line::from(vec![
-                                                    Span::styled(format!("{}      {} ", m, marker), Style::default().fg(marker_color)),
+                                                    Span::styled(format!("{}    {:>3} {} ", m, ci + 1, marker), Style::default().fg(marker_color)),
                                                     Span::styled(cline.to_string(), param_style),
                                                 ]));
                                             }
@@ -1290,13 +1290,13 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
     let mut h = HighlightLines::new(syntax, theme);
     let mut result = Vec::new();
 
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         let code_with_nl = format!("{}\n", line);
         let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
 
         let mut spans = vec![
             Span::styled(
-                format!("{}      {} ", margin, marker),
+                format!("{}    {:>3} {} ", margin, i + 1, marker),
                 Style::default().fg(marker_color),
             ),
         ];
