@@ -89,45 +89,45 @@ struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            code_fg: Color::Rgb(180, 210, 160),
-            code_bg: Color::Rgb(22, 26, 30),
-            heading_color: Color::Rgb(140, 220, 200),
-            quote_color: Color::Rgb(100, 110, 130),
-            list_bullet_color: Color::Rgb(80, 200, 160),
-            table_border_color: Color::Rgb(55, 75, 65),
-            table_header_color: Color::Rgb(140, 220, 200),
-            table_cell_color: Color::Rgb(180, 190, 205),
+            code_fg: Color::Rgb(170, 210, 220),
+            code_bg: Color::Rgb(14, 18, 24),
+            heading_color: Color::Rgb(80, 210, 230),
+            quote_color: Color::Rgb(85, 100, 120),
+            list_bullet_color: Color::Rgb(50, 190, 210),
+            table_border_color: Color::Rgb(35, 55, 70),
+            table_header_color: Color::Rgb(80, 210, 230),
+            table_cell_color: Color::Rgb(175, 185, 200),
 
-            bg: Color::Rgb(12, 14, 18),
-            border: Color::Rgb(35, 40, 50),
-            border_active: Color::Rgb(80, 180, 150),
-            muted: Color::Rgb(55, 62, 75),
+            bg: Color::Rgb(10, 12, 18),
+            border: Color::Rgb(28, 36, 50),
+            border_active: Color::Rgb(50, 180, 210),
+            muted: Color::Rgb(50, 58, 72),
 
-            user_color: Color::Rgb(190, 200, 220),
-            user_bg: Color::Rgb(20, 24, 32),
-            claude_label: Color::Rgb(80, 200, 160),
-            claude_text: Color::Rgb(195, 200, 210),
-            thinking_color: Color::Rgb(65, 75, 95),
-            tool_label: Color::Rgb(100, 180, 220),
-            tool_param: Color::Rgb(80, 110, 140),
-            tool_result_color: Color::Rgb(65, 130, 100),
-            tool_result_ok: Color::Rgb(60, 160, 110),
-            error_color: Color::Rgb(220, 80, 80),
+            user_color: Color::Rgb(185, 195, 215),
+            user_bg: Color::Rgb(16, 20, 30),
+            claude_label: Color::Rgb(50, 200, 220),
+            claude_text: Color::Rgb(192, 198, 210),
+            thinking_color: Color::Rgb(45, 55, 75),
+            tool_label: Color::Rgb(70, 170, 220),
+            tool_param: Color::Rgb(65, 100, 135),
+            tool_result_color: Color::Rgb(55, 120, 130),
+            tool_result_ok: Color::Rgb(50, 175, 160),
+            error_color: Color::Rgb(230, 70, 70),
 
-            header_fg: Color::Rgb(120, 130, 150),
-            status_streaming: Color::Rgb(220, 170, 70),
-            status_ready: Color::Rgb(80, 200, 160),
-            help_fg: Color::Rgb(50, 58, 70),
-            input_fg: Color::Rgb(190, 195, 205),
-            prompt_fg: Color::Rgb(80, 180, 150),
-            separator: Color::Rgb(30, 35, 45),
-            cost_color: Color::Rgb(180, 140, 200),
+            header_fg: Color::Rgb(110, 125, 150),
+            status_streaming: Color::Rgb(220, 175, 60),
+            status_ready: Color::Rgb(50, 195, 190),
+            help_fg: Color::Rgb(42, 52, 68),
+            input_fg: Color::Rgb(188, 195, 210),
+            prompt_fg: Color::Rgb(50, 180, 210),
+            separator: Color::Rgb(24, 30, 42),
+            cost_color: Color::Rgb(210, 170, 80),
 
-            subagent_border: Color::Rgb(60, 50, 90),
-            subagent_name: Color::Rgb(180, 140, 220),
-            subagent_status: Color::Rgb(140, 160, 180),
-            subagent_done: Color::Rgb(80, 200, 160),
-            subagent_time: Color::Rgb(100, 110, 130),
+            subagent_border: Color::Rgb(40, 45, 75),
+            subagent_name: Color::Rgb(140, 130, 220),
+            subagent_status: Color::Rgb(120, 140, 170),
+            subagent_done: Color::Rgb(50, 195, 190),
+            subagent_time: Color::Rgb(80, 95, 120),
         }
     }
 }
@@ -564,18 +564,18 @@ fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
         let parts: Vec<&str> = tool_name.splitn(3, "__").collect();
         let server = parts.get(1).unwrap_or(&"mcp").to_string();
         let tool = parts.get(2).unwrap_or(&tool_name).to_string();
-        ("\u{26a1}", tool, Some(server)) // ⚡
+        ("\u{00bb}", tool, Some(server)) // »
     } else {
         let icon = match tool_name {
-            "bash"     => "\u{276f}",   // ❯
-            "read"     => "\u{25b8}",   // ▸
-            "write"    => "\u{25c2}",   // ◂
-            "edit"     => "\u{0394}",   // Δ
-            "grep"     => "\u{2315}",   // ⌕
-            "find"     => "\u{25cb}",   // ○
-            "ls"       => "\u{2261}",   // ≡
-            "subagent" => "\u{25c8}",   // ◈
-            _          => "\u{2192}",   // →
+            "bash"     => "$",
+            "read"     => ">",
+            "write"    => "<",
+            "edit"     => "~",
+            "grep"     => "/",
+            "find"     => "?",
+            "ls"       => "=",
+            "subagent" => "*",
+            _          => "-",
         };
         (icon, tool_name.to_string(), None)
     }
@@ -1002,14 +1002,10 @@ impl App {
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
                     let thinking_label = if text == "…" {
-                        // Animated thinking placeholder
-                        let dots = match (self.spinner_frame / 10) % 4 {
-                            0 => "·",
-                            1 => "··",
-                            2 => "···",
-                            _ => "",
-                        };
-                        format!("thinking{}", dots)
+                        let braille = ['\u{28fe}','\u{28f7}','\u{28ef}','\u{28df}','\u{287f}','\u{28bf}','\u{28fb}','\u{28fd}'];
+                        let idx = (self.spinner_frame / 4) % braille.len();
+                        let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
+                        format!("{} thinking", wave)
                     } else {
                         "thinking".to_string()
                     };
@@ -1078,10 +1074,14 @@ impl App {
                 ChatMessage::Text(text) => {
                     // Separator between user block and agent response
                     if i > 0 {
-                        let sep: String = "\u{2500}".repeat(width.min(40));
-                        lines.push(Line::from(Span::styled(
-                            format!("{}{}", m, sep), Style::default().fg(THEME.separator),
-                        )));
+                        let sep_half = width.min(40) / 2;
+                        let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
+                        let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{}{}", m, sep_left), Style::default().fg(THEME.separator)),
+                            Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
+                            Span::styled(sep_right, Style::default().fg(THEME.separator)),
+                        ]));
                     }
                     // Header
                     let label = format!("{}\u{25c8} agent", m);
@@ -1125,10 +1125,29 @@ impl App {
                         String::new()
                     };
                     let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
-                    header.push(Span::styled(
-                        format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
-                        Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
-                    ));
+                    // Bash gets a special animated execution trace
+                    if tool_name == "bash" {
+                        let trace_chars = ['░', '▒', '▓', '█', '▓', '▒', '░', ' '];
+                        let trace_width = 12;
+                        let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
+                        let trace: String = (0..trace_width).map(|i| {
+                            let dist = if offset >= i { offset - i } else { trace_width + trace_chars.len() };
+                            if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
+                        }).collect();
+                        let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+                        let r = (50.0 * pulse) as u8;
+                        let g = (180.0 * pulse) as u8;
+                        let b = (220.0 * pulse) as u8;
+                        header.push(Span::styled(
+                            format!(" {}{}", trace, elapsed_str),
+                            Style::default().fg(Color::Rgb(r, g, b)),
+                        ));
+                    } else {
+                        header.push(Span::styled(
+                            format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
+                            Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                        ));
+                    }
                     lines.push(Line::from(header));
                     // Show accumulated partial input with newlines rendered
                     if !partial_input.is_empty() {
@@ -1174,6 +1193,39 @@ impl App {
                     ];
                     if let Some(tag) = server_tag {
                         header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
+                    }
+                    // If this is the last message and a tool is executing, show animation
+                    let is_last = i == self.messages.len() - 1;
+                    if is_last && self.tool_start_time.is_some() {
+                        let elapsed_str = if let Some(start) = self.tool_start_time {
+                            let secs = start.elapsed().as_secs_f64();
+                            if secs >= 1.0 { format!(" {:.1}s", secs) }
+                            else { format!(" {}ms", (secs * 1000.0) as u64) }
+                        } else { String::new() };
+
+                        if tool_name == "bash" {
+                            let trace_chars = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
+                            let trace_width = 14;
+                            let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
+                            let trace: String = (0..trace_width).map(|i| {
+                                let dist = if offset >= i { offset - i } else { trace_width + trace_chars.len() };
+                                if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
+                            }).collect();
+                            let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+                            let r = (50.0 * pulse) as u8;
+                            let g = (180.0 * pulse) as u8;
+                            let b = (220.0 * pulse) as u8;
+                            header.push(Span::styled(
+                                format!(" {}{}", trace, elapsed_str),
+                                Style::default().fg(Color::Rgb(r, g, b)),
+                            ));
+                        } else {
+                            let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                            header.push(Span::styled(
+                                format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
+                                Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                            ));
+                        }
                     }
                     lines.push(Line::from(header));
                     // Params — key:value on one line each, dimmed
@@ -1272,21 +1324,55 @@ impl App {
 
                     // Success/fail indicator with elapsed time
                     if !is_error && show > 0 {
-                        let elapsed_str = match elapsed_ms {
-                            Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
-                            Some(ms) => format!(" {}ms", ms),
-                            None => String::new(),
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                                Style::default().fg(THEME.tool_result_ok),
-                            ),
-                            Span::styled(
-                                elapsed_str,
-                                Style::default().fg(THEME.subagent_time),
-                            ),
-                        ]));
+                        if elapsed_ms.is_none() && self.tool_start_time.is_some() {
+                            // Tool still executing — show animation
+                            let preceding_tool_name = self.find_preceding_tool_name(i);
+                            let elapsed_str = if let Some(start) = self.tool_start_time {
+                                let secs = start.elapsed().as_secs_f64();
+                                if secs >= 1.0 { format!(" {:.1}s", secs) }
+                                else { format!(" {}ms", (secs * 1000.0) as u64) }
+                            } else { String::new() };
+
+                            if preceding_tool_name.as_deref() == Some("bash") {
+                                let trace_chars = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
+                                let trace_width = 14;
+                                let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
+                                let trace: String = (0..trace_width).map(|ti| {
+                                    let dist = if offset >= ti { offset - ti } else { trace_width + trace_chars.len() };
+                                    if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
+                                }).collect();
+                                let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+                                let r = (50.0 * pulse) as u8;
+                                let g = (180.0 * pulse) as u8;
+                                let b = (220.0 * pulse) as u8;
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!("{}     ", m), Style::default()),
+                                    Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(Color::Rgb(r, g, b))),
+                                ]));
+                            } else {
+                                let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                                lines.push(Line::from(Span::styled(
+                                    format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
+                                    Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                                )));
+                            }
+                        } else {
+                            let elapsed_str = match elapsed_ms {
+                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                                Some(ms) => format!(" {}ms", ms),
+                                None => String::new(),
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
+                                    Style::default().fg(THEME.tool_result_ok),
+                                ),
+                                Span::styled(
+                                    elapsed_str,
+                                    Style::default().fg(THEME.subagent_time),
+                                ),
+                            ]));
+                        }
                     }
 
                     // Detect which tool produced this result
@@ -2043,9 +2129,9 @@ fn boot_effect() -> Effect {
     use tachyonfx::fx::Direction as FxDir;
     fx::parallel(&[
         // CRT-style scanline reveal, top-to-bottom, clean (no randomness) with a tight gradient trail
-        fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(28, 28, 32), (750, Interpolation::QuintOut)),
+        fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(12, 22, 35), (750, Interpolation::QuintOut)),
         // long, slow fade from pure black — elegant deceleration
-        fx::fade_from_fg(Color::Black, (750, Interpolation::QuintOut)),
+        fx::fade_from_fg(Color::Rgb(5, 8, 18), (750, Interpolation::QuintOut)),
     ])
 }
 
@@ -2118,7 +2204,11 @@ fn draw(
                 Style::default().fg(THEME.subagent_name),
             )
         } else if app.streaming {
-            Span::styled(" \u{25cf} streaming ", Style::default().fg(THEME.status_streaming))
+            let pulse = ((app.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
+            let r = (220.0 * pulse) as u8;
+            let g = (175.0 * pulse) as u8;
+            let b = (60.0 * pulse) as u8;
+            Span::styled(" \u{25cf} streaming ", Style::default().fg(Color::Rgb(r, g, b)))
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.status_ready))
         };
@@ -2214,11 +2304,18 @@ fn draw(
 
                 if dismiss_t < 0.001 {
                     // Normal state / Boot-in
-                    let breathe = ((t % 5000) as f64 / 5000.0 * std::f64::consts::PI * 2.0).sin();
-                    let g = (100.0 + 50.0 * breathe) as u8;
-                    let b = (160.0 + 60.0 * breathe) as u8;
-                    let art_style = Style::default().fg(Color::Rgb(30, g, b)).add_modifier(Modifier::BOLD);
-                    let sub_style = Style::default().fg(Color::Rgb(15, g / 2, b / 2));
+                    let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
+                    let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
+                    let breathe = phase1 * 0.7 + phase2 * 0.3;
+                    let r = (20.0 + 15.0 * breathe) as u8;
+                    let g = (160.0 + 50.0 * breathe) as u8;
+                    let b = (210.0 + 35.0 * breathe) as u8;
+                    let art_style = Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD);
+                    let sub_style = Style::default().fg(Color::Rgb(
+                        (35.0 + 10.0 * breathe) as u8,
+                        (70.0 + 20.0 * breathe) as u8,
+                        (95.0 + 15.0 * breathe) as u8,
+                    ));
 
                     let build_t = app.logo_build_t.unwrap_or(1.0);
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
@@ -2462,24 +2559,32 @@ fn draw(
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(model.len() as u16 + 50),
+                Constraint::Length(model.len() as u16 + 75),
             ])
             .split(outer[4]);
 
+        let key_style = Style::default().fg(Color::Rgb(60, 75, 95));
+        let label_style = Style::default().fg(THEME.help_fg);
+        let dot_style = Style::default().fg(Color::Rgb(30, 38, 52));
+
         let keybinds = Paragraph::new(Line::from(vec![
-            Span::styled(" ctrl+c ", Style::default().fg(THEME.muted)),
-            Span::styled("quit", Style::default().fg(THEME.help_fg)),
-            Span::styled("  esc ", Style::default().fg(THEME.muted)),
-            Span::styled("abort", Style::default().fg(THEME.help_fg)),
-            Span::styled("  shift+\u{2191}\u{2193} ", Style::default().fg(THEME.muted)),
-            Span::styled("scroll", Style::default().fg(THEME.help_fg)),
-            Span::styled("  ctrl+o ", Style::default().fg(THEME.muted)),
+            Span::styled(" ctrl+c ", key_style),
+            Span::styled("quit", label_style),
+            Span::styled(" \u{00b7} ", dot_style),
+            Span::styled("esc ", key_style),
+            Span::styled("abort", label_style),
+            Span::styled(" \u{00b7} ", dot_style),
+            Span::styled("shift+\u{2191}\u{2193} ", key_style),
+            Span::styled("scroll", label_style),
+            Span::styled(" \u{00b7} ", dot_style),
+            Span::styled("ctrl+o ", key_style),
             Span::styled(
                 if app.show_full_output { "full" } else { "compact" },
-                Style::default().fg(THEME.help_fg),
+                label_style,
             ),
-            Span::styled("  enter ", Style::default().fg(THEME.muted)),
-            Span::styled("send", Style::default().fg(THEME.help_fg)),
+            Span::styled(" \u{00b7} ", dot_style),
+            Span::styled("enter ", key_style),
+            Span::styled("send", label_style),
         ]))
         .style(Style::default().bg(THEME.bg));
         frame.render_widget(keybinds, footer_chunks[0]);
@@ -2498,7 +2603,7 @@ fn draw(
         };
         let token_str = if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
             format!(
-                "{}in {}out{}  ",
+                "{}\u{2191} {}\u{2193}{}  ",
                 format_tokens(app.total_input_tokens),
                 format_tokens(app.total_output_tokens),
                 cache_rate,
@@ -2509,9 +2614,34 @@ fn draw(
         let info = Paragraph::new(Line::from(vec![
             Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
             Span::styled(&token_str, Style::default().fg(THEME.muted)),
-            Span::styled("thinking:", Style::default().fg(THEME.muted)),
-            Span::styled(format!("{} ", thinking), Style::default().fg(THEME.help_fg)),
-            Span::styled(" ", Style::default().fg(THEME.muted)),
+            {
+                // Context usage bar — shows how much of the 200k context window is consumed
+                let total_used = app.total_input_tokens + app.total_output_tokens;
+                if total_used > 0 {
+                    let context_window: u64 = 200_000;
+                    let usage_ratio = (total_used as f64 / context_window as f64).min(1.0);
+                    let bar_width: usize = 14;
+                    let filled = (usage_ratio * bar_width as f64).round() as usize;
+                    let empty = bar_width.saturating_sub(filled);
+                    let bar_color = if usage_ratio < 0.5 {
+                        Color::Rgb(50, 180, 210)
+                    } else if usage_ratio < 0.75 {
+                        Color::Rgb(210, 175, 60)
+                    } else {
+                        Color::Rgb(220, 70, 70)
+                    };
+                    let pct = (usage_ratio * 100.0) as u32;
+                    Span::styled(
+                        format!("{}{} {}% ", "\u{2593}".repeat(filled), "\u{2591}".repeat(empty), pct),
+                        Style::default().fg(bar_color),
+                    )
+                } else {
+                    Span::raw("")
+                }
+            },
+            Span::styled("\u{03b8}:", Style::default().fg(THEME.muted)),
+            Span::styled(format!("{}", thinking), Style::default().fg(THEME.help_fg)),
+            Span::styled(" \u{2502} ", Style::default().fg(THEME.border)),
             Span::styled(model, Style::default().fg(THEME.header_fg)),
             Span::styled(" ", Style::default()),
         ]))
