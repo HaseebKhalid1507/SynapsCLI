@@ -3053,6 +3053,81 @@ async fn main() -> Result<()> {
                             }
                             (KeyCode::Enter, _) if app.streaming && !app.input.is_empty() => {
                                 let input = app.input.clone();
+
+                                // Check for slash commands even while streaming
+                                if input.starts_with('/') {
+                                    let trimmed = input[1..].trim();
+                                    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+                                    let raw_cmd = parts[0];
+                                    // Only handle commands that make sense during streaming
+                                    if raw_cmd == "gamba" || raw_cmd.starts_with("gamb") {
+                                        app.input_history.push(input.clone());
+                                        app.history_index = None;
+                                        app.input_stash.clear();
+                                        app.input.clear();
+                                        app.cursor_pos = 0;
+                                        // Launch casino
+                                        if app.gamba_child.is_some() {
+                                            app.push_msg(ChatMessage::System(
+                                                "🎰 Casino already running!".to_string()
+                                            ));
+                                        } else {
+                                            let gamba_bin = std::env::var("HOME").ok()
+                                                .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+                                                .filter(|p| p.exists());
+                                            if let Some(bin) = gamba_bin {
+                                                crossterm::terminal::disable_raw_mode().ok();
+                                                crossterm::execute!(
+                                                    std::io::stdout(),
+                                                    crossterm::terminal::LeaveAlternateScreen
+                                                ).ok();
+                                                match std::process::Command::new(&bin)
+                                                    .stdin(std::process::Stdio::inherit())
+                                                    .stdout(std::process::Stdio::inherit())
+                                                    .stderr(std::process::Stdio::inherit())
+                                                    .spawn()
+                                                {
+                                                    Ok(child) => {
+                                                        app.gamba_child = Some(child);
+                                                    }
+                                                    Err(e) => {
+                                                        crossterm::terminal::enable_raw_mode().ok();
+                                                        crossterm::execute!(
+                                                            std::io::stdout(),
+                                                            crossterm::terminal::EnterAlternateScreen
+                                                        ).ok();
+                                                        terminal.clear().ok();
+                                                        app.push_msg(ChatMessage::Error(
+                                                            format!("Failed to launch casino: {}", e)
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                app.push_msg(ChatMessage::Error(
+                                                    "GamblersDen binary not found.".to_string()
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        // Other slash commands during streaming — just queue/steer as normal
+                                        app.input_history.push(input.clone());
+                                        app.history_index = None;
+                                        app.input_stash.clear();
+                                        app.input.clear();
+                                        app.cursor_pos = 0;
+                                        app.input_before_paste = None;
+                                        app.pasted_char_count = 0;
+                                        let steered = steer_tx.as_ref()
+                                            .map(|tx| tx.send(input.clone()).is_ok())
+                                            .unwrap_or(false);
+                                        if steered {
+                                            app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                        } else {
+                                            app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                        }
+                                        app.queued_message = Some(input);
+                                    }
+                                } else {
                                 app.input_history.push(input.clone());
                                 app.history_index = None;
                                 app.input_stash.clear();
@@ -3074,6 +3149,7 @@ async fn main() -> Result<()> {
                                 }
                                 // Always set queue as fallback — last message wins
                                 app.queued_message = Some(input);
+                                }
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
