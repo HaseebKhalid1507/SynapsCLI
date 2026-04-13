@@ -891,11 +891,17 @@ async fn main() {
                 }
             }
 
-            // Setup signal handling
+            // Setup signal handling (Ctrl+C and SIGTERM)
             let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let r = running.clone();
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate()
+                ).expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
                 r.store(false, std::sync::atomic::Ordering::Relaxed);
             });
 
