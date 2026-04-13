@@ -941,14 +941,19 @@ impl App {
                     let tlines: Vec<&str> = text.lines().collect();
                     let non_empty: Vec<&&str> = tlines.iter().filter(|l| !l.trim().is_empty()).collect();
                     let show = non_empty.len().min(8);
+                    // Calculate usable width for thinking content
+                    let prefix_len = m.len() + 4; // margin + "│ · " or "│ "
+                    let content_width = width.saturating_sub(prefix_len);
+
                     for (i, line) in non_empty[..show].iter().enumerate() {
                         let trimmed = line.trim();
                         let is_last = i == show - 1 && non_empty.len() <= 8;
                         let connector = if is_last { "╰" } else { "│" };
+                        let continuation = "│";
 
                         // Detect structure in thinking
                         let (prefix_char, line_style) = if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                            ("·", dim_italic)
+                            ("· ", dim_italic)
                         } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
                             ("", dim.add_modifier(Modifier::BOLD))
                         } else if trimmed.starts_with("```") {
@@ -957,14 +962,30 @@ impl App {
                             ("", dim_italic)
                         };
 
-                        let display = if !prefix_char.is_empty() {
-                            format!("{}{} {} {}", m, connector, prefix_char, trimmed)
-                        } else {
-                            format!("{}{} {}", m, connector, trimmed)
-                        };
+                        // Wrap manually to preserve connector on each line
+                        let first_prefix = format!("{}{} {}", m, connector, prefix_char);
+                        let cont_prefix = format!("{}{} {}", m, continuation, " ".repeat(prefix_char.len()));
 
-                        for wline in wrap_text(&display, width) {
-                            lines.push(Line::from(Span::styled(wline, line_style)));
+                        if content_width > 10 {
+                            let chars: Vec<char> = trimmed.chars().collect();
+                            let mut pos = 0;
+                            let mut is_first = true;
+                            while pos < chars.len() {
+                                let chunk_len = content_width.min(chars.len() - pos);
+                                let chunk: String = chars[pos..pos + chunk_len].iter().collect();
+                                let prefix = if is_first { &first_prefix } else { &cont_prefix };
+                                lines.push(Line::from(Span::styled(
+                                    format!("{}{}", prefix, chunk),
+                                    line_style,
+                                )));
+                                pos += chunk_len;
+                                is_first = false;
+                            }
+                        } else {
+                            lines.push(Line::from(Span::styled(
+                                format!("{}{}", first_prefix, trimmed),
+                                line_style,
+                            )));
                         }
                     }
                     if non_empty.len() > 8 {
