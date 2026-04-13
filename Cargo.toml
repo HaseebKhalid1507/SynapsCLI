@@ -2,7 +2,14 @@
 name = "synaps-cli"
 version = "0.1.0"
 edition = "2021"
+authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
+license = "MIT"
 description = "A terminal-native AI agent runtime"
+repository = "https://github.com/HaseebKhalid1507/SynapsCLI"
+homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
+keywords = ["ai", "agent", "terminal", "cli", "rust"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.70"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }

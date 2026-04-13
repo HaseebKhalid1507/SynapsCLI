@@ -1,6 +1,6 @@
 # SynapsCLI
 
-A terminal-native AI agent runtime built in Rust. 4.8MB binary, 3ms startup, 8 built-in tools, unlimited MCP tools, parallel subagents, on-demand skills — all in ~7,700 lines.
+A terminal-native AI agent runtime built in Rust. 4.8MB binary, 3ms startup, 8 built-in tools, unlimited MCP tools, parallel subagents, on-demand skills — all in ~7,900 lines.
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-4.8MB_binary-orange" alt="Rust" />
@@ -14,7 +14,7 @@ A terminal-native AI agent runtime built in Rust. 4.8MB binary, 3ms startup, 8 b
 
 ## Why SynapsCLI?
 
-Most agent runtimes are 100K–450K lines of TypeScript. SynapsCLI does the same in **7,700 lines of Rust** — 3ms startup, 4.8MB binary, zero runtime dependencies.
+Most agent runtimes are 100K–450K lines of TypeScript. SynapsCLI does the same in **7,900 lines of Rust** — 3ms startup, 4.8MB binary, zero runtime dependencies.
 
 ```
 8 built-in tools + entire MCP ecosystem on demand
@@ -208,11 +208,11 @@ synaps-cli server --port 3145              # WebSocket server
 
 ```
 src/
-├── chatui.rs    (2.4K)  TUI — ratatui, markdown, subagent panel, steering
+├── chatui.rs    (2.6K)  TUI — ratatui, markdown, subagent panel, steering
 ├── runtime.rs   (1.3K)  API client, SSE streaming, agentic tool loop
-├── tools.rs     (940)   Tool trait + 8 built-in implementations
+├── tools.rs     (945)   Tool trait + 8 built-in implementations
 ├── auth.rs      (655)   OAuth 2.0 PKCE, token refresh with flock
-├── server.rs    (559)   Axum WebSocket server
+├── server.rs    (563)   Axum WebSocket server
 ├── mcp.rs       (515)   MCP client — JSON-RPC 2.0, lazy loading, gateway tool
 ├── client.rs    (277)   WebSocket CLI client
 ├── skills.rs    (223)   Skill loading, on-demand tool, config auto-load
@@ -226,7 +226,7 @@ src/
 ├── chat.rs      (133)   Simple REPL (non-TUI)
 └── lib.rs       (18)    Module root
                 ─────
-                7,717 lines total
+                7,903 lines total
 ```
 
 ### Design Decisions
