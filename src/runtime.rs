@@ -210,7 +210,7 @@ impl Runtime {
         }
         // Read lock dropped here
 
-        eprintln!("\x1b[2m  ↻ checking / refreshing OAuth token...\x1b[0m");
+        tracing::info!("Token needs refresh, checking...");
 
         // Slow path: delegate to auth.rs which handles locking, re-read,
         // conditional refresh, and persistence.
@@ -491,7 +491,7 @@ impl Runtime {
                         // Drop read lock before acquiring write
                         drop(auth_state);
 
-                        eprintln!("\x1b[2m  ↻ refreshing token mid-stream...\x1b[0m");
+                        tracing::info!("Refreshing token mid-stream");
                         let creds = crate::auth::ensure_fresh_token(&client)
                             .await
                             .map_err(|e| RuntimeError::Auth(format!(

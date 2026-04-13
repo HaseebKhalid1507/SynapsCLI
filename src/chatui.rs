@@ -288,6 +288,8 @@ struct App {
     pasted_char_count: usize,
     /// Spinner frame counter (incremented on tick)
     spinner_frame: usize,
+    /// Transient status text shown in the header bar (auto-cleared when streaming starts)
+    status_text: Option<String>,
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -363,6 +365,7 @@ impl App {
             input_before_paste: None,
             pasted_char_count: 0,
             spinner_frame: 0,
+            status_text: None,
         }
     }
 
@@ -713,17 +716,43 @@ impl App {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
                             for (k, v) in obj {
-                                let val = match v.as_str() {
-                                    Some(s) if s.len() > 120 => {
-                                        let p: String = s.chars().take(120).collect();
-                                        format!("{}\u{2026}", p)
+                                if let Some(s) = v.as_str() {
+                                    if s.contains('\n') {
+                                        // Multi-line content: show key header, then content lines
+                                        let content_lines: Vec<&str> = s.lines().collect();
+                                        let total = content_lines.len();
+                                        let max_preview = 12;
+                                        let show = total.min(max_preview);
+                                        let header = format!("{}     {}: ({} lines)", m, k, total);
+                                        lines.push(Line::from(Span::styled(header, param_style)));
+                                        for cline in content_lines.iter().take(show) {
+                                            let line_str = format!("{}       {}", m, cline);
+                                            for wline in wrap_text(&line_str, width) {
+                                                lines.push(Line::from(Span::styled(wline, param_style)));
+                                            }
+                                        }
+                                        if total > max_preview {
+                                            let omit = format!("{}       … +{} more lines", m, total - max_preview);
+                                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.muted))));
+                                        }
+                                    } else {
+                                        let val = if s.len() > 120 {
+                                            let p: String = s.chars().take(120).collect();
+                                            format!("{}\u{2026}", p)
+                                        } else {
+                                            s.to_string()
+                                        };
+                                        let line_str = format!("{}     {}: {}", m, k, val);
+                                        for wline in wrap_text(&line_str, width) {
+                                            lines.push(Line::from(Span::styled(wline, param_style)));
+                                        }
                                     }
-                                    Some(s) => s.to_string(),
-                                    None => v.to_string(),
-                                };
-                                let line_str = format!("{}     {}: {}", m, k, val);
-                                for wline in wrap_text(&line_str, width) {
-                                    lines.push(Line::from(Span::styled(wline, param_style)));
+                                } else {
+                                    let val = v.to_string();
+                                    let line_str = format!("{}     {}: {}", m, k, val);
+                                    for wline in wrap_text(&line_str, width) {
+                                        lines.push(Line::from(Span::styled(wline, param_style)));
+                                    }
                                 }
                             }
                         }
@@ -1295,7 +1324,13 @@ fn draw(
             .split(frame.area());
 
         // -- Header ----------------------------------------------------------
-        let status_span = if !app.subagents.is_empty() {
+        let status_span = if let Some(ref status) = app.status_text {
+            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
+            Span::styled(
+                format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
+                Style::default().fg(THEME.status_streaming),
+            )
+        } else if !app.subagents.is_empty() {
             let active = app.subagents.iter().filter(|s| !s.done).count();
             let done = app.subagents.iter().filter(|s| s.done).count();
             let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
@@ -2168,7 +2203,14 @@ async fn main() -> Result<()> {
                                     app.api_messages.push(json!({"role": "user", "content": api_content}));
                                     let ct = CancellationToken::new();
                                     let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                    // Show auth status in header during token refresh
+                                    app.status_text = Some("refreshing auth…".to_string());
+                                    app.spinner_frame = 0;
+                                    let elapsed = last_frame.elapsed();
+                                    last_frame = Instant::now();
+                                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                                     stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                    app.status_text = None;
                                     cancel_token = Some(ct);
                                     steer_tx = Some(s_tx);
                                     app.streaming = true;
@@ -2529,7 +2571,14 @@ async fn main() -> Result<()> {
                                 app.api_messages.push(json!({"role": "user", "content": api_content}));
                                 let ct = CancellationToken::new();
                                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                // Show auth status in header during token refresh
+                                app.status_text = Some("refreshing auth…".to_string());
+                                app.spinner_frame = 0;
+                                let elapsed = last_frame.elapsed();
+                                last_frame = Instant::now();
+                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                app.status_text = None;
                                 cancel_token = Some(ct);
                                 steer_tx = Some(s_tx);
                                 app.streaming = true;
