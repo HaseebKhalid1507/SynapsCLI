@@ -3637,32 +3637,55 @@ async fn main() -> Result<()> {
                                             exit_fx = Some(quit_effect());
                                         }
                                         "theme" => {
+                                            let descriptions: &[(&str, &str)] = &[
+                                                ("default",        "cool teal on dark blue-gray"),
+                                                ("neon-rain",      "cyberpunk hot pink + cyan"),
+                                                ("amber",          "warm CRT retro terminal"),
+                                                ("phosphor",       "green monochrome CRT"),
+                                                ("solarized-dark", "Ethan Schoonover's classic"),
+                                                ("blood",          "dark red, Doom/horror"),
+                                                ("ocean",          "deep sea bioluminescence"),
+                                                ("rose-pine",      "elegant muted purples/pinks"),
+                                                ("nord",           "arctic frost blues"),
+                                                ("dracula",        "purple/pink/cyan vibrant"),
+                                                ("monokai",        "classic orange/pink/green"),
+                                                ("gruvbox",        "warm earthy tones"),
+                                                ("catppuccin",     "soft pastels, cozy dark"),
+                                                ("tokyo-night",    "dark blue-purple, soft accents"),
+                                                ("sunset",         "warm oranges/pinks dusk"),
+                                                ("ice",            "frozen arctic pale blues"),
+                                                ("forest",         "deep greens and browns"),
+                                                ("lavender",       "rich purple/violet"),
+                                            ];
                                             app.push_msg(ChatMessage::System(
-                                                "Available built-in themes:".to_string()
+                                                "Available themes:".to_string()
+                                            ));
+                                            for (name, desc) in descriptions {
+                                                app.push_msg(ChatMessage::System(
+                                                    format!("  {:<15} — {}", name, desc)
+                                                ));
+                                            }
+                                            // Also list any custom user themes
+                                            let themes_dir = synaps_cli::config::base_dir().join("themes");
+                                            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                                                let mut custom: Vec<String> = entries
+                                                    .filter_map(|e| e.ok())
+                                                    .map(|e| e.file_name().to_string_lossy().to_string())
+                                                    .filter(|n| !descriptions.iter().any(|(d, _)| *d == n.as_str()))
+                                                    .collect();
+                                                custom.sort();
+                                                for name in &custom {
+                                                    app.push_msg(ChatMessage::System(
+                                                        format!("  {:<15} — custom", name)
+                                                    ));
+                                                }
+                                            }
+                                            app.push_msg(ChatMessage::System(String::new()));
+                                            app.push_msg(ChatMessage::System(
+                                                "Set in ~/.synaps-cli/config: theme = <name>".to_string()
                                             ));
                                             app.push_msg(ChatMessage::System(
-                                                "  default       — cool teal/green on dark blue-gray".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "  neon-rain     — cyberpunk magenta/cyan/yellow (Akira, Blade Runner)".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "  amber         — warm CRT amber on black (retro terminal)".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "  phosphor      — green monochrome CRT (classic hacker)".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "  solarized     — Ethan Schoonover's solarized dark".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "  blood         — dark red, Doom/horror aesthetic".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "Set in ~/.synaps-cli/config: theme = neon-rain".to_string()
-                                            ));
-                                            app.push_msg(ChatMessage::System(
-                                                "Or create ~/.synaps-cli/theme for custom colors (overrides config).".to_string()
+                                                "Edit themes in ~/.synaps-cli/themes/ — no rebuild needed.".to_string()
                                             ));
                                             app.push_msg(ChatMessage::System(
                                                 "Restart to apply.".to_string()
