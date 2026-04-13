@@ -557,6 +557,25 @@ struct App {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Generate a bash execution trace animation string and its pulsing color.
+/// Returns (trace_string, Color) for use in Span styling.
+fn bash_trace(spinner_frame: usize) -> (String, Color) {
+    const CHARS: [char; 8] = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
+    const WIDTH: usize = 14;
+    let offset = (spinner_frame / 2) % (WIDTH + CHARS.len());
+    let trace: String = (0..WIDTH).map(|i| {
+        let dist = if offset >= i { offset - i } else { WIDTH + CHARS.len() };
+        if dist < CHARS.len() { CHARS[dist] } else { ' ' }
+    }).collect();
+    let pulse = ((spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+    let color = Color::Rgb(
+        (50.0 * pulse) as u8,
+        (180.0 * pulse) as u8,
+        (220.0 * pulse) as u8,
+    );
+    (trace, color)
+}
+
 /// Format a tool name for display. Returns (icon, display_name, optional_server_tag).
 /// MCP tools like "mcp__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
 fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
@@ -1127,20 +1146,10 @@ impl App {
                     let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
                     // Bash gets a special animated execution trace
                     if tool_name == "bash" {
-                        let trace_chars = ['░', '▒', '▓', '█', '▓', '▒', '░', ' '];
-                        let trace_width = 12;
-                        let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
-                        let trace: String = (0..trace_width).map(|i| {
-                            let dist = if offset >= i { offset - i } else { trace_width + trace_chars.len() };
-                            if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
-                        }).collect();
-                        let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
-                        let r = (50.0 * pulse) as u8;
-                        let g = (180.0 * pulse) as u8;
-                        let b = (220.0 * pulse) as u8;
+                        let (trace, color) = bash_trace(self.spinner_frame);
                         header.push(Span::styled(
                             format!(" {}{}", trace, elapsed_str),
-                            Style::default().fg(Color::Rgb(r, g, b)),
+                            Style::default().fg(color),
                         ));
                     } else {
                         header.push(Span::styled(
@@ -1204,20 +1213,10 @@ impl App {
                         } else { String::new() };
 
                         if tool_name == "bash" {
-                            let trace_chars = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
-                            let trace_width = 14;
-                            let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
-                            let trace: String = (0..trace_width).map(|i| {
-                                let dist = if offset >= i { offset - i } else { trace_width + trace_chars.len() };
-                                if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
-                            }).collect();
-                            let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
-                            let r = (50.0 * pulse) as u8;
-                            let g = (180.0 * pulse) as u8;
-                            let b = (220.0 * pulse) as u8;
+                            let (trace, color) = bash_trace(self.spinner_frame);
                             header.push(Span::styled(
                                 format!(" {}{}", trace, elapsed_str),
-                                Style::default().fg(Color::Rgb(r, g, b)),
+                                Style::default().fg(color),
                             ));
                         } else {
                             let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
@@ -1334,20 +1333,10 @@ impl App {
                             } else { String::new() };
 
                             if preceding_tool_name.as_deref() == Some("bash") {
-                                let trace_chars = [' ', '░', '▒', '▓', '█', '▓', '▒', '░'];
-                                let trace_width = 14;
-                                let offset = (self.spinner_frame / 2) % (trace_width + trace_chars.len());
-                                let trace: String = (0..trace_width).map(|ti| {
-                                    let dist = if offset >= ti { offset - ti } else { trace_width + trace_chars.len() };
-                                    if dist < trace_chars.len() { trace_chars[dist] } else { ' ' }
-                                }).collect();
-                                let pulse = ((self.spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
-                                let r = (50.0 * pulse) as u8;
-                                let g = (180.0 * pulse) as u8;
-                                let b = (220.0 * pulse) as u8;
+                                let (trace, color) = bash_trace(self.spinner_frame);
                                 lines.push(Line::from(vec![
                                     Span::styled(format!("{}     ", m), Style::default()),
-                                    Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(Color::Rgb(r, g, b))),
+                                    Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(color)),
                                 ]));
                             } else {
                                 let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
