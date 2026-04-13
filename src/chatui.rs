@@ -2224,7 +2224,8 @@ async fn main() -> Result<()> {
                                     let ct = CancellationToken::new();
                                     let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     // Show auth status in header during token refresh
-                                    app.status_text = Some("refreshing auth…".to_string());
+                                    app.status_text = Some("connecting…".to_string());
+                                    app.streaming = true;  // Start spinner immediately
                                     app.spinner_frame = 0;
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
@@ -2233,7 +2234,6 @@ async fn main() -> Result<()> {
                                     app.status_text = None;
                                     cancel_token = Some(ct);
                                     steer_tx = Some(s_tx);
-                                    app.streaming = true;
                                 }
                             }
                             (KeyCode::Enter, _) if app.streaming && !app.input.is_empty() => {
@@ -2592,7 +2592,8 @@ async fn main() -> Result<()> {
                                 let ct = CancellationToken::new();
                                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 // Show auth status in header during token refresh
-                                app.status_text = Some("refreshing auth…".to_string());
+                                app.status_text = Some("connecting…".to_string());
+                                app.streaming = true;  // Start spinner immediately
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
@@ -2601,7 +2602,6 @@ async fn main() -> Result<()> {
                                 app.status_text = None;
                                 cancel_token = Some(ct);
                                 steer_tx = Some(s_tx);
-                                app.streaming = true;
                             }
                         }
                         StreamEvent::Error(err) => {
