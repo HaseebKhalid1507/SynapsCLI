@@ -887,9 +887,21 @@ impl App {
                     let dim = Style::default().fg(THEME.thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
+                    let thinking_label = if text == "…" {
+                        // Animated thinking placeholder
+                        let dots = match (self.spinner_frame / 10) % 4 {
+                            0 => "·",
+                            1 => "··",
+                            2 => "···",
+                            _ => "",
+                        };
+                        format!("thinking{}", dots)
+                    } else {
+                        "thinking".to_string()
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(format!("{}\u{2502} ", m), dim),
-                        Span::styled("thinking", dim.add_modifier(Modifier::DIM)),
+                        Span::styled(thinking_label, dim.add_modifier(Modifier::DIM)),
                     ]));
                     // Body — filtered, capped
                     let tlines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1077,10 +1089,21 @@ impl App {
                         ]));
                     }
 
-                    for line in &result_lines[..show] {
+                    for (li, line) in result_lines[..show].iter().enumerate() {
                         let full = format!("{}       {}", m, line);
-                        for wline in wrap_text(&full, width) {
-                            lines.push(Line::from(Span::styled(wline, style)));
+                        // Try syntax highlighting for tool output
+                        // Detect line-numbered content from read tool (e.g., "  42 | fn main()")
+                        let highlighted = try_highlight_tool_line(line);
+                        if let Some(spans) = highlighted {
+                            let mut prefix_spans = vec![
+                                Span::styled(format!("{}       ", m), style),
+                            ];
+                            prefix_spans.extend(spans);
+                            lines.push(Line::from(prefix_spans));
+                        } else {
+                            for wline in wrap_text(&full, width) {
+                                lines.push(Line::from(Span::styled(wline, style)));
+                            }
                         }
                     }
                     if result_lines.len() > show {
@@ -1199,6 +1222,78 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
         lines.push(Line::from(spans));
     }
     lines
+}
+
+/// Try to syntax-highlight a single tool output line.
+/// Returns Some(spans) if the line looks like code (from read tool), None otherwise.
+fn try_highlight_tool_line(line: &str) -> Option<Vec<Span<'static>>> {
+    // Detect read tool output pattern: "  42 | code here"
+    // The line number + pipe separator is the giveaway
+    let trimmed = line.trim_start();
+    let pipe_idx = trimmed.find('|');
+    if let Some(idx) = pipe_idx {
+        let before = trimmed[..idx].trim();
+        // Check if everything before the pipe is a number (line number)
+        if before.chars().all(|c| c.is_ascii_digit()) && !before.is_empty() {
+            let line_num = before;
+            let code = if idx + 1 < trimmed.len() { &trimmed[idx + 1..] } else { "" };
+
+            let ss = &*SYNTAX_SET;
+            let ts = &*THEME_SET;
+            let theme = &ts.themes["base16-ocean.dark"];
+
+            // Try to detect language from content (rough heuristics)
+            let lang = guess_lang_from_content(code);
+            let syntax = ss.find_syntax_by_token(lang)
+                .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+            let mut h = HighlightLines::new(syntax, theme);
+            let code_with_nl = format!("{}\n", code);
+            let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>4} \u{2502} ", line_num),
+                    Style::default().fg(THEME.muted),
+                ),
+            ];
+            for (style, text) in ranges {
+                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                let content = text.trim_end_matches('\n').to_string();
+                if !content.is_empty() {
+                    spans.push(Span::styled(content, Style::default().fg(fg)));
+                }
+            }
+            return Some(spans);
+        }
+    }
+    None
+}
+
+/// Guess language from a single line of code content (very rough).
+fn guess_lang_from_content(line: &str) -> &'static str {
+    let t = line.trim();
+    if t.starts_with("fn ") || t.starts_with("pub ") || t.starts_with("use ") || t.starts_with("mod ")
+        || t.starts_with("impl ") || t.starts_with("struct ") || t.starts_with("enum ")
+        || t.starts_with("let ") || t.starts_with("match ") || t.contains("->") || t.contains("=> {")
+    {
+        return "rs";
+    }
+    if t.starts_with("def ") || t.starts_with("import ") || t.starts_with("from ") || t.starts_with("class ")
+        || t.starts_with("self.") || t.contains("__init__")
+    {
+        return "py";
+    }
+    if t.starts_with("function ") || t.starts_with("const ") || t.starts_with("export ")
+        || t.starts_with("async ") || t.starts_with("await ") || t.contains("=>")
+    {
+        return "ts";
+    }
+    if t.starts_with("#!/") { return "sh"; }
+    if t.starts_with("{") && t.ends_with("}") || t.starts_with("\"") && t.contains("\": ") {
+        return "json";
+    }
+    "txt"
 }
 
 /// Render a markdown table into styled Lines with box-drawing borders.
@@ -2203,8 +2298,8 @@ async fn main() -> Result<()> {
                         app.logo_dismiss_t = None;
                     }
                 }
-                // Advance spinner for active subagents (~6 fps visual)
-                if !app.subagents.is_empty() {
+                // Advance spinner for active subagents or streaming (~6 fps visual)
+                if !app.subagents.is_empty() || app.streaming {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                     // Only dirty every 3rd tick (~20fps spinner, smooth but not crazy)
                     if app.spinner_frame % 3 == 0 {
@@ -2528,6 +2623,8 @@ async fn main() -> Result<()> {
                                     draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                                     stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                     app.status_text = None;
+                                    // Show thinking placeholder until first real token arrives
+                                    app.push_msg(ChatMessage::Thinking("…".to_string()));
                                     cancel_token = Some(ct);
                                     steer_tx = Some(s_tx);
                                 }
@@ -2896,6 +2993,8 @@ async fn main() -> Result<()> {
                                 draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                 app.status_text = None;
+                                // Show thinking placeholder until first real token arrives
+                                app.push_msg(ChatMessage::Thinking("…".to_string()));
                                 cancel_token = Some(ct);
                                 steer_tx = Some(s_tx);
                             }
