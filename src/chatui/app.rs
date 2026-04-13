@@ -275,6 +275,7 @@ impl App {
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
+        self.session.abort_context = self.abort_context.clone();
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
         if let Err(e) = self.session.save() {

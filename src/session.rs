@@ -18,6 +18,9 @@ pub struct Session {
     pub total_output_tokens: u64,
     pub session_cost: f64,
     pub api_messages: Vec<Value>,
+    /// Saved abort context — injected into the next user message on /continue
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_context: Option<String>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -48,6 +51,7 @@ impl Session {
             total_output_tokens: 0,
             session_cost: 0.0,
             api_messages: Vec::new(),
+            abort_context: None,
         }
     }
 
