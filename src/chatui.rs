@@ -2682,7 +2682,7 @@ async fn main() -> Result<()> {
                                     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
                                     let raw_cmd = parts[0];
                                     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-                                    let all_cmds = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "help", "quit", "exit"];
+                                    let all_cmds = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "gamba", "help", "quit", "exit"];
                                     // Resolve prefix: exact match first, then unique prefix
                                     let cmd = if all_cmds.contains(&raw_cmd) {
                                         raw_cmd.to_string()
@@ -2849,6 +2849,9 @@ async fn main() -> Result<()> {
                                             app.push_msg(ChatMessage::System(
                                                 "/theme — list available themes".to_string()
                                             ));
+                                            app.push_msg(ChatMessage::System(
+                                                "/gamba — open the casino 🎰".to_string()
+                                            ));
                                         }
                                         "quit" | "exit" => {
                                             exit_fx = Some(quit_effect());
@@ -2884,6 +2887,49 @@ async fn main() -> Result<()> {
                                             app.push_msg(ChatMessage::System(
                                                 "Restart to apply.".to_string()
                                             ));
+                                        }
+                                        "gamba" => {
+                                            // Spawn GamblersDen casino — yield terminal, reclaim on exit
+                                            let gamba_bin = std::env::var("HOME").ok()
+                                                .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+                                                .filter(|p| p.exists());
+                                            if let Some(bin) = gamba_bin {
+                                                // Tear down our TUI
+                                                crossterm::terminal::disable_raw_mode().ok();
+                                                crossterm::execute!(
+                                                    std::io::stdout(),
+                                                    crossterm::terminal::LeaveAlternateScreen
+                                                ).ok();
+                                                // Run the casino
+                                                let status = std::process::Command::new(&bin)
+                                                    .stdin(std::process::Stdio::inherit())
+                                                    .stdout(std::process::Stdio::inherit())
+                                                    .stderr(std::process::Stdio::inherit())
+                                                    .status();
+                                                // Reclaim terminal
+                                                crossterm::terminal::enable_raw_mode().ok();
+                                                crossterm::execute!(
+                                                    std::io::stdout(),
+                                                    crossterm::terminal::EnterAlternateScreen
+                                                ).ok();
+                                                terminal.clear().ok();
+                                                match status {
+                                                    Ok(s) if s.success() => {
+                                                        app.push_msg(ChatMessage::System(
+                                                            "🎰 Back from the casino. How'd you do, degen?".to_string()
+                                                        ));
+                                                    }
+                                                    _ => {
+                                                        app.push_msg(ChatMessage::System(
+                                                            "🎰 Casino closed unexpectedly. House always wins.".to_string()
+                                                        ));
+                                                    }
+                                                }
+                                            } else {
+                                                app.push_msg(ChatMessage::Error(
+                                                    "GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()
+                                                ));
+                                            }
                                         }
                                         _ => {
                                             app.push_msg(ChatMessage::Error(
@@ -2972,7 +3018,7 @@ async fn main() -> Result<()> {
                             }
                             (KeyCode::Tab, _) if app.input.starts_with('/') => {
                                 let partial = &app.input[1..];
-                                let commands = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "help", "quit", "exit"];
+                                let commands = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "gamba", "help", "quit", "exit"];
                                 let matches: Vec<&&str> = commands.iter()
                                     .filter(|c| c.starts_with(partial))
                                     .collect();
