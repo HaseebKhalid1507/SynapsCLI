@@ -1001,7 +1001,22 @@ impl App {
                     if let Some(tag) = server_tag {
                         header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
                     }
-                    header.push(Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)));
+                    // Show elapsed time while tool is running
+                    let elapsed_str = if let Some(start) = self.tool_start_time {
+                        let secs = start.elapsed().as_secs_f64();
+                        if secs >= 1.0 {
+                            format!(" {:.1}s", secs)
+                        } else {
+                            format!(" {}ms", (secs * 1000.0) as u64)
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                    header.push(Span::styled(
+                        format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
+                        Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                    ));
                     lines.push(Line::from(header));
                     // Show accumulated partial input with newlines rendered
                     if !partial_input.is_empty() {
@@ -1175,9 +1190,14 @@ impl App {
                         lines.extend(hl_lines);
                     } else {
                         for line in &result_lines[..show] {
-                            let full = format!("{}       {}", m, line);
-                            for wline in wrap_text(&full, width) {
-                                lines.push(Line::from(Span::styled(wline, style)));
+                            // Try to detect and highlight grep output (filepath:linenum:content)
+                            if let Some(grep_spans) = try_highlight_grep_line(line, &m) {
+                                lines.push(Line::from(grep_spans));
+                            } else {
+                                let full = format!("{}       {}", m, line);
+                                for wline in wrap_text(&full, width) {
+                                    lines.push(Line::from(Span::styled(wline, style)));
+                                }
                             }
                         }
                     }
@@ -1343,6 +1363,49 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
     }
 
     result
+}
+
+/// Try to highlight a grep output line (filepath:linenum:content)
+fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Span<'static>>> {
+    // Grep format: filepath:linenum:content  or  filepath-linenum-content (context)
+    // Also: filepath:linenum:  (empty match line)
+    let first_colon = line.find(':')?;
+    let filepath = &line[..first_colon];
+
+    // Filepath should look like a path (contain / or .)
+    if !filepath.contains('/') && !filepath.contains('.') {
+        return None;
+    }
+
+    let rest = &line[first_colon + 1..];
+    let second_sep = rest.find(|c: char| c == ':' || c == '-')?;
+    let linenum = &rest[..second_sep];
+
+    // Line number should be numeric
+    if !linenum.chars().all(|c| c.is_ascii_digit()) || linenum.is_empty() {
+        return None;
+    }
+
+    let sep_char = rest.as_bytes()[second_sep] as char;
+    let content = if second_sep + 1 < rest.len() { &rest[second_sep + 1..] } else { "" };
+
+    let is_context = sep_char == '-';
+
+    Some(vec![
+        Span::styled(format!("{}       ", margin), Style::default().fg(THEME.tool_result_color)),
+        Span::styled(filepath.to_string(), Style::default().fg(THEME.tool_label)),
+        Span::styled(":", Style::default().fg(THEME.muted)),
+        Span::styled(linenum.to_string(), Style::default().fg(THEME.list_bullet_color)),
+        Span::styled(format!("{}", sep_char), Style::default().fg(THEME.muted)),
+        Span::styled(
+            content.to_string(),
+            if is_context {
+                Style::default().fg(THEME.muted)
+            } else {
+                Style::default().fg(THEME.tool_result_color)
+            },
+        ),
+    ])
 }
 
 /// Check if tool output looks like read tool output (line-numbered with tabs)
@@ -2209,21 +2272,20 @@ fn draw(
         } else {
             String::new()
         };
+        let cache_rate = if app.total_cache_read_tokens + app.total_cache_creation_tokens > 0 {
+            let total_cacheable = app.total_cache_read_tokens + app.total_cache_creation_tokens;
+            let rate = (app.total_cache_read_tokens as f64 / total_cacheable as f64 * 100.0) as u32;
+            format!(" {}%↺", rate)
+        } else {
+            String::new()
+        };
         let token_str = if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
-            let mut s = format!(
-                "{}in {}out",
+            format!(
+                "{}in {}out{}  ",
                 format_tokens(app.total_input_tokens),
                 format_tokens(app.total_output_tokens),
-            );
-            if app.total_cache_read_tokens > 0 || app.total_cache_creation_tokens > 0 {
-                s.push_str(&format!(
-                    " {}cr {}cw",
-                    format_tokens(app.total_cache_read_tokens),
-                    format_tokens(app.total_cache_creation_tokens),
-                ));
-            }
-            s.push_str("  ");
-            s
+                cache_rate,
+            )
         } else {
             String::new()
         };
@@ -2967,6 +3029,7 @@ async fn main() -> Result<()> {
                             app.append_or_update_text(&text);
                         }
                         StreamEvent::ToolUseStart(name) => {
+                            app.tool_start_time = Some(std::time::Instant::now());
                             app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
                         }
                         StreamEvent::ToolUseDelta(delta) => {
