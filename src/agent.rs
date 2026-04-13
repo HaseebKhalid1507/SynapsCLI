@@ -88,15 +88,16 @@ async fn main() {
     runtime.set_model(config.agent.model.clone());
     runtime.set_system_prompt(soul);
 
+    // Handoff path for sentinel_exit tool
+    let handoff_path = agent_dir.join("handoff.json");
+    runtime.sentinel_exit_path = Some(handoff_path.clone());
+
     // Register sentinel_exit tool
     {
         let tools = runtime.tools_shared();
         let mut tools = tools.write().await;
         tools.register(Arc::new(synaps_cli::tools::SentinelExitTool));
     }
-
-    // Handoff path for sentinel_exit tool
-    let handoff_path = agent_dir.join("handoff.json");
 
     // Setup heartbeat
     let heartbeat_path = agent_dir.join("heartbeat");

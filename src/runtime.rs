@@ -2,6 +2,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use serde::{Deserialize};
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use crate::{Result, RuntimeError, ToolRegistry};
@@ -99,6 +100,8 @@ pub struct Runtime {
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
     thinking_budget: u32,
+    /// Path for sentinel_exit tool to write handoff state (agent mode only)
+    pub sentinel_exit_path: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -123,6 +126,7 @@ impl Runtime {
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
+            sentinel_exit_path: None,
         })
     }
 
@@ -330,7 +334,7 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None, sentinel_exit_path: None };
+                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None, sentinel_exit_path: self.sentinel_exit_path.clone() };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -355,11 +359,12 @@ impl Runtime {
                         ) {
                             let input = tool_use["input"].clone();
                             let tool = self.tools.read().await.get(&tool_name).cloned();
+                            let exit_path = self.sentinel_exit_path.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None, sentinel_exit_path: None };
+                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None, sentinel_exit_path: exit_path };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -440,11 +445,12 @@ impl Runtime {
         let tools = self.tools.clone();
         let system_prompt = self.system_prompt.clone();
         let thinking_budget = self.thinking_budget;
+        let sentinel_exit_path = self.sentinel_exit_path.clone();
 
         tokio::spawn(async move {
             if let Err(e) = Self::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
-                messages, tx.clone(), cancel, steering_rx,
+                messages, tx.clone(), cancel, steering_rx, sentinel_exit_path,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -465,6 +471,7 @@ impl Runtime {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: CancellationToken,
         mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        sentinel_exit_path: Option<PathBuf>,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -596,7 +603,7 @@ impl Runtime {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), sentinel_exit_path: None }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), sentinel_exit_path: sentinel_exit_path.clone() }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -639,6 +646,7 @@ impl Runtime {
                         let tool = tools.read().await.get(&tool_name).cloned();
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
+                        let exit_path = sentinel_exit_path.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -656,7 +664,7 @@ impl Runtime {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), sentinel_exit_path: None }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), sentinel_exit_path: exit_path.clone() }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
@@ -1282,6 +1290,7 @@ impl Clone for Runtime {
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
+            sentinel_exit_path: self.sentinel_exit_path.clone(),
         }
     }
 }
