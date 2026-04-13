@@ -324,4 +324,163 @@ mod tests {
         assert_eq!(session_info.session_cost, 1.23);
         assert_eq!(session_info.message_count, 5);
     }
+
+    #[test]
+    fn test_session_serialization_round_trip() {
+        let mut session = Session::new("gpt-4-turbo", "detailed", Some("You are a helpful assistant"));
+        session.title = "Test Session".to_string();
+        session.api_messages.push(json!({"role": "user", "content": "test"}));
+        session.total_input_tokens = 100;
+        session.total_output_tokens = 200;
+        session.session_cost = 0.15;
+
+        // Serialize to JSON string
+        let json_str = serde_json::to_string(&session).expect("Failed to serialize session");
+        
+        // Deserialize back from JSON string
+        let deserialized: Session = serde_json::from_str(&json_str).expect("Failed to deserialize session");
+
+        // Verify all fields match
+        assert_eq!(deserialized.id, session.id);
+        assert_eq!(deserialized.title, session.title);
+        assert_eq!(deserialized.model, session.model);
+        assert_eq!(deserialized.thinking_level, session.thinking_level);
+        assert_eq!(deserialized.system_prompt, session.system_prompt);
+        assert_eq!(deserialized.created_at, session.created_at);
+        assert_eq!(deserialized.updated_at, session.updated_at);
+        assert_eq!(deserialized.total_input_tokens, session.total_input_tokens);
+        assert_eq!(deserialized.total_output_tokens, session.total_output_tokens);
+        assert_eq!(deserialized.session_cost, session.session_cost);
+        assert_eq!(deserialized.api_messages.len(), session.api_messages.len());
+        assert_eq!(deserialized.api_messages[0], session.api_messages[0]);
+    }
+
+    #[test] 
+    fn test_session_serialization_preserves_all_fields() {
+        let mut session = Session::new("claude-3-opus", "comprehensive", Some("Custom system prompt"));
+        session.title = "Complex Session".to_string();
+        
+        // Add multiple messages
+        session.api_messages.push(json!({"role": "user", "content": "First message"}));
+        session.api_messages.push(json!({"role": "assistant", "content": "First response"}));
+        session.api_messages.push(json!({"role": "user", "content": "Second message"}));
+        
+        // Set token counts and cost
+        session.total_input_tokens = 1500;
+        session.total_output_tokens = 2500;
+        session.session_cost = 0.75;
+
+        // Serialize and deserialize
+        let json_str = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&json_str).unwrap();
+
+        // Verify every field is preserved
+        assert_eq!(restored.id, session.id);
+        assert_eq!(restored.title, "Complex Session");
+        assert_eq!(restored.model, "claude-3-opus");
+        assert_eq!(restored.thinking_level, "comprehensive");
+        assert_eq!(restored.system_prompt.as_ref().unwrap(), "Custom system prompt");
+        assert_eq!(restored.created_at, session.created_at);
+        assert_eq!(restored.updated_at, session.updated_at);
+        assert_eq!(restored.total_input_tokens, 1500);
+        assert_eq!(restored.total_output_tokens, 2500);
+        assert_eq!(restored.session_cost, 0.75);
+        assert_eq!(restored.api_messages.len(), 3);
+        assert_eq!(restored.api_messages[0]["role"], "user");
+        assert_eq!(restored.api_messages[0]["content"], "First message");
+        assert_eq!(restored.api_messages[1]["role"], "assistant");
+        assert_eq!(restored.api_messages[2]["content"], "Second message");
+    }
+
+    #[test]
+    fn test_session_info_from_session_with_messages() {
+        let mut session = Session::new("gpt-3.5-turbo", "normal", None);
+        
+        // Add exactly 3 messages
+        session.api_messages.push(json!({"role": "user", "content": "message 1"}));
+        session.api_messages.push(json!({"role": "assistant", "content": "response 1"}));
+        session.api_messages.push(json!({"role": "user", "content": "message 2"}));
+        
+        let info = session.info();
+        
+        // Verify message count is exactly 3
+        assert_eq!(info.message_count, 3);
+        assert_eq!(info.id, session.id);
+        assert_eq!(info.model, "gpt-3.5-turbo");
+    }
+
+    #[test] 
+    fn test_session_auto_title_truncation() {
+        let mut session = Session::new("gpt-4", "brief", None);
+        
+        // Create a user message with exactly 200 characters
+        let long_content = "a".repeat(200);
+        session.api_messages.push(json!({
+            "role": "user",
+            "content": long_content
+        }));
+        
+        session.auto_title();
+        
+        // Verify title is exactly 80 characters
+        assert_eq!(session.title.len(), 80);
+        assert_eq!(session.title, "a".repeat(80));
+    }
+
+    #[test]
+    fn test_session_auto_title_skips_non_user_messages() {
+        let mut session = Session::new("gpt-4", "brief", None);
+        
+        // Push only an assistant message (no user messages)
+        session.api_messages.push(json!({
+            "role": "assistant", 
+            "content": "This should be ignored for auto title"
+        }));
+        
+        session.auto_title();
+        
+        // Verify title stays empty since there are no user messages
+        assert_eq!(session.title, "");
+        
+        // Test with system message too
+        session.api_messages.push(json!({
+            "role": "system",
+            "content": "System message should also be ignored"
+        }));
+        
+        session.auto_title();
+        assert_eq!(session.title, "");
+    }
+
+    #[test]
+    fn test_session_new_generates_unique_ids() {
+        let session1 = Session::new("gpt-4", "brief", None);
+        let session2 = Session::new("gpt-4", "brief", None);
+        
+        // Verify IDs are different
+        assert_ne!(session1.id, session2.id);
+        assert!(!session1.id.is_empty());
+        assert!(!session2.id.is_empty());
+    }
+
+    #[test]
+    fn test_session_new_timestamps() {
+        let before = Utc::now();
+        let session = Session::new("gpt-4", "brief", None);
+        let after = Utc::now();
+        
+        // Verify created_at and updated_at are close to now (within 2 seconds)
+        let created_diff = (session.created_at - before).num_seconds().abs();
+        let updated_diff = (session.updated_at - before).num_seconds().abs();
+        
+        assert!(created_diff <= 2, "created_at should be within 2 seconds of now");
+        assert!(updated_diff <= 2, "updated_at should be within 2 seconds of now");
+        
+        // Verify both timestamps are the same for new sessions
+        assert_eq!(session.created_at, session.updated_at);
+        
+        // Verify timestamps are not in the future
+        assert!(session.created_at <= after);
+        assert!(session.updated_at <= after);
+    }
 }
