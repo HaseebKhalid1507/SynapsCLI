@@ -24,10 +24,11 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
         if dist < CHARS.len() { CHARS[dist] } else { ' ' }
     }).collect();
     let pulse = ((spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+    let Color::Rgb(br, bg, bb) = THEME.border_active else { return (trace, Color::Reset) };
     let color = Color::Rgb(
-        (50.0 * pulse) as u8,
-        (180.0 * pulse) as u8,
-        (220.0 * pulse) as u8,
+        (br as f64 * pulse) as u8,
+        (bg as f64 * pulse) as u8,
+        (bb as f64 * pulse) as u8,
     );
     (trace, color)
 }
@@ -58,20 +59,22 @@ pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option
 
 pub(crate) fn boot_effect() -> Effect {
     use tachyonfx::fx::Direction as FxDir;
+    let Color::Rgb(r, g, b) = THEME.bg else { return fx::sleep(0) };
     fx::parallel(&[
         // CRT-style scanline reveal, top-to-bottom, clean (no randomness) with a tight gradient trail
-        fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(12, 22, 35), (750, Interpolation::QuintOut)),
+        fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(r.saturating_add(10), g.saturating_add(15), b.saturating_add(20)), (750, Interpolation::QuintOut)),
         // long, slow fade from pure black — elegant deceleration
-        fx::fade_from_fg(Color::Rgb(5, 8, 18), (750, Interpolation::QuintOut)),
+        fx::fade_from_fg(Color::Rgb(r.saturating_add(2), g.saturating_add(3), b.saturating_add(5)), (750, Interpolation::QuintOut)),
     ])
 }
 
 pub(crate) fn quit_effect() -> Effect {
     use tachyonfx::fx::Direction as FxDir;
+    let Color::Rgb(r, g, b) = THEME.muted else { return fx::sleep(0) };
     fx::sequence(&[
         fx::hsl_shift_fg([180.0, -40.0, 0.0], (180, Interpolation::QuadOut)),
         fx::parallel(&[
-            fx::sweep_out(FxDir::DownToUp, 18, 12, Color::Rgb(40, 40, 44), (650, Interpolation::QuadIn)),
+            fx::sweep_out(FxDir::DownToUp, 18, 12, Color::Rgb(r, g, b), (650, Interpolation::QuadIn)),
             fx::dissolve((650, Interpolation::QuadIn)),
             fx::fade_to_fg(Color::Black, (650, Interpolation::QuadIn)),
         ]),
@@ -136,9 +139,10 @@ pub(crate) fn draw(
             )
         } else if app.streaming {
             let pulse = ((app.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-            let r = (220.0 * pulse) as u8;
-            let g = (175.0 * pulse) as u8;
-            let b = (60.0 * pulse) as u8;
+            let Color::Rgb(sr, sg, sb) = THEME.status_streaming else { unreachable!() };
+            let r = (sr as f64 * pulse) as u8;
+            let g = (sg as f64 * pulse) as u8;
+            let b = (sb as f64 * pulse) as u8;
             Span::styled(" \u{25cf} streaming ", Style::default().fg(Color::Rgb(r, g, b)))
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.status_ready))
@@ -238,14 +242,17 @@ pub(crate) fn draw(
                     let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
                     let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
                     let breathe = phase1 * 0.7 + phase2 * 0.3;
-                    let r = (20.0 + 15.0 * breathe) as u8;
-                    let g = (160.0 + 50.0 * breathe) as u8;
-                    let b = (210.0 + 35.0 * breathe) as u8;
+                    let Color::Rgb(ar, ag, ab) = THEME.border_active else { unreachable!() };
+                    let breathe_scale = 0.7 + 0.3 * breathe; // breathe is -1..1, scale is 0.4..1.0
+                    let r = (ar as f64 * breathe_scale) as u8;
+                    let g = (ag as f64 * breathe_scale) as u8;
+                    let b = (ab as f64 * breathe_scale) as u8;
                     let art_style = Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD);
+                    let Color::Rgb(mr, mg, mb) = THEME.muted else { unreachable!() };
                     let sub_style = Style::default().fg(Color::Rgb(
-                        (35.0 + 10.0 * breathe) as u8,
-                        (70.0 + 20.0 * breathe) as u8,
-                        (95.0 + 15.0 * breathe) as u8,
+                        (mr as f64 * breathe_scale) as u8,
+                        (mg as f64 * breathe_scale) as u8,
+                        (mb as f64 * breathe_scale) as u8,
                     ));
 
                     let build_t = app.logo_build_t.unwrap_or(1.0);
@@ -293,7 +300,7 @@ pub(crate) fn draw(
                     }
                 } else {
                     // Clean Dismiss: Top-Left to Bottom-Right (reverse of build-in)
-                    let art_style = Style::default().fg(Color::Rgb(30, 80, 120)).add_modifier(Modifier::BOLD);
+                    let art_style = Style::default().fg(THEME.muted).add_modifier(Modifier::BOLD);
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
@@ -494,9 +501,9 @@ pub(crate) fn draw(
             ])
             .split(outer[4]);
 
-        let key_style = Style::default().fg(Color::Rgb(60, 75, 95));
+        let key_style = Style::default().fg(THEME.muted);
         let label_style = Style::default().fg(THEME.help_fg);
-        let dot_style = Style::default().fg(Color::Rgb(30, 38, 52));
+        let dot_style = Style::default().fg(THEME.help_fg);
 
         let keybinds = Paragraph::new(Line::from(vec![
             Span::styled(" ctrl+c ", key_style),
@@ -555,11 +562,11 @@ pub(crate) fn draw(
                     let filled = (usage_ratio * bar_width as f64).round() as usize;
                     let empty = bar_width.saturating_sub(filled);
                     let bar_color = if usage_ratio < 0.5 {
-                        Color::Rgb(50, 180, 210)
+                        THEME.border_active
                     } else if usage_ratio < 0.75 {
-                        Color::Rgb(210, 175, 60)
+                        THEME.status_streaming
                     } else {
-                        Color::Rgb(220, 70, 70)
+                        THEME.error_color
                     };
                     let pct = (usage_ratio * 100.0) as u32;
                     Span::styled(

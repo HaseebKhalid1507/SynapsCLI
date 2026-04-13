@@ -35,6 +35,7 @@ pub(crate) struct Theme {
     pub(crate) tool_result_color: Color,
     pub(crate) tool_result_ok: Color,
     pub(crate) error_color: Color,
+    pub(crate) warning_color: Color,
 
     // UI chrome
     pub(crate) header_fg: Color,
@@ -81,6 +82,7 @@ impl Default for Theme {
             tool_result_color: Color::Rgb(55, 120, 130),
             tool_result_ok: Color::Rgb(50, 175, 160),
             error_color: Color::Rgb(230, 70, 70),
+            warning_color: Color::Rgb(220, 180, 60),
 
             header_fg: Color::Rgb(110, 125, 150),
             status_streaming: Color::Rgb(220, 175, 60),
@@ -128,6 +130,7 @@ impl Theme {
             tool_result_color: Color::Rgb(138, 154, 204),
             tool_result_ok: Color::Rgb(0, 240, 255),
             error_color: Color::Rgb(255, 23, 68),
+            warning_color: Color::Rgb(252, 238, 10),
 
             header_fg: Color::Rgb(255, 46, 136),
             status_streaming: Color::Rgb(252, 238, 10),
@@ -173,6 +176,7 @@ impl Theme {
             tool_result_color: Color::Rgb(180, 150, 80),
             tool_result_ok: Color::Rgb(200, 170, 50),
             error_color: Color::Rgb(255, 80, 40),
+            warning_color: Color::Rgb(255, 220, 100),
 
             header_fg: Color::Rgb(255, 176, 0),
             status_streaming: Color::Rgb(255, 220, 100),
@@ -218,6 +222,7 @@ impl Theme {
             tool_result_color: Color::Rgb(40, 160, 60),
             tool_result_ok: Color::Rgb(50, 220, 80),
             error_color: Color::Rgb(255, 60, 60),
+            warning_color: Color::Rgb(80, 255, 120),
 
             header_fg: Color::Rgb(50, 255, 80),
             status_streaming: Color::Rgb(80, 255, 120),
@@ -263,6 +268,7 @@ impl Theme {
             tool_result_color: Color::Rgb(133, 153, 0),
             tool_result_ok: Color::Rgb(42, 161, 152),
             error_color: Color::Rgb(220, 50, 47),   // red
+            warning_color: Color::Rgb(181, 137, 0),
 
             header_fg: Color::Rgb(131, 148, 150),   // base0
             status_streaming: Color::Rgb(181, 137, 0), // yellow
@@ -308,6 +314,7 @@ impl Theme {
             tool_result_color: Color::Rgb(180, 100, 80),
             tool_result_ok: Color::Rgb(200, 80, 60),
             error_color: Color::Rgb(255, 30, 30),
+            warning_color: Color::Rgb(255, 150, 50),
 
             header_fg: Color::Rgb(255, 50, 50),
             status_streaming: Color::Rgb(255, 150, 50),
@@ -353,6 +360,7 @@ impl Theme {
             tool_result_color: Color::Rgb(135, 175, 215),
             tool_result_ok: Color::Rgb(64, 224, 208),
             error_color: Color::Rgb(255, 99, 71),
+            warning_color: Color::Rgb(100, 200, 180),
 
             header_fg: Color::Rgb(0, 206, 209),
             status_streaming: Color::Rgb(32, 178, 170),
@@ -398,6 +406,7 @@ impl Theme {
             tool_result_color: Color::Rgb(156, 207, 216),
             tool_result_ok: Color::Rgb(234, 154, 151),
             error_color: Color::Rgb(235, 111, 146),
+            warning_color: Color::Rgb(246, 193, 119),
 
             header_fg: Color::Rgb(235, 111, 146),
             status_streaming: Color::Rgb(156, 207, 216),
@@ -443,6 +452,7 @@ impl Theme {
             tool_result_color: Color::Rgb(180, 142, 173),
             tool_result_ok: Color::Rgb(136, 192, 208),
             error_color: Color::Rgb(191, 97, 106),
+            warning_color: Color::Rgb(235, 203, 139),
 
             header_fg: Color::Rgb(129, 161, 193),
             status_streaming: Color::Rgb(163, 190, 140),
@@ -488,6 +498,7 @@ impl Theme {
             tool_result_color: Color::Rgb(80, 250, 123),
             tool_result_ok: Color::Rgb(139, 233, 253),
             error_color: Color::Rgb(255, 85, 85),
+            warning_color: Color::Rgb(241, 250, 140),
 
             header_fg: Color::Rgb(189, 147, 249),
             status_streaming: Color::Rgb(241, 250, 140),
@@ -533,6 +544,7 @@ impl Theme {
             tool_result_color: Color::Rgb(102, 217, 239),
             tool_result_ok: Color::Rgb(166, 226, 46),
             error_color: Color::Rgb(249, 38, 114),
+            warning_color: Color::Rgb(230, 219, 116),
 
             header_fg: Color::Rgb(253, 151, 31),
             status_streaming: Color::Rgb(102, 217, 239),
@@ -578,6 +590,7 @@ impl Theme {
             tool_result_color: Color::Rgb(131, 165, 152),
             tool_result_ok: Color::Rgb(184, 187, 38),
             error_color: Color::Rgb(251, 73, 52),
+            warning_color: Color::Rgb(250, 189, 47),
 
             header_fg: Color::Rgb(254, 128, 25),
             status_streaming: Color::Rgb(131, 165, 152),
@@ -623,6 +636,7 @@ impl Theme {
             tool_result_color: Color::Rgb(148, 226, 213),
             tool_result_ok: Color::Rgb(166, 227, 161),
             error_color: Color::Rgb(243, 139, 168),
+            warning_color: Color::Rgb(249, 226, 175),
 
             header_fg: Color::Rgb(250, 179, 135),
             status_streaming: Color::Rgb(137, 220, 235),
@@ -668,6 +682,7 @@ impl Theme {
             tool_result_color: Color::Rgb(125, 207, 255),
             tool_result_ok: Color::Rgb(158, 206, 106),
             error_color: Color::Rgb(247, 118, 142),
+            warning_color: Color::Rgb(224, 175, 104),
 
             header_fg: Color::Rgb(125, 207, 255),
             status_streaming: Color::Rgb(255, 158, 100),
@@ -713,6 +728,7 @@ impl Theme {
             tool_result_color: Color::Rgb(220, 130, 90),
             tool_result_ok: Color::Rgb(255, 160, 110),
             error_color: Color::Rgb(255, 80, 80),
+            warning_color: Color::Rgb(255, 200, 100),
 
             header_fg: Color::Rgb(255, 150, 100),
             status_streaming: Color::Rgb(255, 140, 90),
@@ -758,6 +774,7 @@ impl Theme {
             tool_result_color: Color::Rgb(150, 190, 230),
             tool_result_ok: Color::Rgb(180, 220, 255),
             error_color: Color::Rgb(255, 120, 140),
+            warning_color: Color::Rgb(180, 200, 230),
 
             header_fg: Color::Rgb(200, 230, 255),
             status_streaming: Color::Rgb(180, 220, 255),
@@ -803,6 +820,7 @@ impl Theme {
             tool_result_color: Color::Rgb(110, 160, 90),
             tool_result_ok: Color::Rgb(130, 190, 110),
             error_color: Color::Rgb(220, 80, 60),
+            warning_color: Color::Rgb(180, 170, 80),
 
             header_fg: Color::Rgb(140, 200, 120),
             status_streaming: Color::Rgb(120, 180, 100),
@@ -848,6 +866,7 @@ impl Theme {
             tool_result_color: Color::Rgb(140, 180, 230),
             tool_result_ok: Color::Rgb(160, 220, 200),
             error_color: Color::Rgb(255, 95, 130),
+            warning_color: Color::Rgb(220, 180, 240),
 
             header_fg: Color::Rgb(170, 120, 255),
             status_streaming: Color::Rgb(220, 170, 255),
@@ -939,6 +958,7 @@ impl Theme {
             "tool_result_color" => self.tool_result_color = c,
             "tool_result_ok" => self.tool_result_ok = c,
             "error_color" => self.error_color = c,
+            "warning_color" => self.warning_color = c,
 
             "header_fg" => self.header_fg = c,
             "status_streaming" => self.status_streaming = c,

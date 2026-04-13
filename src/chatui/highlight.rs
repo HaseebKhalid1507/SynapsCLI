@@ -109,14 +109,14 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         if trimmed.starts_with("error") || trimmed.starts_with("Error") || trimmed.starts_with("ERROR")
             || trimmed.starts_with("fatal") || trimmed.starts_with("FATAL") {
             // Errors → red
-            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(220, 70, 70))));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.error_color)));
         } else if trimmed.starts_with("warning") || trimmed.starts_with("Warning") || trimmed.starts_with("WARN") {
             // Warnings → yellow
-            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(220, 180, 50))));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.warning_color)));
         } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")
             || trimmed.starts_with("done") || trimmed.starts_with("Done") || trimmed.starts_with("success") {
             // Success → green with blue tint
-            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(60, 190, 130))));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.tool_result_ok)));
         } else {
             // Default: blue-tinted with smart coloring
             let mut remaining = *line;
@@ -131,7 +131,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_start > 0 {
                             spans.push(Span::styled(
                                 remaining[..path_start].to_string(),
-                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                                Style::default().fg(THEME.tool_result_color),
                             ));
                         }
                         // Path portion
@@ -142,13 +142,13 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_end == 0 {
                             spans.push(Span::styled(
                                 after_slash[..1].to_string(),
-                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                                Style::default().fg(THEME.tool_result_color),
                             ));
                             remaining = &after_slash[1..];
                         } else {
                             spans.push(Span::styled(
                                 after_slash[..path_end].to_string(),
-                                Style::default().fg(Color::Rgb(80, 160, 220)),
+                                Style::default().fg(THEME.tool_label),
                             ));
                             remaining = &after_slash[path_end..];
                         }
@@ -159,13 +159,13 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_end == 0 {
                             spans.push(Span::styled(
                                 remaining[..1].to_string(),
-                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                                Style::default().fg(THEME.tool_result_color),
                             ));
                             remaining = &remaining[1..];
                         } else {
                             spans.push(Span::styled(
                                 remaining[..path_end].to_string(),
-                                Style::default().fg(Color::Rgb(80, 160, 220)),
+                                Style::default().fg(THEME.tool_label),
                             ));
                             remaining = &remaining[path_end..];
                         }
@@ -174,7 +174,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                     // No more paths — output the rest with blue tint
                     spans.push(Span::styled(
                         remaining.to_string(),
-                        Style::default().fg(Color::Rgb(120, 140, 180)),
+                        Style::default().fg(THEME.tool_result_color),
                     ));
                     break;
                 }
