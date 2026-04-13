@@ -14,7 +14,7 @@
 //!   sentinel logs <name>            — show agent logs
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -389,6 +389,172 @@ fn discover_agents() -> Vec<(String, PathBuf)> {
     }
     agents.sort_by(|a, b| a.0.cmp(&b.0));
     agents
+}
+
+fn format_log_entry(entry: &str) -> Option<String> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(entry) {
+        let ts_str = json["ts"].as_str().unwrap_or("??:??:??");
+        let timestamp = if let Some(time_part) = ts_str.split('T').nth(1) {
+            time_part.split('.').next().unwrap_or(time_part)
+        } else {
+            ts_str
+        };
+
+        let log_type = json["type"].as_str().unwrap_or("unknown");
+        
+        match log_type {
+            "boot" => {
+                let session = json["session"].as_u64().unwrap_or(0);
+                let model = json["model"].as_str().unwrap_or("unknown");
+                let trigger = json["trigger"].as_str().unwrap_or("unknown");
+                Some(format!("[{}] BOOT session #{} (model: {}, trigger: {})", timestamp, session, model, trigger))
+            }
+            "tool_start" => {
+                let name = json["name"].as_str().unwrap_or("unknown");
+                let call_num = json["call_num"].as_u64().unwrap_or(0);
+                Some(format!("[{}] TOOL {} (#{}) ", timestamp, name, call_num))
+            }
+            "tool_result" => {
+                let preview = json["preview"].as_str().unwrap_or("").chars().take(80).collect::<String>();
+                Some(format!("[{}]   → {}", timestamp, preview))
+            }
+            "usage" => {
+                let input_tokens = json["input_tokens"].as_u64().unwrap_or(0);
+                let output_tokens = json["output_tokens"].as_u64().unwrap_or(0);
+                let total_tokens = json["total_tokens"].as_u64().unwrap_or(0);
+                let cost = json["cost"].as_f64().unwrap_or(0.0);
+                Some(format!("[{}] USAGE +{}/+{} tokens (total: {}, cost: ${:.4})", 
+                    timestamp, input_tokens, output_tokens, total_tokens, cost))
+            }
+            "text" => {
+                let length = json["length"].as_u64().unwrap_or(0);
+                let preview = json["preview"].as_str().unwrap_or("").chars().take(80).collect::<String>();
+                Some(format!("[{}] TEXT {} chars: {}", timestamp, length, preview))
+            }
+            "exit" => {
+                let reason = json["reason"].as_str().unwrap_or("unknown");
+                let total_tokens = json["total_tokens"].as_u64().unwrap_or(0);
+                let total_cost = json["total_cost"].as_f64().unwrap_or(0.0);
+                let tool_calls = json["tool_calls"].as_u64().unwrap_or(0);
+                let duration_secs = json["duration_secs"].as_u64().unwrap_or(0);
+                Some(format!("[{}] EXIT {} ({} tokens, ${:.2}, {} tool calls, {}s)", 
+                    timestamp, reason, total_tokens, total_cost, tool_calls, duration_secs))
+            }
+            _ => Some(format!("[{}] {}: {}", timestamp, log_type.to_uppercase(), entry))
+        }
+    } else {
+        None
+    }
+}
+
+fn find_latest_session_file(logs_dir: &Path) -> Result<PathBuf, String> {
+    let mut max_session = 0;
+    let mut found_any = false;
+    
+    if let Ok(entries) = std::fs::read_dir(logs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("session-") && name_str.ends_with(".jsonl") {
+                found_any = true;
+                if let Ok(num) = name_str.trim_start_matches("session-").trim_end_matches(".jsonl").parse::<u64>() {
+                    if num > max_session {
+                        max_session = num;
+                    }
+                }
+            }
+        }
+    }
+    
+    if !found_any {
+        return Err("No session logs found".to_string());
+    }
+    
+    Ok(logs_dir.join(format!("session-{:03}.jsonl", max_session)))
+}
+
+async fn show_logs(name: &str, follow: bool, session_num: Option<u64>, last_n: Option<usize>) -> Result<(), String> {
+    let logs_dir = sentinel_dir().join(name).join("logs");
+    
+    if !logs_dir.exists() {
+        return Err(format!("Agent '{}' has no logs directory", name));
+    }
+
+    let log_file = if let Some(session) = session_num {
+        logs_dir.join(format!("session-{:03}.jsonl", session))
+    } else {
+        find_latest_session_file(&logs_dir)?
+    };
+
+    if !log_file.exists() {
+        return Err(format!("Log file {:?} does not exist", log_file));
+    }
+
+    if follow {
+        // For follow mode, use current.log if available
+        let current_log = logs_dir.join("current.log");
+        let follow_path = if current_log.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&current_log) {
+                PathBuf::from(contents.trim())
+            } else {
+                log_file
+            }
+        } else {
+            log_file
+        };
+
+        // Initial read
+        if let Ok(contents) = std::fs::read_to_string(&follow_path) {
+            for line in contents.lines() {
+                if let Some(formatted) = format_log_entry(line) {
+                    println!("{}", formatted);
+                }
+            }
+        }
+
+        // Poll for new lines
+        let mut last_size = std::fs::metadata(&follow_path).map(|m| m.len()).unwrap_or(0);
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            if let Ok(metadata) = std::fs::metadata(&follow_path) {
+                let current_size = metadata.len();
+                if current_size > last_size {
+                    if let Ok(contents) = std::fs::read_to_string(&follow_path) {
+                        let new_content = &contents[(last_size as usize)..];
+                        for line in new_content.lines() {
+                            if !line.trim().is_empty() {
+                                if let Some(formatted) = format_log_entry(line) {
+                                    println!("{}", formatted);
+                                }
+                            }
+                        }
+                        last_size = current_size;
+                    }
+                }
+            }
+        }
+    } else {
+        // Read and display log file
+        let contents = std::fs::read_to_string(&log_file)
+            .map_err(|e| format!("Failed to read log file: {}", e))?;
+        
+        let mut lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        
+        if let Some(n) = last_n {
+            if lines.len() > n {
+                lines = lines[(lines.len() - n)..].to_vec();
+            }
+        }
+
+        for line in lines {
+            if let Some(formatted) = format_log_entry(line) {
+                println!("{}", formatted);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Spawn an agent worker process
@@ -839,6 +1005,23 @@ async fn main() {
             }
         }
 
+        "logs" => {
+            let name = args.get(2).unwrap_or_else(|| {
+                eprintln!("Usage: sentinel logs <name> [--follow | --session N | --last N]");
+                std::process::exit(1);
+            });
+
+            // Parse flags
+            let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+            let session_num = args.iter().position(|a| a == "--session").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<u64>().ok());
+            let last_n = args.iter().position(|a| a == "--last").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<usize>().ok());
+
+            if let Err(e) = show_logs(name, follow, session_num, last_n).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         "help" | "--help" | "-h" => {
             println!("sentinel — Autonomous agent supervisor");
             println!();
@@ -851,6 +1034,9 @@ async fn main() {
             println!("  sentinel list                List configured agents");
             println!("  sentinel status              Show all agent statuses");
             println!("  sentinel status <name>       Show detailed status for agent");
+            println!("  sentinel logs <name>         Show latest session log");
+            println!("  sentinel logs <name> --follow  Tail current session log");
+            println!("  sentinel logs <name> --session N  Show specific session");
             println!("  sentinel help                Show this help");
             println!();
             println!("AGENTS DIR: {}", sentinel_dir().display());

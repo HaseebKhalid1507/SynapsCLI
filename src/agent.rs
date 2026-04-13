@@ -8,7 +8,7 @@
 use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -30,6 +30,30 @@ fn estimate_cost(input_tokens: u64, output_tokens: u64, model: &str) -> f64 {
 fn log(agent: &str, msg: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
     eprintln!("[{}] [{}] {}", ts, agent, msg);
+}
+
+fn write_log(log_path: &Path, entry: &serde_json::Value) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = serde_json::to_writer(&mut f, entry);
+        let _ = writeln!(f);
+    }
+}
+
+fn get_session_number(logs_dir: &Path) -> u64 {
+    let mut max_session = 0;
+    if let Ok(entries) = std::fs::read_dir(logs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("session-") && name_str.ends_with(".jsonl") {
+                if let Ok(num) = name_str.trim_start_matches("session-").trim_end_matches(".jsonl").parse::<u64>() {
+                    max_session = max_session.max(num);
+                }
+            }
+        }
+    }
+    max_session + 1
 }
 
 #[tokio::main]
@@ -61,7 +85,26 @@ async fn main() {
     let agent_dir = AgentConfig::agent_dir(&config_path);
     let agent_name = &config.agent.name;
 
+    // Setup session logging
+    let logs_dir = agent_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap_or_default();
+    let session_number = get_session_number(&logs_dir);
+    let session_log_path = logs_dir.join(format!("session-{:03}.jsonl", session_number));
+    let current_log_path = logs_dir.join("current.log");
+    
+    // Write current.log file
+    let _ = std::fs::write(&current_log_path, session_log_path.to_string_lossy().as_bytes());
+
     log(agent_name, &format!("booting (model: {}, trigger: {})", config.agent.model, config.agent.trigger));
+
+    // Log boot event
+    write_log(&session_log_path, &json!({
+        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "type": "boot",
+        "session": session_number,
+        "model": config.agent.model,
+        "trigger": trigger_context
+    }));
 
     // Load soul (system prompt)
     let soul = AgentConfig::load_soul(&agent_dir).unwrap_or_else(|e| {
@@ -125,6 +168,7 @@ async fn main() {
     let mut total_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
     let mut total_tool_calls: u64 = 0;
+    let mut tool_call_num: u64 = 0;
     let session_start = Instant::now();
     let max_duration = std::time::Duration::from_secs(config.limits.max_session_duration_mins * 60);
     let mut sentinel_exit_called = false;
@@ -185,11 +229,25 @@ async fn main() {
                     // Log significant text output
                     if text.len() > 100 {
                         log(agent_name, &format!("output: {}...", &text[..100]));
+                        write_log(&session_log_path, &json!({
+                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                            "type": "text",
+                            "length": text.len(),
+                            "preview": text.chars().take(200).collect::<String>()
+                        }));
                     }
                 }
                 StreamEvent::ToolUseStart(name) => {
                     total_tool_calls += 1;
+                    tool_call_num += 1;
                     log(agent_name, &format!("tool: {}", name));
+
+                    write_log(&session_log_path, &json!({
+                        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        "type": "tool_start",
+                        "name": name,
+                        "call_num": tool_call_num
+                    }));
 
                     // Check if this is a sentinel_exit call
                     if name == "sentinel_exit" {
@@ -199,12 +257,28 @@ async fn main() {
                 StreamEvent::ToolResult { result, .. } => {
                     let preview: String = result.chars().take(100).collect();
                     log(agent_name, &format!("  result: {}", preview));
+                    
+                    write_log(&session_log_path, &json!({
+                        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        "type": "tool_result",
+                        "name": "unknown", // We don't have tool name here, but it's from the most recent tool
+                        "preview": result.chars().take(200).collect::<String>()
+                    }));
                 }
                 StreamEvent::Usage { input_tokens, output_tokens, model, .. } => {
                     total_tokens += input_tokens + output_tokens;
-                    total_cost += estimate_cost(input_tokens, output_tokens, &model.as_deref().unwrap_or("sonnet"));
+                    total_cost += estimate_cost(input_tokens, output_tokens, model.as_deref().unwrap_or("sonnet"));
                     log(agent_name, &format!("  tokens: +{}/+{} (total: {}, cost: ${:.4})",
                         input_tokens, output_tokens, total_tokens, total_cost));
+
+                    write_log(&session_log_path, &json!({
+                        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        "type": "usage",
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                        "cost": total_cost
+                    }));
 
                     // Real-time limit check during streaming
                     if total_tokens >= config.limits.max_session_tokens
@@ -306,6 +380,34 @@ async fn main() {
     }
 
     let elapsed = session_start.elapsed().as_secs_f64();
+    
+    // Log exit event
+    let exit_reason = if sentinel_exit_called {
+        "sentinel_exit"
+    } else if interrupted.load(Ordering::Relaxed) {
+        "signal"
+    } else if total_tokens >= config.limits.max_session_tokens {
+        "token_limit"
+    } else if total_cost >= config.limits.max_session_cost_usd {
+        "cost_limit"
+    } else if session_start.elapsed() >= max_duration {
+        "time_limit"
+    } else if total_tool_calls >= config.limits.max_tool_calls {
+        "tool_limit"
+    } else {
+        "unknown"
+    };
+    
+    write_log(&session_log_path, &json!({
+        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "type": "exit",
+        "reason": exit_reason,
+        "total_tokens": total_tokens,
+        "total_cost": total_cost,
+        "tool_calls": total_tool_calls,
+        "duration_secs": elapsed as u64
+    }));
+    
     log(agent_name, &format!(
         "session complete — {:.0}s, {} tokens, {} tool calls, ${:.4}",
         elapsed, total_tokens, total_tool_calls, total_cost
