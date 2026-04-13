@@ -870,10 +870,13 @@ impl App {
                     let preceding_tool = self.find_preceding_tool_name(i);
 
                     // Check if this is read tool output (line-numbered) and try syntax highlighting
-                    let highlighted_lines = if !is_error && is_read_tool_output(&result_lines) {
+                    // Skip fancy highlighting for timeouts — render everything in warning style
+                    let highlighted_lines = if is_timeout || is_error {
+                        None
+                    } else if is_read_tool_output(&result_lines) {
                         let ext = self.find_preceding_read_extension(i);
                         highlight_read_output(&result_lines[..show], &ext, &m)
-                    } else if !is_error && preceding_tool.as_deref() == Some("bash") {
+                    } else if preceding_tool.as_deref() == Some("bash") {
                         Some(highlight_bash_output(&result_lines[..show], &m))
                     } else {
                         None
@@ -883,14 +886,16 @@ impl App {
                         lines.extend(hl_lines);
                     } else {
                         for line in &result_lines[..show] {
-                            // Try to detect and highlight grep output (filepath:linenum:content)
-                            if let Some(grep_spans) = try_highlight_grep_line(line, &m) {
-                                lines.push(Line::from(grep_spans));
-                            } else {
-                                let full = format!("{}       {}", m, line);
-                                for wline in wrap_text(&full, width) {
-                                    lines.push(Line::from(Span::styled(wline, style)));
+                            // Try to detect and highlight grep output (skip for timeout/error)
+                            if !is_timeout && !is_error {
+                                if let Some(grep_spans) = try_highlight_grep_line(line, &m) {
+                                    lines.push(Line::from(grep_spans));
+                                    continue;
                                 }
+                            }
+                            let full = format!("{}       {}", m, line);
+                            for wline in wrap_text(&full, width) {
+                                lines.push(Line::from(Span::styled(wline, style)));
                             }
                         }
                     }
