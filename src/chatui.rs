@@ -2773,7 +2773,7 @@ async fn main() -> Result<()> {
                                 app.scroll_back = 0;
                                 app.scroll_pinned = true;
 
-                                if input.starts_with('/') {
+                                if input.starts_with('/') && input.len() > 1 {
                                     let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
                                     let raw_cmd = parts[0];
                                     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -3120,7 +3120,7 @@ async fn main() -> Result<()> {
                                     app.queued_message = Some(input);
                                 }
                             }
-                            (KeyCode::Tab, _) if app.input.starts_with('/') => {
+                            (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
                                 let partial = &app.input[1..];
                                 let commands = ["clear", "model", "system", "thinking", "sessions", "resume", "theme", "gamba", "help", "quit", "exit"];
                                 let matches: Vec<&&str> = commands.iter()

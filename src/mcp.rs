@@ -108,7 +108,8 @@ impl McpConnection {
             "params": params
         });
         
-        let msg = format!("{}\n", serde_json::to_string(&request).unwrap());
+        let msg = format!("{}\n", serde_json::to_string(&request)
+            .map_err(|e| format!("Failed to serialize MCP request: {}", e))?);
         self.stdin.write_all(msg.as_bytes()).await
             .map_err(|e| format!("Failed to write to MCP server: {}", e))?;
         self.stdin.flush().await
@@ -157,7 +158,8 @@ impl McpConnection {
             "params": params
         });
         
-        let msg = format!("{}\n", serde_json::to_string(&notification).unwrap());
+        let msg = format!("{}\n", serde_json::to_string(&notification)
+            .map_err(|e| format!("Failed to serialize MCP notification: {}", e))?);
         self.stdin.write_all(msg.as_bytes()).await
             .map_err(|e| format!("Failed to write notification to MCP server: {}", e))?;
         self.stdin.flush().await

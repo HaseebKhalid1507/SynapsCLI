@@ -171,7 +171,10 @@ async fn main() -> anyhow::Result<()> {
                                     if let Some(obj) = input.as_object() {
                                         for (k, v) in obj {
                                             let val = match v.as_str() {
-                                                Some(s) if s.len() > 100 => format!("{}…", &s[..100]),
+                                                Some(s) if s.len() > 100 => {
+                                                    let end = s.char_indices().nth(100).map(|(i, _)| i).unwrap_or(s.len());
+                                                    format!("{}…", &s[..end])
+                                                }
                                                 Some(s) => s.to_string(),
                                                 None => v.to_string(),
                                             };

@@ -172,8 +172,10 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| RuntimeError::Tool(e.to_string()))?;
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let stdout = child.stdout.take()
+            .ok_or_else(|| RuntimeError::Tool("Failed to capture stdout".to_string()))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| RuntimeError::Tool("Failed to capture stderr".to_string()))?;
 
         let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<String>();
 

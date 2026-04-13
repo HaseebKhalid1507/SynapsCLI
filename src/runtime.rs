@@ -1105,7 +1105,7 @@ impl Runtime {
 
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
-            tracing::info!("Steering message injected: {}", &msg[..msg.len().min(80)]);
+            tracing::info!("Steering message injected: {}", &msg[..msg.floor_char_boundary(80.min(msg.len()))]);
             let _ = tx.send(StreamEvent::SteeringDelivered { message: msg.clone() });
             messages.push(json!({"role": "user", "content": msg}));
             injected = true;

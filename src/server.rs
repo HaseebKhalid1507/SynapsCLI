@@ -491,7 +491,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 let rt = state.runtime.lock().await;
                 let prompt = rt.system_prompt().unwrap_or("(none)");
                 let _ = broadcast.send(ServerMessage::System {
-                    message: format!("system prompt: {}", &prompt[..prompt.len().min(200)]),
+                    message: format!("system prompt: {}", &prompt[..prompt.floor_char_boundary(200.min(prompt.len()))]),
                 });
             } else {
                 let mut rt = state.runtime.lock().await;
