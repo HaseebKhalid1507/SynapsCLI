@@ -1148,8 +1148,12 @@ impl Tool for SentinelExitTool {
                 }
             }
 
-            tokio::fs::write(&path, &json_content).await
-                .map_err(|e| RuntimeError::Tool(format!("Failed to write handoff to '{}': {}", path.display(), e)))?;
+            // Atomic write for handoff
+            let tmp_path = path.with_extension("tmp");
+            tokio::fs::write(&tmp_path, &json_content).await
+                .map_err(|e| RuntimeError::Tool(format!("Failed to write handoff temp file: {}", e)))?;
+            tokio::fs::rename(&tmp_path, &path).await
+                .map_err(|e| RuntimeError::Tool(format!("Failed to rename handoff file: {}", e)))?;
         }
 
         Ok(format!("Shutdown acknowledged. Handoff saved. Reason: {}", reason))

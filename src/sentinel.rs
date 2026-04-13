@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::os::unix::fs::PermissionsExt;
 use synaps_cli::{AgentConfig, SentinelCommand, SentinelResponse, AgentStatusInfo};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -37,6 +38,22 @@ fn agent_binary() -> PathBuf {
 fn log(msg: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
     eprintln!("[{}] [sentinel] {}", ts, msg);
+}
+
+fn validate_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Agent name cannot be empty".to_string());
+    }
+    if name.len() > 64 {
+        return Err("Agent name too long (max 64 characters)".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!("Agent name '{}' contains invalid characters (use a-z, 0-9, -, _)", name));
+    }
+    if name.starts_with('-') || name.starts_with('_') {
+        return Err("Agent name cannot start with - or _".to_string());
+    }
+    Ok(())
 }
 
 fn load_agent_stats(agent_dir: &std::path::Path) -> synaps_cli::sentinel_types::AgentStats {
@@ -128,6 +145,11 @@ async fn handle_ipc_command(
 ) -> SentinelResponse {
     match command {
         SentinelCommand::Deploy { name } => {
+            // Validate agent name
+            if let Err(e) = validate_agent_name(&name) {
+                return SentinelResponse::Error { message: e };
+            }
+
             let mut agents = agents.lock().await;
             
             // Check if agent config exists
@@ -238,8 +260,18 @@ async fn handle_ipc_command(
 async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>>>) {
     let socket_path = sentinel_dir().join("sentinel.sock");
     
-    // Clean up any existing socket
-    let _ = std::fs::remove_file(&socket_path);
+    // Check if socket exists and test if it's alive
+    if socket_path.exists() {
+        // Try to connect to existing socket
+        if tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path)).await.is_ok() {
+            log("Another supervisor is already running");
+            std::process::exit(1);
+        } else {
+            // Stale socket - remove it
+            log("Removing stale socket");
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
     
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
@@ -249,17 +281,33 @@ async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>>>) {
         }
     };
 
+    // Set socket permissions to owner-only
+    if let Err(e) = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)) {
+        log(&format!("Failed to set socket permissions: {}", e));
+        return;
+    }
+
     log(&format!("IPC listening on {}", socket_path.display()));
+
+    let semaphore = Arc::new(Semaphore::new(10)); // Max 10 concurrent IPC connections
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let agents = agents.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_ipc_connection(stream, agents).await {
-                        log(&format!("IPC connection error: {}", e));
+                let permit = semaphore.clone().try_acquire_owned();
+                match permit {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _ = handle_ipc_connection(stream, agents).await;
+                            drop(permit); // Release on completion
+                        });
                     }
-                });
+                    Err(_) => {
+                        // Too many connections — drop this one
+                        log("IPC: too many concurrent connections, dropping");
+                    }
+                }
             }
             Err(e) => {
                 log(&format!("IPC accept error: {}", e));
@@ -293,13 +341,26 @@ async fn handle_ipc_connection(
 /// Send command to supervisor via IPC
 async fn send_ipc_command(command: SentinelCommand) -> Result<SentinelResponse, String> {
     let socket_path = sentinel_dir().join("sentinel.sock");
-    
     if !socket_path.exists() {
         return Err("Supervisor not running. Start with: sentinel run".to_string());
     }
-
-    let mut stream = UnixStream::connect(&socket_path).await
-        .map_err(|e| format!("Failed to connect to supervisor: {}", e))?;
+    
+    // Add timeout to avoid hanging on stale socket
+    let connect_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        UnixStream::connect(&socket_path)
+    ).await;
+    
+    let mut stream = match connect_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) => {
+            // Socket exists but can't connect — stale
+            return Err("Supervisor socket is stale. Remove it and restart: sentinel run".to_string());
+        }
+        Err(_) => {
+            return Err("Supervisor not responding (timeout). Try: sentinel run".to_string());
+        }
+    };
     
     let command_json = serde_json::to_string(&command)
         .map_err(|e| format!("Failed to serialize command: {}", e))?;
@@ -410,7 +471,10 @@ fn discover_agents() -> Vec<(String, PathBuf)> {
                 let config_path = entry.path().join("config.toml");
                 if config_path.exists() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    agents.push((name, config_path));
+                    // Filter out invalid names
+                    if validate_agent_name(&name).is_ok() {
+                        agents.push((name, config_path));
+                    }
                 }
             }
         }
@@ -628,6 +692,9 @@ fn check_heartbeat(agent_dir: &std::path::Path, stale_threshold: u64) -> bool {
 
 /// Create agent from template
 fn init_agent(name: &str) -> Result<(), String> {
+    // Validate agent name
+    validate_agent_name(name)?;
+    
     let dir = sentinel_dir().join(name);
     if dir.exists() {
         return Err(format!("Agent '{}' already exists at {}", name, dir.display()));
@@ -748,6 +815,23 @@ async fn main() {
         }
 
         "run" => {
+            // Check if supervisor already running
+            let pid_path = sentinel_dir().join("sentinel.pid");
+            if pid_path.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        // Check if process is alive
+                        let proc_path = format!("/proc/{}", pid);
+                        if std::path::Path::new(&proc_path).exists() {
+                            eprintln!("Error: Supervisor already running (PID {})", pid);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                // Stale PID file — clean up
+                let _ = std::fs::remove_file(&pid_path);
+            }
+            
             // Main supervisor loop
             log("starting supervisor");
 
@@ -929,6 +1013,12 @@ async fn main() {
 
         "status" => {
             if let Some(agent_name) = args.get(2) {
+                // Validate agent name
+                if let Err(e) = validate_agent_name(agent_name) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                
                 // Detailed status for specific agent
                 match send_ipc_command(SentinelCommand::AgentStatus { name: agent_name.clone() }).await {
                     Ok(SentinelResponse::AgentDetail { info }) => {
@@ -940,7 +1030,7 @@ async fn main() {
                     }
                     Err(_e) => {
                         // Fallback to static detailed status
-                        let config_path = sentinel_dir().join(&*agent_name).join("config.toml");
+                        let config_path = sentinel_dir().join(agent_name).join("config.toml");
                         if let Ok(config) = AgentConfig::load(&config_path) {
                             let agent = ManagedAgent::new(agent_name.clone(), config_path, config);
                             print_agent_detail(agent.to_status_info());
@@ -992,6 +1082,12 @@ async fn main() {
                 std::process::exit(1);
             });
             
+            // Validate agent name
+            if let Err(e) = validate_agent_name(name) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            
             match send_ipc_command(SentinelCommand::Deploy { name: name.clone() }).await {
                 Ok(SentinelResponse::Ok { message }) => {
                     println!("{}", message);
@@ -1017,6 +1113,12 @@ async fn main() {
                 std::process::exit(1);
             });
             
+            // Validate agent name
+            if let Err(e) = validate_agent_name(name) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            
             match send_ipc_command(SentinelCommand::Stop { name: name.clone() }).await {
                 Ok(SentinelResponse::Ok { message }) => {
                     println!("{}", message);
@@ -1041,6 +1143,12 @@ async fn main() {
                 eprintln!("Usage: sentinel logs <name> [--follow | --session N | --last N]");
                 std::process::exit(1);
             });
+
+            // Validate agent name
+            if let Err(e) = validate_agent_name(name) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
 
             // Parse flags
             let follow = args.iter().any(|a| a == "--follow" || a == "-f");

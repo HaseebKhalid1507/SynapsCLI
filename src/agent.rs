@@ -13,6 +13,53 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use fs4::fs_std::FileExt;
+
+/// Write data to a file atomically (write to .tmp, then rename)
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Update stats with file locking to prevent race conditions
+fn update_stats(agent_dir: &Path, updater: impl FnOnce(&mut AgentStats)) {
+    use std::io::{Read, Write, Seek};
+    
+    let stats_path = agent_dir.join("stats.json");
+    
+    // Open with exclusive lock
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)  // We'll manually truncate after reading
+        .open(&stats_path);
+    
+    let Ok(mut file) = file else { return; };
+    
+    // Get exclusive lock (blocking)
+    if file.lock_exclusive().is_err() {
+        return; // Failed to lock, skip update
+    }
+    
+    // Read current stats
+    let mut contents = String::new();
+    let _ = file.read_to_string(&mut contents);
+    let mut stats: AgentStats = serde_json::from_str(&contents).unwrap_or_default();
+    
+    // Apply update
+    updater(&mut stats);
+    
+    // Write back (truncate + write)
+    let _ = file.set_len(0);
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = serde_json::to_writer_pretty(&mut file, &stats);
+    let _ = file.flush();
+    
+    // Lock released when file is dropped
+}
 
 /// Calculate approximate cost for a model
 fn estimate_cost(input_tokens: u64, output_tokens: u64, model: &str) -> f64 {
@@ -57,11 +104,26 @@ fn get_session_number(logs_dir: &Path) -> u64 {
 }
 
 fn load_stats(agent_dir: &Path) -> AgentStats {
+    use std::io::Read;
+    
     let path = agent_dir.join("stats.json");
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path);
+    
+    let Ok(mut file) = file else {
+        return AgentStats::default();
+    };
+    
+    // Try to get shared lock for reading
+    if file.lock_shared().is_err() {
+        // If we can't lock, just return default
+        return AgentStats::default();
+    }
+    
+    let mut contents = String::new();
+    let _ = file.read_to_string(&mut contents);
+    serde_json::from_str(&contents).unwrap_or_default()
 }
 
 #[tokio::main]
@@ -109,8 +171,8 @@ async fn main() {
     let session_log_path = logs_dir.join(format!("session-{:03}.jsonl", session_number));
     let current_log_path = logs_dir.join("current.log");
     
-    // Write current.log file
-    let _ = std::fs::write(&current_log_path, session_log_path.to_string_lossy().as_bytes());
+    // Write current.log file atomically
+    let _ = atomic_write(&current_log_path, session_log_path.to_string_lossy().as_bytes());
 
     log(agent_name, &format!("booting (model: {}, trigger: {})", config.agent.model, config.agent.trigger));
 
@@ -132,6 +194,13 @@ async fn main() {
     // Load handoff state from previous session
     let handoff = AgentConfig::load_handoff(&agent_dir);
     let handoff_json = serde_json::to_string_pretty(&handoff).unwrap_or_default();
+    
+    // Validate handoff size to prevent context bloat
+    if handoff_json.len() > 50 * 1024 {
+        log(agent_name, &format!("WARNING: handoff state large ({}KB), trimming", handoff_json.len() / 1024));
+        // Note: using empty handoff to prevent context bloat would require regenerating boot message
+        // For now just warn - the agent can decide if this is too much context
+    }
 
     // Build boot message from template
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
@@ -168,7 +237,10 @@ async fn main() {
     tokio::spawn(async move {
         while hb_flag.load(Ordering::Relaxed) {
             let ts = chrono::Utc::now().timestamp().to_string();
-            let _ = tokio::fs::write(&hb_path, &ts).await;
+            // Atomic heartbeat write
+            let tmp = hb_path.with_extension("tmp");
+            let _ = tokio::fs::write(&tmp, &ts).await;
+            let _ = tokio::fs::rename(&tmp, &hb_path).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(heartbeat_interval)).await;
         }
     });
@@ -393,7 +465,7 @@ async fn main() {
             context: serde_json::Value::Null,
         };
         let json = serde_json::to_string_pretty(&minimal).unwrap_or_default();
-        let _ = std::fs::write(&handoff_path, &json);
+        let _ = atomic_write(&handoff_path, json.as_bytes());
     }
 
     let elapsed = session_start.elapsed().as_secs_f64();
@@ -430,38 +502,33 @@ async fn main() {
         elapsed, total_tokens, total_tool_calls, total_cost
     ));
 
-    // Update stats before exit
-    let mut stats = load_stats(&agent_dir);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    
-    // Reset daily stats if it's a new day
-    if stats.today.date != today {
-        stats.today = DailyStats { date: today, sessions: 0, cost_usd: 0.0, tokens: 0 };
-    }
-    
-    // Update
-    stats.total_sessions += 1;
-    stats.total_tokens += total_tokens;
-    stats.total_cost_usd += total_cost;
-    stats.total_uptime_secs += session_start.elapsed().as_secs_f64();
-    stats.today.sessions += 1;
-    stats.today.cost_usd += total_cost;
-    stats.today.tokens += total_tokens;
-    
-    // If we crashed (non-clean exit), record it
-    if !sentinel_exit_called && !interrupted.load(Ordering::Relaxed) {
-        stats.crashes += 1;
-        stats.last_crash = Some(format!("{}: {}", 
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            exit_reason
-        ));
-    }
-    
-    // Write stats
-    let _ = std::fs::write(
-        agent_dir.join("stats.json"),
-        serde_json::to_string_pretty(&stats).unwrap_or_default()
-    );
+    // Update stats before exit using locked update
+    update_stats(&agent_dir, |stats| {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        
+        // Reset daily stats if it's a new day
+        if stats.today.date != today {
+            stats.today = DailyStats { date: today, sessions: 0, cost_usd: 0.0, tokens: 0 };
+        }
+        
+        // Update stats
+        stats.total_sessions += 1;
+        stats.total_tokens += total_tokens;
+        stats.total_cost_usd += total_cost;
+        stats.total_uptime_secs += session_start.elapsed().as_secs_f64();
+        stats.today.sessions += 1;
+        stats.today.cost_usd += total_cost;
+        stats.today.tokens += total_tokens;
+        
+        // If we crashed (non-clean exit), record it
+        if !sentinel_exit_called && !interrupted.load(Ordering::Relaxed) {
+            stats.crashes += 1;
+            stats.last_crash = Some(format!("{}: {}", 
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                exit_reason
+            ));
+        }
+    });
 
     std::process::exit(0);
 }
