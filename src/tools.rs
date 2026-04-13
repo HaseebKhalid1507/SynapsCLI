@@ -703,6 +703,10 @@ impl Tool for SubagentTool {
                 "model": {
                     "type": "string",
                     "description": "Model override (default: claude-sonnet-4-20250514). Use claude-opus-4-6 for complex tasks."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 300). Increase for long-running tasks."
                 }
             },
             "required": ["task"]
@@ -717,6 +721,7 @@ impl Tool for SubagentTool {
         let agent_name = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
         let model_override = params["model"].as_str().map(|s| s.to_string());
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(300);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => {
@@ -788,7 +793,7 @@ impl Tool for SubagentTool {
                 let mut total_cache_read = 0u64;
                 let mut total_cache_creation = 0u64;
 
-                let timeout_fut = tokio::time::sleep(Duration::from_secs(300));
+                let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
                 tokio::pin!(timeout_fut);
 
                 loop {
@@ -850,7 +855,7 @@ impl Tool for SubagentTool {
                             }
                         }
                         _ = &mut timeout_fut => {
-                            return Err("Subagent timed out after 300s".to_string());
+                            return Err(format!("Subagent timed out after {}s", timeout_secs));
                         }
                     }
                 }
