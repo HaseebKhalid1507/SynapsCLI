@@ -744,6 +744,29 @@ impl App {
         self.dirty = true;
     }
 
+    /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
+    fn find_preceding_read_extension(&self, idx: usize) -> String {
+        // Walk backwards from idx to find the preceding ToolUse
+        if idx == 0 { return String::new(); }
+        for i in (0..idx).rev() {
+            if let ChatMessage::ToolUse { ref tool_name, ref input } = self.messages[i].msg {
+                if tool_name == "read" {
+                    // Extract path from the JSON input
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
+                        if let Some(path) = parsed["path"].as_str() {
+                            // Get the extension
+                            if let Some(ext) = std::path::Path::new(path).extension() {
+                                return ext.to_string_lossy().to_string();
+                            }
+                        }
+                    }
+                }
+                break; // Stop at first ToolUse regardless
+            }
+        }
+        String::new()
+    }
+
     /// Capture all assistant output since the last user message as abort context.
     /// This gets injected into the next user message so the model knows what it
     /// was doing before the abort.
@@ -1008,20 +1031,36 @@ impl App {
                     let param_style = Style::default().fg(THEME.tool_param);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
+                            // Extract file extension from "path" param if present (for syntax highlighting)
+                            let file_ext = obj.get("path")
+                                .and_then(|v| v.as_str())
+                                .and_then(|p| std::path::Path::new(p).extension())
+                                .map(|e| e.to_string_lossy().to_string())
+                                .unwrap_or_default();
+
                             for (k, v) in obj {
                                 if let Some(s) = v.as_str() {
                                     if s.contains('\n') {
-                                        // Multi-line content: show key header, then content lines
+                                        // Multi-line content: syntax highlight if we know the language
                                         let content_lines: Vec<&str> = s.lines().collect();
                                         let total = content_lines.len();
                                         let max_preview = 12;
                                         let show = total.min(max_preview);
                                         let header = format!("{}     {}: ({} lines)", m, k, total);
                                         lines.push(Line::from(Span::styled(header, param_style)));
-                                        for cline in content_lines.iter().take(show) {
-                                            let line_str = format!("{}       {}", m, cline);
-                                            for wline in wrap_text(&line_str, width) {
-                                                lines.push(Line::from(Span::styled(wline, param_style)));
+
+                                        // Try syntax highlighting for code content
+                                        let is_code_param = k == "content" || k == "old_string" || k == "new_string" || k == "command";
+                                        if is_code_param && !file_ext.is_empty() {
+                                            let code_block: String = content_lines.iter().take(show).map(|l| format!("{}\n", l)).collect();
+                                            let hl = highlight_code_block(&code_block, &file_ext, &format!("{}      ", m));
+                                            lines.extend(hl);
+                                        } else {
+                                            for cline in content_lines.iter().take(show) {
+                                                let line_str = format!("{}       {}", m, cline);
+                                                for wline in wrap_text(&line_str, width) {
+                                                    lines.push(Line::from(Span::styled(wline, param_style)));
+                                                }
                                             }
                                         }
                                         if total > max_preview {
@@ -1089,18 +1128,20 @@ impl App {
                         ]));
                     }
 
-                    for (li, line) in result_lines[..show].iter().enumerate() {
-                        let full = format!("{}       {}", m, line);
-                        // Try syntax highlighting for tool output
-                        // Detect line-numbered content from read tool (e.g., "  42 | fn main()")
-                        let highlighted = try_highlight_tool_line(line);
-                        if let Some(spans) = highlighted {
-                            let mut prefix_spans = vec![
-                                Span::styled(format!("{}       ", m), style),
-                            ];
-                            prefix_spans.extend(spans);
-                            lines.push(Line::from(prefix_spans));
-                        } else {
+                    // Check if this is read tool output (line-numbered) and try syntax highlighting
+                    let highlighted_lines = if !is_error && is_read_tool_output(&result_lines) {
+                        // Find file extension from the preceding ToolUse message
+                        let ext = self.find_preceding_read_extension(i);
+                        highlight_read_output(&result_lines[..show], &ext, &m)
+                    } else {
+                        None
+                    };
+
+                    if let Some(hl_lines) = highlighted_lines {
+                        lines.extend(hl_lines);
+                    } else {
+                        for line in &result_lines[..show] {
+                            let full = format!("{}       {}", m, line);
                             for wline in wrap_text(&full, width) {
                                 lines.push(Line::from(Span::styled(wline, style)));
                             }
@@ -1225,73 +1266,73 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
 }
 
 /// Try to syntax-highlight a single tool output line.
-/// Returns Some(spans) if the line looks like code (from read tool), None otherwise.
-fn try_highlight_tool_line(line: &str) -> Option<Vec<Span<'static>>> {
-    // Detect read tool output pattern: "42\tcode here" (line number + tab)
-    let tab_idx = line.find('\t');
-    if let Some(idx) = tab_idx {
-        let before = line[..idx].trim();
-        // Check if everything before the tab is a number (line number)
-        if before.chars().all(|c| c.is_ascii_digit()) && !before.is_empty() {
-            let line_num = before;
-            let code = &line[idx + 1..];
-
-            let ss = &*SYNTAX_SET;
-            let ts = &*THEME_SET;
-            let theme = &ts.themes["base16-ocean.dark"];
-
-            // Try to detect language from content (rough heuristics)
-            let lang = guess_lang_from_content(code);
-            let syntax = ss.find_syntax_by_token(lang)
-                .unwrap_or_else(|| ss.find_syntax_plain_text());
-
-            let mut h = HighlightLines::new(syntax, theme);
-            let code_with_nl = format!("{}\n", code);
-            let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
-
-            let mut spans = vec![
-                Span::styled(
-                    format!("{:>4} \u{2502} ", line_num),
-                    Style::default().fg(THEME.muted),
-                ),
-            ];
-            for (style, text) in ranges {
-                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                let content = text.trim_end_matches('\n').to_string();
-                if !content.is_empty() {
-                    spans.push(Span::styled(content, Style::default().fg(fg)));
-                }
+/// Check if tool output looks like read tool output (line-numbered with tabs)
+fn is_read_tool_output(lines: &[&str]) -> bool {
+    if lines.is_empty() { return false; }
+    // Check first few non-empty lines for "number\tcontent" pattern
+    let mut checked = 0;
+    let mut matches = 0;
+    for line in lines.iter().take(10) {
+        if line.trim().is_empty() { continue; }
+        checked += 1;
+        if let Some(tab_idx) = line.find('\t') {
+            if line[..tab_idx].trim().chars().all(|c| c.is_ascii_digit()) && !line[..tab_idx].trim().is_empty() {
+                matches += 1;
             }
-            return Some(spans);
         }
     }
-    None
+    checked > 0 && matches * 2 >= checked // At least half the lines match
 }
 
-/// Guess language from a single line of code content (very rough).
-fn guess_lang_from_content(line: &str) -> &'static str {
-    let t = line.trim();
-    if t.starts_with("fn ") || t.starts_with("pub ") || t.starts_with("use ") || t.starts_with("mod ")
-        || t.starts_with("impl ") || t.starts_with("struct ") || t.starts_with("enum ")
-        || t.starts_with("let ") || t.starts_with("match ") || t.contains("->") || t.contains("=> {")
-    {
-        return "rs";
+/// Highlight read tool output as a code block using syntect
+fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> Option<Vec<Line<'static>>> {
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
+    let theme = &ts.themes["base16-ocean.dark"];
+
+    let syntax = if !ext.is_empty() {
+        ss.find_syntax_by_extension(ext).unwrap_or_else(|| ss.find_syntax_plain_text())
+    } else {
+        ss.find_syntax_plain_text()
+    };
+
+    // If plain text, don't bother highlighting
+    if syntax.name == "Plain Text" && ext.is_empty() {
+        return None;
     }
-    if t.starts_with("def ") || t.starts_with("import ") || t.starts_with("from ") || t.starts_with("class ")
-        || t.starts_with("self.") || t.contains("__init__")
-    {
-        return "py";
+
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut result = Vec::new();
+
+    for line in lines {
+        let (line_num, code) = if let Some(tab_idx) = line.find('\t') {
+            let num = line[..tab_idx].trim();
+            let code = &line[tab_idx + 1..];
+            (num.to_string(), code)
+        } else {
+            (String::new(), *line)
+        };
+
+        let code_with_nl = format!("{}\n", code);
+        let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
+
+        let mut spans = vec![
+            Span::styled(
+                format!("{}     {:>4} \u{2502} ", margin, line_num),
+                Style::default().fg(THEME.muted),
+            ),
+        ];
+        for (sty, text) in ranges {
+            let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+            let content = text.trim_end_matches('\n').to_string();
+            if !content.is_empty() {
+                spans.push(Span::styled(content, Style::default().fg(fg)));
+            }
+        }
+        result.push(Line::from(spans));
     }
-    if t.starts_with("function ") || t.starts_with("const ") || t.starts_with("export ")
-        || t.starts_with("async ") || t.starts_with("await ") || t.contains("=>")
-    {
-        return "ts";
-    }
-    if t.starts_with("#!/") { return "sh"; }
-    if t.starts_with("{") && t.ends_with("}") || t.starts_with("\"") && t.contains("\": ") {
-        return "json";
-    }
-    "txt"
+
+    Some(result)
 }
 
 /// Render a markdown table into styled Lines with box-drawing borders.
