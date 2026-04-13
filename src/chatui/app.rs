@@ -84,9 +84,8 @@ pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", 
 
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct SubagentState {
-    pub(crate) id: u32,
+    pub(crate) _id: u32,
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) start_time: std::time::Instant,

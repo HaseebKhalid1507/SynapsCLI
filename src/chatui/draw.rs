@@ -276,7 +276,7 @@ pub(crate) fn draw(
                                     let inv_row = (art_height - 1 - j) as f64;
                                     let inv_col = (max_art_width.saturating_sub(ci + 1)) as f64;
                                     let diag = (inv_row + inv_col) / (art_height as f64 + max_art_width as f64);
-                                    
+
                                     if build_t >= diag {
                                         let lp = ((build_t - diag) / 0.15).min(1.0);
                                         if lp < 1.0 && ch != ' ' {
@@ -307,7 +307,7 @@ pub(crate) fn draw(
                         let char_w = art_char_widths[j];
                         let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
                         let y = start_y + j as u16;
-                        
+
                         if y >= msg_area.y && y < msg_area.y + msg_area.height {
                             let clamped_w = char_w.min(avail_w);
                             let mut dis = String::with_capacity(clamped_w);
@@ -318,9 +318,9 @@ pub(crate) fn draw(
                                 let row = j as f64;
                                 let col = ci as f64;
                                 let diag = (row + col) / (art_height as f64 + max_art_width as f64);
-                                
+
                                 // dismiss_t goes 0 -> 1. 1.0 - diag is when it starts dismantled.
-                                let threshold = diag; 
+                                let threshold = diag;
                                 if dismiss_t < (1.0 - threshold) {
                                     // Still visible, but check if starting to fade
                                     let rem = (1.0 - threshold) - dismiss_t;

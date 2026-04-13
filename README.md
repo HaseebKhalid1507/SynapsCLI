@@ -3,9 +3,10 @@
 A terminal-native AI agent runtime built in Rust. One binary, zero runtime dependencies.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-~9K_lines-orange" alt="Rust" />
+  <img src="https://img.shields.io/badge/rust-~11K_lines-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/binary-6.5MB-blue" alt="6.5MB" />
   <img src="https://img.shields.io/badge/tests-90-brightgreen" alt="90 tests" />
+  <img src="https://img.shields.io/badge/themes-18-ff69b4" alt="18 themes" />
   <img src="https://img.shields.io/badge/MCP-lazy_loading-purple" alt="MCP" />
   <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT" />
 </p>
@@ -17,7 +18,8 @@ A terminal-native AI agent runtime built in Rust. One binary, zero runtime depen
  │  Skills loaded on demand — zero tokens until needed             │
  │  Type while the agent streams (steering + message queue)        │
  │  Syntax-highlighted diffs, code blocks, and tool output         │
- │  6 built-in themes · context usage bar · cost tracking          │
+ │  18 built-in themes · custom theme files                        │
+ │  Variable subagent timeouts with partial result recovery        │
  │  OAuth + API key auth with auto-refresh mid-stream              │
  │  ~95% prompt cache hit rates                                    │
  ╰──────────────────────────────────────────────────────────────────╯
@@ -43,12 +45,12 @@ export ANTHROPIC_API_KEY="sk-ant-..."      # or API key
 
 ## Why SynapsCLI?
 
-Most AI coding agents are 100K–450K lines of TypeScript/Go. SynapsCLI does the same in **~9,000 lines of Rust**.
+Most AI coding agents are 100K–450K lines of TypeScript/Go. SynapsCLI does the same in **~11,000 lines of Rust**.
 
 | | SynapsCLI | Claude Code | Gemini CLI |
 |---|---|---|---|
 | **Language** | Rust | TypeScript | Go |
-| **Lines** | ~9K | ~100K | ~45K |
+| **Lines** | ~11K | ~100K | ~45K |
 | **Binary** | 6.5MB | ~370MB (node) | ~50MB |
 | **MCP loading** | Lazy (on demand) | Eager (all at boot) | Eager |
 | **Subagents** | Parallel with live panel | Sequential | — |
@@ -132,7 +134,7 @@ Agent calls `load_skill("rust")` → content returned as tool result → cached 
 
 ### Subagents
 
-Parallel dispatch with a live TUI status panel.
+Parallel dispatch with a live TUI status panel. Variable timeouts with partial result recovery when timeouts occur.
 
 ```
 ╭ ◈ 2 agents ─────────────────────────────────────────╮
@@ -150,7 +152,8 @@ Parallel dispatch with a live TUI status panel.
 ### TUI
 
 - **Syntax highlighting** — code blocks, diffs (red/green), bash output, grep results
-- **6 themes** — default, neon-rain, amber, phosphor, solarized, blood
+- **18 themes** — default, neon-rain, dracula, nord, catppuccin, gruvbox, monokai, tokyo-night, rose-pine, and more
+- **Runtime theme loading** — edit themes in ~/.synaps-cli/themes/ without rebuilding
 - **Animated execution** — braille thinking spinner, bash trace animation, streaming pulse
 - **Smart scroll** — viewport stays still when scrolled up, auto-follows at bottom
 - **Steering** — type while the agent streams; messages inject between tool rounds
@@ -171,6 +174,7 @@ Parallel dispatch with a live TUI status panel.
 | `/sessions` | List saved sessions |
 | `/resume [id]` | Resume a session |
 | `/system [prompt]` | View or change system prompt |
+| `/gamba` | Open the casino 🎰 |
 | `/help` | Show all commands |
 | `/quit` | Exit |
 
@@ -187,6 +191,8 @@ All commands support prefix matching — `/m` resolves to `/model`, `/th` to `/t
 ├── auth.json             # OAuth tokens or API key
 ├── mcp.json              # MCP server definitions
 ├── theme                 # custom color overrides
+├── themes/              # editable theme color files
+│   └── <name>
 ├── agents/               # subagent personality files
 │   └── <name>.md
 ├── skills/               # loadable skill files
@@ -213,7 +219,13 @@ chatui --profile work    # uses ~/.synaps-cli/work/config, auth.json, etc.
 
 ```
 src/
-├── chatui.rs    (3.5K)  TUI — ratatui, markdown, themes, animations
+├── chatui/
+│   ├── main.rs    (1.1K)  Entry point, event loop, command dispatch
+│   ├── app.rs     (900)   App state, message rendering, session management
+│   ├── draw.rs    (600)   TUI layout, widgets, animations
+│   ├── theme.rs   (1.0K)  18 themes, runtime loading from ~/.synaps-cli/themes/
+│   ├── markdown.rs (410)  Markdown → styled Lines (tables, code, lists)
+│   └── highlight.rs (310) Syntect highlighting, bash/grep/read output
 ├── runtime.rs   (1.3K)  API client, streaming, agentic tool loop, steering
 ├── tools.rs     (1.2K)  Tool trait + 8 implementations + subagent dispatch
 ├── auth.rs      (750)   OAuth 2.0 PKCE, file-locked token refresh
@@ -231,7 +243,7 @@ src/
 ├── chat.rs      (133)   Simple REPL (non-TUI)
 └── lib.rs       (19)    Module exports
                 ─────
-                ~9,000 lines  ·  90 tests  ·  17 files
+                ~11,400 lines · 90 tests · 22 files
 ```
 
 ### Key Design Decisions
@@ -254,7 +266,7 @@ src/
 
 | Metric | Value |
 |--------|-------|
-| Binary size | 6.5MB (stripped, LTO) |
+| Binary size (chatui) | 6.5MB (stripped, LTO) |
 | Startup | ~3ms |
 | Tool schema reads | Zero-copy (`Arc<Vec<Value>>`) |
 | Tests | 90 across 10 modules |

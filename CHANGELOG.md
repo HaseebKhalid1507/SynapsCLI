@@ -2,7 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - 2025-01-XX
+## [Unreleased]
+
+### Features
+- **18 Built-in Themes**: ocean, rose-pine, nord, dracula, monokai, gruvbox, catppuccin, tokyo-night, sunset, ice, forest, lavender (plus original 6: default, neon-rain, amber, phosphor, solarized-dark, blood)
+- **Runtime Theme Loading**: Themes load from `~/.synaps-cli/themes/<name>` files — edit colors without rebuilding
+- **`/theme` Command**: Lists all 18 built-in themes plus any custom user themes
+- **Variable Subagent Timeouts**: `timeout` parameter on subagent tool (default 300s)
+- **Partial Result Recovery**: Timed-out subagents return partial work (tool log + response text) instead of just an error
+- **Warning Color**: New `warning_color` theme field for timeout/warning states
+
+### Improvements
+- **Theme-Aware UI**: All hardcoded RGB colors in highlight.rs and draw.rs replaced with theme references — boot/quit effects, logo animation, footer, progress bar, bash output highlighting all respect active theme
+- **Timeout Visual Feedback**: Timed-out subagents show ⚠ in `warning_color` instead of ✔ in green, both in subagent panel and tool result rendering
+
+### Refactoring
+- **chatui Module Split**: Monolithic `chatui.rs` (4200 lines) split into 6 focused modules: main.rs, app.rs, draw.rs, theme.rs, markdown.rs, highlight.rs
+
+### Fixes
+- **`/resume` Indentation**: Fixed broken indentation in resume command handler
+- **Subagent Fields in `set()`**: Added missing `subagent_*` fields to theme file parser
+
+## [0.2.0] - 2025-01
 
 ### Features
 - **Skills System**: Markdown skill files that can be injected into system prompt or loaded on-demand via `load_skill` tool

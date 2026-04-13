@@ -25,12 +25,6 @@ use std::time::Instant;
 use tachyonfx::{Effect, Shader};
 
 
-// -- Theme -------------------------------------------------------------------
-
-// Syntect loaded once, reused forever
-
-
-
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     for msg in api_messages {
         match msg["role"].as_str() {
@@ -893,7 +887,7 @@ async fn main() -> Result<()> {
                             let id = app.next_subagent_id;
                             app.next_subagent_id += 1;
                             app.subagents.push(SubagentState {
-                                id,
+                                _id: id,
                                 name: agent_name,
                                 status: format!("starting: {}", task_preview),
                                 start_time: std::time::Instant::now(),
