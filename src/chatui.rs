@@ -2684,7 +2684,7 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             // Tick: redraws during animations AND during streaming (~60fps throttle)
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 // Progress logo build-in animation
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025; // ~40 frames = ~0.66s
@@ -2724,7 +2724,7 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
-            maybe_event = event_reader.next() => {
+            maybe_event = event_reader.next(), if app.gamba_child.is_none() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => {
                         match (key.code, key.modifiers) {
@@ -2984,6 +2984,8 @@ async fn main() -> Result<()> {
                                             ));
                                         }
                                         "gamba" => {
+                                            // Drop event reader so crossterm stops consuming stdin
+                                            drop(event_reader);
                                             match app.launch_gamba() {
                                                 Ok(()) => {} // casino running, terminal yielded
                                                 Err(msg) => {
@@ -2991,6 +2993,9 @@ async fn main() -> Result<()> {
                                                     app.push_msg(ChatMessage::Error(msg));
                                                 }
                                             }
+                                            // Recreate event reader (casino may still be running — that's ok,
+                                            // the select! guard prevents polling until gamba exits)
+                                            event_reader = EventStream::new();
                                         }
                                         _ => {
                                             app.push_msg(ChatMessage::Error(
@@ -3076,6 +3081,7 @@ async fn main() -> Result<()> {
                                     };
                                     match cmd.as_str() {
                                         "gamba" => {
+                                            drop(event_reader);
                                             match app.launch_gamba() {
                                                 Ok(()) => {}
                                                 Err(msg) => {
@@ -3083,6 +3089,7 @@ async fn main() -> Result<()> {
                                                     app.push_msg(ChatMessage::Error(msg));
                                                 }
                                             }
+                                            event_reader = EventStream::new();
                                         }
                                         "quit" | "exit" => {
                                             exit_fx = Some(quit_effect());
