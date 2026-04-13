@@ -159,3 +159,64 @@ pub fn apply_config(runtime: &mut crate::Runtime, config: &SynapsConfig) {
         runtime.set_thinking_budget(budget);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_thinking_budget() {
+        assert_eq!(parse_thinking_budget("low"), Some(2048));
+        assert_eq!(parse_thinking_budget("medium"), Some(4096));
+        assert_eq!(parse_thinking_budget("high"), Some(16384));
+        assert_eq!(parse_thinking_budget("xhigh"), Some(32768));
+        assert_eq!(parse_thinking_budget("8192"), Some(8192));
+        assert_eq!(parse_thinking_budget("invalid"), None);
+    }
+
+    #[test]
+    fn test_base_dir() {
+        let path = base_dir();
+        assert!(path.to_string_lossy().ends_with(".synaps-cli"));
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_explicit() {
+        let result = resolve_system_prompt(Some("test prompt"));
+        assert_eq!(result, "test prompt");
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_none() {
+        let result = resolve_system_prompt(None);
+        assert!(result.contains("helpful AI agent"));
+    }
+
+    #[test] 
+    fn test_load_config_nonexistent_file() {
+        // Test that loading from a completely non-existent directory returns defaults
+        // We'll temporarily set HOME to a non-existent directory
+        let original_home = std::env::var("HOME").ok();
+        
+        std::env::set_var("HOME", "/tmp/nonexistent_home_dir_12345");
+        
+        let config = load_config();
+        assert_eq!(config.model, None);
+        assert_eq!(config.thinking_budget, None);
+        
+        // Restore original HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn test_synaps_config_default() {
+        let config = SynapsConfig::default();
+        assert_eq!(config.model, None);
+        assert_eq!(config.thinking_budget, None);
+        assert_eq!(config.skills, None);
+    }
+}

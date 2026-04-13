@@ -221,3 +221,91 @@ pub async fn setup_skill_tool(registry: &Arc<tokio::sync::RwLock<crate::ToolRegi
 
     count
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_frontmatter_valid() {
+        let text = "---\nname: test\ndescription: Test skill\n---\nThis is the content";
+        let (fields, body) = parse_frontmatter(text);
+        
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], ("name".to_string(), "test".to_string()));
+        assert_eq!(fields[1], ("description".to_string(), "Test skill".to_string()));
+        assert_eq!(body, "This is the content");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_no_frontmatter() {
+        let text = "This is just regular content";
+        let (fields, body) = parse_frontmatter(text);
+        
+        assert!(fields.is_empty());
+        assert_eq!(body, "This is just regular content");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_unclosed() {
+        let text = "---\nname: test\ndescription: Test skill\nThis is content without closing";
+        let (fields, body) = parse_frontmatter(text);
+        
+        assert!(fields.is_empty());
+        assert_eq!(body, text);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_empty() {
+        let text = "---\n---\nThis is the content";
+        let (fields, body) = parse_frontmatter(text);
+        
+        assert!(fields.is_empty());
+        assert_eq!(body, "This is the content");
+    }
+
+    #[test]
+    fn test_parse_skills_config_multiple() {
+        let result = parse_skills_config("rust, security");
+        assert_eq!(result, vec!["rust".to_string(), "security".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_skills_config_empty() {
+        let result = parse_skills_config("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_skills_config_single() {
+        let result = parse_skills_config("rust");
+        assert_eq!(result, vec!["rust".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_skills_config_whitespace() {
+        let result = parse_skills_config("  rust  ,   security   ");
+        assert_eq!(result, vec!["rust".to_string(), "security".to_string()]);
+    }
+
+    #[test]
+    fn test_format_skills_for_prompt_empty() {
+        let result = format_skills_for_prompt(&[]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_format_skills_for_prompt_single() {
+        let skill = Skill {
+            name: "rust".to_string(),
+            description: "Rust programming".to_string(),
+            content: "Use safe Rust practices".to_string(),
+        };
+        let result = format_skills_for_prompt(&[skill]);
+        
+        assert!(result.contains("rust"));
+        assert!(result.contains("Rust programming"));
+        assert!(result.contains("Use safe Rust practices"));
+        assert!(result.starts_with("\n\n# Active Skills\n\n"));
+    }
+}
