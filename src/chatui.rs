@@ -767,6 +767,17 @@ impl App {
         String::new()
     }
 
+    /// Find the tool name from the ToolUse message preceding a ToolResult at index `idx`.
+    fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
+        if idx == 0 { return None; }
+        for i in (0..idx).rev() {
+            if let ChatMessage::ToolUse { ref tool_name, .. } = self.messages[i].msg {
+                return Some(tool_name.clone());
+            }
+        }
+        None
+    }
+
     /// Capture all assistant output since the last user message as abort context.
     /// This gets injected into the next user message so the model knows what it
     /// was doing before the abort.
@@ -1177,11 +1188,15 @@ impl App {
                         ]));
                     }
 
+                    // Detect which tool produced this result
+                    let preceding_tool = self.find_preceding_tool_name(i);
+
                     // Check if this is read tool output (line-numbered) and try syntax highlighting
                     let highlighted_lines = if !is_error && is_read_tool_output(&result_lines) {
-                        // Find file extension from the preceding ToolUse message
                         let ext = self.find_preceding_read_extension(i);
                         highlight_read_output(&result_lines[..show], &ext, &m)
+                    } else if !is_error && preceding_tool.as_deref() == Some("bash") {
+                        Some(highlight_bash_output(&result_lines[..show], &m))
                     } else {
                         None
                     };
@@ -1359,6 +1374,85 @@ fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, ma
                 spans.push(Span::styled(content, Style::default().fg(fg)));
             }
         }
+        result.push(Line::from(spans));
+    }
+
+    result
+}
+
+/// Highlight bash tool output with blue tint and pattern detection
+fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+
+    for line in lines {
+        let trimmed = line.trim();
+        let mut spans = vec![
+            Span::styled(format!("{}       ", margin), Style::default().fg(THEME.tool_result_color)),
+        ];
+
+        if trimmed.is_empty() {
+            result.push(Line::from(spans));
+            continue;
+        }
+
+        // Detect patterns and colorize
+        if trimmed.starts_with("error") || trimmed.starts_with("Error") || trimmed.starts_with("ERROR")
+            || trimmed.starts_with("fatal") || trimmed.starts_with("FATAL") {
+            // Errors → red
+            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(220, 70, 70))));
+        } else if trimmed.starts_with("warning") || trimmed.starts_with("Warning") || trimmed.starts_with("WARN") {
+            // Warnings → yellow
+            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(220, 180, 50))));
+        } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")
+            || trimmed.starts_with("done") || trimmed.starts_with("Done") || trimmed.starts_with("success") {
+            // Success → green with blue tint
+            spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Rgb(60, 190, 130))));
+        } else {
+            // Default: blue-tinted with smart coloring
+            let mut remaining = *line;
+            while !remaining.is_empty() {
+                // Find paths (contain /)
+                if let Some(slash_pos) = remaining.find('/') {
+                    // Output text before the path
+                    if slash_pos > 0 {
+                        let before = &remaining[..slash_pos];
+                        // Find the start of the path (walk back to whitespace)
+                        let path_start = before.rfind(|c: char| c.is_whitespace()).map(|p| p + 1).unwrap_or(0);
+                        if path_start > 0 {
+                            spans.push(Span::styled(
+                                remaining[..path_start].to_string(),
+                                Style::default().fg(Color::Rgb(120, 140, 180)),
+                            ));
+                        }
+                        // Path portion
+                        let after_slash = &remaining[path_start..];
+                        let path_end = after_slash.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
+                            .unwrap_or(after_slash.len());
+                        spans.push(Span::styled(
+                            after_slash[..path_end].to_string(),
+                            Style::default().fg(Color::Rgb(80, 160, 220)),
+                        ));
+                        remaining = &after_slash[path_end..];
+                    } else {
+                        let path_end = remaining.find(|c: char| c.is_whitespace() || c == ':' || c == ')' || c == ']')
+                            .unwrap_or(remaining.len());
+                        spans.push(Span::styled(
+                            remaining[..path_end].to_string(),
+                            Style::default().fg(Color::Rgb(80, 160, 220)),
+                        ));
+                        remaining = &remaining[path_end..];
+                    }
+                } else {
+                    // No more paths — output the rest with blue tint
+                    spans.push(Span::styled(
+                        remaining.to_string(),
+                        Style::default().fg(Color::Rgb(120, 140, 180)),
+                    ));
+                    break;
+                }
+            }
+        }
+
         result.push(Line::from(spans));
     }
 
