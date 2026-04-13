@@ -1496,7 +1496,7 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(
             format!("{}  \u{2502} ", prefix),
-            Style::default().fg(THEME.muted).bg(THEME.code_bg),
+            Style::default().fg(THEME.muted),
         ));
         for (style, text) in ranges {
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
