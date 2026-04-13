@@ -685,17 +685,37 @@ impl App {
                     }
                     header.push(Span::styled(" (streaming...)", Style::default().fg(THEME.muted).add_modifier(Modifier::DIM)));
                     lines.push(Line::from(header));
-                    // Show accumulated partial input if any
+                    // Show accumulated partial input with newlines rendered
                     if !partial_input.is_empty() {
                         let param_style = Style::default().fg(THEME.tool_param);
-                        let preview: String = if partial_input.len() > 200 {
-                            let tail: String = partial_input.chars().rev().take(200).collect::<String>().chars().rev().collect();
-                            format!("\u{2026}{}", tail)
+                        // Unescape \n in JSON string to real newlines for display
+                        let unescaped = partial_input.replace("\\n", "\n").replace("\\t", "  ");
+
+                        // Try to extract just the content value if this is a write tool
+                        let display = if let Some(idx) = unescaped.find("\"content\": \"") {
+                            let content_start = idx + "\"content\": \"".len();
+                            &unescaped[content_start..]
+                        } else if let Some(idx) = unescaped.find("\"content\":\"") {
+                            let content_start = idx + "\"content\":\"".len();
+                            &unescaped[content_start..]
                         } else {
-                            partial_input.clone()
+                            &unescaped
                         };
-                        for wline in wrap_text(&format!("{}     {}", m, preview), width) {
-                            lines.push(Line::from(Span::styled(wline, param_style)));
+
+                        let content_lines: Vec<&str> = display.lines().collect();
+                        let total = content_lines.len();
+                        let max_show = 12;
+                        // Show last N lines (tail) so you see what's being written now
+                        let skip = total.saturating_sub(max_show);
+                        if skip > 0 {
+                            let omit = format!("{}     … {} lines above", m, skip);
+                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.muted))));
+                        }
+                        for cline in content_lines.iter().skip(skip) {
+                            let line_str = format!("{}       {}", m, cline);
+                            for wline in wrap_text(&line_str, width) {
+                                lines.push(Line::from(Span::styled(wline, param_style)));
+                            }
                         }
                     }
                 }
