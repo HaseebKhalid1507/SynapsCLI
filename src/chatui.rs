@@ -1046,21 +1046,33 @@ impl App {
                                         let total = content_lines.len();
                                         let max_preview = 12;
                                         let show = total.min(max_preview);
-                                        let header = format!("{}     {}: ({} lines)", m, k, total);
+
+                                        // Diff-style markers for edit tool
+                                        let (marker, marker_color) = match k.as_str() {
+                                            "old_string" => ("−", Color::Rgb(200, 60, 60)),
+                                            "new_string" => ("+", Color::Rgb(60, 200, 80)),
+                                            _ => ("│", THEME.muted),
+                                        };
+
+                                        let label = match k.as_str() {
+                                            "old_string" => "old",
+                                            "new_string" => "new",
+                                            _ => k.as_str(),
+                                        };
+                                        let header = format!("{}     {}: ({} lines)", m, label, total);
                                         lines.push(Line::from(Span::styled(header, param_style)));
 
-                                        // Try syntax highlighting for code content
-                                        let is_code_param = k == "content" || k == "old_string" || k == "new_string" || k == "command";
+                                        // Syntax highlight the code
+                                        let is_code_param = k == "content" || k == "old_string" || k == "new_string";
                                         if is_code_param && !file_ext.is_empty() {
-                                            let code_block: String = content_lines.iter().take(show).map(|l| format!("{}\n", l)).collect();
-                                            let hl = highlight_code_block(&code_block, &file_ext, &format!("{}      ", m));
-                                            lines.extend(hl);
+                                            let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, &m, marker, marker_color);
+                                            lines.extend(hl_lines);
                                         } else {
                                             for cline in content_lines.iter().take(show) {
-                                                let line_str = format!("{}       {}", m, cline);
-                                                for wline in wrap_text(&line_str, width) {
-                                                    lines.push(Line::from(Span::styled(wline, param_style)));
-                                                }
+                                                lines.push(Line::from(vec![
+                                                    Span::styled(format!("{}      {} ", m, marker), Style::default().fg(marker_color)),
+                                                    Span::styled(cline.to_string(), param_style),
+                                                ]));
                                             }
                                         }
                                         if total > max_preview {
@@ -1266,6 +1278,41 @@ fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'stati
 }
 
 /// Try to syntax-highlight a single tool output line.
+/// Highlight code lines for tool params (write content, edit old/new) — clean style matching read output
+fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, marker_color: Color) -> Vec<Line<'static>> {
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
+    let theme = &ts.themes["base16-ocean.dark"];
+
+    let syntax = ss.find_syntax_by_extension(ext)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut result = Vec::new();
+
+    for line in lines {
+        let code_with_nl = format!("{}\n", line);
+        let ranges = h.highlight_line(&code_with_nl, ss).unwrap_or_default();
+
+        let mut spans = vec![
+            Span::styled(
+                format!("{}      {} ", margin, marker),
+                Style::default().fg(marker_color),
+            ),
+        ];
+        for (sty, text) in ranges {
+            let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+            let content = text.trim_end_matches('\n').to_string();
+            if !content.is_empty() {
+                spans.push(Span::styled(content, Style::default().fg(fg)));
+            }
+        }
+        result.push(Line::from(spans));
+    }
+
+    result
+}
+
 /// Check if tool output looks like read tool output (line-numbered with tabs)
 fn is_read_tool_output(lines: &[&str]) -> bool {
     if lines.is_empty() { return false; }
