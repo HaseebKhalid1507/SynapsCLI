@@ -33,7 +33,8 @@ impl Tool for BashTool {
         let command = params["command"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(30).min(300);
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.bash_timeout).min(ctx.bash_max_timeout);
+        let max_output = ctx.max_tool_output;
 
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
@@ -81,9 +82,9 @@ impl Tool for BashTool {
             let mut full_output = String::new();
             while let Some(line) = rx_inter.recv().await {
                 full_output.push_str(&line);
-                if full_output.len() > 30_000 {
-                    full_output.truncate(30_000);
-                    full_output.push_str("\n\n[output truncated at 30KB]");
+                if full_output.len() > max_output {
+                    full_output.truncate(max_output);
+                    full_output.push_str(&format!("\n\n[output truncated at {}]", max_output));
                     break;
                 }
             }

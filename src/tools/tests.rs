@@ -156,6 +156,10 @@ fn create_tool_context() -> ToolContext {
         tx_events: None,
         watcher_exit_path: None,
         tool_register_tx: None,
+        max_tool_output: 30000,
+        bash_timeout: 30,
+        bash_max_timeout: 300,
+        subagent_timeout: 300,
     }
 }
 

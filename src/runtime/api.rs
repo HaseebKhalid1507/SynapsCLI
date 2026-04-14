@@ -22,8 +22,9 @@ impl ApiMethods {
         thinking_budget: u32,
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
+        max_retries: u32,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new()).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -39,6 +40,7 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
+        max_retries: u32,
     ) -> Result<Value> {
         // Read auth state for this API call
         let (auth_token, auth_type) = {
@@ -103,15 +105,14 @@ impl ApiMethods {
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503)
         let response = {
-            const MAX_RETRIES: u32 = 3;
             let mut last_err = String::new();
             let mut response = None;
 
-            for attempt in 0..=MAX_RETRIES {
+            for attempt in 0..=max_retries {
                 if attempt > 0 {
                     let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
-                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, MAX_RETRIES, delay, last_err);
-                    let _ = tx.send(StreamEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, MAX_RETRIES)));
+                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
+                    let _ = tx.send(StreamEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries)));
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
@@ -138,13 +139,13 @@ impl ApiMethods {
                         }
                         let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
                         let error_text = resp.text().await.unwrap_or_default();
-                        if !is_retryable || attempt == MAX_RETRIES {
+                        if !is_retryable || attempt == max_retries {
                             return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
                         }
                         last_err = format!("{}: {}", status, error_text);
                     }
                     Err(e) => {
-                        if attempt == MAX_RETRIES {
+                        if attempt == max_retries {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
@@ -152,7 +153,7 @@ impl ApiMethods {
                 }
             }
 
-            response.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", MAX_RETRIES, last_err)))?
+            response.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
         };
         
         let mut stream = response.bytes_stream();
@@ -416,6 +417,7 @@ impl ApiMethods {
         }))
     }
     
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_api(
         auth: &Arc<RwLock<AuthState>>,
         client: &Client,
@@ -424,6 +426,7 @@ impl ApiMethods {
         system_prompt: &Option<String>,
         thinking_budget: u32,
         messages: &[Value],
+        max_retries: u32,
     ) -> Result<Value> {
         // Read auth state
         let (auth_token, auth_type) = {
@@ -481,14 +484,13 @@ impl ApiMethods {
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503)
         let json: Value = {
-            const MAX_RETRIES: u32 = 3;
             let mut last_err = String::new();
 
             let mut result_json = None;
-            for attempt in 0..=MAX_RETRIES {
+            for attempt in 0..=max_retries {
                 if attempt > 0 {
                     let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
-                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, MAX_RETRIES, delay, last_err);
+                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
                     tokio::time::sleep(delay).await;
                 }
 
@@ -517,7 +519,7 @@ impl ApiMethods {
                                     break;
                                 }
                                 Err(e) => {
-                                    if attempt == MAX_RETRIES {
+                                    if attempt == max_retries {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
@@ -526,14 +528,14 @@ impl ApiMethods {
                         } else {
                             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
                             let error_text = resp.text().await.unwrap_or_default();
-                            if !is_retryable || attempt == MAX_RETRIES {
+                            if !is_retryable || attempt == max_retries {
                                 return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
                             }
                             last_err = format!("{}: {}", status, error_text);
                         }
                     }
                     Err(e) => {
-                        if attempt == MAX_RETRIES {
+                        if attempt == max_retries {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
@@ -541,7 +543,7 @@ impl ApiMethods {
                 }
             }
 
-            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", MAX_RETRIES, last_err)))?
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
         };
         
         Ok(json)

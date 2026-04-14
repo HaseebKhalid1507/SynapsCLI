@@ -34,6 +34,12 @@ pub struct Runtime {
     thinking_budget: u32,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
+    // New configurable fields
+    max_tool_output: usize,
+    bash_timeout: u64,
+    bash_max_timeout: u64,
+    subagent_timeout: u64,
+    api_retries: u32,
 }
 
 impl Runtime {
@@ -59,6 +65,11 @@ impl Runtime {
             system_prompt: None,
             thinking_budget: 4096,
             watcher_exit_path: None,
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            api_retries: 3,
         })
     }
 
@@ -99,10 +110,35 @@ impl Runtime {
         if let Some(budget) = config.thinking_budget {
             self.set_thinking_budget(budget);
         }
+        self.max_tool_output = config.max_tool_output;
+        self.bash_timeout = config.bash_timeout;
+        self.bash_max_timeout = config.bash_max_timeout;
+        self.subagent_timeout = config.subagent_timeout;
+        self.api_retries = config.api_retries;
     }
 
     pub fn thinking_budget(&self) -> u32 {
         self.thinking_budget
+    }
+
+    pub fn max_tool_output(&self) -> usize {
+        self.max_tool_output
+    }
+
+    pub fn bash_timeout(&self) -> u64 {
+        self.bash_timeout
+    }
+
+    pub fn bash_max_timeout(&self) -> u64 {
+        self.bash_max_timeout
+    }
+
+    pub fn subagent_timeout(&self) -> u64 {
+        self.subagent_timeout
+    }
+
+    pub fn api_retries(&self) -> u32 {
+        self.api_retries
     }
 
     pub fn thinking_level(&self) -> &str {
@@ -136,6 +172,7 @@ impl Runtime {
                 &self.system_prompt,
                 self.thinking_budget,
                 &messages,
+                self.api_retries,
             ).await?;
             
             // Check if Claude wants to use tools
@@ -182,7 +219,16 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: self.watcher_exit_path.clone(), tool_register_tx: None };
+                                let ctx = crate::ToolContext { 
+                                    tx_delta: None, 
+                                    tx_events: None, 
+                                    watcher_exit_path: self.watcher_exit_path.clone(), 
+                                    tool_register_tx: None, 
+                                    max_tool_output: self.max_tool_output,
+                                    bash_timeout: self.bash_timeout,
+                                    bash_max_timeout: self.bash_max_timeout,
+                                    subagent_timeout: self.subagent_timeout,
+                                };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -193,12 +239,18 @@ impl Runtime {
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result)
+                            "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
                         }));
                     }
                 } else {
                     // Multiple tools — run in parallel with JoinSet
                     let mut join_set = tokio::task::JoinSet::new();
+                    
+                    // Capture config values before spawning (can't borrow &self in 'static spawn)
+                    let cfg_max_tool_output = self.max_tool_output;
+                    let cfg_bash_timeout = self.bash_timeout;
+                    let cfg_bash_max_timeout = self.bash_max_timeout;
+                    let cfg_subagent_timeout = self.subagent_timeout;
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -212,7 +264,16 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: exit_path, tool_register_tx: None };
+                                        let ctx = crate::ToolContext { 
+                                            tx_delta: None, 
+                                            tx_events: None, 
+                                            watcher_exit_path: exit_path, 
+                                            tool_register_tx: None, 
+                                            max_tool_output: cfg_max_tool_output,
+                                            bash_timeout: cfg_bash_timeout,
+                                            bash_max_timeout: cfg_bash_max_timeout,
+                                            subagent_timeout: cfg_subagent_timeout,
+                                        };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -247,7 +308,7 @@ impl Runtime {
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result)
+                                "content": HelperMethods::truncate_tool_result(&result, self.max_tool_output)
                             }));
                         }
                     }
@@ -299,11 +360,17 @@ impl Runtime {
         let system_prompt = self.system_prompt.clone();
         let thinking_budget = self.thinking_budget;
         let watcher_exit_path = self.watcher_exit_path.clone();
+        let max_tool_output = self.max_tool_output;
+        let bash_timeout = self.bash_timeout;
+        let bash_max_timeout = self.bash_max_timeout;
+        let subagent_timeout = self.subagent_timeout;
+        let api_retries = self.api_retries;
 
         tokio::spawn(async move {
             if let Err(e) = StreamMethods::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
                 messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
+                max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -324,6 +391,11 @@ impl Clone for Runtime {
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
             watcher_exit_path: self.watcher_exit_path.clone(),
+            max_tool_output: self.max_tool_output,
+            bash_timeout: self.bash_timeout,
+            bash_max_timeout: self.bash_max_timeout,
+            subagent_timeout: self.subagent_timeout,
+            api_retries: self.api_retries,
         }
     }
 }
@@ -352,17 +424,19 @@ mod tests {
 
     #[test]
     fn test_truncate_tool_result() {
+        let default_max = 30000;
+        
         // Short string should remain unchanged
         let short = "This is a short string.";
-        assert_eq!(HelperMethods::truncate_tool_result(short), short);
+        assert_eq!(HelperMethods::truncate_tool_result(short, default_max), short);
         
-        // Exactly MAX_TOOL_RESULT_CHARS should remain unchanged
-        let exact = "x".repeat(30000); // HelperMethods::MAX_TOOL_RESULT_CHARS is 30000
-        assert_eq!(HelperMethods::truncate_tool_result(&exact), exact);
+        // Exactly max should remain unchanged
+        let exact = "x".repeat(30000);
+        assert_eq!(HelperMethods::truncate_tool_result(&exact, default_max), exact);
         
-        // String longer than MAX_TOOL_RESULT_CHARS should be truncated with notice
+        // String longer than max should be truncated with notice
         let too_long = "x".repeat(30001);
-        let truncated = HelperMethods::truncate_tool_result(&too_long);
+        let truncated = HelperMethods::truncate_tool_result(&too_long, default_max);
         
         // Should start with the truncated content
         assert!(truncated.starts_with(&"x".repeat(30000)));
@@ -370,14 +444,19 @@ mod tests {
         // Should contain truncation notice with total char count
         assert!(truncated.contains("[truncated — 30001 total chars, showing first 30000]"));
         
-        // Should be longer than MAX_TOOL_RESULT_CHARS (due to notice)
+        // Should be longer than max (due to notice)
         assert!(truncated.len() > 30000);
         
         // Test with a much longer string
         let very_long = "a".repeat(50000);
-        let truncated_very_long = HelperMethods::truncate_tool_result(&very_long);
+        let truncated_very_long = HelperMethods::truncate_tool_result(&very_long, default_max);
         assert!(truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]"));
         assert!(truncated_very_long.starts_with(&"a".repeat(30000)));
+        
+        // Test with custom limit
+        let custom_truncated = HelperMethods::truncate_tool_result(&very_long, 100);
+        assert!(custom_truncated.starts_with(&"a".repeat(100)));
+        assert!(custom_truncated.contains("[truncated — 50000 total chars, showing first 100]"));
     }
 
     #[test]
@@ -405,10 +484,6 @@ mod tests {
         assert_eq!(thinking_level_for_budget(100000), "xhigh");
     }
 
-    #[test]
-    fn test_max_tool_result_chars_constant() {
-        assert_eq!(super::helpers::HelperMethods::MAX_TOOL_RESULT_CHARS, 30000);
-    }
 
     /// Helper function to mirror the thinking_level logic for testing
     /// since we can't easily construct a Runtime instance in tests

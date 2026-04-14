@@ -25,6 +25,11 @@ impl StreamMethods {
         cancel: CancellationToken,
         mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
         watcher_exit_path: Option<PathBuf>,
+        max_tool_output: usize,
+        bash_timeout: u64,
+        bash_max_timeout: u64,
+        subagent_timeout: u64,
+        api_retries: u32,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -69,7 +74,7 @@ impl StreamMethods {
             let tools_snapshot = tools.read().await.clone();
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
-                &messages, tx.clone(), &cancel,
+                &messages, tx.clone(), &cancel, api_retries,
             ).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -156,7 +161,7 @@ impl StreamMethods {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()) }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -179,7 +184,7 @@ impl StreamMethods {
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": HelperMethods::truncate_tool_result(&result)
+                            "content": HelperMethods::truncate_tool_result(&result, max_tool_output)
                         }));
                     }
                 } else {
@@ -218,7 +223,7 @@ impl StreamMethods {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()) }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
@@ -263,7 +268,7 @@ impl StreamMethods {
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": HelperMethods::truncate_tool_result(&result)
+                                "content": HelperMethods::truncate_tool_result(&result, max_tool_output)
                             }));
                         }
                     }
