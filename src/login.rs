@@ -56,10 +56,7 @@ async fn main() {
 
 fn format_expiry(expires_millis: u64) -> String {
     let secs = expires_millis / 1000;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = synaps_cli::epoch_secs();
 
     if secs <= now {
         return "expired".to_string();

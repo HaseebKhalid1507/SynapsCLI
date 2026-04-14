@@ -159,11 +159,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    enable_raw_mode().unwrap();
+    enable_raw_mode().map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).unwrap();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
+        .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).unwrap();
+    let mut terminal = Terminal::new(backend)
+        .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     let mut event_reader = EventStream::new();
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let mut cancel_token: Option<CancellationToken> = None;
@@ -175,7 +177,7 @@ async fn main() -> Result<()> {
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+        let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
 
         tokio::select! {
             // Tick: redraws during animations AND during streaming (~60fps throttle)
@@ -212,7 +214,7 @@ async fn main() -> Result<()> {
                     // Force immediate redraw so user doesn't see bare tmux
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                    let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                 }
                 if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
                     break;
@@ -517,7 +519,7 @@ async fn main() -> Result<()> {
                                     app.spinner_frame = 0;
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
-                                    draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                                    let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                                     stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                     app.status_text = None;
                                     // Show thinking placeholder until first real token arrives
@@ -919,7 +921,7 @@ async fn main() -> Result<()> {
                                 app.line_cache.clear();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                                let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                             }
 
                             // Auto-send queued message if one was typed during streaming
@@ -944,7 +946,7 @@ async fn main() -> Result<()> {
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                                let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                 app.status_text = None;
                                 // Show thinking placeholder until first real token arrives
@@ -968,7 +970,7 @@ async fn main() -> Result<()> {
                                 app.line_cache.clear();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                                let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                             }
                             // Restore a valid trailing state. The runtime guarantees that
                             // each tool_use has a matching tool_result, so we only need to
@@ -989,7 +991,7 @@ async fn main() -> Result<()> {
                     if needs_immediate_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed).unwrap();
+                        let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                     }
                 }
             }
@@ -999,9 +1001,9 @@ async fn main() -> Result<()> {
     // Save session on exit
     app.save_session();
 
-    disable_raw_mode().unwrap();
-    execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).unwrap();
-    terminal.show_cursor().unwrap();
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
 
     Ok(())
 }

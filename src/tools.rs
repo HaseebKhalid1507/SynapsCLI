@@ -805,10 +805,16 @@ impl Tool for SubagentTool {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let _thread_handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                    return;
+                }
+            };
 
             let result = rt.block_on(async move {
                 use futures::StreamExt;
