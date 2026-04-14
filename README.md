@@ -1,80 +1,53 @@
 # SynapsCLI
 
-**One binary. Infinite agents.**
+![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
+![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
+![~14K lines](https://img.shields.io/badge/lines-~14.4K-green.svg)
 
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Lines](https://img.shields.io/badge/lines-~14K-blue.svg)](#architecture)
-[![Tests](https://img.shields.io/badge/tests-96-green.svg)](#)
-[![Binary](https://img.shields.io/badge/binary-6.5MB-purple.svg)](#)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
+Terminal-native AI agent runtime built in Rust. Chat, orchestrate, deploy autonomous agents — one codebase.
 
----
-
-## What is SynapsCLI?
-
-SynapsCLI is a **complete AI agent runtime** built in Rust. Start with interactive chat, scale to parallel agent orchestration, deploy autonomous agents that run 24/7. One binary handles everything from casual conversation to production workflows.
-
-Three modes. Infinite possibilities. Zero complexity.
-
----
-
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
 cargo build --release
+```
 
-# Auth (pick one)
-./target/release/login                     # OAuth (Claude Pro/Max/Team)
-export ANTHROPIC_API_KEY="sk-ant-..."      # or API key
+**Authenticate:**
+```bash
+# OAuth (Claude Pro/Max/Team)
+./target/release/login
 
-# Launch
+# OR API key
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+**Launch:**
+```bash
 ./target/release/chatui
 ```
 
-You're now running the interactive agent. Type `/help` to see what it can do.
+Type `/help` for available commands. Type `/theme` to browse 18 themes.
 
 ---
 
-## The Three Modes
+## Three Modes
 
-### 💬 Interactive Mode (`chatui`)
+### 💬 Interactive Chat (`chatui`)
 
-Your daily AI companion. Chat with Claude through a rich terminal interface with 8 built-in tools, syntax highlighting, and 18 themes.
-
-**Features:**
-- 🛠️ **8 Built-in Tools**: bash, read, write, edit, grep, find, ls, subagent
-- 🔌 **MCP Ecosystem**: 1,800+ servers, lazy loaded on demand  
-- 🎯 **Skills System**: On-demand context loading from your knowledge base
-- 🎨 **18 Themes**: From minimal to cyberpunk
-- ⚡ **Mid-stream Steering**: Change direction while Claude is thinking
-- 💾 **Session Continuation**: Resume conversations exactly where you left off
-- ⌨️ **Slash Commands**: `/theme`, `/clear`, `/save`, `/load`, `/help`
+Full TUI with streaming, syntax highlighting, markdown rendering, and a live subagent panel.
 
 ```bash
-chatui --theme cyberpunk --model claude-3-5-sonnet-20241022
+chatui --theme cyberpunk --model claude-sonnet-4-20250514
 ```
 
-### 🎭 Orchestration Mode (`subagents`)
+- **10 built-in tools:** bash, read, write, edit, grep, find, ls, subagent, mcp_connect, load_skill
+- **Mid-stream steering:** Type while Claude is responding to redirect
+- **Session continuation:** `/continue` to resume previous conversations
+- **18 themes:** From minimal to cyberpunk
+- **Parallel subagents:** Dispatch named agents and watch them work in real-time
 
-Dispatch multiple named agents in parallel. Watch them work in real-time through a live status panel.
-
-**Define agents** in simple markdown files:
-```markdown
-# Spike - Code Reviewer  
-You are Spike Spiegel. Review code with a cynical eye and dry humor.
-```
-
-**Launch parallel missions:**
-```bash
-subagents dispatch "Review this codebase from 4 different angles" \
-  --agents spike,chrollo,shady,zero \
-  --timeout 300 \
-  --model claude-3-5-sonnet-20241022
-```
-
-**Watch them work:**
 ```
 ╭ ◈ 4 agents ────────────────────────────────────╮
 │  ✓ spike    done                         12.3s  │
@@ -84,184 +57,200 @@ subagents dispatch "Review this codebase from 4 different angles" \
 ╰─────────────────────────────────────────────────╯
 ```
 
-Each agent can use different models, timeouts, and tools. Results are collected and presented together.
+### 📡 Headless Chat (`chat`)
 
-### 🤖 Autonomous Mode (`watcher`)
+Stdin/stdout interface for scripting and piping:
 
-Deploy agents that run 24/7. Full lifecycle management with heartbeat monitoring, crash recovery, and cost controls.
-
-**Create an autonomous agent:**
 ```bash
-watcher init scout
-# Edit ~/.synaps-cli/agents/scout/config.toml and soul.md
-watcher deploy scout
+echo "Explain this error" | cat error.log - | ./target/release/chat
 ```
 
-**Monitor your fleet:**
+### 🤖 Autonomous Agents (`watcher`)
+
+Supervised agents that run 24/7 with heartbeat monitoring, crash recovery, cost limits, and session handoff.
+
 ```bash
-watcher status
+watcher init scout              # Create agent from template
+watcher deploy scout            # Start supervised execution
+watcher status                  # Monitor fleet
+watcher logs scout -f           # Follow logs
+watcher stop scout              # Graceful shutdown
 ```
 
-```
-AGENT       TRIGGER  STATUS   SESSION  UPTIME   COST TODAY
-──────────────────────────────────────────────────────────────
-patrol      always   running  #47      2h 15m   $1.23/$10.00
-scout       manual   sleeping —        —        $0.02/$10.00
-```
-
-**Agent configuration** (`~/.synaps-cli/agents/scout/config.toml`):
+**Agent configuration** (`~/.synaps-cli/watcher/scout/config.toml`):
 ```toml
 [agent]
 name = "scout"
-model = "claude-3-5-haiku-20241022"
-trigger = "manual"
-cost_limit = 10.00
-heartbeat_interval = "30s"
+model = "claude-sonnet-4-20250514"
+trigger = "manual"              # manual | always | watch
 
-[supervisor]
-max_crashes = 3
-backoff_base = "2s"
-session_timeout = "1h"
+[trigger]
+paths = ["./src"]               # watch mode: directories to monitor
+patterns = ["*.rs"]             # watch mode: file filters
+debounce_secs = 3               # watch mode: settle time
+
+[limits]
+max_session_tokens = 100000
+max_session_duration_mins = 60
+max_session_cost_usd = 0.50
+max_daily_cost_usd = 10.0
+max_tool_calls = 200
+cooldown_secs = 10
+max_retries = 3
+
+[heartbeat]
+interval_secs = 30
+stale_threshold_secs = 120
 ```
 
-**Session handoff** enables seamless restarts. Agents persist their state:
+Agents write handoff state on exit so the next session picks up exactly where they left off.
+
+---
+
+## Tool System
+
+10 built-in tools available to all agents:
+
+| Tool | Purpose |
+|------|---------|
+| `bash` | Execute shell commands (30s default, 300s max timeout) |
+| `read` | Read files with line numbers (validates UTF-8, rejects binary) |
+| `write` | Create/overwrite files (atomic write-then-rename) |
+| `edit` | Surgical string replacement (exact match, atomic) |
+| `grep` | Regex search with context lines |
+| `find` | Glob-based file discovery |
+| `ls` | Directory listing with metadata |
+| `subagent` | Dispatch a specialist agent with its own runtime |
+| `mcp_connect` | Connect to MCP servers and load external tools |
+| `load_skill` | Load behavioral guidelines from markdown files |
+
+See [AGENTS.md](AGENTS.md) for full tool reference with parameters and behavior.
+
+---
+
+## MCP Integration
+
+Connect to the [Model Context Protocol](https://modelcontextprotocol.io/) ecosystem. Servers spawn lazily on first tool use.
+
+**Configuration** (`~/.synaps-cli/mcp.json`):
 ```json
 {
-  "session_id": 47,
-  "last_heartbeat": "2024-01-15T14:30:00Z",
-  "context": {
-    "current_task": "monitoring logs",
-    "findings": ["anomaly detected at 14:25"]
-  },
-  "cost_used": 1.23
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/files"],
+      "env": {}
+    },
+    "brave-search": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": { "BRAVE_API_KEY": "your-key" }
+    }
+  }
 }
 ```
 
-**Full lifecycle commands:**
-```bash
-watcher deploy scout      # Start agent
-watcher stop scout        # Graceful shutdown  
-watcher logs scout -f     # Follow logs
-watcher reset scout       # Clear session state
-watcher remove scout      # Delete agent
-```
+Tools from MCP servers are prefixed `mcp__{server}__{tool}` and available for the rest of the session.
 
 ---
 
-## 🛠️ Tool System
-
-Agents access the real world through a unified tool interface:
-
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    async fn execute(&self, args: &str) -> Result<String>;
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-}
-```
-
-**Built-in tools:**
-- `bash` — Execute shell commands  
-- `read` — Read file contents with line numbers
-- `write` — Create or overwrite files
-- `edit` — Surgical string replacement  
-- `grep` — Regex search with context
-- `find` — File discovery with glob patterns
-- `ls` — Directory listings with metadata
-- `subagent` — Dispatch other agents
-
----
-
-## 🔌 MCP Integration
-
-Connect to the Model Context Protocol ecosystem. 1,800+ servers available, loaded on demand.
-
-**Configuration** (`~/.synaps-cli/mcp.toml`):
-```toml
-[servers.filesystem]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"]
-
-[servers.brave-search]  
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-brave-search"]
-env = { BRAVE_API_KEY = "your-key" }
-```
-
-Servers start automatically when tools are needed. No manual server management.
-
----
-
-## ⚙️ Configuration
-
-Your SynapsCLI setup lives in `~/.synaps-cli/`:
+## Configuration
 
 ```
 ~/.synaps-cli/
-├── config.toml           # Global settings
-├── mcp.toml             # MCP server definitions  
-├── agents/              # Agent definitions
-│   ├── spike.md
-│   ├── chrollo.md  
-│   └── scout/
-│       ├── config.toml
-│       ├── soul.md
-│       └── handoff.json
-├── sessions/            # Chat history
-├── skills/              # Context skills
-└── themes/              # Custom themes
+├── config                # Global settings (model, thinking budget, theme)
+├── auth.json             # OAuth tokens (file-locked, permissions 600)
+├── system.md             # Default system prompt
+├── mcp.json              # MCP server definitions
+├── agents/               # Subagent definitions (.md files)
+│   └── spike.md
+├── skills/               # Behavioral guidelines (.md with frontmatter)
+│   └── code-review.md
+├── sessions/             # Conversation history (JSON)
+├── logs/
+│   └── subagents/        # Per-subagent session logs
+└── watcher/              # Autonomous agents
+    └── scout/
+        ├── config.toml   # Agent configuration
+        ├── soul.md       # Agent system prompt
+        ├── handoff.json  # State from last session
+        ├── stats.json    # Cumulative usage stats
+        ├── heartbeat     # Timestamp file
+        └── logs/         # Per-session JSONL logs
 ```
+
+Project-local `.synaps-cli/skills/` override global skills.
 
 ---
 
-## 📁 Architecture
+## Architecture
 
-Built for performance and maintainability:
+7 binaries from 39 source files (~14,400 lines):
 
 ```
 src/
-├── main.rs                    (268 lines)  # chatui entry
-├── lib.rs                     (89 lines)   # Core types  
-├── agent/
-│   ├── mod.rs                 (156 lines)  # Agent runtime
-│   ├── tools/                 (1,847 lines) # Tool implementations
-│   ├── context.rs             (234 lines)  # Context management
-│   └── skills.rs              (445 lines)  # Skills system
-├── chat/
-│   ├── mod.rs                 (423 lines)  # Chat interface
-│   ├── ui.rs                  (1,234 lines) # TUI components  
-│   ├── themes.rs              (567 lines)  # Theme system
-│   └── session.rs             (289 lines)  # Session handling
-├── subagents/
-│   ├── mod.rs                 (345 lines)  # Subagent orchestration
-│   ├── dispatch.rs            (567 lines)  # Parallel execution
-│   └── status.rs              (234 lines)  # Live status panel
-├── watcher/
-│   ├── mod.rs                 (456 lines)  # Autonomous mode
-│   ├── supervisor.rs          (678 lines)  # Process management  
-│   ├── lifecycle.rs           (389 lines)  # Agent lifecycle
-│   └── heartbeat.rs           (234 lines)  # Health monitoring
-├── mcp/
-│   ├── mod.rs                 (345 lines)  # MCP integration
-│   └── client.rs              (456 lines)  # MCP client
-├── config/
-│   ├── mod.rs                 (234 lines)  # Configuration
-│   └── auth.rs                (178 lines)  # Authentication
-└── utils/
-    ├── mod.rs                 (123 lines)  # Utilities
-    └── crypto.rs              (89 lines)   # Encryption
+├── main.rs                  # chatui entry
+├── lib.rs                   # Core types & re-exports
+├── chat.rs                  # Headless chat binary
+├── agent.rs                 # synaps-agent (headless worker for watcher)
+├── watcher.rs               # Watcher supervisor daemon (1,454 lines)
+├── watcher_types.rs         # Watcher config & types
+├── login.rs                 # OAuth login flow
+├── server.rs                # WebSocket server binary
+├── client.rs                # WebSocket client binary
+├── config.rs                # Configuration & path resolution
+├── session.rs               # Session persistence
+├── auth.rs                  # OAuth + API key authentication
+├── error.rs                 # Error types (thiserror)
+├── mcp.rs                   # MCP JSON-RPC client
+├── skills.rs                # Skills system
+├── logging.rs               # Tracing setup
+├── protocol.rs              # Protocol types
+├── runtime/                 # Core runtime (6 files)
+│   ├── mod.rs               # Runtime struct, orchestration loop
+│   ├── api.rs               # API communication, SSE streaming, retry
+│   ├── stream.rs            # Stream processing, parallel tool execution
+│   ├── auth.rs              # Auth state management
+│   ├── helpers.rs           # Shared utilities
+│   └── types.rs             # Internal types
+├── tools/                   # Tool implementations (10 files)
+│   ├── mod.rs               # Tool trait, ToolRegistry, ToolContext
+│   ├── bash.rs              # Shell execution with timeout
+│   ├── read.rs              # File reading (UTF-8 validated)
+│   ├── write.rs             # Atomic file writes
+│   ├── edit.rs              # Surgical string replacement
+│   ├── grep.rs              # Regex search
+│   ├── find.rs              # Glob file discovery
+│   ├── ls.rs                # Directory listing
+│   ├── subagent.rs          # Agent dispatch with panic handling
+│   └── watcher_exit.rs      # Handoff for watcher agents
+└── chatui/                  # TUI frontend (5 files)
+    ├── main.rs              # Event loop
+    ├── app.rs               # Application state
+    ├── draw.rs              # Rendering
+    ├── markdown.rs          # Markdown renderer (tables, lists, wrapping)
+    ├── highlight.rs         # Syntax highlighting (syntect)
+    └── theme.rs             # 18 color themes
 ```
 
-**Total: ~14,000 lines** across 22 files. 96 tests ensure reliability.
-
 **Binaries:**
-- `chatui` (6.5MB) — Interactive and orchestration modes
-- `synaps-agent` (3.0MB) — Lightweight agent runtime  
-- `watcher` (1.2MB) — Supervisor daemon
+
+| Binary | Purpose |
+|--------|---------|
+| `chatui` | Interactive TUI with streaming and subagent panel |
+| `chat` | Headless chat for scripting |
+| `synaps-agent` | Lightweight worker runtime (used by watcher) |
+| `watcher` | Supervisor daemon for autonomous agents |
+| `login` | OAuth authentication flow |
+| `server` | WebSocket server mode |
+| `client` | WebSocket client |
 
 ---
 
-## 📄 License
+## License
 
-MIT License. Build something amazing.
+MIT License. See [LICENSE](LICENSE).
+
+---
+
+**Author:** [Haseeb Khalid](https://github.com/HaseebKhalid1507)

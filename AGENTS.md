@@ -1,388 +1,394 @@
 # SynapsCLI Agent Reference
 
-This document is for AI agents operating within the SynapsCLI runtime system. If you are reading this, you are an agent that has been spawned by SynapsCLI and need to understand your operating environment.
+You are an AI agent running inside the SynapsCLI runtime. This document describes your operating environment, available tools, and protocols.
 
 ## System Overview
 
-SynapsCLI is an agent runtime implemented in Rust with three operational modes:
+SynapsCLI has three operational modes. You are running in one of them:
 
-1. **Interactive Mode** (`chatui`) — Human-agent chat sessions with tool access
-2. **Headless Worker Mode** (`synaps-agent`) — Autonomous agents running one-shot tasks
-3. **Watcher Mode** (`watcher`) — Supervised autonomous agents with state persistence
+1. **Interactive** (`chatui`) — Human-agent chat with TUI, streaming, and tool access
+2. **Headless Worker** (`synaps-agent`) — Autonomous agent managed by the watcher
+3. **Subagent** — Dispatched by another agent for a focused task
 
-You are operating in one of these environments with access to a standardized tool suite. Your responses are handled by an LLM (typically Claude) via the Anthropic API.
+Your responses are powered by an LLM (typically Claude) via the Anthropic API. You have access to a standardized tool suite described below.
 
-### Runtime Architecture
-
-- **Tool Registry**: Dynamically managed set of available tools
-- **Thread Isolation**: Subagents run in separate threads with isolated tool access  
-- **MCP Integration**: External tools can be loaded from Model Context Protocol servers
-- **Skills System**: Markdown-based behavioral guidelines loaded on demand
+---
 
 ## Tool Reference
 
-All agents have access to the following built-in tools:
+### `bash`
 
-### Core File Operations
+Execute shell commands.
 
-#### `bash`
-Execute shell commands with timeout control.
-
-**Parameters:**
-- `command` (required): The bash command to execute
-- `timeout`: Timeout in seconds (default: 30, max: 300)
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `command` | string | yes | — | The bash command to execute |
+| `timeout` | integer | no | 30 | Timeout in seconds, max 300 |
 
 **Behavior:**
-- Commands are executed in a bash shell with piped stdout/stderr
-- Output is stripped of ANSI escape sequences
-- Output truncated at 30KB with notification
-- Automatic process cleanup on timeout
-- Returns error on non-zero exit status
+- Runs via `bash -c` with piped stdout/stderr
+- ANSI escape sequences stripped from output
+- Output truncated at 30KB with `[output truncated at 30KB]` notice
+- Process killed on timeout with `kill_on_drop`
+- Combined stdout + stderr in output
 
-#### `read`
-Read file contents with line numbers and pagination.
+---
 
-**Parameters:**
-- `path` (required): Path to the file to read
-- `offset`: Line number to start reading from (0-indexed, default: 0)
-- `limit`: Maximum number of lines to read (default: 500)
+### `read`
+
+Read file contents with line numbers.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `path` | string | yes | — | Path to file (`~` expands to home) |
+| `offset` | integer | no | 0 | Line to start from (0-indexed) |
+| `limit` | integer | no | 500 | Max lines to read |
 
 **Behavior:**
-- Path expansion: `~` resolves to home directory
 - Returns numbered lines: `{line_number}\t{content}`
-- Shows truncation notice if more lines available
-- Error on file not found or permission denied
+- Validates UTF-8 — binary files return a clear error with suggestion to use `bash` + `xxd`
+- Shows `... (N more lines)` if truncated
 
-#### `write`
-Create or overwrite files with atomic operations.
+---
 
-**Parameters:**
-- `path` (required): Path to the file to write
-- `content` (required): Content to write to the file
+### `write`
+
+Create or overwrite files.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `path` | string | yes | — | Path to file |
+| `content` | string | yes | — | Content to write |
 
 **Behavior:**
-- Creates parent directories if needed
-- Atomic write via temp file + rename
+- Creates parent directories automatically
+- Atomic write: writes to `.agent-tmp` then renames
 - Returns line count and byte count
-- Overwrites existing files completely
+- Completely overwrites existing files
 
-#### `edit`
-Make surgical edits by exact string replacement.
+---
 
-**Parameters:**
-- `path` (required): Path to the file to edit
-- `old_string` (required): The exact text to find and replace. Must match exactly once in the file.
-- `new_string` (required): The replacement text
+### `edit`
 
-**Behavior:**
-- String must match exactly once (error on 0 or >1 matches)
-- Atomic operation via temp file
-- Preserves file structure around the edit
-- Include sufficient context to make match unique
+Surgical string replacement.
 
-#### `grep`
-Search file contents using regex patterns.
-
-**Parameters:**
-- `pattern` (required): Regex pattern to search for
-- `path`: File or directory to search in (default: current directory)
-- `include`: Glob pattern to filter files (e.g. "*.rs", "*.py")
-- `context`: Number of context lines to show before and after each match
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `path` | string | yes | — | Path to file |
+| `old_string` | string | yes | — | Exact text to find (must match exactly once) |
+| `new_string` | string | yes | — | Replacement text |
 
 **Behavior:**
-- Recursive search with standard exclusions (.git, node_modules, target)
-- 15-second timeout with error on timeout
+- Fails if `old_string` matches 0 or >1 times
+- Atomic write via temp file + rename
+- Include enough surrounding context to make the match unique
+
+---
+
+### `grep`
+
+Search file contents using regex.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `pattern` | string | yes | — | Regex pattern |
+| `path` | string | no | `.` | File or directory to search |
+| `include` | string | no | — | Glob filter (e.g. `"*.rs"`) |
+| `context` | integer | no | — | Context lines before/after match |
+
+**Behavior:**
+- Recursive search, excludes `.git`, `node_modules`, `target`
+- 15-second timeout
 - Output truncated at 50KB with notice
-- Returns "No matches found." if no results
+- Returns `No matches found.` on zero results
 
-#### `find`
-Find files by name using glob patterns.
+---
 
-**Parameters:**
-- `pattern` (required): Glob pattern to match file names (e.g. "*.rs", "Cargo.*")
-- `path`: Directory to search in (default: current directory)
-- `type`: Filter by type: "f" for files, "d" for directories
+### `find`
+
+Find files by glob pattern.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `pattern` | string | yes | — | Glob pattern (e.g. `"*.rs"`) |
+| `path` | string | no | `.` | Directory to search from |
+| `type` | string | no | — | `"f"` for files, `"d"` for directories |
 
 **Behavior:**
-- Recursive search with standard exclusions
+- Recursive search, excludes `.git`, `node_modules`, `target`
 - 10-second timeout
-- Returns relative paths from search root
 
-#### `ls`
-List directory contents with details.
+---
 
-**Parameters:**
-- `path`: Directory path to list (default: current directory)
+### `ls`
 
-**Behavior:**
-- Uses `ls -lah` format (permissions, size, modification date)
-- Returns "Directory is empty." for empty directories
-- Error on invalid path or permission denied
+List directory contents.
 
-### Agent Operations
-
-#### `subagent`
-Dispatch a specialized subagent to perform a focused task.
-
-**Parameters:**
-- `task` (required): The task/prompt to send to the subagent
-- `agent`: Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt.
-- `system_prompt`: Inline system prompt for the subagent. Use when you don't have a named agent file.
-- `model`: Model override (default: claude-sonnet-4-20250514). Use claude-opus-4-6 for complex tasks.
-- `timeout`: Timeout in seconds (default: 300)
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `path` | string | no | `.` | Directory to list |
 
 **Behavior:**
-- Spawns agent in separate thread with isolated runtime
-- Has access to core tools (bash, read, write, edit, grep, find, ls) — no recursive subagents
-- Returns partial results on timeout instead of error
-- Streams status updates during execution
-- Logs complete session to ~/.synaps-cli/logs/subagents/
+- Uses `ls -lah` format (permissions, size, date)
+- Returns `Directory is empty.` for empty directories
 
-**Agent Resolution:**
-- Named agent: Loads `~/.synaps-cli/agents/{agent}.md`, strips YAML frontmatter
-- Inline prompt: Uses provided system_prompt directly
-- Must provide either `agent` OR `system_prompt`
+---
 
-### Gateway Tools
+### `subagent`
 
-#### `mcp_connect`
-Connect to an external MCP (Model Context Protocol) server and load its tools.
+Dispatch a specialist agent for a focused task. **Not available to subagents** (no recursion).
 
-**Parameters:**
-- `server` (required): Name of the MCP server to connect to. Available servers are listed in the tool description.
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `task` | string | yes | — | Task prompt for the subagent |
+| `agent` | string | no* | — | Agent name → loads `~/.synaps-cli/agents/{name}.md` |
+| `system_prompt` | string | no* | — | Inline system prompt (mutually exclusive with `agent`) |
+| `model` | string | no | `claude-sonnet-4-20250514` | Model override |
+| `timeout` | integer | no | 300 | Timeout in seconds |
+
+*Must provide either `agent` or `system_prompt`.
 
 **Behavior:**
-- Loads server configuration from ~/.synaps-cli/mcp.json
+- Runs in isolated thread with its own tokio runtime
+- Has core tools (bash, read, write, edit, grep, find, ls) — no subagent, no MCP
+- Thread panics are caught and reported as errors
+- Returns partial results on timeout
+- Streams status updates to parent's TUI panel
+- Logs complete session to `~/.synaps-cli/logs/subagents/`
+- Response prefixed with `[subagent:{name}]`
+
+---
+
+### `mcp_connect`
+
+Connect to an MCP server and load its tools.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `server` | string | yes | — | Server name from `mcp.json` config |
+
+**Behavior:**
 - Spawns server process and establishes JSON-RPC connection
-- Dynamically registers all server tools with `mcp__{server}__{tool}` prefix
-- Tools become available for remainder of session
+- Registers tools as `mcp__{server}__{tool}` — available for rest of session
+- Prevents duplicate connections
 - Returns list of newly available tools
-- Prevents duplicate connections to same server
+- 30-second timeout on MCP requests
 
-**Configuration Format** (mcp.json):
+**Configuration** (`~/.synaps-cli/mcp.json`):
 ```json
 {
   "mcpServers": {
-    "filesystem": {
+    "server-name": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/files"],
-      "env": {}
+      "args": ["-y", "@modelcontextprotocol/server-name"],
+      "env": { "API_KEY": "value" }
     }
   }
 }
 ```
 
-#### `load_skill`
-Load behavioral guidelines from a skill file.
-
-**Parameters:**
-- `skill` (required): Name of the skill to load. Available skills listed in tool description.
-
-**Behavior:**
-- Loads skill from ~/.synaps-cli/skills/{skill}.md
-- Returns skill content to be followed for remainder of conversation
-- Skills include structured guidelines, checklists, best practices
-- Project-local skills (.synaps-cli/skills/) override global ones
-
-**Skill Format** (markdown with YAML frontmatter):
-```markdown
----
-name: rust
-description: Rust programming best practices
 ---
 
-# Rust Development Guidelines
+### `load_skill`
 
-- Use `cargo clippy` for linting
-- Write tests for all public interfaces
-- Handle errors with Result<T,E>
-```
+Load behavioral guidelines from a markdown file.
 
-### Watcher-Only Tools
-
-#### `watcher_exit`
-Signal completion and provide handoff state for next session. **Only available to Watcher agents.**
-
-**Parameters:**
-- `reason` (required): Why you're exiting
-- `summary` (required): What you accomplished this session
-- `pending`: Array of tasks still pending
-- `context`: Structured data for next session
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `skill` | string | yes | — | Skill name (matches filename without `.md`) |
 
 **Behavior:**
-- Writes handoff.json to agent directory
-- Triggers graceful shutdown of watcher agent
-- Handoff data is loaded in next boot message
-- File size should be kept under 50KB
+- Returns skill content to follow for rest of conversation
+- Resolution order: project-local `.synaps-cli/skills/` → global `~/.synaps-cli/skills/`
+- Skills use YAML frontmatter for metadata:
+  ```markdown
+  ---
+  name: code-review
+  description: Structured code review guidelines
+  ---
+  # Code Review
+  (content here)
+  ```
+
+---
+
+### `watcher_exit`
+
+Signal work completion and provide handoff state. **Only available to watcher agents.**
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| `reason` | string | yes | — | Why you're exiting |
+| `summary` | string | yes | — | What you accomplished |
+| `pending` | array[string] | no | `[]` | Tasks still pending |
+| `context` | object | no | `{}` | Structured data for next session |
+
+**Behavior:**
+- Writes `handoff.json` to agent directory
+- Triggers graceful shutdown
+- Handoff data injected into next session's boot message
+
+---
 
 ## Watcher Agent Lifecycle
 
-If you are a Watcher agent, you operate in a supervised autonomous loop:
+If you are a watcher agent (`synaps-agent`), you operate in a supervised loop.
+
+### Boot
+
+1. System prompt loaded from `soul.md` in your agent directory
+2. Handoff state injected from previous session's `handoff.json` (if exists)
+3. Boot message sent with template variables:
+   - `{timestamp}` — current time
+   - `{handoff}` — JSON from last session
+   - `{trigger_context}` — what triggered this session
+
+### Work
+
+Standard conversation loop with full tool access. The supervisor automatically:
+- Sends heartbeat every 30s (configurable)
+- Checks limits after each turn:
+  - Token count (default: 100K)
+  - Session duration (default: 60 min)
+  - Per-session cost (default: $0.50)
+  - Daily cost budget (default: $10.00)
+  - Tool call count (default: 200)
+
+### Exit
+
+**Voluntary:** Call `watcher_exit` with handoff state when done.
+
+**Forced:** When a limit is hit, you're prompted to write handoff state before shutdown:
+```
+You've reached your [limit] limit. Please call watcher_exit with
+your handoff state to transfer your work to your next session.
+```
 
 ### Configuration
 
-Your behavior is controlled by `config.toml` in your agent directory:
+`~/.synaps-cli/watcher/{name}/config.toml`:
 
 ```toml
 [agent]
-name = "your-name"
-model = "claude-sonnet-4-20250514"  # or claude-opus-4-6
-thinking = "medium"  # low, medium, high
-trigger = "manual"   # manual, always
+name = "scout"
+model = "claude-sonnet-4-20250514"   # default
+thinking = "medium"                   # low | medium | high
+trigger = "manual"                    # manual | always | watch
+
+[trigger]                             # watch mode only
+paths = ["./src"]                     # directories to monitor
+patterns = ["*.rs", "*.toml"]         # file filters
+debounce_secs = 3                     # settle time before triggering
 
 [limits]
-max_session_tokens = 100000     # default: 100K
-max_session_duration_mins = 60  # default: 60 minutes  
-max_session_cost_usd = 0.50     # default: $0.50
-max_daily_cost_usd = 10.0       # default: $10
-max_tool_calls = 200            # default: 200
-cooldown_secs = 10              # delay between sessions
-max_retries = 3                 # attempts before marking crashed
+max_session_tokens = 100000
+max_session_duration_mins = 60
+max_session_cost_usd = 0.50
+max_daily_cost_usd = 10.0
+max_tool_calls = 200
+cooldown_secs = 10                    # delay between sessions
+max_retries = 3                       # crash retries before giving up
 
-[boot]  
-message = "..."  # custom boot template (optional)
+[boot]
+message = "..."                       # custom boot template (optional)
 
 [heartbeat]
-interval_secs = 30              # heartbeat frequency
-stale_threshold_secs = 120      # when considered stale
+interval_secs = 30
+stale_threshold_secs = 120            # when considered stale
 ```
 
-### Boot Phase
+### Trigger Modes
 
-1. Your system prompt is loaded from `soul.md`
-2. Handoff state injected from previous session (if exists)
-3. Boot message sent with template variables:
-   - `{timestamp}`: Current time
-   - `{handoff}`: JSON handoff from last session
-   - `{trigger_context}`: What triggered this session
+| Mode | Behavior |
+|------|----------|
+| `manual` | Only runs when explicitly deployed |
+| `always` | Restarts automatically after each session (with cooldown) |
+| `watch` | Triggers on file changes in configured paths/patterns |
 
-### Work Phase
+### Statistics
 
-- You operate in standard LLM conversation loop
-- All tools available per your runtime context
-- Heartbeat automatically sent every 30s (no action needed)
-- Limits checked after each conversation turn:
-  - Token count (input + output)
-  - Session duration
-  - Tool call count  
-  - Per-session cost
-  - Daily cost budget
-
-### Exit Phase
-
-**Option 1: Voluntary Exit**
-Call `watcher_exit` with your handoff state when done.
-
-**Option 2: Limit Reached**
-System prompts you to write handoff state before forced shutdown:
-```
-You've reached your [limit type] limit. Please call watcher_exit with your handoff state to transfer your work to your next session.
-```
-
-### Handoff State
-
-Structure for state transfer between sessions:
-
-```json
-{
-  "summary": "What I accomplished",
-  "pending": ["Task 1", "Task 2"], 
-  "context": {
-    "key": "structured data",
-    "progress": {"task_a": "50%"}
-  }
-}
-```
-
-### Statistics Tracking
-
-Per-agent stats tracked automatically:
-- Total sessions run
-- Total tokens consumed
-- Total cost incurred  
-- Uptime across sessions
-- Crash count and last error
+Per-agent stats tracked in `stats.json`:
+- Total sessions, tokens, cost, uptime
+- Crash count and last crash error
 - Daily usage (resets at midnight)
-
-## Directory Structure
-
-Your runtime operates within this file system structure:
-
-```
-~/.synaps-cli/
-├── config                  # global settings (model, thinking, skills)
-├── agents/                 # subagent definitions (.md files)
-├── skills/                 # loadable skill files (.md with frontmatter)
-├── mcp.json               # MCP server configurations
-├── sessions/              # conversation history
-└── watcher/              # autonomous agents
-    └── <name>/
-        ├── config.toml    # agent configuration
-        ├── soul.md        # agent system prompt
-        ├── handoff.json   # state from last session
-        ├── stats.json     # usage statistics
-        ├── heartbeat      # heartbeat timestamp file
-        └── logs/          # per-session logs (JSONL format)
-            └── session-001.jsonl
-```
-
-## Subagent Protocol
-
-If you are a subagent (spawned via `subagent` tool):
-
-- You run in an isolated thread with your own tokio runtime
-- You receive: system prompt + user task + core tool suite
-- You have NO access to:
-  - `subagent` tool (prevents recursion)
-  - MCP servers
-  - Watcher-specific tools
-- Your output streams back to parent agent
-- You're terminated on timeout with partial results returned
-- Parent receives your final response prefixed with `[subagent:{name}]`
-
-## Best Practices
-
-### Tool Usage
-- Use `bash` for system operations, but respect timeout limits
-- Use `edit` for surgical changes; `write` for complete rewrites
-- Use `subagent` for delegation of focused subtasks
-- Always call `watcher_exit` when done (Watcher agents)
-
-### Error Handling  
-- File operations may fail due to permissions or missing paths
-- Shell commands may timeout or return non-zero exit codes
-- MCP servers may be unavailable or crash
-- Subagents may timeout and return partial work
-
-### State Management
-- Keep handoff.json under 50KB for reliable state transfer
-- Use structured data in context field for complex state
-- Write meaningful summaries for continuity across sessions
-
-### Resource Limits
-- Default session limit: 100K tokens, 60 minutes, $0.50, 200 tool calls
-- Daily limit: $10 by default
-- Heartbeat automatic every 30s — no action needed
-- Graceful degradation on limit hits with handoff prompting
-
-## Tool Schema Summary
-
-| Tool | Required Params | Optional Params | Purpose |
-|------|----------------|------------------|---------|
-| bash | command | timeout | Execute shell commands |
-| read | path | offset, limit | Read file contents |
-| write | path, content | | Create/overwrite files |
-| edit | path, old_string, new_string | | Make surgical edits |
-| grep | pattern | path, include, context | Search file contents |
-| find | pattern | path, type | Find files by name |
-| ls | | path | List directory contents |
-| subagent | task | agent, system_prompt, model, timeout | Dispatch specialist agent |
-| mcp_connect | server | | Connect to MCP server |
-| load_skill | skill | | Load behavioral guidelines |
-| watcher_exit* | reason, summary | pending, context | Exit with handoff state |
-
-*Watcher agents only
 
 ---
 
-*You are now fully briefed on your operational environment. Utilize the available tools effectively and follow the protocols appropriate to your agent type.*
+## Subagent Protocol
+
+If you were spawned via the `subagent` tool:
+
+- You run in an **isolated thread** with your own tokio runtime
+- You have: `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`
+- You do **NOT** have: `subagent`, `mcp_connect`, `load_skill`, `watcher_exit`
+- Your output streams back to the parent agent in real-time
+- On timeout, partial results are returned (not an error)
+- Your session is logged to `~/.synaps-cli/logs/subagents/`
+
+---
+
+## Directory Structure
+
+```
+~/.synaps-cli/
+├── config                  # Global settings (model, thinking, theme)
+├── auth.json               # OAuth tokens (file-locked, permissions 600)
+├── system.md               # Default system prompt
+├── mcp.json                # MCP server configurations
+├── agents/                 # Subagent definitions
+│   └── {name}.md           # Markdown with optional YAML frontmatter
+├── skills/                 # Global behavioral guidelines
+│   └── {skill}.md          # Markdown with YAML frontmatter
+├── sessions/               # Conversation history (JSON)
+├── logs/
+│   └── subagents/          # Per-subagent session logs
+└── watcher/                # Autonomous agents
+    └── {name}/
+        ├── config.toml     # Agent configuration
+        ├── soul.md         # Agent system prompt
+        ├── handoff.json    # State from last session
+        ├── stats.json      # Cumulative usage statistics
+        ├── heartbeat       # Timestamp file
+        └── logs/           # Per-session JSONL logs
+```
+
+---
+
+## Best Practices
+
+**Tool usage:**
+- Use `edit` for surgical changes, `write` for complete rewrites
+- Use `bash` for system operations — respect the timeout
+- Use `subagent` to delegate focused subtasks
+- Always call `watcher_exit` when done (watcher agents)
+
+**Error handling:**
+- File operations may fail (permissions, missing paths)
+- Shell commands may timeout or return non-zero exit
+- MCP servers may be unavailable
+- Subagents may timeout and return partial work
+
+**State management (watcher agents):**
+- Keep `handoff.json` concise for reliable state transfer
+- Use structured data in the `context` field
+- Write meaningful summaries for continuity across sessions
+
+---
+
+## Tool Schema Summary
+
+| Tool | Required | Optional | Purpose |
+|------|----------|----------|---------|
+| `bash` | command | timeout | Shell execution |
+| `read` | path | offset, limit | File reading |
+| `write` | path, content | — | File creation |
+| `edit` | path, old_string, new_string | — | Surgical editing |
+| `grep` | pattern | path, include, context | Regex search |
+| `find` | pattern | path, type | File discovery |
+| `ls` | — | path | Directory listing |
+| `subagent` | task | agent, system_prompt, model, timeout | Agent dispatch |
+| `mcp_connect` | server | — | MCP server connection |
+| `load_skill` | skill | — | Behavioral guidelines |
+| `watcher_exit`* | reason, summary | pending, context | Session handoff |
+
+*Watcher agents only
