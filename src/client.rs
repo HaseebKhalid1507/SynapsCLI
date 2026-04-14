@@ -3,7 +3,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use std::io::Write;
+
 
 #[derive(Parser)]
 #[command(name = "client", about = "SynapsCLI terminal client")]
@@ -144,11 +144,11 @@ async fn main() -> anyhow::Result<()> {
                                         _       => "→",
                                     };
                                     eprint!("\x1b[38;2;100;180;220m  {} {}\x1b[0m ", icon, tool_name);
-                                    std::io::stderr().flush().unwrap();
+                                    synaps_cli::flush_stderr();
                                 }
                                 ServerMessage::ToolUseDelta(delta) => {
                                     eprint!("\x1b[38;2;80;110;140m{}\x1b[0m", delta);
-                                    std::io::stderr().flush().unwrap();
+                                    synaps_cli::flush_stderr();
                                 }
                                 ServerMessage::ToolUse { tool_name, input, .. } => {
                                     eprint!("                                                                                          \r");

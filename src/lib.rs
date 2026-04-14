@@ -23,3 +23,17 @@ pub use watcher_types::{
 // Re-export for convenience
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;
+
+/// Flush stdout, ignoring errors (pipe closed, etc.)
+#[inline]
+pub fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Flush stderr, ignoring errors (pipe closed, etc.)
+#[inline]
+pub fn flush_stderr() {
+    use std::io::Write;
+    let _ = std::io::stderr().flush();
+}
