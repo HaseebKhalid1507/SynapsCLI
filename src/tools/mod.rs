@@ -89,6 +89,8 @@ pub trait Tool: Send + Sync {
 
 // ── Tool Registry ──────────────────────────────────────────────────────────
 
+/// Registry of available tools. Maintains a name→tool map and a cached JSON schema
+/// array that gets sent to the API. Thread-safe via `Arc<RwLock<ToolRegistry>>`.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,

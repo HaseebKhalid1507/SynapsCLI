@@ -23,6 +23,8 @@ use api::ApiMethods;
 use stream::StreamMethods;
 use helpers::HelperMethods;
 
+/// The core runtime — manages API communication, tool execution, authentication,
+/// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
 pub struct Runtime {
     client: Client,
     auth: Arc<RwLock<AuthState>>,
@@ -107,6 +109,8 @@ impl Runtime {
         AuthMethods::refresh_if_needed(Arc::clone(&self.auth), &self.client).await
     }
 
+    /// Run a single prompt synchronously (non-streaming). Handles tool execution
+    /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
         // Refresh OAuth token if expired
         self.refresh_if_needed().await?;
@@ -252,10 +256,15 @@ impl Runtime {
         }
     }
 
+    /// Run a prompt as a cancellable stream of [`StreamEvent`]s. Convenience wrapper
+    /// around [`run_stream_with_messages`] for single-turn usage.
     pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None).await
     }
 
+    /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
+    /// This is the main entry point for chat UIs and agents. Handles tool execution,
+    /// API retries, and dynamic tool registration (MCP) internally.
     pub async fn run_stream_with_messages(
         &self,
         messages: Vec<Value>,
