@@ -444,24 +444,20 @@ mod tests {
 /// Instead of spawning all servers at startup (burning tokens on 65 tool schemas),
 /// this registers ONE tool that the model calls to activate a specific server.
 ///
-/// NOTE: This tool holds an Arc to the ToolRegistry it is registered in (circular Arc).
-/// This is safe because: the write lock on the registry is only acquired inside execute(),
-/// never nested with another lock on the same registry, and the tool loop in runtime.rs
-/// drops its read lock before executing tools.
+/// MCP connect gateway — discovers tools from an MCP server and registers them dynamically.
+/// Uses the ToolContext.tool_register_tx channel instead of holding a direct Arc to the registry,
+/// breaking the circular reference that previously existed.
 pub struct McpConnectTool {
     configs: HashMap<String, McpServerConfig>,
-    registry: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     connected: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl McpConnectTool {
     pub fn new(
         configs: HashMap<String, McpServerConfig>,
-        registry: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     ) -> Self {
         Self {
             configs,
-            registry,
             connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -490,7 +486,7 @@ impl Tool for McpConnectTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: crate::ToolContext) -> crate::Result<String> {
+    async fn execute(&self, params: Value, ctx: crate::ToolContext) -> crate::Result<String> {
         let server_name = params["server"].as_str()
             .ok_or_else(|| crate::RuntimeError::Tool("Missing 'server' parameter".to_string()))?;
 
@@ -538,25 +534,28 @@ impl Tool for McpConnectTool {
         let tool_count = tools.len();
         let connection = Arc::new(Mutex::new(conn));
         let mut tool_names = Vec::new();
+        let mut new_tools: Vec<Arc<dyn crate::Tool>> = Vec::new();
 
-        {
-            let mut registry = self.registry.write().await;
-            for tool_def in tools {
-                let prefixed_name = format!("mcp__{}__{}", server_name, tool_def.name);
-                tool_names.push(format!("{} — {}", tool_def.name,
-                    tool_def.description.chars().take(60).collect::<String>()));
+        for tool_def in tools {
+            let prefixed_name = format!("mcp__{}__{}", server_name, tool_def.name);
+            tool_names.push(format!("{} — {}", tool_def.name,
+                tool_def.description.chars().take(60).collect::<String>()));
 
-                let mcp_tool = McpTool {
-                    tool_name: prefixed_name,
-                    server_tool_name: tool_def.name.clone(),
-                    server_name: server_name.to_string(),
-                    description: format!("[MCP:{}] {}", server_name, tool_def.description),
-                    input_schema: tool_def.input_schema,
-                    connection: Arc::clone(&connection),
-                };
+            let mcp_tool = McpTool {
+                tool_name: prefixed_name,
+                server_tool_name: tool_def.name.clone(),
+                server_name: server_name.to_string(),
+                description: format!("[MCP:{}] {}", server_name, tool_def.description),
+                input_schema: tool_def.input_schema,
+                connection: Arc::clone(&connection),
+            };
 
-                registry.register(Arc::new(mcp_tool));
-            }
+            new_tools.push(Arc::new(mcp_tool));
+        }
+
+        // Send new tools to the runtime for registration (via channel, no circular Arc)
+        if let Some(ref tx) = ctx.tool_register_tx {
+            let _ = tx.send(new_tools);
         }
 
         tracing::info!(server = %server_name, tools = tool_count, "MCP server connected (lazy)");
@@ -587,7 +586,6 @@ pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegist
 
     let connect_tool = McpConnectTool::new(
         config.mcp_servers,
-        Arc::clone(registry),
     );
 
     registry.write().await.register(Arc::new(connect_tool));

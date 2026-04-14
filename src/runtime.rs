@@ -331,7 +331,7 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: self.watcher_exit_path.clone() };
+                                let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: self.watcher_exit_path.clone(), tool_register_tx: None };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -361,7 +361,7 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: exit_path };
+                                        let ctx = crate::ToolContext { tx_delta: None, tx_events: None, watcher_exit_path: exit_path, tool_register_tx: None };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -557,6 +557,9 @@ impl Runtime {
                 // Execute tools and add results. We must always produce a tool_result for
                 // every tool_use we just pushed onto the assistant message — otherwise the
                 // next API call will fail with "tool_use ids were found without tool_result
+
+                // Channel for dynamic tool registration (MCP connect uses this)
+                let (tool_reg_tx, mut tool_reg_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
                 // blocks". On cancellation we synthesize a "Cancelled by user" result for any
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
@@ -598,7 +601,7 @@ impl Runtime {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone() }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()) }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -642,6 +645,7 @@ impl Runtime {
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
+                        let tool_reg_tx_inner = tool_reg_tx.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -659,7 +663,7 @@ impl Runtime {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone() }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()) }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
@@ -707,6 +711,15 @@ impl Runtime {
                                 "content": Self::truncate_tool_result(&result)
                             }));
                         }
+                    }
+                }
+
+                // Drain dynamic tool registrations (e.g. from MCP connect)
+                drop(tool_reg_tx); // close sender so recv returns None
+                while let Ok(new_tools) = tool_reg_rx.try_recv() {
+                    let mut registry = tools.write().await;
+                    for tool in new_tools {
+                        registry.register(tool);
                     }
                 }
 
