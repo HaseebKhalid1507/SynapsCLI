@@ -1,0 +1,186 @@
+//! Stream event handling — processes StreamEvent variants from the runtime.
+
+
+use synaps_cli::{Runtime, StreamEvent};
+
+use super::app::{App, ChatMessage, SubagentState};
+
+/// What the event loop should do after processing a stream event.
+pub(super) enum StreamAction {
+    /// Continue processing — no special action needed.
+    Continue,
+    /// Stream completed and a queued message should be auto-sent.
+    AutoSendQueued(String),
+}
+
+/// Returns true if the event should trigger an immediate redraw.
+pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
+    matches!(event,
+        StreamEvent::ToolUse { .. }
+        | StreamEvent::ToolResult { .. }
+        | StreamEvent::SubagentStart { .. }
+        | StreamEvent::SubagentUpdate { .. }
+        | StreamEvent::SubagentDone { .. }
+        | StreamEvent::SteeringDelivered { .. }
+        | StreamEvent::Done
+        | StreamEvent::Error(_)
+    )
+}
+
+/// Process a StreamEvent, update app state, return what the loop should do.
+pub(super) async fn handle_stream_event(
+    event: StreamEvent,
+    app: &mut App,
+    runtime: &Runtime,
+) -> StreamAction {
+    match event {
+        StreamEvent::Thinking(text) => {
+            app.append_or_update_thinking(&text);
+        }
+        StreamEvent::Text(text) => {
+            app.append_or_update_text(&text);
+        }
+        StreamEvent::ToolUseStart(name) => {
+            app.tool_start_time = Some(std::time::Instant::now());
+            app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
+        }
+        StreamEvent::ToolUseDelta(delta) => {
+            if let Some(last) = app.messages.last_mut() {
+                if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
+                    partial.push_str(&delta);
+                    app.dirty = true;
+                    app.line_cache.clear();
+                }
+            }
+        }
+        StreamEvent::ToolUse { tool_name, input, .. } => {
+            app.tool_start_time = Some(std::time::Instant::now());
+            let input_str = serde_json::to_string(&input).unwrap_or_default();
+            if let Some(last) = app.messages.last_mut() {
+                if let ChatMessage::ToolUseStart(name, _) = &last.msg {
+                    if name == &tool_name {
+                        last.msg = ChatMessage::ToolUse { tool_name, input: input_str };
+                        app.dirty = true;
+                        app.line_cache.clear();
+                        return StreamAction::Continue;
+                    }
+                }
+            }
+            app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
+        }
+        StreamEvent::ToolResultDelta { delta, .. } => {
+            if let Some(last) = app.messages.last_mut() {
+                if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
+                    content.push_str(&delta);
+                    app.dirty = true;
+                    app.line_cache.clear();
+                    return StreamAction::Continue;
+                }
+            }
+            app.push_msg(ChatMessage::ToolResult { content: delta, elapsed_ms: None });
+        }
+        StreamEvent::ToolResult { result, .. } => {
+            let elapsed = app.tool_start_time.take()
+                .map(|t| t.elapsed().as_millis() as u64);
+            if let Some(last) = app.messages.last_mut() {
+                if let ChatMessage::ToolResult { ref mut content, elapsed_ms: ref mut el, .. } = last.msg {
+                    *content = result;
+                    *el = elapsed;
+                    app.dirty = true;
+                    app.line_cache.clear();
+                    return StreamAction::Continue;
+                }
+            }
+            app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms: elapsed });
+        }
+        StreamEvent::MessageHistory(history) => {
+            app.api_messages = history;
+            app.save_session().await;
+        }
+        StreamEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+            app.subagents.push(SubagentState {
+                id: subagent_id,
+                name: agent_name,
+                status: format!("starting: {}", task_preview),
+                start_time: std::time::Instant::now(),
+                done: false,
+                duration_secs: None,
+            });
+            app.dirty = true;
+            app.line_cache.clear();
+        }
+        StreamEvent::SubagentUpdate { subagent_id, status, .. } => {
+            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+                sa.status = status;
+            }
+            app.dirty = true;
+            app.line_cache.clear();
+        }
+        StreamEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
+            if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
+                sa.done = true;
+                sa.duration_secs = Some(duration_secs);
+                let preview: String = result_preview.chars().take(40).collect();
+                if result_preview.starts_with("[TIMED OUT") {
+                    sa.status = "\u{26a0} timed out".to_string();
+                } else if result_preview.starts_with("ERROR") {
+                    sa.status = format!("\u{2718} {}", preview);
+                } else {
+                    sa.status = format!("\u{2714} {}", preview);
+                }
+            }
+            app.dirty = true;
+            app.line_cache.clear();
+        }
+        StreamEvent::SteeringDelivered { message } => {
+            app.push_msg(ChatMessage::User(message.clone()));
+            if app.queued_message.as_ref() == Some(&message) {
+                app.queued_message = None;
+            }
+            app.scroll_back = 0;
+            app.scroll_pinned = true;
+            app.dirty = true;
+            app.line_cache.clear();
+        }
+        StreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            model: usage_model,
+        } => {
+            let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
+            app.add_usage(
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                model_for_pricing,
+            );
+        }
+        StreamEvent::Done => {
+            app.streaming = false;
+            app.subagents.clear();
+
+            // Check for queued message to auto-send
+            if let Some(queued) = app.queued_message.take() {
+                return StreamAction::AutoSendQueued(queued);
+            }
+        }
+        StreamEvent::Error(err) => {
+            app.push_msg(ChatMessage::Error(err));
+            app.streaming = false;
+            app.subagents.clear();
+            // Restore a valid trailing state — drop unmatched trailing messages
+            if let Some(last) = app.api_messages.last() {
+                let role = last["role"].as_str().unwrap_or("");
+                let is_text_user = role == "user" && last["content"].is_string();
+                let is_assistant = role == "assistant";
+                if is_text_user || is_assistant {
+                    app.api_messages.pop();
+                }
+            }
+        }
+    }
+    StreamAction::Continue
+}
