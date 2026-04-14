@@ -93,15 +93,13 @@ impl HelperMethods {
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
-    pub(super) const MAX_TOOL_RESULT_CHARS: usize = 30_000;
-
-    pub(super) fn truncate_tool_result(result: &str) -> String {
-        if result.len() <= Self::MAX_TOOL_RESULT_CHARS {
+    pub(super) fn truncate_tool_result(result: &str, max_chars: usize) -> String {
+        if result.len() <= max_chars {
             return result.to_string();
         }
-        let truncated: String = result.chars().take(Self::MAX_TOOL_RESULT_CHARS).collect();
+        let truncated: String = result.chars().take(max_chars).collect();
         format!("{}\n\n[truncated — {} total chars, showing first {}]",
-            truncated, result.len(), Self::MAX_TOOL_RESULT_CHARS)
+            truncated, result.len(), max_chars)
     }
 
     /// Returns the max output tokens for a given model.

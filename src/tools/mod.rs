@@ -49,6 +49,11 @@ pub struct ToolContext {
     /// Channel for tools that need to register new tools at runtime (e.g. MCP).
     /// Breaks the circular Arc — tools send registrations, runtime applies them.
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
+    // Configuration parameters
+    pub max_tool_output: usize,
+    pub bash_timeout: u64,
+    pub bash_max_timeout: u64,
+    pub subagent_timeout: u64,
 }
 
 /// The core trait for all tools. Implement this to add a new tool.

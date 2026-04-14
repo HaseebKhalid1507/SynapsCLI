@@ -74,11 +74,30 @@ pub fn get_active_config_dir() -> PathBuf {
 
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
-#[derive(Default)]
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
     pub skills: Option<Vec<String>>,
+    pub max_tool_output: usize,        // default 30000
+    pub bash_timeout: u64,             // default 30
+    pub bash_max_timeout: u64,         // default 300
+    pub subagent_timeout: u64,         // default 300
+    pub api_retries: u32,              // default 3
+}
+
+impl Default for SynapsConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            thinking_budget: None,
+            skills: None,
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            api_retries: 3,
+        }
+    }
 }
 
 
@@ -114,6 +133,31 @@ pub fn load_config() -> SynapsConfig {
             "skills" => config.skills = Some(
                 val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             ),
+            "max_tool_output" => {
+                if let Ok(size) = val.parse::<usize>() {
+                    config.max_tool_output = size;
+                }
+            }
+            "bash_timeout" => {
+                if let Ok(timeout) = val.parse::<u64>() {
+                    config.bash_timeout = timeout;
+                }
+            }
+            "bash_max_timeout" => {
+                if let Ok(timeout) = val.parse::<u64>() {
+                    config.bash_max_timeout = timeout;
+                }
+            }
+            "subagent_timeout" => {
+                if let Ok(timeout) = val.parse::<u64>() {
+                    config.subagent_timeout = timeout;
+                }
+            }
+            "api_retries" => {
+                if let Ok(retries) = val.parse::<u32>() {
+                    config.api_retries = retries;
+                }
+            }
             _ => {} // Unknown keys silently ignored
         }
     }
@@ -202,5 +246,54 @@ mod tests {
         assert_eq!(config.model, None);
         assert_eq!(config.thinking_budget, None);
         assert_eq!(config.skills, None);
+        assert_eq!(config.max_tool_output, 30000);
+        assert_eq!(config.bash_timeout, 30);
+        assert_eq!(config.bash_max_timeout, 300);
+        assert_eq!(config.subagent_timeout, 300);
+        assert_eq!(config.api_retries, 3);
+    }
+
+    #[test]
+    fn test_load_config_new_keys() {
+        // Create a temporary config directory with the new keys
+        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-new-keys/.synaps-cli");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let config_path = test_dir.join("config");
+        
+        let config_content = r#"
+# Test config with new keys
+model = claude-haiku
+thinking = medium
+max_tool_output = 50000
+bash_timeout = 45
+bash_max_timeout = 600
+subagent_timeout = 120
+api_retries = 5
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+        
+        // Temporarily override the config path for this test
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-new-keys");
+        
+        let config = load_config();
+        
+        // Restore original HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-new-keys");
+        
+        assert_eq!(config.model, Some("claude-haiku".to_string()));
+        assert_eq!(config.thinking_budget, Some(4096)); // medium = 4096
+        assert_eq!(config.max_tool_output, 50000);
+        assert_eq!(config.bash_timeout, 45);
+        assert_eq!(config.bash_max_timeout, 600);
+        assert_eq!(config.subagent_timeout, 120);
+        assert_eq!(config.api_retries, 5);
     }
 }

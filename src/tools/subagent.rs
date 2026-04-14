@@ -51,7 +51,7 @@ impl Tool for SubagentTool {
         let agent_name = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
         let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(300);
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => {

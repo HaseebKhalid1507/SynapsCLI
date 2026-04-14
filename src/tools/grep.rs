@@ -39,7 +39,7 @@ impl Tool for GrepTool {
         })
     }
 
-    async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
         let pattern = params["pattern"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing pattern parameter".to_string()))?;
         let path = expand_path(params["path"].as_str().unwrap_or("."));
@@ -74,8 +74,8 @@ impl Tool for GrepTool {
             Ok("No matches found.".to_string())
         } else {
             let result = stdout.to_string();
-            if result.len() > 50000 {
-                let truncated: String = result.chars().take(50000).collect();
+            if result.len() > ctx.max_tool_output {
+                let truncated: String = result.chars().take(ctx.max_tool_output).collect();
                 Ok(format!("{}\n\n... (output truncated, {} total bytes)", truncated, result.len()))
             } else {
                 Ok(result)
