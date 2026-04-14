@@ -1,12 +1,12 @@
-# Contributing to SynapsCLI
+# Contributing to Agent Runtime
 
-Thanks for your interest in contributing. SynapsCLI is an open-source AI agent runtime built in Rust, and contributions of all kinds are welcome.
+Thanks for your interest in contributing. This is an open-source AI agent runtime built in Rust, and contributions of all kinds are welcome.
 
 ## Getting Started
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
-cd SynapsCLI
+cd agent-runtime
 cargo build
 cargo test
 ```
@@ -21,7 +21,7 @@ Open an [issue](https://github.com/HaseebKhalid1507/SynapsCLI/issues/new?templat
 - What you expected to happen
 - What actually happened
 - Steps to reproduce
-- Your OS, Rust version, and SynapsCLI version
+- Your OS, Rust version, and version info
 
 ### Feature Requests
 

@@ -9,7 +9,7 @@ repository = "https://github.com/HaseebKhalid1507/SynapsCLI"
 homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
 keywords = ["ai", "agent", "terminal", "cli", "rust"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.70"
+rust-version = "1.80"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }

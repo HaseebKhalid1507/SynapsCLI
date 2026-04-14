@@ -17,12 +17,12 @@ Instead, email **haseebkhalid1507@gmail.com** with:
 - Potential impact
 - Suggested fix (if any)
 
-You will receive a response within 48 hours. We take security seriously — SynapsCLI runs autonomous agents with tool access, so the attack surface matters.
+You will receive a response within 48 hours. We take security seriously — this runtime manages autonomous agents with tool access, so the attack surface matters.
 
 ## Security Model
 
 ### Agent Isolation
-- Watcher agents run as child processes, not in the supervisor's address space
+- Sentinel agents run as separate processes, isolated from the supervisor
 - Agent names are validated (`^[a-zA-Z0-9_-]+$`) to prevent path traversal
 - IPC socket permissions are set to `0600` (owner-only)
 

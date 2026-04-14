@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in SynapsCLI
+about: Report a bug in the agent runtime
 title: "[Bug] "
 labels: bug
 assignees: ''
@@ -23,8 +23,8 @@ What actually happened.
 ## Environment
 - **OS:** (e.g., Ubuntu 24.04, macOS 15)
 - **Rust version:** (`rustc --version`)
-- **SynapsCLI version:** (commit hash or version)
-- **Binary:** (chatui / watcher / synaps-agent)
+- **Version:** (commit hash or release version)
+- **Binary:** (chatui / sentinel / synaps-agent)
 
 ## Logs / Screenshots
 If applicable, paste relevant terminal output or error messages.

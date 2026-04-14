@@ -92,6 +92,26 @@ pub(crate) struct SubagentState {
     pub(crate) duration_secs: Option<f64>,
 }
 
+/// Find the GamblersDen binary: check $PATH first, then the dev build path.
+fn which_gamba() -> Option<std::path::PathBuf> {
+    // 1. Check $PATH (works if user installed to /usr/local/bin, ~/.cargo/bin, etc.)
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("gamblers-den")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+    // 2. Fallback: dev build path
+    std::env::var("HOME").ok()
+        .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+        .filter(|p| p.exists())
+}
+
 impl App {
     pub(crate) fn new(session: Session) -> Self {
         Self {
@@ -147,13 +167,9 @@ impl App {
         if self.gamba_child.is_some() {
             return Err("🎰 Casino already running!".to_string());
         }
-        let bin = match std::env::var("HOME").ok()
-            .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
-            .filter(|p| p.exists())
-        {
-            Some(b) => b,
-            None => return Err("GamblersDen binary not found. Build it: cd ~/Projects/GamblersDen && cargo build --release".to_string()),
-        };
+        let bin = which_gamba().ok_or_else(|| {
+            "GamblersDen binary not found. Install it to $PATH or ~/Projects/GamblersDen/target/release/".to_string()
+        })?;
 
         // Tear down our TUI
         crossterm::terminal::disable_raw_mode().ok();

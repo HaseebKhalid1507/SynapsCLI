@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest an idea for SynapsCLI
+about: Suggest an idea for the agent runtime
 title: "[Feature] "
 labels: enhancement
 assignees: ''
@@ -16,7 +16,7 @@ How should it work?
 Any other approaches you've thought about.
 
 ## Context
-Which part of SynapsCLI does this relate to?
+Which part of the agent runtime does this relate to?
 - [ ] Interactive mode (chatui)
 - [ ] Orchestration (subagents)
 - [ ] Autonomous agents (Watcher)
