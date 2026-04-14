@@ -305,17 +305,21 @@ async fn test_edit_tool_execution() {
 async fn test_ls_tool_execution() {
     let tool = LsTool;
     let ctx = create_tool_context();
-    
+
+    // Use a dedicated temp dir to avoid races with other tests
+    let dir = std::env::temp_dir().join("synaps_test_ls");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+
     let params = json!({
-        "path": "/tmp"
+        "path": dir.to_str().unwrap()
     });
-    
+
     let result = tool.execute(params, ctx).await.unwrap();
-    
-    // Verify output is non-empty (should contain at least total line)
-    assert!(!result.is_empty());
-    // ls -lah should include total line or files/directories
-    assert!(result.contains("total") || result.len() > 0);
+    assert!(result.contains("hello.txt"));
+
+    // Cleanup
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
