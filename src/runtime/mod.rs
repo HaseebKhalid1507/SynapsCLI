@@ -293,12 +293,6 @@ impl Runtime {
 
         Box::pin(UnboundedReceiverStream::new(rx))
     }
-
-    #[allow(dead_code)]
-    pub async fn call_api_stream(&self, messages: &[Value], tx: mpsc::UnboundedSender<StreamEvent>) -> Result<Value> {
-        let tools_snapshot = self.tools.read().await.clone();
-        ApiMethods::call_api_stream(&self.auth, &self.client, &self.model, &tools_snapshot, &self.system_prompt, self.thinking_budget, messages, tx).await
-    }
 }
 
 impl Clone for Runtime {
