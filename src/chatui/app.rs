@@ -283,7 +283,7 @@ impl App {
         (total_lines, cursor_row, cursor_col)
     }
 
-    pub(crate) fn save_session(&mut self) {
+    pub(crate) async fn save_session(&mut self) {
         if self.api_messages.is_empty() {
             return;
         }
@@ -294,7 +294,7 @@ impl App {
         self.session.abort_context = self.abort_context.clone();
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
-        if let Err(e) = self.session.save() {
+        if let Err(e) = self.session.save().await {
             eprintln!("\x1b[31m[ERROR] Failed to save session: {}\x1b[0m", e);
         }
     }

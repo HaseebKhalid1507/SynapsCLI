@@ -612,10 +612,10 @@ async fn show_logs(name: &str, follow: bool, session_num: Option<u64>, last_n: O
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             
-            if let Ok(metadata) = std::fs::metadata(&follow_path) {
+            if let Ok(metadata) = tokio::fs::metadata(&follow_path).await {
                 let current_size = metadata.len();
                 if current_size > last_size {
-                    if let Ok(contents) = std::fs::read_to_string(&follow_path) {
+                    if let Ok(contents) = tokio::fs::read_to_string(&follow_path).await {
                         let new_content = &contents[(last_size as usize)..];
                         for line in new_content.lines() {
                             if !line.trim().is_empty() {
@@ -631,7 +631,7 @@ async fn show_logs(name: &str, follow: bool, session_num: Option<u64>, last_n: O
         }
     } else {
         // Read and display log file
-        let contents = std::fs::read_to_string(&log_file)
+        let contents = tokio::fs::read_to_string(&log_file).await
             .map_err(|e| format!("Failed to read log file: {}", e))?;
         
         let mut lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();

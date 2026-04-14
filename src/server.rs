@@ -61,7 +61,7 @@ impl ServerState {
         session.session_cost = *self.session_cost.read().await;
         session.updated_at = chrono::Utc::now();
         session.auto_title();
-        if let Err(e) = session.save() {
+        if let Err(e) = session.save().await {
             tracing::error!("Failed to save session: {}", e);
         }
     }

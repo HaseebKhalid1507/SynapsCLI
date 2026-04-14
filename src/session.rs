@@ -70,13 +70,13 @@ impl Session {
         }
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
+    pub async fn save(&self) -> std::io::Result<()> {
         let dir = crate::config::resolve_write_path("sessions");
-        std::fs::create_dir_all(&dir)?;
+        tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", self.id));
         let json = serde_json::to_string(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        tokio::fs::write(path, json).await
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {

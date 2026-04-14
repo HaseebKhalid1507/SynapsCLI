@@ -291,7 +291,7 @@ impl Tool for SubagentTool {
         drop(shutdown_tx);
 
         let log_dir = crate::config::base_dir().join("logs").join("subagents");
-        let _ = std::fs::create_dir_all(&log_dir);
+        let _ = tokio::fs::create_dir_all(&log_dir).await;
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
 
         match result {
@@ -323,7 +323,7 @@ impl Tool for SubagentTool {
                     sa_result.tool_count, sa_result.text,
                 );
                 let log_path = log_dir.join(format!("{}-{}.md", timestamp, label));
-                let _ = std::fs::write(&log_path, &log_content);
+                let _ = tokio::fs::write(&log_path, &log_content).await;
 
                 Ok(format!("[subagent:{}] {}", label, sa_result.text))
             }
@@ -337,7 +337,7 @@ impl Tool for SubagentTool {
                     });
                 }
                 let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
-                let _ = std::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e));
+                let _ = tokio::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e)).await;
                 Ok(format!("[subagent:{} ERROR] {}", label, e))
             }
             Err(_) => {

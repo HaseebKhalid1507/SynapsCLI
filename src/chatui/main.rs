@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
                                 };
                                 app.push_msg(ChatMessage::Error(abort_msg.to_string()));
                                 // Save session so partial work survives /continue
-                                app.save_session();
+                                app.save_session().await;
                             }
                             (KeyCode::Enter, KeyModifiers::SHIFT) if !app.streaming => {
                                 // Shift+Enter inserts a literal newline
@@ -290,7 +290,7 @@ async fn main() -> Result<()> {
                                     };
                                     match cmd.as_str() {
                                         "clear" => {
-                                            app.save_session();
+                                            app.save_session().await;
                                             app.messages.clear();
                                             app.dirty = true;
                                             app.api_messages.clear();
@@ -396,7 +396,7 @@ async fn main() -> Result<()> {
                                                             runtime.set_system_prompt(sp.clone());
                                                         }
                                                         // Save current session before switching
-                                                        app.save_session();
+                                                        app.save_session().await;
                                                         let old_id = app.session.id.clone();
                                                         // Rebuild app state from loaded session
                                                         app.messages.clear();
@@ -841,7 +841,7 @@ async fn main() -> Result<()> {
                         }
                         StreamEvent::MessageHistory(history) => {
                             app.api_messages = history;
-                            app.save_session();
+                            app.save_session().await;
                         }
                         StreamEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
                             app.subagents.push(SubagentState {
@@ -999,7 +999,7 @@ async fn main() -> Result<()> {
     }
 
     // Save session on exit
-    app.save_session();
+    app.save_session().await;
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();
