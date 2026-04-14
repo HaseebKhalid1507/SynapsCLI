@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use synaps_cli::{Runtime, Result};
-use std::io::{self, Write};
+use synaps_cli::{Runtime, Result, flush_stdout};
+use std::io;
 
 #[derive(Parser)]
 struct Cli {
@@ -76,10 +76,13 @@ async fn main() -> Result<()> {
             
             loop {
                 print!("You: ");
-                io::stdout().flush().unwrap();
+                flush_stdout();
                 
                 let mut input = String::new();
-                io::stdin().read_line(&mut input).unwrap();
+                if io::stdin().read_line(&mut input).is_err() {
+                    eprintln!("stdin closed");
+                    break;
+                }
                 let input = input.trim();
                 
                 if input.is_empty() {
@@ -92,7 +95,7 @@ async fn main() -> Result<()> {
                 }
                 
                 print!("Claude: ");
-                io::stdout().flush().unwrap();
+                flush_stdout();
                 
                 match runtime.run_single(input).await {
                     Ok(response) => println!("{}\n", response),
