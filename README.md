@@ -203,7 +203,8 @@ src/
 │   ├── auth.rs              # OAuth + API key authentication
 │   ├── error.rs             # Error types (thiserror)
 │   ├── logging.rs           # Tracing setup
-│   └── protocol.rs          # Protocol types
+│   ├── protocol.rs          # Protocol types
+│   └── watcher_types.rs     # Watcher config & shared types
 ├── runtime/                 # Core runtime (6 files)
 │   ├── mod.rs               # Runtime struct, orchestration loop
 │   ├── api.rs               # API communication, SSE streaming, retry
@@ -232,11 +233,10 @@ src/
 ├── watcher/                 # Supervisor daemon (4 files)
 │   ├── mod.rs               # Types, CLI dispatch
 │   ├── ipc.rs               # Unix socket communication
-│   ├── supervisor.rs        # Agent spawning, heartbeat, file watching
-│   └── display.rs           # Status tables, log viewing, agent init
+│   ├── supervisor.rs        # Agent spawning, heartbeat, file watching, init
+│   └── display.rs           # Status tables, log viewing
 ├── mcp.rs                   # MCP JSON-RPC client
-├── skills.rs                # Skills system
-└── watcher_types.rs         # Shared watcher config & types
+└── skills.rs                # Skills system
 ```
 
 **Binaries:**

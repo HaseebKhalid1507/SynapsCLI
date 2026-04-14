@@ -4,7 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Features
+### Added
+- **Binary file detection**: Read tool validates UTF-8 and returns clean error for binary files
+- **Thread panic handling**: Subagent threads wrapped in `catch_unwind` — panics become visible errors
+- **Doc comments**: Public API types (`Runtime`, `ToolRegistry`) and key methods documented
+- **Markdown wrapping**: List items and tables now respect terminal width instead of overflowing
+
+### Fixed
+- **Zombie processes**: All 3 `child.kill()` sites now followed by `.wait()` to reap
+- **Blocking I/O in async**: Session saves, subagent logs, watcher log reads use `tokio::fs`
+- **Dead code**: Removed unused `call_api_stream` method
+- **Useless assertion**: Removed `usize >= 0` check in MCP
+
+### Refactored
+- **Source restructure**: `src/` reorganized into `core/`, `bin/`, `watcher/` modules
+- **`core/` module**: config, session, auth, error, logging, protocol, watcher_types grouped as shared infrastructure
+- **`watcher/` split**: 1,454-line god object → 4 focused modules (mod, ipc, supervisor, display)
+- **`bin/` directory**: 6 binary entry points moved out of src/ root
+- **Layering fix**: `apply_config` moved to `Runtime` method — `core/` no longer depends on runtime
+- **Dependency cleanup**: Removed redundant `futures-util` crate
+
+### Documentation
+- **README overhaul**: Accurate architecture section, real file counts, correct config paths
+- **AGENTS.md rewrite**: All tool parameters verified against source code
+
+### Features (prior)
 - **18 Built-in Themes**: ocean, rose-pine, nord, dracula, monokai, gruvbox, catppuccin, tokyo-night, sunset, ice, forest, lavender (plus original 6: default, neon-rain, amber, phosphor, solarized-dark, blood)
 - **Runtime Theme Loading**: Themes load from `~/.synaps-cli/themes/<name>` files — edit colors without rebuilding
 - **`/theme` Command**: Lists all 18 built-in themes plus any custom user themes
