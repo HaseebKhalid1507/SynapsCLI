@@ -111,7 +111,9 @@ pub fn load_config() -> SynapsConfig {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => config.thinking_budget = parse_thinking_budget(val),
-            "skills" => config.skills = Some(crate::skills::parse_skills_config(val)),
+            "skills" => config.skills = Some(
+                val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            ),
             _ => {} // Unknown keys silently ignored
         }
     }
@@ -140,16 +142,6 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
     }
 
     DEFAULT_PROMPT.to_string()
-}
-
-/// Apply a parsed config to a Runtime instance.
-pub fn apply_config(runtime: &mut crate::Runtime, config: &SynapsConfig) {
-    if let Some(ref model) = config.model {
-        runtime.set_model(model.clone());
-    }
-    if let Some(budget) = config.thinking_budget {
-        runtime.set_thinking_budget(budget);
-    }
 }
 
 #[cfg(test)]
