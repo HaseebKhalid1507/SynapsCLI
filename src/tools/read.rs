@@ -38,8 +38,17 @@ impl Tool for ReadTool {
             .ok_or_else(|| RuntimeError::Tool("Missing path parameter".to_string()))?;
         let path = expand_path(raw_path);
 
-        let content = tokio::fs::read_to_string(&path).await
+        // Read raw bytes first to detect binary files
+        let bytes = tokio::fs::read(&path).await
             .map_err(|e| RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e)))?;
+
+        let content = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return Err(RuntimeError::Tool(format!(
+                "File '{}' appears to be binary (not valid UTF-8). Use `bash` with `xxd` or `file` to inspect binary files.",
+                path.display()
+            ))),
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
