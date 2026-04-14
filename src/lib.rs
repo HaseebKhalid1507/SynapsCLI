@@ -3,7 +3,6 @@ pub mod runtime;
 pub mod tools;
 pub mod mcp;
 pub mod skills;
-pub mod watcher_types;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -12,6 +11,7 @@ pub use core::auth;
 pub use core::logging;
 pub use core::protocol;
 pub use core::error;
+pub use core::watcher_types;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
