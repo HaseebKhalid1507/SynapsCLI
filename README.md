@@ -86,20 +86,20 @@ subagents dispatch "Review this codebase from 4 different angles" \
 
 Each agent can use different models, timeouts, and tools. Results are collected and presented together.
 
-### 🤖 Autonomous Mode (`sentinel`)
+### 🤖 Autonomous Mode (`watcher`)
 
 Deploy agents that run 24/7. Full lifecycle management with heartbeat monitoring, crash recovery, and cost controls.
 
 **Create an autonomous agent:**
 ```bash
-sentinel init scout
+watcher init scout
 # Edit ~/.synaps-cli/agents/scout/config.toml and soul.md
-sentinel deploy scout
+watcher deploy scout
 ```
 
 **Monitor your fleet:**
 ```bash
-sentinel status
+watcher status
 ```
 
 ```
@@ -139,11 +139,11 @@ session_timeout = "1h"
 
 **Full lifecycle commands:**
 ```bash
-sentinel deploy scout      # Start agent
-sentinel stop scout        # Graceful shutdown  
-sentinel logs scout -f     # Follow logs
-sentinel reset scout       # Clear session state
-sentinel remove scout      # Delete agent
+watcher deploy scout      # Start agent
+watcher stop scout        # Graceful shutdown  
+watcher logs scout -f     # Follow logs
+watcher reset scout       # Clear session state
+watcher remove scout      # Delete agent
 ```
 
 ---
@@ -237,7 +237,7 @@ src/
 │   ├── mod.rs                 (345 lines)  # Subagent orchestration
 │   ├── dispatch.rs            (567 lines)  # Parallel execution
 │   └── status.rs              (234 lines)  # Live status panel
-├── sentinel/
+├── watcher/
 │   ├── mod.rs                 (456 lines)  # Autonomous mode
 │   ├── supervisor.rs          (678 lines)  # Process management  
 │   ├── lifecycle.rs           (389 lines)  # Agent lifecycle
@@ -258,7 +258,7 @@ src/
 **Binaries:**
 - `chatui` (6.5MB) — Interactive and orchestration modes
 - `synaps-agent` (3.0MB) — Lightweight agent runtime  
-- `sentinel` (1.2MB) — Supervisor daemon
+- `watcher` (1.2MB) — Supervisor daemon
 
 ---
 

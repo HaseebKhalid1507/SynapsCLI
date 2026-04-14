@@ -19,7 +19,7 @@ Any other approaches you've thought about.
 Which part of SynapsCLI does this relate to?
 - [ ] Interactive mode (chatui)
 - [ ] Orchestration (subagents)
-- [ ] Autonomous agents (Sentinel)
+- [ ] Autonomous agents (Watcher)
 - [ ] Tool system
 - [ ] MCP integration
 - [ ] Other

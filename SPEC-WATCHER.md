@@ -1,4 +1,4 @@
-# Sentinel — Autonomous Agent Supervisor for SynapsCLI
+# Watcher — Autonomous Agent Supervisor for SynapsCLI
 
 **Version:** 0.1.0
 **Author:** Jawz (S157)
@@ -13,9 +13,9 @@
 **Who:** Haseeb (dogfooding with Dexter, Shadow, file-watchers), and eventually any developer using SynapsCLI who wants persistent autonomous agents.
 
 **Success looks like:**
-- `sentinel deploy dexter` starts an always-on trading agent that runs 24/7, reboots itself on token limits, and maintains state across sessions
-- `sentinel deploy watcher --trigger watch:~/inbox` starts an agent that wakes when files appear, processes them, then sleeps
-- `sentinel status` shows all running agents, uptime, session count, cost
+- `watcher deploy dexter` starts an always-on trading agent that runs 24/7, reboots itself on token limits, and maintains state across sessions
+- `watcher deploy watcher --trigger watch:~/inbox` starts an agent that wakes when files appear, processes them, then sleeps
+- `watcher status` shows all running agents, uptime, session count, cost
 - An agent can run unattended for days without human intervention
 - Crash recovery is automatic — supervisor restarts within 30 seconds
 - Zero token waste between sessions — handoff is lean, boot is fast
@@ -26,9 +26,9 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  SENTINEL SUPERVISOR (always running, single process)         │
-│  Binary: sentinel                                             │
-│  - Reads agent configs from ~/.synaps-cli/sentinel/           │
+│  WATCHER SUPERVISOR (always running, single process)         │
+│  Binary: watcher                                             │
+│  - Reads agent configs from ~/.synaps-cli/watcher/           │
 │  - Spawns/monitors/restarts agent worker processes            │
 │  - Watches heartbeats, enforces resource limits               │
 │  - Handles triggers (cron, file-watch, always-on)             │
@@ -57,18 +57,18 @@ name = "agent"
 path = "src/agent.rs"
 
 [[bin]]
-name = "sentinel"  
-path = "src/sentinel.rs"
+name = "watcher"  
+path = "src/watcher.rs"
 ```
 
 ---
 
 ## 3. Agent Configuration
 
-Each agent is a directory under `~/.synaps-cli/sentinel/<name>/`:
+Each agent is a directory under `~/.synaps-cli/watcher/<name>/`:
 
 ```
-~/.synaps-cli/sentinel/
+~/.synaps-cli/watcher/
 ├── dexter/
 │   ├── config.toml       # Agent configuration
 │   ├── soul.md            # System prompt (identity)
@@ -101,7 +101,7 @@ thinking = "medium"
 # "always"     — runs 24/7, restarts immediately on exit
 # "cron"       — runs on schedule (cron expression)
 # "watch"      — wakes when files change in watched directories
-# "webhook"    — wakes on HTTP POST to sentinel API
+# "webhook"    — wakes on HTTP POST to watcher API
 # "manual"     — only runs when explicitly started via CLI
 trigger = "always"
 
@@ -213,10 +213,10 @@ max_size_kb = 50                  # prevent handoff bloat
 
 ### Agent-Initiated Exit
 
-The agent can signal it's done by calling a special tool or writing a sentinel marker:
+The agent can signal it's done by calling a special tool or writing a watcher marker:
 
 ```
-Tool: sentinel_exit
+Tool: watcher_exit
 Parameters:
   reason: "completed daily analysis"
   handoff: { ... state for next session ... }
@@ -252,9 +252,9 @@ This tool writes handoff.json and returns a special exit signal that the worker 
 - Pause agent if daily limit exceeded
 
 ### Status API
-- Unix socket at `/tmp/sentinel.sock`
+- Unix socket at `/tmp/watcher.sock`
 - JSON protocol for status queries
-- Used by `sentinel status` CLI command
+- Used by `watcher status` CLI command
 
 ---
 
@@ -262,16 +262,16 @@ This tool writes handoff.json and returns a special exit signal that the worker 
 
 ```bash
 # Deploy an agent (starts it according to its trigger mode)
-sentinel deploy <name>
+watcher deploy <name>
 
 # Stop a running agent
-sentinel stop <name>
+watcher stop <name>
 
 # Restart an agent
-sentinel restart <name>
+watcher restart <name>
 
 # Show status of all agents
-sentinel status
+watcher status
 # Output:
 # AGENT      TRIGGER   STATUS     SESSION   UPTIME     COST TODAY
 # dexter     always    running    #47       2h 15m     $1.23
@@ -280,7 +280,7 @@ sentinel status
 # monitor    manual    stopped    —         —          $0.00
 
 # Show detailed status of one agent
-sentinel status <name>
+watcher status <name>
 # Output:
 # Agent: dexter
 # Trigger: always
@@ -295,19 +295,19 @@ sentinel status <name>
 # Crashes today: 0
 
 # View agent logs (tail -f style)
-sentinel logs <name> [--follow]
+watcher logs <name> [--follow]
 
 # List configured agents (deployed or not)
-sentinel list
+watcher list
 
 # Create a new agent from template
-sentinel init <name>
+watcher init <name>
 
 # Run supervisor daemon (foreground, for systemd)
-sentinel run
+watcher run
 
 # One-shot: run an agent once, don't supervise
-sentinel once <name>
+watcher once <name>
 ```
 
 ---
@@ -334,9 +334,9 @@ fn main() {
     runtime.set_model(&config.agent.model);
     runtime.set_system_prompt(&soul);
     
-    // Register tools (including sentinel_exit)
+    // Register tools (including watcher_exit)
     let tools = default_tools();  // bash, read, write, edit, grep, find, ls
-    tools.register(SentinelExitTool::new());
+    tools.register(WatcherExitTool::new());
     tools.register(HeartbeatTool::new(&config));
     
     // Start heartbeat thread
@@ -372,14 +372,14 @@ fn main() {
         if start.elapsed() > config.limits.max_session_duration { break; }
         if total_cost > config.limits.max_session_cost { break; }
         if tool_calls > config.limits.max_tool_calls { break; }
-        if sentinel_exit_requested { break; }
+        if watcher_exit_requested { break; }
         
         // Touch heartbeat
         hb.touch();
     }
     
     // Exit phase: ask agent to write handoff
-    if !sentinel_exit_requested {
+    if !watcher_exit_requested {
         let exit_msg = "You're being shut down (resource limit reached). \
                         Write your handoff state to handoff.json — include: \
                         what you accomplished, what's pending, any context \
@@ -402,7 +402,7 @@ Simple file touch in a background thread:
 
 ```rust
 fn spawn_heartbeat(interval_secs: u64) -> HeartbeatHandle {
-    let path = sentinel_dir.join("heartbeat");
+    let path = watcher_dir.join("heartbeat");
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
@@ -414,10 +414,10 @@ fn spawn_heartbeat(interval_secs: u64) -> HeartbeatHandle {
 
 ### Special Tools
 
-**`sentinel_exit`** — Agent calls this when it decides it's done:
+**`watcher_exit`** — Agent calls this when it decides it's done:
 ```json
 {
-    "name": "sentinel_exit",
+    "name": "watcher_exit",
     "description": "Signal that you've completed your work and are ready to shut down. Write your handoff state for your next session.",
     "parameters": {
         "reason": "string — why you're exiting",
@@ -433,8 +433,8 @@ When called: writes handoff.json, sets exit flag, tool returns "shutdown acknowl
 ## 8. File & Directory Structure
 
 ```
-~/.synaps-cli/sentinel/
-├── sentinel.toml              # Global supervisor config (port, log level, etc.)
+~/.synaps-cli/watcher/
+├── watcher.toml              # Global supervisor config (port, log level, etc.)
 ├── <agent-name>/
 │   ├── config.toml            # Agent configuration
 │   ├── soul.md                # System prompt / identity
@@ -446,11 +446,11 @@ When called: writes handoff.json, sets exit flag, tool returns "shutdown acknowl
 │       └── supervisor.log     # Supervisor log for this agent
 ```
 
-### Global Config (`sentinel.toml`)
+### Global Config (`watcher.toml`)
 
 ```toml
 [supervisor]
-socket = "/tmp/sentinel.sock"     # Status API socket
+socket = "/tmp/watcher.sock"     # Status API socket
 log_level = "info"                 # debug, info, warn, error
 max_concurrent_agents = 5          # prevent resource exhaustion
 
@@ -494,7 +494,7 @@ cooldown_secs = 10
 - GET to `/agents/<name>/status` → current status.
 
 ### manual
-- Only starts via `sentinel once <name>` or `sentinel deploy <name>`.
+- Only starts via `watcher once <name>` or `watcher deploy <name>`.
 - `deploy` with manual trigger = start once, don't restart on exit.
 
 ---
@@ -540,17 +540,17 @@ Persisted per-agent, updated by supervisor after each session:
 - Boot with system prompt + initial message
 - Run agentic loop with token/time/cost limit checking
 - Heartbeat file touch in background
-- `sentinel_exit` tool
+- `watcher_exit` tool
 - Handoff write on exit
 - **Test:** Run manually, verify it boots, works, writes handoff, exits
 
 ### Phase 2: Supervisor Core (~400 LOC)
-- `src/sentinel.rs` — daemon binary
-- Load agent configs from `~/.synaps-cli/sentinel/`
+- `src/watcher.rs` — daemon binary
+- Load agent configs from `~/.synaps-cli/watcher/`
 - Spawn/monitor agent worker processes
 - Heartbeat monitoring + kill/restart
 - Trigger: `always` mode only (simplest)
-- CLI: `sentinel run`, `sentinel deploy`, `sentinel stop`, `sentinel status`
+- CLI: `watcher run`, `watcher deploy`, `watcher stop`, `watcher status`
 - **Test:** Deploy an always-on agent, verify restart cycle
 
 ### Phase 3: Trigger Modes (~300 LOC)
@@ -568,8 +568,8 @@ Persisted per-agent, updated by supervisor after each session:
 
 ### Phase 5: Polish (~200 LOC)
 - Webhook trigger (axum endpoint, already a dependency)
-- `sentinel init` scaffolding
-- `sentinel logs --follow`
+- `watcher init` scaffolding
+- `watcher logs --follow`
 - Status socket API
 - systemd unit file
 - **Test:** Full integration — multiple agents, mixed triggers
@@ -599,20 +599,20 @@ Persisted per-agent, updated by supervisor after each session:
 
 ```bash
 # Build
-cargo build --release --bin agent --bin sentinel
+cargo build --release --bin agent --bin watcher
 
 # Test
 cargo test
 
 # Run supervisor (foreground, for dev)
-sentinel run
+watcher run
 
 # Deploy
-sentinel deploy dexter
-sentinel deploy watcher
-sentinel status
-sentinel logs dexter --follow
-sentinel stop dexter
+watcher deploy dexter
+watcher deploy watcher
+watcher status
+watcher logs dexter --follow
+watcher stop dexter
 ```
 
 ---
@@ -622,8 +622,8 @@ sentinel stop dexter
 ```
 src/
 ├── agent.rs              # Headless autonomous agent worker
-├── sentinel.rs           # Supervisor daemon
-├── sentinel/
+├── watcher.rs           # Supervisor daemon
+├── watcher/
 │   ├── config.rs         # Config parsing (TOML)
 │   ├── supervisor.rs     # Process management, heartbeat, restart logic
 │   ├── triggers.rs       # Always, cron, watch, webhook, manual
@@ -671,4 +671,4 @@ src/
 1. **Agent-to-agent communication?** Should agents be able to message each other, or is that a v2 feature? (Recommendation: v2)
 2. **Web dashboard?** Live view of all agents? (Recommendation: v2, CLI-first)
 3. **Remote agents?** Run agents on different machines? (Recommendation: v2, single-host first)
-4. **Existing Shadow migration?** Port current Python Shadow to Sentinel, or run both? (Recommendation: migrate after Sentinel is proven)
+4. **Existing Shadow migration?** Port current Python Shadow to Watcher, or run both? (Recommendation: migrate after Watcher is proven)

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 use crate::{Result, RuntimeError};
-use crate::sentinel_types::HandoffState;
+use crate::watcher_types::HandoffState;
 
 /// Global counter for unique subagent IDs across all dispatches
 static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -68,7 +68,7 @@ fn expand_path(path: &str) -> PathBuf {
 pub struct ToolContext {
     pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
-    pub sentinel_exit_path: Option<PathBuf>,
+    pub watcher_exit_path: Option<PathBuf>,
 }
 
 /// The core trait for all tools. Implement this to add a new tool.
@@ -1073,13 +1073,13 @@ struct SubagentResult {
     tool_count: u32,
 }
 
-// ── Sentinel Exit Tool ─────────────────────────────────────────────────────
+// ── Watcher Exit Tool ─────────────────────────────────────────────────────
 
-pub struct SentinelExitTool;
+pub struct WatcherExitTool;
 
 #[async_trait::async_trait]
-impl Tool for SentinelExitTool {
-    fn name(&self) -> &str { "sentinel_exit" }
+impl Tool for WatcherExitTool {
+    fn name(&self) -> &str { "watcher_exit" }
 
     fn description(&self) -> &str {
         "Signal that you've completed your work. Call this when you're done or at a natural stopping point. Provide a handoff summary for your next session."
@@ -1136,7 +1136,7 @@ impl Tool for SentinelExitTool {
         };
 
         // Write handoff state to the specified path if provided
-        if let Some(ref path) = ctx.sentinel_exit_path {
+        if let Some(ref path) = ctx.watcher_exit_path {
             let json_content = serde_json::to_string_pretty(&handoff)
                 .map_err(|e| RuntimeError::Tool(format!("Failed to serialize handoff: {}", e)))?;
             
@@ -1316,7 +1316,7 @@ mod tests {
         ToolContext {
             tx_delta: None,
             tx_events: None,
-            sentinel_exit_path: None,
+            watcher_exit_path: None,
         }
     }
 

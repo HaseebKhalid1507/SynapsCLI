@@ -41,6 +41,8 @@ urlencoding = "2"
 url = "2"
 fs4 = "0.13"
 toml = "0.8"
+notify = "6.1"
+globset = "0.4"
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
@@ -75,8 +77,8 @@ name = "synaps-agent"
 path = "src/agent.rs"
 
 [[bin]]
-name = "sentinel"
-path = "src/sentinel.rs"
+name = "watcher"
+path = "src/watcher.rs"
 
 
 [profile.release]

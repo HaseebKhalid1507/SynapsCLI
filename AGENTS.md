@@ -8,7 +8,7 @@ SynapsCLI is an agent runtime implemented in Rust with three operational modes:
 
 1. **Interactive Mode** (`chatui`) — Human-agent chat sessions with tool access
 2. **Headless Worker Mode** (`synaps-agent`) — Autonomous agents running one-shot tasks
-3. **Sentinel Mode** (`sentinel`) — Supervised autonomous agents with state persistence
+3. **Watcher Mode** (`watcher`) — Supervised autonomous agents with state persistence
 
 You are operating in one of these environments with access to a standardized tool suite. Your responses are handled by an LLM (typically Claude) via the Anthropic API.
 
@@ -198,10 +198,10 @@ description: Rust programming best practices
 - Handle errors with Result<T,E>
 ```
 
-### Sentinel-Only Tools
+### Watcher-Only Tools
 
-#### `sentinel_exit`
-Signal completion and provide handoff state for next session. **Only available to Sentinel agents.**
+#### `watcher_exit`
+Signal completion and provide handoff state for next session. **Only available to Watcher agents.**
 
 **Parameters:**
 - `reason` (required): Why you're exiting
@@ -211,13 +211,13 @@ Signal completion and provide handoff state for next session. **Only available t
 
 **Behavior:**
 - Writes handoff.json to agent directory
-- Triggers graceful shutdown of sentinel agent
+- Triggers graceful shutdown of watcher agent
 - Handoff data is loaded in next boot message
 - File size should be kept under 50KB
 
-## Sentinel Agent Lifecycle
+## Watcher Agent Lifecycle
 
-If you are a Sentinel agent, you operate in a supervised autonomous loop:
+If you are a Watcher agent, you operate in a supervised autonomous loop:
 
 ### Configuration
 
@@ -271,12 +271,12 @@ stale_threshold_secs = 120      # when considered stale
 ### Exit Phase
 
 **Option 1: Voluntary Exit**
-Call `sentinel_exit` with your handoff state when done.
+Call `watcher_exit` with your handoff state when done.
 
 **Option 2: Limit Reached**
 System prompts you to write handoff state before forced shutdown:
 ```
-You've reached your [limit type] limit. Please call sentinel_exit with your handoff state to transfer your work to your next session.
+You've reached your [limit type] limit. Please call watcher_exit with your handoff state to transfer your work to your next session.
 ```
 
 ### Handoff State
@@ -315,7 +315,7 @@ Your runtime operates within this file system structure:
 ├── skills/                 # loadable skill files (.md with frontmatter)
 ├── mcp.json               # MCP server configurations
 ├── sessions/              # conversation history
-└── sentinel/              # autonomous agents
+└── watcher/              # autonomous agents
     └── <name>/
         ├── config.toml    # agent configuration
         ├── soul.md        # agent system prompt
@@ -335,7 +335,7 @@ If you are a subagent (spawned via `subagent` tool):
 - You have NO access to:
   - `subagent` tool (prevents recursion)
   - MCP servers
-  - Sentinel-specific tools
+  - Watcher-specific tools
 - Your output streams back to parent agent
 - You're terminated on timeout with partial results returned
 - Parent receives your final response prefixed with `[subagent:{name}]`
@@ -346,7 +346,7 @@ If you are a subagent (spawned via `subagent` tool):
 - Use `bash` for system operations, but respect timeout limits
 - Use `edit` for surgical changes; `write` for complete rewrites
 - Use `subagent` for delegation of focused subtasks
-- Always call `sentinel_exit` when done (Sentinel agents)
+- Always call `watcher_exit` when done (Watcher agents)
 
 ### Error Handling  
 - File operations may fail due to permissions or missing paths
@@ -379,9 +379,9 @@ If you are a subagent (spawned via `subagent` tool):
 | subagent | task | agent, system_prompt, model, timeout | Dispatch specialist agent |
 | mcp_connect | server | | Connect to MCP server |
 | load_skill | skill | | Load behavioral guidelines |
-| sentinel_exit* | reason, summary | pending, context | Exit with handoff state |
+| watcher_exit* | reason, summary | pending, context | Exit with handoff state |
 
-*Sentinel agents only
+*Watcher agents only
 
 ---
 

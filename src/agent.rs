@@ -5,7 +5,7 @@
 //!
 //! Usage: synaps-agent --config <path/to/config.toml>
 
-use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState, sentinel_types::{AgentStats, DailyStats}};
+use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState, watcher_types::{AgentStats, DailyStats}};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -217,15 +217,15 @@ async fn main() {
     runtime.set_model(config.agent.model.clone());
     runtime.set_system_prompt(soul);
 
-    // Handoff path for sentinel_exit tool
+    // Handoff path for watcher_exit tool
     let handoff_path = agent_dir.join("handoff.json");
-    runtime.sentinel_exit_path = Some(handoff_path.clone());
+    runtime.watcher_exit_path = Some(handoff_path.clone());
 
-    // Register sentinel_exit tool
+    // Register watcher_exit tool
     {
         let tools = runtime.tools_shared();
         let mut tools = tools.write().await;
-        tools.register(Arc::new(synaps_cli::tools::SentinelExitTool));
+        tools.register(Arc::new(synaps_cli::tools::WatcherExitTool));
     }
 
     // Setup heartbeat
@@ -260,7 +260,7 @@ async fn main() {
     let mut tool_call_num: u64 = 0;
     let session_start = Instant::now();
     let max_duration = std::time::Duration::from_secs(config.limits.max_session_duration_mins * 60);
-    let mut sentinel_exit_called = false;
+    let mut watcher_exit_called = false;
     let mut messages: Vec<Value> = vec![json!({"role": "user", "content": boot_message})];
 
     log(agent_name, "session started — entering agentic loop");
@@ -338,9 +338,9 @@ async fn main() {
                         "call_num": tool_call_num
                     }));
 
-                    // Check if this is a sentinel_exit call
-                    if name == "sentinel_exit" {
-                        sentinel_exit_called = true;
+                    // Check if this is a watcher_exit call
+                    if name == "watcher_exit" {
+                        watcher_exit_called = true;
                     }
                 }
                 StreamEvent::ToolResult { result, .. } => {
@@ -394,9 +394,9 @@ async fn main() {
             }
         }
 
-        // If sentinel_exit was called, agent is done
-        if sentinel_exit_called {
-            log(agent_name, "agent called sentinel_exit — clean shutdown");
+        // If watcher_exit was called, agent is done
+        if watcher_exit_called {
+            log(agent_name, "agent called watcher_exit — clean shutdown");
             break;
         }
 
@@ -405,13 +405,13 @@ async fn main() {
         // the last message was from the assistant with no tool use
         if let Some(last) = messages.last() {
             if last["role"].as_str() == Some("assistant") && last["stop_reason"].as_str() == Some("end_turn") {
-                // Agent stopped on its own without calling sentinel_exit
+                // Agent stopped on its own without calling watcher_exit
                 // Give it one more chance to write handoff
-                if !sentinel_exit_called {
+                if !watcher_exit_called {
                     log(agent_name, "agent ended turn without tool calls — prompting for handoff");
                     messages.push(json!({
                         "role": "user",
-                        "content": "You stopped without calling sentinel_exit. If you're done, call sentinel_exit now with your handoff state. If you have more work, continue."
+                        "content": "You stopped without calling watcher_exit. If you're done, call watcher_exit now with your handoff state. If you have more work, continue."
                     }));
                     // Let it have one more turn
                     continue;
@@ -420,12 +420,12 @@ async fn main() {
         }
     }
 
-    // Exit phase — if we didn't get a clean sentinel_exit, ask for handoff
-    if !sentinel_exit_called && !interrupted.load(Ordering::Relaxed) {
+    // Exit phase — if we didn't get a clean watcher_exit, ask for handoff
+    if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
         log(agent_name, "requesting handoff before shutdown...");
         messages.push(json!({
             "role": "user",
-            "content": "You're being shut down (resource limit reached). Call sentinel_exit NOW with your handoff state — summarize what you did, what's pending, and any context your next session needs."
+            "content": "You're being shut down (resource limit reached). Call watcher_exit NOW with your handoff state — summarize what you did, what's pending, and any context your next session needs."
         }));
 
         let cancel = CancellationToken::new();
@@ -437,8 +437,8 @@ async fn main() {
             tokio::select! {
                 event = stream.next() => {
                     match event {
-                        Some(StreamEvent::ToolUseStart(name)) if name == "sentinel_exit" => {
-                            sentinel_exit_called = true;
+                        Some(StreamEvent::ToolUseStart(name)) if name == "watcher_exit" => {
+                            watcher_exit_called = true;
                         }
                         Some(StreamEvent::Done) | None => break,
                         _ => {}
@@ -456,7 +456,7 @@ async fn main() {
     hb_running.store(false, Ordering::Relaxed);
 
     // If we still don't have a handoff, write a minimal one
-    if !sentinel_exit_called {
+    if !watcher_exit_called {
         log(agent_name, "no handoff from agent — writing minimal state");
         let minimal = HandoffState {
             summary: format!("Session ended without clean handoff. Ran for {:.0}s, {} tokens, ${:.4}",
@@ -471,8 +471,8 @@ async fn main() {
     let elapsed = session_start.elapsed().as_secs_f64();
     
     // Log exit event
-    let exit_reason = if sentinel_exit_called {
-        "sentinel_exit"
+    let exit_reason = if watcher_exit_called {
+        "watcher_exit"
     } else if interrupted.load(Ordering::Relaxed) {
         "signal"
     } else if total_tokens >= config.limits.max_session_tokens {
@@ -521,7 +521,7 @@ async fn main() {
         stats.today.tokens += total_tokens;
         
         // If we crashed (non-clean exit), record it
-        if !sentinel_exit_called && !interrupted.load(Ordering::Relaxed) {
+        if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
             stats.crashes += 1;
             stats.last_crash = Some(format!("{}: {}", 
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),

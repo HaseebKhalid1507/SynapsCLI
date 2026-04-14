@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// Commands sent from CLI to supervisor
 #[derive(Debug, Serialize, Deserialize)]
-pub enum SentinelCommand {
+pub enum WatcherCommand {
     Deploy { name: String },
     Stop { name: String },
     Status,
@@ -12,7 +12,7 @@ pub enum SentinelCommand {
 
 /// Responses from supervisor to CLI
 #[derive(Debug, Serialize, Deserialize)]
-pub enum SentinelResponse {
+pub enum WatcherResponse {
     Ok { message: String },
     Error { message: String },
     Status { agents: Vec<AgentStatusInfo> },
@@ -42,6 +42,8 @@ pub struct AgentStatusInfo {
 pub struct AgentConfig {
     pub agent: AgentInfo,
     #[serde(default)]
+    pub trigger: TriggerConfig,
+    #[serde(default)]
     pub limits: SessionLimits,
     #[serde(default)]
     pub boot: BootConfig,
@@ -59,6 +61,22 @@ pub struct AgentInfo {
     #[serde(default = "default_trigger")]
     pub trigger: String,
 }
+
+/// Trigger-specific configuration (for watch, cron, webhook modes)
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TriggerConfig {
+    /// Directories to watch (watch mode)
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Glob patterns to filter (e.g. ["*.csv", "*.json"])
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Seconds to wait for writes to settle before triggering
+    #[serde(default = "default_debounce")]
+    pub debounce_secs: u64,
+}
+
+fn default_debounce() -> u64 { 3 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionLimits {
@@ -197,7 +215,7 @@ fn default_boot_message() -> String {
 ## What triggered this session:
 {trigger_context}
 
-Review your state, decide what to do, and get to work. When you've completed your work or hit a natural stopping point, call the `sentinel_exit` tool with your handoff state."#.to_string()
+Review your state, decide what to do, and get to work. When you've completed your work or hit a natural stopping point, call the `watcher_exit` tool with your handoff state."#.to_string()
 }
 
 impl Default for SessionLimits {
@@ -277,6 +295,40 @@ stale_threshold_secs = 60
         assert_eq!(config.limits.cooldown_secs, 30);
         assert_eq!(config.heartbeat.interval_secs, 15);
         assert!(config.boot.message.contains("{timestamp}"));
+    }
+
+    #[test]
+    fn test_parse_watch_config() {
+        let toml = r#"
+[agent]
+name = "file-watcher"
+trigger = "watch"
+
+[trigger]
+paths = ["~/inbox", "/tmp/data"]
+patterns = ["*.csv", "*.json"]
+debounce_secs = 5
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.trigger, "watch");
+        assert_eq!(config.trigger.paths, vec!["~/inbox", "/tmp/data"]);
+        assert_eq!(config.trigger.patterns, vec!["*.csv", "*.json"]);
+        assert_eq!(config.trigger.debounce_secs, 5);
+    }
+
+    #[test]
+    fn test_watch_config_defaults() {
+        let toml = r#"
+[agent]
+name = "simple-watcher"
+trigger = "watch"
+
+[trigger]
+paths = ["/tmp/inbox"]
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(config.trigger.patterns.is_empty());
+        assert_eq!(config.trigger.debounce_secs, 3);
     }
 
     #[test]

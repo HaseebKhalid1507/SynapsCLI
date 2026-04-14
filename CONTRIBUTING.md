@@ -53,9 +53,9 @@ src/
 ├── chatui/         # TUI interface (app, draw, theme, markdown, highlight)
 ├── runtime.rs      # API client, streaming, agentic tool loop
 ├── tools.rs        # Tool trait + implementations
-├── sentinel.rs     # Autonomous agent supervisor
+├── watcher.rs     # Autonomous agent supervisor
 ├── agent.rs        # Headless agent worker
-├── sentinel_types.rs  # Sentinel config and type definitions
+├── watcher_types.rs  # Watcher config and type definitions
 ├── auth.rs         # OAuth + API key authentication
 ├── mcp.rs          # MCP client (lazy loading)
 ├── skills.rs       # On-demand skill loading
@@ -79,7 +79,7 @@ pub trait Tool: Send + Sync {
 
 Register it in `ToolRegistry::new()` in `src/tools.rs`.
 
-## Adding a Sentinel Trigger
+## Adding a Watcher Trigger
 
 New trigger modes (cron, file-watch, webhook) are on the roadmap. If you want to work on one, open an issue first to discuss the approach.
 

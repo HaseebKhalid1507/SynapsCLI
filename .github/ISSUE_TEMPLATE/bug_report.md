@@ -24,7 +24,7 @@ What actually happened.
 - **OS:** (e.g., Ubuntu 24.04, macOS 15)
 - **Rust version:** (`rustc --version`)
 - **SynapsCLI version:** (commit hash or version)
-- **Binary:** (chatui / sentinel / synaps-agent)
+- **Binary:** (chatui / watcher / synaps-agent)
 
 ## Logs / Screenshots
 If applicable, paste relevant terminal output or error messages.

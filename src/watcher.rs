@@ -1,35 +1,37 @@
-//! sentinel — Autonomous agent supervisor daemon
+//! watcher — Autonomous agent supervisor daemon
 //!
 //! Spawns, monitors, and restarts agent worker processes.
 //! Manages agent lifecycles with heartbeat monitoring and crash recovery.
 //!
 //! Usage:
-//!   sentinel run                    — start supervisor daemon (foreground)
-//!   sentinel deploy <name>          — start supervising an agent
-//!   sentinel stop <name>            — stop an agent
-//!   sentinel status                 — show all agent statuses
-//!   sentinel list                   — list configured agents
-//!   sentinel init <name>            — create agent from template
-//!   sentinel once <name>            — run agent once, no supervision
-//!   sentinel logs <name>            — show agent logs
+//!   watcher run                    — start supervisor daemon (foreground)
+//!   watcher deploy <name>          — start supervising an agent
+//!   watcher stop <name>            — stop an agent
+//!   watcher status                 — show all agent statuses
+//!   watcher list                   — list configured agents
+//!   watcher init <name>            — create agent from template
+//!   watcher once <name>            — run agent once, no supervision
+//!   watcher logs <name>            — show agent logs
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::os::unix::fs::PermissionsExt;
-use synaps_cli::{AgentConfig, SentinelCommand, SentinelResponse, AgentStatusInfo};
+use synaps_cli::{AgentConfig, WatcherCommand, WatcherResponse, AgentStatusInfo};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use notify::Watcher;
 
-fn sentinel_dir() -> PathBuf {
-    synaps_cli::config::base_dir().join("sentinel")
+fn watcher_dir() -> PathBuf {
+    synaps_cli::config::base_dir().join("watcher")
 }
 
 fn agent_binary() -> PathBuf {
-    // Find synaps-agent binary next to the sentinel binary
+    // Find synaps-agent binary next to the watcher binary
     let current_exe = std::env::current_exe().unwrap_or_default();
     let dir = current_exe.parent().unwrap_or(std::path::Path::new("."));
     dir.join("synaps-agent")
@@ -37,7 +39,7 @@ fn agent_binary() -> PathBuf {
 
 fn log(msg: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-    eprintln!("[{}] [sentinel] {}", ts, msg);
+    eprintln!("[{}] [watcher] {}", ts, msg);
 }
 
 fn validate_agent_name(name: &str) -> Result<(), String> {
@@ -56,7 +58,7 @@ fn validate_agent_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn load_agent_stats(agent_dir: &std::path::Path) -> synaps_cli::sentinel_types::AgentStats {
+fn load_agent_stats(agent_dir: &std::path::Path) -> synaps_cli::watcher_types::AgentStats {
     let path = agent_dir.join("stats.json");
     std::fs::read_to_string(&path)
         .ok()
@@ -140,30 +142,30 @@ impl ManagedAgent {
 
 /// Handle IPC command from CLI
 async fn handle_ipc_command(
-    command: SentinelCommand,
+    command: WatcherCommand,
     agents: Arc<Mutex<HashMap<String, ManagedAgent>>>,
-) -> SentinelResponse {
+) -> WatcherResponse {
     match command {
-        SentinelCommand::Deploy { name } => {
+        WatcherCommand::Deploy { name } => {
             // Validate agent name
             if let Err(e) = validate_agent_name(&name) {
-                return SentinelResponse::Error { message: e };
+                return WatcherResponse::Error { message: e };
             }
 
             let mut agents = agents.lock().await;
             
             // Check if agent config exists
-            let config_path = sentinel_dir().join(&name).join("config.toml");
+            let config_path = watcher_dir().join(&name).join("config.toml");
             if !config_path.exists() {
-                return SentinelResponse::Error {
-                    message: format!("Agent '{}' not found. Run: sentinel init {}", name, name)
+                return WatcherResponse::Error {
+                    message: format!("Agent '{}' not found. Run: watcher init {}", name, name)
                 };
             }
 
             // Load config
             let config = match AgentConfig::load(&config_path) {
                 Ok(config) => config,
-                Err(e) => return SentinelResponse::Error {
+                Err(e) => return WatcherResponse::Error {
                     message: format!("Failed to load agent '{}': {}", name, e)
                 }
             };
@@ -171,7 +173,7 @@ async fn handle_ipc_command(
             // Check if already exists in map
             if let Some(agent) = agents.get_mut(&name) {
                 if agent.is_running() {
-                    return SentinelResponse::Error {
+                    return WatcherResponse::Error {
                         message: format!("Agent '{}' is already running", name)
                     };
                 }
@@ -179,15 +181,15 @@ async fn handle_ipc_command(
                 agent.stopped = false;
                 if agent.config.agent.trigger == "always" {
                     match spawn_agent(agent, "deploy restart").await {
-                        Ok(()) => SentinelResponse::Ok {
+                        Ok(()) => WatcherResponse::Ok {
                             message: format!("Agent '{}' deployed and started", name)
                         },
-                        Err(e) => SentinelResponse::Error {
+                        Err(e) => WatcherResponse::Error {
                             message: format!("Failed to start agent '{}': {}", name, e)
                         }
                     }
                 } else {
-                    SentinelResponse::Ok {
+                    WatcherResponse::Ok {
                         message: format!("Agent '{}' deployed", name)
                     }
                 }
@@ -199,56 +201,56 @@ async fn handle_ipc_command(
                     match spawn_agent(&mut agent, "deploy start").await {
                         Ok(()) => {
                             agents.insert(name.clone(), agent);
-                            SentinelResponse::Ok {
+                            WatcherResponse::Ok {
                                 message: format!("Agent '{}' deployed and started", name)
                             }
                         },
-                        Err(e) => SentinelResponse::Error {
+                        Err(e) => WatcherResponse::Error {
                             message: format!("Failed to start agent '{}': {}", name, e)
                         }
                     }
                 } else {
                     agents.insert(name.clone(), agent);
-                    SentinelResponse::Ok {
+                    WatcherResponse::Ok {
                         message: format!("Agent '{}' deployed", name)
                     }
                 }
             }
         }
 
-        SentinelCommand::Stop { name } => {
+        WatcherCommand::Stop { name } => {
             let mut agents = agents.lock().await;
             if let Some(agent) = agents.get_mut(&name) {
                 agent.stopped = true;
                 if let Some(ref mut child) = agent.child {
                     let _ = child.kill().await;
                 }
-                SentinelResponse::Ok {
+                WatcherResponse::Ok {
                     message: format!("Agent '{}' stopped", name)
                 }
             } else {
-                SentinelResponse::Error {
+                WatcherResponse::Error {
                     message: format!("Agent '{}' not found or not running", name)
                 }
             }
         }
 
-        SentinelCommand::Status => {
+        WatcherCommand::Status => {
             let agents = agents.lock().await;
             let agent_info: Vec<AgentStatusInfo> = agents.values()
                 .map(|agent| agent.to_status_info())
                 .collect();
-            SentinelResponse::Status { agents: agent_info }
+            WatcherResponse::Status { agents: agent_info }
         }
 
-        SentinelCommand::AgentStatus { name } => {
+        WatcherCommand::AgentStatus { name } => {
             let agents = agents.lock().await;
             if let Some(agent) = agents.get(&name) {
-                SentinelResponse::AgentDetail {
+                WatcherResponse::AgentDetail {
                     info: agent.to_status_info()
                 }
             } else {
-                SentinelResponse::Error {
+                WatcherResponse::Error {
                     message: format!("Agent '{}' not found", name)
                 }
             }
@@ -258,7 +260,7 @@ async fn handle_ipc_command(
 
 /// IPC listener task
 async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>>>) {
-    let socket_path = sentinel_dir().join("sentinel.sock");
+    let socket_path = watcher_dir().join("watcher.sock");
     
     // Check if socket exists and test if it's alive
     if socket_path.exists() {
@@ -326,7 +328,7 @@ async fn handle_ipc_connection(
     let mut line = String::new();
     
     reader.read_line(&mut line).await?;
-    let command: SentinelCommand = serde_json::from_str(line.trim())?;
+    let command: WatcherCommand = serde_json::from_str(line.trim())?;
     
     let response = handle_ipc_command(command, agents).await;
     let response_json = serde_json::to_string(&response)?;
@@ -339,10 +341,10 @@ async fn handle_ipc_connection(
 }
 
 /// Send command to supervisor via IPC
-async fn send_ipc_command(command: SentinelCommand) -> Result<SentinelResponse, String> {
-    let socket_path = sentinel_dir().join("sentinel.sock");
+async fn send_ipc_command(command: WatcherCommand) -> Result<WatcherResponse, String> {
+    let socket_path = watcher_dir().join("watcher.sock");
     if !socket_path.exists() {
-        return Err("Supervisor not running. Start with: sentinel run".to_string());
+        return Err("Supervisor not running. Start with: watcher run".to_string());
     }
     
     // Add timeout to avoid hanging on stale socket
@@ -355,10 +357,10 @@ async fn send_ipc_command(command: SentinelCommand) -> Result<SentinelResponse, 
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) => {
             // Socket exists but can't connect — stale
-            return Err("Supervisor socket is stale. Remove it and restart: sentinel run".to_string());
+            return Err("Supervisor socket is stale. Remove it and restart: watcher run".to_string());
         }
         Err(_) => {
-            return Err("Supervisor not responding (timeout). Try: sentinel run".to_string());
+            return Err("Supervisor not responding (timeout). Try: watcher run".to_string());
         }
     };
     
@@ -392,7 +394,7 @@ fn format_uptime(secs: f64) -> String {
 /// Print status response in table format
 fn print_status_table(agents: Vec<AgentStatusInfo>) {
     if agents.is_empty() {
-        println!("No agents configured. Run: sentinel init <name>");
+        println!("No agents configured. Run: watcher init <name>");
         return;
     }
     
@@ -463,7 +465,7 @@ fn format_number_with_commas(n: u64) -> String {
     result
 }
 fn discover_agents() -> Vec<(String, PathBuf)> {
-    let dir = sentinel_dir();
+    let dir = watcher_dir();
     let mut agents = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -566,7 +568,7 @@ fn find_latest_session_file(logs_dir: &Path) -> Result<PathBuf, String> {
 }
 
 async fn show_logs(name: &str, follow: bool, session_num: Option<u64>, last_n: Option<usize>) -> Result<(), String> {
-    let logs_dir = sentinel_dir().join(name).join("logs");
+    let logs_dir = watcher_dir().join(name).join("logs");
     
     if !logs_dir.exists() {
         return Err(format!("Agent '{}' has no logs directory", name));
@@ -695,7 +697,7 @@ fn init_agent(name: &str) -> Result<(), String> {
     // Validate agent name
     validate_agent_name(name)?;
     
-    let dir = sentinel_dir().join(name);
+    let dir = watcher_dir().join(name);
     if dir.exists() {
         return Err(format!("Agent '{}' already exists at {}", name, dir.display()));
     }
@@ -725,7 +727,7 @@ You are waking up for a new session. Current time: {{timestamp}}
 ## What triggered this session:
 {{trigger_context}}
 
-Review your state, decide what to do, and get to work. When done, call sentinel_exit.
+Review your state, decide what to do, and get to work. When done, call watcher_exit.
 """
 
 [heartbeat]
@@ -744,17 +746,255 @@ stale_threshold_secs = 120
     println!("✓ Agent '{}' created at {}", name, dir.display());
     println!("  Edit soul.md to define the agent's identity");
     println!("  Edit config.toml to tune limits and trigger mode");
-    println!("  Run: sentinel deploy {}", name);
+    println!("  Run: watcher deploy {}", name);
     Ok(())
 }
 
 fn print_status(agents: &HashMap<String, ManagedAgent>) {
     if agents.is_empty() {
-        println!("No agents configured. Run: sentinel init <name>");
+        println!("No agents configured. Run: watcher init <name>");
         return;
     }
     let infos: Vec<AgentStatusInfo> = agents.values().map(|a| a.to_status_info()).collect();
     print_status_table(infos);
+}
+
+/// Expand ~ in a path string to the home directory
+fn expand_watch_path(p: &str) -> PathBuf {
+    if p.starts_with("~/") {
+        if let Some(home) = dirs_next() {
+            return home.join(&p[2..]);
+        }
+    }
+    PathBuf::from(p)
+}
+
+fn dirs_next() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Check if a path matches the configured glob patterns (empty patterns = match all)
+fn matches_patterns(path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    for pattern in patterns {
+        if let Ok(glob) = globset::Glob::new(pattern) {
+            let matcher = glob.compile_matcher();
+            if matcher.is_match(file_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Spawn a file-watching task for a watch-trigger agent.
+/// Runs in its own tokio task, watches directories, debounces events,
+/// and spawns the agent when files change.
+fn spawn_watch_task(
+    agent_name: String,
+    config: AgentConfig,
+    agents: Arc<Mutex<HashMap<String, ManagedAgent>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let trigger_config = config.trigger.clone();
+
+    tokio::spawn(async move {
+        // Validate paths
+        let watch_paths: Vec<PathBuf> = trigger_config.paths.iter()
+            .map(|p| expand_watch_path(p))
+            .collect();
+
+        if watch_paths.is_empty() {
+            log(&format!("[{}] watch trigger has no paths configured — skipping", agent_name));
+            return;
+        }
+
+        // Validate that paths exist
+        for p in &watch_paths {
+            if !p.exists() {
+                log(&format!("[{}] creating watched directory: {}", agent_name, p.display()));
+                let _ = std::fs::create_dir_all(p);
+            }
+        }
+
+        log(&format!("[{}] watching {} path(s): {}",
+            agent_name,
+            watch_paths.len(),
+            watch_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ));
+
+        let patterns = trigger_config.patterns.clone();
+        let debounce_secs = trigger_config.debounce_secs;
+
+        // Main watch loop — restarts the watcher after each agent session
+        while running.load(std::sync::atomic::Ordering::Relaxed) {
+            // Set up notify watcher with a crossbeam channel
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut notify_watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
+                tx,
+                notify::Config::default(),
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    log(&format!("[{}] failed to create file watcher: {}", agent_name, e));
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+
+            // Watch all configured paths
+            for path in &watch_paths {
+                if let Err(e) = notify_watcher.watch(path, notify::RecursiveMode::Recursive) {
+                    log(&format!("[{}] failed to watch {}: {}", agent_name, path.display(), e));
+                }
+            }
+
+            // Wait for events with debounce
+            let changed_paths = tokio::task::spawn_blocking({
+                let patterns = patterns.clone();
+                let agent_name = agent_name.clone();
+                let running = running.clone();
+                let debounce = Duration::from_secs(debounce_secs);
+
+                move || -> HashSet<PathBuf> {
+                    let mut changed: HashSet<PathBuf> = HashSet::new();
+
+                    // Block until first event
+                    loop {
+                        if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                            return changed;
+                        }
+                        // Use recv_timeout so we can check the running flag periodically
+                        match rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(Ok(event)) => {
+                                for path in &event.paths {
+                                    if matches_patterns(path, &patterns) {
+                                        changed.insert(path.to_path_buf());
+                                    }
+                                }
+                                if !changed.is_empty() {
+                                    break; // Got first matching event, start debounce
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[watcher] [{}] notify error: {}", agent_name, e);
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return changed,
+                        }
+                    }
+
+                    // Debounce: keep collecting events until quiet for debounce_secs
+                    loop {
+                        match rx.recv_timeout(debounce) {
+                            Ok(Ok(event)) => {
+                                for path in &event.paths {
+                                    if matches_patterns(path, &patterns) {
+                                        changed.insert(path.to_path_buf());
+                                    }
+                                }
+                                // Reset debounce timer by continuing
+                            }
+                            Ok(Err(_)) => continue,
+                            Err(_) => break, // Timeout = debounce complete
+                        }
+                    }
+
+                    changed
+                }
+            }).await.unwrap_or_default();
+
+            // Drop the watcher to release inotify watches while agent runs
+            drop(notify_watcher);
+
+            if changed_paths.is_empty() || !running.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
+            // Build trigger context with changed file paths
+            let paths_str: Vec<String> = changed_paths.iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            let trigger_context = format!("files changed:\n{}", paths_str.join("\n"));
+
+            log(&format!("[{}] triggered by {} file(s)", agent_name, paths_str.len()));
+
+            // Spawn the agent
+            {
+                let mut agents_map = agents.lock().await;
+                if let Some(agent) = agents_map.get_mut(&agent_name) {
+                    if agent.stopped {
+                        log(&format!("[{}] agent is stopped — ignoring trigger", agent_name));
+                        continue;
+                    }
+                    if agent.is_running() {
+                        log(&format!("[{}] agent already running — ignoring trigger", agent_name));
+                        continue;
+                    }
+                    if let Err(e) = spawn_agent(agent, &trigger_context).await {
+                        log(&format!("[{}] failed to start: {}", agent_name, e));
+                        continue;
+                    }
+                }
+            }
+
+            // Wait for agent to finish before watching again
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !running.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+                let mut agents_map = agents.lock().await;
+                if let Some(agent) = agents_map.get_mut(&agent_name) {
+                    if let Some(ref mut child) = agent.child {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                                agent.total_uptime_secs += elapsed;
+                                let code = status.code().unwrap_or(-1);
+
+                                if code == 0 {
+                                    log(&format!("[{}] session #{} completed cleanly ({:.0}s)", agent_name, agent.session_count, elapsed));
+                                    agent.consecutive_crashes = 0;
+                                } else {
+                                    agent.consecutive_crashes += 1;
+                                    log(&format!("[{}] session #{} crashed (code: {})", agent_name, agent.session_count, code));
+                                }
+
+                                agent.child = None;
+                                agent.pid = None;
+                                break; // Back to watching
+                            }
+                            Ok(None) => {} // Still running
+                            Err(e) => {
+                                log(&format!("[{}] error checking child: {}", agent_name, e));
+                            }
+                        }
+                    } else {
+                        break; // No child = already exited
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Small cooldown before re-watching
+            let cooldown = {
+                let agents_map = agents.lock().await;
+                agents_map.get(&agent_name)
+                    .map(|a| a.config.limits.cooldown_secs)
+                    .unwrap_or(5)
+            };
+            if cooldown > 0 {
+                tokio::time::sleep(Duration::from_secs(cooldown)).await;
+            }
+        }
+    });
 }
 
 #[tokio::main]
@@ -765,7 +1005,7 @@ async fn main() {
     match command {
         "init" => {
             let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: sentinel init <name>");
+                eprintln!("Usage: watcher init <name>");
                 std::process::exit(1);
             });
             if let Err(e) = init_agent(name) {
@@ -777,7 +1017,7 @@ async fn main() {
         "list" => {
             let agents = discover_agents();
             if agents.is_empty() {
-                println!("No agents configured. Run: sentinel init <name>");
+                println!("No agents configured. Run: watcher init <name>");
             } else {
                 println!("{:<15} {:<50}", "AGENT", "CONFIG");
                 println!("{}", "─".repeat(65));
@@ -789,10 +1029,10 @@ async fn main() {
 
         "once" => {
             let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: sentinel once <name>");
+                eprintln!("Usage: watcher once <name>");
                 std::process::exit(1);
             });
-            let config_path = sentinel_dir().join(name).join("config.toml");
+            let config_path = watcher_dir().join(name).join("config.toml");
             let config = AgentConfig::load(&config_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load agent '{}': {}", name, e);
                 std::process::exit(1);
@@ -816,7 +1056,7 @@ async fn main() {
 
         "run" => {
             // Check if supervisor already running
-            let pid_path = sentinel_dir().join("sentinel.pid");
+            let pid_path = watcher_dir().join("watcher.pid");
             if pid_path.exists() {
                 if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
@@ -836,13 +1076,13 @@ async fn main() {
             log("starting supervisor");
 
             // Setup socket and PID file paths
-            let socket_path = sentinel_dir().join("sentinel.sock");
-            let pid_path = sentinel_dir().join("sentinel.pid");
+            let socket_path = watcher_dir().join("watcher.sock");
+            let pid_path = watcher_dir().join("watcher.pid");
             
             // Clean up socket and write PID
             let _ = std::fs::remove_file(&socket_path);
-            std::fs::create_dir_all(sentinel_dir()).unwrap_or_else(|e| {
-                eprintln!("Failed to create sentinel directory: {}", e);
+            std::fs::create_dir_all(watcher_dir()).unwrap_or_else(|e| {
+                eprintln!("Failed to create watcher directory: {}", e);
                 std::process::exit(1);
             });
             std::fs::write(&pid_path, std::process::id().to_string()).unwrap_or_else(|e| {
@@ -868,7 +1108,7 @@ async fn main() {
                 }
 
                 if agents_map.is_empty() {
-                    log("no agents configured — run 'sentinel init <name>' first");
+                    log("no agents configured — run 'watcher init <name>' first");
                     std::process::exit(0);
                 }
             }
@@ -878,18 +1118,6 @@ async fn main() {
             tokio::spawn(async move {
                 ipc_listener(ipc_agents).await;
             });
-
-            // Start always-on agents
-            {
-                let mut agents_map = agents.lock().await;
-                for (name, agent) in agents_map.iter_mut() {
-                    if agent.config.agent.trigger == "always" {
-                        if let Err(e) = spawn_agent(agent, "supervisor start (always-on)").await {
-                            log(&format!("[{}] failed to start: {}", name, e));
-                        }
-                    }
-                }
-            }
 
             // Setup signal handling (Ctrl+C and SIGTERM)
             let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -904,6 +1132,33 @@ async fn main() {
                 }
                 r.store(false, std::sync::atomic::Ordering::Relaxed);
             });
+
+            // Start always-on agents
+            {
+                let mut agents_map = agents.lock().await;
+                for (name, agent) in agents_map.iter_mut() {
+                    if agent.config.agent.trigger == "always" {
+                        if let Err(e) = spawn_agent(agent, "supervisor start (always-on)").await {
+                            log(&format!("[{}] failed to start: {}", name, e));
+                        }
+                    }
+                }
+            }
+
+            // Start file watchers for watch-trigger agents
+            {
+                let agents_map = agents.lock().await;
+                for (name, agent) in agents_map.iter() {
+                    if agent.config.agent.trigger == "watch" {
+                        spawn_watch_task(
+                            name.clone(),
+                            agent.config.clone(),
+                            agents.clone(),
+                            running.clone(),
+                        );
+                    }
+                }
+            }
 
             // Supervisor loop — check agents every 5 seconds
             while running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1026,17 +1281,17 @@ async fn main() {
                 }
                 
                 // Detailed status for specific agent
-                match send_ipc_command(SentinelCommand::AgentStatus { name: agent_name.clone() }).await {
-                    Ok(SentinelResponse::AgentDetail { info }) => {
+                match send_ipc_command(WatcherCommand::AgentStatus { name: agent_name.clone() }).await {
+                    Ok(WatcherResponse::AgentDetail { info }) => {
                         print_agent_detail(info);
                     }
-                    Ok(SentinelResponse::Error { message }) => {
+                    Ok(WatcherResponse::Error { message }) => {
                         eprintln!("Error: {}", message);
                         std::process::exit(1);
                     }
                     Err(_e) => {
                         // Fallback to static detailed status
-                        let config_path = sentinel_dir().join(agent_name).join("config.toml");
+                        let config_path = watcher_dir().join(agent_name).join("config.toml");
                         if let Ok(config) = AgentConfig::load(&config_path) {
                             let agent = ManagedAgent::new(agent_name.clone(), config_path, config);
                             print_agent_detail(agent.to_status_info());
@@ -1052,11 +1307,11 @@ async fn main() {
                 }
             } else {
                 // Overall status
-                match send_ipc_command(SentinelCommand::Status).await {
-                    Ok(SentinelResponse::Status { agents }) => {
+                match send_ipc_command(WatcherCommand::Status).await {
+                    Ok(WatcherResponse::Status { agents }) => {
                         print_status_table(agents);
                     }
-                    Ok(SentinelResponse::Error { message }) => {
+                    Ok(WatcherResponse::Error { message }) => {
                         eprintln!("Error: {}", message);
                         std::process::exit(1);
                     }
@@ -1084,7 +1339,7 @@ async fn main() {
 
         "deploy" => {
             let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: sentinel deploy <name>");
+                eprintln!("Usage: watcher deploy <name>");
                 std::process::exit(1);
             });
             
@@ -1094,11 +1349,11 @@ async fn main() {
                 std::process::exit(1);
             }
             
-            match send_ipc_command(SentinelCommand::Deploy { name: name.clone() }).await {
-                Ok(SentinelResponse::Ok { message }) => {
+            match send_ipc_command(WatcherCommand::Deploy { name: name.clone() }).await {
+                Ok(WatcherResponse::Ok { message }) => {
                     println!("{}", message);
                 }
-                Ok(SentinelResponse::Error { message }) => {
+                Ok(WatcherResponse::Error { message }) => {
                     eprintln!("Error: {}", message);
                     std::process::exit(1);
                 }
@@ -1115,7 +1370,7 @@ async fn main() {
 
         "stop" => {
             let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: sentinel stop <name>");
+                eprintln!("Usage: watcher stop <name>");
                 std::process::exit(1);
             });
             
@@ -1125,11 +1380,11 @@ async fn main() {
                 std::process::exit(1);
             }
             
-            match send_ipc_command(SentinelCommand::Stop { name: name.clone() }).await {
-                Ok(SentinelResponse::Ok { message }) => {
+            match send_ipc_command(WatcherCommand::Stop { name: name.clone() }).await {
+                Ok(WatcherResponse::Ok { message }) => {
                     println!("{}", message);
                 }
-                Ok(SentinelResponse::Error { message }) => {
+                Ok(WatcherResponse::Error { message }) => {
                     eprintln!("Error: {}", message);
                     std::process::exit(1);
                 }
@@ -1146,7 +1401,7 @@ async fn main() {
 
         "logs" => {
             let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: sentinel logs <name> [--follow | --session N | --last N]");
+                eprintln!("Usage: watcher logs <name> [--follow | --session N | --last N]");
                 std::process::exit(1);
             });
 
@@ -1168,28 +1423,28 @@ async fn main() {
         }
 
         "help" | "--help" | "-h" => {
-            println!("sentinel — Autonomous agent supervisor");
+            println!("watcher — Autonomous agent supervisor");
             println!();
             println!("USAGE:");
-            println!("  sentinel run                 Start supervisor daemon (foreground)");
-            println!("  sentinel deploy <name>       Deploy/start an agent");
-            println!("  sentinel stop <name>         Stop an agent");  
-            println!("  sentinel once <name>         Run agent once without supervision");
-            println!("  sentinel init <name>         Create new agent from template");
-            println!("  sentinel list                List configured agents");
-            println!("  sentinel status              Show all agent statuses");
-            println!("  sentinel status <name>       Show detailed status for agent");
-            println!("  sentinel logs <name>         Show latest session log");
-            println!("  sentinel logs <name> --follow  Tail current session log");
-            println!("  sentinel logs <name> --session N  Show specific session");
-            println!("  sentinel help                Show this help");
+            println!("  watcher run                 Start supervisor daemon (foreground)");
+            println!("  watcher deploy <name>       Deploy/start an agent");
+            println!("  watcher stop <name>         Stop an agent");  
+            println!("  watcher once <name>         Run agent once without supervision");
+            println!("  watcher init <name>         Create new agent from template");
+            println!("  watcher list                List configured agents");
+            println!("  watcher status              Show all agent statuses");
+            println!("  watcher status <name>       Show detailed status for agent");
+            println!("  watcher logs <name>         Show latest session log");
+            println!("  watcher logs <name> --follow  Tail current session log");
+            println!("  watcher logs <name> --session N  Show specific session");
+            println!("  watcher help                Show this help");
             println!();
-            println!("AGENTS DIR: {}", sentinel_dir().display());
+            println!("AGENTS DIR: {}", watcher_dir().display());
         }
 
         _ => {
             eprintln!("Unknown command: {}", command);
-            eprintln!("Run 'sentinel help' for usage information");
+            eprintln!("Run 'watcher help' for usage information");
             std::process::exit(1);
         }
     }

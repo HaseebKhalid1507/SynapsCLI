@@ -22,7 +22,7 @@ You will receive a response within 48 hours. We take security seriously — Syna
 ## Security Model
 
 ### Agent Isolation
-- Sentinel agents run as child processes, not in the supervisor's address space
+- Watcher agents run as child processes, not in the supervisor's address space
 - Agent names are validated (`^[a-zA-Z0-9_-]+$`) to prevent path traversal
 - IPC socket permissions are set to `0600` (owner-only)
 
