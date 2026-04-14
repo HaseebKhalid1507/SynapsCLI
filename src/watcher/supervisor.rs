@@ -278,3 +278,267 @@ pub(crate) fn spawn_watch_task(
         }
     });
 }
+/// Run the supervisor daemon — manages all agent lifecycles.
+pub(crate) async fn run_supervisor() {
+    // Check if supervisor already running
+    let pid_path = watcher_dir().join("watcher.pid");
+    if pid_path.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                let proc_path = format!("/proc/{}", pid);
+                if std::path::Path::new(&proc_path).exists() {
+                    eprintln!("Error: Supervisor already running (PID {})", pid);
+                    std::process::exit(1);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    log("starting supervisor");
+
+    let socket_path = watcher_dir().join("watcher.sock");
+    let pid_path = watcher_dir().join("watcher.pid");
+
+    let _ = std::fs::remove_file(&socket_path);
+    std::fs::create_dir_all(watcher_dir()).unwrap_or_else(|e| {
+        eprintln!("Failed to create watcher directory: {}", e);
+        std::process::exit(1);
+    });
+    std::fs::write(&pid_path, std::process::id().to_string()).unwrap_or_else(|e| {
+        eprintln!("Failed to write PID file: {}", e);
+        std::process::exit(1);
+    });
+
+    let agents: Arc<Mutex<HashMap<String, ManagedAgent>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Load all agents
+    {
+        let mut agents_map = agents.lock().await;
+        for (name, config_path) in discover_agents() {
+            match AgentConfig::load(&config_path) {
+                Ok(config) => {
+                    log(&format!("loaded agent: {} (trigger: {})", name, config.agent.trigger));
+                    agents_map.insert(name.clone(), ManagedAgent::new(name, config_path, config));
+                }
+                Err(e) => {
+                    log(&format!("WARN: failed to load {}: {}", name, e));
+                }
+            }
+        }
+
+        if agents_map.is_empty() {
+            log("no agents configured — run 'watcher init <name>' first");
+            std::process::exit(0);
+        }
+    }
+
+    // Start IPC listener
+    let ipc_agents = agents.clone();
+    tokio::spawn(async move {
+        ipc_listener(ipc_agents).await;
+    });
+
+    // Setup signal handling (Ctrl+C and SIGTERM)
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+        ).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+        r.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    // Start always-on agents
+    {
+        let mut agents_map = agents.lock().await;
+        for (name, agent) in agents_map.iter_mut() {
+            if agent.config.agent.trigger == "always" {
+                if let Err(e) = spawn_agent(agent, "supervisor start (always-on)").await {
+                    log(&format!("[{}] failed to start: {}", name, e));
+                }
+            }
+        }
+    }
+
+    // Start file watchers for watch-trigger agents
+    {
+        let agents_map = agents.lock().await;
+        for (name, agent) in agents_map.iter() {
+            if agent.config.agent.trigger == "watch" {
+                spawn_watch_task(
+                    name.clone(),
+                    agent.config.clone(),
+                    agents.clone(),
+                    running.clone(),
+                );
+            }
+        }
+    }
+
+    // Supervisor loop — check agents every 5 seconds
+    while running.load(std::sync::atomic::Ordering::Relaxed) {
+        {
+            let mut agents_map = agents.lock().await;
+            for (name, agent) in agents_map.iter_mut() {
+                if agent.stopped { continue; }
+
+                if let Some(ref mut child) = agent.child {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                            agent.total_uptime_secs += elapsed;
+                            let code = status.code().unwrap_or(-1);
+
+                            if code == 0 {
+                                log(&format!("[{}] session #{} completed cleanly ({:.0}s)", name, agent.session_count, elapsed));
+                                agent.consecutive_crashes = 0;
+                            } else if code == 2 {
+                                log(&format!("[{}] daily cost limit reached — pausing until midnight", name));
+                                agent.stopped = true;
+                            } else {
+                                agent.consecutive_crashes += 1;
+                                log(&format!("[{}] session #{} crashed (code: {}, consecutive: {})",
+                                    name, agent.session_count, code, agent.consecutive_crashes));
+                            }
+
+                            agent.child = None;
+                            agent.pid = None;
+
+                            if agent.config.agent.trigger == "always" {
+                                if agent.consecutive_crashes >= agent.config.limits.max_retries {
+                                    log(&format!("[{}] max retries ({}) exceeded — stopping", name, agent.config.limits.max_retries));
+                                    agent.stopped = true;
+                                } else {
+                                    let backoff = if agent.consecutive_crashes > 0 {
+                                        let base = agent.config.limits.cooldown_secs;
+                                        let factor = 2u64.pow(agent.consecutive_crashes.saturating_sub(1));
+                                        (base * factor).min(300)
+                                    } else {
+                                        agent.config.limits.cooldown_secs
+                                    };
+                                    log(&format!("[{}] restarting in {}s", name, backoff));
+
+                                    let agent_name = name.clone();
+                                    let agents_clone = agents.clone();
+                                    let running_clone = running.clone();
+
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+                                        if running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                            let mut agents_map = agents_clone.lock().await;
+                                            if let Some(agent) = agents_map.get_mut(&agent_name) {
+                                                let ctx = if code == 0 { "automatic restart (always-on)" }
+                                                          else { "crash recovery restart" };
+                                                if let Err(e) = spawn_agent(agent, ctx).await {
+                                                    log(&format!("[{}] failed to restart: {}", agent_name, e));
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let agent_dir = AgentConfig::agent_dir(&agent.config_path);
+                            if agent.last_start.map(|s| s.elapsed().as_secs()).unwrap_or(0) > 60
+                                && !check_heartbeat(&agent_dir, agent.config.heartbeat.stale_threshold_secs)
+                            {
+                                log(&format!("[{}] heartbeat stale — killing", name));
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!("[{}] error checking child: {}", name, e));
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    // Graceful shutdown
+    log("shutting down — stopping all agents");
+    {
+        let mut agents_map = agents.lock().await;
+        for (name, agent) in agents_map.iter_mut() {
+            if let Some(ref mut child) = agent.child {
+                log(&format!("[{}] sending SIGTERM", name));
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&pid_path);
+
+    log("supervisor stopped");
+}
+
+/// Create agent from template
+pub(crate) fn init_agent(name: &str) -> Result<(), String> {
+    // Validate agent name
+    validate_agent_name(name)?;
+    
+    let dir = watcher_dir().join(name);
+    if dir.exists() {
+        return Err(format!("Agent '{}' already exists at {}", name, dir.display()));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    let config = format!(r#"[agent]
+name = "{name}"
+model = "claude-sonnet-4-20250514"
+thinking = "medium"
+trigger = "always"
+
+[limits]
+max_session_tokens = 100000
+max_session_duration_mins = 60
+max_session_cost_usd = 0.50
+max_daily_cost_usd = 10.00
+cooldown_secs = 10
+max_retries = 3
+
+[boot]
+message = """
+You are waking up for a new session. Current time: {{timestamp}}
+
+## State from your last session:
+{{handoff}}
+
+## What triggered this session:
+{{trigger_context}}
+
+Review your state, decide what to do, and get to work. When done, call watcher_exit.
+"""
+
+[heartbeat]
+interval_secs = 30
+stale_threshold_secs = 120
+"#);
+
+    let soul = format!("# {name}\n\nYou are {name}, an autonomous agent.\n\nDescribe your purpose and personality here.\n");
+
+    std::fs::write(dir.join("config.toml"), config).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("soul.md"), soul).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("handoff.json"), "{}").map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("stats.json"), "{}").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir.join("logs")).map_err(|e| e.to_string())?;
+
+    println!("✓ Agent '{}' created at {}", name, dir.display());
+    println!("  Edit soul.md to define the agent's identity");
+    println!("  Edit config.toml to tune limits and trigger mode");
+    println!("  Run: watcher deploy {}", name);
+    Ok(())
+}
