@@ -2,6 +2,8 @@ mod theme;
 mod highlight;
 mod markdown;
 mod app;
+mod render;
+mod gamba;
 mod draw;
 
 use app::{App, ChatMessage, SubagentState};
