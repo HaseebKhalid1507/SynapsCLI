@@ -1,14 +1,17 @@
+pub mod core;
 pub mod runtime;
 pub mod tools;
-pub mod session;
-pub mod error;
-pub mod protocol;
-pub mod auth;
-pub mod logging;
-pub mod config;
 pub mod mcp;
 pub mod skills;
 pub mod watcher_types;
+
+// Re-export core modules at crate root for backward compatibility
+pub use core::config;
+pub use core::session;
+pub use core::auth;
+pub use core::logging;
+pub use core::protocol;
+pub use core::error;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
