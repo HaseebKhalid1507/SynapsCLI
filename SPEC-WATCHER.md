@@ -54,11 +54,11 @@
 ```toml
 [[bin]]
 name = "agent"
-path = "src/agent.rs"
+path = "src/bin/agent.rs"
 
 [[bin]]
 name = "watcher"  
-path = "src/watcher.rs"
+path = "src/watcher/mod.rs"
 ```
 
 ---
@@ -536,7 +536,7 @@ Persisted per-agent, updated by supervisor after each session:
 ## 11. Implementation Plan
 
 ### Phase 1: Agent Worker (~200 LOC)
-- `src/agent.rs` — headless binary using `Runtime`
+- `src/bin/agent.rs` — headless binary using `Runtime`
 - Boot with system prompt + initial message
 - Run agentic loop with token/time/cost limit checking
 - Heartbeat file touch in background
@@ -545,7 +545,7 @@ Persisted per-agent, updated by supervisor after each session:
 - **Test:** Run manually, verify it boots, works, writes handoff, exits
 
 ### Phase 2: Supervisor Core (~400 LOC)
-- `src/watcher.rs` — daemon binary
+- `src/watcher/mod.rs` — daemon binary
 - Load agent configs from `~/.synaps-cli/watcher/`
 - Spawn/monitor agent worker processes
 - Heartbeat monitoring + kill/restart

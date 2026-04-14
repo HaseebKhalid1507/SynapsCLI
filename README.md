@@ -185,27 +185,25 @@ Project-local `.synaps-cli/skills/` override global skills.
 
 ## Architecture
 
-7 binaries from 39 source files (~14,400 lines):
+8 binaries from 43 source files (~14,400 lines):
 
 ```
 src/
-├── main.rs                  # chatui entry
-├── lib.rs                   # Core types & re-exports
-├── chat.rs                  # Headless chat binary
-├── agent.rs                 # synaps-agent (headless worker for watcher)
-├── watcher.rs               # Watcher supervisor daemon (1,454 lines)
-├── watcher_types.rs         # Watcher config & types
-├── login.rs                 # OAuth login flow
-├── server.rs                # WebSocket server binary
-├── client.rs                # WebSocket client binary
-├── config.rs                # Configuration & path resolution
-├── session.rs               # Session persistence
-├── auth.rs                  # OAuth + API key authentication
-├── error.rs                 # Error types (thiserror)
-├── mcp.rs                   # MCP JSON-RPC client
-├── skills.rs                # Skills system
-├── logging.rs               # Tracing setup
-├── protocol.rs              # Protocol types
+├── lib.rs                   # Crate root & re-exports
+├── bin/                     # Binary entry points
+│   ├── chat.rs              # Headless chat (stdin/stdout)
+│   ├── cli.rs               # Simple CLI (run/chat subcommands)
+│   ├── agent.rs             # synaps-agent (headless worker for watcher)
+│   ├── login.rs             # OAuth login flow
+│   ├── server.rs            # WebSocket server
+│   └── client.rs            # WebSocket client
+├── core/                    # Shared infrastructure
+│   ├── config.rs            # Configuration & path resolution
+│   ├── session.rs           # Session persistence
+│   ├── auth.rs              # OAuth + API key authentication
+│   ├── error.rs             # Error types (thiserror)
+│   ├── logging.rs           # Tracing setup
+│   └── protocol.rs          # Protocol types
 ├── runtime/                 # Core runtime (6 files)
 │   ├── mod.rs               # Runtime struct, orchestration loop
 │   ├── api.rs               # API communication, SSE streaming, retry
@@ -224,13 +222,21 @@ src/
 │   ├── ls.rs                # Directory listing
 │   ├── subagent.rs          # Agent dispatch with panic handling
 │   └── watcher_exit.rs      # Handoff for watcher agents
-└── chatui/                  # TUI frontend (5 files)
-    ├── main.rs              # Event loop
-    ├── app.rs               # Application state
-    ├── draw.rs              # Rendering
-    ├── markdown.rs          # Markdown renderer (tables, lists, wrapping)
-    ├── highlight.rs         # Syntax highlighting (syntect)
-    └── theme.rs             # 18 color themes
+├── chatui/                  # TUI frontend (6 files)
+│   ├── main.rs              # Event loop
+│   ├── app.rs               # Application state
+│   ├── draw.rs              # Rendering
+│   ├── markdown.rs          # Markdown renderer (tables, lists, wrapping)
+│   ├── highlight.rs         # Syntax highlighting (syntect)
+│   └── theme.rs             # 18 color themes
+├── watcher/                 # Supervisor daemon (4 files)
+│   ├── mod.rs               # Types, CLI dispatch
+│   ├── ipc.rs               # Unix socket communication
+│   ├── supervisor.rs        # Agent spawning, heartbeat, file watching
+│   └── display.rs           # Status tables, log viewing, agent init
+├── mcp.rs                   # MCP JSON-RPC client
+├── skills.rs                # Skills system
+└── watcher_types.rs         # Shared watcher config & types
 ```
 
 **Binaries:**
@@ -239,6 +245,7 @@ src/
 |--------|---------|
 | `chatui` | Interactive TUI with streaming and subagent panel |
 | `chat` | Headless chat for scripting |
+| `cli` | Simple CLI with run/chat subcommands |
 | `synaps-agent` | Lightweight worker runtime (used by watcher) |
 | `watcher` | Supervisor daemon for autonomous agents |
 | `login` | OAuth authentication flow |
