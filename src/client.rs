@@ -1,6 +1,6 @@
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
 use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio::io::{AsyncBufReadExt, BufReader};
 

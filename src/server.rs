@@ -8,7 +8,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use chrono::Local;
