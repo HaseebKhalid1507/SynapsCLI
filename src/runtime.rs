@@ -202,10 +202,7 @@ impl Runtime {
 
             let in_memory_expired = match auth.token_expires {
                 Some(exp) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
+                    let now = crate::epoch_millis();
                     now >= exp
                 }
                 None => false,
@@ -261,9 +258,9 @@ impl Runtime {
             if let Ok(content) = std::fs::read_to_string(&auth_path) {
                 if let Ok(auth) = serde_json::from_str::<PiAuth>(&content) {
                     let creds = &auth.anthropic;
-                    if creds.auth_type == "oauth" && creds.access.is_some() {
+                    if let (true, Some(access)) = (creds.auth_type == "oauth", creds.access.as_ref()) {
                         return Ok((
-                            creds.access.as_ref().unwrap().clone(),
+                            access.clone(),
                             "oauth".to_string(),
                             creds.refresh.clone(),
                             creds.expires,
@@ -489,10 +486,7 @@ impl Runtime {
                 if auth_state.auth_type == "oauth" {
                     let expired = match auth_state.token_expires {
                         Some(exp) => {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64;
+                            let now = crate::epoch_millis();
                             now >= exp
                         }
                         None => false,

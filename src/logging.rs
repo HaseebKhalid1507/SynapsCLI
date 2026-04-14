@@ -12,8 +12,8 @@ pub fn init_logging() -> Option<WorkerGuard> {
 
     if let Err(e) = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive("synaps_cli=debug".parse().unwrap())
-            .add_directive("tracing=info".parse().unwrap()))
+            .add_directive("synaps_cli=debug".parse().expect("valid directive"))
+            .add_directive("tracing=info".parse().expect("valid directive")))
         .with_writer(non_blocking)
         .with_target(false)
         .with_thread_ids(true)

@@ -37,3 +37,21 @@ pub fn flush_stderr() {
     use std::io::Write;
     let _ = std::io::stderr().flush();
 }
+
+/// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
+#[inline]
+pub fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis() as u64
+}
+
+/// Current time as Unix epoch seconds.
+#[inline]
+pub fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_secs()
+}

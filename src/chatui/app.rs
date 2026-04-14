@@ -435,8 +435,10 @@ impl App {
             }
             _ => return,
         }
-        self.input = self.input_history[self.history_index.unwrap()].clone();
-        self.cursor_pos = self.input.chars().count();
+        if let Some(idx) = self.history_index {
+            self.input = self.input_history[idx].clone();
+            self.cursor_pos = self.input.chars().count();
+        }
     }
 
     pub(crate) fn history_down(&mut self) {
