@@ -70,7 +70,7 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
 /// Parses the collected table lines into a grid, calculates column widths,
 /// and renders with Unicode box-drawing characters. The separator row
 /// (|---|---|) is detected and skipped — it just confirms we have a header.
-pub(crate) fn render_table(table_lines: &[String], prefix: &str, _width: usize) -> Vec<Line<'static>> {
+pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut result: Vec<Line> = Vec::new();
     if table_lines.is_empty() {
         return result;
@@ -126,6 +126,38 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, _width: usize) 
         }
     }
 
+    // Shrink columns if total table width exceeds terminal width
+    // Layout: prefix + "  " + │ + for each col: " " + cell + " " + │
+    // = prefix_len + 2 + 1 + num_cols * (col_w + 3) 
+    let prefix_overhead = UnicodeWidthStr::width(prefix) + 3; // prefix + "  " + opening │
+    let per_col_overhead = 3; // space + space + separator
+    let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
+    if width > 0 && total_table_width > width {
+        let available = width.saturating_sub(prefix_overhead + num_cols * per_col_overhead);
+        if available > 0 && num_cols > 0 {
+            let total_content: usize = col_widths.iter().sum();
+            if total_content > available {
+                // Proportionally shrink columns, minimum 3 chars each
+                let mut new_widths: Vec<usize> = col_widths.iter()
+                    .map(|&w| (w * available / total_content).max(3))
+                    .collect();
+                // Distribute any remainder to the widest columns
+                let used: usize = new_widths.iter().sum();
+                if used < available {
+                    let mut remainder = available - used;
+                    let mut indices: Vec<usize> = (0..num_cols).collect();
+                    indices.sort_by(|a, b| col_widths[*b].cmp(&col_widths[*a]));
+                    for &idx in &indices {
+                        if remainder == 0 { break; }
+                        new_widths[idx] += 1;
+                        remainder -= 1;
+                    }
+                }
+                col_widths = new_widths;
+            }
+        }
+    }
+
     let border_style = Style::default().fg(THEME.table_border_color);
     let header_style = Style::default().fg(THEME.table_header_color).add_modifier(ratatui::style::Modifier::BOLD);
     let cell_style = Style::default().fg(THEME.table_cell_color);
@@ -149,8 +181,24 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, _width: usize) 
         for (j, cell) in row.iter().enumerate() {
             let w = col_widths[j];
             let display_w = UnicodeWidthStr::width(cell.as_str());
-            let padding = w.saturating_sub(display_w);
-            let padded = format!(" {}{} ", cell, " ".repeat(padding));
+            // Truncate cell content if it exceeds column width
+            let display_cell = if display_w > w {
+                let mut truncated = String::new();
+                let mut tw = 0;
+                for ch in cell.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if tw + cw > w.saturating_sub(1) { break; }
+                    truncated.push(ch);
+                    tw += cw;
+                }
+                truncated.push('…');
+                truncated
+            } else {
+                cell.clone()
+            };
+            let truncated_w = UnicodeWidthStr::width(display_cell.as_str());
+            let padding = w.saturating_sub(truncated_w);
+            let padded = format!(" {}{} ", display_cell, " ".repeat(padding));
             let style = if has_header && i == 0 { header_style } else { cell_style };
             spans.push(Span::styled(padded, style));
             if j < num_cols - 1 {
@@ -297,11 +345,34 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
         // List items
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let item_text = &trimmed[2..];
-            let bullet_span = Span::styled(format!("{}  \u{2022} ", prefix), Style::default().fg(THEME.list_bullet_color));
-            let mut item_spans = parse_inline_md(item_text, base_style);
-            let mut all_spans = vec![bullet_span];
-            all_spans.append(&mut item_spans);
-            lines.push(Line::from(all_spans));
+            let bullet_prefix = format!("{}  \u{2022} ", prefix);
+            let cont_prefix = format!("{}    ", prefix);
+            let flat = format!("{}{}", bullet_prefix, item_text);
+            if flat.chars().count() <= width {
+                let bullet_span = Span::styled(bullet_prefix, Style::default().fg(THEME.list_bullet_color));
+                let mut item_spans = parse_inline_md(item_text, base_style);
+                let mut all_spans = vec![bullet_span];
+                all_spans.append(&mut item_spans);
+                lines.push(Line::from(all_spans));
+            } else {
+                for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
+                    if li == 0 {
+                        let inner = if wline.starts_with(&bullet_prefix) {
+                            &wline[bullet_prefix.len()..]
+                        } else {
+                            &wline
+                        };
+                        let bullet_span = Span::styled(bullet_prefix.clone(), Style::default().fg(THEME.list_bullet_color));
+                        let mut all_spans = vec![bullet_span];
+                        all_spans.extend(parse_inline_md(inner, base_style));
+                        lines.push(Line::from(all_spans));
+                    } else {
+                        let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
+                        all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
+                        lines.push(Line::from(all_spans));
+                    }
+                }
+            }
             continue;
         }
 
@@ -311,14 +382,34 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             if let Some(pos) = num_end {
                 if pos <= 3 && trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
                     let item_text = &trimmed[pos + 2..];
-                    let num_span = Span::styled(
-                        format!("{}  {}. ", prefix, &trimmed[..pos]),
-                        Style::default().fg(THEME.list_bullet_color),
-                    );
-                    let mut item_spans = parse_inline_md(item_text, base_style);
-                    let mut all_spans = vec![num_span];
-                    all_spans.append(&mut item_spans);
-                    lines.push(Line::from(all_spans));
+                    let num_prefix = format!("{}  {}. ", prefix, &trimmed[..pos]);
+                    let cont_prefix = format!("{}     ", prefix);
+                    let flat = format!("{}{}", num_prefix, item_text);
+                    if flat.chars().count() <= width {
+                        let num_span = Span::styled(num_prefix, Style::default().fg(THEME.list_bullet_color));
+                        let mut item_spans = parse_inline_md(item_text, base_style);
+                        let mut all_spans = vec![num_span];
+                        all_spans.append(&mut item_spans);
+                        lines.push(Line::from(all_spans));
+                    } else {
+                        for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
+                            if li == 0 {
+                                let inner = if wline.starts_with(&num_prefix) {
+                                    &wline[num_prefix.len()..]
+                                } else {
+                                    &wline
+                                };
+                                let num_span = Span::styled(num_prefix.clone(), Style::default().fg(THEME.list_bullet_color));
+                                let mut all_spans = vec![num_span];
+                                all_spans.extend(parse_inline_md(inner, base_style));
+                                lines.push(Line::from(all_spans));
+                            } else {
+                                let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
+                                all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
+                                lines.push(Line::from(all_spans));
+                            }
+                        }
+                    }
                     continue;
                 }
             }
