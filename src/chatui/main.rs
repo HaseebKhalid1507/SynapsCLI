@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
 
     // Load config and apply
     let config = synaps_cli::config::load_config();
-    synaps_cli::config::apply_config(&mut runtime, &config);
+    runtime.apply_config(&config);
 
     // Load system prompt
     let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());

@@ -91,6 +91,16 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
+    pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
+        if let Some(ref model) = config.model {
+            self.set_model(model.clone());
+        }
+        if let Some(budget) = config.thinking_budget {
+            self.set_thinking_budget(budget);
+        }
+    }
+
     pub fn thinking_budget(&self) -> u32 {
         self.thinking_budget
     }
