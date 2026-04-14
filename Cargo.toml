@@ -77,7 +77,7 @@ path = "src/agent.rs"
 
 [[bin]]
 name = "watcher"
-path = "src/watcher.rs"
+path = "src/watcher/mod.rs"
 
 
 [profile.release]
