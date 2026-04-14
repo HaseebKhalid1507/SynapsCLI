@@ -66,6 +66,9 @@ pub struct ToolContext {
     pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
     pub watcher_exit_path: Option<PathBuf>,
+    /// Channel for tools that need to register new tools at runtime (e.g. MCP).
+    /// Breaks the circular Arc — tools send registrations, runtime applies them.
+    pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
 }
 
 /// The core trait for all tools. Implement this to add a new tool.
@@ -390,6 +393,7 @@ mod tests {
             tx_delta: None,
             tx_events: None,
             watcher_exit_path: None,
+            tool_register_tx: None,
         }
     }
 
