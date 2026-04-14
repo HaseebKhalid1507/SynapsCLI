@@ -428,7 +428,7 @@ mod tests {
         match result {
             Some(config) => {
                 // If file exists and parses correctly, we get a config
-                assert!(config.mcp_servers.len() >= 0); // Can be empty
+                // (mcp_servers can be empty — that's valid)
             }
             None => {
                 // If file doesn't exist or fails to parse, we get None
