@@ -224,6 +224,7 @@ async fn handle_ipc_command(
                 agent.stopped = true;
                 if let Some(ref mut child) = agent.child {
                     let _ = child.kill().await;
+                    let _ = child.wait().await;
                 }
                 WatcherResponse::Ok {
                     message: format!("Agent '{}' stopped", name)
@@ -1237,6 +1238,7 @@ async fn main() {
                                         if !check_heartbeat(&agent_dir, agent.config.heartbeat.stale_threshold_secs) {
                                             log(&format!("[{}] heartbeat stale — killing", name));
                                             let _ = child.kill().await;
+                                            let _ = child.wait().await;
                                         }
                                     }
                                 }
@@ -1259,6 +1261,7 @@ async fn main() {
                     if let Some(ref mut child) = agent.child {
                         log(&format!("[{}] sending SIGTERM", name));
                         let _ = child.kill().await;
+                        let _ = child.wait().await;
                         // Give it time to write handoff
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
