@@ -1,3 +1,4 @@
+//! Tool registry — maintains name→tool map and cached JSON schema for the API.
 use std::sync::Arc;
 use serde_json::Value;
 use std::collections::HashMap;

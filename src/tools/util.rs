@@ -1,3 +1,4 @@
+//! Shared utilities for tool implementations — path expansion, ANSI stripping, IDs.
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 

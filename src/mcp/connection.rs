@@ -1,3 +1,4 @@
+//! MCP JSON-RPC connection — child process management and protocol implementation.
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};

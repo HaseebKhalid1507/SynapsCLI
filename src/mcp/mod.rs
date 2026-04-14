@@ -1,3 +1,4 @@
+//! MCP (Model Context Protocol) integration — JSON-RPC client, tool bridging, lazy loading.
 mod connection;
 mod tool;
 mod lazy;

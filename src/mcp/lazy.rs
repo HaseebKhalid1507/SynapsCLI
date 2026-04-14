@@ -1,3 +1,4 @@
+//! Lazy MCP connection — the mcp_connect tool that connects to servers on-demand.
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,3 +1,4 @@
+//! Agent prompt resolution — loads agent configs from ~/.synaps-cli/agents/.
 use super::util::expand_path;
 
 /// Resolve an agent name to a system prompt.

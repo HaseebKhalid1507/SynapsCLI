@@ -1,3 +1,7 @@
+//! Tool system — trait, registry, and built-in tool implementations.
+//!
+//! All tools implement the `Tool` trait and are registered in `ToolRegistry`.
+//! Subagents get `ToolRegistry::without_subagent()` to prevent recursion.
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;

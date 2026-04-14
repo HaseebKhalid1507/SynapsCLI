@@ -1,3 +1,4 @@
+//! McpTool — bridges an MCP server tool into the native Tool trait.
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;

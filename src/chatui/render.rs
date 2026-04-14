@@ -1,3 +1,4 @@
+//! Message rendering — converts ChatMessage variants into styled ratatui Lines.
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},

@@ -11,11 +11,11 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-pub mod pkce;
-pub mod callback;
-pub mod token;
-pub mod storage;
-pub mod browser;
+mod pkce;
+mod callback;
+mod token;
+mod storage;
+mod browser;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -27,12 +27,12 @@ pub use browser::open_browser;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CALLBACK_HOST: &str = "127.0.0.1";
-const CALLBACK_PORT: u16 = 53692;
-const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+pub(super) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(super) const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+pub(super) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub(super) const CALLBACK_HOST: &str = "127.0.0.1";
+pub(super) const CALLBACK_PORT: u16 = 53692;
+pub(super) const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 

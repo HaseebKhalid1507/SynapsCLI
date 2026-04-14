@@ -1,3 +1,4 @@
+//! GamblersDen integration — casino subprocess spawning and terminal handoff.
 use super::app::App;
 
 /// Find the GamblersDen binary: check $PATH first, then the dev build path.
