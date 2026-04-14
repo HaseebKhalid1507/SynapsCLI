@@ -91,38 +91,39 @@ impl Tool for SubagentTool {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let _thread_handle = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
-                    return;
-                }
-            };
-
-            let result = rt.block_on(async move {
-                use futures::StreamExt;
-
-                let mut runtime = match crate::Runtime::new().await {
-                    Ok(r) => r,
-                    Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = result_tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
+                        return;
+                    }
                 };
 
-                runtime.set_system_prompt(system_prompt);
-                runtime.set_model(model);
-                runtime.set_tools(crate::ToolRegistry::without_subagent());
+                let result = rt.block_on(async move {
+                    use futures::StreamExt;
 
-                let cancel = crate::CancellationToken::new();
-                let cancel_inner = cancel.clone();
+                    let mut runtime = match crate::Runtime::new().await {
+                        Ok(r) => r,
+                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                    };
 
-                tokio::spawn(async move {
-                    let _ = shutdown_rx.await;
-                    cancel_inner.cancel();
-                });
+                    runtime.set_system_prompt(system_prompt);
+                    runtime.set_model(model);
+                    runtime.set_tools(crate::ToolRegistry::without_subagent());
 
-                let mut stream = runtime.run_stream(task, cancel).await;
+                    let cancel = crate::CancellationToken::new();
+                    let cancel_inner = cancel.clone();
+
+                    tokio::spawn(async move {
+                        let _ = shutdown_rx.await;
+                        cancel_inner.cancel();
+                    });
+
+                    let mut stream = runtime.run_stream(task, cancel).await;
 
                 let mut final_text = String::new();
                 let mut tool_count = 0u32;
@@ -282,7 +283,21 @@ impl Tool for SubagentTool {
                 })
             });
 
-            let _ = result_tx.send(result);
+                let _ = result_tx.send(result);
+            }));
+
+            if let Err(panic_info) = result {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("Subagent thread panicked: {}", msg);
+                // result_tx is consumed inside the closure, so we can't send here —
+                // the oneshot receiver will see a RecvError, handled below.
+            }
         });
 
         let result = result_rx.await;
