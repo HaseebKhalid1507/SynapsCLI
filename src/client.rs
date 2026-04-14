@@ -59,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
 
-                        let msg = if input.starts_with('/') {
-                            let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+                        let msg = if let Some(rest) = input.strip_prefix('/') {
+                            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                             let cmd = parts[0];
                             let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
 

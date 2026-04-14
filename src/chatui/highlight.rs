@@ -10,8 +10,8 @@ use std::sync::LazyLock;
 
 use super::theme::THEME;
 
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| SyntaxSet::load_defaults_newlines());
-static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| ThemeSet::load_defaults());
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 /// Highlight a code block using syntect
 pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'static>> {
@@ -26,7 +26,7 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
     let mut lines: Vec<Line> = Vec::new();
 
     for line in LinesWithEndings::from(code) {
-        let ranges = h.highlight_line(line, &ss).unwrap_or_default();
+        let ranges = h.highlight_line(line, ss).unwrap_or_default();
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(
             format!("{}  \u{2502} ", prefix),
@@ -202,7 +202,7 @@ pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Sp
     }
 
     let rest = &line[first_colon + 1..];
-    let second_sep = rest.find(|c: char| c == ':' || c == '-')?;
+    let second_sep = rest.find([':', '-'])?;
     let linenum = &rest[..second_sep];
 
     // Line number should be numeric

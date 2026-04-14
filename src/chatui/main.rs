@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
                 }
-                if exit_fx.as_ref().map_or(false, |fx| fx.done()) {
+                if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
                 }
                 continue;
@@ -539,8 +539,8 @@ async fn main() -> Result<()> {
                                 app.pasted_char_count = 0;
 
                                 // Intercept slash commands during streaming
-                                if input.starts_with('/') {
-                                    let raw_cmd = input[1..].split_whitespace().next().unwrap_or("");
+                                if let Some(rest) = input.strip_prefix('/') {
+                                    let raw_cmd = rest.split_whitespace().next().unwrap_or("");
                                     // Use same prefix resolution as non-streaming path
                                     let streaming_cmds = ["gamba", "theme", "quit", "exit"];
                                     let cmd = if streaming_cmds.contains(&raw_cmd) {
@@ -562,7 +562,7 @@ async fn main() -> Result<()> {
                                             event_reader = EventStream::new();
                                         }
                                         "theme" => {
-                                            let arg = input[1..].splitn(2, ' ').nth(1).unwrap_or("").trim();
+                                            let arg = input[1..].split_once(' ').map(|x| x.1).unwrap_or("").trim();
                                             app.handle_theme_command(arg);
                                         }
                                         "quit" | "exit" => {
@@ -868,7 +868,7 @@ async fn main() -> Result<()> {
                                 sa.duration_secs = Some(duration_secs);
                                 let preview: String = result_preview.chars().take(40).collect();
                                 if result_preview.starts_with("[TIMED OUT") {
-                                    sa.status = format!("\u{26a0} timed out");
+                                    sa.status = "\u{26a0} timed out".to_string();
                                 } else if result_preview.starts_with("ERROR") {
                                     sa.status = format!("\u{2718} {}", preview);
                                 } else {

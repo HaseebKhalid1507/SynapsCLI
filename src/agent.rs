@@ -39,7 +39,8 @@ fn update_stats(agent_dir: &Path, updater: impl FnOnce(&mut AgentStats)) {
     
     let Ok(mut file) = file else { return; };
     
-    // Get exclusive lock (blocking)
+    // Get exclusive lock - blocking (fs4 crate, not std)
+    #[allow(clippy::incompatible_msrv)]
     if file.lock_exclusive().is_err() {
         return; // Failed to lock, skip update
     }
@@ -115,7 +116,8 @@ fn load_stats(agent_dir: &Path) -> AgentStats {
         return AgentStats::default();
     };
     
-    // Try to get shared lock for reading
+    // Try to get shared lock for reading (fs4 crate, not std)
+    #[allow(clippy::incompatible_msrv)]
     if file.lock_shared().is_err() {
         // If we can't lock, just return default
         return AgentStats::default();

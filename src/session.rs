@@ -75,7 +75,7 @@ impl Session {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", self.id));
         let json = serde_json::to_string(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -83,7 +83,7 @@ impl Session {
         let path = sessions_dir().join(format!("{}.json", id));
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     }
 
     pub fn info(&self) -> SessionInfo {
@@ -128,7 +128,7 @@ pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
     match matches.len() {
         0 => Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session matching '{}'", partial_id))),
         1 => Session::load(&matches[0]),
-        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("ambiguous: {} sessions match '{}'", matches.len(), partial_id))),
+        _ => Err(std::io::Error::other(format!("ambiguous: {} sessions match '{}'", matches.len(), partial_id))),
     }
 }
 
@@ -168,7 +168,7 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "json") {
+        if path.extension().is_some_and(|e| e == "json") {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&content) {
                     sessions.push(SessionInfo {

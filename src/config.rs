@@ -74,21 +74,13 @@ pub fn get_active_config_dir() -> PathBuf {
 
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
     pub skills: Option<Vec<String>>,
 }
 
-impl Default for SynapsConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            thinking_budget: None,
-            skills: None,
-        }
-    }
-}
 
 fn parse_thinking_budget(val: &str) -> Option<u32> {
     match val {

@@ -5,7 +5,7 @@ use serde::{Deserialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::{Result, RuntimeError, ToolRegistry};
+use crate::{Result, RuntimeError, ToolRegistry, truncate_str};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -457,6 +457,7 @@ impl Runtime {
         Box::pin(UnboundedReceiverStream::new(rx))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_stream_internal(
         auth: Arc<RwLock<AuthState>>,
         client: Client,
@@ -743,6 +744,7 @@ impl Runtime {
 
     /// Static inner version — used by both `call_api_stream` (instance) and
     /// `run_stream_internal` (spawned task) so there's one implementation.
+    #[allow(clippy::too_many_arguments)]
     async fn call_api_stream_inner(
         auth: &Arc<RwLock<AuthState>>,
         client: &Client,
@@ -1028,8 +1030,7 @@ impl Runtime {
 
         // Process any remaining data in line_buffer (final line without trailing newline)
         let remaining = line_buffer.trim().to_string();
-        if remaining.starts_with("data: ") {
-            let data_part = &remaining[6..];
+        if let Some(data_part) = remaining.strip_prefix("data: ") {
             if data_part.trim() != "[DONE]" {
                 if let Ok(event) = serde_json::from_str::<Value>(data_part) {
                     if event["type"].as_str() == Some("content_block_stop") {
@@ -1110,7 +1111,7 @@ impl Runtime {
 
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
-            tracing::info!("Steering message injected: {}", &msg[..msg.floor_char_boundary(80.min(msg.len()))]);
+            tracing::info!("Steering message injected: {}", truncate_str(&msg, 80));
             let _ = tx.send(StreamEvent::SteeringDelivered { message: msg.clone() });
             messages.push(json!({"role": "user", "content": msg}));
             injected = true;
@@ -1121,7 +1122,7 @@ impl Runtime {
     /// Annotate a cache breakpoint on the conversation prefix.
     /// To maximize cache hits, we must place stationary boundaries. Modifying an old marker
     /// breaks the cache for that prefix. We retain up to 2 conversational markers.
-    fn annotate_cache_breakpoint(messages: &mut Vec<Value>) {
+    fn annotate_cache_breakpoint(messages: &mut [Value]) {
         let user_indices: Vec<usize> = messages.iter().enumerate()
             .filter(|(_, m)| m["role"].as_str() == Some("user"))
             .map(|(i, _)| i)

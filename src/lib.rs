@@ -55,3 +55,16 @@ pub fn epoch_secs() -> u64 {
         .expect("system clock before Unix epoch")
         .as_secs()
 }
+
+/// Truncate a string to at most `max` bytes at a valid UTF-8 boundary.
+#[inline]
+pub fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}

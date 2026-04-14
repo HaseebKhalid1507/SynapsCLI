@@ -1,4 +1,4 @@
-use synaps_cli::{Runtime, StreamEvent, CancellationToken, Session};
+use synaps_cli::{Runtime, StreamEvent, CancellationToken, Session, truncate_str};
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -491,7 +491,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 let rt = state.runtime.lock().await;
                 let prompt = rt.system_prompt().unwrap_or("(none)");
                 let _ = broadcast.send(ServerMessage::System {
-                    message: format!("system prompt: {}", &prompt[..prompt.floor_char_boundary(200.min(prompt.len()))]),
+                    message: format!("system prompt: {}", truncate_str(prompt, 200)),
                 });
             } else {
                 let mut rt = state.runtime.lock().await;

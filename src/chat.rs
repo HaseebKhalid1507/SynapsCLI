@@ -2,7 +2,6 @@ use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, flush_stdout};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io;
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +62,7 @@ async fn main() -> Result<()> {
                 }
                 StreamEvent::ToolUseStart(tool_name) => {
                     if in_thinking {
-                        print!("\n");
+                        println!();
                         in_thinking = false;
                     }
                     print!("⚙️  Using tool: {} (args: ", tool_name);
@@ -76,7 +75,7 @@ async fn main() -> Result<()> {
                 StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
                     print!(")                                                                                          \r");
                     if in_thinking {
-                        print!("\n");
+                        println!();
                         in_thinking = false;
                     }
                     println!("⚙️  Using tool: {} ({})", tool_name, tool_id);
@@ -115,14 +114,14 @@ async fn main() -> Result<()> {
                 }
                 StreamEvent::Done => {
                     if in_thinking {
-                        print!("\n");
+                        println!();
                     }
                     println!("\n");
                     break;
                 }
                 StreamEvent::Error(err) => {
                     if in_thinking {
-                        print!("\n");
+                        println!();
                     }
                     println!("❌ Error: {}\n", err);
                     // Remove the user message that caused the error

@@ -763,7 +763,7 @@ fn print_status(agents: &HashMap<String, ManagedAgent>) {
 fn expand_watch_path(p: &str) -> PathBuf {
     if p.starts_with("~/") {
         if let Some(home) = dirs_next() {
-            return home.join(&p[2..]);
+            return home.join(p.strip_prefix("~/").unwrap());
         }
     }
     PathBuf::from(p)

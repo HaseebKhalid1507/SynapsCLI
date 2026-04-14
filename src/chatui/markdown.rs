@@ -211,7 +211,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             }
             if !in_code_block {
                 in_code_block = true;
-                code_lang = trimmed[3..].trim().to_string();
+                code_lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
                 let label = if code_lang.is_empty() {
                     format!("{}  \u{2500}\u{2500}\u{2500}", prefix)
                 } else {
@@ -286,7 +286,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
 
         // Blockquotes
         if trimmed.starts_with('>') {
-            let quote_text = trimmed[1..].trim();
+            let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
             let full = format!("{}  \u{2502} {}", prefix, quote_text);
             for wline in wrap_text(&full, width) {
                 lines.push(Line::from(Span::styled(wline, Style::default().fg(THEME.quote_color).add_modifier(Modifier::ITALIC))));

@@ -442,19 +442,16 @@ impl App {
     }
 
     pub(crate) fn history_down(&mut self) {
-        match self.history_index {
-            Some(i) => {
-                if i + 1 < self.input_history.len() {
-                    self.history_index = Some(i + 1);
-                    self.input = self.input_history[i + 1].clone();
-                } else {
-                    self.history_index = None;
-                    self.input = self.input_stash.clone();
-                    self.input_stash.clear();
-                }
-                self.cursor_pos = self.input.chars().count();
+        if let Some(i) = self.history_index {
+            if i + 1 < self.input_history.len() {
+                self.history_index = Some(i + 1);
+                self.input = self.input_history[i + 1].clone();
+            } else {
+                self.history_index = None;
+                self.input = self.input_stash.clone();
+                self.input_stash.clear();
             }
-            None => {}
+            self.cursor_pos = self.input.chars().count();
         }
     }
 
@@ -848,7 +845,7 @@ impl App {
                                         // Syntax highlight the code
                                         let is_code_param = k == "content" || k == "old_string" || k == "new_string";
                                         if is_code_param && !file_ext.is_empty() {
-                                            let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, &m, marker, marker_color);
+                                            let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, m, marker, marker_color);
                                             lines.extend(hl_lines);
                                         } else {
                                             for (ci, cline) in content_lines.iter().take(show).enumerate() {
@@ -975,9 +972,9 @@ impl App {
                         None
                     } else if is_read_tool_output(&result_lines) {
                         let ext = self.find_preceding_read_extension(i);
-                        highlight_read_output(&result_lines[..show], &ext, &m)
+                        highlight_read_output(&result_lines[..show], &ext, m)
                     } else if preceding_tool.as_deref() == Some("bash") {
-                        Some(highlight_bash_output(&result_lines[..show], &m))
+                        Some(highlight_bash_output(&result_lines[..show], m))
                     } else {
                         None
                     };
@@ -988,7 +985,7 @@ impl App {
                         for line in &result_lines[..show] {
                             // Try to detect and highlight grep output (skip for timeout/error)
                             if !is_timeout && !is_error {
-                                if let Some(grep_spans) = try_highlight_grep_line(line, &m) {
+                                if let Some(grep_spans) = try_highlight_grep_line(line, m) {
                                     lines.push(Line::from(grep_spans));
                                     continue;
                                 }

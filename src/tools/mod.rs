@@ -49,7 +49,7 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 pub(crate) fn expand_path(path: &str) -> PathBuf {
     if path.starts_with("~/") {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(&path[2..]);
+            return PathBuf::from(home).join(path.strip_prefix("~/").unwrap());
         }
     } else if path == "~" {
         if let Ok(home) = std::env::var("HOME") {
@@ -91,6 +91,12 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Cached schema — rebuilt on register(), shared via Arc for zero-copy reads.
     cached_schema: Arc<Vec<Value>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
@@ -194,11 +200,10 @@ pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
 }
 
 fn strip_frontmatter(content: &str) -> String {
-    if content.starts_with("---") {
-        if let Some(end) = content[3..].find("\n---") {
-            // end is relative to content[3..], so closing "---" starts at 3+end+1
+    if let Some(rest) = content.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
             // skip past the "\n---" (4 bytes) to get the body
-            return content[3 + end + 4..].trim().to_string();
+            return rest[end + 4..].trim().to_string();
         }
     }
     content.to_string()

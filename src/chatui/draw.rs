@@ -23,7 +23,7 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
         let dist = if offset >= i { offset - i } else { WIDTH + CHARS.len() };
         if dist < CHARS.len() { CHARS[dist] } else { ' ' }
     }).collect();
-    let pulse = ((spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7) as f64;
+    let pulse = (spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7;
     let Color::Rgb(br, bg, bb) = THEME.border_active else { return (trace, Color::Reset) };
     let color = Color::Rgb(
         (br as f64 * pulse) as u8,
@@ -588,7 +588,7 @@ pub(crate) fn draw(
                 }
             },
             Span::styled("\u{03b8}:", Style::default().fg(THEME.muted)),
-            Span::styled(format!("{}", thinking), Style::default().fg(THEME.help_fg)),
+            Span::styled(thinking.to_string(), Style::default().fg(THEME.help_fg)),
             Span::styled(" \u{2502} ", Style::default().fg(THEME.border)),
             Span::styled(model, Style::default().fg(THEME.header_fg)),
             Span::styled(" ", Style::default()),

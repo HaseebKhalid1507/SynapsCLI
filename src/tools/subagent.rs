@@ -56,7 +56,7 @@ impl Tool for SubagentTool {
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => {
                 resolve_agent_prompt(name)
-                    .map_err(|e| RuntimeError::Tool(e))?
+                    .map_err(RuntimeError::Tool)?
             }
             (None, Some(prompt)) => prompt.clone(),
             (None, None) => {
@@ -215,7 +215,7 @@ impl Tool for SubagentTool {
                                             } else {
                                                 other
                                             };
-                                            format!("{}", short_name)
+                                            short_name.to_string()
                                         }
                                     };
                                     if let Some(ref tx) = tx_events_inner {
