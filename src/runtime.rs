@@ -763,22 +763,12 @@ impl Runtime {
         };
 
         let auth_header = if auth_type == "oauth" {
-            ("authorization", format!("Bearer {}", auth_token))
+            ("authorization".to_string(), format!("Bearer {}", auth_token))
         } else {
-            ("x-api-key", auth_token.clone())
+            ("x-api-key".to_string(), auth_token.clone())
         };
         
         tracing::info!(model = %model, "Starting API request");
-        let mut request = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header(auth_header.0, auth_header.1)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
-        
-        // Add standard beta headers based on auth type
-        if auth_type == "oauth" {
-            request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
-        }
         
         // We no longer strip_old_thinking or microcompact here! 
         // Modifying historical messages breaks Anthropic's exact-prefix prompt cache.
@@ -826,12 +816,60 @@ impl Runtime {
         }
 
         tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
-        let response = request.json(&body).send().await?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(RuntimeError::Tool(format!("API Error: {}", error_text)));
-        }
+        // Retry loop for transient API errors (429, 529, 500, 502, 503)
+        let response = {
+            const MAX_RETRIES: u32 = 3;
+            let mut last_err = String::new();
+            let mut response = None;
+
+            for attempt in 0..=MAX_RETRIES {
+                if attempt > 0 {
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
+                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, MAX_RETRIES, delay, last_err);
+                    let _ = tx.send(StreamEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, MAX_RETRIES)));
+                    tokio::time::sleep(delay).await;
+
+                    if cancel.is_cancelled() {
+                        return Err(RuntimeError::Cancelled);
+                    }
+                }
+
+                // Rebuild request (consumed on send)
+                let mut req = client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json");
+                if auth_type == "oauth" {
+                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                }
+
+                match req.json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            response = Some(resp);
+                            break;
+                        }
+                        let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                        let error_text = resp.text().await.unwrap_or_default();
+                        if !is_retryable || attempt == MAX_RETRIES {
+                            return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+                        }
+                        last_err = format!("{}: {}", status, error_text);
+                    }
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            return Err(RuntimeError::Api(e));
+                        }
+                        last_err = e.to_string();
+                    }
+                }
+            }
+
+            response.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", MAX_RETRIES, last_err)))?
+        };
         
         let mut stream = response.bytes_stream();
         tracing::debug!("Stream opened");
@@ -1203,21 +1241,10 @@ impl Runtime {
         };
 
         let auth_header = if auth_type == "oauth" {
-            ("authorization", format!("Bearer {}", auth_token))
+            ("authorization".to_string(), format!("Bearer {}", auth_token))
         } else {
-            ("x-api-key", auth_token.clone())
+            ("x-api-key".to_string(), auth_token.clone())
         };
-        
-        let mut request = self.client
-            .post("https://api.anthropic.com/v1/messages")
-            .header(auth_header.0, auth_header.1)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
-        
-        // Add standard beta headers based on auth type
-        if auth_type == "oauth" {
-            request = request.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
-        }
         
         // Avoid modifying past messages to maintain a 100% stable prefix for Anthropic caching.
         let mut cleaned_messages = messages.to_vec();
@@ -1261,16 +1288,70 @@ impl Runtime {
             ]);
         }
 
-        let response = request.json(&body).send().await?;
-        let json: Value = response.json().await?;
-        
-        // Debug: print the full response on error
-        if json["error"].is_object() {
-            eprintln!("API Error Response: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
-            if let Some(error_type) = json["error"]["type"].as_str() {
-                return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+        // Retry loop for transient API errors (429, 529, 500, 502, 503)
+        let json: Value = {
+            const MAX_RETRIES: u32 = 3;
+            let mut last_err = String::new();
+
+            let mut result_json = None;
+            for attempt in 0..=MAX_RETRIES {
+                if attempt > 0 {
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
+                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, MAX_RETRIES, delay, last_err);
+                    tokio::time::sleep(delay).await;
+                }
+
+                let mut req = self.client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json");
+                if auth_type == "oauth" {
+                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                }
+
+                match req.json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            match resp.json::<Value>().await {
+                                Ok(j) => {
+                                    if j["error"].is_object() {
+                                        eprintln!("API Error Response: {}", serde_json::to_string_pretty(&j).unwrap_or_default());
+                                        if let Some(error_type) = j["error"]["type"].as_str() {
+                                            return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+                                        }
+                                    }
+                                    result_json = Some(j);
+                                    break;
+                                }
+                                Err(e) => {
+                                    if attempt == MAX_RETRIES {
+                                        return Err(RuntimeError::Api(e));
+                                    }
+                                    last_err = e.to_string();
+                                }
+                            }
+                        } else {
+                            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let error_text = resp.text().await.unwrap_or_default();
+                            if !is_retryable || attempt == MAX_RETRIES {
+                                return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+                            }
+                            last_err = format!("{}: {}", status, error_text);
+                        }
+                    }
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            return Err(RuntimeError::Api(e));
+                        }
+                        last_err = e.to_string();
+                    }
+                }
             }
-        }
+
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", MAX_RETRIES, last_err)))?
+        };
         
         Ok(json)
     }
