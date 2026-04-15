@@ -1,6 +1,58 @@
 use tokio::sync::{broadcast, mpsc};
 use super::{AgentEvent, Inbound, SyncState, Transport};
 
+/// Clone-able handle to an AgentBus. Supports subscribing to events,
+/// sending inbound messages, and connecting transports — without
+/// owning the inbound receiver (the driver owns that).
+#[derive(Clone)]
+pub struct BusHandle {
+    event_tx: broadcast::Sender<AgentEvent>,
+    inbound_tx: mpsc::UnboundedSender<Inbound>,
+}
+
+impl BusHandle {
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub fn inbound(&self) -> mpsc::UnboundedSender<Inbound> {
+        self.inbound_tx.clone()
+    }
+
+    pub fn broadcast(&self, event: AgentEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.event_tx.receiver_count()
+    }
+
+    pub fn connect<T: Transport>(&self, mut transport: T, sync: SyncState) {
+        let mut event_rx = self.subscribe();
+        let inbound_tx = self.inbound();
+
+        tokio::spawn(async move {
+            transport.on_sync(sync).await;
+            loop {
+                tokio::select! {
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(e) => { if !transport.send(e).await { break; } }
+                            Err(_) => break,
+                        }
+                    }
+                    inbound = transport.recv() => {
+                        match inbound {
+                            Some(msg) => { if inbound_tx.send(msg).is_err() { break; } }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 pub struct AgentBus {
     event_tx: broadcast::Sender<AgentEvent>,
     inbound_tx: mpsc::UnboundedSender<Inbound>,
@@ -45,42 +97,15 @@ impl AgentBus {
         self.event_tx.receiver_count()
     }
 
-    pub fn connect<T: Transport>(&self, mut transport: T, sync: SyncState) {
-        let mut event_rx = self.subscribe();
-        let inbound_tx = self.inbound();
+    pub fn handle(&self) -> BusHandle {
+        BusHandle {
+            event_tx: self.event_tx.clone(),
+            inbound_tx: self.inbound_tx.clone(),
+        }
+    }
 
-        tokio::spawn(async move {
-            // Send initial sync
-            transport.on_sync(sync).await;
-
-            loop {
-                tokio::select! {
-                    // Event from bus -> transport
-                    event = event_rx.recv() => {
-                        match event {
-                            Ok(event) => {
-                                if !transport.send(event).await {
-                                    break; // transport disconnected
-                                }
-                            }
-                            Err(_) => break, // channel closed
-                        }
-                    }
-                    
-                    // Inbound from transport -> bus
-                    inbound = transport.recv() => {
-                        match inbound {
-                            Some(inbound) => {
-                                if inbound_tx.send(inbound).is_err() {
-                                    break; // bus disconnected
-                                }
-                            }
-                            None => break, // transport disconnected
-                        }
-                    }
-                }
-            }
-        });
+    pub fn connect<T: Transport>(&self, transport: T, sync: SyncState) {
+        self.handle().connect(transport, sync);
     }
 }
 
