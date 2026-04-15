@@ -11,6 +11,7 @@ pub mod bus;
 pub mod driver;
 pub mod stdio;
 pub mod websocket;
+pub mod agent;
 
 pub use events::{AgentEvent, ToolEvent, SubagentEvent, MetaEvent};
 pub use inbound::Inbound;
@@ -19,6 +20,7 @@ pub use bus::{AgentBus, BusHandle};
 pub use driver::ConversationDriver;
 pub use stdio::StdioTransport;
 pub use websocket::WebSocketTransport;
+pub use agent::AgentHarness;
 
 use async_trait::async_trait;
 
