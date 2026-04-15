@@ -9,11 +9,14 @@ pub mod inbound;
 pub mod sync;
 pub mod bus;
 pub mod driver;
+pub mod stdio;
 
 pub use events::{AgentEvent, ToolEvent, SubagentEvent, MetaEvent};
 pub use inbound::Inbound;
 pub use sync::SyncState;
 pub use bus::AgentBus;
+pub use driver::ConversationDriver;
+pub use stdio::StdioTransport;
 
 use async_trait::async_trait;
 

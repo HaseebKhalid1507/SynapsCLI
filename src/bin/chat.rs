@@ -1,135 +1,36 @@
-use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, flush_stdout};
-use futures::StreamExt;
-use serde_json::{json, Value};
-use std::io;
+use synaps_cli::{Runtime, Session};
+use synaps_cli::transport::{ConversationDriver, StdioTransport};
+use synaps_cli::transport::driver::DriverConfig;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> synaps_cli::Result<()> {
     let _log_guard = synaps_cli::logging::init_logging();
-    println!("💬 Terminal Chat with Thinking Blocks - type 'quit' to exit\n");
-    let runtime = Runtime::new().await?;
-    let mut messages: Vec<Value> = Vec::new();
 
-    loop {
-        print!("You: ");
-        flush_stdout();
+    let config = synaps_cli::config::load_config();
+    let mut runtime = Runtime::new().await?;
+    runtime.apply_config(&config);
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            eprintln!("stdin closed");
-            break;
-        }
-        let input = input.trim();
+    let system_prompt = synaps_cli::config::resolve_system_prompt(None);
+    runtime.set_system_prompt(system_prompt);
 
-        if input.is_empty() {
-            continue;
-        }
+    let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
 
-        if input == "quit" || input == "exit" {
-            println!("Goodbye! 👋");
-            break;
-        }
+    println!("💬 Terminal Chat (Transport Edition)");
+    println!("Model: {} | Thinking: {}", runtime.model(), runtime.thinking_level());
+    println!("Type your message. Press Ctrl+C to exit.\n");
 
-        // Add user message to history
-        messages.push(json!({"role": "user", "content": input}));
+    let driver_config = DriverConfig {
+        agent_name: None,
+        auto_save: true,
+        event_buffer_size: 50,
+    };
+    let mut driver = ConversationDriver::new(runtime, session, driver_config);
 
-        print!("Claude: ");
-        flush_stdout();
+    let transport = StdioTransport::new();
+    let sync = driver.sync_state();
+    driver.bus().connect(transport, sync);
 
-        let cancel = CancellationToken::new();
-        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None).await;
-        let mut in_thinking = false;
+    driver.run().await?;
 
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamEvent::Thinking(text) => {
-                    if !in_thinking {
-                        print!("\n🤔 ");
-                        flush_stdout();
-                        in_thinking = true;
-                    }
-                    print!("{}", text);
-                    flush_stdout();
-                }
-                StreamEvent::Text(text) => {
-                    if in_thinking {
-                        print!("\n\n💬 ");
-                        flush_stdout();
-                        in_thinking = false;
-                    }
-                    print!("{}", text);
-                    flush_stdout();
-                }
-                StreamEvent::ToolUseStart(tool_name) => {
-                    if in_thinking {
-                        println!();
-                        in_thinking = false;
-                    }
-                    print!("⚙️  Using tool: {} (args: ", tool_name);
-                    flush_stdout();
-                }
-                StreamEvent::ToolUseDelta(delta) => {
-                    print!("{}", delta);
-                    flush_stdout();
-                }
-                StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
-                    print!(")                                                                                          \r");
-                    if in_thinking {
-                        println!();
-                        in_thinking = false;
-                    }
-                    println!("⚙️  Using tool: {} ({})", tool_name, tool_id);
-                    println!("📝 Input: {}", serde_json::to_string_pretty(&tool_input).unwrap_or_default());
-                    flush_stdout();
-                }
-                StreamEvent::ToolResultDelta { delta, .. } => {
-                    print!("\x1b[38;2;140;180;150m{}\x1b[0m", delta);
-                    flush_stdout();
-                }
-                StreamEvent::ToolResult { tool_id, result } => {
-                    println!("✅ Tool result ({}): {}", tool_id, result);
-                    print!("💬 ");
-                    flush_stdout();
-                }
-                StreamEvent::MessageHistory(history) => {
-                    messages = history;
-                }
-                StreamEvent::Usage { .. } => {}
-                // Subagent lifecycle — print inline for non-TUI chat
-                StreamEvent::SubagentStart { agent_name, task_preview, .. } => {
-                    println!("\n\x1b[35m🎭 [{}] dispatched: {}\x1b[0m", agent_name, task_preview);
-                    flush_stdout();
-                }
-                StreamEvent::SubagentUpdate { agent_name, status, .. } => {
-                    print!("\x1b[90m  [{}] {}\x1b[0m\r", agent_name, status);
-                    flush_stdout();
-                }
-                StreamEvent::SubagentDone { agent_name, duration_secs, .. } => {
-                    println!("\x1b[32m✔ [{}] done ({:.1}s)\x1b[0m", agent_name, duration_secs);
-                    flush_stdout();
-                }
-                StreamEvent::SteeringDelivered { message } => {
-                    println!("\n\x1b[33m→ [steering] {}\x1b[0m", message);
-                    flush_stdout();
-                }
-                StreamEvent::Done => {
-                    if in_thinking {
-                        println!();
-                    }
-                    println!("\n");
-                    break;
-                }
-                StreamEvent::Error(err) => {
-                    if in_thinking {
-                        println!();
-                    }
-                    println!("❌ Error: {}\n", err);
-                    // Remove the user message that caused the error
-                    messages.pop();
-                    break;
-                }
-            }
-        }
-    }
     Ok(())
 }
