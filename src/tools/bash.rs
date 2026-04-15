@@ -39,6 +39,7 @@ impl Tool for BashTool {
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(command)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
