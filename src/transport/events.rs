@@ -1,6 +1,8 @@
+use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     Text(String),
     Thinking(String),
@@ -11,7 +13,8 @@ pub enum AgentEvent {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum ToolEvent {
     Start { tool_name: String, tool_id: String },
     ArgsDelta(String),
@@ -20,14 +23,16 @@ pub enum ToolEvent {
     Complete { tool_id: String, result: String, elapsed_ms: Option<u64> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum SubagentEvent {
     Start { id: u64, agent_name: String, task_preview: String },
     Update { id: u64, agent_name: String, status: String },
     Done { id: u64, agent_name: String, result_preview: String, duration_secs: f64 },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum MetaEvent {
     Usage {
         input_tokens: u64,

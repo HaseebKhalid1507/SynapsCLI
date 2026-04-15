@@ -1,4 +1,5 @@
 use super::*;
+use synaps_cli::AgentHarness;
 
 /// Spawn an agent worker process
 pub(crate) async fn spawn_agent(agent: &mut ManagedAgent, trigger_context: &str) -> Result<(), String> {
@@ -27,6 +28,49 @@ pub(crate) async fn spawn_agent(agent: &mut ManagedAgent, trigger_context: &str)
 
     log(&format!("[{}] started (pid: {:?})", agent.name, agent.pid));
     Ok(())
+}
+
+/// Spawn an agent as an in-process tokio task (task isolation mode).
+pub(crate) async fn spawn_agent_inprocess(
+    agent: &mut ManagedAgent,
+    trigger_context: &str,
+) -> Result<(), String> {
+    let config_path = agent.config_path.to_string_lossy().to_string();
+    let trigger = trigger_context.to_string();
+    let name = agent.name.clone();
+
+    log(&format!("[{}] spawning in-process session #{}", name, agent.session_count + 1));
+
+    let mut harness = AgentHarness::from_config(&config_path, Some(&trigger)).await?;
+    harness.init().await?;
+
+    let bus_handle = harness.bus_handle()
+        .ok_or_else(|| "harness init() did not produce a bus handle".to_string())?;
+
+    let task_handle = tokio::spawn(async move {
+        if let Err(e) = harness.run().await {
+            let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
+            eprintln!("[{}] [{}] session error: {}", ts, name, e);
+        }
+    });
+
+    agent.bus_handle = Some(bus_handle);
+    agent.task_handle = Some(task_handle);
+    agent.session_count += 1;
+    agent.last_start = Some(Instant::now());
+    agent.pid = None; // no PID in task mode
+
+    log(&format!("[{}] started (in-process task)", agent.name));
+    Ok(())
+}
+
+/// Spawn an agent using the configured isolation mode (process or task).
+pub(crate) async fn spawn_agent_auto(agent: &mut ManagedAgent, trigger_context: &str) -> Result<(), String> {
+    if agent.config.agent.isolation == "task" {
+        spawn_agent_inprocess(agent, trigger_context).await
+    } else {
+        spawn_agent(agent, trigger_context).await
+    }
 }
 
 /// Check heartbeat freshness
@@ -219,7 +263,7 @@ pub(crate) fn spawn_watch_task(
                         log(&format!("[{}] agent already running — ignoring trigger", agent_name));
                         continue;
                     }
-                    if let Err(e) = spawn_agent(agent, &trigger_context).await {
+                    if let Err(e) = spawn_agent_auto(agent, &trigger_context).await {
                         log(&format!("[{}] failed to start: {}", agent_name, e));
                         continue;
                     }
@@ -358,7 +402,7 @@ pub(crate) async fn run_supervisor() {
         let mut agents_map = agents.lock().await;
         for (name, agent) in agents_map.iter_mut() {
             if agent.config.agent.trigger == "always" {
-                if let Err(e) = spawn_agent(agent, "supervisor start (always-on)").await {
+                if let Err(e) = spawn_agent_auto(agent, "supervisor start (always-on)").await {
                     log(&format!("[{}] failed to start: {}", name, e));
                 }
             }
@@ -435,7 +479,7 @@ pub(crate) async fn run_supervisor() {
                                             if let Some(agent) = agents_map.get_mut(&agent_name) {
                                                 let ctx = if code == 0 { "automatic restart (always-on)" }
                                                           else { "crash recovery restart" };
-                                                if let Err(e) = spawn_agent(agent, ctx).await {
+                                                if let Err(e) = spawn_agent_auto(agent, ctx).await {
                                                     log(&format!("[{}] failed to restart: {}", agent_name, e));
                                                 }
                                             }

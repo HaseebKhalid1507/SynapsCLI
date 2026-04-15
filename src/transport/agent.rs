@@ -16,6 +16,7 @@ use crate::watcher_types::{
 };
 use crate::{Runtime, Session};
 
+use super::bus::BusHandle;
 use super::driver::{ConversationDriver, DriverConfig};
 use super::events::{AgentEvent, MetaEvent, ToolEvent};
 use super::Inbound;
@@ -160,6 +161,12 @@ pub struct AgentHarness {
     // State flags
     watcher_exit_called: bool,
     exit_reason: String,
+
+    // In-process driver state (populated after init())
+    bus_handle: Option<BusHandle>,
+    event_rx: Option<broadcast::Receiver<AgentEvent>>,
+    inbound_tx: Option<tokio::sync::mpsc::UnboundedSender<Inbound>>,
+    driver_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AgentHarness {
@@ -227,11 +234,16 @@ impl AgentHarness {
             trigger_context: trigger,
             watcher_exit_called: false,
             exit_reason: "unknown".to_string(),
+            bus_handle: None,
+            event_rx: None,
+            inbound_tx: None,
+            driver_task: None,
         })
     }
 
-    /// Run the autonomous agent session.
-    pub async fn run(&mut self) -> Result<(), String> {
+    /// Initialize the driver, runtime, and session. Call before run().
+    /// After init(), bus_handle() returns a handle for attaching transports.
+    pub async fn init(&mut self) -> Result<(), String> {
         let name = self.config.agent.name.clone();
         log(&name, &format!(
             "booting (model: {}, trigger: {})",
@@ -257,7 +269,7 @@ impl AgentHarness {
         runtime.set_system_prompt(soul);
 
         let handoff_path = self.agent_dir.join("handoff.json");
-        runtime.watcher_exit_path = Some(handoff_path.clone());
+        runtime.watcher_exit_path = Some(handoff_path);
 
         // Register watcher_exit tool
         {
@@ -285,21 +297,49 @@ impl AgentHarness {
 
         let driver_config = DriverConfig {
             agent_name: Some(name.clone()),
-            auto_save: false, // Agent manages its own lifecycle
+            auto_save: false,
             ..Default::default()
         };
 
         let mut driver = ConversationDriver::new(runtime, session, driver_config);
 
-        // Get bus handle before we move driver
+        // Extract bus handle before spawning driver
         let bus_handle = driver.bus().handle();
-        let mut event_rx = bus_handle.subscribe();
+        let event_rx = bus_handle.subscribe();
         let inbound_tx = bus_handle.inbound();
 
         // Spawn driver loop
-        tokio::spawn(async move {
+        let driver_task = tokio::spawn(async move {
             let _ = driver.run().await;
         });
+
+        self.bus_handle = Some(bus_handle);
+        self.event_rx = Some(event_rx);
+        self.inbound_tx = Some(inbound_tx);
+        self.driver_task = Some(driver_task);
+
+        Ok(())
+    }
+
+    /// Get a BusHandle for attaching transports. Only available after init().
+    pub fn bus_handle(&self) -> Option<BusHandle> {
+        self.bus_handle.clone()
+    }
+
+    /// Run the autonomous agent session.
+    pub async fn run(&mut self) -> Result<(), String> {
+        let name = self.config.agent.name.clone();
+
+        // If init() hasn't been called, call it now (backwards compat)
+        if self.bus_handle.is_none() {
+            self.init().await?;
+        }
+
+        let inbound_tx = self.inbound_tx.take()
+            .expect("init() must be called before run()");
+        let mut event_rx = self.event_rx.take()
+            .expect("init() must be called before run()");
+        let handoff_path = self.agent_dir.join("handoff.json");
 
         // Send boot message
         inbound_tx

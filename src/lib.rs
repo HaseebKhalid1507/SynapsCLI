@@ -23,6 +23,9 @@ pub use watcher_types::{
     AgentConfig, SessionLimits, HandoffState, ExitReason, SessionStats,
     WatcherCommand, WatcherResponse, AgentStatusInfo
 };
+pub use transport::{
+    BusHandle, AgentEvent, SyncState, AttachEvent, AttachInbound, AgentHarness,
+};
 
 // Re-export for convenience
 pub use serde_json::Value;

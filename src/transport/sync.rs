@@ -1,6 +1,7 @@
+use serde::{Serialize, Deserialize};
 use super::AgentEvent;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
     pub agent_name: Option<String>,
     pub model: String,

@@ -8,6 +8,7 @@ pub enum WatcherCommand {
     Stop { name: String },
     Status,
     AgentStatus { name: String },
+    Attach { name: String, mode: String },
 }
 
 /// Responses from supervisor to CLI
@@ -17,6 +18,7 @@ pub enum WatcherResponse {
     Error { message: String },
     Status { agents: Vec<AgentStatusInfo> },
     AgentDetail { info: AgentStatusInfo },
+    AttachOk { sync_state: String },
 }
 
 /// Runtime info for a single agent (for status display)
@@ -60,6 +62,8 @@ pub struct AgentInfo {
     pub thinking: String,
     #[serde(default = "default_trigger")]
     pub trigger: String,
+    #[serde(default = "default_isolation")]
+    pub isolation: String,
 }
 
 /// Trigger-specific configuration (for watch, cron, webhook modes)
@@ -196,6 +200,7 @@ impl AgentConfig {
 fn default_model() -> String { "claude-sonnet-4-20250514".to_string() }
 fn default_thinking() -> String { "medium".to_string() }
 fn default_trigger() -> String { "manual".to_string() }
+fn default_isolation() -> String { "task".to_string() }
 fn default_max_tokens() -> u64 { 100_000 }
 fn default_max_duration() -> u64 { 60 }
 fn default_max_cost() -> f64 { 0.50 }

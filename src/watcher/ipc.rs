@@ -1,4 +1,5 @@
 use super::*;
+use synaps_cli::{AttachEvent, AttachInbound, SyncState};
 
 /// Handle IPC command from CLI
 pub(crate) async fn handle_ipc_command(
@@ -40,7 +41,7 @@ pub(crate) async fn handle_ipc_command(
                 // Un-stop it and restart if needed
                 agent.stopped = false;
                 if agent.config.agent.trigger == "always" {
-                    match spawn_agent(agent, "deploy restart").await {
+                    match spawn_agent_auto(agent, "deploy restart").await {
                         Ok(()) => WatcherResponse::Ok {
                             message: format!("Agent '{}' deployed and started", name)
                         },
@@ -116,6 +117,14 @@ pub(crate) async fn handle_ipc_command(
                 }
             }
         }
+
+        WatcherCommand::Attach { name, mode: _ } => {
+            // Attach is handled specially in handle_ipc_connection — this shouldn't be reached
+            // But just in case, return an error
+            WatcherResponse::Error {
+                message: format!("Attach for '{}' must be handled at connection level", name)
+            }
+        }
     }
 }
 
@@ -182,23 +191,138 @@ pub(crate) async fn ipc_listener(agents: Arc<Mutex<HashMap<String, ManagedAgent>
 
 /// Handle a single IPC connection
 pub(crate) async fn handle_ipc_connection(
-    mut stream: UnixStream,
+    stream: UnixStream,
     agents: Arc<Mutex<HashMap<String, ManagedAgent>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(&mut stream);
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     
-    reader.read_line(&mut line).await?;
+    buf_reader.read_line(&mut line).await?;
     let command: WatcherCommand = serde_json::from_str(line.trim())?;
+    
+    // Attach is special — it upgrades the connection to streaming mode
+    if let WatcherCommand::Attach { ref name, ref mode } = command {
+        let (bus_handle, sync_json) = {
+            let agents_map = agents.lock().await;
+            match agents_map.get(name) {
+                Some(agent) if agent.bus_handle.is_some() => {
+                    let bh = agent.bus_handle.clone().unwrap();
+                    // Build a minimal sync state
+                    let sync = SyncState {
+                        agent_name: Some(name.clone()),
+                        model: agent.config.agent.model.clone(),
+                        thinking_level: agent.config.agent.thinking.clone(),
+                        session_id: format!("session-{}", agent.session_count),
+                        is_streaming: agent.is_running(),
+                        turn_count: 0,
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        partial_text: None,
+                        partial_thinking: None,
+                        active_tool: None,
+                        recent_events: Vec::new(),
+                    };
+                    let sync_str = serde_json::to_string(&sync).unwrap_or_default();
+                    (bh, sync_str)
+                }
+                Some(_) => {
+                    let resp = WatcherResponse::Error {
+                        message: format!("Agent '{}' is not running in-process", name)
+                    };
+                    let resp_json = serde_json::to_string(&resp)?;
+                    writer.write_all(resp_json.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                    return Ok(());
+                }
+                None => {
+                    let resp = WatcherResponse::Error {
+                        message: format!("Agent '{}' not found", name)
+                    };
+                    let resp_json = serde_json::to_string(&resp)?;
+                    writer.write_all(resp_json.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        // Send AttachOk
+        let resp = WatcherResponse::AttachOk { sync_state: sync_json };
+        let resp_json = serde_json::to_string(&resp)?;
+        writer.write_all(resp_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        // Switch to streaming mode
+        handle_attach(buf_reader, writer, bus_handle, mode.clone()).await;
+        return Ok(());
+    }
     
     let response = handle_ipc_command(command, agents).await;
     let response_json = serde_json::to_string(&response)?;
     
-    stream.write_all(response_json.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
+    writer.write_all(response_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     
     Ok(())
+}
+
+/// Handle an attached streaming session
+async fn handle_attach(
+    mut buf_reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    bus_handle: synaps_cli::BusHandle,
+    mode: String,
+) {
+    let mut event_rx = bus_handle.subscribe();
+    let inbound_tx = bus_handle.inbound();
+    let read_only = mode == "ro";
+
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Ok(e) => {
+                        let wire = AttachEvent::Event { event: e };
+                        let Ok(json) = serde_json::to_string(&wire) else { break };
+                        if writer.write_all(json.as_bytes()).await.is_err() { break; }
+                        if writer.write_all(b"\n").await.is_err() { break; }
+                        let _ = writer.flush().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+
+            line = async {
+                let mut line = String::new();
+                buf_reader.read_line(&mut line).await.map(|_| line)
+            }, if !read_only => {
+                match line {
+                    Ok(ref l) if l.is_empty() => break, // EOF
+                    Ok(ref l) => {
+                        if let Ok(msg) = serde_json::from_str::<AttachInbound>(l) {
+                            match msg {
+                                AttachInbound::Message { content } => {
+                                    let _ = inbound_tx.send(synaps_cli::transport::Inbound::Message { content });
+                                }
+                                AttachInbound::Cancel => {
+                                    let _ = inbound_tx.send(synaps_cli::transport::Inbound::Cancel);
+                                }
+                                AttachInbound::Detach => break,
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
 }
 
 /// Send command to supervisor via IPC

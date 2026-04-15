@@ -12,6 +12,7 @@ pub mod driver;
 pub mod stdio;
 pub mod websocket;
 pub mod agent;
+pub mod attach;
 
 pub use events::{AgentEvent, ToolEvent, SubagentEvent, MetaEvent};
 pub use inbound::Inbound;
@@ -21,6 +22,7 @@ pub use driver::ConversationDriver;
 pub use stdio::StdioTransport;
 pub use websocket::WebSocketTransport;
 pub use agent::AgentHarness;
+pub use attach::{AttachEvent, AttachInbound};
 
 use async_trait::async_trait;
 

@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::os::unix::fs::PermissionsExt;
-use synaps_cli::{AgentConfig, WatcherCommand, WatcherResponse, AgentStatusInfo};
+use synaps_cli::{AgentConfig, WatcherCommand, WatcherResponse, AgentStatusInfo, BusHandle};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -79,7 +79,9 @@ pub(crate) struct ManagedAgent {
     pub(crate) name: String,
     pub(crate) config_path: PathBuf,
     pub(crate) config: AgentConfig,
-    pub(crate) child: Option<tokio::process::Child>,
+    pub(crate) child: Option<tokio::process::Child>,  // process isolation mode
+    pub(crate) bus_handle: Option<BusHandle>,          // task isolation mode
+    pub(crate) task_handle: Option<tokio::task::JoinHandle<()>>,  // task isolation mode
     pub(crate) pid: Option<u32>,
     pub(crate) session_count: u64,
     pub(crate) consecutive_crashes: u32,
@@ -95,6 +97,8 @@ impl ManagedAgent {
             config_path,
             config,
             child: None,
+            bus_handle: None,
+            task_handle: None,
             pid: None,
             session_count: 0,
             consecutive_crashes: 0,
@@ -105,7 +109,7 @@ impl ManagedAgent {
     }
 
     pub(crate) fn is_running(&self) -> bool {
-        self.child.is_some()
+        self.child.is_some() || self.task_handle.is_some()
     }
 
     pub(crate) fn status_str(&self) -> &str {
@@ -389,6 +393,78 @@ async fn main() {
             }
         }
 
+        "attach" => {
+            let name = args.get(2).unwrap_or_else(|| {
+                eprintln!("Usage: watcher attach <name> [--readonly]");
+                std::process::exit(1);
+            });
+            if let Err(e) = validate_agent_name(name) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            let mode = if args.iter().any(|a| a == "--readonly" || a == "--ro") { "ro" } else { "rw" };
+
+            let socket_path = watcher_dir().join("watcher.sock");
+            if !socket_path.exists() {
+                eprintln!("Supervisor not running. Start with: watcher run");
+                std::process::exit(1);
+            }
+            let mut stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
+                eprintln!("Failed to connect to supervisor: {}", e);
+                std::process::exit(1);
+            });
+
+            // Send attach command
+            let cmd = serde_json::to_string(&WatcherCommand::Attach {
+                name: name.clone(),
+                mode: mode.to_string(),
+            }).unwrap();
+            stream.write_all(cmd.as_bytes()).await.ok();
+            stream.write_all(b"\n").await.ok();
+            stream.flush().await.ok();
+
+            // Read streaming events
+            let mut reader = BufReader::new(stream);
+            eprintln!("Attached to '{}' ({}). Ctrl+C to detach.\n", name, mode);
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() { continue; }
+                        // Try to parse as attach protocol
+                        if let Ok(event) = serde_json::from_str::<synaps_cli::AttachEvent>(trimmed) {
+                            match event {
+                                synaps_cli::AttachEvent::Sync { .. } => {
+                                    eprintln!("[sync received]");
+                                }
+                                synaps_cli::AttachEvent::Event { event } => {
+                                    // Simple text-mode display
+                                    match &event {
+                                        synaps_cli::transport::AgentEvent::Text(t) => print!("{}", t),
+                                        synaps_cli::transport::AgentEvent::Thinking(t) => eprint!("\x1b[2m{}\x1b[0m", t),
+                                        synaps_cli::transport::AgentEvent::TurnComplete => println!(),
+                                        synaps_cli::transport::AgentEvent::Error(e) => eprintln!("\x1b[31mError: {}\x1b[0m", e),
+                                        synaps_cli::transport::AgentEvent::Tool(synaps_cli::transport::ToolEvent::Invoke { tool_name, .. }) => {
+                                            eprintln!("\x1b[33m⚡ {}\x1b[0m", tool_name);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        } else if let Ok(WatcherResponse::Error { message }) = serde_json::from_str::<WatcherResponse>(trimmed) {
+                            eprintln!("Error: {}", message);
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         "help" | "--help" | "-h" => {
             println!("watcher — Autonomous agent supervisor");
             println!();
@@ -396,6 +472,7 @@ async fn main() {
             println!("  watcher run                 Start supervisor daemon (foreground)");
             println!("  watcher deploy <name>       Deploy/start an agent");
             println!("  watcher stop <name>         Stop an agent");  
+            println!("  watcher attach <name>       Attach to a running agent's event stream");
             println!("  watcher once <name>         Run agent once without supervision");
             println!("  watcher init <name>         Create new agent from template");
             println!("  watcher list                List configured agents");
