@@ -50,7 +50,7 @@ pub(super) async fn handle_command(
     arg: &str,
     app: &mut App,
     inbound_tx: &mpsc::UnboundedSender<Inbound>,
-    system_prompt_path: &PathBuf,
+    system_prompt_path: Option<&PathBuf>,
 ) -> CommandAction {
     let _ = system_prompt_path; // reserved for future use
     match cmd {

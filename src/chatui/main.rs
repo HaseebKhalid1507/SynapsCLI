@@ -10,6 +10,7 @@ mod draw;
 mod commands;
 mod input;
 mod stream_handler;
+mod attach;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -86,6 +87,14 @@ struct Cli {
 
     #[arg(long, global = true)]
     profile: Option<String>,
+
+    /// Attach to a running watcher agent's event stream (full TUI).
+    #[arg(long = "attach", value_name = "AGENT_NAME")]
+    attach: Option<String>,
+
+    /// Attach in read-only mode (observe only, no sending messages).
+    #[arg(long = "readonly", requires = "attach")]
+    readonly: bool,
 }
 
 #[tokio::main]
@@ -96,103 +105,144 @@ async fn main() -> Result<()> {
     }
 
     let _log_guard = synaps_cli::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
 
-    // Load config and apply
-    let config = synaps_cli::config::load_config();
-    runtime.apply_config(&config);
-
-    // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
-
-    // Auto-load skills specified in config (injected into system prompt)
-    let mut final_prompt = system_prompt;
-    if let Some(ref skill_names) = config.skills {
-        let auto_skills = synaps_cli::skills::load_skills(Some(skill_names));
-        if !auto_skills.is_empty() {
-            let names: Vec<&str> = auto_skills.iter().map(|s| s.name.as_str()).collect();
-            eprintln!("\x1b[2m  📚 {} skills auto-loaded: {}\x1b[0m", auto_skills.len(), names.join(", "));
-            final_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&auto_skills));
-        }
-    }
-    runtime.set_system_prompt(final_prompt);
-
-    // Register load_skill tool for on-demand activation of any skill
-    let skill_count = synaps_cli::skills::setup_skill_tool(&runtime.tools_shared()).await;
-    if skill_count > 0 {
-        eprintln!("\x1b[2m  📚 {} skills available on demand (load_skill tool)\x1b[0m", skill_count);
-    }
-
-    // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
-    let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
-    if mcp_server_count > 0 {
-        eprintln!("\x1b[2m  ⚡ {} MCP servers available (use mcp_connect to activate)\x1b[0m", mcp_server_count);
-    }
-
-    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-
-    // Capture display info before handing runtime to driver
-    let model_name = runtime.model().to_string();
-    let thinking_level = runtime.thinking_level().to_string();
-
-    // Session: continue existing or create new
-    let (mut app, session) = match cli.continue_session {
-        Some(maybe_id) => {
-            let session = match maybe_id {
-                Some(id) => find_session(&id).unwrap_or_else(|e| {
-                    eprintln!("Failed to load session '{}': {}", id, e);
-                    std::process::exit(1);
-                }),
-                None => latest_session().unwrap_or_else(|e| {
-                    eprintln!("No sessions to continue: {}", e);
-                    std::process::exit(1);
-                }),
-            };
-            runtime.set_model(session.model.clone());
-            if let Some(ref sp) = session.system_prompt {
-                runtime.set_system_prompt(sp.clone());
+    // ── Two modes: local driver OR attach to running agent ──
+    let (mut event_rx, inbound_tx, mut app, _model_name, _thinking_level, system_prompt_path) = if let Some(ref agent_name) = cli.attach {
+        // ── ATTACH MODE: connect to watcher agent ──
+        let session = match attach::AttachSession::connect(agent_name, cli.readonly).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Attach failed: {}", e);
+                std::process::exit(1);
             }
-            let mut app = App::new(session.clone());
-            app.api_messages = session.api_messages.clone();
-            app.total_input_tokens = session.total_input_tokens;
-            app.total_output_tokens = session.total_output_tokens;
-            app.session_cost = session.session_cost;
-            app.abort_context = session.abort_context.clone();
-            app.model_name = session.model.clone();
-            app.thinking_level = runtime.thinking_level().to_string();
-            rebuild_display_messages(&session.api_messages, &mut app);
-            app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
-            if app.abort_context.is_some() {
-                app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
+        };
+
+        let model_name = session.sync_state.model.clone();
+        let thinking_level = session.sync_state.thinking_level.clone();
+
+        // Create a minimal session for the App (display only — no local save needed)
+        let display_session = Session::new(&model_name, &thinking_level, None);
+        let mut app = App::new(display_session);
+        app.model_name = model_name.clone();
+        app.thinking_level = thinking_level.clone();
+        let agent_label = session.sync_state.agent_name.as_deref().unwrap_or(agent_name);
+        app.push_msg(ChatMessage::System(format!("attached to agent '{}' ({})", agent_label, if cli.readonly { "read-only" } else { "interactive" })));
+        if session.sync_state.is_streaming {
+            app.streaming = true;
+            app.push_msg(ChatMessage::System("agent is currently streaming...".into()));
+        }
+
+        let event_rx = session.event_rx;
+        let inbound_tx = session.inbound_tx;
+
+        // Keep the session alive (tasks run until dropped)
+        std::mem::forget(session._reader_task);
+        std::mem::forget(session._writer_task);
+
+        let system_prompt_path: Option<std::path::PathBuf> = None;
+        (event_rx, inbound_tx, app, model_name, thinking_level, system_prompt_path)
+    } else {
+        // ── LOCAL MODE: create runtime + driver ──
+        let mut runtime = Runtime::new().await?;
+
+        // Load config and apply
+        let config = synaps_cli::config::load_config();
+        runtime.apply_config(&config);
+
+        // Load system prompt
+        let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+
+        // Auto-load skills specified in config (injected into system prompt)
+        let mut final_prompt = system_prompt;
+        if let Some(ref skill_names) = config.skills {
+            let auto_skills = synaps_cli::skills::load_skills(Some(skill_names));
+            if !auto_skills.is_empty() {
+                let names: Vec<&str> = auto_skills.iter().map(|s| s.name.as_str()).collect();
+                eprintln!("\x1b[2m  📚 {} skills auto-loaded: {}\x1b[0m", auto_skills.len(), names.join(", "));
+                final_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&auto_skills));
             }
-            (app, session)
         }
-        None => {
-            let session = Session::new(&model_name, &thinking_level, runtime.system_prompt());
-            let app = App::new(session.clone());
-            (app, session)
+        runtime.set_system_prompt(final_prompt);
+
+        // Register load_skill tool for on-demand activation of any skill
+        let skill_count = synaps_cli::skills::setup_skill_tool(&runtime.tools_shared()).await;
+        if skill_count > 0 {
+            eprintln!("\x1b[2m  📚 {} skills available on demand (load_skill tool)\x1b[0m", skill_count);
         }
+
+        // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
+        let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
+        if mcp_server_count > 0 {
+            eprintln!("\x1b[2m  ⚡ {} MCP servers available (use mcp_connect to activate)\x1b[0m", mcp_server_count);
+        }
+
+        let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
+
+        // Capture display info before handing runtime to driver
+        let model_name = runtime.model().to_string();
+        let thinking_level = runtime.thinking_level().to_string();
+
+        // Session: continue existing or create new
+        let (app, session) = match cli.continue_session {
+            Some(maybe_id) => {
+                let session = match maybe_id {
+                    Some(id) => find_session(&id).unwrap_or_else(|e| {
+                        eprintln!("Failed to load session '{}': {}", id, e);
+                        std::process::exit(1);
+                    }),
+                    None => latest_session().unwrap_or_else(|e| {
+                        eprintln!("No sessions to continue: {}", e);
+                        std::process::exit(1);
+                    }),
+                };
+                runtime.set_model(session.model.clone());
+                if let Some(ref sp) = session.system_prompt {
+                    runtime.set_system_prompt(sp.clone());
+                }
+                let mut app = App::new(session.clone());
+                app.api_messages = session.api_messages.clone();
+                app.total_input_tokens = session.total_input_tokens;
+                app.total_output_tokens = session.total_output_tokens;
+                app.session_cost = session.session_cost;
+                app.abort_context = session.abort_context.clone();
+                app.model_name = session.model.clone();
+                app.thinking_level = runtime.thinking_level().to_string();
+                rebuild_display_messages(&session.api_messages, &mut app);
+                app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
+                if app.abort_context.is_some() {
+                    app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
+                }
+                (app, session)
+            }
+            None => {
+                let session = Session::new(&model_name, &thinking_level, runtime.system_prompt());
+                let app = App::new(session.clone());
+                (app, session)
+            }
+        };
+
+        // ── Create driver and bus ──
+        let driver_config = DriverConfig {
+            agent_name: None,
+            auto_save: true,
+            event_buffer_size: 100,
+        };
+        let mut driver = ConversationDriver::new(runtime, session, driver_config);
+
+        // Get bus handle before spawning driver
+        let bus_handle = driver.bus().handle();
+        let event_rx = bus_handle.subscribe();
+        let inbound_tx = bus_handle.inbound();
+
+        // Spawn driver in background
+        tokio::spawn(async move {
+            if let Err(e) = driver.run().await {
+                tracing::error!("Driver error: {}", e);
+            }
+        });
+
+        (event_rx, inbound_tx, app, model_name, thinking_level, Some(system_prompt_path))
     };
-
-    // ── Create driver and bus ──
-    let driver_config = DriverConfig {
-        agent_name: None,
-        auto_save: true,
-        event_buffer_size: 100,
-    };
-    let mut driver = ConversationDriver::new(runtime, session, driver_config);
-
-    // Get bus handle before spawning driver
-    let bus_handle = driver.bus().handle();
-    let mut event_rx = bus_handle.subscribe();
-    let inbound_tx = bus_handle.inbound();
-
-    // Spawn driver in background
-    tokio::spawn(async move {
-        if let Err(e) = driver.run().await {
-            tracing::error!("Driver error: {}", e);
-        }
-    });
 
     // ── Terminal setup ──
     enable_raw_mode().map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
@@ -274,7 +324,7 @@ async fn main() -> Result<()> {
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &inbound_tx, &system_prompt_path).await {
+                                match commands::handle_command(&cmd, &arg, &mut app, &inbound_tx, system_prompt_path.as_ref()).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
