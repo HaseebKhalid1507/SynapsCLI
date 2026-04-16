@@ -292,6 +292,13 @@ where
             event = event_rx.recv() => {
                 match event {
                     Ok(e) => {
+                        // MessageHistory is a TUI-local sync signal — it carries the full
+                        // conversation Vec<Value> and is broadcast on every auto-save.
+                        // Forwarding it to attached clients over NDJSON would send the
+                        // entire message history down the wire every turn. Skip.
+                        if matches!(e, synaps_cli::transport::AgentEvent::MessageHistory(_)) {
+                            continue;
+                        }
                         let wire = AttachEvent::Event { event: e };
                         let Ok(json) = serde_json::to_string(&wire) else { break };
                         if writer.write_all(json.as_bytes()).await.is_err() { break; }
@@ -640,6 +647,41 @@ mod attach_tests {
             .expect("inbound_rx timed out after valid message")
             .expect("inbound_rx closed");
         assert!(matches!(received, Inbound::Message { .. }));
+
+        join.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 9: MessageHistory is filtered out of the attach stream
+    //
+    // MessageHistory is a TUI-local sync signal — the driver broadcasts the
+    // full Vec<Value> on every auto-save. Forwarding it over NDJSON to every
+    // attached client would ship the entire conversation history down the
+    // wire every turn. The attach handler must drop it silently.
+    // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_message_history_filtered_from_attach_stream() {
+        let (mut client_r, _client_w, join, bus) = spawn_attach_session("rw");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Broadcast a MessageHistory event — should be suppressed
+        bus.broadcast(AgentEvent::MessageHistory(vec![
+            serde_json::json!({"role": "user", "content": "should not reach client"}),
+        ]));
+
+        // Immediately broadcast a Text event — should reach the client
+        bus.broadcast(AgentEvent::Text("visible".to_string()));
+
+        // The NEXT event the client reads must be the Text event, not MessageHistory
+        let ev = recv_attach_event(&mut client_r).await;
+        match ev {
+            AttachEvent::Event { event: AgentEvent::Text(t) } => assert_eq!(t, "visible"),
+            AttachEvent::Event { event: AgentEvent::MessageHistory(_) } => {
+                panic!("MessageHistory leaked to attached client")
+            }
+            other => panic!("expected Event(Text), got {:?}", other),
+        }
 
         join.abort();
     }
