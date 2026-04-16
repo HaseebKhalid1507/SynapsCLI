@@ -135,9 +135,10 @@ async fn main() -> Result<()> {
         let event_rx = session.event_rx;
         let inbound_tx = session.inbound_tx;
 
-        // Keep the session alive (tasks run until dropped)
-        std::mem::forget(session._reader_task);
-        std::mem::forget(session._writer_task);
+        // Keep session tasks alive by storing the session
+        // (tokio tasks continue running even if JoinHandle is dropped,
+        // but we hold it to be explicit about lifecycle)
+        let _attach_session = (session._reader_task, session._writer_task);
 
         let system_prompt_path: Option<std::path::PathBuf> = None;
         (event_rx, inbound_tx, app, model_name, thinking_level, system_prompt_path)
@@ -497,6 +498,22 @@ async fn main() -> Result<()> {
                         tracing::warn!("TUI lagged, missed {} events", n);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // In attach mode this means the socket connection was lost
+                        app.push_msg(ChatMessage::Error("connection lost — agent disconnected".to_string()));
+                        app.streaming = false;
+                        let elapsed = last_frame.elapsed();
+                        last_frame = Instant::now();
+                        { let m = app.model_name.clone(); let t = app.thinking_level.clone(); let _ = draw(&mut terminal, &mut app, &m, &t, &mut boot_fx, &mut exit_fx, elapsed); }
+                        // Wait for user to quit manually instead of vanishing
+                        if cli.attach.is_some() {
+                            loop {
+                                if let Some(Ok(crossterm::event::Event::Key(key))) = event_reader.next().await {
+                                    if matches!(key.code, crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         break;
                     }
                 }

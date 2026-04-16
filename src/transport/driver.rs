@@ -45,6 +45,7 @@ pub struct ConversationDriver {
     cancel: Option<CancellationToken>,
     steer_tx: Option<mpsc::UnboundedSender<String>>,
     is_streaming: bool,
+    queued_followup: Option<String>,
 
     // For SyncState
     partial_text: String,
@@ -71,6 +72,7 @@ impl ConversationDriver {
             cancel: None,
             steer_tx: None,
             is_streaming: false,
+            queued_followup: None,
             partial_text: String::new(),
             partial_thinking: String::new(),
             active_tool: None,
@@ -121,6 +123,11 @@ impl ConversationDriver {
             match inbound {
                 Inbound::Message { content } => {
                     self.handle_user_message(content, &mut inbound_rx).await?;
+                    // If a message arrived during streaming (e.g. user aborted
+                    // then resent), process it now.
+                    if let Some(followup) = self.queued_followup.take() {
+                        self.handle_user_message(followup, &mut inbound_rx).await?;
+                    }
                 }
                 Inbound::Steer { content } => {
                     if let Some(ref tx) = self.steer_tx {
@@ -214,8 +221,16 @@ impl ConversationDriver {
                         Inbound::Command { name, args } => {
                             self.handle_command(&name, &args);
                         }
-                        // Messages arriving during streaming are ignored —
-                        // the TUI queues them and resends after TurnComplete.
+                        // Messages arriving during streaming get queued —
+                        // the sender (TUI) expects them to be delivered after
+                        // the current stream finishes (e.g. abort then resend).
+                        Inbound::Message { content } => {
+                            // Push back: the outer run() loop will pick this up
+                            // after handle_user_message returns.
+                            // We can't easily push back into inbound_rx, so
+                            // we handle it as a queued follow-up.
+                            self.queued_followup = Some(content);
+                        }
                         _ => {}
                     }
                 }
