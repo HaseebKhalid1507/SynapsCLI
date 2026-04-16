@@ -19,6 +19,7 @@ pub(super) fn needs_immediate_draw(event: &AgentEvent) -> bool {
         | AgentEvent::Tool(ToolEvent::Complete { .. })
         | AgentEvent::Subagent(_)
         | AgentEvent::Meta(MetaEvent::Steered { .. })
+        | AgentEvent::MessageHistory(_)
         | AgentEvent::TurnComplete
         | AgentEvent::Error(_)
     )
@@ -147,6 +148,9 @@ pub(super) fn handle_agent_event(
         }
         AgentEvent::Meta(MetaEvent::Shutdown { .. }) => {
             // Driver is shutting down — TUI will exit on its own
+        }
+        AgentEvent::MessageHistory(h) => {
+            app.api_messages = h;
         }
         AgentEvent::TurnComplete => {
             app.streaming = false;

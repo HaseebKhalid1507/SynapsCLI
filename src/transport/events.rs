@@ -9,6 +9,7 @@ pub enum AgentEvent {
     Tool(ToolEvent),
     Subagent(SubagentEvent),
     Meta(MetaEvent),
+    MessageHistory(Vec<Value>),
     TurnComplete,
     Error(String),
 }
@@ -72,6 +73,7 @@ mod tests {
             task_preview: "task".to_string(),
         });
         let _meta = AgentEvent::Meta(MetaEvent::Steered { message: "test".to_string() });
+        let _msg_history = AgentEvent::MessageHistory(vec![]);
         let _complete = AgentEvent::TurnComplete;
         let _error = AgentEvent::Error("error".to_string());
     }

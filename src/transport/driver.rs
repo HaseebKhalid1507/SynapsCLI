@@ -267,6 +267,8 @@ impl ConversationDriver {
                     if self.config.auto_save {
                         self.save_session().await;
                     }
+                    // Broadcast to TUI so app.api_messages stays in sync
+                    self.emit(AgentEvent::MessageHistory(self.messages.clone()));
                 }
                 StreamEvent::Done => {
                     self.turn_count += 1;
