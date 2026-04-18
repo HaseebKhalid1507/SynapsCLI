@@ -325,9 +325,16 @@ async fn main() -> Result<()> {
                                     }
                                     CommandAction::OpenPlugins => {
                                         let path = synaps_cli::skills::state::PluginsState::default_path();
-                                        let file = synaps_cli::skills::state::PluginsState::load_from(&path)
-                                            .unwrap_or_default();
-                                        app.plugins = Some(plugins::PluginsModalState::new(file));
+                                        match synaps_cli::skills::state::PluginsState::load_from(&path) {
+                                            Ok(file) => {
+                                                app.plugins = Some(plugins::PluginsModalState::new(file));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!(
+                                                    "failed to load plugins.json: {}", e
+                                                )));
+                                            }
+                                        }
                                     }
                                     CommandAction::ReloadPlugins => {
                                         synaps_cli::skills::reload_registry(&registry, &config);
