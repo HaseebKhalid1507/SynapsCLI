@@ -83,6 +83,8 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub disabled_plugins: Vec<String>,
+    pub disabled_skills: Vec<String>,
 }
 
 impl Default for SynapsConfig {
@@ -96,6 +98,8 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            disabled_plugins: Vec::new(),
+            disabled_skills: Vec::new(),
         }
     }
 }
@@ -157,6 +161,18 @@ pub fn load_config() -> SynapsConfig {
                 if let Ok(retries) = val.parse::<u32>() {
                     config.api_retries = retries;
                 }
+            }
+            "disabled_plugins" => {
+                config.disabled_plugins = val.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "disabled_skills" => {
+                config.disabled_skills = val.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             _ => {} // Unknown keys silently ignored
         }
@@ -251,6 +267,38 @@ mod tests {
         assert_eq!(config.bash_max_timeout, 300);
         assert_eq!(config.subagent_timeout, 300);
         assert_eq!(config.api_retries, 3);
+        assert!(config.disabled_plugins.is_empty());
+        assert!(config.disabled_skills.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_disable_lists() {
+        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let config_path = test_dir.join("config");
+
+        let config_content = r#"
+# Test config with disable lists
+disabled_plugins = foo, bar
+disabled_skills = baz, plug:qual
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-disable-lists");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-disable-lists");
+
+        assert_eq!(config.disabled_plugins, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(config.disabled_skills, vec!["baz".to_string(), "plug:qual".to_string()]);
     }
 
     #[test]
