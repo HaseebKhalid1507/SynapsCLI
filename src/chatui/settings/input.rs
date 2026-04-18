@@ -256,7 +256,7 @@ mod tests {
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p1");
-                assert_eq!(enabled, false);
+                assert!(!enabled);
             }
             _ => panic!("expected TogglePlugin"),
         }
@@ -273,7 +273,7 @@ mod tests {
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p2");
-                assert_eq!(enabled, true);
+                assert!(enabled);
             }
             _ => panic!("expected TogglePlugin"),
         }
