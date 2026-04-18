@@ -15,6 +15,7 @@ pub mod registry;
 pub mod tool;
 pub mod state;
 pub mod marketplace;
+pub mod install;
 
 use std::path::PathBuf;
 use std::sync::Arc;
