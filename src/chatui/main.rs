@@ -11,6 +11,7 @@ mod commands;
 mod input;
 mod stream_handler;
 mod settings;
+mod plugins;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -158,7 +159,7 @@ async fn main() -> Result<()> {
     let mut runtime = Runtime::new().await?;
 
     // Load config and apply
-    let config = synaps_cli::config::load_config();
+    let mut config = synaps_cli::config::load_config();
     runtime.apply_config(&config);
 
     // Load system prompt
@@ -236,7 +237,7 @@ async fn main() -> Result<()> {
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
             // ── Tick: animations + spinner (~60fps) ──
@@ -263,7 +264,7 @@ async fn main() -> Result<()> {
                     app.line_cache.clear();
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -322,6 +323,23 @@ async fn main() -> Result<()> {
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
                                     }
+                                    CommandAction::OpenPlugins => {
+                                        let path = synaps_cli::skills::state::PluginsState::default_path();
+                                        match synaps_cli::skills::state::PluginsState::load_from(&path) {
+                                            Ok(file) => {
+                                                app.plugins = Some(plugins::PluginsModalState::new(file));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!(
+                                                    "failed to load plugins.json: {}", e
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ReloadPlugins => {
+                                        synaps_cli::skills::reload_registry(&registry, &config);
+                                        app.push_msg(ChatMessage::System("plugins reloaded".to_string()));
+                                    }
                                     CommandAction::LoadSkill { skill, arg } => {
                                         use synaps_cli::skills::tool::LoadSkillTool;
 
@@ -363,7 +381,7 @@ async fn main() -> Result<()> {
                                         app.spinner_frame = 0;
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
-                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -412,7 +430,7 @@ async fn main() -> Result<()> {
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -454,6 +472,8 @@ async fn main() -> Result<()> {
                                         }
                                         CommandAction::StartStream => {}
                                         CommandAction::OpenSettings => {}
+                                        CommandAction::OpenPlugins => {}
+                                        CommandAction::ReloadPlugins => {}
                                         // handle_streaming_command never returns LoadSkill.
                                         CommandAction::LoadSkill { .. } => {}
                                     }
@@ -472,6 +492,48 @@ async fn main() -> Result<()> {
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
+                            }
+                            InputAction::PluginsOutcome(outcome) => {
+                                if let Some(state) = app.plugins.as_mut() {
+                                    use crate::plugins::InputOutcome as PO;
+                                    match outcome {
+                                        PO::None | PO::Close => {}
+                                        PO::AddMarketplace(url) => {
+                                            plugins::actions::apply_add_marketplace(state, url).await;
+                                        }
+                                        PO::Install { marketplace, plugin } => {
+                                            plugins::actions::apply_install(
+                                                state, marketplace, plugin, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::TrustAndInstall { plugin_name, host, source } => {
+                                            plugins::actions::apply_trust_and_install(
+                                                state, plugin_name, host, source, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::Uninstall(name) => {
+                                            plugins::actions::apply_uninstall(
+                                                state, name, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::Update(name) => {
+                                            plugins::actions::apply_update(
+                                                state, name, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::RefreshMarketplace(name) => {
+                                            plugins::actions::apply_refresh_marketplace(state, name).await;
+                                        }
+                                        PO::RemoveMarketplace(name) => {
+                                            plugins::actions::apply_remove_marketplace(state, name);
+                                        }
+                                        PO::TogglePlugin { name, enabled } => {
+                                            plugins::actions::apply_toggle_plugin(
+                                                state, name, enabled, &registry, &mut config,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -506,7 +568,7 @@ async fn main() -> Result<()> {
                                     app.line_cache.clear();
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                 }
                             }
                         }
@@ -523,7 +585,7 @@ async fn main() -> Result<()> {
                                 app.line_cache.clear();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
@@ -544,7 +606,7 @@ async fn main() -> Result<()> {
                             app.spinner_frame = 0;
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -556,7 +618,7 @@ async fn main() -> Result<()> {
                     if do_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                     }
                 }
             }

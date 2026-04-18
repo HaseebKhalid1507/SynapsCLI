@@ -13,6 +13,9 @@ pub mod loader;
 pub mod config;
 pub mod registry;
 pub mod tool;
+pub mod state;
+pub mod marketplace;
+pub mod install;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,4 +70,13 @@ pub async fn register(
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
     registry
+}
+
+/// Re-walks discovery roots and swaps in the new skill set atomically.
+/// Built-ins and the existing `load_skill` tool registration are unchanged.
+pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
+    let (_plugins, mut skills) = loader::load_all(&loader::default_roots());
+    skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
+    tracing::info!(skills = skills.len(), "reloaded skills");
+    registry.rebuild_with(skills);
 }

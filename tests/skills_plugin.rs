@@ -103,3 +103,48 @@ fn end_to_end_nested_marketplace_discovery() {
 
     fs::remove_dir_all(&tmp).ok();
 }
+
+#[tokio::test]
+async fn reload_picks_up_new_skill() {
+    use synaps_cli::{ToolRegistry, SynapsConfig};
+    use synaps_cli::skills::{register, reload_registry};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join(".synaps-cli").join("plugins");
+    std::fs::create_dir_all(&plugins_root).unwrap();
+
+    // Save HOME so we can restore it at the end (avoid leaking into other tests).
+    let prev_home = std::env::var_os("HOME");
+    // Point HOME so default_roots() picks up our dir.
+    std::env::set_var("HOME", dir.path());
+
+    let tools = Arc::new(RwLock::new(ToolRegistry::new()));
+    let config = SynapsConfig::default();
+    let registry = register(&tools, &config).await;
+
+    // No skill yet.
+    assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Unknown));
+
+    // Drop a new skill on disk.
+    let skill_dir = plugins_root.join("freshplug").join("skills").join("fresh");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::create_dir_all(plugins_root.join("freshplug").join(".synaps-plugin")).unwrap();
+    std::fs::write(
+        plugins_root.join("freshplug").join(".synaps-plugin").join("plugin.json"),
+        r#"{"name":"freshplug"}"#,
+    ).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"),
+        "---\nname: fresh\ndescription: d\n---\nbody").unwrap();
+
+    reload_registry(&registry, &config);
+
+    assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Skill(_)));
+
+    // Restore HOME so we don't leak into other tests in this binary.
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+}

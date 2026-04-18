@@ -6,6 +6,7 @@ pub(crate) enum Category {
     Agent,
     ToolLimits,
     Appearance,
+    Plugins,
 }
 
 impl Category {
@@ -15,15 +16,17 @@ impl Category {
             Category::Agent => "Agent",
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
+            Category::Plugins => "Plugins",
         }
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 4] = [
+pub(crate) const CATEGORIES: [Category; 5] = [
     Category::Model,
     Category::Agent,
     Category::ToolLimits,
     Category::Appearance,
+    Category::Plugins,
 ];
 
 pub(crate) enum EditorKind {
@@ -122,5 +125,15 @@ mod tests {
         for def in ALL_SETTINGS {
             assert!(CATEGORIES.contains(&def.category));
         }
+    }
+
+    #[test]
+    fn plugins_category_is_present() {
+        assert!(CATEGORIES.contains(&Category::Plugins));
+    }
+
+    #[test]
+    fn plugins_category_label() {
+        assert_eq!(Category::Plugins.label(), "Plugins");
     }
 }

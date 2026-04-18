@@ -88,6 +88,7 @@ pub(crate) fn draw(
     effect: &mut Option<Effect>,
     exit_effect: &mut Option<Effect>,
     elapsed: std::time::Duration,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
 ) -> io::Result<()> {
     let model = runtime.model();
     let thinking = runtime.thinking_level();
@@ -611,8 +612,11 @@ pub(crate) fn draw(
         }
 
         if let Some(ref state) = app.settings {
-            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime);
+            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime, registry);
             crate::settings::render(frame, frame.area(), state, &snap);
+        }
+        if let Some(ref state) = app.plugins {
+            crate::plugins::render(frame, frame.area(), state);
         }
     })?;
     Ok(())

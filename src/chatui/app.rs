@@ -72,6 +72,8 @@ pub(crate) struct App {
     pub(crate) gamba_child: Option<std::process::Child>,
     /// Active settings modal state (Some while /settings is open).
     pub(crate) settings: Option<super::settings::SettingsState>,
+    /// Active plugins modal state (Some while /plugins is open).
+    pub(crate) plugins: Option<super::plugins::PluginsModalState>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -125,6 +127,7 @@ impl App {
             status_text: None,
             gamba_child: None,
             settings: None,
+            plugins: None,
         }
     }
 
