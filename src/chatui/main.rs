@@ -36,6 +36,65 @@ use std::time::Instant;
 use tachyonfx::{Effect, Shader};
 
 
+/// Apply a settings-menu change: mutate Runtime where possible, persist to config,
+/// and stash write errors in the modal's row_error slot.
+fn apply_setting(
+    key: &'static str,
+    value: &str,
+    app: &mut App,
+    runtime: &mut synaps_cli::Runtime,
+) {
+    match key {
+        "thinking" => {
+            let budget = match value {
+                "low" => 2048,
+                "medium" => 4096,
+                "high" => 16384,
+                "xhigh" => 32768,
+                _ => return,
+            };
+            runtime.set_thinking_budget(budget);
+        }
+        "model" => {
+            runtime.set_model(value.to_string());
+        }
+        "api_retries" => {
+            if let Ok(n) = value.parse::<u32>() { runtime.set_api_retries(n); }
+        }
+        "bash_timeout" => {
+            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_timeout(n); }
+        }
+        "bash_max_timeout" => {
+            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_max_timeout(n); }
+        }
+        "subagent_timeout" => {
+            if let Ok(n) = value.parse::<u64>() { runtime.set_subagent_timeout(n); }
+        }
+        "max_tool_output" => {
+            if let Ok(n) = value.parse::<usize>() { runtime.set_max_tool_output(n); }
+        }
+        "skills" | "theme" => {}
+        _ => return,
+    }
+    match synaps_cli::config::write_config_value(key, value) {
+        Ok(()) => {
+            if let Some(st) = app.settings.as_mut() {
+                if key == "theme" {
+                    st.row_error = Some((key.to_string(), "saved — restart to apply".to_string()));
+                } else {
+                    st.row_error = None;
+                }
+                st.edit_mode = None;
+            }
+        }
+        Err(e) => {
+            if let Some(st) = app.settings.as_mut() {
+                st.row_error = Some((key.to_string(), e.to_string()));
+            }
+        }
+    }
+}
+
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     for msg in api_messages {
         match msg["role"].as_str() {
@@ -226,7 +285,7 @@ async fn main() -> Result<()> {
                 match maybe_event {
                     Some(Ok(event)) => {
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, is_streaming);
+                        let action = input::handle_event(event, &mut app, &runtime, is_streaming);
                         match action {
                             InputAction::None => {}
                             InputAction::Quit => {
@@ -368,6 +427,9 @@ async fn main() -> Result<()> {
                                     }
                                     app.queued_message = Some(input);
                                 }
+                            }
+                            InputAction::SettingsApply(key, value) => {
+                                apply_setting(key, &value, &mut app, &mut runtime);
                             }
                         }
                     }

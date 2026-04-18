@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use super::{SettingsState, Focus, RuntimeSnapshot};
-use super::schema::{CATEGORIES, SettingDef};
+use super::schema::{CATEGORIES, SettingDef, EditorKind};
 use crate::theme::THEME;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
@@ -66,8 +66,13 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
             Style::default().fg(THEME.claude_text)
         };
         let current_value = current_value_for(def, snap);
+        let value_display = if selected && matches!(def.editor, EditorKind::Cycler(_)) {
+            format!("◀ {} ▶", current_value)
+        } else {
+            current_value
+        };
         lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(format!("  {:<20} {}", def.label, current_value), style),
+            ratatui::text::Span::styled(format!("  {:<20} {}", def.label, value_display), style),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
