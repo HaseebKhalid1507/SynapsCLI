@@ -1,7 +1,7 @@
 //! Slash command registry: built-ins + dynamically registered skills.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use crate::skills::LoadedSkill;
 
 /// Resolution outcome for a typed slash command.
@@ -17,22 +17,35 @@ pub enum Resolution {
     Unknown,
 }
 
-pub struct CommandRegistry {
-    builtins: Vec<&'static str>,
+struct Inner {
     skills: HashMap<String, Vec<Arc<LoadedSkill>>>, // unqualified name -> all matches
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
 }
 
+pub struct CommandRegistry {
+    builtins: Vec<&'static str>,
+    inner: RwLock<Inner>,
+}
+
 impl CommandRegistry {
     pub fn new(builtins: &[&'static str], skills: Vec<LoadedSkill>) -> Self {
-        let mut r = CommandRegistry {
+        let r = CommandRegistry {
             builtins: builtins.to_vec(),
-            skills: HashMap::new(),
-            qualified: HashMap::new(),
+            inner: RwLock::new(Inner {
+                skills: HashMap::new(),
+                qualified: HashMap::new(),
+            }),
         };
-        let builtins_set: std::collections::HashSet<&str> =
-            builtins.iter().copied().collect();
+        r.rebuild_with(skills);
+        r
+    }
 
+    /// Atomically replace the skill set. Built-ins are unchanged.
+    pub fn rebuild_with(&self, skills: Vec<LoadedSkill>) {
+        let builtins_set: std::collections::HashSet<&str> =
+            self.builtins.iter().copied().collect();
+        let mut new_skills: HashMap<String, Vec<Arc<LoadedSkill>>> = HashMap::new();
+        let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
         for s in skills {
             let arc = Arc::new(s);
             // Unqualified entry
@@ -44,20 +57,23 @@ impl CommandRegistry {
                     arc.name
                 );
             } else {
-                r.skills.entry(arc.name.clone()).or_default().push(arc.clone());
+                new_skills.entry(arc.name.clone()).or_default().push(arc.clone());
             }
             // Qualified entry
             if let Some(ref p) = arc.plugin {
                 let q = format!("{}:{}", p, arc.name);
-                r.qualified.insert(q, arc.clone());
+                new_qualified.insert(q, arc.clone());
             }
         }
-        r
+        let mut w = self.inner.write().unwrap();
+        w.skills = new_skills;
+        w.qualified = new_qualified;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
+        let r = self.inner.read().unwrap();
         if cmd.contains(':') {
-            return match self.qualified.get(cmd) {
+            return match r.qualified.get(cmd) {
                 Some(s) => Resolution::Skill(s.clone()),
                 None => Resolution::Unknown,
             };
@@ -65,7 +81,7 @@ impl CommandRegistry {
         if self.builtins.contains(&cmd) {
             return Resolution::Builtin;
         }
-        match self.skills.get(cmd) {
+        match r.skills.get(cmd) {
             Some(v) if v.len() == 1 => Resolution::Skill(v[0].clone()),
             Some(v) => Resolution::Ambiguous(
                 v.iter()
@@ -78,24 +94,26 @@ impl CommandRegistry {
 
     /// All commands for autocomplete/help: builtins + unique unqualified skill names, sorted.
     pub fn all_commands(&self) -> Vec<String> {
+        let r = self.inner.read().unwrap();
         let mut v: Vec<String> = self.builtins.iter().map(|s| s.to_string()).collect();
-        v.extend(self.skills.keys().cloned());
+        v.extend(r.skills.keys().cloned());
         v.sort();
         v.dedup();
         v
     }
 
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
+        let r = self.inner.read().unwrap();
         let mut seen: std::collections::HashSet<(Option<String>, String)> =
             std::collections::HashSet::new();
         let mut out = Vec::new();
-        for list in self.skills.values() {
+        for list in r.skills.values() {
             for s in list {
                 let key = (s.plugin.clone(), s.name.clone());
                 if seen.insert(key) { out.push(s.clone()); }
             }
         }
-        for s in self.qualified.values() {
+        for s in r.qualified.values() {
             let key = (s.plugin.clone(), s.name.clone());
             if seen.insert(key) { out.push(s.clone()); }
         }
@@ -213,5 +231,24 @@ mod tests {
         let r = CommandRegistry::new(&[], vec![mk("search", Some("p1"))]);
         assert!(matches!(r.resolve("p1:nosuch"), Resolution::Unknown));
         assert!(matches!(r.resolve("nosuch:search"), Resolution::Unknown));
+    }
+
+    #[test]
+    fn rebuild_replaces_skills() {
+        let r = CommandRegistry::new(&["clear"], vec![mk("old", None)]);
+        assert!(matches!(r.resolve("old"), Resolution::Skill(_)));
+        assert!(matches!(r.resolve("new"), Resolution::Unknown));
+        r.rebuild_with(vec![mk("new", None)]);
+        assert!(matches!(r.resolve("old"), Resolution::Unknown));
+        assert!(matches!(r.resolve("new"), Resolution::Skill(_)));
+    }
+
+    #[test]
+    fn rebuild_visible_through_shared_arc() {
+        let r = std::sync::Arc::new(CommandRegistry::new(&[], vec![mk("a", None)]));
+        let r2 = r.clone();
+        r.rebuild_with(vec![mk("b", None)]);
+        assert!(matches!(r2.resolve("b"), Resolution::Skill(_)));
+        assert!(matches!(r2.resolve("a"), Resolution::Unknown));
     }
 }
