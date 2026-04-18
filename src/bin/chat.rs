@@ -15,9 +15,12 @@ async fn main() -> Result<()> {
         flush_stdout();
 
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            eprintln!("stdin closed");
-            break;
+        match io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => {
+                // EOF or error — stdin closed (e.g. piped input exhausted)
+                break;
+            }
+            Ok(_) => {}
         }
         let input = input.trim();
 
