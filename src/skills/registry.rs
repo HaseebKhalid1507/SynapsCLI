@@ -4,6 +4,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::skills::LoadedSkill;
 
+#[derive(Debug, Clone)]
+pub struct PluginSummary {
+    pub name: String,
+    pub skill_count: usize,
+}
+
 /// Resolution outcome for a typed slash command.
 #[derive(Debug)]
 pub enum Resolution {
@@ -100,6 +106,23 @@ impl CommandRegistry {
         v.sort();
         v.dedup();
         v
+    }
+
+    pub fn plugins(&self) -> Vec<PluginSummary> {
+        let r = self.inner.read().unwrap();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for s in r.qualified.values() {
+            if let Some(ref p) = s.plugin {
+                let key = (p.clone(), s.name.clone());
+                if seen.insert(key) {
+                    *counts.entry(p.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts.into_iter()
+            .map(|(name, skill_count)| PluginSummary { name, skill_count })
+            .collect()
     }
 
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
@@ -250,5 +273,22 @@ mod tests {
         r.rebuild_with(vec![mk("b", None)]);
         assert!(matches!(r2.resolve("b"), Resolution::Skill(_)));
         assert!(matches!(r2.resolve("a"), Resolution::Unknown));
+    }
+
+    #[test]
+    fn plugins_summary_groups_by_plugin_name() {
+        let r = CommandRegistry::new(&[], vec![
+            mk("a", Some("p1")),
+            mk("b", Some("p1")),
+            mk("c", Some("p2")),
+            mk("loose", None),
+        ]);
+        let mut plugins = r.plugins();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].name, "p1");
+        assert_eq!(plugins[0].skill_count, 2);
+        assert_eq!(plugins[1].name, "p2");
+        assert_eq!(plugins[1].skill_count, 1);
     }
 }
