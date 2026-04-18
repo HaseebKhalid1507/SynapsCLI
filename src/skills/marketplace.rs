@@ -52,6 +52,27 @@ pub fn is_trusted(source_url: &str, trusted_hosts: &[String]) -> bool {
     }
 }
 
+use crate::skills::manifest::MarketplaceManifest;
+
+pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
+    for p in &m.plugins {
+        let s = p.source.trim();
+        if s.starts_with("./") || s.starts_with("../") || !s.contains("://") {
+            return Err(format!(
+                "plugin '{}' uses unsupported relative source path '{}'",
+                p.name, s
+            ));
+        }
+        if !s.starts_with("https://") {
+            return Err(format!(
+                "plugin '{}' source must be https:// (got '{}')",
+                p.name, s
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +149,44 @@ mod tests {
     #[test]
     fn derive_trust_host_rejects_http() {
         assert!(trust_host_for_source("http://github.com/a/b").is_err());
+    }
+
+    #[test]
+    fn validate_manifest_accepts_https_sources() {
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[{"name":"p","source":"https://github.com/a/b.git"}]}
+        "#).unwrap();
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_relative_source() {
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[{"name":"p","source":"./p"}]}
+        "#).unwrap();
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(err.contains("relative"));
+        assert!(err.contains("'p'"));
+    }
+
+    #[test]
+    fn validate_manifest_rejects_http_source() {
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[{"name":"p","source":"http://x/y"}]}
+        "#).unwrap();
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(err.contains("https"));
+    }
+
+    #[test]
+    fn validate_manifest_reports_first_bad_entry() {
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[
+                {"name":"ok","source":"https://github.com/a/b.git"},
+                {"name":"bad","source":"./b"}
+            ]}
+        "#).unwrap();
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(err.contains("'bad'"));
     }
 }
