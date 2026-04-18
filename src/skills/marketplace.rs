@@ -91,7 +91,7 @@ pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
 
 /// Low-level: GET the URL and return the body. Used by fetch_manifest and
 /// by tests (which need http:// against a local loopback server).
-pub(crate) async fn fetch_raw(url: &str) -> Result<String, String> {
+pub async fn fetch_raw(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
