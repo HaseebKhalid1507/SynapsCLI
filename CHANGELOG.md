@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Interactive `/settings` menu**: full-screen modal in `chatui` for editing model, thinking, skills, tool limits, and theme — persists to `~/.synaps-cli/config`, applies to running `Runtime` where possible
 - **Binary file detection**: Read tool validates UTF-8 and returns clean error for binary files
 - **Thread panic handling**: Subagent threads wrapped in `catch_unwind` — panics become visible errors
 - **Doc comments**: Public API types (`Runtime`, `ToolRegistry`) and key methods documented

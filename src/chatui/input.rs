@@ -17,14 +17,33 @@ pub(super) enum InputAction {
     Quit,
     /// Abort the current stream (Esc during streaming).
     Abort,
+    /// Settings modal requested an apply — (key, value).
+    SettingsApply(&'static str, String),
 }
 
 /// Process a crossterm Event and return what the main loop should do.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
+    runtime: &synaps_cli::Runtime,
     streaming: bool,
 ) -> InputAction {
+    // Route events to the settings modal while it's open.
+    if app.settings.is_some() {
+        if let Event::Key(key) = event {
+            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime);
+            let state = app.settings.as_mut().expect("just checked");
+            match crate::settings::handle_event(state, key, &snap) {
+                crate::settings::InputOutcome::Close => { app.settings = None; }
+                crate::settings::InputOutcome::None => {}
+                crate::settings::InputOutcome::Apply { key, value } => {
+                    return InputAction::SettingsApply(key, value);
+                }
+            }
+        }
+        // Swallow all other events while settings is open.
+        return InputAction::None;
+    }
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming),
         Event::Mouse(mouse) => {

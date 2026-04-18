@@ -10,6 +10,7 @@ use super::app::{App, ChatMessage};
 pub(super) const ALL_COMMANDS: &[&str] = &[
     "clear", "model", "system", "thinking", "sessions",
     "resume", "theme", "gamba", "help", "quit", "exit",
+    "settings",
 ];
 
 /// Commands that work while streaming.
@@ -25,6 +26,8 @@ pub(super) enum CommandAction {
     Quit,
     /// Launch the casino (requires dropping/recreating EventStream).
     LaunchGamba,
+    /// Open the /settings modal.
+    OpenSettings,
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -186,6 +189,7 @@ pub(super) async fn handle_command(
                 "/resume <id> — switch to a different session",
                 "/help — show this",
                 "/theme — list available themes",
+                "/settings — open the settings menu",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
@@ -200,6 +204,9 @@ pub(super) async fn handle_command(
         }
         "gamba" => {
             return CommandAction::LaunchGamba;
+        }
+        "settings" => {
+            return CommandAction::OpenSettings;
         }
         _ => {
             app.push_msg(ChatMessage::Error(
