@@ -120,6 +120,44 @@ mod tests {
         assert!(load_skill_file(&path, None).is_none());
     }
 
+    #[test]
+    fn load_skill_missing_name_returns_none() {
+        let tmp = tempdir();
+        let skill_dir = tmp.join("bad3");
+        let path = write_skill(&skill_dir, "---\ndescription: d\n---\nbody");
+        assert!(load_skill_file(&path, None).is_none());
+    }
+
+    #[test]
+    fn load_skill_empty_body_returns_none() {
+        let tmp = tempdir();
+        let skill_dir = tmp.join("empty-body");
+        let path = write_skill(&skill_dir, "---\nname: x\ndescription: d\n---\n");
+        assert!(load_skill_file(&path, None).is_none());
+    }
+
+    #[test]
+    fn load_skill_unclosed_frontmatter_returns_none() {
+        let tmp = tempdir();
+        let skill_dir = tmp.join("unclosed");
+        // No closing `---`; parse_frontmatter returns ([], full_text) so name/description missing → None.
+        let path = write_skill(&skill_dir, "---\nname: x\ndescription: d\nbody without closing fence");
+        assert!(load_skill_file(&path, None).is_none());
+    }
+
+    #[test]
+    fn load_skill_basedir_multiple_occurrences() {
+        let tmp = tempdir();
+        let skill_dir = tmp.join("multi");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: m\ndescription: d\n---\n{baseDir}/a and {baseDir}/b",
+        );
+        let s = load_skill_file(&path, None).unwrap();
+        let bd = s.base_dir.to_str().unwrap();
+        assert_eq!(s.body, format!("{}/a and {}/b", bd, bd));
+    }
+
     /// Create a unique tempdir under /tmp for tests.
     fn tempdir() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
