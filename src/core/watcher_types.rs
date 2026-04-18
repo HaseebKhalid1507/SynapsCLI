@@ -193,7 +193,7 @@ impl AgentConfig {
 
 // -- Defaults ----------------------------------------------------------------
 
-fn default_model() -> String { "claude-sonnet-4-20250514".to_string() }
+fn default_model() -> String { crate::models::default_model().to_string() }
 fn default_thinking() -> String { "medium".to_string() }
 fn default_trigger() -> String { "manual".to_string() }
 fn default_max_tokens() -> u64 { 100_000 }
@@ -259,7 +259,7 @@ name = "dexter"
 "#;
         let config: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.name, "dexter");
-        assert_eq!(config.agent.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.agent.model, crate::models::default_model());
         assert_eq!(config.agent.trigger, "manual");
         assert_eq!(config.limits.max_session_tokens, 100_000);
     }
