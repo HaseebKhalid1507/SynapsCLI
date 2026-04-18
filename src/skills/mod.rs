@@ -13,6 +13,7 @@ pub mod loader;
 pub mod config;
 pub mod registry;
 pub mod tool;
+pub mod state;
 
 use std::path::PathBuf;
 use std::sync::Arc;
