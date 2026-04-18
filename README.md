@@ -164,8 +164,11 @@ Tools from MCP servers are prefixed `mcp__{server}__{tool}` and available for th
 ├── mcp.json              # MCP server definitions
 ├── agents/               # Subagent definitions (.md files)
 │   └── spike.md
-├── skills/               # Behavioral guidelines (.md with frontmatter)
-│   └── code-review.md
+├── plugins/              # Cloned marketplaces / plugins (.synaps-plugin manifests)
+│   └── pi-skills/        # e.g. a marketplace clone with multiple plugins
+├── skills/               # Loose skills (folder-per-skill with SKILL.md)
+│   └── code-review/
+│       └── SKILL.md
 ├── sessions/             # Conversation history (JSON)
 ├── logs/
 │   └── subagents/        # Per-subagent session logs
@@ -179,7 +182,7 @@ Tools from MCP servers are prefixed `mcp__{server}__{tool}` and available for th
         └── logs/         # Per-session JSONL logs
 ```
 
-Project-local `.synaps-cli/skills/` override global skills.
+Project-local `.synaps-cli/{plugins,skills}/` override global counterparts. Each discovered skill registers as a slash command (`/skill-name <args>`) and is also callable by the model via the `load_skill` tool. Block skills with `disabled_skills = a, b` or whole plugins with `disabled_plugins = p1, p2` in `~/.synaps-cli/config`.
 
 ---
 
