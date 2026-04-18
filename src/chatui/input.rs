@@ -68,6 +68,17 @@ pub(super) fn handle_event(
         // Swallow all other events while settings is open.
         return InputAction::None;
     }
+    // Route events to the plugins modal while it's open.
+    if app.plugins.is_some() {
+        if let Event::Key(key) = event {
+            let state = app.plugins.as_mut().expect("just checked");
+            match crate::plugins::handle_event(state, key) {
+                crate::plugins::InputOutcome::Close => { app.plugins = None; }
+                crate::plugins::InputOutcome::None => {}
+            }
+        }
+        return InputAction::None;
+    }
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry),
         Event::Mouse(mouse) => {

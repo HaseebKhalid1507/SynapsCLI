@@ -13,7 +13,7 @@ use super::app::{App, ChatMessage};
 pub(super) const ALL_COMMANDS: &[&str] = &[
     "clear", "model", "system", "thinking", "sessions",
     "resume", "theme", "gamba", "help", "quit", "exit",
-    "settings",
+    "settings", "plugins",
 ];
 
 /// Commands that work while streaming.
@@ -44,6 +44,10 @@ pub(super) enum CommandAction {
     LaunchGamba,
     /// Open the /settings modal.
     OpenSettings,
+    /// Open the /plugins modal.
+    OpenPlugins,
+    /// Force-reload registered plugins (for `/plugins reload`).
+    ReloadPlugins,
     /// Synthesize load_skill tool-result + user message, then start stream.
     LoadSkill {
         skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
@@ -213,6 +217,7 @@ pub(super) async fn handle_command(
                 "/help — show this",
                 "/theme — list available themes",
                 "/settings — open the settings menu",
+                "/plugins — manage marketplaces and installed plugins",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
@@ -244,6 +249,12 @@ pub(super) async fn handle_command(
         }
         "settings" => {
             return CommandAction::OpenSettings;
+        }
+        "plugins" => {
+            if arg.trim() == "reload" {
+                return CommandAction::ReloadPlugins;
+            }
+            return CommandAction::OpenPlugins;
         }
         _ => {
             match registry.resolve(cmd) {
@@ -281,5 +292,15 @@ pub(super) fn handle_streaming_command(
         }
         "quit" | "exit" => CommandAction::Quit,
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugins_is_in_all_commands() {
+        assert!(ALL_COMMANDS.contains(&"plugins"));
     }
 }
