@@ -189,4 +189,29 @@ mod tests {
         let cmds = r.all_commands();
         assert_eq!(cmds, vec!["clear", "help-me", "model", "search"]);
     }
+
+    #[test]
+    fn all_skills_dedups_plugin_skill() {
+        let r = CommandRegistry::new(&[], vec![mk("search", Some("p"))]);
+        let all = r.all_skills();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "search");
+        assert_eq!(all[0].plugin.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn all_skills_includes_shadowed_skill() {
+        let r = CommandRegistry::new(&["clear"], vec![mk("clear", Some("p"))]);
+        let all = r.all_skills();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "clear");
+        assert_eq!(all[0].plugin.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn resolve_qualified_unknown_returns_unknown() {
+        let r = CommandRegistry::new(&[], vec![mk("search", Some("p1"))]);
+        assert!(matches!(r.resolve("p1:nosuch"), Resolution::Unknown));
+        assert!(matches!(r.resolve("nosuch:search"), Resolution::Unknown));
+    }
 }
