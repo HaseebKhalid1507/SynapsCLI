@@ -298,7 +298,7 @@ mod tests {
         let skill_dir = tmp.join("skills").join("loose");
         write_skill(&skill_dir, "---\nname: loose\ndescription: d\n---\nBody");
 
-        let (plugins, skills) = load_all(&[tmp.clone()]);
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert!(plugins.is_empty());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "loose");
@@ -317,7 +317,7 @@ mod tests {
         write_skill(&plugin_dir.join("skills").join("s1"),
             "---\nname: s1\ndescription: d\n---\nBody");
 
-        let (plugins, skills) = load_all(&[tmp.clone()]);
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "my-plugin");
         assert_eq!(skills.len(), 1);
@@ -339,7 +339,7 @@ mod tests {
         write_skill(&plugin_dir.join("skills").join("search"),
             "---\nname: search\ndescription: d\n---\nBody");
 
-        let (plugins, skills) = load_all(&[tmp.clone()]);
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].marketplace.as_deref(), Some("pi-skills"));
         assert_eq!(skills.len(), 1);
