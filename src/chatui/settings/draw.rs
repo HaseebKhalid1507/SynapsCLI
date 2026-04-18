@@ -2,12 +2,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
-use super::{SettingsState, Focus};
+use super::{SettingsState, Focus, RuntimeSnapshot};
 use super::schema::{CATEGORIES, SettingDef};
 use crate::theme::THEME;
 
-pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState) {
-    // Centered modal — 80% width, 70% height, min 60x20
+pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
     let h = (area.height.saturating_mul(7) / 10).max(20).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -24,7 +23,6 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    // Split into left (categories) / right (settings) with a footer hint line
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -35,7 +33,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState) {
         .split(outer[0]);
 
     render_categories(frame, panes[0], state);
-    render_settings(frame, panes[1], state);
+    render_settings(frame, panes[1], state, snap);
     render_footer(frame, outer[1]);
 }
 
@@ -57,7 +55,7 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState) {
+fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let settings = state.current_settings();
     let mut lines = Vec::new();
     for (i, def) in settings.iter().enumerate() {
@@ -67,7 +65,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState) {
         } else {
             Style::default().fg(THEME.claude_text)
         };
-        let current_value = current_value_for(def);
+        let current_value = current_value_for(def, snap);
         lines.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(format!("  {:<20} {}", def.label, current_value), style),
         ]));
@@ -83,7 +81,19 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Read the persisted value for a setting. Placeholder — filled in Task 12.
-fn current_value_for(_def: &SettingDef) -> String {
-    String::from("(...)")
+pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> String {
+    match def.key {
+        "model" => snap.model.clone(),
+        "thinking" => snap.thinking.clone(),
+        "skills" => snap.skills.as_ref()
+            .map(|s| if s.is_empty() { "(none)".to_string() } else { s.join(",") })
+            .unwrap_or_else(|| "(none)".into()),
+        "api_retries" => snap.api_retries.to_string(),
+        "subagent_timeout" => format!("{}s", snap.subagent_timeout),
+        "max_tool_output" => snap.max_tool_output.to_string(),
+        "bash_timeout" => format!("{}s", snap.bash_timeout),
+        "bash_max_timeout" => format!("{}s", snap.bash_max_timeout),
+        "theme" => snap.theme_name.clone(),
+        _ => "?".into(),
+    }
 }

@@ -10,6 +10,37 @@ pub(crate) use input::{handle_event, InputOutcome};
 
 use schema::{Category, SettingDef};
 
+/// Snapshot of live runtime + persisted config values, used to display current
+/// values in the modal and seed text editors.
+pub(crate) struct RuntimeSnapshot {
+    pub model: String,
+    pub thinking: String,
+    pub max_tool_output: usize,
+    pub bash_timeout: u64,
+    pub bash_max_timeout: u64,
+    pub subagent_timeout: u64,
+    pub api_retries: u32,
+    pub skills: Option<Vec<String>>,
+    pub theme_name: String,
+}
+
+impl RuntimeSnapshot {
+    pub fn from_runtime(runtime: &synaps_cli::Runtime) -> Self {
+        let config = synaps_cli::config::load_config();
+        Self {
+            model: runtime.model().to_string(),
+            thinking: runtime.thinking_level().to_string(),
+            max_tool_output: runtime.max_tool_output(),
+            bash_timeout: runtime.bash_timeout(),
+            bash_max_timeout: runtime.bash_max_timeout(),
+            subagent_timeout: runtime.subagent_timeout(),
+            api_retries: runtime.api_retries(),
+            skills: config.skills,
+            theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Focus {
     Left,
@@ -53,6 +84,3 @@ impl SettingsState {
     }
 }
 
-// Silence unused-field warnings until later tasks wire these up.
-#[allow(dead_code)]
-fn _keep_category_used(_: Category) {}
