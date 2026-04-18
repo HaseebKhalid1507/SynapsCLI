@@ -2,8 +2,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 use super::PluginsModalState;
 use super::state::{Focus, RightMode, LeftRow};
 
-// TODO(task 16): remove allow(dead_code) once side-effect handlers construct every variant.
-#[allow(dead_code)]
 pub(crate) enum InputOutcome {
     None,
     Close,

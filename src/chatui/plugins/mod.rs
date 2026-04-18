@@ -3,6 +3,7 @@
 pub(crate) mod state;
 pub(crate) mod draw;
 pub(crate) mod input;
+pub(crate) mod actions;
 
 pub(crate) use state::PluginsModalState;
 pub(crate) use draw::render;

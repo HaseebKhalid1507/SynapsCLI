@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
     let mut runtime = Runtime::new().await?;
 
     // Load config and apply
-    let config = synaps_cli::config::load_config();
+    let mut config = synaps_cli::config::load_config();
     runtime.apply_config(&config);
 
     // Load system prompt
@@ -492,6 +492,48 @@ async fn main() -> Result<()> {
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
+                            }
+                            InputAction::PluginsOutcome(outcome) => {
+                                if let Some(state) = app.plugins.as_mut() {
+                                    use crate::plugins::InputOutcome as PO;
+                                    match outcome {
+                                        PO::None | PO::Close => {}
+                                        PO::AddMarketplace(url) => {
+                                            plugins::actions::apply_add_marketplace(state, url).await;
+                                        }
+                                        PO::Install { marketplace, plugin } => {
+                                            plugins::actions::apply_install(
+                                                state, marketplace, plugin, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::TrustAndInstall { plugin_name, host, source } => {
+                                            plugins::actions::apply_trust_and_install(
+                                                state, plugin_name, host, source, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::Uninstall(name) => {
+                                            plugins::actions::apply_uninstall(
+                                                state, name, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::Update(name) => {
+                                            plugins::actions::apply_update(
+                                                state, name, &registry, &config,
+                                            ).await;
+                                        }
+                                        PO::RefreshMarketplace(name) => {
+                                            plugins::actions::apply_refresh_marketplace(state, name).await;
+                                        }
+                                        PO::RemoveMarketplace(name) => {
+                                            plugins::actions::apply_remove_marketplace(state, name);
+                                        }
+                                        PO::TogglePlugin { name, enabled } => {
+                                            plugins::actions::apply_toggle_plugin(
+                                                state, name, enabled, &registry, &mut config,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

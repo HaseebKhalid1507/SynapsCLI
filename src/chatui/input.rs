@@ -22,6 +22,9 @@ pub(super) enum InputAction {
     Abort,
     /// Settings modal requested an apply — (key, value).
     SettingsApply(&'static str, String),
+    /// Plugins modal emitted an outcome — handled in the async main loop
+    /// because most variants perform async I/O (network, filesystem).
+    PluginsOutcome(crate::plugins::InputOutcome),
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -68,23 +71,21 @@ pub(super) fn handle_event(
         // Swallow all other events while settings is open.
         return InputAction::None;
     }
-    // Route events to the plugins modal while it's open.
+    // Route events to the plugins modal while it's open. Most outcomes run
+    // async side-effects (fetch manifest, git clone, etc.), so we delegate
+    // them to the main loop via `InputAction::PluginsOutcome`.
     if app.plugins.is_some() {
         if let Event::Key(key) = event {
             let state = app.plugins.as_mut().expect("just checked");
-            // TODO(task 16): replace these {} no-ops with real side-effect handlers.
-            match crate::plugins::handle_event(state, key) {
-                crate::plugins::InputOutcome::Close => { app.plugins = None; }
-                crate::plugins::InputOutcome::None => {}
-                crate::plugins::InputOutcome::AddMarketplace(_) => {}
-                crate::plugins::InputOutcome::Install { .. } => {}
-                crate::plugins::InputOutcome::Uninstall(_) => {}
-                crate::plugins::InputOutcome::Update(_) => {}
-                crate::plugins::InputOutcome::RefreshMarketplace(_) => {}
-                crate::plugins::InputOutcome::RemoveMarketplace(_) => {}
-                crate::plugins::InputOutcome::TrustAndInstall { .. } => {}
-                crate::plugins::InputOutcome::TogglePlugin { .. } => {}
-            }
+            let outcome = crate::plugins::handle_event(state, key);
+            return match outcome {
+                crate::plugins::InputOutcome::Close => {
+                    app.plugins = None;
+                    InputAction::None
+                }
+                crate::plugins::InputOutcome::None => InputAction::None,
+                other => InputAction::PluginsOutcome(other),
+            };
         }
         return InputAction::None;
     }
