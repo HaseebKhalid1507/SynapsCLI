@@ -43,6 +43,17 @@ pub(super) fn handle_event(
                 crate::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
+                crate::settings::InputOutcome::TogglePlugin { name, enabled } => {
+                    let mut config = synaps_cli::config::load_config();
+                    if enabled {
+                        config.disabled_plugins.retain(|p| p != &name);
+                    } else if !config.disabled_plugins.iter().any(|p| p == &name) {
+                        config.disabled_plugins.push(name.clone());
+                    }
+                    let csv = config.disabled_plugins.join(", ");
+                    let _ = synaps_cli::config::write_config_value("disabled_plugins", &csv);
+                    synaps_cli::skills::reload_registry(registry, &config);
+                }
             }
         }
         // Swallow all other events while settings is open.

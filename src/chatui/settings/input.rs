@@ -7,6 +7,7 @@ pub(crate) enum InputOutcome {
     None,
     Close,
     Apply { key: &'static str, value: String },
+    TogglePlugin { name: String, enabled: bool },
 }
 
 pub(crate) fn handle_event(
@@ -21,6 +22,25 @@ pub(crate) fn handle_event(
             return InputOutcome::None;
         }
         return handle_editor_key(state, key);
+    }
+    // Plugins category: Enter or Space toggles plugin.
+    if state.focus == Focus::Right {
+        let cat = super::schema::CATEGORIES[state.category_idx];
+        if cat == super::schema::Category::Plugins {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(row) = snap.plugins.get(state.setting_idx) {
+                        let disabled = snap.disabled_plugins.iter().any(|d| d == &row.name);
+                        return InputOutcome::TogglePlugin {
+                            name: row.name.clone(),
+                            enabled: disabled, // toggle: if was disabled, now enabled
+                        };
+                    }
+                    return InputOutcome::None;
+                }
+                _ => {}
+            }
+        }
     }
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => InputOutcome::Close,
@@ -56,7 +76,7 @@ pub(crate) fn handle_event(
                     }
                 }
                 Focus::Right => {
-                    let n = state.current_settings().len();
+                    let n = row_count(state, snap);
                     if state.setting_idx + 1 < n { state.setting_idx += 1; }
                 }
             }
@@ -190,5 +210,72 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
     match key {
         "thinking" => snap.thinking.clone(),
         _ => String::new(),
+    }
+}
+
+fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
+    let cat = super::schema::CATEGORIES[state.category_idx];
+    if cat == super::schema::Category::Plugins {
+        snap.plugins.len()
+    } else {
+        state.current_settings().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn snap() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            model: "m".into(),
+            thinking: "medium".into(),
+            max_tool_output: 0,
+            bash_timeout: 0,
+            bash_max_timeout: 0,
+            subagent_timeout: 0,
+            api_retries: 0,
+            theme_name: "t".into(),
+            plugins: vec![
+                super::super::PluginRow { name: "p1".into(), skill_count: 1 },
+                super::super::PluginRow { name: "p2".into(), skill_count: 2 },
+            ],
+            disabled_plugins: vec!["p2".into()],
+        }
+    }
+
+    #[test]
+    fn enter_on_plugin_row_toggles_off() {
+        let mut state = SettingsState::new();
+        state.category_idx = super::super::schema::CATEGORIES
+            .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
+        state.focus = Focus::Right;
+        state.setting_idx = 0;
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        match out {
+            InputOutcome::TogglePlugin { name, enabled } => {
+                assert_eq!(name, "p1");
+                assert_eq!(enabled, false);
+            }
+            _ => panic!("expected TogglePlugin"),
+        }
+    }
+
+    #[test]
+    fn enter_on_disabled_plugin_toggles_on() {
+        let mut state = SettingsState::new();
+        state.category_idx = super::super::schema::CATEGORIES
+            .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
+        state.focus = Focus::Right;
+        state.setting_idx = 1;
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        match out {
+            InputOutcome::TogglePlugin { name, enabled } => {
+                assert_eq!(name, "p2");
+                assert_eq!(enabled, true);
+            }
+            _ => panic!("expected TogglePlugin"),
+        }
     }
 }
