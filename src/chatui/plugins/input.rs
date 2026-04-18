@@ -2,8 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use super::PluginsModalState;
 use super::state::{Focus, RightMode, LeftRow};
 
-// Task 16 will consume these variants' fields from the main loop dispatcher;
-// until then clippy (with -D warnings) treats them as dead reads.
+// TODO(task 16): remove allow(dead_code) once side-effect handlers construct every variant.
 #[allow(dead_code)]
 pub(crate) enum InputOutcome {
     None,
@@ -22,7 +21,6 @@ pub(crate) enum InputOutcome {
 }
 
 pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
-    // Editor / prompt / confirm modes first.
     match &state.mode {
         RightMode::AddMarketplaceEditor { .. } => return editor_key(state, key),
         RightMode::TrustPrompt { .. } => return trust_key(state, key),
@@ -40,10 +38,12 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         }
         KeyCode::Up => {
             match state.focus { Focus::Left => state.move_left_up(), Focus::Right => state.move_right_up() }
+            state.row_error = None;
             InputOutcome::None
         }
         KeyCode::Down => {
             match state.focus { Focus::Left => state.move_left_down(), Focus::Right => state.move_right_down() }
+            state.row_error = None;
             InputOutcome::None
         }
         KeyCode::Enter => list_enter(state),
@@ -69,7 +69,6 @@ fn list_enter(state: &mut PluginsModalState) -> InputOutcome {
             InputOutcome::None
         }
         Some(_) if matches!(state.focus, Focus::Right) => {
-            // Detail view for selected right row.
             if !state.right_rows().is_empty() {
                 state.mode = RightMode::Detail { row_idx: state.selected_right };
             }
@@ -244,5 +243,58 @@ mod tests {
         };
         handle_event(&mut s, key(KeyCode::Esc));
         assert!(matches!(s.mode, crate::plugins::state::RightMode::List));
+    }
+
+    #[test]
+    fn y_in_confirm_uninstall_emits_uninstall_and_returns_to_list() {
+        use crate::plugins::state::{RightMode, ConfirmAction};
+        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        s.mode = RightMode::Confirm {
+            prompt: "Uninstall 'x'? y/n".into(),
+            on_yes: ConfirmAction::Uninstall("x".into()),
+        };
+        let out = handle_event(&mut s, key(KeyCode::Char('y')));
+        assert!(matches!(out, InputOutcome::Uninstall(ref n) if n == "x"));
+        assert!(matches!(s.mode, RightMode::List));
+    }
+
+    #[test]
+    fn n_in_confirm_returns_to_list_without_action() {
+        use crate::plugins::state::{RightMode, ConfirmAction};
+        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        s.mode = RightMode::Confirm {
+            prompt: "x".into(),
+            on_yes: ConfirmAction::RemoveMarketplace("m".into()),
+        };
+        let out = handle_event(&mut s, key(KeyCode::Char('n')));
+        assert!(matches!(out, InputOutcome::None));
+        assert!(matches!(s.mode, RightMode::List));
+    }
+
+    #[test]
+    fn y_in_trust_prompt_emits_trust_and_install() {
+        use crate::plugins::state::RightMode;
+        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        s.mode = RightMode::TrustPrompt {
+            plugin_name: "p".into(),
+            host: "github.com".into(),
+            pending_source: "https://github.com/u/r".into(),
+        };
+        let out = handle_event(&mut s, key(KeyCode::Char('y')));
+        assert!(matches!(
+            out,
+            InputOutcome::TrustAndInstall { ref plugin_name, ref host, ref source }
+                if plugin_name == "p" && host == "github.com" && source == "https://github.com/u/r"
+        ));
+        assert!(matches!(s.mode, RightMode::List));
+    }
+
+    #[test]
+    fn esc_in_detail_returns_to_list() {
+        use crate::plugins::state::RightMode;
+        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        s.mode = RightMode::Detail { row_idx: 0 };
+        handle_event(&mut s, key(KeyCode::Esc));
+        assert!(matches!(s.mode, RightMode::List));
     }
 }
