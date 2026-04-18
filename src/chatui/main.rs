@@ -103,23 +103,14 @@ async fn main() -> Result<()> {
 
     // Load system prompt
     let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+    runtime.set_system_prompt(system_prompt);
 
-    // Auto-load skills specified in config (injected into system prompt)
-    let mut final_prompt = system_prompt;
-    if let Some(ref skill_names) = config.skills {
-        let auto_skills = synaps_cli::skills::load_skills(Some(skill_names));
-        if !auto_skills.is_empty() {
-            let names: Vec<&str> = auto_skills.iter().map(|s| s.name.as_str()).collect();
-            eprintln!("\x1b[2m  📚 {} skills auto-loaded: {}\x1b[0m", auto_skills.len(), names.join(", "));
-            final_prompt.push_str(&synaps_cli::skills::format_skills_for_prompt(&auto_skills));
-        }
-    }
-    runtime.set_system_prompt(final_prompt);
-
-    // Register load_skill tool for on-demand activation of any skill
-    let skill_count = synaps_cli::skills::setup_skill_tool(&runtime.tools_shared()).await;
+    // Discover plugins/skills, build command registry, register load_skill tool.
+    let tools_shared = runtime.tools_shared();
+    let registry = synaps_cli::skills::register(&tools_shared, &config).await;
+    let skill_count = registry.all_skills().len();
     if skill_count > 0 {
-        eprintln!("\x1b[2m  📚 {} skills available on demand (load_skill tool)\x1b[0m", skill_count);
+        eprintln!("\x1b[2m  📚 {} skills available (type / to list)\x1b[0m", skill_count);
     }
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
@@ -251,7 +242,7 @@ async fn main() -> Result<()> {
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path).await {
+                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
@@ -267,6 +258,54 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         event_reader = EventStream::new();
+                                    }
+                                    CommandAction::LoadSkill { skill, arg } => {
+                                        use synaps_cli::skills::tool::LoadSkillTool;
+
+                                        let tool_use_id = format!("toolu_skill_{}", uuid::Uuid::new_v4().simple());
+                                        let body = LoadSkillTool::format_body(&skill);
+
+                                        app.api_messages.push(json!({
+                                            "role": "assistant",
+                                            "content": [{
+                                                "type": "tool_use",
+                                                "id": tool_use_id,
+                                                "name": "load_skill",
+                                                "input": {"skill": skill.name.clone()}
+                                            }]
+                                        }));
+                                        app.api_messages.push(json!({
+                                            "role": "user",
+                                            "content": [{
+                                                "type": "tool_result",
+                                                "tool_use_id": tool_use_id,
+                                                "content": body
+                                            }]
+                                        }));
+                                        let display_name = match &skill.plugin {
+                                            Some(p) => format!("{}:{}", p, skill.name),
+                                            None => skill.name.clone(),
+                                        };
+                                        app.push_msg(ChatMessage::System(format!("loaded skill: {}", display_name)));
+
+                                        if !arg.is_empty() {
+                                            app.api_messages.push(json!({"role": "user", "content": arg.clone()}));
+                                            app.push_msg(ChatMessage::User(arg));
+                                        }
+                                        // Start stream — mirror InputAction::Submit stream-start pattern.
+                                        let ct = CancellationToken::new();
+                                        let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                        app.status_text = Some("connecting…".to_string());
+                                        app.streaming = true;
+                                        app.spinner_frame = 0;
+                                        let elapsed = last_frame.elapsed();
+                                        last_frame = Instant::now();
+                                        let _ = draw(&mut terminal, &mut app, runtime.model(), runtime.thinking_level(), &mut boot_fx, &mut exit_fx, elapsed);
+                                        stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                        app.status_text = None;
+                                        app.push_msg(ChatMessage::Thinking("…".to_string()));
+                                        cancel_token = Some(ct);
+                                        steer_tx = Some(s_tx);
                                     }
                                 }
                             }
@@ -350,6 +389,8 @@ async fn main() -> Result<()> {
                                             event_reader = EventStream::new();
                                         }
                                         CommandAction::StartStream => {}
+                                        // handle_streaming_command never returns LoadSkill.
+                                        CommandAction::LoadSkill { .. } => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
