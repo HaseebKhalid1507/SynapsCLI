@@ -73,6 +73,38 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
     Ok(())
 }
 
+use std::time::Duration;
+
+pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
+    let https_url = if url.starts_with("http://") {
+        // only allowed from internal callers; public callers go via normalize.
+        return Err("only https:// URLs are supported".into());
+    } else {
+        url.to_string()
+    };
+    let body = fetch_raw(&https_url).await?;
+    let m: MarketplaceManifest = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid marketplace.json: {}", e))?;
+    validate_manifest(&m)?;
+    Ok(m)
+}
+
+/// Low-level: GET the URL and return the body. Used by fetch_manifest and
+/// by tests (which need http:// against a local loopback server).
+pub(crate) async fn fetch_raw(url: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("reqwest build: {}", e))?;
+    let resp = client.get(url).send().await
+        .map_err(|e| format!("failed to fetch: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("failed to fetch marketplace.json: {}", status));
+    }
+    resp.text().await.map_err(|e| format!("read body: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +220,46 @@ mod tests {
         "#).unwrap();
         let err = validate_manifest(&m).unwrap_err();
         assert!(err.contains("'bad'"));
+    }
+
+    #[tokio::test]
+    async fn fetch_marketplace_json_success() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let body = r#"{"name":"mk","plugins":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(), body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{}/x", port);
+        // Bypass the https-only guard by calling fetch_raw (internal helper).
+        let body = fetch_raw(&url).await.unwrap();
+        assert!(body.contains(r#""name":"mk""#));
+    }
+
+    #[tokio::test]
+    async fn fetch_marketplace_json_404_returns_error() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let url = format!("http://127.0.0.1:{}/x", port);
+        let err = fetch_raw(&url).await.unwrap_err();
+        assert!(err.contains("404"));
     }
 }
