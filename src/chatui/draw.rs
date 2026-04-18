@@ -163,14 +163,16 @@ pub(crate) fn draw(
         let content_height = msg_area.height.saturating_sub(2) as usize;
         let content_width = msg_area.width.saturating_sub(2) as usize; // horizontal padding only (no left/right borders)
 
-        // Rebuild line cache only when content changed or width changed
-        if app.dirty || app.cache_width != content_width {
-            app.line_cache = app.render_lines(content_width);
-            app.cache_width = content_width;
-            app.dirty = false;
+        // Rebuild line cache when missing (invalidated) or width has changed.
+        let needs_rebuild = app
+            .line_cache
+            .as_ref()
+            .map_or(true, |(w, _)| *w != content_width);
+        if needs_rebuild {
+            let lines = app.render_lines(content_width);
+            app.line_cache = Some((content_width, lines));
         }
-
-        let all_lines = &app.line_cache;
+        let all_lines: &[Line<'static>] = &app.line_cache.as_ref().unwrap().1;
         let total = all_lines.len();
 
         // When pinned, always show the latest content (scroll_back = 0).

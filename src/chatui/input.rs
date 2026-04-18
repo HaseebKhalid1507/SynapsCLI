@@ -183,8 +183,7 @@ fn handle_key(
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             app.show_full_output = !app.show_full_output;
-            app.dirty = true;
-            app.line_cache.clear();
+            app.invalidate();
         }
         (KeyCode::Char(c), _) => {
             let byte_pos = app.cursor_byte_pos();

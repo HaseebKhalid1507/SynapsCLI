@@ -83,7 +83,7 @@ pub(super) async fn handle_command(
         "clear" => {
             app.save_session().await;
             app.messages.clear();
-            app.dirty = true;
+            app.invalidate();
             app.api_messages.clear();
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
@@ -189,7 +189,7 @@ pub(super) async fn handle_command(
                         app.save_session().await;
                         let old_id = app.session.id.clone();
                         app.messages.clear();
-                        app.dirty = true;
+                        app.invalidate();
                         app.api_messages = session.api_messages.clone();
                         app.total_input_tokens = session.total_input_tokens;
                         app.total_output_tokens = session.total_output_tokens;

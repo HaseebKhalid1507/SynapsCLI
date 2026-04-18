@@ -48,8 +48,7 @@ pub(super) async fn handle_stream_event(
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
                     partial.push_str(&delta);
-                    app.dirty = true;
-                    app.line_cache.clear();
+                    app.invalidate();
                 }
             }
         }
@@ -60,8 +59,7 @@ pub(super) async fn handle_stream_event(
                 if let ChatMessage::ToolUseStart(name, _) = &last.msg {
                     if name == &tool_name {
                         last.msg = ChatMessage::ToolUse { tool_name, input: input_str };
-                        app.dirty = true;
-                        app.line_cache.clear();
+                        app.invalidate();
                         return StreamAction::Continue;
                     }
                 }
@@ -72,8 +70,7 @@ pub(super) async fn handle_stream_event(
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
                     content.push_str(&delta);
-                    app.dirty = true;
-                    app.line_cache.clear();
+                    app.invalidate();
                     return StreamAction::Continue;
                 }
             }
@@ -86,8 +83,7 @@ pub(super) async fn handle_stream_event(
                 if let ChatMessage::ToolResult { ref mut content, elapsed_ms: ref mut el, .. } = last.msg {
                     *content = result;
                     *el = elapsed;
-                    app.dirty = true;
-                    app.line_cache.clear();
+                    app.invalidate();
                     return StreamAction::Continue;
                 }
             }
@@ -106,15 +102,13 @@ pub(super) async fn handle_stream_event(
                 done: false,
                 duration_secs: None,
             });
-            app.dirty = true;
-            app.line_cache.clear();
+            app.invalidate();
         }
         StreamEvent::SubagentUpdate { subagent_id, status, .. } => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.status = status;
             }
-            app.dirty = true;
-            app.line_cache.clear();
+            app.invalidate();
         }
         StreamEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
@@ -129,8 +123,7 @@ pub(super) async fn handle_stream_event(
                     sa.status = format!("\u{2714} {}", preview);
                 }
             }
-            app.dirty = true;
-            app.line_cache.clear();
+            app.invalidate();
         }
         StreamEvent::SteeringDelivered { message } => {
             app.push_msg(ChatMessage::User(message.clone()));
@@ -139,8 +132,7 @@ pub(super) async fn handle_stream_event(
             }
             app.scroll_back = 0;
             app.scroll_pinned = true;
-            app.dirty = true;
-            app.line_cache.clear();
+            app.invalidate();
         }
         StreamEvent::Usage {
             input_tokens,
