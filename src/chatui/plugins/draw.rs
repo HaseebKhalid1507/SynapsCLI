@@ -7,6 +7,9 @@ use super::PluginsModalState;
 use super::state::{Focus, LeftRow, RightMode, RightRow};
 use crate::theme::THEME;
 
+const OVERLAY_MAX_WIDTH: u16 = 70;
+const OVERLAY_HEIGHT: u16 = 7;
+
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
     let h = (area.height.saturating_mul(7) / 10).max(20).min(area.height);
@@ -242,21 +245,26 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&str>) {
-    let w = area.width.saturating_sub(4).clamp(24, 70);
-    let h: u16 = 7;
+fn centered_overlay(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    let w = area.width.saturating_sub(4).clamp(24, OVERLAY_MAX_WIDTH);
+    let h = OVERLAY_HEIGHT;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect { x, y, width: w, height: h.min(area.height) };
     frame.render_widget(Clear, rect);
     let block = Block::default()
-        .title(" Add Marketplace ")
+        .title(title.to_string())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(THEME.border_active))
         .style(Style::default().bg(THEME.bg));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    inner
+}
+
+fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&str>) {
+    let inner = centered_overlay(frame, area, " Add Marketplace ");
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -278,20 +286,7 @@ fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<
 }
 
 fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &str) {
-    let w = area.width.saturating_sub(4).clamp(24, 70);
-    let h: u16 = 7;
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h.min(area.height) };
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" Trust Host ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = centered_overlay(frame, area, " Trust Host ");
 
     let lines = vec![
         Line::from(Span::styled(
@@ -308,20 +303,7 @@ fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str) {
-    let w = area.width.saturating_sub(4).clamp(24, 70);
-    let h: u16 = 7;
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h.min(area.height) };
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" Confirm ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = centered_overlay(frame, area, " Confirm ");
 
     let lines = vec![
         Line::from(Span::styled(
