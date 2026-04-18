@@ -44,9 +44,11 @@ pub(crate) struct App {
     pub(crate) total_cache_creation_tokens: u64,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
-    pub(crate) line_cache: Vec<Line<'static>>,
-    pub(crate) cache_width: usize,
-    pub(crate) dirty: bool,
+    /// Cached wrapped+highlighted message lines.
+    /// `None` means "stale — rebuild on next draw". `Some((w, lines))` means
+    /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
+    /// trio into a single invariant-preserving field — impossible to desync.
+    pub(crate) line_cache: Option<(usize, Vec<Line<'static>>)>,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
@@ -110,9 +112,7 @@ impl App {
             total_cache_creation_tokens: 0,
             session_cost: 0.0,
             session,
-            line_cache: Vec::new(),
-            cache_width: 0,
-            dirty: true,
+            line_cache: None,
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
@@ -244,7 +244,13 @@ impl App {
         if self.scroll_pinned {
             self.scroll_back = 0;
         }
-        self.dirty = true;
+        self.invalidate();
+    }
+
+    /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
+    /// Call this after any mutation that changes how `messages` renders.
+    pub(crate) fn invalidate(&mut self) {
+        self.line_cache = None;
     }
 
     /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
@@ -368,7 +374,7 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Text(text.to_string()));
         }
-        self.dirty = true;
+        self.invalidate();
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
@@ -377,7 +383,7 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
         }
-        self.dirty = true;
+        self.invalidate();
     }
 
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {

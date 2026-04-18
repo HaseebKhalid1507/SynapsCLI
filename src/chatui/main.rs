@@ -253,15 +253,13 @@ async fn main() -> Result<()> {
                 if !app.subagents.is_empty() || app.streaming {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                     if app.spinner_frame % 3 == 0 {
-                        app.dirty = true;
-                        app.line_cache.clear();
+                        app.invalidate();
                     }
                 }
                 if let Some(msg) = app.check_gamba_exited() {
                     terminal.clear().ok();
                     app.push_msg(ChatMessage::System(msg));
-                    app.dirty = true;
-                    app.line_cache.clear();
+                    app.invalidate();
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
@@ -564,8 +562,7 @@ async fn main() -> Result<()> {
                                 if let Some(msg) = app.reclaim_gamba() {
                                     terminal.clear().ok();
                                     app.push_msg(ChatMessage::System(msg));
-                                    app.dirty = true;
-                                    app.line_cache.clear();
+                                    app.invalidate();
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
                                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
@@ -581,8 +578,7 @@ async fn main() -> Result<()> {
                             if let Some(msg) = app.reclaim_gamba() {
                                 terminal.clear().ok();
                                 app.push_msg(ChatMessage::System(msg));
-                                app.dirty = true;
-                                app.line_cache.clear();
+                                app.invalidate();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
                                 let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
