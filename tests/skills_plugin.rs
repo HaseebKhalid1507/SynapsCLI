@@ -67,3 +67,39 @@ fn end_to_end_discovery_and_dispatch() {
 
     fs::remove_dir_all(&tmp).ok();
 }
+
+#[test]
+fn end_to_end_nested_marketplace_discovery() {
+    // Real-world install layout: a marketplace repo cloned into the discovery
+    // root as a subdirectory (e.g. ~/.synaps-cli/plugins/pi-skills/...).
+    let tmp = std::env::temp_dir().join(format!(
+        "synaps-int-nested-{}-{}",
+        std::process::id(),
+        synaps_cli::epoch_millis()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+
+    // Nested marketplace under {tmp}/pkg/.synaps-plugin/marketplace.json
+    write(
+        &tmp.join("pkg/.synaps-plugin/marketplace.json"),
+        r#"{"name":"nested","plugins":[{"name":"web","source":"./web"}]}"#,
+    );
+    write(
+        &tmp.join("pkg/web/.synaps-plugin/plugin.json"),
+        r#"{"name":"web"}"#,
+    );
+    write(
+        &tmp.join("pkg/web/skills/search/SKILL.md"),
+        "---\nname: search\ndescription: Web search\n---\nBody",
+    );
+
+    let (plugins, skills) = loader::load_all(std::slice::from_ref(&tmp));
+    assert_eq!(plugins.len(), 1, "nested marketplace should yield 1 plugin");
+    assert_eq!(plugins[0].name, "web");
+    assert_eq!(plugins[0].marketplace.as_deref(), Some("nested"));
+    assert_eq!(skills.len(), 1, "nested marketplace should yield 1 skill");
+    assert_eq!(skills[0].name, "search");
+    assert_eq!(skills[0].plugin.as_deref(), Some("web"));
+
+    fs::remove_dir_all(&tmp).ok();
+}

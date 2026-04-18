@@ -114,11 +114,18 @@ fn walk_root(
     };
 
     // 2. Plugin pass (subdirs with .synaps-plugin/plugin.json)
+    //    Additionally, if a subdir contains .synaps-plugin/marketplace.json,
+    //    treat it as a nested discovery root and recurse once. This supports
+    //    the common "clone marketplace repo into plugins/" install pattern.
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() { continue; }
-            if path.join(".synaps-plugin").join("plugin.json").exists() {
+            let subdir_synaps = path.join(".synaps-plugin");
+            if subdir_synaps.join("marketplace.json").exists() {
+                // Nested marketplace — recurse into this subdir.
+                walk_root(&path, plugins, skills, seen);
+            } else if subdir_synaps.join("plugin.json").exists() {
                 load_plugin(&path, marketplace_name.as_deref(), plugins, skills, seen);
             }
         }
