@@ -56,6 +56,11 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+    let current_cat = super::schema::CATEGORIES[state.category_idx];
+    if current_cat == super::schema::Category::Plugins {
+        render_plugins_list(frame, area, state, snap);
+        return;
+    }
     let settings = state.current_settings();
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = Vec::new();
@@ -107,6 +112,37 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
     if let Some(ActiveEditor::Picker { options, cursor, .. }) = &state.edit_mode {
         render_picker(frame, area, options, *cursor);
     }
+}
+
+fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+    let mut lines = Vec::new();
+    if snap.plugins.is_empty() {
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            "  No plugins installed. Open /plugins to add a marketplace.",
+            Style::default().fg(THEME.help_fg),
+        )]));
+    } else {
+        for (i, p) in snap.plugins.iter().enumerate() {
+            let disabled = snap.disabled_plugins.iter().any(|d| d == &p.name);
+            let status = if disabled { "✗ disabled" } else { "✓ enabled" };
+            let skills_part = if p.skill_count > 0 {
+                format!("  ({} skills)", p.skill_count)
+            } else {
+                String::new()
+            };
+            let selected = i == state.setting_idx && state.focus == Focus::Right;
+            let style = if selected {
+                Style::default().fg(THEME.claude_label)
+            } else {
+                Style::default().fg(THEME.claude_text)
+            };
+            lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+                format!("  {:<20} {}{}", p.name, status, skills_part),
+                style,
+            )]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {

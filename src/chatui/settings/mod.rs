@@ -33,6 +33,11 @@ pub(crate) fn theme_options() -> Vec<String> {
 
 use schema::SettingDef;
 
+pub(crate) struct PluginRow {
+    pub name: String,
+    pub skill_count: usize,
+}
+
 /// Snapshot of live runtime + persisted config values, used to display current
 /// values in the modal and seed text editors.
 pub(crate) struct RuntimeSnapshot {
@@ -44,11 +49,19 @@ pub(crate) struct RuntimeSnapshot {
     pub subagent_timeout: u64,
     pub api_retries: u32,
     pub theme_name: String,
+    pub plugins: Vec<PluginRow>,
+    pub disabled_plugins: Vec<String>,
 }
 
 impl RuntimeSnapshot {
-    pub fn from_runtime(runtime: &synaps_cli::Runtime) -> Self {
+    pub fn from_runtime(
+        runtime: &synaps_cli::Runtime,
+        registry: &synaps_cli::skills::registry::CommandRegistry,
+    ) -> Self {
         let config = synaps_cli::config::load_config();
+        let plugins: Vec<PluginRow> = registry.plugins().into_iter()
+            .map(|p| PluginRow { name: p.name, skill_count: p.skill_count })
+            .collect();
         Self {
             model: runtime.model().to_string(),
             thinking: runtime.thinking_level().to_string(),
@@ -58,6 +71,8 @@ impl RuntimeSnapshot {
             subagent_timeout: runtime.subagent_timeout(),
             api_retries: runtime.api_retries(),
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
+            plugins,
+            disabled_plugins: config.disabled_plugins.clone(),
         }
     }
 }
@@ -97,6 +112,7 @@ impl SettingsState {
     /// Settings in the currently selected category.
     pub fn current_settings(&self) -> Vec<&'static SettingDef> {
         let cat = schema::CATEGORIES[self.category_idx];
+        if cat == schema::Category::Plugins { return Vec::new(); }
         schema::ALL_SETTINGS.iter().filter(|s| s.category == cat).collect()
     }
 

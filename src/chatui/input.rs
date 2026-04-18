@@ -22,6 +22,9 @@ pub(super) enum InputAction {
     Abort,
     /// Settings modal requested an apply — (key, value).
     SettingsApply(&'static str, String),
+    /// Plugins modal emitted an outcome — handled in the async main loop
+    /// because most variants perform async I/O (network, filesystem).
+    PluginsOutcome(crate::plugins::InputOutcome),
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -35,7 +38,7 @@ pub(super) fn handle_event(
     // Route events to the settings modal while it's open.
     if app.settings.is_some() {
         if let Event::Key(key) = event {
-            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime);
+            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime, registry);
             let state = app.settings.as_mut().expect("just checked");
             match crate::settings::handle_event(state, key, &snap) {
                 crate::settings::InputOutcome::Close => { app.settings = None; }
@@ -43,9 +46,40 @@ pub(super) fn handle_event(
                 crate::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
+                crate::settings::InputOutcome::TogglePlugin { name, enabled } => {
+                    let mut config = synaps_cli::config::load_config();
+                    match crate::plugins::actions::toggle_plugin_config(
+                        &name, enabled, &mut config, registry,
+                    ) {
+                        Ok(()) => {
+                            state.row_error = None;
+                        }
+                        Err(e) => {
+                            state.row_error = Some(("disabled_plugins".to_string(), e));
+                        }
+                    }
+                }
             }
         }
         // Swallow all other events while settings is open.
+        return InputAction::None;
+    }
+    // Route events to the plugins modal while it's open. Most outcomes run
+    // async side-effects (fetch manifest, git clone, etc.), so we delegate
+    // them to the main loop via `InputAction::PluginsOutcome`.
+    if app.plugins.is_some() {
+        if let Event::Key(key) = event {
+            let state = app.plugins.as_mut().expect("just checked");
+            let outcome = crate::plugins::handle_event(state, key);
+            return match outcome {
+                crate::plugins::InputOutcome::Close => {
+                    app.plugins = None;
+                    InputAction::None
+                }
+                crate::plugins::InputOutcome::None => InputAction::None,
+                other => InputAction::PluginsOutcome(other),
+            };
+        }
         return InputAction::None;
     }
     match event {

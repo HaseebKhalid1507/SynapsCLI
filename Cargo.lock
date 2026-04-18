@@ -2145,6 +2145,7 @@ dependencies = [
  "sha2",
  "syntect",
  "tachyonfx",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
