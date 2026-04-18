@@ -141,6 +141,26 @@ impl Runtime {
         self.api_retries
     }
 
+    pub fn set_max_tool_output(&mut self, v: usize) {
+        self.max_tool_output = v;
+    }
+
+    pub fn set_bash_timeout(&mut self, v: u64) {
+        self.bash_timeout = v;
+    }
+
+    pub fn set_bash_max_timeout(&mut self, v: u64) {
+        self.bash_max_timeout = v;
+    }
+
+    pub fn set_subagent_timeout(&mut self, v: u64) {
+        self.subagent_timeout = v;
+    }
+
+    pub fn set_api_retries(&mut self, v: u32) {
+        self.api_retries = v;
+    }
+
     pub fn thinking_level(&self) -> &str {
         match self.thinking_budget {
             0..=2048 => "low",
