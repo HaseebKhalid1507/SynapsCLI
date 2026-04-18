@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
                 match maybe_event {
                     Some(Ok(event)) => {
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, is_streaming);
+                        let action = input::handle_event(event, &mut app, is_streaming, &registry);
                         match action {
                             InputAction::None => {}
                             InputAction::Quit => {
@@ -360,7 +360,8 @@ async fn main() -> Result<()> {
                                 // Check for streaming slash commands
                                 if let Some(rest) = input.strip_prefix('/') {
                                     let raw_cmd = rest.split_whitespace().next().unwrap_or("");
-                                    let cmd = commands::resolve_prefix(raw_cmd, commands::STREAMING_COMMANDS);
+                                    let streaming_cmds = commands::to_owned_commands(commands::STREAMING_COMMANDS);
+                                    let cmd = commands::resolve_prefix(raw_cmd, &streaming_cmds);
                                     match commands::handle_streaming_command(&cmd, &input, &mut app) {
                                         CommandAction::None => {
                                             // Unknown streaming command — steer/queue as normal

@@ -1,6 +1,9 @@
 //! Input handling — keyboard events, cursor movement, paste, mouse scroll.
 
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, Event};
+use synaps_cli::skills::registry::CommandRegistry;
 use super::app::{App, ChatMessage};
 
 /// What the event loop should do after processing input.
@@ -24,9 +27,10 @@ pub(super) fn handle_event(
     event: Event,
     app: &mut App,
     streaming: bool,
+    registry: &Arc<CommandRegistry>,
 ) -> InputAction {
     match event {
-        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming),
+        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry),
         Event::Mouse(mouse) => {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -75,6 +79,7 @@ fn handle_key(
     modifiers: KeyModifiers,
     app: &mut App,
     streaming: bool,
+    registry: &Arc<CommandRegistry>,
 ) -> InputAction {
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -89,13 +94,13 @@ fn handle_key(
             app.cursor_pos += 1;
         }
         (KeyCode::Enter, _) if !streaming && !app.input.is_empty() => {
-            return process_submit(app);
+            return process_submit(app, registry);
         }
         (KeyCode::Enter, _) if streaming && !app.input.is_empty() => {
             return process_streaming_submit(app);
         }
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
-            handle_tab_complete(app);
+            handle_tab_complete(app, registry);
         }
         // Cursor movement
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -166,7 +171,7 @@ fn handle_key(
 }
 
 /// User pressed Enter with non-empty input while not streaming.
-fn process_submit(app: &mut App) -> InputAction {
+fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
     if app.messages.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
@@ -183,7 +188,8 @@ fn process_submit(app: &mut App) -> InputAction {
         let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
-        let cmd = super::commands::resolve_prefix(raw_cmd, super::commands::ALL_COMMANDS);
+        let commands = super::commands::all_commands_with_skills(registry);
+        let cmd = super::commands::resolve_prefix(raw_cmd, &commands);
         InputAction::SlashCommand(cmd, arg)
     } else {
         InputAction::Submit(input)
@@ -205,10 +211,10 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
 }
 
 /// Tab completion for slash commands.
-fn handle_tab_complete(app: &mut App) {
+fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
     let partial = &app.input[1..];
-    let commands = super::commands::ALL_COMMANDS;
-    let matches: Vec<&&str> = commands.iter()
+    let commands = super::commands::all_commands_with_skills(registry);
+    let matches: Vec<&String> = commands.iter()
         .filter(|c| c.starts_with(partial))
         .collect();
     if matches.len() == 1 {
