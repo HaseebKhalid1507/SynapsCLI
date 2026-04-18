@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
             // ── Tick: animations + spinner (~60fps) ──
@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
                     app.line_cache.clear();
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -363,7 +363,7 @@ async fn main() -> Result<()> {
                                         app.spinner_frame = 0;
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
-                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -412,7 +412,7 @@ async fn main() -> Result<()> {
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -506,7 +506,7 @@ async fn main() -> Result<()> {
                                     app.line_cache.clear();
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                                 }
                             }
                         }
@@ -523,7 +523,7 @@ async fn main() -> Result<()> {
                                 app.line_cache.clear();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
                             app.spinner_frame = 0;
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
                     if do_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed);
+                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                     }
                 }
             }

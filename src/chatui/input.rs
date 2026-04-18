@@ -35,7 +35,7 @@ pub(super) fn handle_event(
     // Route events to the settings modal while it's open.
     if app.settings.is_some() {
         if let Event::Key(key) = event {
-            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime);
+            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime, registry);
             let state = app.settings.as_mut().expect("just checked");
             match crate::settings::handle_event(state, key, &snap) {
                 crate::settings::InputOutcome::Close => { app.settings = None; }
