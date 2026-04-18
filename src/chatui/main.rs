@@ -11,6 +11,7 @@ mod commands;
 mod input;
 mod stream_handler;
 mod settings;
+mod plugins;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
