@@ -48,21 +48,14 @@ pub(super) fn handle_event(
                 }
                 crate::settings::InputOutcome::TogglePlugin { name, enabled } => {
                     let mut config = synaps_cli::config::load_config();
-                    let mut new_disabled = config.disabled_plugins.clone();
-                    if enabled {
-                        new_disabled.retain(|p| p != &name);
-                    } else if !new_disabled.iter().any(|p| p == &name) {
-                        new_disabled.push(name.clone());
-                    }
-                    let csv = new_disabled.join(", ");
-                    match synaps_cli::config::write_config_value("disabled_plugins", &csv) {
+                    match crate::plugins::actions::toggle_plugin_config(
+                        &name, enabled, &mut config, registry,
+                    ) {
                         Ok(()) => {
-                            config.disabled_plugins = new_disabled;
-                            synaps_cli::skills::reload_registry(registry, &config);
                             state.row_error = None;
                         }
                         Err(e) => {
-                            state.row_error = Some(("disabled_plugins".to_string(), e.to_string()));
+                            state.row_error = Some(("disabled_plugins".to_string(), e));
                         }
                     }
                 }

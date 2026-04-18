@@ -166,6 +166,7 @@ async fn run_install_flow(
             return;
         }
     };
+    let plugin_name_for_msg = plugin_name.clone();
     state.file.installed.push(InstalledPlugin {
         name: plugin_name,
         marketplace: marketplace_name,
@@ -175,7 +176,10 @@ async fn run_install_flow(
         installed_at: now_rfc3339(),
     });
     if let Err(e) = commit_plugins_state(&state.file) {
-        state.row_error = Some(format!("save failed: {}", e));
+        state.row_error = Some(format!(
+            "installed '{}' but failed to save state: {}. Restart may lose this install.",
+            plugin_name_for_msg, e
+        ));
         return;
     }
     reload_registry(registry, config);
@@ -204,7 +208,10 @@ pub(crate) async fn apply_uninstall(
     }
     state.file.installed.retain(|p| p.name != name);
     if let Err(e) = commit_plugins_state(&state.file) {
-        state.row_error = Some(format!("save failed: {}", e));
+        state.row_error = Some(format!(
+            "uninstalled '{}' but failed to save state: {}. State may be stale.",
+            name, e
+        ));
         return;
     }
     reload_registry(registry, config);
@@ -234,7 +241,10 @@ pub(crate) async fn apply_update(
         p.installed_commit = sha;
     }
     if let Err(e) = commit_plugins_state(&state.file) {
-        state.row_error = Some(format!("save failed: {}", e));
+        state.row_error = Some(format!(
+            "updated '{}' but failed to save state: {}. State may be stale.",
+            name, e
+        ));
         return;
     }
     reload_registry(registry, config);
@@ -290,10 +300,16 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
             .collect();
         m.last_refreshed = Some(now_rfc3339());
     }
+    let mut failed: Vec<String> = Vec::new();
     for (plugin_name, res) in ls_results {
-        if let Ok(sha) = res {
-            if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
-                p.latest_commit = Some(sha);
+        match res {
+            Ok(sha) => {
+                if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
+                    p.latest_commit = Some(sha);
+                }
+            }
+            Err(_) => {
+                failed.push(plugin_name);
             }
         }
     }
@@ -301,7 +317,16 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
         state.row_error = Some(format!("save failed: {}", e));
         return;
     }
-    state.row_error = None;
+    if !failed.is_empty() {
+        state.row_error = Some(format!(
+            "refreshed '{}', but could not check updates for: {}",
+            name,
+            failed.join(", ")
+        ));
+    } else {
+        state.row_error = None;
+    }
+    state.mode = RightMode::List;
 }
 
 pub(crate) fn apply_remove_marketplace(state: &mut PluginsModalState, name: String) {
@@ -318,6 +343,32 @@ pub(crate) fn apply_remove_marketplace(state: &mut PluginsModalState, name: Stri
     state.row_error = None;
 }
 
+/// Core config mutation for toggling a plugin enabled/disabled.
+///
+/// Shared between the `/plugins` modal (`apply_toggle_plugin`) and the
+/// settings modal's TogglePlugin handler. On success: updates `config`
+/// and reloads the registry. On failure: returns the error string
+/// without mutating `config`.
+pub(crate) fn toggle_plugin_config(
+    name: &str,
+    enabled: bool,
+    config: &mut synaps_cli::SynapsConfig,
+    registry: &Arc<CommandRegistry>,
+) -> Result<(), String> {
+    let mut new_disabled = config.disabled_plugins.clone();
+    if enabled {
+        new_disabled.retain(|p| p != name);
+    } else if !new_disabled.iter().any(|p| p == name) {
+        new_disabled.push(name.to_string());
+    }
+    let csv = new_disabled.join(", ");
+    synaps_cli::config::write_config_value("disabled_plugins", &csv)
+        .map_err(|e| e.to_string())?;
+    config.disabled_plugins = new_disabled;
+    reload_registry(registry, config);
+    Ok(())
+}
+
 pub(crate) fn apply_toggle_plugin(
     state: &mut PluginsModalState,
     name: String,
@@ -325,21 +376,12 @@ pub(crate) fn apply_toggle_plugin(
     registry: &Arc<CommandRegistry>,
     config: &mut synaps_cli::SynapsConfig,
 ) {
-    let mut new_disabled = config.disabled_plugins.clone();
-    if enabled {
-        new_disabled.retain(|p| p != &name);
-    } else if !new_disabled.iter().any(|p| p == &name) {
-        new_disabled.push(name.clone());
-    }
-    let csv = new_disabled.join(", ");
-    match synaps_cli::config::write_config_value("disabled_plugins", &csv) {
+    match toggle_plugin_config(&name, enabled, config, registry) {
         Ok(()) => {
-            config.disabled_plugins = new_disabled;
-            reload_registry(registry, config);
             state.row_error = None;
         }
         Err(e) => {
-            state.row_error = Some(e.to_string());
+            state.row_error = Some(e);
         }
     }
 }
