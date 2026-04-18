@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 - **Thread panic handling**: Subagent threads wrapped in `catch_unwind` — panics become visible errors
 - **Doc comments**: Public API types (`Runtime`, `ToolRegistry`) and key methods documented
 - **Markdown wrapping**: List items and tables now respect terminal width instead of overflowing
-- **Skills & plugins subsystem**: discover plugins under `.synaps-cli/plugins/` and `~/.synaps-cli/plugins/`, register each skill as a dynamic slash command (`/skill-name <args>`), and expose the same skills to the model via the `load_skill` tool. Supports `.synaps-plugin/marketplace.json` (multiple plugins from one clone) and `.synaps-plugin/plugin.json` (per-plugin metadata).
+- **Skills & plugins subsystem**: discover plugins and skills under `.synaps-cli/{plugins,skills}/` (project-local) and `~/.synaps-cli/{plugins,skills}/` (global), register each skill as a dynamic slash command (`/skill-name <args>`), and expose the same skills to the model via the `load_skill` tool. Supports `.synaps-plugin/marketplace.json` (multiple plugins from one clone) and `.synaps-plugin/plugin.json` (per-plugin metadata).
 - **Config keys** `disabled_plugins` **and** `disabled_skills`: block discovered skills via comma-separated list. Qualified names (`plugin:skill`) supported.
 
 ### Breaking
