@@ -115,6 +115,8 @@ async fn reload_picks_up_new_skill() {
     let plugins_root = dir.path().join(".synaps-cli").join("plugins");
     std::fs::create_dir_all(&plugins_root).unwrap();
 
+    // Save HOME so we can restore it at the end (avoid leaking into other tests).
+    let prev_home = std::env::var_os("HOME");
     // Point HOME so default_roots() picks up our dir.
     std::env::set_var("HOME", dir.path());
 
@@ -139,4 +141,10 @@ async fn reload_picks_up_new_skill() {
     reload_registry(&registry, &config);
 
     assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Skill(_)));
+
+    // Restore HOME so we don't leak into other tests in this binary.
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
 }
