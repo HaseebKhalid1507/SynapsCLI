@@ -25,6 +25,18 @@ pub(super) fn handle_event(
     app: &mut App,
     streaming: bool,
 ) -> InputAction {
+    // Route events to the settings modal while it's open.
+    if app.settings.is_some() {
+        if let Event::Key(key) = event {
+            let state = app.settings.as_mut().expect("just checked");
+            match crate::settings::handle_event(state, key) {
+                crate::settings::InputOutcome::Close => { app.settings = None; }
+                crate::settings::InputOutcome::None => {}
+            }
+        }
+        // Swallow all other events while settings is open.
+        return InputAction::None;
+    }
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming),
         Event::Mouse(mouse) => {
