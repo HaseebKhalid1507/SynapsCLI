@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
-use super::{SettingsState, Focus, RuntimeSnapshot};
+use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
 use super::schema::{CATEGORIES, SettingDef, EditorKind};
 use crate::theme::THEME;
 
@@ -66,8 +66,25 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
             Style::default().fg(THEME.claude_text)
         };
         let current_value = current_value_for(def, snap);
-        let value_display = if selected && matches!(def.editor, EditorKind::Cycler(_)) {
-            format!("◀ {} ▶", current_value)
+        let value_display = if selected {
+            match (&state.edit_mode, &def.editor) {
+                (Some(ActiveEditor::Text { buffer, setting_key, error, .. }), _)
+                    if *setting_key == def.key => {
+                    let mut s = format!("[{}_]", buffer);
+                    if let Some(err) = error {
+                        s.push_str(&format!("  ! {}", err));
+                    }
+                    s
+                }
+                (Some(ActiveEditor::CustomModel { buffer }), _)
+                    if def.key == "model" => {
+                    format!("[{}_]", buffer)
+                }
+                (None, EditorKind::Cycler(_)) => {
+                    format!("◀ {} ▶", current_value)
+                }
+                _ => current_value,
+            }
         } else {
             current_value
         };
@@ -76,6 +93,40 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
+
+    if let Some(ActiveEditor::Picker { options, cursor, .. }) = &state.edit_mode {
+        render_picker(frame, area, options, *cursor);
+    }
+}
+
+fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
+    let w = area.width.saturating_sub(4).min(60).max(20);
+    let h = (options.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let x = area.x + 2;
+    let y = area.y + 2;
+    let rect = Rect { x, y, width: w, height: h };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.border_active))
+        .style(Style::default().bg(THEME.bg));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines = Vec::new();
+    for (i, opt) in options.iter().enumerate() {
+        let style = if i == cursor {
+            Style::default().fg(THEME.claude_label)
+        } else {
+            Style::default().fg(THEME.claude_text)
+        };
+        let marker = if i == cursor { "▸ " } else { "  " };
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(format!("{}{}", marker, opt), style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {

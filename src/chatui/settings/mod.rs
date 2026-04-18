@@ -8,6 +8,29 @@ pub(crate) mod input;
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
 
+const BUILTIN_THEMES: &[&str] = &[
+    "neon-rain", "amber", "phosphor", "solarized-dark", "blood",
+    "ocean", "rose-pine", "nord", "dracula", "monokai",
+    "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
+    "forest", "lavender",
+];
+
+pub(crate) fn theme_options() -> Vec<String> {
+    let mut opts: Vec<String> = BUILTIN_THEMES.iter().map(|s| s.to_string()).collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        let themes_dir = std::path::PathBuf::from(home).join(".synaps-cli/themes");
+        if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.path().file_stem().and_then(|s| s.to_str()) {
+                    let s = name.to_string();
+                    if !opts.contains(&s) { opts.push(s); }
+                }
+            }
+        }
+    }
+    opts
+}
+
 use schema::{Category, SettingDef};
 
 /// Snapshot of live runtime + persisted config values, used to display current
