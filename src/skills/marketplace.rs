@@ -89,8 +89,12 @@ pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
     Ok(m)
 }
 
-/// Low-level: GET the URL and return the body. Used by fetch_manifest and
-/// by tests (which need http:// against a local loopback server).
+/// Fetches raw JSON bytes from a URL.
+///
+/// **Unsafe surface:** unlike [`fetch_manifest`], this does NOT enforce
+/// `https://`. Callers must validate the URL scheme themselves. Public only
+/// to let integration tests hit a local `http://127.0.0.1:<port>` loopback;
+/// application code should use `fetch_manifest` instead.
 pub async fn fetch_raw(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
