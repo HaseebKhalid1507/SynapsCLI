@@ -83,6 +83,7 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub theme: Option<String>,
 }
 
 impl Default for SynapsConfig {
@@ -96,6 +97,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            theme: None,
         }
     }
 }
@@ -158,6 +160,7 @@ pub fn load_config() -> SynapsConfig {
                     config.api_retries = retries;
                 }
             }
+            "theme" => config.theme = Some(val.to_string()),
             _ => {} // Unknown keys silently ignored
         }
     }
@@ -251,6 +254,28 @@ mod tests {
         assert_eq!(config.bash_max_timeout, 300);
         assert_eq!(config.subagent_timeout, 300);
         assert_eq!(config.api_retries, 3);
+        assert_eq!(config.theme, None);
+    }
+
+    #[test]
+    fn load_config_parses_theme_key() {
+        let dir = std::path::PathBuf::from("/tmp/synaps-config-test-theme/.synaps-cli");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("config"), "theme = dracula\n").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-theme");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-theme");
+
+        assert_eq!(config.theme.as_deref(), Some("dracula"));
     }
 
     #[test]
