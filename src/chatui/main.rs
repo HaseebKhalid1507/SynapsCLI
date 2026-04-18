@@ -323,6 +323,16 @@ async fn main() -> Result<()> {
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
                                     }
+                                    CommandAction::OpenPlugins => {
+                                        let path = synaps_cli::skills::state::PluginsState::default_path();
+                                        let file = synaps_cli::skills::state::PluginsState::load_from(&path)
+                                            .unwrap_or_default();
+                                        app.plugins = Some(plugins::PluginsModalState::new(file));
+                                    }
+                                    CommandAction::ReloadPlugins => {
+                                        synaps_cli::skills::reload_registry(&registry, &config);
+                                        app.push_msg(ChatMessage::System("plugins reloaded".to_string()));
+                                    }
                                     CommandAction::LoadSkill { skill, arg } => {
                                         use synaps_cli::skills::tool::LoadSkillTool;
 
@@ -455,6 +465,8 @@ async fn main() -> Result<()> {
                                         }
                                         CommandAction::StartStream => {}
                                         CommandAction::OpenSettings => {}
+                                        CommandAction::OpenPlugins => {}
+                                        CommandAction::ReloadPlugins => {}
                                         // handle_streaming_command never returns LoadSkill.
                                         CommandAction::LoadSkill { .. } => {}
                                     }
