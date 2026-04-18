@@ -25,6 +25,11 @@ pub(super) enum CommandAction {
     Quit,
     /// Launch the casino (requires dropping/recreating EventStream).
     LaunchGamba,
+    /// Synthesize load_skill tool-result + user message, then start stream.
+    LoadSkill {
+        skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
+        arg: String,
+    },
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -48,7 +53,9 @@ pub(super) async fn handle_command(
     app: &mut App,
     runtime: &mut Runtime,
     system_prompt_path: &PathBuf,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
 ) -> CommandAction {
+    use synaps_cli::skills::registry::Resolution;
     match cmd {
         "clear" => {
             app.save_session().await;
@@ -202,9 +209,21 @@ pub(super) async fn handle_command(
             return CommandAction::LaunchGamba;
         }
         _ => {
-            app.push_msg(ChatMessage::Error(
-                format!("unknown command: /{}", cmd)
-            ));
+            match registry.resolve(cmd) {
+                Resolution::Skill(skill) => {
+                    return CommandAction::LoadSkill { skill, arg: arg.to_string() };
+                }
+                Resolution::Ambiguous(opts) => {
+                    app.push_msg(ChatMessage::Error(format!(
+                        "ambiguous command /{}; try one of: {}",
+                        cmd,
+                        opts.iter().map(|o| format!("/{}", o)).collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                Resolution::Builtin | Resolution::Unknown => {
+                    app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
+                }
+            }
         }
     }
     CommandAction::None
