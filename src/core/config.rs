@@ -77,7 +77,6 @@ pub fn get_active_config_dir() -> PathBuf {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
-    pub skills: Option<Vec<String>>,
     pub max_tool_output: usize,        // default 30000
     pub bash_timeout: u64,             // default 30
     pub bash_max_timeout: u64,         // default 300
@@ -92,7 +91,6 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
-            skills: None,
             max_tool_output: 30000,
             bash_timeout: 30,
             bash_max_timeout: 300,
@@ -134,9 +132,6 @@ pub fn load_config() -> SynapsConfig {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => config.thinking_budget = parse_thinking_budget(val),
-            "skills" => config.skills = Some(
-                val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-            ),
             "max_tool_output" => {
                 if let Ok(size) = val.parse::<usize>() {
                     config.max_tool_output = size;
@@ -261,7 +256,6 @@ mod tests {
         let config = SynapsConfig::default();
         assert_eq!(config.model, None);
         assert_eq!(config.thinking_budget, None);
-        assert_eq!(config.skills, None);
         assert_eq!(config.max_tool_output, 30000);
         assert_eq!(config.bash_timeout, 30);
         assert_eq!(config.bash_max_timeout, 300);
