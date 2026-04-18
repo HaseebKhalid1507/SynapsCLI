@@ -57,6 +57,7 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
 
 fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let settings = state.current_settings();
+    let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = Vec::new();
     for (i, def) in settings.iter().enumerate() {
         let selected = i == state.setting_idx && state.focus == Focus::Right;
@@ -91,6 +92,15 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         lines.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(format!("  {:<20} {}", def.label, value_display), style),
         ]));
+        if let Some((key, msg)) = &state.row_error {
+            if selected_key == Some(key.as_str()) && i == state.setting_idx {
+                let is_note = msg.starts_with("saved");
+                let color = if is_note { THEME.help_fg } else { THEME.error_color };
+                lines.push(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
+                ]));
+            }
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 
