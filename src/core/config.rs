@@ -83,6 +83,7 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub theme: Option<String>,
 }
 
 impl Default for SynapsConfig {
@@ -96,6 +97,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            theme: None,
         }
     }
 }
@@ -158,11 +160,49 @@ pub fn load_config() -> SynapsConfig {
                     config.api_retries = retries;
                 }
             }
+            "theme" => config.theme = Some(val.to_string()),
             _ => {} // Unknown keys silently ignored
         }
     }
     
     config
+}
+
+/// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
+/// Replaces the first existing line that matches the key, or appends if absent.
+/// Preserves comments and unknown keys. Writes atomically via temp file + rename.
+pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let path = resolve_write_path("config");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let key_trimmed = key.trim();
+    let replacement = format!("{} = {}", key_trimmed, value);
+
+    let mut found = false;
+    let mut new_lines: Vec<String> = existing.lines().map(|line| {
+        if found { return line.to_string(); }
+        let t = line.trim_start();
+        if t.starts_with('#') || t.is_empty() { return line.to_string(); }
+        if let Some((k, _)) = t.split_once('=') {
+            if k.trim() == key_trimmed {
+                found = true;
+                return replacement.clone();
+            }
+        }
+        line.to_string()
+    }).collect();
+
+    if !found {
+        new_lines.push(replacement);
+    }
+
+    let mut out = new_lines.join("\n");
+    if !out.ends_with('\n') { out.push('\n'); }
+
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Resolve the system prompt from CLI flag, config file, or default.
@@ -251,6 +291,125 @@ mod tests {
         assert_eq!(config.bash_max_timeout, 300);
         assert_eq!(config.subagent_timeout, 300);
         assert_eq!(config.api_retries, 3);
+        assert_eq!(config.theme, None);
+    }
+
+    fn make_test_home(subdir: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/tmp/synaps-write-test-{}", subdir));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".synaps-cli")).unwrap();
+        dir
+    }
+
+    fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        f();
+        if let Some(h) = original {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn write_config_value_replaces_existing_key() {
+        let home = make_test_home("replace");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\nthinking = low\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        assert!(contents.contains("thinking = low"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_config_value_appends_when_missing() {
+        let home = make_test_home("append");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("theme", "dracula").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-opus-4-6"));
+        assert!(contents.contains("theme = dracula"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_config_value_preserves_comments() {
+        let home = make_test_home("comments");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "# user comment\nmodel = claude-opus-4-6\n# another\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("# user comment"));
+        assert!(contents.contains("# another"));
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_config_value_preserves_unknown_keys() {
+        let home = make_test_home("unknown");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "custom_thing = 42\nmodel = claude-opus-4-6\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("custom_thing = 42"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_config_value_creates_file_if_absent() {
+        let home = make_test_home("create");
+        let cfg = home.join(".synaps-cli/config");
+        assert!(!cfg.exists());
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_config_parses_theme_key() {
+        let dir = std::path::PathBuf::from("/tmp/synaps-config-test-theme/.synaps-cli");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("config"), "theme = dracula\n").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-theme");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-theme");
+
+        assert_eq!(config.theme.as_deref(), Some("dracula"));
     }
 
     #[test]

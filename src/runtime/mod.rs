@@ -60,7 +60,7 @@ impl Runtime {
                 refresh_token,
                 token_expires,
             })),
-            model: "claude-opus-4-6".to_string(),
+            model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
@@ -139,6 +139,26 @@ impl Runtime {
 
     pub fn api_retries(&self) -> u32 {
         self.api_retries
+    }
+
+    pub fn set_max_tool_output(&mut self, v: usize) {
+        self.max_tool_output = v;
+    }
+
+    pub fn set_bash_timeout(&mut self, v: u64) {
+        self.bash_timeout = v;
+    }
+
+    pub fn set_bash_max_timeout(&mut self, v: u64) {
+        self.bash_max_timeout = v;
+    }
+
+    pub fn set_subagent_timeout(&mut self, v: u64) {
+        self.subagent_timeout = v;
+    }
+
+    pub fn set_api_retries(&mut self, v: u32) {
+        self.api_retries = v;
     }
 
     pub fn thinking_level(&self) -> &str {

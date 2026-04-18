@@ -12,6 +12,7 @@ pub use core::logging;
 pub use core::protocol;
 pub use core::error;
 pub use core::watcher_types;
+pub use core::models;
 
 pub use runtime::{Runtime, StreamEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};

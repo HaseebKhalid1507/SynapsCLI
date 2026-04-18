@@ -84,12 +84,13 @@ pub(crate) fn quit_effect() -> Effect {
 pub(crate) fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    model: &str,
-    thinking: &str,
+    runtime: &synaps_cli::Runtime,
     effect: &mut Option<Effect>,
     exit_effect: &mut Option<Effect>,
     elapsed: std::time::Duration,
 ) -> io::Result<()> {
+    let model = runtime.model();
+    let thinking = runtime.thinking_level();
     // Don't draw while casino owns the terminal
     if app.gamba_child.is_some() {
         return Ok(());
@@ -607,6 +608,11 @@ pub(crate) fn draw(
         if let Some(ref mut fx) = exit_effect {
             let area = frame.area();
             fx.process(elapsed.into(), frame.buffer_mut(), area);
+        }
+
+        if let Some(ref state) = app.settings {
+            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime);
+            crate::settings::render(frame, frame.area(), state, &snap);
         }
     })?;
     Ok(())
