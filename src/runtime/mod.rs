@@ -60,7 +60,7 @@ impl Runtime {
                 refresh_token,
                 token_expires,
             })),
-            model: "claude-opus-4-6".to_string(),
+            model: crate::models::default_model().to_string(),
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
