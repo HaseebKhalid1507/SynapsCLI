@@ -421,24 +421,7 @@ impl App {
                 || synaps_cli::config::base_dir().join("themes").join(name).exists();
 
             if is_valid {
-                let config_path = synaps_cli::config::resolve_read_path("config");
-                let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-                let mut found = false;
-                let new_content: String = content.lines().map(|line| {
-                    if line.trim().starts_with("theme") && line.contains('=') {
-                        found = true;
-                        format!("theme = {}", name)
-                    } else {
-                        line.to_string()
-                    }
-                }).collect::<Vec<_>>().join("\n");
-                let final_content = if found {
-                    new_content
-                } else {
-                    format!("{}\ntheme = {}", content.trim_end(), name)
-                };
-                let _ = std::fs::create_dir_all(synaps_cli::config::get_active_config_dir());
-                match std::fs::write(&config_path, final_content) {
+                match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
                         self.push_msg(ChatMessage::System(
                             format!("theme set to: {}. Restart to apply.", name)
