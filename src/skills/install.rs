@@ -6,6 +6,9 @@ use std::process::Command;
 /// `git clone --depth=1 <url> <dest>`, then `git rev-parse HEAD`.
 /// `dest` must not already exist.
 pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
+    if source_url.starts_with('-') {
+        return Err(format!("refusing suspicious url: {}", source_url));
+    }
     if dest.exists() {
         return Err(format!("{} already exists on disk; uninstall first", dest.display()));
     }
@@ -14,7 +17,7 @@ pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     let out = Command::new("git")
-        .args(["clone", "--depth=1", "-q", source_url])
+        .args(["clone", "--depth=1", "-q", "--", source_url])
         .arg(dest)
         .output()
         .map_err(|e| {
@@ -62,8 +65,11 @@ pub fn update_plugin(install_path: &Path) -> Result<String, String> {
 
 /// `git ls-remote <url> HEAD` → first column (SHA). Network op.
 pub fn ls_remote_head(source_url: &str) -> Result<String, String> {
+    if source_url.starts_with('-') {
+        return Err(format!("refusing suspicious url: {}", source_url));
+    }
     let out = Command::new("git")
-        .args(["ls-remote", source_url, "HEAD"])
+        .args(["ls-remote", "--", source_url, "HEAD"])
         .output()
         .map_err(|e| format!("spawn git: {}", e))?;
     if !out.status.success() {
@@ -171,5 +177,32 @@ mod tests {
         let (_tmp, bare) = mk_local_repo();
         let sha = ls_remote_head(&format!("file://{}", bare.display())).unwrap();
         assert_eq!(sha.len(), 40);
+    }
+
+    #[test]
+    fn update_plugin_fast_forwards_and_returns_new_sha() {
+        let (_tmp, bare) = mk_local_repo();
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("demo");
+        let initial_sha = install_plugin(
+            &format!("file://{}", bare.display()),
+            &dest,
+        ).unwrap();
+
+        // Push a second commit to the bare repo.
+        let pusher_parent = tempfile::tempdir().unwrap();
+        let pusher = pusher_parent.path().join("push");
+        Command::new("git").args(["clone", "-q"])
+            .arg(&bare).arg(&pusher).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&pusher).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&pusher).status().unwrap();
+        std::fs::write(pusher.join("second.md"), "more").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&pusher).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "second"]).current_dir(&pusher).status().unwrap();
+        Command::new("git").args(["push", "-q"]).current_dir(&pusher).status().unwrap();
+
+        let updated_sha = update_plugin(&dest).unwrap();
+        assert_eq!(updated_sha.len(), 40);
+        assert_ne!(updated_sha, initial_sha);
     }
 }
