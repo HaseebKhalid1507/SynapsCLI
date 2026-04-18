@@ -80,6 +80,30 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn test_ctx() -> crate::ToolContext {
+        crate::ToolContext {
+            tx_delta: None,
+            tx_events: None,
+            watcher_exit_path: None,
+            tool_register_tx: None,
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+        }
+    }
+
+    fn mk(name: &str, plugin: Option<&str>) -> LoadedSkill {
+        LoadedSkill {
+            name: name.to_string(),
+            description: format!("desc-{name}"),
+            body: format!("body-{name}"),
+            plugin: plugin.map(str::to_string),
+            base_dir: PathBuf::from("/"),
+            source_path: PathBuf::from("/SKILL.md"),
+        }
+    }
+
     #[test]
     fn format_body_includes_name_and_description() {
         let s = LoadedSkill {
@@ -95,5 +119,86 @@ mod tests {
         assert!(out.contains("y"));
         assert!(out.contains("z"));
         assert!(out.contains("Follow these guidelines"));
+    }
+
+    #[tokio::test]
+    async fn execute_returns_skill_body_on_unique_match() {
+        use crate::Tool;
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(
+            &[], vec![mk("search", Some("p1"))]
+        ));
+        let tool = LoadSkillTool::new(reg);
+        let result = tool.execute(
+            serde_json::json!({"skill": "search"}),
+            test_ctx()
+        ).await.unwrap();
+        assert!(result.contains("# Skill: search"));
+        assert!(result.contains("desc-search"));
+        assert!(result.contains("body-search"));
+    }
+
+    #[tokio::test]
+    async fn execute_errors_on_ambiguous() {
+        use crate::Tool;
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(
+            &[], vec![mk("search", Some("p1")), mk("search", Some("p2"))]
+        ));
+        let tool = LoadSkillTool::new(reg);
+        let err = tool.execute(
+            serde_json::json!({"skill": "search"}),
+            test_ctx()
+        ).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"));
+        assert!(msg.contains("p1:search"));
+        assert!(msg.contains("p2:search"));
+    }
+
+    #[tokio::test]
+    async fn execute_errors_on_unknown() {
+        use crate::Tool;
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(&[], vec![]));
+        let tool = LoadSkillTool::new(reg);
+        let err = tool.execute(
+            serde_json::json!({"skill": "nosuch"}),
+            test_ctx()
+        ).await.unwrap_err();
+        assert!(format!("{err}").contains("unknown skill 'nosuch'"));
+    }
+
+    #[tokio::test]
+    async fn execute_errors_on_builtin() {
+        use crate::Tool;
+        // A built-in is not a skill; load_skill should refuse to load it.
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(&["clear"], vec![]));
+        let tool = LoadSkillTool::new(reg);
+        let err = tool.execute(
+            serde_json::json!({"skill": "clear"}),
+            test_ctx()
+        ).await.unwrap_err();
+        assert!(format!("{err}").contains("unknown skill 'clear'"));
+    }
+
+    #[tokio::test]
+    async fn execute_errors_on_missing_skill_param() {
+        use crate::Tool;
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(&[], vec![]));
+        let tool = LoadSkillTool::new(reg);
+        let err = tool.execute(
+            serde_json::json!({}),
+            test_ctx()
+        ).await.unwrap_err();
+        assert!(format!("{err}").contains("Missing 'skill' parameter"));
+    }
+
+    #[test]
+    fn parameters_schema_is_well_formed() {
+        use crate::Tool;
+        let reg = Arc::new(crate::skills::registry::CommandRegistry::new(&[], vec![]));
+        let tool = LoadSkillTool::new(reg);
+        let schema = tool.parameters();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["skill"]["type"], "string");
+        assert_eq!(schema["required"], serde_json::json!(["skill"]));
     }
 }
