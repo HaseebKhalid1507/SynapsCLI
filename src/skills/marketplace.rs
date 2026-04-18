@@ -29,6 +29,29 @@ pub fn normalize_marketplace_url(input: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Owner-scoped host key for TOFU trust: `github.com/<owner>`.
+/// Returns Err if URL is malformed, not https, or lacks an owner path segment.
+pub fn trust_host_for_source(source_url: &str) -> Result<String, String> {
+    let s = source_url.trim();
+    if !s.starts_with("https://") {
+        return Err("only https:// source URLs are supported".into());
+    }
+    let rest = &s["https://".len()..];
+    let (host_raw, path) = rest.split_once('/').ok_or("missing path in URL")?;
+    let host = host_raw.strip_prefix("www.").unwrap_or(host_raw);
+    let owner = path.split('/').next().ok_or("missing owner in URL")?;
+    if owner.is_empty() { return Err("missing owner in URL".into()); }
+    Ok(format!("{}/{}", host, owner))
+}
+
+/// Is the given source URL's owner-host already trusted?
+pub fn is_trusted(source_url: &str, trusted_hosts: &[String]) -> bool {
+    match trust_host_for_source(source_url) {
+        Ok(h) => trusted_hosts.iter().any(|t| t == &h),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +94,39 @@ mod tests {
     #[test]
     fn reject_ssh_url() {
         assert!(normalize_marketplace_url("git@github.com:a/b.git").is_err());
+    }
+
+    #[test]
+    fn derive_trust_host_from_github_url() {
+        assert_eq!(
+            trust_host_for_source("https://github.com/maha-media/pi-web.git").unwrap(),
+            "github.com/maha-media"
+        );
+    }
+
+    #[test]
+    fn derive_trust_host_from_gitlab_url() {
+        assert_eq!(
+            trust_host_for_source("https://gitlab.com/org/repo.git").unwrap(),
+            "gitlab.com/org"
+        );
+    }
+
+    #[test]
+    fn derive_trust_host_strips_www() {
+        assert_eq!(
+            trust_host_for_source("https://www.github.com/x/y").unwrap(),
+            "github.com/x"
+        );
+    }
+
+    #[test]
+    fn derive_trust_host_rejects_no_owner() {
+        assert!(trust_host_for_source("https://example.com/").is_err());
+    }
+
+    #[test]
+    fn derive_trust_host_rejects_http() {
+        assert!(trust_host_for_source("http://github.com/a/b").is_err());
     }
 }
