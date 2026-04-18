@@ -75,6 +75,8 @@ pub(super) fn handle_event(
             match crate::plugins::handle_event(state, key) {
                 crate::plugins::InputOutcome::Close => { app.plugins = None; }
                 crate::plugins::InputOutcome::None => {}
+                // Task 16 will wire these side-effects into the main loop.
+                _ => {}
             }
         }
         return InputAction::None;
