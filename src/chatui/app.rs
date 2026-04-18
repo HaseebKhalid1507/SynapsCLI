@@ -70,6 +70,8 @@ pub(crate) struct App {
     pub(crate) status_text: Option<String>,
     /// GamblersDen child process — spawned by /gamba, killed when streaming finishes
     pub(crate) gamba_child: Option<std::process::Child>,
+    /// Active settings modal state (Some while /settings is open).
+    pub(crate) settings: Option<super::settings::SettingsState>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -122,6 +124,7 @@ impl App {
             spinner_frame: 0,
             status_text: None,
             gamba_child: None,
+            settings: None,
         }
     }
 

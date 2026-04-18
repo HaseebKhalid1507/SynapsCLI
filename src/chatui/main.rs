@@ -269,6 +269,9 @@ async fn main() -> Result<()> {
                                         }
                                         event_reader = EventStream::new();
                                     }
+                                    CommandAction::OpenSettings => {
+                                        app.settings = Some(settings::SettingsState::new());
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -351,6 +354,7 @@ async fn main() -> Result<()> {
                                             event_reader = EventStream::new();
                                         }
                                         CommandAction::StartStream => {}
+                                        CommandAction::OpenSettings => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
