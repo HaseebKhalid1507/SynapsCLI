@@ -80,7 +80,7 @@ async fn end_to_end_add_install_uninstall() {
         }).collect(),
     });
 
-    // Step 2: install (TOFU bypassed by adding host directly; file:// has no host derivation).
+    // Step 2: install.
     let dest = tmp.path().join("plugins").join("web");
     let sha = install::install_plugin(&file_url, &dest).unwrap();
     assert!(dest.join(".synaps-plugin").join("plugin.json").exists());
@@ -98,6 +98,8 @@ async fn end_to_end_add_install_uninstall() {
     let reloaded = PluginsState::load_from(&state_path).unwrap();
     assert_eq!(reloaded.marketplaces.len(), 1);
     assert_eq!(reloaded.installed.len(), 1);
+    assert_eq!(reloaded.installed[0].installed_commit, state.installed[0].installed_commit);
+    assert_eq!(reloaded.marketplaces[0].cached_plugins[0].source, file_url);
 
     // Step 3: uninstall.
     install::uninstall_plugin(&dest).unwrap();
