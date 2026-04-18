@@ -1,5 +1,25 @@
 //! Marketplace URL normalization + metadata fetch.
 
+/// Returns true if `name` is safe to use as a filesystem directory component
+/// under `~/.synaps-cli/plugins/`. Rejects traversal sequences and path
+/// separators.
+///
+/// Rules:
+/// - non-empty
+/// - length ≤ 64
+/// - contains only ASCII letters, digits, `_`, and `-`
+/// - does not contain `..`, `/`, or `\` (redundant with charset rule; kept
+///   as belt-and-suspenders against future charset relaxation).
+pub fn is_safe_plugin_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Convert a user-provided URL to the HTTPS URL that yields `marketplace.json`.
 /// - `https://github.com/<owner>/<repo>[.git][/]` → raw.githubusercontent.com form.
 /// - Any other `https://…` URL is returned unchanged (caller assumed to have pasted a raw URL).
@@ -55,7 +75,19 @@ pub fn is_trusted(source_url: &str, trusted_hosts: &[String]) -> bool {
 use crate::skills::manifest::MarketplaceManifest;
 
 pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
+    if !is_safe_plugin_name(&m.name) {
+        return Err(format!(
+            "invalid plugin name '{}': only letters, digits, _ and - allowed (max 64 chars)",
+            m.name
+        ));
+    }
     for p in &m.plugins {
+        if !is_safe_plugin_name(&p.name) {
+            return Err(format!(
+                "invalid plugin name '{}': only letters, digits, _ and - allowed (max 64 chars)",
+                p.name
+            ));
+        }
         let s = p.source.trim();
         if s.starts_with("./") || s.starts_with("../") || !s.contains("://") {
             return Err(format!(
@@ -76,13 +108,10 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
 use std::time::Duration;
 
 pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
-    let https_url = if url.starts_with("http://") {
-        // only allowed from internal callers; public callers go via normalize.
-        return Err("only https:// URLs are supported".into());
-    } else {
-        url.to_string()
-    };
-    let body = fetch_raw(&https_url).await?;
+    if !url.starts_with("https://") {
+        return Err(format!("fetch_manifest requires https:// URL, got: {}", url));
+    }
+    let body = fetch_raw(url).await?;
     let m: MarketplaceManifest = serde_json::from_str(&body)
         .map_err(|e| format!("invalid marketplace.json: {}", e))?;
     validate_manifest(&m)?;
@@ -224,6 +253,54 @@ mod tests {
         "#).unwrap();
         let err = validate_manifest(&m).unwrap_err();
         assert!(err.contains("'bad'"));
+    }
+
+    #[test]
+    fn validate_manifest_rejects_traversal_in_plugin_name() {
+        let m = MarketplaceManifest {
+            name: "mk".into(),
+            version: None,
+            description: None,
+            plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
+                name: "../etc/hostile".into(),
+                source: "https://github.com/u/r".into(),
+                description: None,
+                version: None,
+            }],
+        };
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_slash_in_plugin_name() {
+        let m = MarketplaceManifest {
+            name: "mk".into(),
+            version: None,
+            description: None,
+            plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
+                name: "foo/bar".into(),
+                source: "https://github.com/u/r".into(),
+                description: None,
+                version: None,
+            }],
+        };
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_accepts_safe_plugin_name() {
+        let m = MarketplaceManifest {
+            name: "mk".into(),
+            version: None,
+            description: None,
+            plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
+                name: "web-search_v2".into(),
+                source: "https://github.com/u/r".into(),
+                description: None,
+                version: None,
+            }],
+        };
+        assert!(validate_manifest(&m).is_ok());
     }
 
     #[tokio::test]

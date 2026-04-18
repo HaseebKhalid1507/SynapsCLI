@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use synaps_cli::skills::{
     install,
-    marketplace::{fetch_manifest, is_trusted, normalize_marketplace_url, trust_host_for_source},
+    marketplace::{fetch_manifest, is_safe_plugin_name, is_trusted, normalize_marketplace_url, trust_host_for_source},
     reload_registry,
     registry::CommandRegistry,
     state::{InstalledPlugin, Marketplace, PluginsState},
@@ -25,8 +25,15 @@ fn commit_plugins_state(file: &PluginsState) -> std::io::Result<()> {
 }
 
 /// Resolve `~/.synaps-cli/plugins/<name>` (profile-aware).
-fn install_dir_for(name: &str) -> PathBuf {
-    synaps_cli::config::resolve_write_path("plugins").join(name)
+///
+/// Defense-in-depth: rejects unsafe names via [`is_safe_plugin_name`]. This
+/// should never fire in practice because `validate_manifest` already rejects
+/// such names upstream during marketplace fetch.
+fn install_dir_for(name: &str) -> Result<PathBuf, String> {
+    if !is_safe_plugin_name(name) {
+        return Err("refused to install plugin with unsafe name".into());
+    }
+    Ok(synaps_cli::config::resolve_write_path("plugins").join(name))
 }
 
 fn now_rfc3339() -> String {
@@ -150,7 +157,13 @@ async fn run_install_flow(
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
-    let dest = install_dir_for(&plugin_name);
+    let dest = match install_dir_for(&plugin_name) {
+        Ok(d) => d,
+        Err(e) => {
+            state.row_error = Some(e);
+            return;
+        }
+    };
     // Run install_plugin on a blocking thread (it spawns git).
     let src = source_url.clone();
     let dest_clone = dest.clone();
@@ -193,7 +206,13 @@ pub(crate) async fn apply_uninstall(
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
-    let dir = install_dir_for(&name);
+    let dir = match install_dir_for(&name) {
+        Ok(d) => d,
+        Err(e) => {
+            state.row_error = Some(e);
+            return;
+        }
+    };
     let uninstall_res = tokio::task::spawn_blocking(move || install::uninstall_plugin(&dir)).await;
     match uninstall_res {
         Ok(Ok(())) => {}
@@ -224,7 +243,13 @@ pub(crate) async fn apply_update(
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
-    let dir = install_dir_for(&name);
+    let dir = match install_dir_for(&name) {
+        Ok(d) => d,
+        Err(e) => {
+            state.row_error = Some(e);
+            return;
+        }
+    };
     let update_res = tokio::task::spawn_blocking(move || install::update_plugin(&dir)).await;
     let sha = match update_res {
         Ok(Ok(sha)) => sha,
