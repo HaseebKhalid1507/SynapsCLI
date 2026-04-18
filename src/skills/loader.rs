@@ -360,6 +360,91 @@ mod tests {
         assert_eq!(skills[0].description, "local"); // local wins
     }
 
+    #[test]
+    fn test_load_all_plugin_dedup_via_marketplace_and_subdir() {
+        // Regression: when a plugin is discovered both through marketplace.json
+        // and through the plugin-subdir walk, load_plugin's root-based dedup guard
+        // must prevent a duplicate Plugin entry and duplicate skill registration.
+        let root = tempdir();
+
+        // marketplace.json at root pointing to ./web
+        fs::create_dir_all(root.join(".synaps-plugin")).unwrap();
+        fs::write(
+            root.join(".synaps-plugin").join("marketplace.json"),
+            r#"{"name":"mp","plugins":[{"name":"web","source":"./web"}]}"#,
+        )
+        .unwrap();
+
+        // Plugin at ./web — also discoverable via the plugin-subdir pass
+        let plugin_dir = root.join("web");
+        fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+        write_skill(
+            &plugin_dir.join("skills").join("demo"),
+            "---\nname: demo\ndescription: d\n---\nBody",
+        );
+
+        let (plugins, skills) = load_all(std::slice::from_ref(&root));
+
+        // Exactly one plugin registered, not two.
+        assert_eq!(plugins.len(), 1, "plugin should be deduplicated");
+        assert_eq!(plugins[0].name, "web");
+        assert_eq!(plugins[0].root, plugin_dir.canonicalize().unwrap());
+
+        // Skill registered exactly once.
+        assert_eq!(skills.len(), 1, "skill should be registered exactly once");
+        assert_eq!(skills[0].name, "demo");
+        assert_eq!(skills[0].plugin.as_deref(), Some("web"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_load_all_malformed_plugin_json_continues_walk() {
+        // Regression: a malformed plugin.json should be skipped with a warning,
+        // and the walk must continue so other valid plugins still register.
+        let root = tempdir();
+
+        // Broken plugin: invalid JSON in plugin.json
+        let broken_dir = root.join("broken");
+        fs::create_dir_all(broken_dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            broken_dir.join(".synaps-plugin").join("plugin.json"),
+            "{ this is not valid json",
+        )
+        .unwrap();
+
+        // Good plugin alongside it
+        let good_dir = root.join("good");
+        fs::create_dir_all(good_dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            good_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"good"}"#,
+        )
+        .unwrap();
+        write_skill(
+            &good_dir.join("skills").join("hello"),
+            "---\nname: hello\ndescription: d\n---\nBody",
+        );
+
+        let (plugins, skills) = load_all(std::slice::from_ref(&root));
+
+        // Only the good plugin registered.
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "good");
+
+        // Its skill is present.
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "hello");
+        assert_eq!(skills[0].plugin.as_deref(), Some("good"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Create a unique tempdir under /tmp for tests.
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
