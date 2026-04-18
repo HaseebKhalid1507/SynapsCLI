@@ -608,6 +608,10 @@ pub(crate) fn draw(
             let area = frame.area();
             fx.process(elapsed.into(), frame.buffer_mut(), area);
         }
+
+        if let Some(ref state) = app.settings {
+            crate::settings::render(frame, frame.area(), state);
+        }
     })?;
     Ok(())
 }
