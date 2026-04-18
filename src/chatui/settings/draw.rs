@@ -151,9 +151,6 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
     match def.key {
         "model" => snap.model.clone(),
         "thinking" => snap.thinking.clone(),
-        "skills" => snap.skills.as_ref()
-            .map(|s| if s.is_empty() { "(none)".to_string() } else { s.join(",") })
-            .unwrap_or_else(|| "(none)".into()),
         "api_retries" => snap.api_retries.to_string(),
         "subagent_timeout" => format!("{}s", snap.subagent_timeout),
         "max_tool_output" => snap.max_tool_output.to_string(),

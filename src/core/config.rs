@@ -77,13 +77,14 @@ pub fn get_active_config_dir() -> PathBuf {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
-    pub skills: Option<Vec<String>>,
     pub max_tool_output: usize,        // default 30000
     pub bash_timeout: u64,             // default 30
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
     pub theme: Option<String>,
+    pub disabled_plugins: Vec<String>,
+    pub disabled_skills: Vec<String>,
 }
 
 impl Default for SynapsConfig {
@@ -91,13 +92,14 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
-            skills: None,
             max_tool_output: 30000,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
             theme: None,
+            disabled_plugins: Vec::new(),
+            disabled_skills: Vec::new(),
         }
     }
 }
@@ -132,9 +134,6 @@ pub fn load_config() -> SynapsConfig {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => config.thinking_budget = parse_thinking_budget(val),
-            "skills" => config.skills = Some(
-                val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-            ),
             "max_tool_output" => {
                 if let Ok(size) = val.parse::<usize>() {
                     config.max_tool_output = size;
@@ -161,6 +160,18 @@ pub fn load_config() -> SynapsConfig {
                 }
             }
             "theme" => config.theme = Some(val.to_string()),
+            "disabled_plugins" => {
+                config.disabled_plugins = val.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "disabled_skills" => {
+                config.disabled_skills = val.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             _ => {} // Unknown keys silently ignored
         }
     }
@@ -285,13 +296,14 @@ mod tests {
         let config = SynapsConfig::default();
         assert_eq!(config.model, None);
         assert_eq!(config.thinking_budget, None);
-        assert_eq!(config.skills, None);
         assert_eq!(config.max_tool_output, 30000);
         assert_eq!(config.bash_timeout, 30);
         assert_eq!(config.bash_max_timeout, 300);
         assert_eq!(config.subagent_timeout, 300);
         assert_eq!(config.api_retries, 3);
         assert_eq!(config.theme, None);
+        assert!(config.disabled_plugins.is_empty());
+        assert!(config.disabled_skills.is_empty());
     }
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
@@ -410,6 +422,36 @@ mod tests {
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-theme");
 
         assert_eq!(config.theme.as_deref(), Some("dracula"));
+    }
+
+    #[test]
+    fn test_load_config_disable_lists() {
+        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let config_path = test_dir.join("config");
+
+        let config_content = r#"
+# Test config with disable lists
+disabled_plugins = foo, bar
+disabled_skills = baz, plug:qual
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-disable-lists");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-disable-lists");
+
+        assert_eq!(config.disabled_plugins, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(config.disabled_skills, vec!["baz".to_string(), "plug:qual".to_string()]);
     }
 
     #[test]

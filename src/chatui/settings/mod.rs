@@ -31,7 +31,7 @@ pub(crate) fn theme_options() -> Vec<String> {
     opts
 }
 
-use schema::{Category, SettingDef};
+use schema::SettingDef;
 
 /// Snapshot of live runtime + persisted config values, used to display current
 /// values in the modal and seed text editors.
@@ -43,7 +43,6 @@ pub(crate) struct RuntimeSnapshot {
     pub bash_max_timeout: u64,
     pub subagent_timeout: u64,
     pub api_retries: u32,
-    pub skills: Option<Vec<String>>,
     pub theme_name: String,
 }
 
@@ -58,7 +57,6 @@ impl RuntimeSnapshot {
             bash_max_timeout: runtime.bash_max_timeout(),
             subagent_timeout: runtime.subagent_timeout(),
             api_retries: runtime.api_retries(),
-            skills: config.skills,
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
         }
     }

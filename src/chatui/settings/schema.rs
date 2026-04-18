@@ -57,13 +57,6 @@ pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
         help: "Extended thinking budget level.",
     },
     SettingDef {
-        key: "skills",
-        label: "Skills",
-        category: Category::Agent,
-        editor: EditorKind::Text { numeric: false },
-        help: "Comma-separated skills to auto-load at startup.",
-    },
-    SettingDef {
         key: "api_retries",
         label: "API retries",
         category: Category::Agent,
@@ -115,7 +108,7 @@ mod tests {
     #[test]
     fn every_setting_key_is_known_to_load_config() {
         let valid = [
-            "model", "thinking", "skills",
+            "model", "thinking",
             "max_tool_output", "bash_timeout", "bash_max_timeout",
             "subagent_timeout", "api_retries", "theme",
         ];

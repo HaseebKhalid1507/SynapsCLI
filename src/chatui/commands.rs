@@ -6,7 +6,10 @@ use synaps_cli::{Runtime, Session, list_sessions, find_session};
 
 use super::app::{App, ChatMessage};
 
-/// All recognized slash commands.
+/// All recognized built-in slash commands. Source of truth for the
+/// built-in surface; the runtime merges this with discovered skills via
+/// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
+#[allow(dead_code)]
 pub(super) const ALL_COMMANDS: &[&str] = &[
     "clear", "model", "system", "thinking", "sessions",
     "resume", "theme", "gamba", "help", "quit", "exit",
@@ -15,6 +18,19 @@ pub(super) const ALL_COMMANDS: &[&str] = &[
 
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit"];
+
+/// Merged list of built-ins + registered skill names (deduped, sorted).
+/// Used for autocomplete and prefix resolution.
+pub(super) fn all_commands_with_skills(
+    registry: &synaps_cli::skills::registry::CommandRegistry,
+) -> Vec<String> {
+    registry.all_commands()
+}
+
+/// Convert a `&[&str]` slice into a `Vec<String>` for `resolve_prefix`.
+pub(super) fn to_owned_commands(commands: &[&str]) -> Vec<String> {
+    commands.iter().map(|s| s.to_string()).collect()
+}
 
 /// What the event loop should do after a command executes.
 pub(super) enum CommandAction {
@@ -28,17 +44,22 @@ pub(super) enum CommandAction {
     LaunchGamba,
     /// Open the /settings modal.
     OpenSettings,
+    /// Synthesize load_skill tool-result + user message, then start stream.
+    LoadSkill {
+        skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
+        arg: String,
+    },
 }
 
 /// Resolve a partial command prefix to a full command name.
 /// Returns the input unchanged if no unique match.
-pub(super) fn resolve_prefix(raw: &str, commands: &[&str]) -> String {
-    if commands.contains(&raw) {
+pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
+    if commands.iter().any(|c| c == raw) {
         return raw.to_string();
     }
-    let matches: Vec<&&str> = commands.iter().filter(|c| c.starts_with(raw)).collect();
+    let matches: Vec<&String> = commands.iter().filter(|c| c.starts_with(raw)).collect();
     if matches.len() == 1 {
-        matches[0].to_string()
+        matches[0].clone()
     } else {
         raw.to_string()
     }
@@ -51,7 +72,9 @@ pub(super) async fn handle_command(
     app: &mut App,
     runtime: &mut Runtime,
     system_prompt_path: &PathBuf,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
 ) -> CommandAction {
+    use synaps_cli::skills::registry::Resolution;
     match cmd {
         "clear" => {
             app.save_session().await;
@@ -195,6 +218,20 @@ pub(super) async fn handle_command(
             for line in help_lines {
                 app.push_msg(ChatMessage::System(line.to_string()));
             }
+            let skills = registry.all_skills();
+            if !skills.is_empty() {
+                app.push_msg(ChatMessage::System(String::new()));
+                app.push_msg(ChatMessage::System("## Skills".to_string()));
+                let mut sorted = skills.clone();
+                sorted.sort_by(|a, b| a.name.cmp(&b.name));
+                for s in sorted {
+                    let display = match &s.plugin {
+                        Some(p) => format!("/{} ({}:{}) — {}", s.name, p, s.name, s.description),
+                        None => format!("/{} — {}", s.name, s.description),
+                    };
+                    app.push_msg(ChatMessage::System(display));
+                }
+            }
         }
         "quit" | "exit" => {
             return CommandAction::Quit;
@@ -209,9 +246,21 @@ pub(super) async fn handle_command(
             return CommandAction::OpenSettings;
         }
         _ => {
-            app.push_msg(ChatMessage::Error(
-                format!("unknown command: /{}", cmd)
-            ));
+            match registry.resolve(cmd) {
+                Resolution::Skill(skill) => {
+                    return CommandAction::LoadSkill { skill, arg: arg.to_string() };
+                }
+                Resolution::Ambiguous(opts) => {
+                    app.push_msg(ChatMessage::Error(format!(
+                        "ambiguous command /{}; try one of: {}",
+                        cmd,
+                        opts.iter().map(|o| format!("/{}", o)).collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                Resolution::Builtin | Resolution::Unknown => {
+                    app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
+                }
+            }
         }
     }
     CommandAction::None

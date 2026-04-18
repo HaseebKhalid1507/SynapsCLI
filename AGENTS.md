@@ -191,15 +191,17 @@ Connect to an MCP server and load its tools.
 
 ### `load_skill`
 
-Load behavioral guidelines from a markdown file.
+Load behavioral guidelines from a discovered skill.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
-| `skill` | string | yes | — | Skill name (matches filename without `.md`) |
+| `skill` | string | yes | — | Skill name (bare `name` or plugin-qualified `plugin:name`) |
 
 **Behavior:**
-- Returns skill content to follow for rest of conversation
-- Resolution order: project-local `.synaps-cli/skills/` → global `~/.synaps-cli/skills/`
+- Returns the skill body (with `{baseDir}` tokens substituted) to follow for rest of conversation.
+- Discovery roots (walked in order): `.synaps-cli/plugins/`, `.synaps-cli/skills/`, `~/.synaps-cli/plugins/`, `~/.synaps-cli/skills/`.
+- A plugin is any directory containing `.synaps-plugin/plugin.json`; a marketplace is `.synaps-plugin/marketplace.json` listing multiple plugins by relative source path. Marketplaces may live at a root or one level beneath it (e.g. `~/.synaps-cli/plugins/pi-skills/.synaps-plugin/marketplace.json`).
+- Loose skills live at `<root>/skills/<name>/SKILL.md` (no plugin).
 - Skills use YAML frontmatter for metadata:
   ```markdown
   ---
@@ -207,8 +209,10 @@ Load behavioral guidelines from a markdown file.
   description: Structured code review guidelines
   ---
   # Code Review
-  (content here)
+  Body — use {baseDir}/scripts/run.js for absolute paths.
   ```
+- Name collisions: built-in slash commands win over bare skill names; shadowed skills remain reachable via `plugin:skill`. Duplicate skills across plugins resolve as an ambiguity error listing the qualified options.
+- Block skills with the `disabled_skills` or `disabled_plugins` config keys (comma-separated).
 
 ---
 
