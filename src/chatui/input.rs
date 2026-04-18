@@ -72,11 +72,18 @@ pub(super) fn handle_event(
     if app.plugins.is_some() {
         if let Event::Key(key) = event {
             let state = app.plugins.as_mut().expect("just checked");
+            // TODO(task 16): replace these {} no-ops with real side-effect handlers.
             match crate::plugins::handle_event(state, key) {
                 crate::plugins::InputOutcome::Close => { app.plugins = None; }
                 crate::plugins::InputOutcome::None => {}
-                // Task 16 will wire these side-effects into the main loop.
-                _ => {}
+                crate::plugins::InputOutcome::AddMarketplace(_) => {}
+                crate::plugins::InputOutcome::Install { .. } => {}
+                crate::plugins::InputOutcome::Uninstall(_) => {}
+                crate::plugins::InputOutcome::Update(_) => {}
+                crate::plugins::InputOutcome::RefreshMarketplace(_) => {}
+                crate::plugins::InputOutcome::RemoveMarketplace(_) => {}
+                crate::plugins::InputOutcome::TrustAndInstall { .. } => {}
+                crate::plugins::InputOutcome::TogglePlugin { .. } => {}
             }
         }
         return InputAction::None;
