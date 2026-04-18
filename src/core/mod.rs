@@ -7,3 +7,4 @@ pub mod logging;
 pub mod protocol;
 pub mod error;
 pub mod watcher_types;
+pub mod models;
