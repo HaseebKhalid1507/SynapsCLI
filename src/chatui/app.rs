@@ -42,6 +42,7 @@ pub(crate) struct App {
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,
     pub(crate) total_cache_creation_tokens: u64,
+    pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     /// Cached wrapped+highlighted message lines.
@@ -110,6 +111,7 @@ impl App {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            api_call_count: 0,
             session_cost: 0.0,
             session,
             line_cache: None,
@@ -220,9 +222,27 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
-        // Pricing per million tokens (as of 2025)
+        self.api_call_count += 1;
+
+        // Per-call usage log to file for cache analysis
+        let total_input_this_call = input_tokens + cache_read + cache_creation;
+        let cache_pct = if total_input_this_call > 0 {
+            (cache_read as f64 / total_input_this_call as f64 * 100.0) as u32
+        } else { 0 };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/synaps-usage.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(f,
+                "[usage] call={} uncached={} cache_read={} cache_write={} output={} cache_hit={}%",
+                self.api_call_count, input_tokens, cache_read, cache_creation, output_tokens, cache_pct
+            );
+        }
+        // Pricing per million tokens (as of 2026-04)
+        // Opus 4.5+ = $5/$25, Sonnet 4.5+ = $3/$15, Haiku = $0.80/$4
         let (input_price, output_price) = match model {
-            m if m.contains("opus") => (15.0, 75.0),
+            m if m.contains("opus") => (5.0, 25.0),
             m if m.contains("sonnet") => (3.0, 15.0),
             m if m.contains("haiku") => (0.80, 4.0),
             _ => (3.0, 15.0), // default to sonnet pricing
