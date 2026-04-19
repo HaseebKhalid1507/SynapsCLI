@@ -51,7 +51,12 @@ impl App {
                 }
 
                 ChatMessage::Thinking(text) => {
-                    lines.push(Line::from(""));
+                    // Only add spacing if previous message wasn't a User block
+                    // (User blocks already have bottom margin)
+                    let prev_was_user = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::User(_));
+                    if !prev_was_user {
+                        lines.push(Line::from(""));
+                    }
                     let dim = Style::default().fg(THEME.thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
@@ -127,13 +132,19 @@ impl App {
 
                 ChatMessage::Text(text) => {
                     // Separator between user block and agent response
-                    if i > 0 {
+                    // Skip separator + extra spacing when previous message was thinking
+                    let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
+                    if i > 0 && !prev_was_thinking {
                         lines.push(Line::from(""));
-                        let sep_half = width.min(40) / 2;
+                        let sep_total = width.min(40);
+                        let sep_half = sep_total / 2;
                         let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
                         let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
+                        let sep_content_width = sep_left.chars().count() + 3 + sep_right.chars().count(); // left + " · " + right
+                        let pad_left = width.saturating_sub(sep_content_width) / 2;
                         lines.push(Line::from(vec![
-                            Span::styled(format!("{}{}", m, sep_left), Style::default().fg(THEME.separator)),
+                            Span::styled(" ".repeat(pad_left), Style::default()),
+                            Span::styled(sep_left, Style::default().fg(THEME.separator)),
                             Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
                             Span::styled(sep_right, Style::default().fg(THEME.separator)),
                         ]));
