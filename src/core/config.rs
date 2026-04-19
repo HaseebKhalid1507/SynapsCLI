@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use crate::tools::shell::config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 
@@ -85,6 +86,7 @@ pub struct SynapsConfig {
     pub theme: Option<String>,
     pub disabled_plugins: Vec<String>,
     pub disabled_skills: Vec<String>,
+    pub shell: ShellConfig,
 }
 
 impl Default for SynapsConfig {
@@ -100,6 +102,7 @@ impl Default for SynapsConfig {
             theme: None,
             disabled_plugins: Vec::new(),
             disabled_skills: Vec::new(),
+            shell: ShellConfig::default(),
         }
     }
 }
@@ -112,6 +115,57 @@ fn parse_thinking_budget(val: &str) -> Option<u32> {
         "high" => Some(16384),
         "xhigh" => Some(32768),
         _ => val.parse::<u32>().ok(),
+    }
+}
+
+/// Parse shell.* configuration keys and update the ShellConfig.
+fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) {
+    match key {
+        "shell.max_sessions" => {
+            if let Ok(sessions) = val.parse::<usize>() {
+                shell_config.max_sessions = sessions;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_sessions: '{}', using default", val);
+            }
+        }
+        "shell.idle_timeout" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
+            } else {
+                eprintln!("Warning: invalid value for shell.idle_timeout: '{}', using default", val);
+            }
+        }
+        "shell.readiness_timeout_ms" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.readiness_timeout_ms = timeout;
+            } else {
+                eprintln!("Warning: invalid value for shell.readiness_timeout_ms: '{}', using default", val);
+            }
+        }
+        "shell.max_readiness_timeout_ms" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.max_readiness_timeout_ms = timeout;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_readiness_timeout_ms: '{}', using default", val);
+            }
+        }
+        "shell.default_rows" => {
+            if let Ok(rows) = val.parse::<u16>() {
+                shell_config.default_rows = rows;
+            } else {
+                eprintln!("Warning: invalid value for shell.default_rows: '{}', using default", val);
+            }
+        }
+        "shell.default_cols" => {
+            if let Ok(cols) = val.parse::<u16>() {
+                shell_config.default_cols = cols;
+            } else {
+                eprintln!("Warning: invalid value for shell.default_cols: '{}', using default", val);
+            }
+        }
+        _ => {
+            // Unknown shell.* keys are preserved (not rejected)
+        }
     }
 }
 
@@ -172,7 +226,13 @@ pub fn load_config() -> SynapsConfig {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
-            _ => {} // Unknown keys silently ignored
+            _ => {
+                // Handle shell.* keys
+                if key.starts_with("shell.") {
+                    parse_shell_config_key(&mut config.shell, key, val);
+                }
+                // Other unknown keys silently ignored
+            }
         }
     }
     
@@ -304,6 +364,8 @@ mod tests {
         assert_eq!(config.theme, None);
         assert!(config.disabled_plugins.is_empty());
         assert!(config.disabled_skills.is_empty());
+        assert_eq!(config.shell.max_sessions, 5);
+        assert_eq!(config.shell.idle_timeout.as_secs(), 600);
     }
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
