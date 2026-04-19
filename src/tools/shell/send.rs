@@ -45,12 +45,7 @@ impl Tool for ShellSendTool {
             .ok_or_else(|| RuntimeError::Tool("Missing input parameter".into()))?;
         let timeout_ms = params["timeout_ms"].as_u64();
         
-        let result = mgr.send_input(session_id, input, timeout_ms).await?;
-        
-        // Stream output to TUI
-        if let Some(ref tx) = ctx.tx_delta {
-            let _ = tx.send(result.output.clone());
-        }
+        let result = mgr.send_input(session_id, input, timeout_ms, ctx.tx_delta.as_ref()).await?;
         
         Ok(serde_json::json!({
             "session_id": session_id,

@@ -91,6 +91,7 @@ async fn wait_for_output(
     pty: &mut PtyHandle,
     detector: &ReadinessDetector,
     _timeout_override: Option<u64>,
+    tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> (String, String) {
     let mut output = String::new();
     let start = Instant::now();
@@ -105,6 +106,11 @@ async fn wait_for_output(
             let text = String::from_utf8_lossy(&bytes);
             output.push_str(&text);
             last_output_time = Instant::now();
+            
+            // Stream to TUI if requested (strip ANSI escapes first)
+            if let Some(tx) = tx_delta {
+                let _ = tx.send(strip_ansi(&text));
+            }
         }
 
         // Check if process exited.
@@ -113,7 +119,13 @@ async fn wait_for_output(
             tokio::time::sleep(Duration::from_millis(50)).await;
             let remaining = pty.try_read_output(Duration::from_millis(100)).await;
             if !remaining.is_empty() {
-                output.push_str(&String::from_utf8_lossy(&remaining));
+                let remaining_text = String::from_utf8_lossy(&remaining);
+                output.push_str(&remaining_text);
+                
+                // Stream remaining output to TUI
+                if let Some(tx) = tx_delta {
+                    let _ = tx.send(strip_ansi(&remaining_text));
+                }
             }
             return (strip_ansi(&output), "exited".into());
         }
@@ -148,7 +160,11 @@ impl SessionManager {
     /// Create a new interactive shell session.
     ///
     /// Returns `(session_id, initial_output)` on success.
-    pub async fn create_session(&self, opts: SessionOpts) -> Result<(String, String)> {
+    pub async fn create_session(
+        &self, 
+        opts: SessionOpts,
+        tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<(String, String)> {
         // --- Check session limit ---
         {
             let sessions = self.sessions.lock().map_err(|e| {
@@ -200,7 +216,7 @@ impl SessionManager {
 
         // --- Wait for initial output ---
         let (initial_output, status_str) =
-            wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms).await;
+            wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms, tx_delta).await;
 
         let now = Instant::now();
         let status = if status_str == "exited" {
@@ -235,6 +251,7 @@ impl SessionManager {
         id: &str,
         input: &str,
         timeout_ms: Option<u64>,
+        tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<SendResult> {
         // --- Remove session from map (release lock before I/O) ---
         let mut session = {
@@ -264,7 +281,7 @@ impl SessionManager {
 
         // --- Wait for output ---
         let (output, status_str) =
-            wait_for_output(&mut session.pty, &session.detector, timeout_ms).await;
+            wait_for_output(&mut session.pty, &session.detector, timeout_ms, tx_delta).await;
 
         // --- Update metadata ---
         session.last_active = Instant::now();
@@ -440,7 +457,7 @@ mod tests {
     async fn test_create_session_echo_hello() {
         let mgr = default_manager();
         let (id, output) = mgr
-            .create_session(opts_for("echo hello"))
+            .create_session(opts_for("echo hello"), None)
             .await
             .expect("failed to create session");
 
@@ -456,12 +473,12 @@ mod tests {
     async fn test_send_input_echo() {
         let mgr = default_manager();
         let (id, _initial) = mgr
-            .create_session(opts_for("bash"))
+            .create_session(opts_for("bash"), None)
             .await
             .expect("failed to create session");
 
         let result = mgr
-            .send_input(&id, "echo test\n", None)
+            .send_input(&id, "echo test\n", None, None)
             .await
             .expect("failed to send input");
 
@@ -480,7 +497,7 @@ mod tests {
     async fn test_close_session_idempotent() {
         let mgr = default_manager();
         let (id, _) = mgr
-            .create_session(opts_for("bash"))
+            .create_session(opts_for("bash"), None)
             .await
             .expect("failed to create session");
 
@@ -500,15 +517,15 @@ mod tests {
         let mgr = SessionManager::new(config);
 
         let (id1, _) = mgr
-            .create_session(opts_for("bash"))
+            .create_session(opts_for("bash"), None)
             .await
             .expect("session 1");
         let (id2, _) = mgr
-            .create_session(opts_for("bash"))
+            .create_session(opts_for("bash"), None)
             .await
             .expect("session 2");
 
-        let result = mgr.create_session(opts_for("bash")).await;
+        let result = mgr.create_session(opts_for("bash"), None).await;
         assert!(result.is_err(), "third session should fail");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -525,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_not_found() {
         let mgr = default_manager();
-        let result = mgr.send_input("shell_99", "hello\n", None).await;
+        let result = mgr.send_input("shell_99", "hello\n", None, None).await;
         assert!(result.is_err(), "send to non-existent session should fail");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(

@@ -76,12 +76,7 @@ impl Tool for ShellStartTool {
             readiness_timeout_ms, idle_timeout,
         };
         
-        let (session_id, output) = mgr.create_session(opts).await?;
-        
-        // Stream initial output to TUI
-        if let Some(ref tx) = ctx.tx_delta {
-            let _ = tx.send(output.clone());
-        }
+        let (session_id, output) = mgr.create_session(opts, ctx.tx_delta.as_ref()).await?;
         
         Ok(serde_json::json!({
             "session_id": session_id,
