@@ -157,6 +157,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     let cell_style = Style::default().fg(THEME.table_cell_color);
 
     // No top border — let it breathe
+    result.push(Line::from("")); // spacing above table
 
     let body_start = if has_header { 1 } else { 0 };
     let body_count = rows.len().saturating_sub(body_start);
@@ -227,6 +228,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     }
 
     // No bottom border — let it breathe
+    result.push(Line::from("")); // spacing below table
 
     result
 }
@@ -266,6 +268,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 let rule_width = block_inner_width.min(60).max(20);
 
                 // Top rule with optional language tag
+                lines.push(Line::from("")); // breathing room above code block
                 if !code_lang.is_empty() {
                     // Language label line (above the top rule)
                     let lang_upper = code_lang.to_uppercase();
@@ -293,6 +296,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                     border_style,
                 )));
 
+                lines.push(Line::from("")); // breathing room below code block
                 in_code_block = false;
             }
             continue;
@@ -341,6 +345,10 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
         if trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|&c| c == '#').count();
             let heading_text = trimmed[level..].trim();
+            // Spacing above heading (unless it's the first line)
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
             let full = format!("{}  {}", prefix, heading_text);
             for wline in wrap_text(&full, width) {
                 lines.push(Line::from(Span::styled(

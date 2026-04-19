@@ -51,6 +51,7 @@ impl App {
                 }
 
                 ChatMessage::Thinking(text) => {
+                    lines.push(Line::from(""));
                     let dim = Style::default().fg(THEME.thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
@@ -127,6 +128,7 @@ impl App {
                 ChatMessage::Text(text) => {
                     // Separator between user block and agent response
                     if i > 0 {
+                        lines.push(Line::from(""));
                         let sep_half = width.min(40) / 2;
                         let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
                         let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
@@ -135,6 +137,7 @@ impl App {
                             Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
                             Span::styled(sep_right, Style::default().fg(THEME.separator)),
                         ]));
+                        lines.push(Line::from(""));
                     }
                     // Header
                     let label = format!("{}\u{25c8} agent", m);
@@ -173,6 +176,8 @@ impl App {
                 }
 
                 ChatMessage::ToolUseStart(tool_name, partial_input) => {
+                    // Breathing room before tool block
+                    lines.push(Line::from(""));
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
                         Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
@@ -243,6 +248,8 @@ impl App {
                 }
 
                 ChatMessage::ToolUse { tool_name, input } => {
+                    // Breathing room before tool block
+                    lines.push(Line::from(""));
                     // Compact tool header
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
