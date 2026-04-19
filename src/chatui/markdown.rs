@@ -65,11 +65,11 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
-/// Render a markdown table into styled Lines with box-drawing borders.
+/// Render a markdown table into styled Lines.
 ///
-/// Parses the collected table lines into a grid, calculates column widths,
-/// and renders with Unicode box-drawing characters. The separator row
-/// (|---|---|) is detected and skipped — it just confirms we have a header.
+/// No outer border — clean, breathable layout. Header row is bold with a
+/// single ─ rule underneath. For tables >6 rows a faint rule appears every
+/// 5th body row for readability. Columns are padded to the widest cell.
 pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut result: Vec<Line> = Vec::new();
     if table_lines.is_empty() {
@@ -89,7 +89,6 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         });
 
         if is_separator {
-            // Separator after first row means row 0 is the header
             if i == 1 {
                 has_header = true;
             }
@@ -115,8 +114,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         }
     }
 
-    // Calculate column widths using display width (not byte length)
-    // This correctly handles emojis, CJK chars, etc. that take 2 terminal columns
+    // Calculate column widths using display width
     let mut col_widths: Vec<usize> = vec![3; num_cols];
     for row in &rows {
         for (j, cell) in row.iter().enumerate() {
@@ -127,21 +125,17 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     }
 
     // Shrink columns if total table width exceeds terminal width
-    // Layout: prefix + "  " + │ + for each col: " " + cell + " " + │
-    // = prefix_len + 2 + 1 + num_cols * (col_w + 3) 
-    let prefix_overhead = UnicodeWidthStr::width(prefix) + 3; // prefix + "  " + opening │
-    let per_col_overhead = 3; // space + space + separator
+    let prefix_overhead = UnicodeWidthStr::width(prefix) + 2; // prefix + "  "
+    let per_col_overhead = 3; // " " + cell + " " + gap
     let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
     if width > 0 && total_table_width > width {
         let available = width.saturating_sub(prefix_overhead + num_cols * per_col_overhead);
         if available > 0 && num_cols > 0 {
             let total_content: usize = col_widths.iter().sum();
             if total_content > available {
-                // Proportionally shrink columns, minimum 3 chars each
                 let mut new_widths: Vec<usize> = col_widths.iter()
                     .map(|&w| (w * available / total_content).max(3))
                     .collect();
-                // Distribute any remainder to the widest columns
                 let used: usize = new_widths.iter().sum();
                 if used < available {
                     let mut remainder = available - used;
@@ -159,29 +153,23 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     }
 
     let border_style = Style::default().fg(THEME.table_border_color);
-    let header_style = Style::default().fg(THEME.table_header_color).add_modifier(ratatui::style::Modifier::BOLD);
+    let header_style = Style::default().fg(THEME.table_header_color).add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(THEME.table_cell_color);
 
-    // Top border: ┌───┬───┐
-    let mut top = format!("{}  \u{250C}", prefix);
-    for (j, w) in col_widths.iter().enumerate() {
-        top.push_str(&"\u{2500}".repeat(w + 2));
-        if j < num_cols - 1 {
-            top.push('\u{252C}');
-        }
-    }
-    top.push('\u{2510}');
-    result.push(Line::from(Span::styled(top, border_style)));
+    // No top border — let it breathe
+    result.push(Line::from("")); // spacing above table
+
+    let body_start = if has_header { 1 } else { 0 };
+    let body_count = rows.len().saturating_sub(body_start);
 
     for (i, row) in rows.iter().enumerate() {
-        // Data row: │ cell │ cell │
+        // Data row: padded cells separated by spaces (no vertical borders)
         let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(format!("{}  \u{2502}", prefix), border_style));
+        spans.push(Span::styled(format!("{}  ", prefix), Style::default()));
 
         for (j, cell) in row.iter().enumerate() {
             let w = col_widths[j];
             let display_w = UnicodeWidthStr::width(cell.as_str());
-            // Truncate cell content if it exceeds column width
             let display_cell = if display_w > w {
                 let mut truncated = String::new();
                 let mut tw = 0;
@@ -191,7 +179,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                     truncated.push(ch);
                     tw += cw;
                 }
-                truncated.push('…');
+                truncated.push('\u{2026}');
                 truncated
             } else {
                 cell.clone()
@@ -201,37 +189,46 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             let padded = format!(" {}{} ", display_cell, " ".repeat(padding));
             let style = if has_header && i == 0 { header_style } else { cell_style };
             spans.push(Span::styled(padded, style));
+            // Light separator between columns (not after last)
             if j < num_cols - 1 {
-                spans.push(Span::styled("\u{2502}", border_style));
+                spans.push(Span::styled(" ", Style::default()));
             }
         }
-        spans.push(Span::styled("\u{2502}", border_style));
         result.push(Line::from(spans));
 
-        // After header row, draw separator: ├───┼───┤
+        // After header row, draw a single ─ rule
         if has_header && i == 0 {
-            let mut sep = format!("{}  \u{251C}", prefix);
-            for (j, w) in col_widths.iter().enumerate() {
-                sep.push_str(&"\u{2500}".repeat(w + 2));
-                if j < num_cols - 1 {
-                    sep.push('\u{253C}');
-                }
-            }
-            sep.push('\u{2524}');
+            let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
+            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
             result.push(Line::from(Span::styled(sep, border_style)));
+        }
+
+        // For tables with >6 rows, add a faint rule every 5th body row
+        if has_header && i > 0 && body_count > 6 {
+            let body_idx = i - body_start; // 0-indexed body row
+            if body_idx > 0 && body_idx % 5 == 0 && i < rows.len() - 1 {
+                let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+                result.push(Line::from(Span::styled(
+                    sep,
+                    Style::default().fg(THEME.table_border_color).add_modifier(Modifier::DIM),
+                )));
+            }
+        } else if !has_header && body_count > 6 {
+            // No header case — stripe from row 0
+            if i > 0 && i % 5 == 0 && i < rows.len() - 1 {
+                let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+                result.push(Line::from(Span::styled(
+                    sep,
+                    Style::default().fg(THEME.table_border_color).add_modifier(Modifier::DIM),
+                )));
+            }
         }
     }
 
-    // Bottom border: └───┴───┘
-    let mut bot = format!("{}  \u{2514}", prefix);
-    for (j, w) in col_widths.iter().enumerate() {
-        bot.push_str(&"\u{2500}".repeat(w + 2));
-        if j < num_cols - 1 {
-            bot.push('\u{2534}');
-        }
-    }
-    bot.push('\u{2518}');
-    result.push(Line::from(Span::styled(bot, border_style)));
+    // No bottom border — let it breathe
+    result.push(Line::from("")); // spacing below table
 
     result
 }
@@ -260,21 +257,47 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             if !in_code_block {
                 in_code_block = true;
                 code_lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
-                let label = if code_lang.is_empty() {
-                    format!("{}  \u{2500}\u{2500}\u{2500}", prefix)
-                } else {
-                    format!("{}  \u{2500}\u{2500} {} \u{2500}\u{2500}", prefix, code_lang)
-                };
-                lines.push(Line::from(Span::styled(label, Style::default().fg(THEME.muted))));
                 code_buf.clear();
             } else {
-                // End of code block — highlight and flush
-                lines.extend(highlight_code_block(&code_buf, &code_lang, prefix));
-                in_code_block = false;
+                // End of code block — render with language tag chip + border frame
+                let border_style = Style::default().fg(THEME.border);
+                let lang_style = Style::default().fg(THEME.muted).add_modifier(Modifier::DIM);
+
+                // Calculate block width: use a reasonable portion of available width
+                let block_inner_width = width.saturating_sub(prefix.len() + 4); // prefix + "  " + borders
+                let rule_width = block_inner_width.min(60).max(20);
+
+                // Top rule with optional language tag
+                lines.push(Line::from("")); // breathing room above code block
+                if !code_lang.is_empty() {
+                    // Language label line (above the top rule)
+                    let lang_upper = code_lang.to_uppercase();
+                    let spaced: String = lang_upper.chars()
+                        .enumerate()
+                        .map(|(i, c)| if i > 0 { format!(" {}", c) } else { c.to_string() })
+                        .collect();
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}  ", prefix), Style::default()),
+                        Span::styled(spaced, lang_style),
+                    ]));
+                }
+                // Top border rule
                 lines.push(Line::from(Span::styled(
-                    format!("{}  \u{2500}\u{2500}\u{2500}", prefix),
-                    Style::default().fg(THEME.muted),
+                    format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
+                    border_style,
                 )));
+
+                // Code body (highlight_code_block already adds prefix + │ per line)
+                lines.extend(highlight_code_block(&code_buf, &code_lang, prefix));
+
+                // Bottom border rule
+                lines.push(Line::from(Span::styled(
+                    format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
+                    border_style,
+                )));
+
+                lines.push(Line::from("")); // breathing room below code block
+                in_code_block = false;
             }
             continue;
         }
@@ -322,6 +345,10 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
         if trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|&c| c == '#').count();
             let heading_text = trimmed[level..].trim();
+            // Spacing above heading (unless it's the first line)
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
             let full = format!("{}  {}", prefix, heading_text);
             for wline in wrap_text(&full, width) {
                 lines.push(Line::from(Span::styled(
@@ -434,20 +461,21 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             lines.push(Line::from(line_spans));
         } else {
             // Wrap and re-parse each wrapped line
+            // wrap_text carries the leading indent forward on continuation lines
             for wline in wrap_text(&full, width) {
-                let inner = if wline.starts_with(&full_prefix) {
-                    &wline[full_prefix.len()..]
+                let (prefix_part, inner) = if wline.starts_with(&full_prefix) {
+                    (full_prefix.clone(), &wline[full_prefix.len()..])
                 } else {
-                    &wline
+                    // Continuation line — extract the indent wrap_text added
+                    let indent_len = wline.chars().take_while(|c| *c == ' ').count();
+                    let indent: String = " ".repeat(indent_len);
+                    let rest = &wline[indent.len()..];
+                    (indent, rest)
                 };
                 let parsed = parse_inline_md(inner, base_style);
-                if wline.starts_with(&full_prefix) {
-                    let mut line_spans = vec![Span::styled(full_prefix.clone(), base_style)];
-                    line_spans.extend(parsed);
-                    lines.push(Line::from(line_spans));
-                } else {
-                    lines.push(Line::from(parsed));
-                }
+                let mut line_spans = vec![Span::styled(prefix_part, base_style)];
+                line_spans.extend(parsed);
+                lines.push(Line::from(line_spans));
             }
         }
     }
@@ -462,25 +490,37 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
         return vec![text];
     }
 
+    // Detect leading whitespace to carry forward on continuation lines.
+    // This prevents wrapped text from bleeding to column 0 and leaving
+    // scroll artifacts in the TUI.
+    let indent_len = text.chars().take_while(|c| *c == ' ').count();
+    let indent: String = " ".repeat(indent_len);
+    let wrap_width = width.saturating_sub(indent_len);
+
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut is_first_line = true;
 
     for word in text.split_inclusive(' ') {
         let wlen = word.chars().count();
         let col = current.chars().count();
-        if col + wlen > width && col > 0 {
+        let effective_width = if is_first_line { width } else { wrap_width };
+        if col + wlen > effective_width && col > 0 {
             lines.push(current.trim_end().to_string());
-            current = String::new();
+            current = indent.clone();
+            is_first_line = false;
         }
-        // Word longer than width — hard break it
-        if wlen > width {
+        // Word longer than effective width — hard break it
+        let effective_width = if is_first_line { width } else { wrap_width };
+        if wlen > effective_width {
             let chars: Vec<char> = word.chars().collect();
-            for chunk in chars.chunks(width) {
-                if !current.is_empty() {
+            for chunk in chars.chunks(effective_width) {
+                if !current.is_empty() && current != indent {
                     lines.push(current.trim_end().to_string());
-                    current = String::new();
+                    current = indent.clone();
+                    is_first_line = false;
                 }
-                current = chunk.iter().collect::<String>();
+                current.push_str(&chunk.iter().collect::<String>());
             }
         } else {
             current.push_str(word);
