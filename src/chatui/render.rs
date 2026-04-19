@@ -51,6 +51,12 @@ impl App {
                 }
 
                 ChatMessage::Thinking(text) => {
+                    // Only add spacing if previous message wasn't a User block
+                    // (User blocks already have bottom margin)
+                    let prev_was_user = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::User(_));
+                    if !prev_was_user {
+                        lines.push(Line::from(""));
+                    }
                     let dim = Style::default().fg(THEME.thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
@@ -126,24 +132,49 @@ impl App {
 
                 ChatMessage::Text(text) => {
                     // Separator between user block and agent response
-                    if i > 0 {
-                        let sep_half = width.min(40) / 2;
+                    // After thinking: just a single blank line (no separator)
+                    let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
+                    if prev_was_thinking {
+                        lines.push(Line::from(""));
+                    } else if i > 0 {
+                        lines.push(Line::from(""));
+                        let sep_total = width.min(40);
+                        let sep_half = sep_total / 2;
                         let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
                         let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
+                        let sep_content_width = sep_left.chars().count() + 3 + sep_right.chars().count();
+                        let pad_left = width.saturating_sub(sep_content_width) / 2;
                         lines.push(Line::from(vec![
-                            Span::styled(format!("{}{}", m, sep_left), Style::default().fg(THEME.separator)),
+                            Span::styled(" ".repeat(pad_left), Style::default()),
+                            Span::styled(sep_left, Style::default().fg(THEME.separator)),
                             Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
                             Span::styled(sep_right, Style::default().fg(THEME.separator)),
                         ]));
+                        lines.push(Line::from(""));
                     }
                     // Header
                     let label = format!("{}\u{25c8} agent", m);
                     let ts_str = format!("{} ", ts);
                     let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
+                    // Pulse the agent label when streaming (same sin-wave as header dot)
+                    let label_color = if self.streaming && i == self.messages.len() - 1 {
+                        let pulse = ((self.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
+                        if let Color::Rgb(r, g, b) = THEME.claude_label {
+                            Color::Rgb(
+                                (r as f64 * pulse) as u8,
+                                (g as f64 * pulse) as u8,
+                                (b as f64 * pulse) as u8,
+                            )
+                        } else {
+                            THEME.claude_label
+                        }
+                    } else {
+                        THEME.claude_label
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(THEME.claude_label).add_modifier(Modifier::BOLD),
+                            Style::default().fg(label_color).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(ts_str, Style::default().fg(THEME.muted)),
                     ]));
@@ -158,6 +189,8 @@ impl App {
                 }
 
                 ChatMessage::ToolUseStart(tool_name, partial_input) => {
+                    // Breathing room before tool block
+                    lines.push(Line::from(""));
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
                         Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
@@ -228,6 +261,8 @@ impl App {
                 }
 
                 ChatMessage::ToolUse { tool_name, input } => {
+                    // Breathing room before tool block
+                    lines.push(Line::from(""));
                     // Compact tool header
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
@@ -434,7 +469,16 @@ impl App {
                     };
 
                     if let Some(hl_lines) = highlighted_lines {
-                        lines.extend(hl_lines);
+                        if !is_error && !is_timeout {
+                            for hl_line in hl_lines {
+                                let dimmed_spans: Vec<Span> = hl_line.spans.into_iter().map(|span| {
+                                    Span::styled(span.content, span.style.add_modifier(Modifier::DIM))
+                                }).collect();
+                                lines.push(Line::from(dimmed_spans));
+                            }
+                        } else {
+                            lines.extend(hl_lines);
+                        }
                     } else {
                         for line in &result_lines[..show] {
                             // Try to detect and highlight grep output (skip for timeout/error)
@@ -446,7 +490,8 @@ impl App {
                             }
                             let full = format!("{}       {}", m, line);
                             for wline in wrap_text(&full, width) {
-                                lines.push(Line::from(Span::styled(wline, style)));
+                                let body_style = if is_error || is_timeout { style } else { style.add_modifier(Modifier::DIM) };
+                                lines.push(Line::from(Span::styled(wline, body_style)));
                             }
                         }
                     }
