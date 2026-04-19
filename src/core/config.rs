@@ -83,6 +83,7 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub auto_cache: bool,              // default false — use manual breakpoints
     pub theme: Option<String>,
     pub disabled_plugins: Vec<String>,
     pub disabled_skills: Vec<String>,
@@ -99,6 +100,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            auto_cache: false,
             theme: None,
             disabled_plugins: Vec::new(),
             disabled_skills: Vec::new(),
@@ -232,6 +234,7 @@ pub fn load_config() -> SynapsConfig {
                 }
             }
             "theme" => config.theme = Some(val.to_string()),
+            "auto_cache" => config.auto_cache = val == "true" || val == "1",
             "disabled_plugins" => {
                 config.disabled_plugins = val.split(',')
                     .map(|s| s.trim().to_string())
