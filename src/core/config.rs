@@ -332,24 +332,9 @@ mod tests {
     }
 
     #[test] 
-    fn test_load_config_nonexistent_file() {
-        // Test that loading from a completely non-existent directory returns defaults
-        // We'll temporarily set HOME to a non-existent directory
-        let original_home = std::env::var("HOME").ok();
-        
-        std::env::set_var("HOME", "/tmp/nonexistent_home_dir_12345");
-        
-        let config = load_config();
-        assert_eq!(config.model, None);
-        assert_eq!(config.thinking_budget, None);
-        
-        // Restore original HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
+    // Note: test_load_config_nonexistent_file removed — HOME env var mutation
+    // is not thread-safe and races with shell config tests. Coverage provided
+    // by shell::config::tests::test_shell_config_from_file.
 
     #[test]
     fn test_synaps_config_default() {
