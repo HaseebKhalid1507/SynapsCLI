@@ -163,6 +163,24 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
                 eprintln!("Warning: invalid value for shell.default_cols: '{}', using default", val);
             }
         }
+        "shell.readiness_strategy" => {
+            let val_lower = val.to_lowercase();
+            match val_lower.as_str() {
+                "timeout" | "prompt" | "hybrid" => {
+                    shell_config.readiness_strategy = val.to_string();
+                }
+                _ => {
+                    eprintln!("Warning: invalid value for shell.readiness_strategy: '{}', using default", val);
+                }
+            }
+        }
+        "shell.max_output" => {
+            if let Ok(max_output) = val.parse::<usize>() {
+                shell_config.max_output = max_output;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_output: '{}', using default", val);
+            }
+        }
         _ => {
             // Unknown shell.* keys are preserved (not rejected)
         }
@@ -331,7 +349,6 @@ mod tests {
         assert!(result.contains("helpful AI agent"));
     }
 
-    #[test] 
     // Note: test_load_config_nonexistent_file removed — HOME env var mutation
     // is not thread-safe and races with shell config tests. Coverage provided
     // by shell::config::tests::test_shell_config_from_file.
