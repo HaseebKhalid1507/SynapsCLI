@@ -40,6 +40,9 @@ pub struct Runtime {
     bash_max_timeout: u64,
     subagent_timeout: u64,
     api_retries: u32,
+    session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    #[allow(dead_code)]
+    reaper_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Runtime {
@@ -52,7 +55,7 @@ impl Runtime {
             .build()
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
-        Ok(Runtime {
+        let runtime = Ok(Runtime {
             client,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
@@ -70,7 +73,21 @@ impl Runtime {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
-        })
+            session_manager: {
+                let config = crate::tools::shell::ShellConfig::default();
+                crate::tools::shell::SessionManager::new(config)
+            },
+            reaper_handle: None,
+        });
+
+        // Start the idle session reaper
+        if let Ok(ref rt) = runtime {
+            let mgr = rt.session_manager.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            crate::tools::shell::session::start_reaper(mgr, cancel);
+        }
+
+        runtime
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -244,7 +261,7 @@ impl Runtime {
                                     tx_events: None, 
                                     watcher_exit_path: self.watcher_exit_path.clone(), 
                                     tool_register_tx: None, 
-                                    session_manager: None,
+                                    session_manager: Some(self.session_manager.clone()),
                                     max_tool_output: self.max_tool_output,
                                     bash_timeout: self.bash_timeout,
                                     bash_max_timeout: self.bash_max_timeout,
@@ -272,6 +289,7 @@ impl Runtime {
                     let cfg_bash_timeout = self.bash_timeout;
                     let cfg_bash_max_timeout = self.bash_max_timeout;
                     let cfg_subagent_timeout = self.subagent_timeout;
+                    let session_mgr = self.session_manager.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -281,6 +299,7 @@ impl Runtime {
                             let input = tool_use["input"].clone();
                             let tool = self.tools.read().await.get(&tool_name).cloned();
                             let exit_path = self.watcher_exit_path.clone();
+                            let session_mgr_inner = session_mgr.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -290,7 +309,7 @@ impl Runtime {
                                             tx_events: None, 
                                             watcher_exit_path: exit_path, 
                                             tool_register_tx: None, 
-                                            session_manager: None,
+                                            session_manager: Some(session_mgr_inner),
                                             max_tool_output: cfg_max_tool_output,
                                             bash_timeout: cfg_bash_timeout,
                                             bash_max_timeout: cfg_bash_max_timeout,
@@ -387,12 +406,14 @@ impl Runtime {
         let bash_max_timeout = self.bash_max_timeout;
         let subagent_timeout = self.subagent_timeout;
         let api_retries = self.api_retries;
+        let session_manager = self.session_manager.clone();
 
         tokio::spawn(async move {
             if let Err(e) = StreamMethods::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
                 messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
                 max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
+                session_manager,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -418,6 +439,8 @@ impl Clone for Runtime {
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
+            session_manager: self.session_manager.clone(),
+            reaper_handle: None,  // Cloned runtimes don't own the reaper
         }
     }
 }

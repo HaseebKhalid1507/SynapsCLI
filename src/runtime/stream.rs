@@ -30,6 +30,7 @@ impl StreamMethods {
         bash_max_timeout: u64,
         subagent_timeout: u64,
         api_retries: u32,
+        session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -161,7 +162,7 @@ impl StreamMethods {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: None, max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -206,6 +207,7 @@ impl StreamMethods {
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
+                        let session_mgr = session_manager.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -223,7 +225,7 @@ impl StreamMethods {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: None, max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),

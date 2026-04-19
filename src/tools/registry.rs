@@ -30,6 +30,9 @@ impl ToolRegistry {
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
             Arc::new(crate::tools::subagent::SubagentTool),
+            Arc::new(crate::tools::shell::ShellStartTool),
+            Arc::new(crate::tools::shell::ShellSendTool),
+            Arc::new(crate::tools::shell::ShellEndTool),
         ];
         Self::from_tools(tools)
     }
@@ -44,6 +47,9 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
+            Arc::new(crate::tools::shell::ShellStartTool),
+            Arc::new(crate::tools::shell::ShellSendTool),
+            Arc::new(crate::tools::shell::ShellEndTool),
         ];
         Self::from_tools(tools)
     }

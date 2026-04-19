@@ -370,8 +370,8 @@ async fn test_bash_tool_execution() {
 fn test_tool_registry_new() {
     let registry = ToolRegistry::new();
     
-    // Should have 8 tools including subagent
-    assert_eq!(registry.tools_schema().len(), 8);
+    // Should have 11 tools including subagent + 3 shell tools
+    assert_eq!(registry.tools_schema().len(), 11);
     
     // Should find bash tool
     assert!(registry.get("bash").is_some());
@@ -394,8 +394,8 @@ fn test_tool_registry_new() {
 fn test_tool_registry_without_subagent() {
     let registry = ToolRegistry::without_subagent();
     
-    // Should have 7 tools without subagent
-    assert_eq!(registry.tools_schema().len(), 7);
+    // Should have 10 tools without subagent (7 base + 3 shell)
+    assert_eq!(registry.tools_schema().len(), 10);
     
     // Should not have subagent tool
     assert!(registry.get("subagent").is_none());
