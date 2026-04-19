@@ -168,12 +168,7 @@ impl App {
                             format!("{}   \u{2026}", m), Style::default().fg(THEME.muted),
                         )));
                     } else {
-                        let rail_style = Style::default().fg(THEME.claude_label).add_modifier(Modifier::DIM);
-                        for md_line in render_markdown(text, m, width) {
-                            let mut railed = vec![Span::styled("\u{2502} ", rail_style)];
-                            railed.extend(md_line.spans);
-                            lines.push(Line::from(railed));
-                        }
+                        lines.extend(render_markdown(text, m, width));
                     }
                 }
 

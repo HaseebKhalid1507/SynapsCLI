@@ -453,20 +453,21 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             lines.push(Line::from(line_spans));
         } else {
             // Wrap and re-parse each wrapped line
+            // wrap_text carries the leading indent forward on continuation lines
             for wline in wrap_text(&full, width) {
-                let inner = if wline.starts_with(&full_prefix) {
-                    &wline[full_prefix.len()..]
+                let (prefix_part, inner) = if wline.starts_with(&full_prefix) {
+                    (full_prefix.clone(), &wline[full_prefix.len()..])
                 } else {
-                    &wline
+                    // Continuation line — extract the indent wrap_text added
+                    let indent_len = wline.chars().take_while(|c| *c == ' ').count();
+                    let indent: String = " ".repeat(indent_len);
+                    let rest = &wline[indent.len()..];
+                    (indent, rest)
                 };
                 let parsed = parse_inline_md(inner, base_style);
-                if wline.starts_with(&full_prefix) {
-                    let mut line_spans = vec![Span::styled(full_prefix.clone(), base_style)];
-                    line_spans.extend(parsed);
-                    lines.push(Line::from(line_spans));
-                } else {
-                    lines.push(Line::from(parsed));
-                }
+                let mut line_spans = vec![Span::styled(prefix_part, base_style)];
+                line_spans.extend(parsed);
+                lines.push(Line::from(line_spans));
             }
         }
     }
@@ -481,25 +482,37 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
         return vec![text];
     }
 
+    // Detect leading whitespace to carry forward on continuation lines.
+    // This prevents wrapped text from bleeding to column 0 and leaving
+    // scroll artifacts in the TUI.
+    let indent_len = text.chars().take_while(|c| *c == ' ').count();
+    let indent: String = " ".repeat(indent_len);
+    let wrap_width = width.saturating_sub(indent_len);
+
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut is_first_line = true;
 
     for word in text.split_inclusive(' ') {
         let wlen = word.chars().count();
         let col = current.chars().count();
-        if col + wlen > width && col > 0 {
+        let effective_width = if is_first_line { width } else { wrap_width };
+        if col + wlen > effective_width && col > 0 {
             lines.push(current.trim_end().to_string());
-            current = String::new();
+            current = indent.clone();
+            is_first_line = false;
         }
-        // Word longer than width — hard break it
-        if wlen > width {
+        // Word longer than effective width — hard break it
+        let effective_width = if is_first_line { width } else { wrap_width };
+        if wlen > effective_width {
             let chars: Vec<char> = word.chars().collect();
-            for chunk in chars.chunks(width) {
-                if !current.is_empty() {
+            for chunk in chars.chunks(effective_width) {
+                if !current.is_empty() && current != indent {
                     lines.push(current.trim_end().to_string());
-                    current = String::new();
+                    current = indent.clone();
+                    is_first_line = false;
                 }
-                current = chunk.iter().collect::<String>();
+                current.push_str(&chunk.iter().collect::<String>());
             }
         } else {
             current.push_str(word);
