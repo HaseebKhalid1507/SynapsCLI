@@ -12,6 +12,8 @@ pub struct ShellConfig {
     pub default_rows: u16,
     pub default_cols: u16,
     pub prompt_patterns: Vec<String>,
+    pub readiness_strategy: String,
+    pub max_output: usize,
 }
 
 impl Default for ShellConfig {
@@ -24,6 +26,8 @@ impl Default for ShellConfig {
             default_rows: 24,
             default_cols: 80,
             prompt_patterns: default_prompt_patterns(),
+            readiness_strategy: "hybrid".to_string(),
+            max_output: 30000,
         }
     }
 }
@@ -42,6 +46,13 @@ fn default_prompt_patterns() -> Vec<String> {
         r"Password:\s*$".into(),
         r"\[Y/n\]\s*$".into(),
         r"\(yes/no.*\)\?\s*$".into(),
+        r"% $".into(),
+        r"% \s*$".into(),
+        r"root@[\w.-]+:[/~].*# $".into(),
+        r"[\w.-]+@[\w.-]+:[/~].*\$ $".into(),
+        r"Enter passphrase.*:\s*$".into(),
+        r"Token:\s*$".into(),
+        r"Verification code:\s*$".into(),
     ]
 }
 
@@ -59,7 +70,7 @@ mod tests {
         assert_eq!(config.max_readiness_timeout_ms, 10_000);
         assert_eq!(config.default_rows, 24);
         assert_eq!(config.default_cols, 80);
-        assert_eq!(config.prompt_patterns.len(), 12);
+        assert_eq!(config.prompt_patterns.len(), 19);
     }
 
     #[test]

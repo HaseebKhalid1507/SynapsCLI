@@ -20,7 +20,7 @@ use crate::{Result, RuntimeError};
 
 use super::config::ShellConfig;
 use super::pty::PtyHandle;
-use super::readiness::{ReadinessDetector, ReadinessResult};
+use super::readiness::{ReadinessDetector, ReadinessResult, ReadinessStrategy};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -37,7 +37,6 @@ pub struct SessionManager {
 struct ShellSession {
     pty: PtyHandle,
     detector: ReadinessDetector,
-    #[allow(dead_code)]
     created_at: Instant,
     last_active: Instant,
     idle_timeout: Duration,
@@ -48,7 +47,7 @@ struct ShellSession {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     Active,
-    Exited,
+    Exited(Option<i32>),
     Closed,
 }
 
@@ -67,7 +66,7 @@ pub struct SessionOpts {
 #[derive(Debug)]
 pub struct SendResult {
     pub output: String,
-    /// One of: `"active"`, `"exited"`, `"timeout"`
+    /// One of: `"active"`, `"exited"`, `"exited(N)"`, `"timeout"`
     pub status: String,
 }
 
@@ -104,6 +103,13 @@ fn process_input_escapes(input: &str) -> String {
                 Some('r') => { chars.next(); result.push('\r'); }
                 Some('t') => { chars.next(); result.push('\t'); }
                 Some('\\') => { chars.next(); result.push('\\'); }
+                Some('a') => { chars.next(); result.push('\x07'); }  // bell
+                Some('b') => { chars.next(); result.push('\x08'); }  // backspace
+                Some('0') => { chars.next(); result.push('\0'); }    // null
+                Some('e') => {
+                    chars.next();
+                    tracing::warn!("blocked \\e escape sequence (raw ESC) in shell input");
+                }
                 Some('x') => {
                     chars.next(); // consume 'x'
                     let mut hex = String::new();
@@ -118,7 +124,16 @@ fn process_input_escapes(input: &str) -> String {
                         }
                     }
                     if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                        result.push(byte as char);
+                        if byte == 0x1b {
+                            // Block ESC (ANSI escape initiator)
+                            tracing::warn!("blocked \\x1b escape sequence (raw ESC) in shell input");
+                        } else if byte >= 0x80 {
+                            // Block high bytes
+                            tracing::warn!("blocked \\x{hex:} high byte (>= 0x80) in shell input");
+                        } else {
+                            // Allow: 0x00-0x1a, 0x1c-0x1f (control chars except ESC), 0x20-0x7f
+                            result.push(byte as char);
+                        }
                     } else {
                         // Failed to parse — emit the original characters
                         result.push('\\');
@@ -138,16 +153,42 @@ fn process_input_escapes(input: &str) -> String {
     result
 }
 
+/// Format a `SessionStatus` as a status string.
+fn status_string(status: &SessionStatus) -> String {
+    match status {
+        SessionStatus::Active => "active".into(),
+        SessionStatus::Exited(Some(code)) => format!("exited({code})"),
+        SessionStatus::Exited(None) => "exited".into(),
+        SessionStatus::Closed => "closed".into(),
+    }
+}
+
 /// Wait for output from the PTY until the readiness detector signals completion.
 ///
 /// Returns `(normalized_output, status_string)` where status is one of
-/// `"active"`, `"exited"`, or `"timeout"`.
+/// `"active"`, `"exited"`, `"exited(N)"`, or `"timeout"`.
 async fn wait_for_output(
     pty: &mut PtyHandle,
     detector: &ReadinessDetector,
-    _timeout_override: Option<u64>,
+    timeout_override: Option<u64>,
     tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    max_output: usize,
 ) -> (String, String) {
+    // If a timeout override is provided, build a temporary detector with that
+    // silence timeout instead of using the session's detector.
+    let override_detector;
+    let effective_detector = if let Some(ms) = timeout_override {
+        override_detector = ReadinessDetector::new(
+            ReadinessStrategy::Hybrid,
+            &[], // no prompt patterns — falls back to Timeout strategy
+            ms,
+            ms.saturating_mul(10).max(10_000), // reasonable max timeout
+        );
+        &override_detector
+    } else {
+        detector
+    };
+
     let mut output = String::new();
     let start = Instant::now();
     let mut last_output_time = Instant::now();
@@ -168,6 +209,12 @@ async fn wait_for_output(
             }
         }
 
+        // Check if output exceeds the max size — truncate and return early.
+        if output.len() > max_output {
+            output.truncate(max_output);
+            return (normalize_output(&output), "active".into());
+        }
+
         // Check if process exited.
         if !pty.is_alive() {
             // Drain any remaining buffered output.
@@ -182,14 +229,15 @@ async fn wait_for_output(
                     let _ = tx.send(normalize_output(&remaining_text));
                 }
             }
-            return (normalize_output(&output), "exited".into());
+            // PtyHandle doesn't expose exit codes currently — use None
+            return (normalize_output(&output), status_string(&SessionStatus::Exited(None)));
         }
 
         // Evaluate readiness.
         let silence_elapsed = last_output_time.elapsed();
         let total_elapsed = start.elapsed();
 
-        match detector.check(&output, silence_elapsed, total_elapsed) {
+        match effective_detector.check(&output, silence_elapsed, total_elapsed) {
             ReadinessResult::Ready => return (normalize_output(&output), "active".into()),
             ReadinessResult::SilenceTimeout => return (normalize_output(&output), "active".into()),
             ReadinessResult::MaxTimeout => return (normalize_output(&output), "timeout".into()),
@@ -214,12 +262,12 @@ impl SessionManager {
 
     /// Create a new interactive shell session.
     ///
-    /// Returns `(session_id, initial_output)` on success.
+    /// Returns `(session_id, initial_output, status)` on success.
     pub async fn create_session(
         &self, 
         opts: SessionOpts,
         tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, String)> {
         // --- Check session limit ---
         {
             let sessions = self.sessions.lock().map_err(|e| {
@@ -275,11 +323,11 @@ impl SessionManager {
         // had time to print anything (e.g. Python startup, shell rc files).
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (initial_output, status_str) =
-            wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms, tx_delta).await;
+            wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms, tx_delta, 30000).await;
 
         let now = Instant::now();
-        let status = if status_str == "exited" {
-            SessionStatus::Exited
+        let status = if status_str.starts_with("exited") {
+            SessionStatus::Exited(None)
         } else {
             SessionStatus::Active
         };
@@ -301,7 +349,7 @@ impl SessionManager {
             sessions.insert(id.clone(), session);
         }
 
-        Ok((id, initial_output))
+        Ok((id, initial_output, status_str))
     }
 
     /// Send input to an active session and return the output produced.
@@ -318,20 +366,22 @@ impl SessionManager {
                 RuntimeError::Tool(format!("session lock poisoned: {e}"))
             })?;
             sessions.remove(id).ok_or_else(|| {
-                RuntimeError::Tool(format!("session not found: {id}"))
+                RuntimeError::Tool(format!(
+                    "session {id} not found — it may have been closed, reaped, or is currently in use by another call"
+                ))
             })?
         };
 
         // --- Reject if not active ---
         if session.status != SessionStatus::Active {
             // Reinsert so it can still be closed/inspected.
-            let status_str = format!("{:?}", session.status);
+            let s_str = status_string(&session.status);
             let mut sessions = self.sessions.lock().map_err(|e| {
                 RuntimeError::Tool(format!("session lock poisoned: {e}"))
             })?;
             sessions.insert(id.to_string(), session);
             return Err(RuntimeError::Tool(format!(
-                "session {id} is not active (status: {status_str})"
+                "session {id} is not active (status: {s_str})"
             )));
         }
 
@@ -341,12 +391,12 @@ impl SessionManager {
 
         // --- Wait for output ---
         let (output, status_str) =
-            wait_for_output(&mut session.pty, &session.detector, timeout_ms, tx_delta).await;
+            wait_for_output(&mut session.pty, &session.detector, timeout_ms, tx_delta, 30000).await;
 
         // --- Update metadata ---
         session.last_active = Instant::now();
         if !session.pty.is_alive() {
-            session.status = SessionStatus::Exited;
+            session.status = SessionStatus::Exited(None);
         }
 
         let result = SendResult {
@@ -402,7 +452,10 @@ impl SessionManager {
     pub fn reap_idle(&self) -> Vec<String> {
         let mut sessions = match self.sessions.lock() {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::error!("session lock poisoned: {e}");
+                return Vec::new();
+            }
         };
 
         let grace_period = Duration::from_secs(5);
@@ -426,25 +479,32 @@ impl SessionManager {
 
     /// Shutdown all sessions immediately.
     pub fn shutdown_all(&self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.drain();
-            // All PtyHandles dropped — children killed.
+        match self.sessions.lock() {
+            Ok(mut sessions) => {
+                sessions.drain();
+                // All PtyHandles dropped — children killed.
+            }
+            Err(e) => {
+                tracing::error!("session lock poisoned: {e}");
+            }
         }
     }
 
     /// Number of sessions currently in the map.
     pub fn active_count(&self) -> usize {
-        self.sessions
-            .lock()
-            .map(|s| s.len())
-            .unwrap_or(0)
+        match self.sessions.lock() {
+            Ok(s) => s.len(),
+            Err(e) => {
+                tracing::error!("session lock poisoned: {e}");
+                0
+            }
+        }
     }
 
     /// Snapshot of all sessions.
     pub fn list_sessions(&self) -> Vec<ShellSessionInfo> {
-        self.sessions
-            .lock()
-            .map(|sessions| {
+        match self.sessions.lock() {
+            Ok(sessions) => {
                 sessions
                     .iter()
                     .map(|(id, s)| ShellSessionInfo {
@@ -454,8 +514,22 @@ impl SessionManager {
                         last_active: s.last_active,
                     })
                     .collect()
-            })
-            .unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::error!("session lock poisoned: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop implementation — cleanup on drop
+// ---------------------------------------------------------------------------
+
+impl Drop for SessionManager {
+    fn drop(&mut self) {
+        self.shutdown_all();
     }
 }
 
@@ -471,7 +545,7 @@ impl SessionManager {
 pub fn start_reaper(
     manager: Arc<SessionManager>,
     cancel: tokio_util::sync::CancellationToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(30);
         loop {
@@ -485,7 +559,7 @@ pub fn start_reaper(
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_session_echo_hello() {
         let mgr = default_manager();
-        let (id, output) = mgr
+        let (id, output, _status) = mgr
             .create_session(opts_for("echo hello"), None)
             .await
             .expect("failed to create session");
@@ -532,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_input_echo() {
         let mgr = default_manager();
-        let (id, _initial) = mgr
+        let (id, _initial, _status) = mgr
             .create_session(opts_for("bash"), None)
             .await
             .expect("failed to create session");
@@ -556,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_session_idempotent() {
         let mgr = default_manager();
-        let (id, _) = mgr
+        let (id, _, _status) = mgr
             .create_session(opts_for("bash"), None)
             .await
             .expect("failed to create session");
@@ -576,11 +650,11 @@ mod tests {
         config.max_sessions = 2;
         let mgr = SessionManager::new(config);
 
-        let (id1, _) = mgr
+        let (id1, _, _s) = mgr
             .create_session(opts_for("bash"), None)
             .await
             .expect("session 1");
-        let (id2, _) = mgr
+        let (id2, _, _s) = mgr
             .create_session(opts_for("bash"), None)
             .await
             .expect("session 2");
@@ -672,5 +746,45 @@ mod tests {
     fn test_escape_hex_partial() {
         // Incomplete hex — pass through
         assert_eq!(process_input_escapes(r"\xZZ"), "\\xZZ");
+    }
+
+    #[test]
+    fn test_escape_bell() {
+        assert_eq!(process_input_escapes(r"\a"), "\x07");
+    }
+
+    #[test]
+    fn test_escape_backspace() {
+        assert_eq!(process_input_escapes(r"\b"), "\x08");
+    }
+
+    #[test]
+    fn test_escape_null() {
+        assert_eq!(process_input_escapes(r"\0"), "\0");
+    }
+
+    #[test]
+    fn test_escape_esc_blocked() {
+        // \e should be blocked (produces empty string for that escape)
+        assert_eq!(process_input_escapes(r"\e"), "");
+    }
+
+    #[test]
+    fn test_escape_hex_1b_blocked() {
+        // \x1b should be blocked
+        assert_eq!(process_input_escapes(r"\x1b"), "");
+    }
+
+    #[test]
+    fn test_escape_hex_high_byte_blocked() {
+        // \x80 and above should be blocked
+        assert_eq!(process_input_escapes(r"\x80"), "");
+        assert_eq!(process_input_escapes(r"\xff"), "");
+    }
+
+    #[test]
+    fn test_escape_hex_del_allowed() {
+        // \x7f (DEL) should be allowed
+        assert_eq!(process_input_escapes(r"\x7f"), "\x7f");
     }
 }

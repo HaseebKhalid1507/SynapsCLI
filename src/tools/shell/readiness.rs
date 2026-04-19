@@ -33,6 +33,16 @@ pub enum ReadinessStrategy {
     Hybrid,
 }
 
+impl ReadinessStrategy {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "timeout" => ReadinessStrategy::Timeout,
+            "prompt" => ReadinessStrategy::Prompt,
+            _ => ReadinessStrategy::Hybrid,
+        }
+    }
+}
+
 /// Result of a readiness check
 #[derive(Debug, PartialEq)]
 pub enum ReadinessResult {
@@ -108,8 +118,9 @@ impl ReadinessDetector {
 
     /// Build from the default `ShellConfig`.
     pub fn from_config(config: &ShellConfig) -> Self {
+        let strategy = crate::tools::shell::readiness::ReadinessStrategy::from_str(&config.readiness_strategy);
         Self::new(
-            ReadinessStrategy::Hybrid,
+            strategy,
             &config.prompt_patterns,
             config.readiness_timeout_ms,
             config.max_readiness_timeout_ms,
@@ -143,8 +154,6 @@ impl ReadinessDetector {
             ReadinessStrategy::Prompt => {
                 if self.matches_prompt(output) {
                     ReadinessResult::Ready
-                } else if silence_elapsed >= self.silence_timeout {
-                    ReadinessResult::SilenceTimeout
                 } else {
                     ReadinessResult::Waiting
                 }
@@ -272,17 +281,17 @@ mod tests {
         assert_eq!(result, ReadinessResult::Ready);
     }
 
-    // 4. Prompt: output NOT ending with prompt → check silence
+    // 4. Prompt: output NOT ending with prompt → still waiting (no silence fallback)
     #[test]
     fn prompt_strategy_no_match_silence_fallback() {
         let det = prompt_detector();
-        // No prompt at the end, silence exceeded
+        // No prompt at the end, silence exceeded - but prompt strategy doesn't use silence
         let result = det.check(
             "compiling crate...\n",
             Duration::from_millis(500),
             Duration::from_millis(1000),
         );
-        assert_eq!(result, ReadinessResult::SilenceTimeout);
+        assert_eq!(result, ReadinessResult::Waiting);
     }
 
     // 4b. Prompt: no match, silence not exceeded → Waiting

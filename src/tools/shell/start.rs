@@ -76,12 +76,12 @@ impl Tool for ShellStartTool {
             readiness_timeout_ms, idle_timeout,
         };
         
-        let (session_id, output) = mgr.create_session(opts, ctx.tx_delta.as_ref()).await?;
+        let (session_id, output, status) = mgr.create_session(opts, ctx.tx_delta.as_ref()).await?;
         
         Ok(serde_json::json!({
             "session_id": session_id,
             "output": output,
-            "status": "active"
+            "status": status
         }).to_string())
     }
 }

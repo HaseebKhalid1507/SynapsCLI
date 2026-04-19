@@ -41,8 +41,8 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
-    #[allow(dead_code)]
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
+    reaper_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Runtime {
@@ -55,7 +55,17 @@ impl Runtime {
             .build()
             .map_err(|e| RuntimeError::Config(format!("Failed to build HTTP client: {}", e)))?;
 
-        let runtime = Ok(Runtime {
+        let session_manager = {
+            let config = crate::tools::shell::ShellConfig::default();
+            crate::tools::shell::SessionManager::new(config)
+        };
+
+        // Start the idle session reaper
+        let mgr = session_manager.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let reaper_handle = crate::tools::shell::session::start_reaper(mgr, cancel.clone());
+
+        Ok(Runtime {
             client,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
@@ -73,21 +83,10 @@ impl Runtime {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
-            session_manager: {
-                let config = crate::tools::shell::ShellConfig::default();
-                crate::tools::shell::SessionManager::new(config)
-            },
-            reaper_handle: None,
-        });
-
-        // Start the idle session reaper
-        if let Ok(ref rt) = runtime {
-            let mgr = rt.session_manager.clone();
-            let cancel = tokio_util::sync::CancellationToken::new();
-            crate::tools::shell::session::start_reaper(mgr, cancel);
-        }
-
-        runtime
+            session_manager,
+            reaper_handle: Some(reaper_handle),
+            reaper_cancel: Some(cancel),
+        })
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -441,6 +440,7 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             session_manager: self.session_manager.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
+            reaper_cancel: None,  // Cloned runtimes don't own the reaper
         }
     }
 }

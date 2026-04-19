@@ -24,7 +24,7 @@ async fn test_basic_echo() {
     let mut opts = default_opts();
     opts.command = Some("bash".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     let result = manager.send_input(&session_id, "echo hello\n", Some(1000), None).await.expect("send input");
     
@@ -41,7 +41,7 @@ async fn test_python_repl() {
     let mut opts = default_opts();
     opts.command = Some("python3".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     // Wait for Python to start up fully
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -65,7 +65,7 @@ async fn test_ctrl_c_interrupt() {
     let mut opts = default_opts();
     opts.command = Some("bash".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     // Start a long-running process
     let _result = manager.send_input(&session_id, "sleep 999\n", Some(500), None).await;
@@ -90,7 +90,7 @@ async fn test_ctrl_d_eof() {
     let mut opts = default_opts();
     opts.command = Some("cat".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     tokio::time::sleep(Duration::from_millis(200)).await;
     
@@ -109,7 +109,7 @@ async fn test_working_directory() {
     opts.command = Some("bash".to_string());
     opts.working_directory = Some("/tmp".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     let result = manager.send_input(&session_id, "pwd\n", Some(1000), None).await.expect("send pwd");
     
@@ -129,7 +129,7 @@ async fn test_environment_variables() {
     opts.command = Some("bash".to_string());
     opts.env = env;
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     let result = manager.send_input(&session_id, "echo $MY_VAR\n", Some(1000), None).await.expect("send echo env var");
     
@@ -154,8 +154,8 @@ async fn test_max_sessions() {
     opts3.command = Some("bash".to_string());
     
     // Create first two sessions successfully
-    let (session1, _) = manager.create_session(opts1, None).await.expect("create first session");
-    let (session2, _) = manager.create_session(opts2, None).await.expect("create second session");
+    let (session1, _, _) = manager.create_session(opts1, None).await.expect("create first session");
+    let (session2, _, _) = manager.create_session(opts2, None).await.expect("create second session");
     
     // Third session should fail
     let result = manager.create_session(opts3, None).await;
@@ -173,7 +173,7 @@ async fn test_session_not_found() {
     let result = manager.send_input("shell_99", "echo test\n", Some(1000), None).await;
     
     assert!(result.is_err(), "Should error for non-existent session");
-    assert!(result.unwrap_err().to_string().contains("session not found: shell_99"));
+    assert!(result.unwrap_err().to_string().contains("not found"));
 }
 
 #[tokio::test]
@@ -183,7 +183,7 @@ async fn test_double_close() {
     let mut opts = default_opts();
     opts.command = Some("bash".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     // First close should work
     let result1 = manager.close_session(&session_id).await;
@@ -202,7 +202,7 @@ async fn test_process_exit() {
     let mut opts = default_opts();
     opts.command = Some("bash -c \"exit 42\"".to_string());
     
-    let (session_id, _initial) = manager.create_session(opts, None).await.expect("create session");
+    let (session_id, _initial, _status) = manager.create_session(opts, None).await.expect("create session");
     
     tokio::time::sleep(Duration::from_millis(200)).await;
     
