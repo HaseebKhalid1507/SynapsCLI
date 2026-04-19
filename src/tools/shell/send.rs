@@ -11,7 +11,7 @@ impl Tool for ShellSendTool {
     fn name(&self) -> &str { "shell_send" }
 
     fn description(&self) -> &str {
-        "Send input to an active shell session. Returns the output produced after sending the input. The input is sent exactly as provided — include \\n for Enter, \\x03 for Ctrl-C, \\x04 for Ctrl-D."
+        "Send input to an active shell session. Returns the output produced after sending the input. The input is sent exactly as received after JSON parsing — a JSON string containing \\n will send an actual newline (Enter key). Use \\x03 for Ctrl-C, \\x04 for Ctrl-D."
     }
 
     fn parameters(&self) -> Value {
