@@ -56,7 +56,6 @@ impl Tool for ShellStartTool {
         let mgr = ctx.session_manager.as_ref()
             .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
         
-        // Parse params
         let command = params["command"].as_str().map(|s| s.to_string());
         let working_directory = params["working_directory"].as_str().map(|s| s.to_string());
         let rows = params["rows"].as_u64().map(|r| r as u16);
@@ -64,7 +63,6 @@ impl Tool for ShellStartTool {
         let readiness_timeout_ms = params["readiness_timeout_ms"].as_u64();
         let idle_timeout = params["idle_timeout"].as_u64();
         
-        // Parse env
         let env = params["env"].as_object()
             .map(|obj| obj.iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
@@ -78,10 +76,10 @@ impl Tool for ShellStartTool {
         
         let (session_id, output, status) = mgr.create_session(opts, ctx.tx_delta.as_ref()).await?;
         
-        Ok(serde_json::json!({
-            "session_id": session_id,
-            "output": output,
-            "status": status
-        }).to_string())
+        let mut result = format!("[Session {} | {}]\n", session_id, status);
+        if !output.is_empty() {
+            result.push_str(&output);
+        }
+        Ok(result)
     }
 }

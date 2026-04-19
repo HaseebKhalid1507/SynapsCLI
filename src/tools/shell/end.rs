@@ -36,10 +36,10 @@ impl Tool for ShellEndTool {
         
         let output = mgr.close_session(session_id).await?;
         
-        Ok(serde_json::json!({
-            "session_id": session_id,
-            "output": output,
-            "status": "closed"
-        }).to_string())
+        if output.is_empty() {
+            Ok(format!("[Session {} closed]", session_id))
+        } else {
+            Ok(format!("{}\n[Session {} closed]", output, session_id))
+        }
     }
 }

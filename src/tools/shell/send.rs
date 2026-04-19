@@ -47,10 +47,12 @@ impl Tool for ShellSendTool {
         
         let result = mgr.send_input(session_id, input, timeout_ms, ctx.tx_delta.as_ref()).await?;
         
-        Ok(serde_json::json!({
-            "session_id": session_id,
-            "output": result.output,
-            "status": result.status
-        }).to_string())
+        if result.status == "active" {
+            Ok(result.output)
+        } else {
+            let mut out = result.output;
+            out.push_str(&format!("\n[{}]", result.status));
+            Ok(out)
+        }
     }
 }
