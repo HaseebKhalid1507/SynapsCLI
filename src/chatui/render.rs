@@ -132,15 +132,17 @@ impl App {
 
                 ChatMessage::Text(text) => {
                     // Separator between user block and agent response
-                    // Skip separator + extra spacing when previous message was thinking
+                    // After thinking: just a single blank line (no separator)
                     let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
-                    if i > 0 && !prev_was_thinking {
+                    if prev_was_thinking {
+                        lines.push(Line::from(""));
+                    } else if i > 0 {
                         lines.push(Line::from(""));
                         let sep_total = width.min(40);
                         let sep_half = sep_total / 2;
                         let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
                         let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
-                        let sep_content_width = sep_left.chars().count() + 3 + sep_right.chars().count(); // left + " · " + right
+                        let sep_content_width = sep_left.chars().count() + 3 + sep_right.chars().count();
                         let pad_left = width.saturating_sub(sep_content_width) / 2;
                         lines.push(Line::from(vec![
                             Span::styled(" ".repeat(pad_left), Style::default()),
