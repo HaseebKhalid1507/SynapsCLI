@@ -21,6 +21,7 @@ pub mod watcher_exit;
 pub(crate) mod util;
 mod agent;
 mod registry;
+pub mod shell;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ pub use subagent::{SubagentTool, SubagentResult};
 pub use watcher_exit::WatcherExitTool;
 pub use registry::ToolRegistry;
 pub use agent::resolve_agent_prompt;
+pub use shell::{ShellStartTool, ShellSendTool, ShellEndTool};
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};

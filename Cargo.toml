@@ -51,6 +51,10 @@ tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.21"
 unicode-width = "0.2.0"
 
+# Shell / PTY deps
+portable-pty = "0.9"
+regex = "1"
+
 [dev-dependencies]
 tempfile = "3"
 
