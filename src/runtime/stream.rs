@@ -161,7 +161,7 @@ impl StreamMethods {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: None, max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -223,7 +223,7 @@ impl StreamMethods {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: None, max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),

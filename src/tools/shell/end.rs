@@ -27,7 +27,19 @@ impl Tool for ShellEndTool {
         })
     }
 
-    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
-        Err(RuntimeError::Tool("shell_end not yet implemented".into()))
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let mgr = ctx.session_manager.as_ref()
+            .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
+        
+        let session_id = params["session_id"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing session_id parameter".into()))?;
+        
+        let output = mgr.close_session(session_id).await?;
+        
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "output": output,
+            "status": "closed"
+        }).to_string())
     }
 }

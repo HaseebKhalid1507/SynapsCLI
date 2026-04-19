@@ -35,7 +35,27 @@ impl Tool for ShellSendTool {
         })
     }
 
-    async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
-        Err(RuntimeError::Tool("shell_send not yet implemented".into()))
+    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let mgr = ctx.session_manager.as_ref()
+            .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
+        
+        let session_id = params["session_id"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing session_id parameter".into()))?;
+        let input = params["input"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing input parameter".into()))?;
+        let timeout_ms = params["timeout_ms"].as_u64();
+        
+        let result = mgr.send_input(session_id, input, timeout_ms).await?;
+        
+        // Stream output to TUI
+        if let Some(ref tx) = ctx.tx_delta {
+            let _ = tx.send(result.output.clone());
+        }
+        
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "output": result.output,
+            "status": result.status
+        }).to_string())
     }
 }

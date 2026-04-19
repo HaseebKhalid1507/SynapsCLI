@@ -12,7 +12,7 @@ mod send;
 mod end;
 
 pub use config::ShellConfig;
-pub use session::SessionManager;
+pub use session::{SessionManager, SessionOpts, SendResult, start_reaper};
 pub use start::ShellStartTool;
 pub use send::ShellSendTool;
 pub use end::ShellEndTool;
