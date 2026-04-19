@@ -24,7 +24,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, false).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -41,6 +41,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
+        auto_cache: bool,
     ) -> Result<Value> {
         // Read auth state for this API call
         let (auth_token, auth_type) = {
@@ -56,11 +57,11 @@ impl ApiMethods {
         
         tracing::info!(model = %model, "Starting API request");
         
-        // We no longer strip_old_thinking or microcompact here! 
-        // Modifying historical messages breaks Anthropic's exact-prefix prompt cache.
-        // Instead, we leave historical messages fully intact to achieve a ~95% cache hit rate.
+        // Cache strategy: manual breakpoints (default) or automatic (top-level cache_control)
         let mut cleaned_messages = messages.to_vec();
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
+        if !auto_cache {
+            HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
+        }
 
         let mut body = json!({
             "model": model,
@@ -80,6 +81,11 @@ impl ApiMethods {
             if let Some(last_tool) = tool_list.last_mut() {
                 last_tool["cache_control"] = json!({"type": "ephemeral"});
             }
+        }
+
+        // Auto-cache: add top-level cache_control for automatic breakpoint management
+        if auto_cache {
+            body["cache_control"] = json!({"type": "ephemeral"});
         }
         
         if auth_type == "oauth" {

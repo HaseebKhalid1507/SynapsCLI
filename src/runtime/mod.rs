@@ -40,6 +40,7 @@ pub struct Runtime {
     bash_max_timeout: u64,
     subagent_timeout: u64,
     api_retries: u32,
+    pub auto_cache: bool,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
     reaper_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -83,6 +84,7 @@ impl Runtime {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            auto_cache: false,
             session_manager,
             reaper_handle: Some(reaper_handle),
             reaper_cancel: Some(cancel),
@@ -131,6 +133,7 @@ impl Runtime {
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
+        self.auto_cache = config.auto_cache;
     }
 
     pub fn thinking_budget(&self) -> u32 {
@@ -405,6 +408,7 @@ impl Runtime {
         let bash_max_timeout = self.bash_max_timeout;
         let subagent_timeout = self.subagent_timeout;
         let api_retries = self.api_retries;
+        let auto_cache = self.auto_cache;
         let session_manager = self.session_manager.clone();
 
         tokio::spawn(async move {
@@ -412,7 +416,7 @@ impl Runtime {
                 auth, client, model, tools, system_prompt, thinking_budget,
                 messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
                 max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
-                session_manager,
+                session_manager, auto_cache,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -438,6 +442,7 @@ impl Clone for Runtime {
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
+            auto_cache: self.auto_cache,
             session_manager: self.session_manager.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
             reaper_cancel: None,  // Cloned runtimes don't own the reaper
