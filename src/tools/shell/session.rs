@@ -83,9 +83,64 @@ pub struct ShellSessionInfo {
 // Core readiness polling loop
 // ---------------------------------------------------------------------------
 
+/// Normalize PTY output: strip ANSI escapes and convert \r\n → \n.
+fn normalize_output(raw: &str) -> String {
+    strip_ansi(raw).replace("\r\n", "\n").replace('\r', "")
+}
+
+/// Process escape sequences in input strings from the model.
+///
+/// The model sometimes sends literal two-character sequences like `\n` instead
+/// of actual control characters. This function converts common literal escapes
+/// to their real byte values as a defense-in-depth measure.
+fn process_input_escapes(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some('n') => { chars.next(); result.push('\n'); }
+                Some('r') => { chars.next(); result.push('\r'); }
+                Some('t') => { chars.next(); result.push('\t'); }
+                Some('\\') => { chars.next(); result.push('\\'); }
+                Some('x') => {
+                    chars.next(); // consume 'x'
+                    let mut hex = String::new();
+                    for _ in 0..2 {
+                        if let Some(&c) = chars.peek() {
+                            if c.is_ascii_hexdigit() {
+                                hex.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        result.push(byte as char);
+                    } else {
+                        // Failed to parse — emit the original characters
+                        result.push('\\');
+                        result.push('x');
+                        result.push_str(&hex);
+                    }
+                }
+                _ => {
+                    // Unknown escape — pass through literally
+                    result.push(ch);
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Wait for output from the PTY until the readiness detector signals completion.
 ///
-/// Returns `(stripped_output, status_string)` where status is one of
+/// Returns `(normalized_output, status_string)` where status is one of
 /// `"active"`, `"exited"`, or `"timeout"`.
 async fn wait_for_output(
     pty: &mut PtyHandle,
@@ -107,9 +162,9 @@ async fn wait_for_output(
             output.push_str(&text);
             last_output_time = Instant::now();
             
-            // Stream to TUI if requested (strip ANSI escapes first)
+            // Stream to TUI if requested (normalized)
             if let Some(tx) = tx_delta {
-                let _ = tx.send(strip_ansi(&text));
+                let _ = tx.send(normalize_output(&text));
             }
         }
 
@@ -124,10 +179,10 @@ async fn wait_for_output(
                 
                 // Stream remaining output to TUI
                 if let Some(tx) = tx_delta {
-                    let _ = tx.send(strip_ansi(&remaining_text));
+                    let _ = tx.send(normalize_output(&remaining_text));
                 }
             }
-            return (strip_ansi(&output), "exited".into());
+            return (normalize_output(&output), "exited".into());
         }
 
         // Evaluate readiness.
@@ -135,9 +190,9 @@ async fn wait_for_output(
         let total_elapsed = start.elapsed();
 
         match detector.check(&output, silence_elapsed, total_elapsed) {
-            ReadinessResult::Ready => return (strip_ansi(&output), "active".into()),
-            ReadinessResult::SilenceTimeout => return (strip_ansi(&output), "active".into()),
-            ReadinessResult::MaxTimeout => return (strip_ansi(&output), "timeout".into()),
+            ReadinessResult::Ready => return (normalize_output(&output), "active".into()),
+            ReadinessResult::SilenceTimeout => return (normalize_output(&output), "active".into()),
+            ReadinessResult::MaxTimeout => return (normalize_output(&output), "timeout".into()),
             ReadinessResult::Waiting => continue,
         }
     }
@@ -215,6 +270,10 @@ impl SessionManager {
         );
 
         // --- Wait for initial output ---
+        // Give the process a moment to start producing output before polling.
+        // Without this, the silence timeout can fire before the process has
+        // had time to print anything (e.g. Python startup, shell rc files).
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let (initial_output, status_str) =
             wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms, tx_delta).await;
 
@@ -276,8 +335,9 @@ impl SessionManager {
             )));
         }
 
-        // --- Write input ---
-        session.pty.write(input.as_bytes())?;
+        // --- Write input (with escape sequence processing) ---
+        let processed = process_input_escapes(input);
+        session.pty.write(processed.as_bytes())?;
 
         // --- Wait for output ---
         let (output, status_str) =
@@ -549,5 +609,68 @@ mod tests {
             err_msg.contains("not found"),
             "error should mention 'not found', got: {err_msg}"
         );
+    }
+
+    // ── normalize_output tests ──
+
+    #[test]
+    fn test_normalize_output_crlf() {
+        assert_eq!(normalize_output("hello\r\nworld\r\n"), "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_normalize_output_lone_cr() {
+        assert_eq!(normalize_output("abc\rdef"), "abcdef");
+    }
+
+    // ── process_input_escapes tests ──
+
+    #[test]
+    fn test_escape_newline() {
+        assert_eq!(process_input_escapes(r"hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn test_escape_tab() {
+        assert_eq!(process_input_escapes(r"a\tb"), "a\tb");
+    }
+
+    #[test]
+    fn test_escape_ctrl_c() {
+        assert_eq!(process_input_escapes(r"\x03"), "\x03");
+    }
+
+    #[test]
+    fn test_escape_ctrl_d() {
+        assert_eq!(process_input_escapes(r"\x04"), "\x04");
+    }
+
+    #[test]
+    fn test_escape_literal_backslash() {
+        assert_eq!(process_input_escapes(r"a\\b"), "a\\b");
+    }
+
+    #[test]
+    fn test_escape_real_newline_passthrough() {
+        // If the model sends an actual newline (JSON parsed correctly), it passes through
+        assert_eq!(process_input_escapes("hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn test_escape_mixed() {
+        assert_eq!(process_input_escapes(r"ls -la\n"), "ls -la\n");
+        assert_eq!(process_input_escapes(r"124\n"), "124\n");
+    }
+
+    #[test]
+    fn test_escape_unknown_sequence() {
+        // Unknown escapes pass through literally
+        assert_eq!(process_input_escapes(r"\q"), "\\q");
+    }
+
+    #[test]
+    fn test_escape_hex_partial() {
+        // Incomplete hex — pass through
+        assert_eq!(process_input_escapes(r"\xZZ"), "\\xZZ");
     }
 }
