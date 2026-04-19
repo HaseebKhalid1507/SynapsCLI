@@ -31,7 +31,6 @@ impl StreamMethods {
         subagent_timeout: u64,
         api_retries: u32,
         session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
-        auto_cache: bool,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -76,7 +75,7 @@ impl StreamMethods {
             let tools_snapshot = tools.read().await.clone();
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
-                &messages, tx.clone(), &cancel, api_retries, auto_cache,
+                &messages, tx.clone(), &cancel, api_retries,
             ).await {
                 Ok(r) => r,
                 Err(e) => {

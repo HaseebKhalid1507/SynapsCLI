@@ -223,22 +223,6 @@ impl App {
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
         self.api_call_count += 1;
-
-        // Per-call usage log to file for cache analysis
-        let total_input_this_call = input_tokens + cache_read + cache_creation;
-        let cache_pct = if total_input_this_call > 0 {
-            (cache_read as f64 / total_input_this_call as f64 * 100.0) as u32
-        } else { 0 };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/synaps-usage.log")
-        {
-            use std::io::Write;
-            let _ = writeln!(f,
-                "[usage] call={} uncached={} cache_read={} cache_write={} output={} cache_hit={}%",
-                self.api_call_count, input_tokens, cache_read, cache_creation, output_tokens, cache_pct
-            );
-        }
         // Pricing per million tokens (as of 2026-04)
         // Opus 4.5+ = $5/$25, Sonnet 4.5+ = $3/$15, Haiku = $0.80/$4
         let (input_price, output_price) = match model {
