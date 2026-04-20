@@ -571,20 +571,18 @@ pub(crate) fn draw(
             Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
             Span::styled(&token_str, Style::default().fg(THEME.muted)),
             {
-                // Context usage bar — shows how much of the 200k context window is consumed
-                // Total context = uncached input + cache reads + cache writes + output
-                // (cached tokens still occupy context window space)
-                let total_used = app.total_input_tokens
-                    + app.total_cache_read_tokens
-                    + app.total_cache_creation_tokens
-                    + app.total_output_tokens;
-                if total_used > 0 {
-                    // Opus 4.7 default context is 1M tokens (verified S171 limit-test:
-                    // sustained 270K+ per-turn input with no 1M beta header sent).
-                    // NOTE: total_used is still cumulative — bar will pin to 100%
-                    // earlier than reality. True fix needs per-turn tracking.
+                // Context usage bar — per-turn occupancy of the model's
+                // context window. `app.last_turn_context` is reassigned each
+                // turn (uncached input + cache read + cache creation) so the
+                // bar reflects *current* request size, not cumulative cost.
+                // See app.rs where it's updated on every usage callback.
+                let turn_context = app.last_turn_context;
+                if turn_context > 0 {
+                    // Opus 4.7 default context is 1M tokens (verified S171
+                    // limit-test: sustained 270K+ per-turn input without the
+                    // CONTEXT_1M_BETA_HEADER). Anthropic raised the default.
                     let context_window: u64 = 1_000_000;
-                    let usage_ratio = (total_used as f64 / context_window as f64).min(1.0);
+                    let usage_ratio = (turn_context as f64 / context_window as f64).min(1.0);
                     let bar_width: usize = 14;
                     let filled = (usage_ratio * bar_width as f64).round() as usize;
                     let empty = bar_width.saturating_sub(filled);

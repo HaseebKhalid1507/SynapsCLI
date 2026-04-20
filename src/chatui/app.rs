@@ -42,6 +42,12 @@ pub(crate) struct App {
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,
     pub(crate) total_cache_creation_tokens: u64,
+    /// Most recent turn's actual context occupancy (what the API ingested
+    /// this request): uncached input + cache read + cache creation. Unlike
+    /// `total_*_tokens` which accumulate for cost tracking, this is reassigned
+    /// every turn and reflects the current per-request context window use.
+    /// Used by the context-usage bar in `draw.rs`.
+    pub(crate) last_turn_context: u64,
     pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
@@ -111,6 +117,7 @@ impl App {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            last_turn_context: 0,
             api_call_count: 0,
             session_cost: 0.0,
             session,
@@ -222,6 +229,10 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
+        // Per-turn context occupancy (bar denominator): what the API actually
+        // ingested this request. Output tokens are generated, not ingested,
+        // so they don't count toward current-window use. Reassigned, not accumulated.
+        self.last_turn_context = input_tokens + cache_read + cache_creation;
         self.api_call_count += 1;
         // Pricing per million tokens (as of 2026-04)
         // Opus 4.5+ = $5/$25, Sonnet 4.5+ = $3/$15, Haiku = $0.80/$4
