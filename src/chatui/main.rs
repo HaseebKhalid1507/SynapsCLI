@@ -52,6 +52,7 @@ fn apply_setting(
                 "medium" => 4096,
                 "high" => 16384,
                 "xhigh" => 32768,
+                "adaptive" => 0,
                 _ => return,
             };
             runtime.set_thinking_budget(budget);
