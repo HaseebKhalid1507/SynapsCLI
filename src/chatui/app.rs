@@ -48,6 +48,11 @@ pub(crate) struct App {
     /// every turn and reflects the current per-request context window use.
     /// Used by the context-usage bar in `draw.rs`.
     pub(crate) last_turn_context: u64,
+    /// Context window size (in tokens) of the model that answered the most
+    /// recent turn. Updated alongside `last_turn_context` so the bar's
+    /// denominator adapts when users switch models mid-session. See
+    /// `synaps_cli::models::context_window_for_model`.
+    pub(crate) last_turn_context_window: u64,
     pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
@@ -118,6 +123,9 @@ impl App {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             last_turn_context: 0,
+            last_turn_context_window: synaps_cli::models::context_window_for_model(
+                synaps_cli::models::default_model(),
+            ),
             api_call_count: 0,
             session_cost: 0.0,
             session,
@@ -229,10 +237,14 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
-        // Per-turn context occupancy (bar denominator): what the API actually
+        // Per-turn context occupancy (bar numerator): what the API actually
         // ingested this request. Output tokens are generated, not ingested,
         // so they don't count toward current-window use. Reassigned, not accumulated.
         self.last_turn_context = input_tokens + cache_read + cache_creation;
+        // Per-turn bar denominator — the context window of the model that
+        // answered this turn. Tracked alongside so mid-session model swaps
+        // (e.g. main thread Opus → subagent Sonnet) recalibrate the bar.
+        self.last_turn_context_window = synaps_cli::models::context_window_for_model(model);
         self.api_call_count += 1;
         // Pricing per million tokens (as of 2026-04)
         // Opus 4.5+ = $5/$25, Sonnet 4.5+ = $3/$15, Haiku = $0.80/$4

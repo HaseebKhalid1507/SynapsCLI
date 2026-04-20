@@ -11,6 +11,35 @@ pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
 }
 
+/// Returns the input context window size for a given model, in tokens.
+/// Used as the denominator for the chatui context-usage bar and anywhere
+/// else the client needs to know how much prompt the model will accept.
+///
+/// Values verified against Anthropic model cards as of 2026-04:
+/// - Opus 4.x family: 1M default (S171 limit-test confirmed 270K+ per-turn
+///   input succeeded without `CONTEXT_1M_BETA_HEADER` — Anthropic raised the
+///   default silently with this generation).
+/// - Sonnet 4.x family: 200K default; 1M available via beta header opt-in
+///   (we don't send it in api.rs, so the effective limit is 200K).
+/// - Haiku (all versions): 200K.
+/// - Opus 3.x / unknown models: 200K conservative default.
+pub fn context_window_for_model(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus-4") || m.contains("opus4") {
+        1_000_000
+    } else if m.contains("sonnet-4") || m.contains("sonnet4") {
+        200_000
+    } else if m.contains("haiku") {
+        200_000
+    } else if m.contains("opus") {
+        // Opus 3.x — 200K
+        200_000
+    } else {
+        // Unknown — conservative default.
+        200_000
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +62,37 @@ mod tests {
         for (_, desc) in KNOWN_MODELS {
             assert!(!desc.is_empty(), "empty description");
         }
+    }
+
+    #[test]
+    fn context_window_opus4_is_1m() {
+        assert_eq!(context_window_for_model("claude-opus-4-7"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-opus-4-5"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_sonnet4_is_200k() {
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
+    }
+
+    #[test]
+    fn context_window_haiku_is_200k() {
+        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
+    }
+
+    #[test]
+    fn context_window_opus3_is_200k() {
+        assert_eq!(context_window_for_model("claude-opus-3-5-20250101"), 200_000);
+    }
+
+    #[test]
+    fn context_window_unknown_defaults_200k() {
+        assert_eq!(context_window_for_model("some-future-model"), 200_000);
+        assert_eq!(context_window_for_model(""), 200_000);
+    }
+
+    #[test]
+    fn context_window_is_case_insensitive() {
+        assert_eq!(context_window_for_model("CLAUDE-OPUS-4-7"), 1_000_000);
     }
 }
