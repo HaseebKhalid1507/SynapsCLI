@@ -49,6 +49,7 @@ pub struct LoadedSkill {
 pub const BUILTIN_COMMANDS: &[&str] = &[
     "clear", "model", "system", "thinking", "sessions",
     "resume", "theme", "gamba", "help", "quit", "exit",
+    "settings", "plugins",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,
