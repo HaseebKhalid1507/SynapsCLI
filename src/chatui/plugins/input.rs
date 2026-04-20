@@ -118,8 +118,8 @@ fn confirm_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             let action = match on_yes {
-                crate::plugins::state::ConfirmAction::Uninstall(n) => InputOutcome::Uninstall(n.clone()),
-                crate::plugins::state::ConfirmAction::RemoveMarketplace(n) => InputOutcome::RemoveMarketplace(n.clone()),
+                crate::chatui::plugins::state::ConfirmAction::Uninstall(n) => InputOutcome::Uninstall(n.clone()),
+                crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(n) => InputOutcome::RemoveMarketplace(n.clone()),
             };
             state.mode = RightMode::List;
             action
@@ -180,7 +180,7 @@ fn ask_uninstall(state: &mut PluginsModalState) -> InputOutcome {
     if let Some(super::state::RightRow::Installed(p)) = rows.get(state.selected_right) {
         state.mode = RightMode::Confirm {
             prompt: format!("Uninstall '{}'? y/n", p.name),
-            on_yes: crate::plugins::state::ConfirmAction::Uninstall(p.name.clone()),
+            on_yes: crate::chatui::plugins::state::ConfirmAction::Uninstall(p.name.clone()),
         };
     }
     InputOutcome::None
@@ -197,7 +197,7 @@ fn ask_remove_marketplace(state: &mut PluginsModalState) -> InputOutcome {
     if let Some(LeftRow::Marketplace(n)) = state.left_rows().get(state.selected_left) {
         state.mode = RightMode::Confirm {
             prompt: format!("Remove marketplace '{}'? y/n", n),
-            on_yes: crate::plugins::state::ConfirmAction::RemoveMarketplace(n.clone()),
+            on_yes: crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(n.clone()),
         };
     }
     InputOutcome::None
@@ -213,40 +213,40 @@ mod tests {
 
     #[test]
     fn esc_in_list_closes() {
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         assert!(matches!(handle_event(&mut s, key(KeyCode::Esc)), InputOutcome::Close));
     }
 
     #[test]
     fn tab_toggles_focus() {
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         handle_event(&mut s, key(KeyCode::Tab));
-        assert!(matches!(s.focus, crate::plugins::state::Focus::Right));
+        assert!(matches!(s.focus, crate::chatui::plugins::state::Focus::Right));
     }
 
     #[test]
     fn enter_on_add_marketplace_opens_editor() {
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         s.selected_left = s.left_rows().len() - 1; // AddMarketplace
-        s.focus = crate::plugins::state::Focus::Right;
+        s.focus = crate::chatui::plugins::state::Focus::Right;
         handle_event(&mut s, key(KeyCode::Enter));
-        assert!(matches!(s.mode, crate::plugins::state::RightMode::AddMarketplaceEditor { .. }));
+        assert!(matches!(s.mode, crate::chatui::plugins::state::RightMode::AddMarketplaceEditor { .. }));
     }
 
     #[test]
     fn esc_in_add_marketplace_editor_returns_to_list() {
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
-        s.mode = crate::plugins::state::RightMode::AddMarketplaceEditor {
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
+        s.mode = crate::chatui::plugins::state::RightMode::AddMarketplaceEditor {
             buffer: "x".into(), error: None,
         };
         handle_event(&mut s, key(KeyCode::Esc));
-        assert!(matches!(s.mode, crate::plugins::state::RightMode::List));
+        assert!(matches!(s.mode, crate::chatui::plugins::state::RightMode::List));
     }
 
     #[test]
     fn y_in_confirm_uninstall_emits_uninstall_and_returns_to_list() {
-        use crate::plugins::state::{RightMode, ConfirmAction};
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        use crate::chatui::plugins::state::{RightMode, ConfirmAction};
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         s.mode = RightMode::Confirm {
             prompt: "Uninstall 'x'? y/n".into(),
             on_yes: ConfirmAction::Uninstall("x".into()),
@@ -258,8 +258,8 @@ mod tests {
 
     #[test]
     fn n_in_confirm_returns_to_list_without_action() {
-        use crate::plugins::state::{RightMode, ConfirmAction};
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        use crate::chatui::plugins::state::{RightMode, ConfirmAction};
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         s.mode = RightMode::Confirm {
             prompt: "x".into(),
             on_yes: ConfirmAction::RemoveMarketplace("m".into()),
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn y_in_trust_prompt_emits_trust_and_install() {
-        use crate::plugins::state::RightMode;
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        use crate::chatui::plugins::state::RightMode;
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         s.mode = RightMode::TrustPrompt {
             plugin_name: "p".into(),
             host: "github.com".into(),
@@ -289,8 +289,8 @@ mod tests {
 
     #[test]
     fn esc_in_detail_returns_to_list() {
-        use crate::plugins::state::RightMode;
-        let mut s = crate::plugins::PluginsModalState::new(PluginsState::default());
+        use crate::chatui::plugins::state::RightMode;
+        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
         s.mode = RightMode::Detail { row_idx: 0 };
         handle_event(&mut s, key(KeyCode::Esc));
         assert!(matches!(s.mode, RightMode::List));

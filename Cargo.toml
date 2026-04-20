@@ -60,36 +60,8 @@ regex = "1"
 tempfile = "3"
 
 [[bin]]
-name = "chat"
-path = "src/bin/chat.rs"
-
-[[bin]]
-name = "cli"
-path = "src/bin/cli.rs"
-
-[[bin]]
-name = "chatui"
-path = "src/chatui/main.rs"
-
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
-[[bin]]
-name = "client"
-path = "src/bin/client.rs"
-
-[[bin]]
-name = "login"
-path = "src/bin/login.rs"
-
-[[bin]]
-name = "synaps-agent"
-path = "src/bin/agent.rs"
-
-[[bin]]
-name = "watcher"
-path = "src/watcher/mod.rs"
+name = "synaps"
+path = "src/main.rs"
 
 
 [profile.release]

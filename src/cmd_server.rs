@@ -7,7 +7,6 @@ use axum::{
     routing::get,
     Router,
 };
-use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -71,33 +70,14 @@ impl ServerState {
     }
 }
 
-#[derive(Parser)]
-#[command(name = "server", about = "SynapsCLI WebSocket server")]
-struct Cli {
-    /// Port to listen on
-    #[arg(long, short, default_value = "3145")]
+pub async fn run(
     port: u16,
-
-    /// Host/IP to bind to (default: 127.0.0.1, use 0.0.0.0 for all interfaces)
-    #[arg(long, default_value = "127.0.0.1")]
     host: String,
-
-    /// System prompt: a string or a path to a file
-    #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
-
-    /// Continue a previous session
-    #[arg(long = "continue", value_name = "SESSION_ID")]
     continue_session: Option<Option<String>>,
-
-    #[arg(long, global = true)]
     profile: Option<String>,
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    if let Some(ref prof) = cli.profile {
+) -> anyhow::Result<()> {
+    if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
@@ -109,12 +89,12 @@ async fn main() -> anyhow::Result<()> {
     runtime.apply_config(&config);
 
     // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
     runtime.set_system_prompt(system_prompt);
 
     // Session: continue existing or create new
     let (session, initial_api_messages, initial_history, initial_in, initial_out, initial_cost) =
-        match cli.continue_session {
+        match continue_session {
             Some(maybe_id) => {
                 let session = match maybe_id {
                     Some(id) => synaps_cli::find_session(&id)?,
@@ -159,13 +139,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .with_state(state.clone());
 
-    let addr = format!("{}:{}", cli.host, cli.port);
+    let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI Server v0.2         ║");
     eprintln!("╠══════════════════════════════════════╣");
-    eprintln!("║  Listening: ws://{}:{:<5}      ║", cli.host, cli.port);
+    eprintln!("║  Listening: ws://{}:{:<5}      ║", host, port);
     eprintln!("║  Session:   {:<24}║", &session_id);
     eprintln!("╚══════════════════════════════════════╝");
 
