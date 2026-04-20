@@ -8,6 +8,7 @@ Rust-native AI agent runtime. Contributions welcome.
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
 cargo build --release
+# Single binary at target/release/synaps
 cargo test --release --lib
 ```
 

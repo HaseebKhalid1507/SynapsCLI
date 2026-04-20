@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Single binary architecture**: all 8 binaries consolidated into `synaps`
+  - `synaps` (no args) = TUI (was `chatui`)
+  - `synaps run` = one-shot prompt (was `cli run`)
+  - `synaps chat` = streaming chat (was `chat`)
+  - `synaps server` = WebSocket API (was `server`)
+  - `synaps client` = WS client (was `client`)
+  - `synaps agent` = headless worker (was `synaps-agent`)
+  - `synaps watcher` = supervisor (was `watcher`)
+  - `synaps login` = OAuth (was `login`)
+- **Live theme preview in /settings**: scroll themes to preview, Enter confirms, Esc reverts
+- **Theme hot-reload**: `/theme <name>` applies instantly without restart (ArcSwap)
+- **Settings picker scroll**: theme/model picker scrolls with cursor
 - **Adaptive thinking for Opus 4.7+**: `{type: "adaptive", display: "summarized"}` with effort mapping (xhigh/high/medium/low/adaptive)
 - **Model-agnostic context window**: bar denominator adapts per-model (1M Opus 4.7, 200K Sonnet/Haiku)
 - **Per-turn context tracking**: usage bar shows actual request size, not cumulative cost
@@ -17,6 +29,8 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- ASCII logo alignment: use unicode display width for consistent centering
+- 'default' theme missing from settings picker
 - Context bar pinned at 100% after 2-3 turns (was using cumulative tokens / hardcoded 200K)
 - Thinking blocks invisible on Opus 4.7 (display defaulted to "omitted")
 - `budget_tokens: 0` sentinel leaked to non-adaptive models → 400 error
@@ -25,6 +39,10 @@ All notable changes to this project will be documented in this file.
 - Usage log world-readable at `/tmp/` → moved to `~/.cache/` with 0600
 
 ### Changed
+- Binary name: `chatui`/`synaps-cli`/`synaps-agent` → `synaps` (single binary with subcommands)
+- `src/bin/` directory removed — commands live at `src/cmd_*.rs`
+- `src/chatui/main.rs` → `src/chatui/mod.rs` (module, not binary)
+- watcher spawns `synaps agent` instead of standalone `synaps-agent`
 - `thinking_level_for_budget()` consolidated from 4 copies into single source of truth in `core/models.rs`
 - `DEFAULT_LEGACY_ADAPTIVE_FALLBACK` constant replaces magic `16384` in clamp sites
 - Dead-code warnings suppressed with explanatory comments (reaper handles, settings help field)
