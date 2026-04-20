@@ -10,11 +10,6 @@ use super::app::{App, ChatMessage};
 /// built-in surface; the runtime merges this with discovered skills via
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
-pub(super) const ALL_COMMANDS: &[&str] = &[
-    "clear", "model", "system", "thinking", "sessions",
-    "resume", "theme", "gamba", "help", "quit", "exit",
-    "settings", "plugins",
-];
 
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit"];
@@ -297,7 +292,7 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use synaps_cli::skills::BUILTIN_COMMANDS as ALL_COMMANDS;
 
     #[test]
     fn plugins_is_in_all_commands() {
