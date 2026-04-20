@@ -9,6 +9,18 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use super::types::{AuthState, StreamEvent};
 use super::helpers::HelperMethods;
 
+/// Parse accumulated tool input JSON. On failure, returns a JSON object with
+/// `__parse_error` key so the tool executor can report it back to the model.
+fn parse_tool_input(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => json!({ "__parse_error": format!("invalid tool input JSON: {}", e) }),
+    }
+}
+
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
@@ -293,11 +305,7 @@ impl ApiMethods {
                             in_thinking = false;
                         } else if in_tool_use {
                             // Parse the accumulated JSON input
-                            let input: Value = if current_tool_input_json.trim().is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
-                            };
+                            let input = parse_tool_input(&current_tool_input_json);
 
                             accumulated_content.push(json!({
                                 "type": "tool_use",
@@ -385,11 +393,7 @@ impl ApiMethods {
                                 "signature": current_thinking_signature
                             }));
                         } else if in_tool_use {
-                            let input: Value = if current_tool_input_json.trim().is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
-                            };
+                            let input = parse_tool_input(&current_tool_input_json);
                             accumulated_content.push(json!({
                                 "type": "tool_use",
                                 "id": current_tool_id.clone(),
@@ -415,11 +419,7 @@ impl ApiMethods {
                 "signature": current_thinking_signature
             }));
         } else if in_tool_use {
-            let input: Value = if current_tool_input_json.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&current_tool_input_json).unwrap_or(json!({}))
-            };
+            let input = parse_tool_input(&current_tool_input_json);
             accumulated_content.push(json!({
                 "type": "tool_use",
                 "id": current_tool_id,

@@ -146,7 +146,16 @@ impl StreamMethods {
                     let tool_name = tool_use["name"].as_str().unwrap_or("").to_string();
                     let input = tool_use["input"].clone();
 
-                    if !tool_id.is_empty() && !tool_name.is_empty() {
+                    // Catch JSON parse errors surfaced by parse_tool_input()
+                    if let Some(err) = input.get("__parse_error").and_then(|v| v.as_str()) {
+                        tool_results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": err,
+                            "is_error": true
+                        }));
+                        let _ = tx.send(StreamEvent::ToolResult { tool_id, result: err.to_string() });
+                    } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
                                 let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -199,6 +208,18 @@ impl StreamMethods {
                         let input = tool_use["input"].clone();
 
                         if tool_id.is_empty() || tool_name.is_empty() {
+                            continue;
+                        }
+
+                        // Catch JSON parse errors surfaced by parse_tool_input()
+                        if let Some(err) = input.get("__parse_error").and_then(|v| v.as_str()) {
+                            let err = err.to_string();
+                            let tid = tool_id.clone();
+                            let tx_c = tx.clone();
+                            join_set.spawn(async move {
+                                let _ = tx_c.send(StreamEvent::ToolResult { tool_id: tid.clone(), result: err.clone() });
+                                (tid, false, format!("Tool execution failed: {}", err))
+                            });
                             continue;
                         }
 
