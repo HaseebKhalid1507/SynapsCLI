@@ -38,6 +38,13 @@ use tachyonfx::{Effect, Shader};
 
 /// Apply a settings-menu change: mutate Runtime where possible, persist to config,
 /// and stash write errors in the modal's row_error slot.
+/// Keys that apply_setting() handles — must stay in sync with ALL_SETTINGS.
+/// Test `settings_keys_match_apply_setting` enforces parity.
+pub(crate) const APPLY_SETTING_KEYS: &[&str] = &[
+    "model", "thinking", "api_retries", "bash_timeout",
+    "bash_max_timeout", "subagent_timeout", "max_tool_output", "theme",
+];
+
 fn apply_setting(
     key: &'static str,
     value: &str,
