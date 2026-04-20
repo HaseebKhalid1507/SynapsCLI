@@ -249,8 +249,8 @@ impl Theme {
             border_active: Color::Rgb(0, 206, 209),
             muted: Color::Rgb(45, 75, 105),
 
-            user_color: Color::Rgb(224, 240, 255),
-            user_bg: Color::Rgb(8, 16, 28),
+            user_color: Color::Rgb(170, 210, 245),
+            user_bg: Color::Rgb(3, 8, 16),
             claude_label: Color::Rgb(64, 224, 208),
             claude_text: Color::Rgb(176, 216, 230),
             thinking_color: Color::Rgb(35, 65, 95),
