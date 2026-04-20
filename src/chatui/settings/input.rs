@@ -8,6 +8,8 @@ pub(crate) enum InputOutcome {
     Close,
     Apply { key: &'static str, value: String },
     TogglePlugin { name: String, enabled: bool },
+    PreviewTheme { name: String },
+    RevertTheme,
 }
 
 pub(crate) fn handle_event(
@@ -18,7 +20,15 @@ pub(crate) fn handle_event(
     // If an editor is open, route keys to it (Esc closes editor only, not modal).
     if state.edit_mode.is_some() {
         if key.code == KeyCode::Esc {
+            let revert = matches!(
+                &state.edit_mode,
+                Some(ActiveEditor::Picker { setting_key: "theme", .. })
+            ) && state.original_theme_name.is_some();
             state.edit_mode = None;
+            if revert {
+                state.original_theme_name = None;
+                return InputOutcome::RevertTheme;
+            }
             return InputOutcome::None;
         }
         return handle_editor_key(state, key);
@@ -134,6 +144,7 @@ pub(crate) fn handle_event(
                         state.row_error = None;
                         let opts = super::theme_options();
                         let cursor = opts.iter().position(|o| o == &snap.theme_name).unwrap_or(0);
+                        state.original_theme_name = Some(snap.theme_name.clone());
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: "theme",
                             options: opts,
@@ -176,8 +187,20 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
         }
         ActiveEditor::Picker { setting_key, options, cursor } => {
             match key.code {
-                KeyCode::Up => { if *cursor > 0 { *cursor -= 1; } InputOutcome::None }
-                KeyCode::Down => { if *cursor + 1 < options.len() { *cursor += 1; } InputOutcome::None }
+                KeyCode::Up => {
+                    if *cursor > 0 { *cursor -= 1; }
+                    if *setting_key == "theme" {
+                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                    }
+                    InputOutcome::None
+                }
+                KeyCode::Down => {
+                    if *cursor + 1 < options.len() { *cursor += 1; }
+                    if *setting_key == "theme" {
+                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                    }
+                    InputOutcome::None
+                }
                 KeyCode::Enter => {
                     let selection = options[*cursor].clone();
                     if *setting_key == "model" && selection == "Custom…" {
@@ -185,7 +208,11 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         return InputOutcome::None;
                     }
                     let value = selection.split("  —").next().unwrap_or(&selection).trim().to_string();
-                    InputOutcome::Apply { key: *setting_key, value }
+                    let key = *setting_key;
+                    if key == "theme" {
+                        state.original_theme_name = None;
+                    }
+                    InputOutcome::Apply { key, value }
                 }
                 _ => InputOutcome::None,
             }

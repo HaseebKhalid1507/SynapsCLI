@@ -82,7 +82,10 @@ fn apply_setting(
         Ok(()) => {
             if let Some(st) = app.settings.as_mut() {
                 if key == "theme" {
-                    st.row_error = Some((key.to_string(), "saved — restart to apply".to_string()));
+                    if let Some(t) = theme::load_theme_by_name(value) {
+                        theme::set_theme(t);
+                    }
+                    st.row_error = None;
                 } else {
                     st.row_error = None;
                 }
