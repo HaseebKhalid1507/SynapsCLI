@@ -2,7 +2,7 @@
 
 This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) with 8 binaries. Talks to Anthropic's API, streams SSE, dispatches tools, renders a TUI.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API, streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -18,15 +18,15 @@ cargo clippy --all-targets               # linting
 
 **Minimum Rust:** 1.80 (edition 2021).
 **Config path:** `~/.synaps-cli/config` (plain `key = value`, see `src/core/config.rs`).
-**Binaries:** `target/release/{chatui, chat, cli, synaps-agent, watcher, login, server, client}`.
+**Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
 
-- `chatui` — interactive TUI (the main product)
-- `chat` — single-shot CLI chat
-- `cli` — non-interactive one-shot command
-- `synaps-agent` — headless worker managed by the watcher
-- `watcher` — supervisor daemon
-- `login` — OAuth flow
-- `server`/`client` — WebSocket relay (less-used)
+- `synaps` (no args) — interactive TUI (the main product)
+- `synaps chat` — single-shot CLI chat
+- `synaps run` — non-interactive one-shot command
+- `synaps agent` — headless worker managed by the watcher
+- `synaps watcher` — supervisor daemon
+- `synaps login` — OAuth flow
+- `synaps server` / `synaps client` — WebSocket relay (less-used)
 
 **Test quirks:**
 - 7 PTY tests in `src/tools/shell/pty.rs` and `src/tools/shell/{start,send,end}.rs` fail under parallel due to TTY contention. Use `--test-threads=1`. Not a bug.
@@ -39,8 +39,8 @@ cargo clippy --all-targets               # linting
 ```
 src/
 ├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, config, models, etc.
-├── bin/                  — 6 binary entry points (agent, chat, cli, client, login, server)
-│   └── (chatui and watcher have their own dirs, not flat files)
+├── main.rs               — unified CLI entry point, subcommand dispatch
+├── cmd_*.rs              — subcommand handlers (run, chat, server, client, agent, login, watcher)
 ├── core/                 — shared primitives
 │   ├── config.rs         — SynapsConfig, load/write, profile resolution
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
@@ -66,8 +66,8 @@ src/
 │   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
-├── chatui/               — the TUI
-│   ├── main.rs           — event loop + apply_setting()
+├── chatui/               — the TUI (module, entered via default `synaps` subcommand)
+│   ├── mod.rs            — event loop + apply_setting()
 │   ├── app.rs            — App state, record_cost(), line cache
 │   ├── input.rs          — key handling, process_submit()
 │   ├── draw.rs           — render dispatch
@@ -81,7 +81,7 @@ src/
 │   ├── plugins/          — /plugins modal
 │   └── gamba.rs          — easter egg. Don't touch.
 ├── watcher/              — supervisor daemon
-│   ├── mod.rs            — binary entry point
+│   ├── mod.rs            — subsystem entry (invoked by `synaps watcher`)
 │   ├── supervisor.rs     — per-agent lifecycle, limits, retries
 │   ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
 │   └── display.rs        — `watcher status` renderer
@@ -147,7 +147,7 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 Adding a setting requires touching 5 files. Miss one and you get silent failures.
 
 1. **`src/chatui/settings/schema.rs`** — add a `SettingDef` to `ALL_SETTINGS`. Pick `EditorKind::Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`.
-2. **`src/chatui/main.rs::apply_setting()`** — add a match arm that mutates `Runtime` (e.g. `runtime.set_foo(v)`).
+2. **`src/chatui/mod.rs::apply_setting()`** — add a match arm that mutates `Runtime` (e.g. `runtime.set_foo(v)`).
 3. **`src/core/config.rs::load_config()`** — add a branch to parse the key from the config file.
 4. **`src/chatui/commands.rs`** — if it has a slash command (e.g. `/foo`), add to `ALL_COMMANDS` and handle in `handle_command`.
 5. **`src/skills/mod.rs`** — add to `BUILTIN_COMMANDS` (for tab-complete via `CommandRegistry`).
@@ -228,7 +228,7 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
   → core/config.rs::load_config()  — parses key = value, env var overrides
   → Runtime::apply_config()         — sets fields on Runtime
   → runtime/api.rs reads from Runtime at request time
-  → chatui/main.rs::apply_setting() — runtime mutation + write_config_value() for live /settings changes
+  → chatui/mod.rs::apply_setting() — runtime mutation + write_config_value() for live /settings changes
 ```
 
 `SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `core/config.rs::resolve_read_path()`.
@@ -241,7 +241,7 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 2. **`thinking_budget: 0` sentinel.** Always handle the "adaptive" case. Legacy paths must clamp.
 3. **Cache breakpoints are prefix-sensitive.** Any mutation to historical messages breaks the cache for all subsequent turns. Don't "fix up" old messages retroactively.
 4. **PTY tests fail under parallel.** Use `--test-threads=1`. Not a bug — TTY fd contention.
-5. **Binary swap requires process restart.** `cargo build` replaces `target/release/chatui` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes. (Obvious once you know it, confusing the first time.)
+5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes. (Obvious once you know it, confusing the first time.)
 6. **Two command lists** (`ALL_COMMANDS` vs `BUILTIN_COMMANDS`). Tech debt. Keep in sync or tab-complete breaks silently.
 7. **Subagent has NO subagent.** No recursion. Subagents also lack `mcp_connect`, `load_skill`, `watcher_exit`. Enforced by skipping registration in `tools/subagent.rs`.
 8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
@@ -308,14 +308,14 @@ Things an agent should know about, but not necessarily fix in-passing:
 - **Settings require 5-site edits.** A macro or derive could collapse this.
 - **`src/tools/agent.rs`** is legacy, superseded by `subagent.rs`. Kept for compatibility with older agent definitions. Remove after deprecation window.
 - **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
-- **SPEC-WATCHER.md** — the watcher subsystem (`src/watcher/`, `src/bin/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
+- **SPEC-WATCHER.md** — the watcher subsystem (`src/watcher/`, `src/cmd_agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
 - **`gamba.rs`** — easter egg. Yes, really. Leave it alone.
 
 ---
 
 ## Watcher Subsystem (brief)
 
-The watcher daemon (`target/release/watcher`) supervises headless `synaps-agent` processes. Each agent lives at `~/.synaps-cli/watcher/{name}/` with `config.toml`, `soul.md` (system prompt), `handoff.json` (state from last session), `stats.json`, `heartbeat` (timestamp file), and `logs/`.
+The watcher daemon (`target/release/synaps (watcher subcommand)`) supervises headless `synaps agent` processes. Each agent lives at `~/.synaps-cli/watcher/{name}/` with `config.toml`, `soul.md` (system prompt), `handoff.json` (state from last session), `stats.json`, `heartbeat` (timestamp file), and `logs/`.
 
 Trigger modes:
 - `manual` — runs only when deployed via `watcher deploy`
@@ -332,7 +332,7 @@ IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, 
 
 ## Tool Reference (for agents running INSIDE SynapsCLI)
 
-This is the runtime tool surface. An LLM agent running in chatui, synaps-agent, or as a subagent sees these tools.
+This is the runtime tool surface. An LLM agent running in chatui, synaps agent, or as a subagent sees these tools.
 
 ### `bash`
 Execute shell commands via `bash -c`.
