@@ -80,9 +80,14 @@ impl ApiMethods {
             "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
                 json!({ "type": "adaptive", "display": "summarized" })
             } else {
+                // Legacy path requires budget_tokens >= 1024 (Anthropic enforced).
+                // If user picked "adaptive" (sentinel 0) on a legacy model, fall back
+                // to "high" (16384) — the model's effective thinking depth without
+                // the deprecated-but-functional adaptive shape it doesn't support.
+                let budget = if thinking_budget == 0 { 16384 } else { thinking_budget };
                 json!({
                     "type": "enabled",
-                    "budget_tokens": thinking_budget,
+                    "budget_tokens": budget,
                     "display": "summarized"
                 })
             }
@@ -506,9 +511,12 @@ impl ApiMethods {
             "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
                 json!({ "type": "adaptive", "display": "summarized" })
             } else {
+                // Legacy path: budget_tokens must be >= 1024. Fall back to "high"
+                // if the sentinel 0 (adaptive) leaked through for a legacy model.
+                let budget = if thinking_budget == 0 { 16384 } else { thinking_budget };
                 json!({
                     "type": "enabled",
-                    "budget_tokens": thinking_budget,
+                    "budget_tokens": budget,
                     "display": "summarized"
                 })
             }
