@@ -333,19 +333,7 @@ impl ApiMethods {
                             let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                             let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                                // Runtime-level usage log (works for both chatui and synaps-cli)
-                                let total = input_t + cache_read + cache_create;
-                                let pct = if total > 0 { (cache_read as f64 / total as f64 * 100.0) as u32 } else { 0 };
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true).append(true)
-                                    .open("/tmp/synaps-usage.log")
-                                {
-                                    use std::io::Write;
-                                    let _ = writeln!(f,
-                                        "uncached={} cache_read={} cache_write={} output={} hit={}%",
-                                        input_t, cache_read, cache_create, output_t, pct
-                                    );
-                                }
+                                HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                 tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                 let _ = tx.send(StreamEvent::Usage {
                                     input_tokens: input_t,
@@ -365,18 +353,7 @@ impl ApiMethods {
                                 let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                                 let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                                    let total = input_t + cache_read + cache_create;
-                                    let pct = if total > 0 { (cache_read as f64 / total as f64 * 100.0) as u32 } else { 0 };
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true).append(true)
-                                        .open("/tmp/synaps-usage.log")
-                                    {
-                                        use std::io::Write;
-                                        let _ = writeln!(f,
-                                            "uncached={} cache_read={} cache_write={} output={} hit={}%",
-                                            input_t, cache_read, cache_create, output_t, pct
-                                        );
-                                    }
+                                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                     let _ = tx.send(StreamEvent::Usage {
                                         input_tokens: input_t,
@@ -611,18 +588,7 @@ impl ApiMethods {
             let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
             let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
             let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let total = input_t + cache_read + cache_create;
-            let pct = if total > 0 { (cache_read as f64 / total as f64 * 100.0) as u32 } else { 0 };
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("/tmp/synaps-usage.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(f,
-                    "uncached={} cache_read={} cache_write={} output={} hit={}%",
-                    input_t, cache_read, cache_create, output_t, pct
-                );
-            }
+            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
         }
 
         Ok(json)
