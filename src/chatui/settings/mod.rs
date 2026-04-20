@@ -9,7 +9,7 @@ pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
 
 const BUILTIN_THEMES: &[&str] = &[
-    "neon-rain", "amber", "phosphor", "solarized-dark", "blood",
+    "default", "neon-rain", "amber", "phosphor", "solarized-dark", "blood",
     "ocean", "rose-pine", "nord", "dracula", "monokai",
     "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
     "forest", "lavender",
