@@ -571,17 +571,16 @@ pub(crate) fn draw(
             Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
             Span::styled(&token_str, Style::default().fg(THEME.muted)),
             {
-                // Context usage bar — per-turn occupancy of the model's
-                // context window. `app.last_turn_context` is reassigned each
-                // turn (uncached input + cache read + cache creation) so the
-                // bar reflects *current* request size, not cumulative cost.
-                // See app.rs where it's updated on every usage callback.
+                // Context usage bar — per-turn occupancy as a fraction of the
+                // model's own context window. Numerator `last_turn_context`
+                // is reassigned each usage callback (uncached input + cache
+                // read + cache creation). Denominator `last_turn_context_window`
+                // adapts when the answering model changes (main Opus → subagent
+                // Sonnet, etc.). See app.rs for the update site and
+                // `synaps_cli::models::context_window_for_model` for values.
                 let turn_context = app.last_turn_context;
+                let context_window = app.last_turn_context_window.max(1);
                 if turn_context > 0 {
-                    // Opus 4.7 default context is 1M tokens (verified S171
-                    // limit-test: sustained 270K+ per-turn input without the
-                    // CONTEXT_1M_BETA_HEADER). Anthropic raised the default.
-                    let context_window: u64 = 1_000_000;
                     let usage_ratio = (turn_context as f64 / context_window as f64).min(1.0);
                     let bar_width: usize = 14;
                     let filled = (usage_ratio * bar_width as f64).round() as usize;
