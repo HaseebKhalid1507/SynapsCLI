@@ -20,7 +20,6 @@ use input::InputAction;
 use stream_handler::StreamAction;
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, find_session};
-use clap::Parser;
 use crossterm::{
     event::{EventStream, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
     execute,
@@ -137,25 +136,12 @@ fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     }
 }
 
-#[derive(Parser)]
-#[command(name = "chatui", about = "Terminal chat UI for SynapsCLI")]
-struct Cli {
-    /// Continue a previous session. Optionally provide a session ID (partial match supported).
-    #[arg(long = "continue", value_name = "SESSION_ID")]
+pub async fn run(
     continue_session: Option<Option<String>>,
-
-    /// System prompt: a string or a path to a file.
-    #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
-
-    #[arg(long, global = true)]
     profile: Option<String>,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if let Some(ref prof) = cli.profile {
+) -> Result<()> {
+    if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
@@ -167,7 +153,7 @@ async fn main() -> Result<()> {
     runtime.apply_config(&config);
 
     // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(cli.system.as_deref());
+    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
     runtime.set_system_prompt(system_prompt);
 
     // Discover plugins/skills, build command registry, register load_skill tool.
@@ -187,7 +173,7 @@ async fn main() -> Result<()> {
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
 
     // Session: continue existing or create new
-    let mut app = match cli.continue_session {
+    let mut app = match continue_session {
         Some(maybe_id) => {
             let session = match maybe_id {
                 Some(id) => find_session(&id).unwrap_or_else(|e| {
@@ -509,7 +495,7 @@ async fn main() -> Result<()> {
                             }
                             InputAction::PluginsOutcome(outcome) => {
                                 if let Some(state) = app.plugins.as_mut() {
-                                    use crate::plugins::InputOutcome as PO;
+                                    use self::plugins::InputOutcome as PO;
                                     match outcome {
                                         PO::None | PO::Close => {}
                                         PO::AddMarketplace(url) => {

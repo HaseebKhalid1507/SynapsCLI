@@ -128,25 +128,8 @@ fn load_stats(agent_dir: &Path) -> AgentStats {
     serde_json::from_str(&contents).unwrap_or_default()
 }
 
-#[tokio::main]
-async fn main() {
-    // Parse args
-    let args: Vec<String> = std::env::args().collect();
-    let config_path = args.iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            eprintln!("Usage: synaps-agent --config <path/to/config.toml>");
-            std::process::exit(1);
-        });
-
-    // Optional trigger context passed by supervisor
-    let trigger_context = args.iter()
-        .position(|a| a == "--trigger-context")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "manual start".to_string());
+pub async fn run(config_path: String, trigger_context: String) {
+    let config_path = PathBuf::from(config_path);
 
     // Load config
     let config = AgentConfig::load(&config_path).unwrap_or_else(|e| {

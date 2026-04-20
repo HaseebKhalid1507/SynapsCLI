@@ -1,22 +1,7 @@
-//! `synaps login` — OAuth login for SynapsCLI.
-//!
-//! Opens browser to claude.ai, captures the OAuth callback,
-//! exchanges code for tokens, and saves to ~/.pi/agent/auth.json.
-
 use synaps_cli::auth;
-use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "login", about = "OAuth login for SynapsCLI")]
-struct Cli {
-    #[arg(long, global = true)]
-    profile: Option<String>,
-}
-
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-    if let Some(ref prof) = cli.profile {
+pub async fn run(profile: Option<String>) {
+    if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
@@ -28,7 +13,6 @@ async fn main() {
     eprintln!("║  (Pro, Max, Team, or Enterprise)     ║");
     eprintln!("╚══════════════════════════════════════╝");
 
-    // Check if already logged in
     if let Ok(Some(existing)) = auth::load_auth() {
         if !auth::is_token_expired(&existing.anthropic) {
             eprintln!("\n\x1b[33m⚠ Already logged in with a valid token.\x1b[0m");

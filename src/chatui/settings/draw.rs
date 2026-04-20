@@ -4,7 +4,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
 use super::schema::{CATEGORIES, SettingDef, EditorKind};
-use crate::theme::THEME;
+use super::super::theme::THEME;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);

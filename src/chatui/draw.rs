@@ -630,11 +630,11 @@ pub(crate) fn draw(
         }
 
         if let Some(ref state) = app.settings {
-            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime, registry);
-            crate::settings::render(frame, frame.area(), state, &snap);
+            let snap = super::settings::RuntimeSnapshot::from_runtime(runtime, registry);
+            super::settings::render(frame, frame.area(), state, &snap);
         }
         if let Some(ref state) = app.plugins {
-            crate::plugins::render(frame, frame.area(), state);
+            super::plugins::render(frame, frame.area(), state);
         }
     })?;
     Ok(())

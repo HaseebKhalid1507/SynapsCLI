@@ -10,6 +10,7 @@ pub(crate) async fn spawn_agent(agent: &mut ManagedAgent, trigger_context: &str)
     log(&format!("[{}] spawning session #{}", agent.name, agent.session_count + 1));
 
     let child = tokio::process::Command::new(&bin)
+        .arg("agent")
         .arg("--config")
         .arg(&agent.config_path)
         .arg("--trigger-context")

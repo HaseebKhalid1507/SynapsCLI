@@ -24,7 +24,7 @@ pub(super) enum InputAction {
     SettingsApply(&'static str, String),
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
-    PluginsOutcome(crate::plugins::InputOutcome),
+    PluginsOutcome(super::plugins::InputOutcome),
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -38,17 +38,17 @@ pub(super) fn handle_event(
     // Route events to the settings modal while it's open.
     if app.settings.is_some() {
         if let Event::Key(key) = event {
-            let snap = crate::settings::RuntimeSnapshot::from_runtime(runtime, registry);
+            let snap = super::settings::RuntimeSnapshot::from_runtime(runtime, registry);
             let state = app.settings.as_mut().expect("just checked");
-            match crate::settings::handle_event(state, key, &snap) {
-                crate::settings::InputOutcome::Close => { app.settings = None; }
-                crate::settings::InputOutcome::None => {}
-                crate::settings::InputOutcome::Apply { key, value } => {
+            match super::settings::handle_event(state, key, &snap) {
+                super::settings::InputOutcome::Close => { app.settings = None; }
+                super::settings::InputOutcome::None => {}
+                super::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
-                crate::settings::InputOutcome::TogglePlugin { name, enabled } => {
+                super::settings::InputOutcome::TogglePlugin { name, enabled } => {
                     let mut config = synaps_cli::config::load_config();
-                    match crate::plugins::actions::toggle_plugin_config(
+                    match super::plugins::actions::toggle_plugin_config(
                         &name, enabled, &mut config, registry,
                     ) {
                         Ok(()) => {
@@ -59,14 +59,14 @@ pub(super) fn handle_event(
                         }
                     }
                 }
-                crate::settings::InputOutcome::PreviewTheme { name } => {
-                    if let Some(theme) = crate::theme::load_theme_by_name(&name) {
-                        crate::theme::set_theme(theme);
+                super::settings::InputOutcome::PreviewTheme { name } => {
+                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
+                        super::theme::set_theme(theme);
                     }
                 }
-                crate::settings::InputOutcome::RevertTheme => {
-                    let theme = crate::theme::load_theme_from_config();
-                    crate::theme::set_theme(theme);
+                super::settings::InputOutcome::RevertTheme => {
+                    let theme = super::theme::load_theme_from_config();
+                    super::theme::set_theme(theme);
                 }
             }
         }
@@ -79,13 +79,13 @@ pub(super) fn handle_event(
     if app.plugins.is_some() {
         if let Event::Key(key) = event {
             let state = app.plugins.as_mut().expect("just checked");
-            let outcome = crate::plugins::handle_event(state, key);
+            let outcome = super::plugins::handle_event(state, key);
             return match outcome {
-                crate::plugins::InputOutcome::Close => {
+                super::plugins::InputOutcome::Close => {
                     app.plugins = None;
                     InputAction::None
                 }
-                crate::plugins::InputOutcome::None => InputAction::None,
+                super::plugins::InputOutcome::None => InputAction::None,
                 other => InputAction::PluginsOutcome(other),
             };
         }

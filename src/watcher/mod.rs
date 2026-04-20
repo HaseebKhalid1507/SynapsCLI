@@ -39,10 +39,8 @@ pub(crate) fn watcher_dir() -> PathBuf {
 }
 
 pub(crate) fn agent_binary() -> PathBuf {
-    // Find synaps-agent binary next to the watcher binary
-    let current_exe = std::env::current_exe().unwrap_or_default();
-    let dir = current_exe.parent().unwrap_or(std::path::Path::new("."));
-    dir.join("synaps-agent")
+    // Same binary, different subcommand
+    std::env::current_exe().unwrap_or_default()
 }
 
 pub(crate) fn log(msg: &str) {
@@ -178,10 +176,18 @@ pub(crate) fn print_status(agents: &HashMap<String, ManagedAgent>) {
     print_status_table(infos);
 }
 
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
+pub async fn run(command: String, args: Vec<String>) {
+    let command = command.as_str();
+    // Shift args so `args[2]` semantics from original code still work:
+    // original code accessed std::env::args() where args[0]=bin, args[1]=command.
+    // New scheme: args here are positional ones AFTER the subcommand. We'll rebuild
+    // an argv-like vec to minimize code changes below.
+    let argv: Vec<String> = {
+        let mut v = vec!["synaps".to_string(), command.to_string()];
+        v.extend(args.iter().cloned());
+        v
+    };
+    let args = &argv;
 
     match command {
         "init" => {

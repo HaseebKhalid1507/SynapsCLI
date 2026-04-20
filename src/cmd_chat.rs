@@ -3,8 +3,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
     let _log_guard = synaps_cli::logging::init_logging();
     println!("💬 Terminal Chat with Thinking Blocks - type 'quit' to exit\n");
     let runtime = Runtime::new().await?;
@@ -16,10 +15,7 @@ async fn main() -> Result<()> {
 
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
-            Ok(0) | Err(_) => {
-                // EOF or error — stdin closed (e.g. piped input exhausted)
-                break;
-            }
+            Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
         let input = input.trim();
@@ -33,7 +29,6 @@ async fn main() -> Result<()> {
             break;
         }
 
-        // Add user message to history
         messages.push(json!({"role": "user", "content": input}));
 
         print!("Claude: ");
@@ -64,10 +59,7 @@ async fn main() -> Result<()> {
                     flush_stdout();
                 }
                 StreamEvent::ToolUseStart(tool_name) => {
-                    if in_thinking {
-                        println!();
-                        in_thinking = false;
-                    }
+                    if in_thinking { println!(); in_thinking = false; }
                     print!("⚙️  Using tool: {} (args: ", tool_name);
                     flush_stdout();
                 }
@@ -77,10 +69,7 @@ async fn main() -> Result<()> {
                 }
                 StreamEvent::ToolUse { tool_name, tool_id, input: tool_input } => {
                     print!(")                                                                                          \r");
-                    if in_thinking {
-                        println!();
-                        in_thinking = false;
-                    }
+                    if in_thinking { println!(); in_thinking = false; }
                     println!("⚙️  Using tool: {} ({})", tool_name, tool_id);
                     println!("📝 Input: {}", serde_json::to_string_pretty(&tool_input).unwrap_or_default());
                     flush_stdout();
@@ -94,11 +83,8 @@ async fn main() -> Result<()> {
                     print!("💬 ");
                     flush_stdout();
                 }
-                StreamEvent::MessageHistory(history) => {
-                    messages = history;
-                }
+                StreamEvent::MessageHistory(history) => { messages = history; }
                 StreamEvent::Usage { .. } => {}
-                // Subagent lifecycle — print inline for non-TUI chat
                 StreamEvent::SubagentStart { agent_name, task_preview, .. } => {
                     println!("\n\x1b[35m🎭 [{}] dispatched: {}\x1b[0m", agent_name, task_preview);
                     flush_stdout();
@@ -116,18 +102,13 @@ async fn main() -> Result<()> {
                     flush_stdout();
                 }
                 StreamEvent::Done => {
-                    if in_thinking {
-                        println!();
-                    }
+                    if in_thinking { println!(); }
                     println!("\n");
                     break;
                 }
                 StreamEvent::Error(err) => {
-                    if in_thinking {
-                        println!();
-                    }
+                    if in_thinking { println!(); }
                     println!("❌ Error: {}\n", err);
-                    // Remove the user message that caused the error
                     messages.pop();
                     break;
                 }

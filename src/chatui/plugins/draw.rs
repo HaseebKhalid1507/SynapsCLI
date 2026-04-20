@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use super::PluginsModalState;
 use super::state::{Focus, LeftRow, RightMode, RightRow};
-use crate::theme::THEME;
+use super::super::theme::THEME;
 
 const OVERLAY_MAX_WIDTH: u16 = 70;
 const OVERLAY_HEIGHT: u16 = 7;
