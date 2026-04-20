@@ -14,7 +14,7 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
 
     let bold_style = base_style.add_modifier(Modifier::BOLD);
     let italic_style = base_style.add_modifier(Modifier::ITALIC);
-    let code_style = Style::default().fg(THEME.code_fg).bg(THEME.code_bg);
+    let code_style = Style::default().fg(THEME.load().code_fg).bg(THEME.load().code_bg);
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -152,9 +152,9 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         }
     }
 
-    let border_style = Style::default().fg(THEME.table_border_color);
-    let header_style = Style::default().fg(THEME.table_header_color).add_modifier(Modifier::BOLD);
-    let cell_style = Style::default().fg(THEME.table_cell_color);
+    let border_style = Style::default().fg(THEME.load().table_border_color);
+    let header_style = Style::default().fg(THEME.load().table_header_color).add_modifier(Modifier::BOLD);
+    let cell_style = Style::default().fg(THEME.load().table_cell_color);
 
     // No top border — let it breathe
     result.push(Line::from("")); // spacing above table
@@ -211,7 +211,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                 let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
-                    Style::default().fg(THEME.table_border_color).add_modifier(Modifier::DIM),
+                    Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
                 )));
             }
         } else if !has_header && body_count > 6 {
@@ -221,7 +221,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                 let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
-                    Style::default().fg(THEME.table_border_color).add_modifier(Modifier::DIM),
+                    Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
                 )));
             }
         }
@@ -236,7 +236,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
 /// Render markdown text into Lines, handling code blocks, headings, lists, quotes, tables
 pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    let base_style = Style::default().fg(THEME.claude_text);
+    let base_style = Style::default().fg(THEME.load().claude_text);
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
@@ -260,8 +260,8 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 code_buf.clear();
             } else {
                 // End of code block — render with language tag chip + border frame
-                let border_style = Style::default().fg(THEME.border);
-                let lang_style = Style::default().fg(THEME.muted).add_modifier(Modifier::DIM);
+                let border_style = Style::default().fg(THEME.load().border);
+                let lang_style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
 
                 // Calculate block width: use a reasonable portion of available width
                 let block_inner_width = width.saturating_sub(prefix.len() + 4); // prefix + "  " + borders
@@ -353,7 +353,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             for wline in wrap_text(&full, width) {
                 lines.push(Line::from(Span::styled(
                     wline,
-                    Style::default().fg(THEME.heading_color).add_modifier(Modifier::BOLD),
+                    Style::default().fg(THEME.load().heading_color).add_modifier(Modifier::BOLD),
                 )));
             }
             continue;
@@ -364,7 +364,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
             let full = format!("{}  \u{2502} {}", prefix, quote_text);
             for wline in wrap_text(&full, width) {
-                lines.push(Line::from(Span::styled(wline, Style::default().fg(THEME.quote_color).add_modifier(Modifier::ITALIC))));
+                lines.push(Line::from(Span::styled(wline, Style::default().fg(THEME.load().quote_color).add_modifier(Modifier::ITALIC))));
             }
             continue;
         }
@@ -376,7 +376,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             let cont_prefix = format!("{}    ", prefix);
             let flat = format!("{}{}", bullet_prefix, item_text);
             if flat.chars().count() <= width {
-                let bullet_span = Span::styled(bullet_prefix, Style::default().fg(THEME.list_bullet_color));
+                let bullet_span = Span::styled(bullet_prefix, Style::default().fg(THEME.load().list_bullet_color));
                 let mut item_spans = parse_inline_md(item_text, base_style);
                 let mut all_spans = vec![bullet_span];
                 all_spans.append(&mut item_spans);
@@ -389,7 +389,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                         } else {
                             &wline
                         };
-                        let bullet_span = Span::styled(bullet_prefix.clone(), Style::default().fg(THEME.list_bullet_color));
+                        let bullet_span = Span::styled(bullet_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
                         let mut all_spans = vec![bullet_span];
                         all_spans.extend(parse_inline_md(inner, base_style));
                         lines.push(Line::from(all_spans));
@@ -413,7 +413,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                     let cont_prefix = format!("{}     ", prefix);
                     let flat = format!("{}{}", num_prefix, item_text);
                     if flat.chars().count() <= width {
-                        let num_span = Span::styled(num_prefix, Style::default().fg(THEME.list_bullet_color));
+                        let num_span = Span::styled(num_prefix, Style::default().fg(THEME.load().list_bullet_color));
                         let mut item_spans = parse_inline_md(item_text, base_style);
                         let mut all_spans = vec![num_span];
                         all_spans.append(&mut item_spans);
@@ -426,7 +426,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                                 } else {
                                     &wline
                                 };
-                                let num_span = Span::styled(num_prefix.clone(), Style::default().fg(THEME.list_bullet_color));
+                                let num_span = Span::styled(num_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
                                 let mut all_spans = vec![num_span];
                                 all_spans.extend(parse_inline_md(inner, base_style));
                                 lines.push(Line::from(all_spans));

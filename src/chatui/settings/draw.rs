@@ -18,8 +18,8 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
         .title(" Settings ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
@@ -42,11 +42,11 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
     for (i, cat) in CATEGORIES.iter().enumerate() {
         let marker = if i == state.category_idx { "▸ " } else { "  " };
         let style = if i == state.category_idx && state.focus == Focus::Left {
-            Style::default().fg(THEME.claude_label)
+            Style::default().fg(THEME.load().claude_label)
         } else if i == state.category_idx {
-            Style::default().fg(THEME.claude_text)
+            Style::default().fg(THEME.load().claude_text)
         } else {
-            Style::default().fg(THEME.help_fg)
+            Style::default().fg(THEME.load().help_fg)
         };
         lines.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(format!("{}{}", marker, cat.label()), style),
@@ -67,9 +67,9 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
     for (i, def) in settings.iter().enumerate() {
         let selected = i == state.setting_idx && state.focus == Focus::Right;
         let style = if selected {
-            Style::default().fg(THEME.claude_label)
+            Style::default().fg(THEME.load().claude_label)
         } else {
-            Style::default().fg(THEME.claude_text)
+            Style::default().fg(THEME.load().claude_text)
         };
         let current_value = current_value_for(def, snap);
         let value_display = if selected {
@@ -100,7 +100,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         if let Some((key, msg)) = &state.row_error {
             if selected_key == Some(key.as_str()) && i == state.setting_idx {
                 let is_note = msg.starts_with("saved");
-                let color = if is_note { THEME.help_fg } else { THEME.error_color };
+                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
                 lines.push(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
                 ]));
@@ -119,7 +119,7 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
     if snap.plugins.is_empty() {
         lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
             "  No plugins installed. Open /plugins to add a marketplace.",
-            Style::default().fg(THEME.help_fg),
+            Style::default().fg(THEME.load().help_fg),
         )]));
     } else {
         for (i, p) in snap.plugins.iter().enumerate() {
@@ -132,9 +132,9 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
             };
             let selected = i == state.setting_idx && state.focus == Focus::Right;
             let style = if selected {
-                Style::default().fg(THEME.claude_label)
+                Style::default().fg(THEME.load().claude_label)
             } else {
-                Style::default().fg(THEME.claude_text)
+                Style::default().fg(THEME.load().claude_text)
             };
             lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
                 format!("  {:<20} {}{}", p.name, status, skills_part),
@@ -155,17 +155,17 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
     let mut lines = Vec::new();
     for (i, opt) in options.iter().enumerate() {
         let style = if i == cursor {
-            Style::default().fg(THEME.claude_label)
+            Style::default().fg(THEME.load().claude_label)
         } else {
-            Style::default().fg(THEME.claude_text)
+            Style::default().fg(THEME.load().claude_text)
         };
         let marker = if i == cursor { "▸ " } else { "  " };
         lines.push(ratatui::text::Line::from(vec![
@@ -178,7 +178,7 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
 fn render_footer(frame: &mut Frame, area: Rect) {
     let hint = "↑↓ navigate  Tab switch pane  Enter edit  Esc close";
     frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(THEME.help_fg)),
+        Paragraph::new(hint).style(Style::default().fg(THEME.load().help_fg)),
         area,
     );
 }
