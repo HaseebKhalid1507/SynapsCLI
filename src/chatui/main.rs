@@ -444,16 +444,28 @@ async fn main() -> Result<()> {
                                     let cmd = commands::resolve_prefix(raw_cmd, &streaming_cmds);
                                     match commands::handle_streaming_command(&cmd, &input, &mut app) {
                                         CommandAction::None => {
-                                            // Unknown streaming command — steer/queue as normal
-                                            let steered = steer_tx.as_ref()
-                                                .map(|tx| tx.send(input.clone()).is_ok())
-                                                .unwrap_or(false);
-                                            if steered {
-                                                app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                            // Not a streaming-safe command. If it's still a KNOWN
+                                            // command (settings, model, system, etc.), refuse with
+                                            // a clear message — don't leak command text into the
+                                            // model stream as steering input.
+                                            let all_cmds = commands::all_commands_with_skills(&registry);
+                                            let resolved_full = commands::resolve_prefix(raw_cmd, &all_cmds);
+                                            if all_cmds.iter().any(|c| c == &resolved_full) {
+                                                app.push_msg(ChatMessage::System(
+                                                    format!("/{} can't run while streaming — press Esc to cancel first", resolved_full)
+                                                ));
                                             } else {
-                                                app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                                // Unknown slash text — treat as steering
+                                                let steered = steer_tx.as_ref()
+                                                    .map(|tx| tx.send(input.clone()).is_ok())
+                                                    .unwrap_or(false);
+                                                if steered {
+                                                    app.push_msg(ChatMessage::System(format!("→ steering: {}", input)));
+                                                } else {
+                                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                                }
+                                                app.queued_message = Some(input);
                                             }
-                                            app.queued_message = Some(input);
                                         }
                                         CommandAction::Quit => {
                                             exit_fx = Some(quit_effect());
