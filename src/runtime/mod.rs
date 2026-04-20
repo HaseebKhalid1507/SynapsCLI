@@ -181,13 +181,7 @@ impl Runtime {
     }
 
     pub fn thinking_level(&self) -> &str {
-        match self.thinking_budget {
-            0 => "adaptive",
-            1..=2048 => "low",
-            2049..=4096 => "medium",
-            4097..=16384 => "high",
-            _ => "xhigh",
-        }
+        crate::core::models::thinking_level_for_budget(self.thinking_budget)
     }
 
     /// Check if the OAuth token is expired and refresh it if needed.
@@ -510,38 +504,29 @@ mod tests {
 
     #[test]
     fn test_thinking_level_ranges() {
-        // Test the logic by directly checking the ranges that thinking_level uses
-        
-        // Low range: 0..=2048
-        assert_eq!(thinking_level_for_budget(0), "low");
+        use crate::core::models::thinking_level_for_budget;
+
+        // Sentinel 0 = "adaptive" (S172 — model decides)
+        assert_eq!(thinking_level_for_budget(0), "adaptive");
+
+        // Low range: 1..=2048
+        assert_eq!(thinking_level_for_budget(1), "low");
         assert_eq!(thinking_level_for_budget(1024), "low");
         assert_eq!(thinking_level_for_budget(2048), "low");
-        
-        // Medium range: 2049..=4096  
+
+        // Medium range: 2049..=4096
         assert_eq!(thinking_level_for_budget(2049), "medium");
         assert_eq!(thinking_level_for_budget(3000), "medium");
         assert_eq!(thinking_level_for_budget(4096), "medium");
-        
+
         // High range: 4097..=16384
         assert_eq!(thinking_level_for_budget(4097), "high");
         assert_eq!(thinking_level_for_budget(8192), "high");
         assert_eq!(thinking_level_for_budget(16384), "high");
-        
+
         // XHigh range: _ (everything else)
         assert_eq!(thinking_level_for_budget(16385), "xhigh");
         assert_eq!(thinking_level_for_budget(32768), "xhigh");
         assert_eq!(thinking_level_for_budget(100000), "xhigh");
-    }
-
-
-    /// Helper function to mirror the thinking_level logic for testing
-    /// since we can't easily construct a Runtime instance in tests
-    fn thinking_level_for_budget(budget: u32) -> &'static str {
-        match budget {
-            0..=2048 => "low",
-            2049..=4096 => "medium",
-            4097..=16384 => "high",
-            _ => "xhigh",
-        }
     }
 }

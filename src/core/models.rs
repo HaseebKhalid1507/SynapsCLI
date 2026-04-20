@@ -59,6 +59,26 @@ pub fn effort_for_thinking_level(level: &str) -> Option<&'static str> {
     }
 }
 
+/// Maps a raw `thinking_budget` value to the user-facing level name.
+///
+/// `0` is the sentinel for "adaptive" (model decides). Positive values
+/// bucket into the four fixed tiers. Single source of truth — consumed by
+/// Runtime::thinking_level, the request builders in runtime/api.rs, and
+/// the status display.
+pub fn thinking_level_for_budget(budget: u32) -> &'static str {
+    match budget {
+        0 => "adaptive",
+        1..=2048 => "low",
+        2049..=4096 => "medium",
+        4097..=16384 => "high",
+        _ => "xhigh",
+    }
+}
+
+/// Default legacy-model thinking budget used when the "adaptive" sentinel
+/// (0) leaks into the non-adaptive request path. Matches the "high" tier.
+pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
