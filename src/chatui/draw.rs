@@ -546,12 +546,16 @@ pub(crate) fn draw(
         } else {
             String::new()
         };
-        let cache_rate = if app.total_cache_read_tokens + app.total_cache_creation_tokens > 0 {
-            let total_cacheable = app.total_cache_read_tokens + app.total_cache_creation_tokens;
-            let rate = (app.total_cache_read_tokens as f64 / total_cacheable as f64 * 100.0) as u32;
-            format!(" {}%↺", rate)
-        } else {
-            String::new()
+        let cache_rate = {
+            // Total input = uncached input + cache reads + cache writes
+            // This shows what % of all input tokens were served from cache
+            let total_input = app.total_input_tokens + app.total_cache_read_tokens + app.total_cache_creation_tokens;
+            if total_input > 0 && app.total_cache_read_tokens > 0 {
+                let rate = (app.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
+                format!(" {}%↺", rate)
+            } else {
+                String::new()
+            }
         };
         let token_str = if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
             format!(
@@ -567,11 +571,17 @@ pub(crate) fn draw(
             Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
             Span::styled(&token_str, Style::default().fg(THEME.muted)),
             {
-                // Context usage bar — shows how much of the 200k context window is consumed
-                let total_used = app.total_input_tokens + app.total_output_tokens;
-                if total_used > 0 {
-                    let context_window: u64 = 200_000;
-                    let usage_ratio = (total_used as f64 / context_window as f64).min(1.0);
+                // Context usage bar — per-turn occupancy as a fraction of the
+                // model's own context window. Numerator `last_turn_context`
+                // is reassigned each usage callback (uncached input + cache
+                // read + cache creation). Denominator `last_turn_context_window`
+                // adapts when the answering model changes (main Opus → subagent
+                // Sonnet, etc.). See app.rs for the update site and
+                // `synaps_cli::models::context_window_for_model` for values.
+                let turn_context = app.last_turn_context;
+                let context_window = app.last_turn_context_window.max(1);
+                if turn_context > 0 {
+                    let usage_ratio = (turn_context as f64 / context_window as f64).min(1.0);
                     let bar_width: usize = 14;
                     let filled = (usage_ratio * bar_width as f64).round() as usize;
                     let empty = bar_width.saturating_sub(filled);

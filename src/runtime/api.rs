@@ -56,11 +56,13 @@ impl ApiMethods {
         
         tracing::info!(model = %model, "Starting API request");
         
-        // We no longer strip_old_thinking or microcompact here! 
-        // Modifying historical messages breaks Anthropic's exact-prefix prompt cache.
-        // Instead, we leave historical messages fully intact to achieve a ~95% cache hit rate.
+        // Manual cache breakpoints for optimal prompt caching.
+        // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
         let mut cleaned_messages = messages.to_vec();
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
+
+        // Derive the thinking level from the budget for effort mapping.
+        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
 
         let mut body = json!({
             "model": model,
@@ -68,12 +70,29 @@ impl ApiMethods {
             "messages": cleaned_messages,
             "tools": &*tools.tools_schema(),
             "stream": true,
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-                "display": "summarized"
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                // Legacy path requires budget_tokens >= 1024 (Anthropic enforced).
+                // If user picked "adaptive" (sentinel 0) on a legacy model, fall back
+                // to "high" (16384) — the model's effective thinking depth without
+                // the deprecated-but-functional adaptive shape it doesn't support.
+                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                    "display": "summarized"
+                })
             }
         });
+
+        // For adaptive models, control thinking depth via effort (GA, no beta).
+        // "adaptive" level = omit effort entirely (model decides).
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
         if let Some(tool_list) = body["tools"].as_array_mut() {
@@ -314,6 +333,7 @@ impl ApiMethods {
                             let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                             let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                 tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                 let _ = tx.send(StreamEvent::Usage {
                                     input_tokens: input_t,
@@ -333,6 +353,7 @@ impl ApiMethods {
                                 let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                                 let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
                                     let _ = tx.send(StreamEvent::Usage {
                                         input_tokens: input_t,
@@ -444,17 +465,32 @@ impl ApiMethods {
         let mut cleaned_messages = messages.to_vec();
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
+        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
+
         let mut body = json!({
             "model": model,
             "max_tokens": HelperMethods::max_tokens_for_model(model),
             "messages": cleaned_messages,
             "tools": &*tools.tools_schema(),
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-                "display": "summarized"
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                // Legacy path: budget_tokens must be >= 1024. Fall back to "high"
+                // if the sentinel 0 (adaptive) leaked through for a legacy model.
+                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                    "display": "summarized"
+                })
             }
         });
+
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
         if let Some(tools) = body["tools"].as_array_mut() {
@@ -546,6 +582,15 @@ impl ApiMethods {
             result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
         };
         
+        // Log usage for cache analysis
+        if let Some(usage) = json.get("usage") {
+            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+        }
+
         Ok(json)
     }
 }

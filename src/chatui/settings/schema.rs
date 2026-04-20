@@ -41,6 +41,8 @@ pub(crate) struct SettingDef {
     pub label: &'static str,
     pub category: Category,
     pub editor: EditorKind,
+    // Reserved for settings UI tooltip wiring (TODO).
+    #[allow(dead_code)]
     pub help: &'static str,
 }
 
@@ -56,8 +58,8 @@ pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
         key: "thinking",
         label: "Thinking",
         category: Category::Model,
-        editor: EditorKind::Cycler(&["low", "medium", "high", "xhigh"]),
-        help: "Extended thinking budget level.",
+        editor: EditorKind::Cycler(&["low", "medium", "high", "xhigh", "adaptive"]),
+        help: "Thinking depth — controls effort on adaptive models, budget on legacy.",
     },
     SettingDef {
         key: "api_retries",

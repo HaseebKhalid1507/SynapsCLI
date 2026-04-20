@@ -36,12 +36,28 @@ pub(crate) struct App {
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) input_stash: String,
+    /// Tab-completion cycle state for slash commands. `Some((prefix, index))`
+    /// when the user is cycling through matches via repeated Tab; cleared
+    /// on any non-Tab keypress. See input.rs::handle_tab_complete.
+    pub(crate) tab_cycle: Option<(String, usize)>,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) total_input_tokens: u64,
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,
     pub(crate) total_cache_creation_tokens: u64,
+    /// Most recent turn's actual context occupancy (what the API ingested
+    /// this request): uncached input + cache read + cache creation. Unlike
+    /// `total_*_tokens` which accumulate for cost tracking, this is reassigned
+    /// every turn and reflects the current per-request context window use.
+    /// Used by the context-usage bar in `draw.rs`.
+    pub(crate) last_turn_context: u64,
+    /// Context window size (in tokens) of the model that answered the most
+    /// recent turn. Updated alongside `last_turn_context` so the bar's
+    /// denominator adapts when users switch models mid-session. See
+    /// `synaps_cli::models::context_window_for_model`.
+    pub(crate) last_turn_context_window: u64,
+    pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     /// Cached wrapped+highlighted message lines.
@@ -104,12 +120,18 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             input_stash: String::new(),
+            tab_cycle: None,
             input_tokens: 0,
             output_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            last_turn_context: 0,
+            last_turn_context_window: synaps_cli::models::context_window_for_model(
+                synaps_cli::models::default_model(),
+            ),
+            api_call_count: 0,
             session_cost: 0.0,
             session,
             line_cache: None,
@@ -220,9 +242,19 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
-        // Pricing per million tokens (as of 2025)
+        // Per-turn context occupancy (bar numerator): what the API actually
+        // ingested this request. Output tokens are generated, not ingested,
+        // so they don't count toward current-window use. Reassigned, not accumulated.
+        self.last_turn_context = input_tokens + cache_read + cache_creation;
+        // Per-turn bar denominator — the context window of the model that
+        // answered this turn. Tracked alongside so mid-session model swaps
+        // (e.g. main thread Opus → subagent Sonnet) recalibrate the bar.
+        self.last_turn_context_window = synaps_cli::models::context_window_for_model(model);
+        self.api_call_count += 1;
+        // Pricing per million tokens (as of 2026-04)
+        // Opus 4.5+ = $5/$25, Sonnet 4.5+ = $3/$15, Haiku = $0.80/$4
         let (input_price, output_price) = match model {
-            m if m.contains("opus") => (15.0, 75.0),
+            m if m.contains("opus") => (5.0, 25.0),
             m if m.contains("sonnet") => (3.0, 15.0),
             m if m.contains("haiku") => (0.80, 4.0),
             _ => (3.0, 15.0), // default to sonnet pricing
