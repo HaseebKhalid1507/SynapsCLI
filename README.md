@@ -124,10 +124,7 @@ Switch live with `/theme`.
 
 ---
 
-## How It Stacks Up
-
-| | SynapsCLI | Claude Code | Codex | Gemini CLI | Crush |
-|---|---|---|---|---|---|
+---|---|---|---|---|
 | Language | **Rust** | Node | Node | Node | Go |
 | Cold start | **<100ms** | ~1–3s | ~1–3s | ~1–3s | ~200ms |
 | Named agents | ✅ | ❌ | ❌ | ❌ | partial |
