@@ -74,9 +74,11 @@ impl Session {
         let dir = crate::config::resolve_write_path("sessions");
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", self.id));
+        let tmp = path.with_extension("tmp");
         let json = serde_json::to_string(self)
             .map_err(std::io::Error::other)?;
-        tokio::fs::write(path, json).await
+        tokio::fs::write(&tmp, &json).await?;
+        tokio::fs::rename(&tmp, &path).await
     }
 
     pub fn load(id: &str) -> std::io::Result<Self> {
