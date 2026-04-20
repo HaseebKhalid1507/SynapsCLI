@@ -160,8 +160,15 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    let visible_height = inner.height as usize;
+    let scroll_offset = if cursor >= visible_height {
+        cursor - visible_height + 1
+    } else {
+        0
+    };
+
     let mut lines = Vec::new();
-    for (i, opt) in options.iter().enumerate() {
+    for (i, opt) in options.iter().enumerate().skip(scroll_offset).take(visible_height) {
         let style = if i == cursor {
             Style::default().fg(THEME.load().claude_label)
         } else {
