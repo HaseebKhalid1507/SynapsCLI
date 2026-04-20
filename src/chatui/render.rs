@@ -19,7 +19,7 @@ impl App {
             let ts = &tmsg.time;
             match &tmsg.msg {
                 ChatMessage::User(text) => {
-                    let bg = Style::default().bg(THEME.user_bg);
+                    let bg = Style::default().bg(THEME.load().user_bg);
                     // Top margin
                     lines.push(Line::from(""));
                     // Top padding
@@ -31,12 +31,12 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{}{}", label, " ".repeat(gap)),
-                            Style::default().fg(THEME.user_color).bg(THEME.user_bg).add_modifier(Modifier::BOLD),
+                            Style::default().fg(THEME.load().user_color).bg(THEME.load().user_bg).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(ts_str, Style::default().fg(THEME.muted).bg(THEME.user_bg)),
+                        Span::styled(ts_str, Style::default().fg(THEME.load().muted).bg(THEME.load().user_bg)),
                     ]));
                     // Content — just render the text (pasted messages already contain "[Pasted N lines]")
-                    let style = Style::default().fg(THEME.user_color).bg(THEME.user_bg);
+                    let style = Style::default().fg(THEME.load().user_color).bg(THEME.load().user_bg);
                     for line in text.lines() {
                         for wline in wrap_text(&format!("{}  {}", m, line), width) {
                             lines.push(Line::from(Span::styled(
@@ -57,7 +57,7 @@ impl App {
                     if !prev_was_user {
                         lines.push(Line::from(""));
                     }
-                    let dim = Style::default().fg(THEME.thinking_color);
+                    let dim = Style::default().fg(THEME.load().thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
                     let thinking_label = if text == "…" {
@@ -146,9 +146,9 @@ impl App {
                         let pad_left = width.saturating_sub(sep_content_width) / 2;
                         lines.push(Line::from(vec![
                             Span::styled(" ".repeat(pad_left), Style::default()),
-                            Span::styled(sep_left, Style::default().fg(THEME.separator)),
+                            Span::styled(sep_left, Style::default().fg(THEME.load().separator)),
                             Span::styled(" \u{00b7} ", Style::default().fg(Color::Rgb(35, 55, 75))),
-                            Span::styled(sep_right, Style::default().fg(THEME.separator)),
+                            Span::styled(sep_right, Style::default().fg(THEME.load().separator)),
                         ]));
                         lines.push(Line::from(""));
                     }
@@ -159,29 +159,29 @@ impl App {
                     // Pulse the agent label when streaming (same sin-wave as header dot)
                     let label_color = if self.streaming && i == self.messages.len() - 1 {
                         let pulse = ((self.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-                        if let Color::Rgb(r, g, b) = THEME.claude_label {
+                        if let Color::Rgb(r, g, b) = THEME.load().claude_label {
                             Color::Rgb(
                                 (r as f64 * pulse) as u8,
                                 (g as f64 * pulse) as u8,
                                 (b as f64 * pulse) as u8,
                             )
                         } else {
-                            THEME.claude_label
+                            THEME.load().claude_label
                         }
                     } else {
-                        THEME.claude_label
+                        THEME.load().claude_label
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{}{}", label, " ".repeat(gap)),
                             Style::default().fg(label_color).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(ts_str, Style::default().fg(THEME.muted)),
+                        Span::styled(ts_str, Style::default().fg(THEME.load().muted)),
                     ]));
                     // Body
                     if text.is_empty() {
                         lines.push(Line::from(Span::styled(
-                            format!("{}   \u{2026}", m), Style::default().fg(THEME.muted),
+                            format!("{}   \u{2026}", m), Style::default().fg(THEME.load().muted),
                         )));
                     } else {
                         lines.extend(render_markdown(text, m, width));
@@ -193,11 +193,11 @@ impl App {
                     lines.push(Line::from(""));
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
-                        Span::styled(display_name, Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.load().tool_label)),
+                        Span::styled(display_name, Style::default().fg(THEME.load().tool_label).add_modifier(Modifier::BOLD)),
                     ];
                     if let Some(tag) = server_tag {
-                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
+                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                     }
                     // Show elapsed time while tool is running
                     let elapsed_str = if let Some(start) = self.tool_start_time {
@@ -221,13 +221,13 @@ impl App {
                     } else {
                         header.push(Span::styled(
                             format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
-                            Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                            Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
                         ));
                     }
                     lines.push(Line::from(header));
                     // Show accumulated partial input with newlines rendered
                     if !partial_input.is_empty() {
-                        let param_style = Style::default().fg(THEME.tool_param);
+                        let param_style = Style::default().fg(THEME.load().tool_param);
                         // Unescape \n in JSON string to real newlines for display
                         let unescaped = partial_input.replace("\\n", "\n").replace("\\t", "  ");
 
@@ -249,7 +249,7 @@ impl App {
                         let skip = total.saturating_sub(max_show);
                         if skip > 0 {
                             let omit = format!("{}     … {} lines above", m, skip);
-                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.muted))));
+                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))));
                         }
                         for cline in content_lines.iter().skip(skip) {
                             let line_str = format!("{}       {}", m, cline);
@@ -266,11 +266,11 @@ impl App {
                     // Compact tool header
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
                     let mut header = vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.tool_label)),
-                        Span::styled(display_name, Style::default().fg(THEME.tool_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.load().tool_label)),
+                        Span::styled(display_name, Style::default().fg(THEME.load().tool_label).add_modifier(Modifier::BOLD)),
                     ];
                     if let Some(tag) = server_tag {
-                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.muted)));
+                        header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                     }
                     // If this is the last message and a tool is executing, show animation
                     let is_last = i == self.messages.len() - 1;
@@ -291,13 +291,13 @@ impl App {
                             let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
                             header.push(Span::styled(
                                 format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
-                                Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                                Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
                             ));
                         }
                     }
                     lines.push(Line::from(header));
                     // Params — key:value on one line each, dimmed
-                    let param_style = Style::default().fg(THEME.tool_param);
+                    let param_style = Style::default().fg(THEME.load().tool_param);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                         if let Some(obj) = parsed.as_object() {
                             // Extract file extension from "path" param if present (for syntax highlighting)
@@ -320,7 +320,7 @@ impl App {
                                         let (marker, marker_color) = match k.as_str() {
                                             "old_string" => ("−", Color::Rgb(200, 60, 60)),
                                             "new_string" => ("+", Color::Rgb(60, 200, 80)),
-                                            _ => ("│", THEME.muted),
+                                            _ => ("│", THEME.load().muted),
                                         };
 
                                         let label = match k.as_str() {
@@ -346,7 +346,7 @@ impl App {
                                         }
                                         if total > max_preview {
                                             let omit = format!("{}       … +{} more lines", m, total - max_preview);
-                                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.muted))));
+                                            lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))));
                                         }
                                     } else {
                                         let val = if s.len() > 120 {
@@ -378,11 +378,11 @@ impl App {
                         || result.starts_with("Unknown tool");
                     let is_timeout = result.contains("[TIMED OUT");
                     let style = if is_error {
-                        Style::default().fg(THEME.error_color)
+                        Style::default().fg(THEME.load().error_color)
                     } else if is_timeout {
-                        Style::default().fg(THEME.warning_color)
+                        Style::default().fg(THEME.load().warning_color)
                     } else {
-                        Style::default().fg(THEME.tool_result_color)
+                        Style::default().fg(THEME.load().tool_result_color)
                     };
 
                     let result_lines: Vec<&str> = result.lines().collect();
@@ -404,11 +404,11 @@ impl App {
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
-                                    Style::default().fg(THEME.warning_color),
+                                    Style::default().fg(THEME.load().warning_color),
                                 ),
                                 Span::styled(
                                     elapsed_str,
-                                    Style::default().fg(THEME.subagent_time),
+                                    Style::default().fg(THEME.load().subagent_time),
                                 ),
                             ]));
                         } else if elapsed_ms.is_none() && self.tool_start_time.is_some() {
@@ -430,7 +430,7 @@ impl App {
                                 let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
                                 lines.push(Line::from(Span::styled(
                                     format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
-                                    Style::default().fg(THEME.status_streaming).add_modifier(Modifier::DIM),
+                                    Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
                                 )));
                             }
                         } else {
@@ -442,11 +442,11 @@ impl App {
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                                    Style::default().fg(THEME.tool_result_ok),
+                                    Style::default().fg(THEME.load().tool_result_ok),
                                 ),
                                 Span::styled(
                                     elapsed_str,
-                                    Style::default().fg(THEME.subagent_time),
+                                    Style::default().fg(THEME.load().subagent_time),
                                 ),
                             ]));
                         }
@@ -498,22 +498,22 @@ impl App {
                     if result_lines.len() > show {
                         lines.push(Line::from(Span::styled(
                             format!("{}       +{} lines", m, result_lines.len() - show),
-                            Style::default().fg(THEME.muted),
+                            Style::default().fg(THEME.load().muted),
                         )));
                     }
                 }
 
                 ChatMessage::Error(err) => {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(THEME.error_color)),
-                        Span::styled(err.clone(), Style::default().fg(THEME.error_color)),
+                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(THEME.load().error_color)),
+                        Span::styled(err.clone(), Style::default().fg(THEME.load().error_color)),
                     ]));
                 }
 
                 ChatMessage::System(msg) => {
                     lines.push(Line::from(Span::styled(
                         format!("{}  {}", m, msg),
-                        Style::default().fg(THEME.muted).add_modifier(Modifier::DIM),
+                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM),
                     )));
                 }
             }

@@ -469,9 +469,13 @@ impl App {
             if is_valid {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
+                        let new_theme = super::theme::load_theme_by_name(name)
+                            .unwrap_or_else(super::theme::Theme::default);
+                        super::theme::set_theme(new_theme);
                         self.push_msg(ChatMessage::System(
-                            format!("theme set to: {}. Restart to apply.", name)
+                            format!("Theme applied: {}", name)
                         ));
+                        self.invalidate();
                     }
                     Err(e) => {
                         self.push_msg(ChatMessage::Error(

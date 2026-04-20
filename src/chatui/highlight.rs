@@ -30,13 +30,13 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(
             format!("{}  \u{2502} ", prefix),
-            Style::default().fg(THEME.muted),
+            Style::default().fg(THEME.load().muted),
         ));
         for (style, text) in ranges {
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
             let content = text.trim_end_matches('\n').to_string();
             if !content.is_empty() {
-                spans.push(Span::styled(content, Style::default().fg(fg).bg(THEME.code_bg)));
+                spans.push(Span::styled(content, Style::default().fg(fg).bg(THEME.load().code_bg)));
             }
         }
         lines.push(Line::from(spans));
@@ -99,7 +99,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         let line = raw_line.replace('\t', "    ");
         let trimmed = line.trim();
         let mut spans = vec![
-            Span::styled(format!("{}       ", margin), Style::default().fg(THEME.tool_result_color)),
+            Span::styled(format!("{}       ", margin), Style::default().fg(THEME.load().tool_result_color)),
         ];
 
         if trimmed.is_empty() {
@@ -111,14 +111,14 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         if trimmed.starts_with("error") || trimmed.starts_with("Error") || trimmed.starts_with("ERROR")
             || trimmed.starts_with("fatal") || trimmed.starts_with("FATAL") {
             // Errors → red
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.error_color)));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().error_color)));
         } else if trimmed.starts_with("warning") || trimmed.starts_with("Warning") || trimmed.starts_with("WARN") {
             // Warnings → yellow
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.warning_color)));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().warning_color)));
         } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")
             || trimmed.starts_with("done") || trimmed.starts_with("Done") || trimmed.starts_with("success") {
             // Success → green with blue tint
-            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.tool_result_ok)));
+            spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().tool_result_ok)));
         } else {
             // Default: blue-tinted with smart coloring
             let mut remaining = line.as_str();
@@ -133,7 +133,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_start > 0 {
                             spans.push(Span::styled(
                                 remaining[..path_start].to_string(),
-                                Style::default().fg(THEME.tool_result_color),
+                                Style::default().fg(THEME.load().tool_result_color),
                             ));
                         }
                         // Path portion
@@ -144,13 +144,13 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_end == 0 {
                             spans.push(Span::styled(
                                 after_slash[..1].to_string(),
-                                Style::default().fg(THEME.tool_result_color),
+                                Style::default().fg(THEME.load().tool_result_color),
                             ));
                             remaining = &after_slash[1..];
                         } else {
                             spans.push(Span::styled(
                                 after_slash[..path_end].to_string(),
-                                Style::default().fg(THEME.tool_label),
+                                Style::default().fg(THEME.load().tool_label),
                             ));
                             remaining = &after_slash[path_end..];
                         }
@@ -161,13 +161,13 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                         if path_end == 0 {
                             spans.push(Span::styled(
                                 remaining[..1].to_string(),
-                                Style::default().fg(THEME.tool_result_color),
+                                Style::default().fg(THEME.load().tool_result_color),
                             ));
                             remaining = &remaining[1..];
                         } else {
                             spans.push(Span::styled(
                                 remaining[..path_end].to_string(),
-                                Style::default().fg(THEME.tool_label),
+                                Style::default().fg(THEME.load().tool_label),
                             ));
                             remaining = &remaining[path_end..];
                         }
@@ -176,7 +176,7 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                     // No more paths — output the rest with blue tint
                     spans.push(Span::styled(
                         remaining.to_string(),
-                        Style::default().fg(THEME.tool_result_color),
+                        Style::default().fg(THEME.load().tool_result_color),
                     ));
                     break;
                 }
@@ -216,17 +216,17 @@ pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Sp
     let is_context = sep_char == '-';
 
     Some(vec![
-        Span::styled(format!("{}       ", margin), Style::default().fg(THEME.tool_result_color)),
-        Span::styled(filepath.to_string(), Style::default().fg(THEME.tool_label)),
-        Span::styled(":", Style::default().fg(THEME.muted)),
-        Span::styled(linenum.to_string(), Style::default().fg(THEME.list_bullet_color)),
-        Span::styled(format!("{}", sep_char), Style::default().fg(THEME.muted)),
+        Span::styled(format!("{}       ", margin), Style::default().fg(THEME.load().tool_result_color)),
+        Span::styled(filepath.to_string(), Style::default().fg(THEME.load().tool_label)),
+        Span::styled(":", Style::default().fg(THEME.load().muted)),
+        Span::styled(linenum.to_string(), Style::default().fg(THEME.load().list_bullet_color)),
+        Span::styled(format!("{}", sep_char), Style::default().fg(THEME.load().muted)),
         Span::styled(
             content.to_string(),
             if is_context {
-                Style::default().fg(THEME.muted)
+                Style::default().fg(THEME.load().muted)
             } else {
-                Style::default().fg(THEME.tool_result_color)
+                Style::default().fg(THEME.load().tool_result_color)
             },
         ),
     ])
@@ -285,7 +285,7 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
         let mut spans = vec![
             Span::styled(
                 format!("{}     {:>4} \u{2502} ", margin, line_num),
-                Style::default().fg(THEME.muted),
+                Style::default().fg(THEME.load().muted),
             ),
         ];
         for (sty, text) in ranges {

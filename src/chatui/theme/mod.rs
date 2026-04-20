@@ -1,4 +1,6 @@
+use arc_swap::ArcSwap;
 use ratatui::style::Color;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 mod palettes;
@@ -220,7 +222,7 @@ fn parse_hex_color(s: &str) -> Option<Color> {
 ///    a. Check `~/.synaps-cli/themes/<name>` file first (user-editable)
 ///    b. Fall back to compiled-in builtin
 /// 3. Falls back to default
-pub(crate) static THEME: LazyLock<Theme> = LazyLock::new(|| {
+pub(crate) fn load_theme_from_config() -> Theme {
     // First check for a theme file (highest priority)
     let path = synaps_cli::config::resolve_read_path("theme");
     if path.exists() {
@@ -235,12 +237,10 @@ pub(crate) static THEME: LazyLock<Theme> = LazyLock::new(|| {
             if let Some((key, val)) = line.split_once('=') {
                 if key.trim() == "theme" {
                     let name = val.trim();
-                    // Check ~/.synaps-cli/themes/<name> file first
                     let theme_file = synaps_cli::config::base_dir().join("themes").join(name);
                     if theme_file.exists() {
                         return Theme::load_from(&theme_file);
                     }
-                    // Fall back to compiled-in builtin
                     if let Some(theme) = Theme::builtin(name) {
                         return theme;
                     }
@@ -250,4 +250,19 @@ pub(crate) static THEME: LazyLock<Theme> = LazyLock::new(|| {
     }
 
     Theme::default()
-});
+}
+
+pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
+    let theme_file = synaps_cli::config::base_dir().join("themes").join(name);
+    if theme_file.exists() {
+        return Some(Theme::load_from(&theme_file));
+    }
+    Theme::builtin(name)
+}
+
+pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
+    LazyLock::new(|| ArcSwap::from_pointee(load_theme_from_config()));
+
+pub(crate) fn set_theme(theme: Theme) {
+    THEME.store(Arc::new(theme));
+}
