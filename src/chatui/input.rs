@@ -59,6 +59,15 @@ pub(super) fn handle_event(
                         }
                     }
                 }
+                crate::settings::InputOutcome::PreviewTheme { name } => {
+                    if let Some(theme) = crate::theme::load_theme_by_name(&name) {
+                        crate::theme::set_theme(theme);
+                    }
+                }
+                crate::settings::InputOutcome::RevertTheme => {
+                    let theme = crate::theme::load_theme_from_config();
+                    crate::theme::set_theme(theme);
+                }
             }
         }
         // Swallow all other events while settings is open.
