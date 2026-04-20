@@ -124,17 +124,6 @@ Switch live with `/theme`.
 
 ---
 
----|---|---|---|---|
-| Language | **Rust** | Node | Node | Node | Go |
-| Cold start | **<100ms** | ~1–3s | ~1–3s | ~1–3s | ~200ms |
-| Named agents | ✅ | ❌ | ❌ | ❌ | partial |
-| Autonomous daemon | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Themes | **18** | 1 | 1 | few | many |
-| MCP | ✅ | ✅ | ❌ | ✅ | ✅ |
-| License | MIT | proprietary | Apache-2.0 | Apache-2.0 | FSL |
-
----
-
 <details>
 <summary><b>🧬 Architecture (for the curious)</b></summary>
 
