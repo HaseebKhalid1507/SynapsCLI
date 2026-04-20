@@ -579,7 +579,11 @@ pub(crate) fn draw(
                     + app.total_cache_creation_tokens
                     + app.total_output_tokens;
                 if total_used > 0 {
-                    let context_window: u64 = 200_000;
+                    // Opus 4.7 default context is 1M tokens (verified S171 limit-test:
+                    // sustained 270K+ per-turn input with no 1M beta header sent).
+                    // NOTE: total_used is still cumulative — bar will pin to 100%
+                    // earlier than reality. True fix needs per-turn tracking.
+                    let context_window: u64 = 1_000_000;
                     let usage_ratio = (total_used as f64 / context_window as f64).min(1.0);
                     let bar_width: usize = 14;
                     let filled = (usage_ratio * bar_width as f64).round() as usize;

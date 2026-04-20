@@ -41,7 +41,10 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    // Held to keep the reaper task alive for the Runtime's lifetime; never read directly.
+    #[allow(dead_code)]
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
+    #[allow(dead_code)]
     reaper_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 

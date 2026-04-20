@@ -41,6 +41,8 @@ pub(crate) struct SettingDef {
     pub label: &'static str,
     pub category: Category,
     pub editor: EditorKind,
+    // Reserved for settings UI tooltip wiring (TODO).
+    #[allow(dead_code)]
     pub help: &'static str,
 }
 
