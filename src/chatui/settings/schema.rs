@@ -58,8 +58,8 @@ pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
         key: "thinking",
         label: "Thinking",
         category: Category::Model,
-        editor: EditorKind::Cycler(&["low", "medium", "high", "xhigh"]),
-        help: "Extended thinking budget level.",
+        editor: EditorKind::Cycler(&["low", "medium", "high", "xhigh", "adaptive"]),
+        help: "Thinking depth — controls effort on adaptive models, budget on legacy.",
     },
     SettingDef {
         key: "api_retries",

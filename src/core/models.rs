@@ -3,6 +3,7 @@
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-7",           "Opus 4.7 — most capable"),
+    ("claude-opus-4-6",           "Opus 4.6 — previous flagship"),
     ("claude-sonnet-4-6",         "Sonnet 4.6 — balanced"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
 ];
@@ -37,6 +38,23 @@ pub fn model_supports_adaptive_thinking(model: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Maps a SynapsCLI thinking level to an Anthropic `effort` value for models
+/// that use adaptive thinking (Opus 4.6+/Sonnet 4.6+). Effort controls
+/// thinking depth when `budget_tokens` is unavailable/deprecated.
+///
+/// "adaptive" as input means "let the model decide" — returns None so the
+/// caller omits `output_config.effort` entirely.
+pub fn effort_for_thinking_level(level: &str) -> Option<&'static str> {
+    match level {
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "adaptive" => None, // model decides
+        _ => Some("high"),  // safe default
+    }
 }
 
 /// Returns the input context window size for a given model, in tokens.

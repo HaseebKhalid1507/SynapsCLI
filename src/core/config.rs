@@ -114,6 +114,7 @@ fn parse_thinking_budget(val: &str) -> Option<u32> {
         "medium" => Some(4096),
         "high" => Some(16384),
         "xhigh" => Some(32768),
+        "adaptive" => Some(0), // sentinel: model decides depth
         _ => val.parse::<u32>().ok(),
     }
 }
