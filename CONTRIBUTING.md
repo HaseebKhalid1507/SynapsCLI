@@ -1,88 +1,50 @@
-# Contributing to Agent Runtime
+# Contributing to SynapsCLI
 
-Thanks for your interest in contributing. This is an open-source AI agent runtime built in Rust, and contributions of all kinds are welcome.
+Rust-native AI agent runtime. Contributions welcome.
 
-## Getting Started
+## Quick Start
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
-cd agent-runtime
-cargo build
-cargo test
+cd SynapsCLI
+cargo build --release
+cargo test --release --lib
 ```
 
-**Requirements:** Rust 1.70+, a Unix-like OS (Linux/macOS)
+**Requirements:** Rust 1.80+, Linux or macOS
 
-## How to Contribute
+**Note:** 7 PTY tests (`tools::shell`) fail under parallel execution — pass with `cargo test --release --lib -- --test-threads=1`. Not a bug, just TTY contention.
 
-### Bug Reports
+## Branch Model
 
-Open an [issue](https://github.com/HaseebKhalid1507/SynapsCLI/issues/new?template=bug_report.md) with:
-- What you expected to happen
-- What actually happened
-- Steps to reproduce
-- Your OS, Rust version, and version info
+- `main` — stable, merge-only
+- `dev` — active development, merge to main when validated
+- `feat/*` — feature branches off dev
 
-### Feature Requests
+## Before Submitting
 
-Open an [issue](https://github.com/HaseebKhalid1507/SynapsCLI/issues/new?template=feature_request.md) describing:
-- The problem you're trying to solve
-- Your proposed solution
-- Any alternatives you've considered
+1. `cargo build --release` — 0 warnings
+2. `cargo test --release --lib` — 224+ pass (PTY tests excluded from count)
+3. Read `AGENTS.md` — especially the "Common Pitfalls" and "Key Patterns" sections
+4. If adding a setting: update all 5 sync points (see AGENTS.md)
+5. If touching cache logic: verify hit rate hasn't regressed (`SYNAPS_USAGE_LOG=1`)
 
-### Pull Requests
+## Code Style
 
-1. Fork the repo and create a branch from `main`
-2. Make your changes in focused, atomic commits
-3. Add tests for new functionality
-4. Ensure `cargo test`, `cargo build`, and `cargo clippy` all pass
-5. Open a PR with a clear description of what and why
+- No `clippy::pedantic` — standard `cargo clippy` only
+- `#[allow(dead_code)]` requires a comment explaining why
+- Prefer `thiserror` for error types, `anyhow` for binary-level error handling
+- One file per tool (`src/tools/*.rs`)
+- Tests in `#[cfg(test)] mod tests {}` at file bottom
 
-### Code Style
+## What's Useful
 
-- Follow standard Rust conventions (`rustfmt` defaults)
-- Run `cargo clippy` before submitting — no new warnings
-- Keep functions focused — if it's doing too much, split it
-- Error handling: prefer `Result` over `unwrap()` in production paths
-- Add doc comments to public APIs
-
-## Project Structure
-
-```
-src/
-├── chatui/         # TUI interface (app, draw, theme, markdown, highlight)
-├── runtime.rs      # API client, streaming, agentic tool loop
-├── tools.rs        # Tool trait + implementations
-├── watcher.rs     # Autonomous agent supervisor
-├── agent.rs        # Headless agent worker
-├── watcher_types.rs  # Watcher config and type definitions
-├── auth.rs         # OAuth + API key authentication
-├── mcp.rs          # MCP client (lazy loading)
-├── skills.rs       # On-demand skill loading
-├── session.rs      # Session persistence
-└── config.rs       # Configuration management
-```
-
-## Adding a New Tool
-
-Implement the `Tool` trait:
-
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn parameters(&self) -> Value;
-    async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
-}
-```
-
-Register it in `ToolRegistry::new()` in `src/tools.rs`.
-
-## Adding a Watcher Trigger
-
-New trigger modes (cron, file-watch, webhook) are on the roadmap. If you want to work on one, open an issue first to discuss the approach.
+- **Bug reports** with reproduction steps
+- **Tool implementations** (new tools following the `Tool` trait in `src/tools/mod.rs`)
+- **Themes** (add to `src/chatui/theme.rs`)
+- **MCP server configs** (share working `mcp.json` setups)
+- **Skills/plugins** (markdown-driven behavioral guidelines)
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+By contributing, you agree your work is licensed under MIT.
