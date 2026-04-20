@@ -22,8 +22,8 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         .title(" Plugins ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
@@ -49,11 +49,11 @@ fn render_left(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         let selected = i == state.selected_left;
         let marker = if selected { "▸ " } else { "  " };
         let style = if selected && matches!(state.focus, Focus::Left) {
-            Style::default().fg(THEME.claude_label)
+            Style::default().fg(THEME.load().claude_label)
         } else if selected {
-            Style::default().fg(THEME.claude_text)
+            Style::default().fg(THEME.load().claude_text)
         } else {
-            Style::default().fg(THEME.help_fg)
+            Style::default().fg(THEME.load().help_fg)
         };
         let label = match row {
             LeftRow::Installed => {
@@ -109,7 +109,7 @@ fn render_right_list(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
-                Style::default().fg(THEME.help_fg),
+                Style::default().fg(THEME.load().help_fg),
             ))),
             area,
         );
@@ -120,11 +120,11 @@ fn render_right_list(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     for (i, row) in rows.iter().enumerate() {
         let selected = i == state.selected_right && matches!(state.focus, Focus::Right);
         let style = if selected {
-            Style::default().fg(THEME.claude_label)
+            Style::default().fg(THEME.load().claude_label)
         } else if i == state.selected_right {
-            Style::default().fg(THEME.claude_text)
+            Style::default().fg(THEME.load().claude_text)
         } else {
-            Style::default().fg(THEME.help_fg)
+            Style::default().fg(THEME.load().help_fg)
         };
         let (name, status) = match row {
             RightRow::Installed(ip) => {
@@ -156,8 +156,8 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
         .title(" Detail ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -165,14 +165,14 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
     let Some(row) = rows.get(row_idx) else {
         frame.render_widget(
             Paragraph::new("(no selection)")
-                .style(Style::default().fg(THEME.help_fg)),
+                .style(Style::default().fg(THEME.load().help_fg)),
             inner,
         );
         return;
     };
 
-    let label_style = Style::default().fg(THEME.help_fg);
-    let value_style = Style::default().fg(THEME.claude_text);
+    let label_style = Style::default().fg(THEME.load().help_fg);
+    let value_style = Style::default().fg(THEME.load().claude_text);
     let mut lines: Vec<Line> = Vec::new();
     match row {
         RightRow::Installed(ip) => {
@@ -256,8 +256,8 @@ fn centered_overlay(frame: &mut Frame, area: Rect, title: &str) -> Rect {
         .title(title.to_string())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.border_active))
-        .style(Style::default().bg(THEME.bg));
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner
@@ -269,17 +269,17 @@ fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "Enter marketplace URL:",
-        Style::default().fg(THEME.help_fg),
+        Style::default().fg(THEME.load().help_fg),
     )));
     lines.push(Line::from(Span::styled(
         format!("[{}_]", buffer),
-        Style::default().fg(THEME.claude_label),
+        Style::default().fg(THEME.load().claude_label),
     )));
     if let Some(err) = error {
         lines.push(Line::from(Span::raw("")));
         lines.push(Line::from(Span::styled(
             format!("! {}", err),
-            Style::default().fg(THEME.error_color),
+            Style::default().fg(THEME.load().error_color),
         )));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -291,12 +291,12 @@ fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &
     let lines = vec![
         Line::from(Span::styled(
             format!("Trust source {} for plugin {}?", host, plugin_name),
-            Style::default().fg(THEME.claude_text),
+            Style::default().fg(THEME.load().claude_text),
         )),
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             "  [y]es  [n]o",
-            Style::default().fg(THEME.help_fg),
+            Style::default().fg(THEME.load().help_fg),
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -308,12 +308,12 @@ fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str) {
     let lines = vec![
         Line::from(Span::styled(
             prompt.to_string(),
-            Style::default().fg(THEME.claude_text),
+            Style::default().fg(THEME.load().claude_text),
         )),
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             "  [y]es  [n]o",
-            Style::default().fg(THEME.help_fg),
+            Style::default().fg(THEME.load().help_fg),
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -335,13 +335,13 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
 
     if let Some(err) = &state.row_error {
         let spans = vec![
-            Span::styled(format!("! {}  ", err), Style::default().fg(THEME.error_color)),
-            Span::styled(hint.to_string(), Style::default().fg(THEME.help_fg)),
+            Span::styled(format!("! {}  ", err), Style::default().fg(THEME.load().error_color)),
+            Span::styled(hint.to_string(), Style::default().fg(THEME.load().help_fg)),
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
         frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(THEME.help_fg)),
+            Paragraph::new(hint).style(Style::default().fg(THEME.load().help_fg)),
             area,
         );
     }

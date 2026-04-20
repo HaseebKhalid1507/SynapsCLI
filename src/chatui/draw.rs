@@ -24,7 +24,7 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
         if dist < CHARS.len() { CHARS[dist] } else { ' ' }
     }).collect();
     let pulse = (spinner_frame as f64 / 15.0).sin() * 0.3 + 0.7;
-    let Color::Rgb(br, bg, bb) = THEME.border_active else { return (trace, Color::Reset) };
+    let Color::Rgb(br, bg, bb) = THEME.load().border_active else { return (trace, Color::Reset) };
     let color = Color::Rgb(
         (br as f64 * pulse) as u8,
         (bg as f64 * pulse) as u8,
@@ -59,7 +59,7 @@ pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option
 
 pub(crate) fn boot_effect() -> Effect {
     use tachyonfx::fx::Direction as FxDir;
-    let Color::Rgb(r, g, b) = THEME.bg else { return fx::sleep(0) };
+    let Color::Rgb(r, g, b) = THEME.load().bg else { return fx::sleep(0) };
     fx::parallel(&[
         // CRT-style scanline reveal, top-to-bottom, clean (no randomness) with a tight gradient trail
         fx::sweep_in(FxDir::UpToDown, 10, 0, Color::Rgb(r.saturating_add(10), g.saturating_add(15), b.saturating_add(20)), (750, Interpolation::QuintOut)),
@@ -70,7 +70,7 @@ pub(crate) fn boot_effect() -> Effect {
 
 pub(crate) fn quit_effect() -> Effect {
     use tachyonfx::fx::Direction as FxDir;
-    let Color::Rgb(r, g, b) = THEME.muted else { return fx::sleep(0) };
+    let Color::Rgb(r, g, b) = THEME.load().muted else { return fx::sleep(0) };
     fx::sequence(&[
         fx::hsl_shift_fg([180.0, -40.0, 0.0], (180, Interpolation::QuadOut)),
         fx::parallel(&[
@@ -128,7 +128,7 @@ pub(crate) fn draw(
             let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
             Span::styled(
                 format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
-                Style::default().fg(THEME.status_streaming),
+                Style::default().fg(THEME.load().status_streaming),
             )
         } else if !app.subagents.is_empty() {
             let active = app.subagents.iter().filter(|s| !s.done).count();
@@ -137,25 +137,25 @@ pub(crate) fn draw(
             let spinner = if active > 0 { SPINNER_FRAMES[spinner_idx] } else { "\u{2714}" };
             Span::styled(
                 format!(" {} {} agent{} ({} done) ", spinner, active, if active != 1 { "s" } else { "" }, done),
-                Style::default().fg(THEME.subagent_name),
+                Style::default().fg(THEME.load().subagent_name),
             )
         } else if app.streaming {
             let pulse = ((app.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-            let Color::Rgb(sr, sg, sb) = THEME.status_streaming else { unreachable!() };
+            let Color::Rgb(sr, sg, sb) = THEME.load().status_streaming else { unreachable!() };
             let r = (sr as f64 * pulse) as u8;
             let g = (sg as f64 * pulse) as u8;
             let b = (sb as f64 * pulse) as u8;
             Span::styled(" \u{25cf} streaming ", Style::default().fg(Color::Rgb(r, g, b)))
         } else {
-            Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.status_ready))
+            Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(THEME.header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(THEME.muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.border)),
+            Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
+            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
+            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
             status_span,
         ]))
-        .style(Style::default().bg(THEME.bg));
+        .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(header, outer[0]);
 
         // -- Messages --------------------------------------------------------
@@ -202,7 +202,7 @@ pub(crate) fn draw(
         let msg_block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(THEME.border))
+            .border_style(Style::default().fg(THEME.load().border))
             .padding(Padding::horizontal(1));
         let messages_widget = Paragraph::new(visible.clone()).block(msg_block);
         frame.render_widget(Clear, msg_area);
@@ -246,13 +246,13 @@ pub(crate) fn draw(
                     let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
                     let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
                     let breathe = phase1 * 0.7 + phase2 * 0.3;
-                    let Color::Rgb(ar, ag, ab) = THEME.border_active else { unreachable!() };
+                    let Color::Rgb(ar, ag, ab) = THEME.load().border_active else { unreachable!() };
                     let breathe_scale = 0.7 + 0.3 * breathe; // breathe is -1..1, scale is 0.4..1.0
                     let r = (ar as f64 * breathe_scale) as u8;
                     let g = (ag as f64 * breathe_scale) as u8;
                     let b = (ab as f64 * breathe_scale) as u8;
                     let art_style = Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD);
-                    let Color::Rgb(mr, mg, mb) = THEME.muted else { unreachable!() };
+                    let Color::Rgb(mr, mg, mb) = THEME.load().muted else { unreachable!() };
                     let sub_style = Style::default().fg(Color::Rgb(
                         (mr as f64 * breathe_scale) as u8,
                         (mg as f64 * breathe_scale) as u8,
@@ -304,7 +304,7 @@ pub(crate) fn draw(
                     }
                 } else {
                     // Clean Dismiss: Top-Left to Bottom-Right (reverse of build-in)
-                    let art_style = Style::default().fg(THEME.muted).add_modifier(Modifier::BOLD);
+                    let art_style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD);
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
@@ -347,7 +347,7 @@ pub(crate) fn draw(
             let indicator = format!(" \u{2191}{} ", app.scroll_back);
             let indicator_widget = Paragraph::new(Span::styled(
                 indicator,
-                Style::default().fg(THEME.muted),
+                Style::default().fg(THEME.load().muted),
             ))
             .alignment(Alignment::Right);
             let indicator_area = ratatui::layout::Rect {
@@ -376,18 +376,18 @@ pub(crate) fn draw(
                     let is_timeout = sa.status.contains("timed out");
                     let is_error = sa.status.starts_with("\u{2718}");
                     let done_color = if is_timeout {
-                        THEME.warning_color
+                        THEME.load().warning_color
                     } else if is_error {
-                        THEME.error_color
+                        THEME.load().error_color
                     } else {
-                        THEME.subagent_done
+                        THEME.load().subagent_done
                     };
                     let icon = if is_timeout { "  \u{26a0} " } else if is_error { "  \u{2718} " } else { "  \u{2714} " };
                     agent_lines.push(Line::from(vec![
                         Span::styled(icon, Style::default().fg(done_color)),
                         Span::styled(
                             format!("{} ", sa.name),
-                            Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                            Style::default().fg(THEME.load().subagent_name).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             &sa.status,
@@ -395,7 +395,7 @@ pub(crate) fn draw(
                         ),
                         Span::styled(
                             format!("  {}", time_str),
-                            Style::default().fg(THEME.subagent_time),
+                            Style::default().fg(THEME.load().subagent_time),
                         ),
                     ]));
                 } else {
@@ -403,19 +403,19 @@ pub(crate) fn draw(
                     agent_lines.push(Line::from(vec![
                         Span::styled(
                             format!("  {} ", spinner),
-                            Style::default().fg(THEME.subagent_name),
+                            Style::default().fg(THEME.load().subagent_name),
                         ),
                         Span::styled(
                             format!("{} ", sa.name),
-                            Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                            Style::default().fg(THEME.load().subagent_name).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             &sa.status,
-                            Style::default().fg(THEME.subagent_status),
+                            Style::default().fg(THEME.load().subagent_status),
                         ),
                         Span::styled(
                             format!("  {}", time_str),
-                            Style::default().fg(THEME.subagent_time),
+                            Style::default().fg(THEME.load().subagent_time),
                         ),
                     ]));
                 }
@@ -434,30 +434,30 @@ pub(crate) fn draw(
             let agent_block = Block::default()
                 .title(Span::styled(
                     title,
-                    Style::default().fg(THEME.subagent_name).add_modifier(Modifier::BOLD),
+                    Style::default().fg(THEME.load().subagent_name).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(THEME.subagent_border))
-                .style(Style::default().bg(THEME.bg));
+                .border_style(Style::default().fg(THEME.load().subagent_border))
+                .style(Style::default().bg(THEME.load().bg));
             let agent_widget = Paragraph::new(agent_lines).block(agent_block);
             frame.render_widget(agent_widget, outer[2]);
         }
 
         // -- Input -----------------------------------------------------------
-        let input_border_color = if app.streaming { THEME.border } else { THEME.border_active };
+        let input_border_color = if app.streaming { THEME.load().border } else { THEME.load().border_active };
         let input_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(input_border_color))
-            .style(Style::default().bg(THEME.bg));
+            .style(Style::default().bg(THEME.load().bg));
         // Build pre-wrapped input lines using char-level wrapping (must match input_wrap_info exactly)
         let input_lines_vec: Vec<Line> = {
             use unicode_width::UnicodeWidthChar;
             let w = input_inner_width.max(1) as usize;
             let prefix_width: usize = 2;
-            let prompt_style = Style::default().fg(THEME.prompt_fg);
-            let input_style = Style::default().fg(THEME.input_fg);
+            let prompt_style = Style::default().fg(THEME.load().prompt_fg);
+            let input_style = Style::default().fg(THEME.load().input_fg);
 
             let mut rows: Vec<Vec<Span>> = Vec::new();
             let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
@@ -515,9 +515,9 @@ pub(crate) fn draw(
             ])
             .split(outer[4]);
 
-        let key_style = Style::default().fg(THEME.muted);
-        let label_style = Style::default().fg(THEME.help_fg);
-        let dot_style = Style::default().fg(THEME.help_fg);
+        let key_style = Style::default().fg(THEME.load().muted);
+        let label_style = Style::default().fg(THEME.load().help_fg);
+        let dot_style = Style::default().fg(THEME.load().help_fg);
 
         let keybinds = Paragraph::new(Line::from(vec![
             Span::styled(" ctrl+c ", key_style),
@@ -538,7 +538,7 @@ pub(crate) fn draw(
             Span::styled("enter ", key_style),
             Span::styled("send", label_style),
         ]))
-        .style(Style::default().bg(THEME.bg));
+        .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(keybinds, footer_chunks[0]);
 
         let cost_str = if app.session_cost > 0.0 {
@@ -568,8 +568,8 @@ pub(crate) fn draw(
             String::new()
         };
         let info = Paragraph::new(Line::from(vec![
-            Span::styled(&cost_str, Style::default().fg(THEME.cost_color)),
-            Span::styled(&token_str, Style::default().fg(THEME.muted)),
+            Span::styled(&cost_str, Style::default().fg(THEME.load().cost_color)),
+            Span::styled(&token_str, Style::default().fg(THEME.load().muted)),
             {
                 // Context usage bar — per-turn occupancy as a fraction of the
                 // model's own context window. Numerator `last_turn_context`
@@ -586,11 +586,11 @@ pub(crate) fn draw(
                     let filled = (usage_ratio * bar_width as f64).round() as usize;
                     let empty = bar_width.saturating_sub(filled);
                     let bar_color = if usage_ratio < 0.5 {
-                        THEME.border_active
+                        THEME.load().border_active
                     } else if usage_ratio < 0.75 {
-                        THEME.status_streaming
+                        THEME.load().status_streaming
                     } else {
-                        THEME.error_color
+                        THEME.load().error_color
                     };
                     let pct = (usage_ratio * 100.0) as u32;
                     Span::styled(
@@ -601,14 +601,14 @@ pub(crate) fn draw(
                     Span::raw("")
                 }
             },
-            Span::styled("\u{03b8}:", Style::default().fg(THEME.muted)),
-            Span::styled(thinking.to_string(), Style::default().fg(THEME.help_fg)),
-            Span::styled(" \u{2502} ", Style::default().fg(THEME.border)),
-            Span::styled(model, Style::default().fg(THEME.header_fg)),
+            Span::styled("\u{03b8}:", Style::default().fg(THEME.load().muted)),
+            Span::styled(thinking.to_string(), Style::default().fg(THEME.load().help_fg)),
+            Span::styled(" \u{2502} ", Style::default().fg(THEME.load().border)),
+            Span::styled(model, Style::default().fg(THEME.load().header_fg)),
             Span::styled(" ", Style::default()),
         ]))
         .alignment(Alignment::Right)
-        .style(Style::default().bg(THEME.bg));
+        .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(info, footer_chunks[1]);
 
         if let Some(ref mut fx) = effect {
