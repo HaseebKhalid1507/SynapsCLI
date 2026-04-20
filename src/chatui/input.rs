@@ -134,6 +134,11 @@ fn handle_key(
     streaming: bool,
     registry: &Arc<CommandRegistry>,
 ) -> InputAction {
+    // Any non-Tab key resets the tab-completion cycle state. (Tab handler
+    // below returns early after setting its own cycle state.)
+    if !matches!(code, KeyCode::Tab) {
+        app.tab_cycle = None;
+    }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             return InputAction::Quit;
@@ -154,6 +159,8 @@ fn handle_key(
         }
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
             handle_tab_complete(app, registry);
+            // Skip the tab_cycle reset below — we just set it.
+            return InputAction::None;
         }
         // Cursor movement
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -262,25 +269,60 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     InputAction::StreamingInput(input)
 }
 
-/// Tab completion for slash commands.
+/// Tab completion for slash commands. First Tab completes to the longest
+/// common prefix; subsequent Tabs cycle through all matches. Cycle state
+/// is cleared by any non-Tab keypress (see input handler).
 fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
-    let partial = &app.input[1..];
     let commands = super::commands::all_commands_with_skills(registry);
+
+    // If already cycling, advance to the next match.
+    if let Some((ref prefix, idx)) = app.tab_cycle.clone() {
+        let matches: Vec<&String> = commands.iter()
+            .filter(|c| c.starts_with(prefix.as_str()))
+            .collect();
+        if matches.is_empty() {
+            app.tab_cycle = None;
+            return;
+        }
+        let next = (idx + 1) % matches.len();
+        app.input = format!("/{}", matches[next]);
+        app.cursor_pos = app.input.chars().count();
+        app.tab_cycle = Some((prefix.clone(), next));
+        return;
+    }
+
+    // Fresh tab press — find matches for the current partial.
+    let partial = app.input[1..].to_string();
     let matches: Vec<&String> = commands.iter()
-        .filter(|c| c.starts_with(partial))
+        .filter(|c| c.starts_with(partial.as_str()))
         .collect();
+
+    if matches.is_empty() {
+        return;
+    }
+
     if matches.len() == 1 {
         app.input = format!("/{}", matches[0]);
         app.cursor_pos = app.input.chars().count();
-    } else if matches.len() > 1 {
-        let first = matches[0];
-        let common_len = (0..first.len())
-            .take_while(|&i| matches.iter().all(|m| m.as_bytes().get(i) == first.as_bytes().get(i)))
-            .count();
-        if common_len > partial.len() {
-            app.input = format!("/{}", &first[..common_len]);
-            app.cursor_pos = app.input.chars().count();
-        }
+        return;
+    }
+
+    // Multiple matches: first extend to longest common prefix; if that
+    // didn't add anything new, start cycling through matches.
+    let first = matches[0];
+    let common_len = (0..first.len())
+        .take_while(|&i| matches.iter().all(|m| m.as_bytes().get(i) == first.as_bytes().get(i)))
+        .count();
+
+    if common_len > partial.len() {
+        // Extend to common prefix — don't start cycling yet.
+        app.input = format!("/{}", &first[..common_len]);
+        app.cursor_pos = app.input.chars().count();
+    } else {
+        // Already at common prefix — start cycle from match[0].
+        app.input = format!("/{}", matches[0]);
+        app.cursor_pos = app.input.chars().count();
+        app.tab_cycle = Some((partial, 0));
     }
 }
 
