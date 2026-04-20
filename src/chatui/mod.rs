@@ -38,52 +38,21 @@ use tachyonfx::{Effect, Shader};
 
 /// Apply a settings-menu change: mutate Runtime where possible, persist to config,
 /// and stash write errors in the modal's row_error slot.
-/// Keys that apply_setting() handles — must stay in sync with ALL_SETTINGS.
-/// Test `settings_keys_match_apply_setting` enforces parity.
-pub(crate) const APPLY_SETTING_KEYS: &[&str] = &[
-    "model", "thinking", "api_retries", "bash_timeout",
-    "bash_max_timeout", "subagent_timeout", "max_tool_output", "theme",
-];
-
+///
+/// The runtime mutation is delegated to the macro-generated dispatch in
+/// `settings/defs.rs` — single source of truth for schema + apply.
 fn apply_setting(
     key: &'static str,
     value: &str,
     app: &mut App,
     runtime: &mut synaps_cli::Runtime,
 ) {
-    match key {
-        "thinking" => {
-            let budget = match value {
-                "low" => 2048,
-                "medium" => 4096,
-                "high" => 16384,
-                "xhigh" => 32768,
-                "adaptive" => 0,
-                _ => return,
-            };
-            runtime.set_thinking_budget(budget);
-        }
-        "model" => {
-            runtime.set_model(value.to_string());
-        }
-        "api_retries" => {
-            if let Ok(n) = value.parse::<u32>() { runtime.set_api_retries(n); }
-        }
-        "bash_timeout" => {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_timeout(n); }
-        }
-        "bash_max_timeout" => {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_bash_max_timeout(n); }
-        }
-        "subagent_timeout" => {
-            if let Ok(n) = value.parse::<u64>() { runtime.set_subagent_timeout(n); }
-        }
-        "max_tool_output" => {
-            if let Ok(n) = value.parse::<usize>() { runtime.set_max_tool_output(n); }
-        }
-        "skills" | "theme" => {}
-        _ => return,
-    }
+    // Runtime mutation (generated from settings/defs.rs).
+    settings::defs::apply_setting_dispatch(key, value, runtime, app);
+
+    // `skills` is internal — not persisted via write_config_value.
+    if key == "skills" { return; }
+
     match synaps_cli::config::write_config_value(key, value) {
         Ok(()) => {
             if let Some(st) = app.settings.as_mut() {
