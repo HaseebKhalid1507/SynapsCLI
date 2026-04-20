@@ -25,12 +25,14 @@ pub fn default_model() -> &'static str {
 /// header required.
 pub fn model_supports_adaptive_thinking(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // Parse the version from "claude-<family>-<major>-<minor>"
-    // Adaptive required on any Opus 4.6+, Sonnet 4.6+, and assumed on any 5.x+.
-    if m.contains("opus-4-6") || m.contains("opus-4-7") || m.contains("opus-4-8") || m.contains("opus-4-9") {
+    // Only Opus 4.7+ REQUIRES adaptive. Opus 4.6 supports it optionally
+    // but works fine with enabled+budget_tokens (and doesn't support the
+    // xhigh effort level that adaptive users expect). Keep 4.6 on the
+    // legacy path to avoid effort-mapping headaches.
+    if m.contains("opus-4-7") || m.contains("opus-4-8") || m.contains("opus-4-9") {
         return true;
     }
-    if m.contains("sonnet-4-6") || m.contains("sonnet-4-7") || m.contains("sonnet-4-8") || m.contains("sonnet-4-9") {
+    if m.contains("sonnet-4-7") || m.contains("sonnet-4-8") || m.contains("sonnet-4-9") {
         return true;
     }
     // 5.x and beyond — assume adaptive by default.
@@ -143,14 +145,25 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_thinking_required_for_opus_4_6_plus() {
-        assert!(model_supports_adaptive_thinking("claude-opus-4-6"));
+    fn adaptive_thinking_required_for_opus_4_7_plus() {
         assert!(model_supports_adaptive_thinking("claude-opus-4-7"));
+        assert!(model_supports_adaptive_thinking("claude-opus-4-8"));
     }
 
     #[test]
-    fn adaptive_thinking_required_for_sonnet_4_6_plus() {
-        assert!(model_supports_adaptive_thinking("claude-sonnet-4-6"));
+    fn adaptive_thinking_not_for_opus_4_6() {
+        // 4.6 uses enabled+budget_tokens (deprecated but functional)
+        assert!(!model_supports_adaptive_thinking("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn adaptive_thinking_not_for_sonnet_4_6() {
+        assert!(!model_supports_adaptive_thinking("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn adaptive_thinking_required_for_sonnet_4_7_plus() {
+        assert!(model_supports_adaptive_thinking("claude-sonnet-4-7"));
     }
 
     #[test]
