@@ -219,10 +219,11 @@ pub(crate) fn draw(
                 r" ███████    ██    ██   ████ ██   ██ ██      ███████",
             ];
 
-            let art_char_widths: Vec<usize> = ascii_art.iter()
-                .map(|l| l.chars().count())
+            use unicode_width::UnicodeWidthStr;
+            let art_display_widths: Vec<usize> = ascii_art.iter()
+                .map(|l| UnicodeWidthStr::width(*l))
                 .collect();
-            let max_art_width = art_char_widths.iter().copied().max().unwrap_or(0);
+            let max_art_width = art_display_widths.iter().copied().max().unwrap_or(0);
             let avail_w = msg_area.width as usize;
             let avail_h = msg_area.height as usize;
 
@@ -263,7 +264,7 @@ pub(crate) fn draw(
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_char_widths[j];
+                        let char_w = art_display_widths[j];
                         let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
                         let y = start_y + j as u16;
                         if y >= msg_area.y && y < msg_area.y + msg_area.height {
@@ -308,7 +309,7 @@ pub(crate) fn draw(
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_char_widths[j];
+                        let char_w = art_display_widths[j];
                         let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
                         let y = start_y + j as u16;
 
