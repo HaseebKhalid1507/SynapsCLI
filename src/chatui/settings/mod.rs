@@ -96,6 +96,8 @@ pub(super) struct SettingsState {
     pub edit_mode: Option<ActiveEditor>,
     /// Transient error/note shown under a row.
     pub row_error: Option<(String, String)>,
+    /// When a theme picker is open, the theme name before previewing began.
+    pub original_theme_name: Option<String>,
 }
 
 impl SettingsState {
@@ -106,6 +108,7 @@ impl SettingsState {
             focus: Focus::Left,
             edit_mode: None,
             row_error: None,
+            original_theme_name: None,
         }
     }
 
