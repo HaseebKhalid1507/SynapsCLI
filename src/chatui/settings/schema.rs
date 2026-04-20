@@ -122,6 +122,34 @@ mod tests {
         }
     }
 
+    /// Parity check — every setting key has a handler in apply_setting().
+    #[test]
+    fn every_setting_key_handled_by_apply_setting() {
+        let handled = super::super::super::APPLY_SETTING_KEYS;
+        for def in ALL_SETTINGS {
+            assert!(
+                handled.contains(&def.key),
+                "setting '{}' is in ALL_SETTINGS but not in APPLY_SETTING_KEYS — add it to apply_setting()",
+                def.key
+            );
+        }
+    }
+
+    /// Reverse check — every key in APPLY_SETTING_KEYS exists in ALL_SETTINGS.
+    #[test]
+    fn apply_setting_keys_all_have_schema_entry() {
+        let schema_keys: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
+        for key in super::super::super::APPLY_SETTING_KEYS {
+            // "skills" is handled by apply_setting but not in schema (internal)
+            if *key == "skills" { continue; }
+            assert!(
+                schema_keys.contains(key),
+                "APPLY_SETTING_KEYS has '{}' but ALL_SETTINGS doesn't — remove it or add a schema entry",
+                key
+            );
+        }
+    }
+
     #[test]
     fn every_setting_belongs_to_known_category() {
         for def in ALL_SETTINGS {
