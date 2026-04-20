@@ -452,6 +452,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                 "medium" | "med" => { rt.set_thinking_budget(4096); }
                 "high" => { rt.set_thinking_budget(16384); }
                 "xhigh" => { rt.set_thinking_budget(32768); }
+                "adaptive" => { rt.set_thinking_budget(0); }
                 "" => {
                     let _ = broadcast.send(ServerMessage::System {
                         message: format!("thinking: {} ({})", rt.thinking_level(), rt.thinking_budget()),

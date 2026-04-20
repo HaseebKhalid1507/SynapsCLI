@@ -182,7 +182,8 @@ impl Runtime {
 
     pub fn thinking_level(&self) -> &str {
         match self.thinking_budget {
-            0..=2048 => "low",
+            0 => "adaptive",
+            1..=2048 => "low",
             2049..=4096 => "medium",
             4097..=16384 => "high",
             _ => "xhigh",

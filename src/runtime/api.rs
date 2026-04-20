@@ -61,6 +61,16 @@ impl ApiMethods {
         let mut cleaned_messages = messages.to_vec();
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
+        // Derive the thinking level from the budget for effort mapping.
+        // Budget 0 = "adaptive" (model decides depth). See core/models.rs.
+        let thinking_level = match thinking_budget {
+            0 => "adaptive",
+            1..=2048 => "low",
+            2049..=4096 => "medium",
+            4097..=16384 => "high",
+            _ => "xhigh",
+        };
+
         let mut body = json!({
             "model": model,
             "max_tokens": HelperMethods::max_tokens_for_model(model),
@@ -68,11 +78,7 @@ impl ApiMethods {
             "tools": &*tools.tools_schema(),
             "stream": true,
             "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
-                // Opus 4.6+/Sonnet 4.6+: `budget_tokens` is deprecated. Adaptive
-                // thinking auto-enables interleaved thinking (no beta header).
-                // The `thinking_budget` field on Runtime is ignored for these
-                // models — the model decides how much to think per-turn.
-                json!({ "type": "adaptive" })
+                json!({ "type": "adaptive", "display": "summarized" })
             } else {
                 json!({
                     "type": "enabled",
@@ -81,6 +87,14 @@ impl ApiMethods {
                 })
             }
         });
+
+        // For adaptive models, control thinking depth via effort (GA, no beta).
+        // "adaptive" level = omit effort entirely (model decides).
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
         if let Some(tool_list) = body["tools"].as_array_mut() {
@@ -476,14 +490,21 @@ impl ApiMethods {
         let mut cleaned_messages = messages.to_vec();
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
+        let thinking_level = match thinking_budget {
+            0 => "adaptive",
+            1..=2048 => "low",
+            2049..=4096 => "medium",
+            4097..=16384 => "high",
+            _ => "xhigh",
+        };
+
         let mut body = json!({
             "model": model,
             "max_tokens": HelperMethods::max_tokens_for_model(model),
             "messages": cleaned_messages,
             "tools": &*tools.tools_schema(),
             "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
-                // Opus 4.6+/Sonnet 4.6+: adaptive thinking, no fixed budget.
-                json!({ "type": "adaptive" })
+                json!({ "type": "adaptive", "display": "summarized" })
             } else {
                 json!({
                     "type": "enabled",
@@ -492,6 +513,12 @@ impl ApiMethods {
                 })
             }
         });
+
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
         if let Some(tools) = body["tools"].as_array_mut() {
