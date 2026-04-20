@@ -67,10 +67,18 @@ impl ApiMethods {
             "messages": cleaned_messages,
             "tools": &*tools.tools_schema(),
             "stream": true,
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-                "display": "summarized"
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                // Opus 4.6+/Sonnet 4.6+: `budget_tokens` is deprecated. Adaptive
+                // thinking auto-enables interleaved thinking (no beta header).
+                // The `thinking_budget` field on Runtime is ignored for these
+                // models — the model decides how much to think per-turn.
+                json!({ "type": "adaptive" })
+            } else {
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget,
+                    "display": "summarized"
+                })
             }
         });
 
@@ -473,10 +481,15 @@ impl ApiMethods {
             "max_tokens": HelperMethods::max_tokens_for_model(model),
             "messages": cleaned_messages,
             "tools": &*tools.tools_schema(),
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-                "display": "summarized"
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                // Opus 4.6+/Sonnet 4.6+: adaptive thinking, no fixed budget.
+                json!({ "type": "adaptive" })
+            } else {
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": thinking_budget,
+                    "display": "summarized"
+                })
             }
         });
 

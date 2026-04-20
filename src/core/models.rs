@@ -11,6 +11,34 @@ pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
 }
 
+/// Returns true for models that support (and require) adaptive thinking:
+/// `thinking: {type: "adaptive"}` with NO `budget_tokens` field.
+///
+/// Per Anthropic's docs as of 2026-04: Opus 4.6+/Sonnet 4.6+ deprecated
+/// the fixed-budget `{type: "enabled", budget_tokens: N}` shape. On those
+/// models the deprecated shape is silently accepted but returns no
+/// thinking content (observed S172 on Opus 4.7). Older models (Opus 4.5,
+/// Sonnet 4.5, Haiku, Opus 3.x) still use the enabled+budget shape.
+///
+/// Adaptive thinking also auto-enables interleaved thinking — no beta
+/// header required.
+pub fn model_supports_adaptive_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Parse the version from "claude-<family>-<major>-<minor>"
+    // Adaptive required on any Opus 4.6+, Sonnet 4.6+, and assumed on any 5.x+.
+    if m.contains("opus-4-6") || m.contains("opus-4-7") || m.contains("opus-4-8") || m.contains("opus-4-9") {
+        return true;
+    }
+    if m.contains("sonnet-4-6") || m.contains("sonnet-4-7") || m.contains("sonnet-4-8") || m.contains("sonnet-4-9") {
+        return true;
+    }
+    // 5.x and beyond — assume adaptive by default.
+    if m.contains("opus-5") || m.contains("sonnet-5") || m.contains("haiku-5") {
+        return true;
+    }
+    false
+}
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
@@ -94,5 +122,35 @@ mod tests {
     #[test]
     fn context_window_is_case_insensitive() {
         assert_eq!(context_window_for_model("CLAUDE-OPUS-4-7"), 1_000_000);
+    }
+
+    #[test]
+    fn adaptive_thinking_required_for_opus_4_6_plus() {
+        assert!(model_supports_adaptive_thinking("claude-opus-4-6"));
+        assert!(model_supports_adaptive_thinking("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn adaptive_thinking_required_for_sonnet_4_6_plus() {
+        assert!(model_supports_adaptive_thinking("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn adaptive_thinking_not_for_older_models() {
+        assert!(!model_supports_adaptive_thinking("claude-opus-4-5"));
+        assert!(!model_supports_adaptive_thinking("claude-sonnet-4-5"));
+        assert!(!model_supports_adaptive_thinking("claude-haiku-4-5-20251001"));
+        assert!(!model_supports_adaptive_thinking("claude-opus-3-5"));
+    }
+
+    #[test]
+    fn adaptive_thinking_assumed_for_5x() {
+        assert!(model_supports_adaptive_thinking("claude-opus-5-0"));
+        assert!(model_supports_adaptive_thinking("claude-sonnet-5-1"));
+    }
+
+    #[test]
+    fn adaptive_thinking_case_insensitive() {
+        assert!(model_supports_adaptive_thinking("CLAUDE-OPUS-4-7"));
     }
 }
