@@ -62,14 +62,7 @@ impl ApiMethods {
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
         // Derive the thinking level from the budget for effort mapping.
-        // Budget 0 = "adaptive" (model decides depth). See core/models.rs.
-        let thinking_level = match thinking_budget {
-            0 => "adaptive",
-            1..=2048 => "low",
-            2049..=4096 => "medium",
-            4097..=16384 => "high",
-            _ => "xhigh",
-        };
+        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
 
         let mut body = json!({
             "model": model,
@@ -84,7 +77,7 @@ impl ApiMethods {
                 // If user picked "adaptive" (sentinel 0) on a legacy model, fall back
                 // to "high" (16384) — the model's effective thinking depth without
                 // the deprecated-but-functional adaptive shape it doesn't support.
-                let budget = if thinking_budget == 0 { 16384 } else { thinking_budget };
+                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
                 json!({
                     "type": "enabled",
                     "budget_tokens": budget,
@@ -495,13 +488,7 @@ impl ApiMethods {
         let mut cleaned_messages = messages.to_vec();
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
-        let thinking_level = match thinking_budget {
-            0 => "adaptive",
-            1..=2048 => "low",
-            2049..=4096 => "medium",
-            4097..=16384 => "high",
-            _ => "xhigh",
-        };
+        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
 
         let mut body = json!({
             "model": model,
@@ -513,7 +500,7 @@ impl ApiMethods {
             } else {
                 // Legacy path: budget_tokens must be >= 1024. Fall back to "high"
                 // if the sentinel 0 (adaptive) leaked through for a legacy model.
-                let budget = if thinking_budget == 0 { 16384 } else { thinking_budget };
+                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
                 json!({
                     "type": "enabled",
                     "budget_tokens": budget,
