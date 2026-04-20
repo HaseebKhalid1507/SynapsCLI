@@ -263,16 +263,21 @@ pub(crate) fn draw(
                     let build_t = app.logo_build_t.unwrap_or(1.0);
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
+                    let art_x = msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
                     for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_display_widths[j];
-                        let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
+                        let x = art_x;
                         let y = start_y + j as u16;
                         if y >= msg_area.y && y < msg_area.y + msg_area.height {
-                            let clamped_w = char_w.min(avail_w);
+                            let clamped_w = max_art_width.min(avail_w);
 
                             if build_t >= 1.0 {
+                                // Render char-by-char for consistent alignment
+                                let mut spans: Vec<Span> = Vec::with_capacity(clamped_w);
+                                for ch in line.chars().take(clamped_w) {
+                                    spans.push(Span::styled(ch.to_string(), art_style));
+                                }
                                 let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
-                                frame.render_widget(Paragraph::new(Span::styled(line.to_string(), art_style)), area);
+                                frame.render_widget(Paragraph::new(Line::from(spans)), area);
                             } else {
                                 // Diagonal assemby: Bottom-Right to Top-Left
                                 let mut built = String::with_capacity(clamped_w);
