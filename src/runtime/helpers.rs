@@ -111,4 +111,67 @@ impl HelperMethods {
             64000
         }
     }
+
+    /// Append a single-line usage record to the per-call log — opt-in via the
+    /// `SYNAPS_USAGE_LOG` env var. Silent no-op if unset or set to "0".
+    ///
+    /// Value semantics:
+    /// - unset or "0" or empty → logging disabled
+    /// - "1" or "true" → default path `~/.cache/synaps/usage.log`
+    /// - anything else → treated as an absolute path
+    ///
+    /// File is created with mode 0600 to prevent co-located-user snooping
+    /// (previous versions wrote to `/tmp/synaps-usage.log` world-readable —
+    /// flagged by S172 security review). Errors silently dropped so a broken
+    /// log path never breaks the request pipeline.
+    pub(super) fn log_usage(input_t: u64, cache_read: u64, cache_create: u64, output_t: u64) {
+        let setting = match std::env::var("SYNAPS_USAGE_LOG") {
+            Ok(v) if !v.is_empty() && v != "0" => v,
+            _ => return,
+        };
+
+        let path = if matches!(setting.as_str(), "1" | "true" | "True" | "TRUE") {
+            let home = match std::env::var("HOME") {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            format!("{}/.cache/synaps/usage.log", home)
+        } else {
+            setting
+        };
+
+        // Best-effort: create parent dir; ignore failure (open will error out)
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let total = input_t + cache_read + cache_create;
+        let pct = if total > 0 { (cache_read as f64 / total as f64 * 100.0) as u32 } else { 0 };
+
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: refuse to open if the target is a symlink. Defensive
+        // against a co-located user planting a symlink at a custom
+        // SYNAPS_USAGE_LOG path (CWE-59). The default path lives under
+        // $HOME/.cache which is typically 0700 so this is belt-and-braces.
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW_FLAG: i32 = 0o400000;
+        #[cfg(target_os = "macos")]
+        const O_NOFOLLOW_FLAG: i32 = 0x0100;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const O_NOFOLLOW_FLAG: i32 = 0;
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(&path);
+        if let Ok(mut f) = result {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "uncached={} cache_read={} cache_write={} output={} hit={}%",
+                input_t, cache_read, cache_create, output_t, pct
+            );
+        }
+    }
 }
