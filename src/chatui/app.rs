@@ -36,6 +36,10 @@ pub(crate) struct App {
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) input_stash: String,
+    /// Tab-completion cycle state for slash commands. `Some((prefix, index))`
+    /// when the user is cycling through matches via repeated Tab; cleared
+    /// on any non-Tab keypress. See input.rs::handle_tab_complete.
+    pub(crate) tab_cycle: Option<(String, usize)>,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) total_input_tokens: u64,
@@ -116,6 +120,7 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             input_stash: String::new(),
+            tab_cycle: None,
             input_tokens: 0,
             output_tokens: 0,
             total_input_tokens: 0,
