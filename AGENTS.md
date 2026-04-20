@@ -1,385 +1,439 @@
-# SynapsCLI Agent Reference
+# AGENTS.md — SynapsCLI Developer & Agent Guide
 
-You are an AI agent running inside the SynapsCLI runtime. This document describes your operating environment, available tools, and protocols.
+This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-## System Overview
-
-SynapsCLI has three operational modes. You are running in one of them:
-
-1. **Interactive** (`chatui`) — Human-agent chat with TUI, streaming, and tool access
-2. **Headless Worker** (`synaps-agent`) — Autonomous agent managed by the watcher
-3. **Subagent** — Dispatched by another agent for a focused task
-
-Your responses are powered by an LLM (typically Claude) via the Anthropic API. You have access to a standardized tool suite described below.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) with 8 binaries. Talks to Anthropic's API, streams SSE, dispatches tools, renders a TUI.
 
 ---
 
-## Tool Reference
+## Build & Test
+
+```bash
+cargo build --release                    # full release build (lto, single codegen unit, strip)
+cargo build                              # dev build — faster compile, slower runtime
+cargo test --lib                         # most tests
+cargo test --lib -- --test-threads=1     # required for PTY tests in src/tools/shell/pty.rs
+cargo clippy --all-targets               # linting
+```
+
+**Minimum Rust:** 1.80 (edition 2021).
+**Config path:** `~/.synaps-cli/config` (plain `key = value`, see `src/core/config.rs`).
+**Binaries:** `target/release/{chatui, chat, cli, synaps-agent, watcher, login, server, client}`.
+
+- `chatui` — interactive TUI (the main product)
+- `chat` — single-shot CLI chat
+- `cli` — non-interactive one-shot command
+- `synaps-agent` — headless worker managed by the watcher
+- `watcher` — supervisor daemon
+- `login` — OAuth flow
+- `server`/`client` — WebSocket relay (less-used)
+
+**Test quirks:**
+- 7 PTY tests in `src/tools/shell/pty.rs` and `src/tools/shell/{start,send,end}.rs` fail under parallel due to TTY contention. Use `--test-threads=1`. Not a bug.
+- Tests use `tempfile` crate. No fixtures checked in.
+
+---
+
+## Project Structure
+
+```
+src/
+├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, config, models, etc.
+├── bin/                  — 6 binary entry points (agent, chat, cli, client, login, server)
+│   └── (chatui and watcher have their own dirs, not flat files)
+├── core/                 — shared primitives
+│   ├── config.rs         — SynapsConfig, load/write, profile resolution
+│   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
+│   ├── session.rs        — on-disk session persistence (JSONL)
+│   ├── auth/             — OAuth PKCE flow, token storage (fs4-locked, mode 600)
+│   ├── protocol.rs       — WebSocket wire format (server/client)
+│   ├── error.rs          — SynapsError type
+│   ├── logging.rs        — tracing subscriber setup
+│   └── watcher_types.rs  — shared types for watcher IPC
+├── runtime/              — THE BRAIN
+│   ├── mod.rs            — Runtime struct, orchestration loop
+│   ├── api.rs            — Anthropic API body construction + SSE parsing
+│   ├── stream.rs         — tool dispatch from streamed tool_use events
+│   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
+│   ├── types.rs          — StreamEvent enum (the wire between runtime and UIs)
+│   └── auth.rs           — auth token refresh before request
+├── tools/                — 10 built-in tools, each impls the Tool trait
+│   ├── mod.rs            — Tool trait, ToolContext
+│   ├── registry.rs       — ToolRegistry::new() registers all built-ins
+│   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
+│   ├── subagent.rs       — spawns a child Runtime in an isolated thread
+│   ├── agent.rs          — (legacy — prefer subagent.rs)
+│   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
+│   ├── shell/            — stateful PTY shell (start/send/end) — session manager
+│   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
+├── chatui/               — the TUI
+│   ├── main.rs           — event loop + apply_setting()
+│   ├── app.rs            — App state, record_cost(), line cache
+│   ├── input.rs          — key handling, process_submit()
+│   ├── draw.rs           — render dispatch
+│   ├── render.rs         — message rendering
+│   ├── markdown.rs       — markdown → styled lines
+│   ├── highlight.rs      — syntect-backed syntax highlighting
+│   ├── stream_handler.rs — StreamEvent → UI mutation
+│   ├── commands.rs       — slash-command dispatch (ALL_COMMANDS, handle_command)
+│   ├── theme/            — 17 built-in palettes + user TOML loader
+│   ├── settings/         — /settings modal (schema, input, draw)
+│   ├── plugins/          — /plugins modal
+│   └── gamba.rs          — easter egg. Don't touch.
+├── watcher/              — supervisor daemon
+│   ├── mod.rs            — binary entry point
+│   ├── supervisor.rs     — per-agent lifecycle, limits, retries
+│   ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
+│   └── display.rs        — `watcher status` renderer
+├── mcp/                  — Model Context Protocol client
+│   ├── connection.rs     — JSON-RPC over stdio to MCP servers
+│   ├── lazy.rs           — lazy server spawn (don't pay until mcp_connect called)
+│   └── tool.rs           — MCP tools wrapped as Tool impls
+└── skills/               — skill discovery + command registry
+    ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
+    ├── manifest.rs       — plugin.json / marketplace.json parsers
+    ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
+    ├── marketplace.rs    — plugin install from marketplace
+    └── tool.rs           — load_skill Tool impl
+```
+
+---
+
+## The Request Lifecycle
+
+This is the single most important flow to understand.
+
+1. **User input** → `chatui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
+2. **Stream kickoff** → `Runtime::run_stream_with_messages()` in `runtime/mod.rs` (~line 377).
+3. **API body build** → `runtime/api.rs::call_api_stream()` (~line 30). Steps:
+   - Clone messages, strip UI-only fields.
+   - `HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages)` — see caching section below.
+   - Look up thinking config based on model: adaptive (`{type: "adaptive"}` + `output_config.effort`) for Opus 4.7+ / Sonnet 4.7+ / 5.x, else legacy (`{type: "enabled", budget_tokens: N}`). Gated by `model_supports_adaptive_thinking()` in `core/models.rs`.
+   - Serialize tool schemas (`ToolRegistry::schemas_json()`).
+   - POST to `https://api.anthropic.com/v1/messages` with `stream: true`.
+4. **SSE parse** → line-by-line in `api.rs` (~line 200+). Emits `StreamEvent`s (TextDelta, ThinkingDelta, ToolUse, Usage, MessageStop, Error).
+5. **Tool dispatch** → `runtime/stream.rs` collects `ToolUse` blocks, executes them in parallel via `tokio::spawn`, feeds `tool_result` blocks back into the next turn.
+6. **Loop** → steps 3–5 repeat until `stop_reason != "tool_use"` (typically `"end_turn"`).
+7. **UI update** → `chatui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`.
+
+`StreamEvent` (in `runtime/types.rs`) is the wire format between Runtime and any UI. Add new event variants here if you need to surface something new.
+
+---
+
+## Key Patterns
+
+### Adding a New Tool
+
+1. Create `src/tools/my_tool.rs` with a struct implementing the `Tool` trait:
+   ```rust
+   #[async_trait::async_trait]
+   pub trait Tool: Send + Sync {
+       fn name(&self) -> &str;
+       fn description(&self) -> &str;
+       fn parameters(&self) -> serde_json::Value;       // JSON Schema
+       async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
+   }
+   ```
+   See `src/tools/mod.rs:64`.
+2. Re-export in `src/tools/mod.rs` (`pub use my_tool::MyTool;`).
+3. Register in `src/tools/registry.rs::ToolRegistry::new()` — add to the `vec![]`.
+4. If it streams output, use `ctx.tx_delta` (UnboundedSender<String>) to push deltas.
+5. If it's restricted (e.g. watcher-only), gate on `ctx.watcher_exit_path.is_some()` or similar.
+
+The tool's `parameters()` JSON schema is what the model sees. Be precise — bad schemas lead to malformed tool calls.
+
+### Adding a New Setting (the 5-site sync — KNOWN PAIN POINT)
+
+Adding a setting requires touching 5 files. Miss one and you get silent failures.
+
+1. **`src/chatui/settings/schema.rs`** — add a `SettingDef` to `ALL_SETTINGS`. Pick `EditorKind::Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`.
+2. **`src/chatui/main.rs::apply_setting()`** — add a match arm that mutates `Runtime` (e.g. `runtime.set_foo(v)`).
+3. **`src/core/config.rs::load_config()`** — add a branch to parse the key from the config file.
+4. **`src/chatui/commands.rs`** — if it has a slash command (e.g. `/foo`), add to `ALL_COMMANDS` and handle in `handle_command`.
+5. **`src/skills/mod.rs`** — add to `BUILTIN_COMMANDS` (for tab-complete via `CommandRegistry`).
+
+The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step 3 omissions. The other sites are not tested. Be careful.
+
+**Tech debt:** `ALL_COMMANDS` (commands.rs:13) and `BUILTIN_COMMANDS` (skills/mod.rs:49) are duplicated lists. They must be kept in sync manually. Should be unified.
+
+### Adding a New Model
+
+1. `src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple.
+2. If it supports adaptive thinking: update `model_supports_adaptive_thinking()` (~line 26).
+3. If context window differs: update `context_window_for_model()` (~line 94).
+4. Pricing: update the match in `src/chatui/app.rs::record_cost()` (~line 256). Default falls back to Sonnet pricing.
+5. There are existing tests in `core/models.rs` — extend them.
+
+### Adding a New Theme
+
+1. Add a `Theme::my_theme()` method in `src/chatui/theme/palettes.rs` returning a populated `Theme` struct (all ~30 color fields).
+2. Register in `src/chatui/theme/mod.rs::Theme::builtin()` (~line 110) — add a `match` arm.
+3. Add the theme name to the list returned by `src/chatui/settings/mod.rs::theme_options()`.
+4. Test via `/settings → Appearance → Theme` or config `theme = my-theme`. Requires chatui restart to apply.
+
+### Adding a New Slash Command
+
+1. Add name to both `ALL_COMMANDS` (commands.rs:13) AND `BUILTIN_COMMANDS` (skills/mod.rs:49). Yes, both.
+2. If it should work during streaming, add to `STREAMING_COMMANDS` (commands.rs:20).
+3. Add a match arm in `handle_command()` (commands.rs).
+4. If it opens a modal, extend `CommandAction` enum and handle in `main.rs` event loop.
+
+---
+
+## Prompt Caching Strategy
+
+This is non-obvious and critical. See `src/runtime/helpers.rs:34::annotate_cache_breakpoint`.
+
+- **Manual breakpoint placement.** We don't use Anthropic's auto-cache.
+- Anthropic allows up to 4 cache markers per request. We reserve 2 for tools + system prompt (placed elsewhere in `api.rs`), leaving **2 for conversational markers**.
+- Breakpoints advance every **4 user messages**. The latest eligible user message gets a `cache_control: {type: "ephemeral"}` on its last content block.
+- **Historical messages are NEVER modified.** Prefix stability = cache stability. Adding even a single field to an old message invalidates all downstream cache hits.
+- Measured: **90% cache hit rate** vs ~53% with auto-cache. Manual wins.
+
+If you touch `annotate_cache_breakpoint`, re-verify hit rates with `/debug cache` or the usage logs.
+
+---
+
+## Thinking Config by Model
+
+Two code paths, gated by `model_supports_adaptive_thinking()`:
+
+**Adaptive (Opus 4.7+, Sonnet 4.7+, 5.x):**
+```json
+"thinking": {"type": "adaptive", "display": "summarized"}
+"output_config": {"effort": "low" | "medium" | "high" | "xhigh"}  // omitted if "adaptive"
+```
+No `budget_tokens` field — the API rejects it silently on these models (returns no thinking content, error S172).
+
+**Legacy (Opus 4.6, Sonnet 4.6, Haiku, Opus 3.x):**
+```json
+"thinking": {"type": "enabled", "budget_tokens": N, "display": "summarized"}
+```
+
+**The "0 is adaptive" sentinel:** `Runtime::thinking_budget: u32` uses `0` to mean "adaptive (model decides)". Any consumer must handle this. If a user sets `thinking = adaptive` but the model is legacy, `thinking_level_for_budget(0)` returns `"adaptive"` but the legacy path clamps it to `DEFAULT_LEGACY_ADAPTIVE_FALLBACK = 16384` (matches "high"). See `core/models.rs:80` and `runtime/api.rs` (the clamp site — commit 5edcb86).
+
+Mapping (`core/models.rs:68::thinking_level_for_budget`):
+- `0` → `"adaptive"`
+- `1..=2048` → `"low"`
+- `2049..=4096` → `"medium"`
+- `4097..=16384` → `"high"`
+- `16385..` → `"xhigh"`
+
+---
+
+## Configuration Flow
+
+```
+~/.synaps-cli/config (or ~/.synaps-cli/{profile}/config)
+  → core/config.rs::load_config()  — parses key = value, env var overrides
+  → Runtime::apply_config()         — sets fields on Runtime
+  → runtime/api.rs reads from Runtime at request time
+  → chatui/main.rs::apply_setting() — runtime mutation + write_config_value() for live /settings changes
+```
+
+`SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `core/config.rs::resolve_read_path()`.
+
+---
+
+## Common Pitfalls
+
+1. **5-site sync for settings** (see above). Miss one = silent failure.
+2. **`thinking_budget: 0` sentinel.** Always handle the "adaptive" case. Legacy paths must clamp.
+3. **Cache breakpoints are prefix-sensitive.** Any mutation to historical messages breaks the cache for all subsequent turns. Don't "fix up" old messages retroactively.
+4. **PTY tests fail under parallel.** Use `--test-threads=1`. Not a bug — TTY fd contention.
+5. **Binary swap requires process restart.** `cargo build` replaces `target/release/chatui` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes. (Obvious once you know it, confusing the first time.)
+6. **Two command lists** (`ALL_COMMANDS` vs `BUILTIN_COMMANDS`). Tech debt. Keep in sync or tab-complete breaks silently.
+7. **Subagent has NO subagent.** No recursion. Subagents also lack `mcp_connect`, `load_skill`, `watcher_exit`. Enforced by skipping registration in `tools/subagent.rs`.
+8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
+9. **MCP servers are lazy-spawned.** First `mcp_connect` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
+10. **OAuth tokens are file-locked** via `fs4`. Concurrent chatui + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
+
+---
+
+## Dependencies (key ones)
+
+- **`tokio` 1.x** — async runtime. `features = ["full"]`. Everything is async.
+- **`reqwest` 0.11** — HTTP client for Anthropic API.
+- **`ratatui` 0.29 + `crossterm` 0.28** — TUI framework.
+- **`tachyonfx` 0.9** — TUI visual effects (the gamba easter egg).
+- **`serde_json`** — everything JSON (messages, tool schemas, API bodies).
+- **`syntect` 5** — syntax highlighting. `default-themes + default-syntaxes + regex-onig`.
+- **`portable-pty` 0.9** — PTY for stateful shell tool.
+- **`notify` 6.1 + `globset` 0.4** — file-watching for watcher mode.
+- **`axum` 0.7 + `tokio-tungstenite`** — WS server/client (auxiliary).
+- **`fs4` 0.13** — advisory file locks for auth.json.
+- **`toml` 0.8** — watcher per-agent config (note: global config uses plain `key = value`, NOT TOML).
+
+Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`. Slow compile, small binary.
+
+---
+
+## File Layout Conventions
+
+- **One file per tool** in `src/tools/*.rs`. Complex tools get a sub-directory (e.g. `src/tools/shell/`).
+- **Chatui separation of concerns:**
+  - `input.rs` — key handling
+  - `draw.rs`/`render.rs` — rendering
+  - `app.rs` — state
+  - `commands.rs` — slash commands
+  - `stream_handler.rs` — StreamEvent → App mutation
+- **Tests** live in `#[cfg(test)] mod tests { ... }` at the bottom of each file.
+- **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `main.rs::apply_setting()`.
+- **Re-exports** happen at module roots (`tools/mod.rs`, `core/mod.rs`) and at the crate root (`lib.rs`). Prefer using the crate-root re-exports: `synaps_cli::Runtime`, `synaps_cli::config::...`, `synaps_cli::models::...`.
+
+---
+
+## The Runtime Struct
+
+Located at `src/runtime/mod.rs:28`. The single source of truth for a session.
+
+Owns: `model`, `thinking_budget`, `system_prompt`, `ToolRegistry` (behind `Arc<RwLock>`), HTTP client, limits (`max_tool_output`, `bash_timeout`, `bash_max_timeout`, `subagent_timeout`, `api_retries`).
+
+Key entry points:
+- `run_single(&self, prompt)` → `Result<String>` — one-shot, no streaming. Used by `cli` and `chat` binaries.
+- `run_stream(&self, prompt, cancel)` → stream of `StreamEvent` — fire-and-forget (synthesizes messages).
+- `run_stream_with_messages(...)` → stream with caller-supplied message history. **Used by chatui.**
+
+Config: `Runtime::apply_config(&SynapsConfig)` at startup; setters (`set_model`, `set_thinking_budget`, etc.) for live updates.
+
+Runtime is `Clone` (cheap — uses `Arc` internally) so subagents can fork from a parent.
+
+---
+
+## Known Tech Debt
+
+Things an agent should know about, but not necessarily fix in-passing:
+
+- **Command list duplication** (`ALL_COMMANDS` / `BUILTIN_COMMANDS`). Should be unified into one `pub const` consumed by both chatui and skills registry.
+- **Settings require 5-site edits.** A macro or derive could collapse this.
+- **`src/tools/agent.rs`** is legacy, superseded by `subagent.rs`. Kept for compatibility with older agent definitions. Remove after deprecation window.
+- **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
+- **SPEC-WATCHER.md** — the watcher subsystem (`src/watcher/`, `src/bin/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
+- **`gamba.rs`** — easter egg. Yes, really. Leave it alone.
+
+---
+
+## Watcher Subsystem (brief)
+
+The watcher daemon (`target/release/watcher`) supervises headless `synaps-agent` processes. Each agent lives at `~/.synaps-cli/watcher/{name}/` with `config.toml`, `soul.md` (system prompt), `handoff.json` (state from last session), `stats.json`, `heartbeat` (timestamp file), and `logs/`.
+
+Trigger modes:
+- `manual` — runs only when deployed via `watcher deploy`
+- `always` — auto-restart with cooldown
+- `watch` — triggered by file changes (via `notify` crate)
+
+Limits (per-agent, in `config.toml`): `max_session_tokens`, `max_session_duration_mins`, `max_session_cost_usd`, `max_daily_cost_usd`, `max_tool_calls`, `cooldown_secs`, `max_retries`.
+
+When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `src/tools/watcher_exit.rs` and `src/watcher/supervisor.rs`.
+
+IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, `stop`, `logs`.
+
+---
+
+## Tool Reference (for agents running INSIDE SynapsCLI)
+
+This is the runtime tool surface. An LLM agent running in chatui, synaps-agent, or as a subagent sees these tools.
 
 ### `bash`
+Execute shell commands via `bash -c`.
 
-Execute shell commands.
+| Parameter | Type | Req | Default | Notes |
+|---|---|---|---|---|
+| `command` | string | ✓ | — | |
+| `timeout` | integer | | 30 | Seconds, max 300 |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `command` | string | yes | — | The bash command to execute |
-| `timeout` | integer | no | 30 | Timeout in seconds, max 300 |
-
-**Behavior:**
-- Runs via `bash -c` with piped stdout/stderr
-- ANSI escape sequences stripped from output
-- Output truncated at 30KB with `[output truncated at 30KB]` notice
-- Process killed on timeout with `kill_on_drop`
-- Combined stdout + stderr in output
-
----
+ANSI stripped. Output truncated at 30KB. `kill_on_drop` on timeout. Combined stdout+stderr.
 
 ### `read`
+Read file with line numbers.
 
-Read file contents with line numbers.
+| Parameter | Type | Req | Default | Notes |
+|---|---|---|---|---|
+| `path` | string | ✓ | — | `~` expands |
+| `offset` | integer | | 0 | 0-indexed |
+| `limit` | integer | | 500 | |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `path` | string | yes | — | Path to file (`~` expands to home) |
-| `offset` | integer | no | 0 | Line to start from (0-indexed) |
-| `limit` | integer | no | 500 | Max lines to read |
-
-**Behavior:**
-- Returns numbered lines: `{line_number}\t{content}`
-- Validates UTF-8 — binary files return a clear error with suggestion to use `bash` + `xxd`
-- Shows `... (N more lines)` if truncated
-
----
+UTF-8 validated. Binary files error with suggestion to use `bash` + `xxd`.
 
 ### `write`
+Overwrite or create files. Atomic (temp file + rename). Creates parent dirs. Returns line + byte count.
 
-Create or overwrite files.
-
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `path` | string | yes | — | Path to file |
-| `content` | string | yes | — | Content to write |
-
-**Behavior:**
-- Creates parent directories automatically
-- Atomic write: writes to `.agent-tmp` then renames
-- Returns line count and byte count
-- Completely overwrites existing files
-
----
+| `path` (string, req) | `content` (string, req) |
 
 ### `edit`
+Surgical replacement. `old_string` must match exactly once.
 
-Surgical string replacement.
-
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `path` | string | yes | — | Path to file |
-| `old_string` | string | yes | — | Exact text to find (must match exactly once) |
-| `new_string` | string | yes | — | Replacement text |
-
-**Behavior:**
-- Fails if `old_string` matches 0 or >1 times
-- Atomic write via temp file + rename
-- Include enough surrounding context to make the match unique
-
----
+| `path` (string, req) | `old_string` (string, req) | `new_string` (string, req) |
 
 ### `grep`
+Recursive regex search.
 
-Search file contents using regex.
+| Parameter | Type | Req | Default | Notes |
+|---|---|---|---|---|
+| `pattern` | string | ✓ | — | |
+| `path` | string | | `.` | |
+| `include` | string | | — | Glob filter |
+| `context` | integer | | — | Lines before/after |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `pattern` | string | yes | — | Regex pattern |
-| `path` | string | no | `.` | File or directory to search |
-| `include` | string | no | — | Glob filter (e.g. `"*.rs"`) |
-| `context` | integer | no | — | Context lines before/after match |
-
-**Behavior:**
-- Recursive search, excludes `.git`, `node_modules`, `target`
-- 15-second timeout
-- Output truncated at 50KB with notice
-- Returns `No matches found.` on zero results
-
----
+Excludes `.git`, `node_modules`, `target`. 15s timeout. 50KB output cap.
 
 ### `find`
+Glob-based file search.
 
-Find files by glob pattern.
+| Parameter | Type | Req | Default | Notes |
+|---|---|---|---|---|
+| `pattern` | string | ✓ | — | |
+| `path` | string | | `.` | |
+| `type` | string | | — | `"f"` or `"d"` |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `pattern` | string | yes | — | Glob pattern (e.g. `"*.rs"`) |
-| `path` | string | no | `.` | Directory to search from |
-| `type` | string | no | — | `"f"` for files, `"d"` for directories |
-
-**Behavior:**
-- Recursive search, excludes `.git`, `node_modules`, `target`
-- 10-second timeout
-
----
+Same excludes as grep. 10s timeout.
 
 ### `ls`
+`ls -lah` output.
 
-List directory contents.
-
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `path` | string | no | `.` | Directory to list |
-
-**Behavior:**
-- Uses `ls -lah` format (permissions, size, date)
-- Returns `Directory is empty.` for empty directories
-
----
+| `path` (string, optional, default `.`) |
 
 ### `subagent`
+Dispatch a specialist. **Not available to subagents.**
 
-Dispatch a specialist agent for a focused task. **Not available to subagents** (no recursion).
+| Parameter | Type | Req | Default | Notes |
+|---|---|---|---|---|
+| `task` | string | ✓ | — | |
+| `agent` | string | * | — | Loads `~/.synaps-cli/agents/{name}.md` |
+| `system_prompt` | string | * | — | Inline alternative to `agent` |
+| `model` | string | | sonnet | Override |
+| `timeout` | integer | | 300 | Seconds |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `task` | string | yes | — | Task prompt for the subagent |
-| `agent` | string | no* | — | Agent name → loads `~/.synaps-cli/agents/{name}.md` |
-| `system_prompt` | string | no* | — | Inline system prompt (mutually exclusive with `agent`) |
-| `model` | string | no | `claude-sonnet-4-20250514` | Model override |
-| `timeout` | integer | no | 300 | Timeout in seconds |
+*Must provide `agent` OR `system_prompt`.
 
-*Must provide either `agent` or `system_prompt`.
-
-**Behavior:**
-- Runs in isolated thread with its own tokio runtime
-- Has core tools (bash, read, write, edit, grep, find, ls) — no subagent, no MCP
-- Thread panics are caught and reported as errors
-- Returns partial results on timeout
-- Streams status updates to parent's TUI panel
-- Logs complete session to `~/.synaps-cli/logs/subagents/`
-- Response prefixed with `[subagent:{name}]`
-
----
+Runs in isolated thread with its own tokio runtime. Core tools only (no subagent/MCP). Logs to `~/.synaps-cli/logs/subagents/`. Output prefixed `[subagent:{name}]`. Returns partial results on timeout.
 
 ### `mcp_connect`
+Connect to an MCP server defined in `~/.synaps-cli/mcp.json`. Tools registered as `mcp__{server}__{tool}`. 30s request timeout.
 
-Connect to an MCP server and load its tools.
-
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `server` | string | yes | — | Server name from `mcp.json` config |
-
-**Behavior:**
-- Spawns server process and establishes JSON-RPC connection
-- Registers tools as `mcp__{server}__{tool}` — available for rest of session
-- Prevents duplicate connections
-- Returns list of newly available tools
-- 30-second timeout on MCP requests
-
-**Configuration** (`~/.synaps-cli/mcp.json`):
-```json
-{
-  "mcpServers": {
-    "server-name": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-name"],
-      "env": { "API_KEY": "value" }
-    }
-  }
-}
-```
-
----
+| `server` (string, req) |
 
 ### `load_skill`
+Load behavioral guidelines. Discovery roots: `.synaps-cli/plugins/`, `.synaps-cli/skills/`, `~/.synaps-cli/plugins/`, `~/.synaps-cli/skills/`. Plugin = dir with `.synaps-plugin/plugin.json`. Collision resolution: built-ins > bare skill names > qualified `plugin:skill`.
 
-Load behavioral guidelines from a discovered skill.
+| `skill` (string, req) — `name` or `plugin:name` |
 
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `skill` | string | yes | — | Skill name (bare `name` or plugin-qualified `plugin:name`) |
-
-**Behavior:**
-- Returns the skill body (with `{baseDir}` tokens substituted) to follow for rest of conversation.
-- Discovery roots (walked in order): `.synaps-cli/plugins/`, `.synaps-cli/skills/`, `~/.synaps-cli/plugins/`, `~/.synaps-cli/skills/`.
-- A plugin is any directory containing `.synaps-plugin/plugin.json`; a marketplace is `.synaps-plugin/marketplace.json` listing multiple plugins by relative source path. Marketplaces may live at a root or one level beneath it (e.g. `~/.synaps-cli/plugins/pi-skills/.synaps-plugin/marketplace.json`).
-- Loose skills live at `<root>/skills/<name>/SKILL.md` (no plugin).
-- Skills use YAML frontmatter for metadata:
-  ```markdown
-  ---
-  name: code-review
-  description: Structured code review guidelines
-  ---
-  # Code Review
-  Body — use {baseDir}/scripts/run.js for absolute paths.
-  ```
-- Name collisions: built-in slash commands win over bare skill names; shadowed skills remain reachable via `plugin:skill`. Duplicate skills across plugins resolve as an ambiguity error listing the qualified options.
-- Block skills with the `disabled_skills` or `disabled_plugins` config keys (comma-separated).
-
----
+### `shell_start` / `shell_send` / `shell_end`
+Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shell_send` to interact and `shell_end` to clean up. For interactive programs (REPLs, SSH, etc.). See `src/tools/shell/` for the full state machine.
 
 ### `watcher_exit`
+**Watcher agents only.** Writes `handoff.json`, triggers shutdown.
 
-Signal work completion and provide handoff state. **Only available to watcher agents.**
-
-| Parameter | Type | Required | Default | Notes |
-|-----------|------|----------|---------|-------|
-| `reason` | string | yes | — | Why you're exiting |
-| `summary` | string | yes | — | What you accomplished |
-| `pending` | array[string] | no | `[]` | Tasks still pending |
-| `context` | object | no | `{}` | Structured data for next session |
-
-**Behavior:**
-- Writes `handoff.json` to agent directory
-- Triggers graceful shutdown
-- Handoff data injected into next session's boot message
+| Parameter | Type | Req | Default |
+|---|---|---|---|
+| `reason` | string | ✓ | — |
+| `summary` | string | ✓ | — |
+| `pending` | array[string] | | `[]` |
+| `context` | object | | `{}` |
 
 ---
 
-## Watcher Agent Lifecycle
-
-If you are a watcher agent (`synaps-agent`), you operate in a supervised loop.
-
-### Boot
-
-1. System prompt loaded from `soul.md` in your agent directory
-2. Handoff state injected from previous session's `handoff.json` (if exists)
-3. Boot message sent with template variables:
-   - `{timestamp}` — current time
-   - `{handoff}` — JSON from last session
-   - `{trigger_context}` — what triggered this session
-
-### Work
-
-Standard conversation loop with full tool access. The supervisor automatically:
-- Sends heartbeat every 30s (configurable)
-- Checks limits after each turn:
-  - Token count (default: 100K)
-  - Session duration (default: 60 min)
-  - Per-session cost (default: $0.50)
-  - Daily cost budget (default: $10.00)
-  - Tool call count (default: 200)
-
-### Exit
-
-**Voluntary:** Call `watcher_exit` with handoff state when done.
-
-**Forced:** When a limit is hit, you're prompted to write handoff state before shutdown:
-```
-You've reached your [limit] limit. Please call watcher_exit with
-your handoff state to transfer your work to your next session.
-```
-
-### Configuration
-
-`~/.synaps-cli/watcher/{name}/config.toml`:
-
-```toml
-[agent]
-name = "scout"
-model = "claude-sonnet-4-20250514"   # default
-thinking = "medium"                   # low | medium | high
-trigger = "manual"                    # manual | always | watch
-
-[trigger]                             # watch mode only
-paths = ["./src"]                     # directories to monitor
-patterns = ["*.rs", "*.toml"]         # file filters
-debounce_secs = 3                     # settle time before triggering
-
-[limits]
-max_session_tokens = 100000
-max_session_duration_mins = 60
-max_session_cost_usd = 0.50
-max_daily_cost_usd = 10.0
-max_tool_calls = 200
-cooldown_secs = 10                    # delay between sessions
-max_retries = 3                       # crash retries before giving up
-
-[boot]
-message = "..."                       # custom boot template (optional)
-
-[heartbeat]
-interval_secs = 30
-stale_threshold_secs = 120            # when considered stale
-```
-
-### Trigger Modes
-
-| Mode | Behavior |
-|------|----------|
-| `manual` | Only runs when explicitly deployed |
-| `always` | Restarts automatically after each session (with cooldown) |
-| `watch` | Triggers on file changes in configured paths/patterns |
-
-### Statistics
-
-Per-agent stats tracked in `stats.json`:
-- Total sessions, tokens, cost, uptime
-- Crash count and last crash error
-- Daily usage (resets at midnight)
-
----
-
-## Subagent Protocol
-
-If you were spawned via the `subagent` tool:
-
-- You run in an **isolated thread** with your own tokio runtime
-- You have: `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`
-- You do **NOT** have: `subagent`, `mcp_connect`, `load_skill`, `watcher_exit`
-- Your output streams back to the parent agent in real-time
-- On timeout, partial results are returned (not an error)
-- Your session is logged to `~/.synaps-cli/logs/subagents/`
-
----
-
-## Directory Structure
-
-```
-~/.synaps-cli/
-├── config                  # Global settings (model, thinking, theme)
-├── auth.json               # OAuth tokens (file-locked, permissions 600)
-├── system.md               # Default system prompt
-├── mcp.json                # MCP server configurations
-├── agents/                 # Subagent definitions
-│   └── {name}.md           # Markdown with optional YAML frontmatter
-├── skills/                 # Global behavioral guidelines
-│   └── {skill}.md          # Markdown with YAML frontmatter
-├── sessions/               # Conversation history (JSON)
-├── logs/
-│   └── subagents/          # Per-subagent session logs
-└── watcher/                # Autonomous agents
-    └── {name}/
-        ├── config.toml     # Agent configuration
-        ├── soul.md         # Agent system prompt
-        ├── handoff.json    # State from last session
-        ├── stats.json      # Cumulative usage statistics
-        ├── heartbeat       # Timestamp file
-        └── logs/           # Per-session JSONL logs
-```
-
----
-
-## Best Practices
-
-**Tool usage:**
-- Use `edit` for surgical changes, `write` for complete rewrites
-- Use `bash` for system operations — respect the timeout
-- Use `subagent` to delegate focused subtasks
-- Always call `watcher_exit` when done (watcher agents)
-
-**Error handling:**
-- File operations may fail (permissions, missing paths)
-- Shell commands may timeout or return non-zero exit
-- MCP servers may be unavailable
-- Subagents may timeout and return partial work
-
-**State management (watcher agents):**
-- Keep `handoff.json` concise for reliable state transfer
-- Use structured data in the `context` field
-- Write meaningful summaries for continuity across sessions
-
----
-
-## Tool Schema Summary
+## Quick-Reference Summary
 
 | Tool | Required | Optional | Purpose |
 |------|----------|----------|---------|
@@ -393,6 +447,13 @@ If you were spawned via the `subagent` tool:
 | `subagent` | task | agent, system_prompt, model, timeout | Agent dispatch |
 | `mcp_connect` | server | — | MCP server connection |
 | `load_skill` | skill | — | Behavioral guidelines |
-| `watcher_exit`* | reason, summary | pending, context | Session handoff |
+| `shell_start` | — | cwd, env, … | Start PTY session |
+| `shell_send` | session_id, input | timeout_ms | Interact with PTY |
+| `shell_end` | session_id | — | Close PTY |
+| `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
-*Watcher agents only
+*Watcher agents only. Subagents cannot use `subagent`, `mcp_connect`, `load_skill`, `watcher_exit`.
+
+---
+
+*Whatever happens, happens.*
