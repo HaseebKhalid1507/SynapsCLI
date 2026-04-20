@@ -264,7 +264,7 @@ pub(crate) fn draw(
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_display_widths[j];
+                        let char_w = max_art_width;
                         let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
                         let y = start_y + j as u16;
                         if y >= msg_area.y && y < msg_area.y + msg_area.height {
@@ -296,7 +296,66 @@ pub(crate) fn draw(
                     }
 
                     if build_t >= 1.0 {
-                        let sub_y = start_y + art_height as u16 + 1;
+                        // ⚡ Electric aura — animated particles around the logo
+                        let spark_chars: &[char] = &['·', '∗', '✧', '⚡', '░', '▪', '•', '∘'];
+                        let dim_chars: &[char] = &['·', '∘', '•', '∗'];
+                        let art_x = msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
+                        let halo_margin: u16 = 3;
+                        
+                        // Generate deterministic-but-animated spark positions from time
+                        let seed = (t / 80) as u64; // change every 80ms
+                        let num_sparks = 12 + ((breathe + 1.0) * 4.0) as usize; // 8-20 sparks based on breath
+                        
+                        for i in 0..num_sparks {
+                            // Simple LCG pseudo-random from seed + index
+                            let hash = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64 * 1442695040888963407);
+                            let hash2 = hash.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            
+                            // Position in halo around the art
+                            let side = hash % 4; // top, bottom, left, right
+                            let (sx, sy) = match side {
+                                0 => { // top
+                                    let x_off = (hash2 % (max_art_width as u64 + 4)) as u16;
+                                    (art_x.saturating_sub(2) + x_off, start_y.saturating_sub(1 + (hash / 7 % halo_margin as u64) as u16))
+                                }
+                                1 => { // bottom
+                                    let x_off = (hash2 % (max_art_width as u64 + 4)) as u16;
+                                    (art_x.saturating_sub(2) + x_off, start_y + art_height as u16 + (hash / 7 % halo_margin as u64) as u16)
+                                }
+                                2 => { // left
+                                    let y_off = (hash2 % (art_height as u64 + 2)) as u16;
+                                    (art_x.saturating_sub(1 + (hash / 11 % halo_margin as u64) as u16), start_y + y_off)
+                                }
+                                _ => { // right
+                                    let y_off = (hash2 % (art_height as u64 + 2)) as u16;
+                                    (art_x + max_art_width as u16 + (hash / 11 % halo_margin as u64) as u16, start_y + y_off)
+                                }
+                            };
+                            
+                            if sx >= msg_area.x && sx < msg_area.x + msg_area.width
+                                && sy >= msg_area.y && sy < msg_area.y + msg_area.height {
+                                // Intensity based on breath + per-particle variation
+                                let particle_phase = ((hash % 1000) as f64 / 1000.0 + breathe) * 0.5 + 0.5;
+                                let intensity = (particle_phase * 255.0).min(255.0) as u8;
+                                let fade = (intensity as f64 / 255.0 * breathe_scale).min(1.0);
+                                
+                                let ch = if fade > 0.7 {
+                                    spark_chars[(hash / 13 % spark_chars.len() as u64) as usize]
+                                } else {
+                                    dim_chars[(hash / 13 % dim_chars.len() as u64) as usize]
+                                };
+                                
+                                let spark_style = Style::default().fg(Color::Rgb(
+                                    (r as f64 * fade) as u8,
+                                    (g as f64 * fade) as u8,
+                                    (b as f64 * fade) as u8,
+                                ));
+                                let spark_area = ratatui::layout::Rect { x: sx, y: sy, width: 1, height: 1 };
+                                frame.render_widget(Paragraph::new(Span::styled(ch.to_string(), spark_style)), spark_area);
+                            }
+                        }
+
+                        let sub_y = start_y + art_height as u16 + 2;
                         if sub_y >= msg_area.y && sub_y < msg_area.y + msg_area.height && avail_w >= sub_width {
                             let sub_x = msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
                             let area = ratatui::layout::Rect { x: sub_x, y: sub_y, width: sub_width as u16, height: 1 };
@@ -309,7 +368,7 @@ pub(crate) fn draw(
                     let start_y = center_y.saturating_sub((total_block as u16) / 2);
 
                     for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_display_widths[j];
+                        let char_w = max_art_width;
                         let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
                         let y = start_y + j as u16;
 
