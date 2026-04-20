@@ -1,6 +1,7 @@
 //! Settings modal — full-screen overlay opened via /settings.
 //! Persists changes to ~/.synaps-cli/config and mutates Runtime where possible.
 
+pub(crate) mod defs;
 pub(crate) mod schema;
 pub(crate) mod draw;
 pub(crate) mod input;
