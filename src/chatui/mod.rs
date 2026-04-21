@@ -808,6 +808,19 @@ pub async fn run(
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
                         }
+                        StreamAction::AutoTriggerEvents => {
+                            drop(stream.take());
+                            drop(cancel_token.take());
+                            drop(steer_tx.take());
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
                     }
 
                     if do_draw {
