@@ -4,7 +4,7 @@
 //! Subagents get `ToolRegistry::without_subagent()` to prevent recursion.
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use crate::Result;
 
 // ── Module declarations ──────────────────────────────────────────────────────────
@@ -17,11 +17,17 @@ mod grep;
 mod find;
 mod ls;
 mod subagent;
+pub mod subagent_handle;
 pub mod watcher_exit;
 pub(crate) mod util;
 mod agent;
 mod registry;
 pub mod shell;
+pub mod subagent_start;
+pub mod subagent_status;
+pub mod subagent_steer;
+pub mod subagent_collect;
+pub mod subagent_resume;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -32,11 +38,17 @@ pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use find::FindTool;
 pub use ls::LsTool;
-pub use subagent::{SubagentTool, SubagentResult};
+pub use subagent::SubagentTool;
+pub use subagent_handle::{SubagentResult, SubagentHandle, SubagentRegistry, SubagentStatus};
 pub use watcher_exit::WatcherExitTool;
 pub use registry::ToolRegistry;
 pub use agent::resolve_agent_prompt;
 pub use shell::{ShellStartTool, ShellSendTool, ShellEndTool};
+pub use subagent_start::SubagentStartTool;
+pub use subagent_status::SubagentStatusTool;
+pub use subagent_steer::SubagentSteerTool;
+pub use subagent_collect::SubagentCollectTool;
+pub use subagent_resume::SubagentResumeTool;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -52,6 +64,10 @@ pub struct ToolContext {
     /// Breaks the circular Arc — tools send registrations, runtime applies them.
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
+    /// Shared registry of reactive subagent handles — populated by SubagentStartTool,
+    /// read by SubagentStatusTool, and mutated by SubagentSteerTool / SubagentCollectTool.
+    /// `None` in contexts that don't support reactive subagents (e.g. subagent runtimes).
+    pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     // Configuration parameters
     pub max_tool_output: usize,
     pub bash_timeout: u64,

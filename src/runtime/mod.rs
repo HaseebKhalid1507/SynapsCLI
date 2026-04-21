@@ -317,7 +317,7 @@ impl Runtime {
                                     bash_timeout: self.bash_timeout,
                                     bash_max_timeout: self.bash_max_timeout,
                                     subagent_timeout: self.subagent_timeout,
-                                };
+                                subagent_registry: None, };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -365,7 +365,7 @@ impl Runtime {
                                             bash_timeout: cfg_bash_timeout,
                                             bash_max_timeout: cfg_bash_max_timeout,
                                             subagent_timeout: cfg_subagent_timeout,
-                                        };
+                                        subagent_registry: None, };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),

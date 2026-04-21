@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
+pub use super::subagent_handle::SubagentResult;
 
 pub struct SubagentTool;
 
@@ -370,12 +371,3 @@ impl Tool for SubagentTool {
     }
 }
 
-pub struct SubagentResult {
-    pub text: String,
-    pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read: u64,
-    pub cache_creation: u64,
-    pub tool_count: u32,
-}
