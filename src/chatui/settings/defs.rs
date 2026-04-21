@@ -78,7 +78,7 @@ define_settings! {
         };
 
     compaction_model, "Compaction model", Model,
-        EditorKind::Text { numeric: false },
+        EditorKind::ModelPicker,
         "Model used for /compact (default: claude-sonnet-4-6).",
         |runtime, _app, value| {
             let model = if value.is_empty() || value == "auto" || value == "default" {

@@ -98,7 +98,7 @@ pub(super) enum Focus {
 pub(super) enum ActiveEditor {
     Text { buffer: String, setting_key: &'static str, numeric: bool, error: Option<String> },
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
-    CustomModel { buffer: String },
+    CustomModel { buffer: String, setting_key: &'static str },
 }
 
 pub(super) struct SettingsState {
