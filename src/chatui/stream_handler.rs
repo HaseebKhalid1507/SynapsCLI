@@ -177,6 +177,7 @@ pub(super) async fn handle_stream_event(
 
             // If events arrived during streaming, trigger a new model turn
             if had_pending {
+                app.save_session().await;
                 return StreamAction::AutoTriggerEvents;
             }
         }

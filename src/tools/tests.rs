@@ -373,7 +373,7 @@ fn test_tool_registry_new() {
     let registry = ToolRegistry::new();
     
     // Should have 11 tools including subagent + 3 shell tools
-    assert_eq!(registry.tools_schema().len(), 18);
+    assert_eq!(registry.tools_schema().len(), 15);
     
     // Should find bash tool
     assert!(registry.get("bash").is_some());

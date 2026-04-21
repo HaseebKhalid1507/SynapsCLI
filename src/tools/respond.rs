@@ -25,8 +25,12 @@ impl Tool for RespondTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let event_id = params["event_id"].as_str().unwrap_or("").to_string();
-        let text = params["text"].as_str().unwrap_or("").to_string();
+        let event_id = params["event_id"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'event_id' parameter".to_string()))?
+            .to_string();
+        let text = params["text"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'text' parameter".to_string()))?
+            .to_string();
 
         tracing::info!(event_id = %event_id, "respond tool invoked: {}", text);
 

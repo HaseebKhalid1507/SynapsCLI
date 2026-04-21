@@ -51,6 +51,9 @@ impl EventQueue {
     pub fn push_priority(&self, event: Event) {
         let mut q = self.inner.lock().unwrap();
         if q.len() >= self.capacity {
+            if let Some(evicted) = q.back() {
+                tracing::warn!("event queue full — evicting event id={}", evicted.id);
+            }
             q.pop_back();
         }
         q.push_front(event);

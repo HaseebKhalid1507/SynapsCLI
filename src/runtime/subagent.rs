@@ -5,6 +5,7 @@ use serde_json::Value;
 
 // ── SubagentResult ───────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct SubagentResult {
     pub text: String,
     pub model: String,
@@ -29,6 +30,7 @@ pub enum SubagentStatus {
 
 /// All mutable state shared between the subagent thread and its handle.
 /// Collapsed behind a single RwLock so a status poll takes exactly one lock.
+#[derive(Debug)]
 pub struct SubagentState {
     pub status: SubagentStatus,
     pub partial_text: String,
@@ -73,6 +75,16 @@ pub struct SubagentHandle {
 
     // Final result
     result_rx: Option<oneshot::Receiver<SubagentResult>>,
+}
+
+impl std::fmt::Debug for SubagentHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentHandle")
+            .field("id", &self.id)
+            .field("agent_name", &self.agent_name)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SubagentHandle {
@@ -167,6 +179,7 @@ impl SubagentHandle {
 
 // ── SubagentRegistry ─────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct SubagentRegistry {
     handles: HashMap<String, SubagentHandle>,
 }

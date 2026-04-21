@@ -33,6 +33,15 @@ pub async fn run(
 
     let inbox_dir = synaps_cli::config::base_dir().join("inbox");
     std::fs::create_dir_all(&inbox_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&inbox_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&inbox_dir, perms);
+        }
+    }
     let filename = format!("{}-{}.json", Utc::now().timestamp_nanos_opt().unwrap_or(0), Uuid::new_v4().simple());
     let path = inbox_dir.join(&filename);
     let tmp_path = inbox_dir.join(format!("{}.tmp", filename));

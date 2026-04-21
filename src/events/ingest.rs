@@ -20,6 +20,13 @@ async fn process_file(path: &Path, queue: &EventQueue) {
         }
     }
     if path.extension().is_some_and(|e| e == "json") {
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() > 256 * 1024 {
+                tracing::warn!("inbox file too large ({}B), skipping: {}", meta.len(), path.display());
+                let _ = tokio::fs::rename(path, path.with_extension("json.oversized")).await;
+                return;
+            }
+        }
         match tokio::fs::read_to_string(path).await {
             Ok(content) => match serde_json::from_str::<Event>(&content) {
                 Ok(event) => {

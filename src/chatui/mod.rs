@@ -346,6 +346,10 @@ pub async fn run(
                                     "content": formatted
                                 }));
                             }
+                            if let Some(queued) = app.queued_message.take() {
+                                app.api_messages.push(serde_json::json!({"role": "user", "content": queued}));
+                                app.push_msg(ChatMessage::System(format!("queued message restored: {}", queued)));
+                            }
                             app.push_msg(ChatMessage::System(format!(
                                 "✓ compacted {} messages → new session {} (from {})",
                                 msg_count, new_id, old_id

@@ -32,9 +32,15 @@ impl Tool for SendChannelTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let channel_type = params["channel_type"].as_str().unwrap_or("").to_string();
-        let channel_id = params["channel_id"].as_str().unwrap_or("").to_string();
-        let text = params["text"].as_str().unwrap_or("").to_string();
+        let channel_type = params["channel_type"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'channel_type' parameter".to_string()))?
+            .to_string();
+        let channel_id = params["channel_id"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'channel_id' parameter".to_string()))?
+            .to_string();
+        let text = params["text"].as_str()
+            .ok_or_else(|| crate::RuntimeError::Tool("Missing 'text' parameter".to_string()))?
+            .to_string();
 
         tracing::info!(
             channel_type = %channel_type,
