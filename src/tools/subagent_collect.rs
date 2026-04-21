@@ -12,13 +12,10 @@
 //! tool can switch to `tokio::select!` with zero poll overhead.
 
 use serde_json::{json, Value};
-use std::time::Duration;
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext};
 use crate::tools::subagent_handle::SubagentStatus;
 
-/// How often to re-check the registry while waiting for completion.
-const POLL_INTERVAL_MS: u64 = 500;
 
 pub struct SubagentCollectTool;
 
@@ -57,70 +54,39 @@ impl Tool for SubagentCollectTool {
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let extra_timeout_secs = params["timeout"].as_u64();
-
-        // ── Registry presence check ────────────────────────────────────────────
-
         let registry = ctx.subagent_registry.as_ref()
             .ok_or_else(|| RuntimeError::Tool(
                 "SubagentRegistry not available on this ToolContext".to_string()
-            ))?
-            .clone();
+            ))?;
 
-        // Verify the handle exists before entering the wait loop.
-        {
-            let reg = registry.lock().unwrap();
-            if reg.get(&handle_id).is_none() {
-                return Err(RuntimeError::Tool(
-                    format!("No subagent found with handle_id '{}'", handle_id)
-                ));
-            }
-        }
+        let reg = registry.lock().unwrap();
+        let handle = reg.get(&handle_id)
+            .ok_or_else(|| RuntimeError::Tool(
+                format!("No subagent found with handle_id '{}'", handle_id)
+            ))?;
 
-        // ── Poll loop ──────────────────────────────────────────────────────────
+        let status = handle.status();
+        let output = handle.partial_output();
 
-        let deadline = extra_timeout_secs.map(|secs| {
-            std::time::Instant::now() + Duration::from_secs(secs)
-        });
-
-        loop {
-            // Check completion status — hold the lock only for the read.
-            let (done, status_str, output) = {
-                let reg = registry.lock().unwrap();
-                let handle = reg.get(&handle_id).expect("handle vanished from registry");
-                let done = handle.status() != SubagentStatus::Running;
-                (done, handle.status().as_str().to_string(), handle.partial_output())
-            };
-
-            if done {
-                return Ok(json!({
-                    "handle_id": handle_id,
-                    "status":    status_str,
-                    "output":    output
-                }).to_string());
-            }
-
-            // Check additional timeout — never fires if `deadline` is None.
-            if let Some(dl) = deadline {
-                if std::time::Instant::now() >= dl {
-                    let reg = registry.lock().unwrap();
-                    let handle = reg.get(&handle_id).expect("handle vanished from registry");
-                    return Ok(json!({
-                        "handle_id": handle_id,
-                        "status":    "collect_timeout",
-                        "output":    handle.partial_output()
-                    }).to_string());
+        if status == SubagentStatus::Running {
+            // Still going — return current state, don't block
+            return Ok(json!({
+                "handle_id":    handle_id,
+                "status":       "running",
+                "elapsed_secs": (handle.elapsed_secs() * 10.0).round() / 10.0,
+                "output_so_far": if output.chars().count() > 500 {
+                    output.chars().skip(output.chars().count() - 500).collect::<String>()
+                } else {
+                    output.clone()
                 }
-            }
-
-            // ── STUB note ──────────────────────────────────────────────────────
-            // Once background spawn is wired, a completion-notify channel on
-            // SubagentHandle will replace this sleep-poll with:
-            //   tokio::select! {
-            //       _ = handle.done_rx => { ... }
-            //       _ = tokio::time::sleep(deadline_remaining) => { ... }
-            //   }
-            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }).to_string());
         }
+
+        // Done — return full result
+        Ok(json!({
+            "handle_id": handle_id,
+            "status":    status.as_str(),
+            "output":    output
+        }).to_string())
     }
 }
