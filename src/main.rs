@@ -2,13 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod chatui;
 mod watcher;
-mod cmd_run;
-mod cmd_chat;
-mod cmd_server;
-mod cmd_client;
-mod cmd_agent;
-mod cmd_login;
-mod cmd_watcher;
+mod cmd;
 
 #[derive(Parser)]
 #[command(name = "synaps", about = "Neural interface for Claude", version)]
@@ -86,25 +80,25 @@ async fn main() -> anyhow::Result<()> {
             chatui::run(cli.continue_session, cli.system, cli.profile).await?;
         }
         Some(Command::Run { prompt, agent, system }) => {
-            cmd_run::run(prompt, agent, system).await?;
+            cmd::run::run(prompt, agent, system).await?;
         }
         Some(Command::Chat) => {
-            cmd_chat::run().await?;
+            cmd::chat::run().await?;
         }
         Some(Command::Server { port, host, system, continue_session }) => {
-            cmd_server::run(port, host, system, continue_session, cli.profile).await?;
+            cmd::server::run(port, host, system, continue_session, cli.profile).await?;
         }
         Some(Command::Client { url }) => {
-            cmd_client::run(url).await?;
+            cmd::client::run(url).await?;
         }
         Some(Command::Agent { config, trigger_context }) => {
-            cmd_agent::run(config, trigger_context).await;
+            cmd::agent::run(config, trigger_context).await;
         }
         Some(Command::Watcher { subcommand, args }) => {
-            cmd_watcher::run(subcommand, args).await;
+            cmd::watcher::run(subcommand, args).await;
         }
         Some(Command::Login) => {
-            cmd_login::run(cli.profile).await;
+            cmd::login::run(cli.profile).await;
         }
     }
     Ok(())
