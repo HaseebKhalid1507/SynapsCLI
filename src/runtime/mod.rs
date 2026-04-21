@@ -32,6 +32,11 @@ pub struct Runtime {
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
     thinking_budget: u32,
+    /// User override for context window size (tokens). When set, takes
+    /// precedence over the model's auto-detected window from
+    /// `models::context_window_for_model`. Lets users cap context at e.g.
+    /// 200k even on models that natively support 1M.
+    context_window_override: Option<u64>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -80,6 +85,7 @@ impl Runtime {
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
+            context_window_override: None,
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -121,6 +127,17 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    pub fn set_context_window(&mut self, window: Option<u64>) {
+        self.context_window_override = window;
+    }
+
+    /// Effective context window for the current model — user override if set,
+    /// otherwise the model's native window from `models::context_window_for_model`.
+    pub fn context_window(&self) -> u64 {
+        self.context_window_override
+            .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
         if let Some(ref model) = config.model {
@@ -129,6 +146,7 @@ impl Runtime {
         if let Some(budget) = config.thinking_budget {
             self.set_thinking_budget(budget);
         }
+        self.context_window_override = config.context_window;
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -430,6 +448,7 @@ impl Clone for Runtime {
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
+            context_window_override: self.context_window_override,
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,

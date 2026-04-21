@@ -235,6 +235,7 @@ impl App {
         cache_read: u64,
         cache_creation: u64,
         model: &str,
+        context_window_override: Option<u64>,
     ) {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
@@ -249,7 +250,9 @@ impl App {
         // Per-turn bar denominator — the context window of the model that
         // answered this turn. Tracked alongside so mid-session model swaps
         // (e.g. main thread Opus → subagent Sonnet) recalibrate the bar.
-        self.last_turn_context_window = synaps_cli::models::context_window_for_model(model);
+        // If the user configured an explicit context_window, honour it.
+        self.last_turn_context_window = context_window_override
+            .unwrap_or_else(|| synaps_cli::models::context_window_for_model(model));
         self.api_call_count += 1;
         // Pricing per million tokens (as of 2026-04, from platform.claude.com/docs/en/about-claude/pricing)
         // Opus 4.5+ = $5/$25, Sonnet 4+ = $3/$15, Haiku 4.5 = $1/$5, Haiku 3.5 = $0.80/$4

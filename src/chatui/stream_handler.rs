@@ -148,6 +148,7 @@ pub(super) async fn handle_stream_event(
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
                 model_for_pricing,
+                Some(runtime.context_window()),
             );
         }
         StreamEvent::Done => {
