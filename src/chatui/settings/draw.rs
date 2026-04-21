@@ -34,7 +34,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
 
     render_categories(frame, panes[0], state);
     render_settings(frame, panes[1], state, snap);
-    render_footer(frame, outer[1]);
+    render_footer(frame, outer[1], state);
 }
 
 fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
@@ -116,38 +116,62 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
 
 fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let mut lines = Vec::new();
-    if snap.plugins.is_empty() {
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            "  No plugins installed. Open /plugins to add a marketplace.",
-            Style::default().fg(THEME.load().help_fg),
-        )]));
+
+    // Row 0 — action row. Styled distinctly so it reads as a button, not a plugin.
+    let action_selected = state.setting_idx == 0 && state.focus == Focus::Right;
+    let action_style = if action_selected {
+        Style::default()
+            .fg(THEME.load().claude_label)
+            .add_modifier(ratatui::style::Modifier::BOLD)
     } else {
-        for (i, p) in snap.plugins.iter().enumerate() {
-            let disabled = snap.disabled_plugins.iter().any(|d| d == &p.name);
-            let status = if disabled { "✗ disabled" } else { "✓ enabled" };
-            let skills_part = if p.skill_count > 0 {
-                format!("  ({} skills)", p.skill_count)
-            } else {
-                String::new()
-            };
-            let selected = i == state.setting_idx && state.focus == Focus::Right;
-            let style = if selected {
-                Style::default().fg(THEME.load().claude_label)
-            } else {
-                Style::default().fg(THEME.load().claude_text)
-            };
-            lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-                format!("  {:<20} {}{}", p.name, status, skills_part),
-                style,
-            )]));
+        Style::default()
+            .fg(THEME.load().claude_text)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    };
+    lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+        "  + Open Plugin Marketplace…",
+        action_style,
+    )]));
+
+    // Surface load errors / notes attached to the action row.
+    if let Some((key, msg)) = &state.row_error {
+        if key == "plugins" {
+            let is_note = msg.starts_with("saved");
+            let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+            lines.push(ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
+            ]));
         }
     }
+
+    // Rows 1..=n — installed plugins at snap.plugins[idx - 1].
+    for (i, p) in snap.plugins.iter().enumerate() {
+        let row_idx = i + 1;
+        let disabled = snap.disabled_plugins.iter().any(|d| d == &p.name);
+        let status = if disabled { "✗ disabled" } else { "✓ enabled" };
+        let skills_part = if p.skill_count > 0 {
+            format!("  ({} skills)", p.skill_count)
+        } else {
+            String::new()
+        };
+        let selected = row_idx == state.setting_idx && state.focus == Focus::Right;
+        let style = if selected {
+            Style::default().fg(THEME.load().claude_label)
+        } else {
+            Style::default().fg(THEME.load().claude_text)
+        };
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            format!("  {:<20} {}{}", p.name, status, skills_part),
+            style,
+        )]));
+    }
+
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
-    let w = area.width.saturating_sub(4).min(60).max(20);
-    let h = (options.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let w = area.width.saturating_sub(4).clamp(20, 60);
+    let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let x = area.x + 2;
     let y = area.y + 2;
     let rect = Rect { x, y, width: w, height: h };
@@ -182,8 +206,16 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let hint = "↑↓ navigate  Tab switch pane  Enter edit  Esc close";
+fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState) {
+    let on_plugins_right = CATEGORIES[state.category_idx] == super::schema::Category::Plugins
+        && state.focus == Focus::Right;
+    let hint = if on_plugins_right && state.setting_idx == 0 {
+        "↑↓ navigate  Tab switch pane  Enter open marketplace  Esc close"
+    } else if on_plugins_right && state.setting_idx > 0 {
+        "↑↓ navigate  Tab switch pane  Enter/Space toggle  Esc close"
+    } else {
+        "↑↓ navigate  Tab switch pane  Enter edit  Esc close"
+    };
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().fg(THEME.load().help_fg)),
         area,
@@ -194,6 +226,7 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
     match def.key {
         "model" => snap.model.clone(),
         "thinking" => snap.thinking.clone(),
+        "context_window" => snap.context_window.clone(),
         "api_retries" => snap.api_retries.to_string(),
         "subagent_timeout" => format!("{}s", snap.subagent_timeout),
         "max_tool_output" => snap.max_tool_output.to_string(),

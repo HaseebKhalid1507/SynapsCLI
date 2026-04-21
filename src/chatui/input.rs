@@ -25,6 +25,8 @@ pub(super) enum InputAction {
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
     PluginsOutcome(super::plugins::InputOutcome),
+    /// Settings modal asked to open the plugins marketplace as a nested overlay.
+    OpenPluginsMarketplace,
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -35,11 +37,27 @@ pub(super) fn handle_event(
     streaming: bool,
     registry: &Arc<CommandRegistry>,
 ) -> InputAction {
+    // Route events to the plugins modal while it's open. Most outcomes run
+    // async side-effects (fetch manifest, git clone, etc.), so we delegate
+    // them to the main loop via `InputAction::PluginsOutcome`.
+    if let Some(state) = app.plugins.as_mut() {
+        if let Event::Key(key) = event {
+            let outcome = super::plugins::handle_event(state, key);
+            return match outcome {
+                super::plugins::InputOutcome::Close => {
+                    app.plugins = None;
+                    InputAction::None
+                }
+                super::plugins::InputOutcome::None => InputAction::None,
+                other => InputAction::PluginsOutcome(other),
+            };
+        }
+        return InputAction::None;
+    }
     // Route events to the settings modal while it's open.
-    if app.settings.is_some() {
+    if let Some(state) = app.settings.as_mut() {
         if let Event::Key(key) = event {
             let snap = super::settings::RuntimeSnapshot::from_runtime(runtime, registry);
-            let state = app.settings.as_mut().expect("just checked");
             match super::settings::handle_event(state, key, &snap) {
                 super::settings::InputOutcome::Close => { app.settings = None; }
                 super::settings::InputOutcome::None => {}
@@ -68,27 +86,12 @@ pub(super) fn handle_event(
                     let theme = super::theme::load_theme_from_config();
                     super::theme::set_theme(theme);
                 }
+                super::settings::InputOutcome::OpenPluginsMarketplace => {
+                    return InputAction::OpenPluginsMarketplace;
+                }
             }
         }
         // Swallow all other events while settings is open.
-        return InputAction::None;
-    }
-    // Route events to the plugins modal while it's open. Most outcomes run
-    // async side-effects (fetch manifest, git clone, etc.), so we delegate
-    // them to the main loop via `InputAction::PluginsOutcome`.
-    if app.plugins.is_some() {
-        if let Event::Key(key) = event {
-            let state = app.plugins.as_mut().expect("just checked");
-            let outcome = super::plugins::handle_event(state, key);
-            return match outcome {
-                super::plugins::InputOutcome::Close => {
-                    app.plugins = None;
-                    InputAction::None
-                }
-                super::plugins::InputOutcome::None => InputAction::None,
-                other => InputAction::PluginsOutcome(other),
-            };
-        }
         return InputAction::None;
     }
     match event {

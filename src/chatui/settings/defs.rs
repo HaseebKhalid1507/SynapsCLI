@@ -62,6 +62,21 @@ define_settings! {
             runtime.set_thinking_budget(budget);
         };
 
+    context_window, "Context window", Model,
+        EditorKind::Cycler(&["200k", "1m", "auto"]),
+        "Override context window limit (auto = model default).",
+        |runtime, app, value| {
+            let window = match value {
+                "200k" | "200K" => Some(200_000u64),
+                "1m" | "1M" => Some(1_000_000u64),
+                "auto" => None,
+                _ => return,
+            };
+            runtime.set_context_window(window);
+            // Also update the bar denominator immediately so the UI reflects the change.
+            app.last_turn_context_window = runtime.context_window();
+        };
+
     api_retries, "API retries", Agent, EditorKind::Text { numeric: true },
         "Retries on transient API errors.",
         |runtime, _app, value| {

@@ -10,6 +10,7 @@ pub(crate) enum InputOutcome {
     TogglePlugin { name: String, enabled: bool },
     PreviewTheme { name: String },
     RevertTheme,
+    OpenPluginsMarketplace,
 }
 
 pub(crate) fn handle_event(
@@ -33,20 +34,32 @@ pub(crate) fn handle_event(
         }
         return handle_editor_key(state, key);
     }
-    // Plugins category: Enter or Space toggles plugin.
     if state.focus == Focus::Right {
         let cat = super::schema::CATEGORIES[state.category_idx];
         if cat == super::schema::Category::Plugins {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(row) = snap.plugins.get(state.setting_idx) {
-                        let disabled = snap.disabled_plugins.iter().any(|d| d == &row.name);
-                        return InputOutcome::TogglePlugin {
-                            name: row.name.clone(),
-                            enabled: disabled, // toggle: if was disabled, now enabled
-                        };
+            // Row 0 is the "Open Plugin Marketplace…" action row.
+            // Rows 1..=n map to snap.plugins[idx - 1].
+            let toggle_at = |idx: usize| -> InputOutcome {
+                if let Some(row) = snap.plugins.get(idx) {
+                    let was_disabled = snap.disabled_plugins.iter().any(|d| d == &row.name);
+                    // Toggle polarity: if was disabled, the new state is enabled.
+                    InputOutcome::TogglePlugin {
+                        name: row.name.clone(),
+                        enabled: was_disabled,
                     }
+                } else {
+                    InputOutcome::None
+                }
+            };
+            match key.code {
+                KeyCode::Enter if state.setting_idx == 0 => {
+                    return InputOutcome::OpenPluginsMarketplace;
+                }
+                KeyCode::Char(' ') if state.setting_idx == 0 => {
                     return InputOutcome::None;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    return toggle_at(state.setting_idx - 1);
                 }
                 _ => {}
             }
@@ -236,6 +249,7 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
 fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
     match key {
         "thinking" => snap.thinking.clone(),
+        "context_window" => snap.context_window.clone(),
         _ => String::new(),
     }
 }
@@ -243,7 +257,7 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
 fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     let cat = super::schema::CATEGORIES[state.category_idx];
     if cat == super::schema::Category::Plugins {
-        snap.plugins.len()
+        snap.plugins.len() + 1
     } else {
         state.current_settings().len()
     }
@@ -258,6 +272,7 @@ mod tests {
         RuntimeSnapshot {
             model: "m".into(),
             thinking: "medium".into(),
+            context_window: "auto".into(),
             max_tool_output: 0,
             bash_timeout: 0,
             bash_max_timeout: 0,
@@ -272,13 +287,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enter_on_plugin_row_toggles_off() {
+    fn plugins_state_at(idx: usize) -> SettingsState {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES
             .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
         state.focus = Focus::Right;
-        state.setting_idx = 0;
+        state.setting_idx = idx;
+        state
+    }
+
+    #[test]
+    fn enter_on_marketplace_row_opens_plugins_marketplace() {
+        let mut state = plugins_state_at(0);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        assert!(matches!(out, InputOutcome::OpenPluginsMarketplace));
+    }
+
+    #[test]
+    fn enter_on_plugin_row_toggles_off() {
+        // Row 1 is the first plugin (p1).
+        let mut state = plugins_state_at(1);
         let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
@@ -291,11 +319,8 @@ mod tests {
 
     #[test]
     fn enter_on_disabled_plugin_toggles_on() {
-        let mut state = SettingsState::new();
-        state.category_idx = super::super::schema::CATEGORIES
-            .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
-        state.focus = Focus::Right;
-        state.setting_idx = 1;
+        // Row 2 is the second plugin (p2, disabled).
+        let mut state = plugins_state_at(2);
         let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
