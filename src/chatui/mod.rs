@@ -339,6 +339,13 @@ pub async fn run(
                                     tracing::warn!("Failed to update old session {}: {}", old_id, e);
                                 }
                             }
+                            // Flush any events that arrived during compaction
+                            for formatted in app.pending_events.drain(..) {
+                                app.api_messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": formatted
+                                }));
+                            }
                             app.push_msg(ChatMessage::System(format!(
                                 "✓ compacted {} messages → new session {} (from {})",
                                 msg_count, new_id, old_id

@@ -1,5 +1,32 @@
 use super::types::Event;
 
+/// Strip any variation of </event> tags (case-insensitive, with whitespace)
+fn regex_strip_event_close(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let lower = s.to_lowercase();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Check for </ event > pattern at current position
+        if i + 7 < bytes.len() && &lower[i..i+2] == "</" {
+            // Scan for "event" after optional whitespace
+            let mut j = i + 2;
+            while j < bytes.len() && lower.as_bytes()[j] == b' ' { j += 1; }
+            if j + 5 <= bytes.len() && &lower[j..j+5] == "event" {
+                let mut k = j + 5;
+                while k < bytes.len() && lower.as_bytes()[k] == b' ' { k += 1; }
+                if k < bytes.len() && bytes[k] == b'>' {
+                    i = k + 1; // skip the entire closing tag
+                    continue;
+                }
+            }
+        }
+        result.push(s.as_bytes()[i] as char);
+        i += 1;
+    }
+    result
+}
+
 /// Format an event as a system message the agent can understand.
 /// Wrapped in XML tags to prevent prompt injection — the model should treat
 /// content inside <event> tags as DATA, not instructions.
@@ -18,7 +45,7 @@ pub fn format_event_for_agent(event: &Event) -> String {
     };
 
     // Sanitize text — strip any closing </event> tags to prevent breakout
-    let safe_text = event.content.text.replace("</event>", "");
+    let safe_text = regex_strip_event_close(&event.content.text);
     let safe_source = event.source.source_type.replace('"', "'");
     let safe_content_type = event.content.content_type.replace('"', "'");
 
@@ -31,7 +58,9 @@ pub fn format_event_for_agent(event: &Event) -> String {
         let data_str = serde_json::to_string(data).unwrap_or_default();
         // Cap data size to prevent token abuse
         let truncated: String = data_str.chars().take(1000).collect();
-        out.push_str(&format!("\nData: {}", truncated));
+        // Strip closing event tags from data (case-insensitive) to prevent breakout
+        let safe_data = regex_strip_event_close(&truncated);
+        out.push_str(&format!("\nData: {}", safe_data));
     }
 
     out.push_str("</event>");
