@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Event Bus** — universal message ingestion for agent sessions
+  - `synaps send` CLI command with atomic file writes
+  - inotify inbox watcher via `notify` crate (spawn_blocking, non-blocking)
+  - Priority EventQueue with severity ordering (Critical→front, High→after)
+  - `tokio::sync::Notify` for instant TUI wake on event push
+  - Events auto-trigger model turns when agent is idle
+  - Events buffer during streaming via `pending_events`, flush on completion
+  - Styled TUI event cards with severity icons (🔴🟠🟡🔵)
+  - XML-wrapped event format with prompt injection hardening
+  - 256KB file size cap, symlink guard, 0700 permissions
+- **Reactive Subagents** — dispatch, poll, steer, collect
+  - `subagent_start` — spawn and return handle_id immediately
+  - `subagent_status` — non-blocking progress snapshot
+  - `subagent_steer` — inject guidance mid-flight via steering channel
+  - `subagent_collect` — non-blocking result check
+  - `subagent_resume` — restart timed-out agents (stub)
+  - `SubagentHandle` with shared `RwLock<SubagentState>`
+  - `SubagentRegistry` with cleanup_finished on stream Done
+  - Abort cancels all running reactive subagents
+  - Thread handles stored for graceful shutdown
+  - 13 unit tests for handle + registry
+- **Chain Sessions** — `/compact` creates linked child session
+  - Old session preserved on disk with `compacted_into` forward link
+  - New session starts with `parent_session` back link
+  - `/chain` command walks the session lineage
+  - System prompt included in compaction summary
+  - Configurable compaction model (defaults to Sonnet)
+  - ModelPicker for compaction model in settings
+  - Non-blocking compaction with spinner animation
+  - Compacted summary hidden from TUI display
+  - Message queuing during compaction
+- **`respond` tool** (stub — returns honest failure until wired)
+- **`send_channel` tool** (stub — returns honest failure until wired)
 - **`/compact` slash command**: summarize & compact conversation history when context gets long
   - Structured checkpoint format (goals, progress, decisions, file ops, next steps)
   - Iterative compaction — re-compacting merges new work into existing summary
@@ -40,6 +73,18 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- Compaction no longer overwrites original session (loads from disk)
+- Event content sanitized against prompt injection (XML tags, case-insensitive)
+- Atomic inbox writes (.json.tmp → .json rename)
+- inotify watcher runs on spawn_blocking (no longer starves tokio runtime)
+- Events during streaming buffered and flushed after MessageHistory
+- Spurious auto-triggers prevented by event_received guard
+- push() calls notify_one() (was missing — events silently queued)
+- Session save ordering: new session saved before old session updated
+- chars().count() moved outside lock scope
+- High-priority event FIFO ordering (was LIFO among Highs)
+- Queue-full events left in inbox for retry (not silently dropped)
+- push_priority logs evicted event ID
 - **Session file corruption**: atomic writes via write-to-tmp then rename
 - **Tool input parse errors surfaced to model**: malformed tool_use JSON no longer silently falls through to empty input; model sees `invalid tool input JSON: ...` and can self-correct
 - **Custom theme crash**: `unreachable!()` in draw replaced with graceful fallback colors for non-Rgb themes
@@ -53,6 +98,15 @@ All notable changes to this project will be documented in this file.
 - Usage log world-readable at `/tmp/` → moved to `~/.cache/` with 0600
 
 ### Changed
+- Compaction logic moved from chatui to `core/compaction.rs`
+- `SubagentHandle`/`Registry`/`Status` moved to `runtime/subagent.rs`
+- `ApiOptions` struct replaces `use_1m_context: bool` threading
+- `build_auth_header` + `build_beta_header` extracted as helpers
+- `clone_repo` helper deduplicates plugin installer
+- All compaction prompts colocated in `core/compaction.rs`
+- Tool descriptions guide model choice (subagent vs subagent_start)
+- Stub tools unregistered from tool registry (model doesn't see unimplemented tools)
+- SubagentState uses RwLock instead of Mutex
 - **`define_settings!` macro**: settings schema + apply handler defined once in `settings/defs.rs` via declarative macro — zero drift possible (replaced manual sync + parity tests)
 - **Single source of truth for commands**: removed duplicate `ALL_COMMANDS` array; `commands.rs` now sources from `skills::BUILTIN_COMMANDS`
 - **`src/cmd_*.rs` → `src/cmd/` module**: subcommand handlers moved to dedicated directory, `cmd_` prefix stripped

@@ -456,4 +456,29 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 
 ---
 
+## Reactive Subagent Tools
+
+```
+subagent_start(agent, task, ...)   → {"handle_id": "sa_1", "status": "running"}
+subagent_status(handle_id)         → {"status": "running", "partial_output": "..."}
+subagent_steer(handle_id, message) → {"acknowledged": true}
+subagent_collect(handle_id)        → {"status": "completed", "output": "full result"}
+```
+
+Use `subagent` for simple sequential delegation (blocks until done).
+Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
+
+---
+
+## Event Bus
+
+External systems push events into running sessions via `synaps send`:
+```bash
+synaps send "message" --source cli --severity medium
+```
+
+Events appear as styled cards and auto-trigger model turns. During streaming, events buffer and flush after the current response.
+
+---
+
 *Whatever happens, happens.*

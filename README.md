@@ -2,7 +2,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~21K lines](https://img.shields.io/badge/lines-~21.3K-green.svg)
+![~24K lines](https://img.shields.io/badge/lines-~24K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
@@ -15,8 +15,10 @@ Chat, orchestrate a crew of named subagents, or leave autonomous workers running
 
 ## Why SynapsCLI?
 
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~21K lines, `cargo build` and you're done.
+- ⚡ **Sub-100ms cold start.** Single Rust binary, ~24K lines, `cargo build` and you're done.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
+- 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
+- 🔄 **Reactive Subagents.** Dispatch, poll, steer, collect. Five tools that turn fire-and-forget into collaborative orchestration.
 - 🤖 **Autonomous mode that won't eat your wallet.** `watcher` supervises long-running agents with heartbeats, crash recovery, cost limits, and session handoff.
 - 🎨 **18 themes.** cyberpunk, tokyo-night, gruvbox, catppuccin, nord, dracula, and friends. Live preview in `/settings`, hot-reload with `/theme`.
 - 🧠 **90%+ prompt cache hit rate.** Hand-tuned cache breakpoints beat auto-cache (tested: 90% vs 53%). Built for multi-hour sessions.
@@ -48,6 +50,10 @@ synaps
 ```
 
 `/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long.
+
+```bash
+synaps send "alert" --source monitoring  # inject events from anywhere
+```
 
 ---
 
@@ -118,6 +124,15 @@ max_daily_cost_usd = 10.0
 
 Full schema in [AGENTS.md](AGENTS.md). Agents checkpoint state on exit and resume where they left off.
 
+### Event Bus
+```bash
+# Any script, cron job, or service can push events into a running session
+synaps send "Jellyfin is DOWN" --source uptime-kuma --severity high
+synaps send "deploy complete" --source ci --severity low --content-type event
+synaps send "check PR #42" --source github --channel reviews
+```
+Events appear as styled cards in the TUI and auto-trigger the agent to respond. During streaming, events buffer and flush after the current response completes.
+
 ---
 
 ## Built-in Tools
@@ -128,6 +143,11 @@ Full schema in [AGENTS.md](AGENTS.md). Agents checkpoint state on exit and resum
 | `read` / `write` / `edit` | Atomic, UTF-8 validated file ops |
 | `grep` / `find` / `ls` | Regex, glob, directory ops |
 | `subagent` | Dispatch a named crew member |
+| `subagent_start` | Dispatch reactive subagent (returns immediately) |
+| `subagent_status` | Poll running subagent progress |
+| `subagent_steer` | Inject guidance into running subagent |
+| `subagent_collect` | Check if subagent is done, get result |
+| `shell_start/send/end` | Interactive PTY sessions |
 | `mcp_connect` | Load tools from MCP servers |
 | `load_skill` | Load behavioral guidelines from markdown |
 
@@ -145,6 +165,10 @@ Long sessions eat context. `/compact` fixes that.
 ```
 
 The LLM produces a structured checkpoint (goals, progress, decisions, file ops, next steps) and the entire message history is replaced with that summary. Iterative — `/compact` again merges new work into the existing summary. Inspired by [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
+
+- Chain sessions: `/compact` creates a new linked session, preserving the original
+- Configurable model: compaction defaults to Sonnet (saves tokens)
+- System prompt carried through compaction chains
 
 ---
 
@@ -168,6 +192,7 @@ src/
 ├── chatui/      # TUI: event loop, rendering, markdown, themes, settings
 ├── watcher/     # supervisor daemon, IPC, heartbeats
 ├── core/        # config, session, auth, protocol, logging
+├── events/      # event bus: types, priority queue, inotify watcher, formatting
 ├── runtime/     # orchestration, SSE streaming, parallel tool exec
 ├── tools/       # bash, read, write, edit, grep, find, ls, subagent, mcp
 ├── mcp/         # JSON-RPC client, lazy server spawning
