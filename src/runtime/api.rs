@@ -21,6 +21,14 @@ fn parse_tool_input(raw: &str) -> Value {
     }
 }
 
+/// Options that modify API request behavior beyond the core parameters.
+/// Extensible — new flags go here instead of adding parameters to 4 signatures.
+#[derive(Debug, Clone, Default)]
+pub struct ApiOptions {
+    /// Opt into the 1M context window beta header.
+    pub use_1m_context: bool,
+}
+
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
@@ -41,13 +49,13 @@ impl ApiMethods {
 
     /// Build the `anthropic-beta` header value. Returns `None` when no beta
     /// flags apply.
-    fn build_beta_header(auth_type: &str, use_1m_context: bool, model: &str) -> Option<String> {
+    fn build_beta_header(auth_type: &str, options: &ApiOptions, model: &str) -> Option<String> {
         let mut betas: Vec<&str> = Vec::new();
         if auth_type == "oauth" {
             betas.push("claude-code-20250219");
             betas.push("oauth-2025-04-20");
         }
-        if use_1m_context && crate::core::models::model_supports_1m(model) {
+        if options.use_1m_context && crate::core::models::model_supports_1m(model) {
             betas.push("context-1m-2025-08-07");
         }
         if betas.is_empty() {
@@ -68,9 +76,9 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
-        use_1m_context: bool,
+        options: &ApiOptions,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, use_1m_context).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -87,7 +95,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
-        use_1m_context: bool,
+        options: &ApiOptions,
     ) -> Result<Value> {
         // Read auth state for this API call
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
@@ -189,7 +197,7 @@ impl ApiMethods {
                 // this opt-in, all models default to 200k mode — which is the
                 // documented "smarter" inference regime (see
                 // anthropic.com/engineering/effective-context-engineering).
-                if let Some(beta) = Self::build_beta_header(&auth_type, use_1m_context, model) {
+                if let Some(beta) = Self::build_beta_header(&auth_type, options, model) {
                     req = req.header("anthropic-beta", beta);
                 }
 
@@ -480,7 +488,7 @@ impl ApiMethods {
         thinking_budget: u32,
         messages: &[Value],
         max_retries: u32,
-        use_1m_context: bool,
+        options: &ApiOptions,
     ) -> Result<Value> {
         // Read auth state
         let (auth_token, auth_type) = {
@@ -573,7 +581,7 @@ impl ApiMethods {
                     betas.push("claude-code-20250219");
                     betas.push("oauth-2025-04-20");
                 }
-                if use_1m_context && crate::core::models::model_supports_1m(model) {
+                if options.use_1m_context && crate::core::models::model_supports_1m(model) {
                     betas.push("context-1m-2025-08-07");
                 }
                 if !betas.is_empty() {
@@ -705,7 +713,7 @@ impl ApiMethods {
                     .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
-                if let Some(beta) = Self::build_beta_header(&auth_type, false, model) {
+                if let Some(beta) = Self::build_beta_header(&auth_type, &ApiOptions::default(), model) {
                     req = req.header("anthropic-beta", beta);
                 }
 
