@@ -41,54 +41,65 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
     scan_inbox(&inbox_dir, &queue).await;
 
-    // Set up inotify watcher (same pattern as watcher/supervisor.rs)
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut notify_watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
-        tx,
-        notify::Config::default(),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("inotify unavailable ({}), polling fallback", e);
-            poll_loop(&inbox_dir, &queue).await;
-            return;
-        }
-    };
+    // Use a tokio channel so the async runtime isn't blocked
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
 
-    if let Err(e) = notify_watcher.watch(&inbox_dir, notify::RecursiveMode::NonRecursive) {
-        tracing::warn!("watch failed ({}), polling fallback", e);
-        poll_loop(&inbox_dir, &queue).await;
-        return;
-    }
-    tracing::info!("Inbox watcher (inotify) on {}", inbox_dir.display());
-
-    // Keep watcher alive, process events
-    loop {
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(event)) => {
-                for path in &event.paths {
-                    process_file(path, &queue).await;
-                }
-            }
-            Ok(Err(e)) => tracing::warn!("notify error: {}", e),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                scan_inbox(&inbox_dir, &queue).await; // safety scan
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::error!("notify disconnected, switching to polling");
-                poll_loop(&inbox_dir, &queue).await;
+    // Spawn the blocking notify watcher on a dedicated thread
+    let inbox_clone = inbox_dir.clone();
+    let watcher_handle = tokio::task::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut _watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
+            tx,
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("inotify unavailable: {}", e);
                 return;
             }
+        };
+
+        if let Err(e) = _watcher.watch(&inbox_clone, notify::RecursiveMode::NonRecursive) {
+            tracing::warn!("watch failed: {}", e);
+            return;
+        }
+        tracing::info!("Inbox watcher (inotify) on {}", inbox_clone.display());
+
+        // Blocking loop on its own thread — doesn't touch tokio
+        loop {
+            match rx.recv() {
+                Ok(Ok(event)) => {
+                    if !event.paths.is_empty() {
+                        let _ = async_tx.send(event.paths);
+                    }
+                }
+                Ok(Err(e)) => tracing::warn!("notify error: {}", e),
+                Err(_) => {
+                    tracing::error!("notify disconnected");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Async loop — receives paths from the blocking watcher thread
+    let queue_ref = &queue;
+    let dir_ref = &inbox_dir;
+    loop {
+        tokio::select! {
+            Some(paths) = async_rx.recv() => {
+                for path in &paths {
+                    process_file(path, queue_ref).await;
+                }
+            }
+            // Safety scan every 10s in case inotify misses something
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                scan_inbox(dir_ref, queue_ref).await;
+            }
         }
     }
 }
 
-async fn poll_loop(dir: &Path, queue: &EventQueue) {
-    loop {
-        scan_inbox(dir, queue).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
 
 #[cfg(test)]
 mod tests {
