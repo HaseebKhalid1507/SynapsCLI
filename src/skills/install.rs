@@ -37,6 +37,102 @@ pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
     rev_parse_head(dest)
 }
 
+/// Shallow-clone `marketplace_url` into a temp dir sibling to `dest`, then
+/// move its `<subdir>` directly into place at `dest`. Returns the HEAD SHA
+/// of the cloned marketplace. Used for Claude-Code-style marketplaces whose
+/// plugins reference `./<subdir>` instead of their own standalone repos.
+///
+/// Guarantees:
+/// - `subdir` must pass [`crate::skills::marketplace::is_safe_plugin_name`]
+///   (no traversal, no path separators).
+/// - `dest` must not exist.
+/// - If the subdir doesn't exist inside the cloned repo, returns `Err` and
+///   does not create `dest`.
+pub fn install_plugin_from_subdir(
+    marketplace_url: &str,
+    subdir: &str,
+    dest: &Path,
+) -> Result<String, String> {
+    if marketplace_url.starts_with('-') {
+        return Err(format!("refusing suspicious url: {}", marketplace_url));
+    }
+    if !crate::skills::marketplace::is_safe_plugin_name(subdir) {
+        return Err(format!("refusing unsafe subdir name: {}", subdir));
+    }
+    if dest.exists() {
+        return Err(format!("{} already exists on disk; uninstall first", dest.display()));
+    }
+    let parent = dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+
+    let dest_name = dest.file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "dest file name is not utf-8".to_string())?;
+    let tmp = parent.join(format!(".{}-clone-tmp", dest_name));
+    // Clean any stale temp from a prior aborted install.
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let out = Command::new("git")
+        .args(["clone", "--depth=1", "-q", "--", marketplace_url])
+        .arg(&tmp)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git not found on PATH".to_string()
+            } else {
+                format!("spawn git: {}", e)
+            }
+        })?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let sha = match rev_parse_head(&tmp) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+
+    let src_subdir = tmp.join(subdir);
+    if !src_subdir.is_dir() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("subdir '{}' not found in marketplace repo", subdir));
+    }
+
+    // Prefer rename (fast, same-filesystem); fall back to recursive copy.
+    if std::fs::rename(&src_subdir, dest).is_err() {
+        copy_dir_all(&src_subdir, dest).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            format!("copy {} to {}: {}", src_subdir.display(), dest.display(), e)
+        })?;
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(sha)
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), dst_path)?;
+        }
+        // Symlinks and other types are skipped intentionally.
+    }
+    Ok(())
+}
+
 /// `rm -rf <path>`. Missing path is OK.
 pub fn uninstall_plugin(path: &Path) -> Result<(), String> {
     match std::fs::remove_dir_all(path) {
@@ -140,6 +236,77 @@ mod tests {
         ).unwrap();
         assert!(dest.join("SKILL.md").exists());
         assert_eq!(sha.len(), 40);
+    }
+
+    /// Like `mk_local_repo`, but puts the plugin content under `work/<sub>/`
+    /// so the bare clone can be snapshotted via `install_plugin_from_subdir`.
+    fn mk_local_repo_with_subdir(sub: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join(sub)).unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&work).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&work).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&work).status().unwrap();
+        std::fs::write(
+            work.join(sub).join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody",
+        ).unwrap();
+        std::fs::write(work.join("README.md"), "top level").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&work).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&work).status().unwrap();
+
+        let bare = dir.path().join("bare.git");
+        Command::new("git").args(["clone", "--bare", "-q",
+            work.to_str().unwrap(), bare.to_str().unwrap()]).status().unwrap();
+        (dir, bare)
+    }
+
+    #[test]
+    fn install_plugin_from_subdir_snapshots_subdir_content() {
+        let (_tmp, bare) = mk_local_repo_with_subdir("web");
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("web");
+        let sha = install_plugin_from_subdir(
+            &format!("file://{}", bare.display()),
+            "web",
+            &dest,
+        ).unwrap();
+        assert_eq!(sha.len(), 40);
+        // Subdir contents landed directly at dest.
+        assert!(dest.join("SKILL.md").exists());
+        // README.md from the parent repo was NOT copied in.
+        assert!(!dest.join("README.md").exists());
+        // No leftover temp clone.
+        let tmp_leftover = dest_parent.path().join(".web-clone-tmp");
+        assert!(!tmp_leftover.exists());
+    }
+
+    #[test]
+    fn install_plugin_from_subdir_rejects_unsafe_subdir() {
+        let (_tmp, bare) = mk_local_repo_with_subdir("web");
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("web");
+        let err = install_plugin_from_subdir(
+            &format!("file://{}", bare.display()),
+            "../evil",
+            &dest,
+        ).unwrap_err();
+        assert!(err.contains("unsafe"));
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn install_plugin_from_subdir_fails_when_subdir_missing() {
+        let (_tmp, bare) = mk_local_repo_with_subdir("web");
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("nope");
+        let err = install_plugin_from_subdir(
+            &format!("file://{}", bare.display()),
+            "nope",
+            &dest,
+        ).unwrap_err();
+        assert!(err.contains("not found"));
+        assert!(!dest.exists());
     }
 
     #[test]
