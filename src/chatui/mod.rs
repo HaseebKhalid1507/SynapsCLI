@@ -84,6 +84,10 @@ fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
                 continue;
             }
         }
+        // Skip event messages — already displayed as event cards
+        if msg.get("_event").is_some() {
+            continue;
+        }
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
@@ -236,7 +240,9 @@ pub async fn run(
 
             // ── Event bus wake — fires instantly when an event is pushed to the queue ──
             _ = runtime.event_queue().notified() => {
+                let mut event_received = false;
                 while let Some(event) = runtime.event_queue().pop() {
+                    event_received = true;
                     let formatted = synaps_cli::events::format_event_for_agent(&event);
                     let severity_str = event.content.severity
                         .as_ref()
@@ -255,14 +261,15 @@ pub async fn run(
                     } else {
                         app.api_messages.push(serde_json::json!({
                             "role": "user",
-                            "content": formatted
+                            "content": formatted,
+                            "_event": true
                         }));
                     }
                     app.invalidate();
                 }
 
-                // Auto-trigger model turn when idle
-                if !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                // Auto-trigger model turn when idle — only if we actually received events
+                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
                     if let Some(last) = app.api_messages.last() {
                         if last["role"].as_str() == Some("user") {
                             let ct = CancellationToken::new();
