@@ -227,6 +227,7 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
         "model" => snap.model.clone(),
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
+        "compaction_model" => snap.compaction_model.clone(),
         "api_retries" => snap.api_retries.to_string(),
         "subagent_timeout" => format!("{}s", snap.subagent_timeout),
         "max_tool_output" => snap.max_tool_output.to_string(),

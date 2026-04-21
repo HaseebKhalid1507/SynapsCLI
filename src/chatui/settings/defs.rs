@@ -77,6 +77,18 @@ define_settings! {
             app.last_turn_context_window = runtime.context_window();
         };
 
+    compaction_model, "Compaction model", Model,
+        EditorKind::Text { numeric: false },
+        "Model used for /compact (default: claude-sonnet-4-6).",
+        |runtime, _app, value| {
+            let model = if value.is_empty() || value == "auto" || value == "default" {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            runtime.set_compaction_model(model);
+        };
+
     api_retries, "API retries", Agent, EditorKind::Text { numeric: true },
         "Retries on transient API errors.",
         |runtime, _app, value| {
