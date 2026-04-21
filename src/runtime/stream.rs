@@ -32,7 +32,7 @@ impl StreamMethods {
         api_retries: u32,
         session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
         options: super::api::ApiOptions,
-        subagent_registry: Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>>,
+        subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
         event_queue: Arc<crate::events::EventQueue>,
     ) -> Result<()> {
         let mut messages = initial_messages;

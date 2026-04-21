@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-use super::subagent_handle::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
+use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
 pub struct SubagentStartTool;
 

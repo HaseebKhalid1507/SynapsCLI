@@ -366,7 +366,7 @@ pub async fn run(
                                 {
                                     let mut registry = runtime.subagent_registry().lock().unwrap();
                                     for handle in registry.iter_mut_handles() {
-                                        if handle.status() == synaps_cli::tools::subagent_handle::SubagentStatus::Running {
+                                        if handle.status() == synaps_cli::runtime::subagent::SubagentStatus::Running {
                                             handle.cancel();
                                         }
                                     }

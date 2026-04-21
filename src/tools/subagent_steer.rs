@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext};
-use crate::tools::subagent_handle::SubagentStatus;
+use crate::runtime::subagent::SubagentStatus;
 
 pub struct SubagentSteerTool;
 

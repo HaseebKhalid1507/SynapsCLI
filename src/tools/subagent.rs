@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-pub use super::subagent_handle::SubagentResult;
+pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;
 
