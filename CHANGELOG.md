@@ -38,6 +38,7 @@ All notable changes to this project will be documented in this file.
   - Message queuing during compaction
 - **`respond` tool** (stub — returns honest failure until wired)
 - **`send_channel` tool** (stub — returns honest failure until wired)
+- **`/status` command + `synaps status` subcommand**: check account usage (5-hour, 7-day, Sonnet) with progress bars and reset countdowns. Hits OAuth usage API.
 - **`/compact` slash command**: summarize & compact conversation history when context gets long
   - Structured checkpoint format (goals, progress, decisions, file ops, next steps)
   - Iterative compaction — re-compacting merges new work into existing summary
