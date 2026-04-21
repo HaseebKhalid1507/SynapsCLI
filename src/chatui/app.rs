@@ -95,6 +95,8 @@ pub(crate) struct App {
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
+    /// Events buffered during streaming — injected into api_messages after stream completes
+    pub(crate) pending_events: Vec<String>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -154,6 +156,7 @@ impl App {
             settings: None,
             plugins: None,
             compact_task: None,
+            pending_events: Vec::new(),
         }
     }
 

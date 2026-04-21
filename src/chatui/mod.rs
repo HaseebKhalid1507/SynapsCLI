@@ -256,16 +256,15 @@ pub async fn run(
                         text: event.content.text.clone(),
                     });
 
-                    // Always queue for next turn — steering causes duplicates
-                    // because steered messages become user messages in MessageHistory
-                    if !app.streaming {
+                    if app.streaming {
+                        // Buffer during streaming — inject after MessageHistory
+                        app.pending_events.push(formatted);
+                    } else {
                         app.api_messages.push(serde_json::json!({
                             "role": "user",
                             "content": formatted
                         }));
                     }
-                    // During streaming, events are visible as cards but the model
-                    // sees them on the next turn (after MessageHistory updates)
                     app.invalidate();
                 }
 

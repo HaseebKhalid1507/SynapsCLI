@@ -155,6 +155,14 @@ pub(super) async fn handle_stream_event(
             app.streaming = false;
             app.subagents.clear();
 
+            // Flush events that arrived during streaming into api_messages
+            for formatted in app.pending_events.drain(..) {
+                app.api_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": formatted
+                }));
+            }
+
             // Check for queued message to auto-send
             if let Some(queued) = app.queued_message.take() {
                 return StreamAction::AutoSendQueued(queued);
