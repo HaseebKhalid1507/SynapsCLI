@@ -78,6 +78,12 @@ fn apply_setting(
 
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     for msg in api_messages {
+        // Skip compaction summary messages — internal context, not user-visible
+        if let Some(content) = msg["content"].as_str() {
+            if content.contains("<context-summary>") {
+                continue;
+            }
+        }
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
@@ -219,7 +225,7 @@ pub async fn run(
 
         tokio::select! {
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
@@ -228,7 +234,7 @@ pub async fn run(
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
                 }
-                if !app.subagents.is_empty() || app.streaming {
+                if !app.subagents.is_empty() || app.streaming || app.compact_task.is_some() {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                     if app.spinner_frame % 3 == 0 {
                         app.invalidate();
@@ -241,6 +247,40 @@ pub async fn run(
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                }
+                // Poll background compaction task
+                if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
+                    let handle = app.compact_task.take().unwrap();
+                    let msg_count = app.api_messages.len();
+                    match handle.await {
+                        Ok(Ok(summary)) => {
+                            let old_id = app.session.id.clone();
+                            let new_session = Session::new_from_compaction(&app.session, summary.clone());
+                            let new_id = new_session.id.clone();
+                            app.session.compacted_into = Some(new_id.clone());
+                            app.session.save().await.ok();
+                            app.session = new_session;
+                            app.api_messages = app.session.api_messages.clone();
+                            app.total_input_tokens = 0;
+                            app.total_output_tokens = 0;
+                            app.session_cost = 0.0;
+                            let msgs = app.api_messages.clone();
+                            rebuild_display_messages(&msgs, &mut app);
+                            app.save_session().await;
+                            app.push_msg(ChatMessage::System(format!(
+                                "✓ compacted {} messages → new session {} (from {})",
+                                msg_count, new_id, old_id
+                            )));
+                        }
+                        Ok(Err(e)) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
+                        }
+                        Err(e) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction task panicked: {}", e)));
+                        }
+                    }
+                    app.status_text = None;
+                    app.invalidate();
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -370,56 +410,24 @@ pub async fn run(
                                             app.push_msg(ChatMessage::System(
                                                 "nothing to compact (need at least 2 turns)".to_string(),
                                             ));
+                                        } else if app.compact_task.is_some() {
+                                            app.push_msg(ChatMessage::System(
+                                                "compaction already in progress".to_string(),
+                                            ));
                                         } else {
                                             app.push_msg(ChatMessage::System(
                                                 "compacting conversation...".to_string(),
                                             ));
                                             app.status_text = Some("compacting…".to_string());
-                                            let elapsed = last_frame.elapsed();
-                                            last_frame = Instant::now();
-                                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                                            app.spinner_frame = 0;
 
-                                            let msg_count = app.api_messages.len();
-                                            let summary_result = compact_conversation(
-                                                &app.api_messages,
-                                                &runtime,
-                                                custom_instructions.as_deref(),
-                                            ).await;
-
-                                            match summary_result {
-                                                Ok(summary) => {
-                                                    let old_id = app.session.id.clone();
-
-                                                    // Create new linked session
-                                                    let new_session = Session::new_from_compaction(&app.session, summary.clone());
-                                                    let new_id = new_session.id.clone();
-
-                                                    // Mark old session as compacted
-                                                    app.session.compacted_into = Some(new_id.clone());
-                                                    app.session.save().await.ok();
-
-                                                    // Swap to new session
-                                                    app.session = new_session;
-                                                    app.api_messages = app.session.api_messages.clone();
-                                                    app.total_input_tokens = 0;
-                                                    app.total_output_tokens = 0;
-                                                    app.session_cost = 0.0;
-                                                    let msgs = app.api_messages.clone();
-                                                    rebuild_display_messages(&msgs, &mut app);
-                                                    app.save_session().await;
-
-                                                    app.push_msg(ChatMessage::System(format!(
-                                                        "✓ compacted {} messages → new session {} (from {})",
-                                                        msg_count, new_id, old_id
-                                                    )));
-                                                }
-                                                Err(e) => {
-                                                    app.push_msg(ChatMessage::Error(format!(
-                                                        "compaction failed: {}", e
-                                                    )));
-                                                }
-                                            }
-                                            app.status_text = None;
+                                            let msgs = app.api_messages.clone();
+                                            let rt = runtime.clone();
+                                            let instr = custom_instructions.clone();
+                                            let handle = tokio::spawn(async move {
+                                                compact_conversation(&msgs, &rt, instr.as_deref()).await
+                                            });
+                                            app.compact_task = Some(handle);
                                         }
                                     }
                                     CommandAction::Chain => {

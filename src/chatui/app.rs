@@ -92,6 +92,8 @@ pub(crate) struct App {
     pub(crate) settings: Option<super::settings::SettingsState>,
     /// Active plugins modal state (Some while /plugins is open).
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
+    /// Background compaction task — polled in the event loop so /compact doesn't block.
+    pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -150,6 +152,7 @@ impl App {
             gamba_child: None,
             settings: None,
             plugins: None,
+            compact_task: None,
         }
     }
 
