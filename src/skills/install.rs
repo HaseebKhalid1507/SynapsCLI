@@ -3,14 +3,12 @@
 use std::path::Path;
 use std::process::Command;
 
-/// `git clone --depth=1 <url> <dest>`, then `git rev-parse HEAD`.
-/// `dest` must not already exist.
-pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
+
+/// Shared git clone logic. Validates URL, ensures dest parent exists,
+/// runs `git clone --depth=1`. Returns Ok(()) on success, cleans up on failure.
+fn clone_repo(source_url: &str, dest: &Path) -> Result<(), String> {
     if source_url.starts_with('-') {
         return Err(format!("refusing suspicious url: {}", source_url));
-    }
-    if dest.exists() {
-        return Err(format!("{} already exists on disk; uninstall first", dest.display()));
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -34,6 +32,16 @@ pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    Ok(())
+}
+
+/// `git clone --depth=1 <url> <dest>`, then `git rev-parse HEAD`.
+/// `dest` must not already exist.
+pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
+    if dest.exists() {
+        return Err(format!("{} already exists on disk; uninstall first", dest.display()));
+    }
+    clone_repo(source_url, dest)?;
     rev_parse_head(dest)
 }
 
@@ -53,9 +61,6 @@ pub fn install_plugin_from_subdir(
     subdir: &str,
     dest: &Path,
 ) -> Result<String, String> {
-    if marketplace_url.starts_with('-') {
-        return Err(format!("refusing suspicious url: {}", marketplace_url));
-    }
     if !crate::skills::marketplace::is_safe_plugin_name(subdir) {
         return Err(format!("refusing unsafe subdir name: {}", subdir));
     }
@@ -63,9 +68,6 @@ pub fn install_plugin_from_subdir(
         return Err(format!("{} already exists on disk; uninstall first", dest.display()));
     }
     let parent = dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-
     let dest_name = dest.file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "dest file name is not utf-8".to_string())?;
@@ -73,24 +75,7 @@ pub fn install_plugin_from_subdir(
     // Clean any stale temp from a prior aborted install.
     let _ = std::fs::remove_dir_all(&tmp);
 
-    let out = Command::new("git")
-        .args(["clone", "--depth=1", "-q", "--", marketplace_url])
-        .arg(&tmp)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "git not found on PATH".to_string()
-            } else {
-                format!("spawn git: {}", e)
-            }
-        })?;
-    if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(format!(
-            "git clone failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    clone_repo(marketplace_url, &tmp)?;
 
     let sha = match rev_parse_head(&tmp) {
         Ok(s) => s,
