@@ -84,28 +84,32 @@ pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
 /// else the client needs to know how much prompt the model will accept.
 ///
 /// Values verified against Anthropic model cards as of 2026-04:
-/// - Opus 4.x family: 1M default (S171 limit-test confirmed 270K+ per-turn
-///   input succeeded without `CONTEXT_1M_BETA_HEADER` — Anthropic raised the
-///   default silently with this generation).
-/// - Sonnet 4.x family: 200K default; 1M available via beta header opt-in
-///   (we don't send it in api.rs, so the effective limit is 200K).
+/// - Opus 4.6+: 1M (native, no beta header needed).
+/// - Opus 4.7: 1M (native; uses a new tokenizer so ~555k words).
+/// - Sonnet 4.6+: 1M (native, no beta header needed).
+/// - Opus 4.5 and earlier: 200K default; 1M via `context-1m-2025-08-07` beta.
+/// - Sonnet 4.5 and earlier: 200K.
 /// - Haiku (all versions): 200K.
-/// - Opus 3.x / unknown models: 200K conservative default.
 pub fn context_window_for_model(model: &str) -> u64 {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus-4") || m.contains("opus4") {
-        1_000_000
-    } else if m.contains("sonnet-4") || m.contains("sonnet4") {
-        200_000
-    } else if m.contains("haiku") {
-        200_000
-    } else if m.contains("opus") {
-        // Opus 3.x — 200K
-        200_000
-    } else {
-        // Unknown — conservative default.
-        200_000
+    // Opus 4.6+ and Sonnet 4.6+ have native 1M context.
+    // Match 4.6, 4.7, 4.8, 4.9 (but NOT 4.5 or earlier).
+    if m.contains("opus-4-6") || m.contains("opus-4-7")
+        || m.contains("opus-4-8") || m.contains("opus-4-9")
+    {
+        return 1_000_000;
     }
+    if m.contains("sonnet-4-6") || m.contains("sonnet-4-7")
+        || m.contains("sonnet-4-8") || m.contains("sonnet-4-9")
+    {
+        return 1_000_000;
+    }
+    // 5.x and beyond — assume 1M+ by default.
+    if m.contains("opus-5") || m.contains("sonnet-5") || m.contains("haiku-5") {
+        return 1_000_000;
+    }
+    // Opus 4.5 and earlier, Sonnet 4.5, Haiku, unknown → 200K
+    200_000
 }
 
 #[cfg(test)]
@@ -133,14 +137,25 @@ mod tests {
     }
 
     #[test]
-    fn context_window_opus4_is_1m() {
+    fn context_window_opus46_plus_is_1m() {
         assert_eq!(context_window_for_model("claude-opus-4-7"), 1_000_000);
-        assert_eq!(context_window_for_model("claude-opus-4-5"), 1_000_000);
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 1_000_000);
     }
 
     #[test]
-    fn context_window_sonnet4_is_200k() {
-        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
+    fn context_window_opus45_is_200k() {
+        assert_eq!(context_window_for_model("claude-opus-4-5"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-5-20251101"), 200_000);
+    }
+
+    #[test]
+    fn context_window_sonnet46_is_1m() {
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_sonnet45_is_200k() {
+        assert_eq!(context_window_for_model("claude-sonnet-4-5-20250929"), 200_000);
     }
 
     #[test]
