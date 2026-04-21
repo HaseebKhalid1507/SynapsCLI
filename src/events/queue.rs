@@ -42,6 +42,8 @@ impl EventQueue {
             }
             _ => q.push_back(event),
         }
+        drop(q);
+        self.notify.notify_one();
         Ok(())
     }
 
