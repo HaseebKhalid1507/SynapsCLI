@@ -5,6 +5,7 @@ use std::sync::Mutex;
 pub struct EventQueue {
     inner: Mutex<VecDeque<Event>>,
     capacity: usize,
+    notify: tokio::sync::Notify,
 }
 
 impl EventQueue {
@@ -12,6 +13,7 @@ impl EventQueue {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -50,6 +52,8 @@ impl EventQueue {
             q.pop_back();
         }
         q.push_front(event);
+        drop(q);
+        self.notify.notify_one();
     }
 
     pub fn pop(&self) -> Option<Event> {
@@ -62,6 +66,11 @@ impl EventQueue {
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+
+    /// Wait until an event is pushed. Use in tokio::select! for instant wake.
+    pub fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
     }
 
     pub fn is_empty(&self) -> bool {
