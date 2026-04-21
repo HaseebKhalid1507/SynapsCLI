@@ -76,6 +76,51 @@ fn apply_setting(
     }
 }
 
+async fn fetch_usage() -> std::result::Result<String, String> {
+    let auth_path = synaps_cli::config::base_dir().join("auth.json");
+    let content = std::fs::read_to_string(&auth_path)
+        .map_err(|e| format!("Auth read failed: {}", e))?;
+    let auth: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Auth parse failed: {}", e))?;
+    let access = auth["anthropic"]["access"].as_str()
+        .ok_or("No OAuth token")?;
+
+    let client = reqwest::Client::new();
+    let resp = client.get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {}", access))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send().await
+        .map_err(|e| format!("API error: {}", e))?;
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    fn format_row(label: &str, data: &serde_json::Value) -> Option<String> {
+        let util = data["utilization"].as_f64()?;
+        let resets = data["resets_at"].as_str()?;
+        let reset_display = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(resets) {
+            let diff = dt.signed_duration_since(chrono::Utc::now());
+            let hours = diff.num_hours();
+            let mins = diff.num_minutes() % 60;
+            if hours > 24 { format!("{}d {}h", hours / 24, hours % 24) }
+            else if hours > 0 { format!("{}h {}m", hours, mins) }
+            else { format!("{}m", mins) }
+        } else { "—".to_string() };
+
+        let filled = ((util / 100.0) * 15.0) as usize;
+        let empty = 15usize.saturating_sub(filled);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+        Some(format!("{:>10}: {} {:>3.0}%  resets in {}", label, bar, util, reset_display))
+    }
+
+    let mut lines = vec!["Account Usage:".to_string()];
+    if let Some(row) = format_row("5-hour", &data["five_hour"]) { lines.push(row); }
+    if let Some(row) = format_row("7-day", &data["seven_day"]) { lines.push(row); }
+    if let Some(row) = format_row("Sonnet", &data["seven_day_sonnet"]) { lines.push(row); }
+
+    Ok(lines.join("\n"))
+}
+
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     app.messages.clear();
     for msg in api_messages {
@@ -569,6 +614,13 @@ pub async fn run(
                                             app.push_msg(ChatMessage::System(lines.join("\n")));
                                         }
                                     }
+                                    CommandAction::Status => {
+                                        app.push_msg(ChatMessage::System("Checking usage...".to_string()));
+                                        match fetch_usage().await {
+                                            Ok(msg) => app.push_msg(ChatMessage::System(msg)),
+                                            Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -677,6 +729,7 @@ pub async fn run(
                                         CommandAction::LoadSkill { .. } => {}
                                         CommandAction::Compact { .. } => {}
                                         CommandAction::Chain => {}
+                                        CommandAction::Status => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue

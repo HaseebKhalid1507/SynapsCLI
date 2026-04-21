@@ -54,6 +54,8 @@ pub(super) enum CommandAction {
     },
     /// Show the session compaction chain.
     Chain,
+    /// Show account usage and reset times.
+    Status,
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -221,6 +223,7 @@ pub(super) async fn handle_command(
                 "/theme — list available themes",
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
+                "/status — show account usage and reset times",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
@@ -266,6 +269,9 @@ pub(super) async fn handle_command(
         }
         "chain" => {
             return CommandAction::Chain;
+        }
+        "status" => {
+            return CommandAction::Status;
         }
         _ => {
             match registry.resolve(cmd) {
