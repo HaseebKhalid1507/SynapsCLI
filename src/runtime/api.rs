@@ -24,6 +24,39 @@ fn parse_tool_input(raw: &str) -> Value {
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
+    /// Build the auth header for Anthropic requests.
+    /// Returns `(header_name, header_value, auth_type)`.
+    async fn build_auth_header(auth: &Arc<RwLock<AuthState>>) -> (String, String, String) {
+        let (auth_token, auth_type) = {
+            let a = auth.read().await;
+            (a.auth_token.clone(), a.auth_type.clone())
+        };
+        let (name, value) = if auth_type == "oauth" {
+            ("authorization".to_string(), format!("Bearer {}", auth_token))
+        } else {
+            ("x-api-key".to_string(), auth_token)
+        };
+        (name, value, auth_type)
+    }
+
+    /// Build the `anthropic-beta` header value. Returns `None` when no beta
+    /// flags apply.
+    fn build_beta_header(auth_type: &str, use_1m_context: bool, model: &str) -> Option<String> {
+        let mut betas: Vec<&str> = Vec::new();
+        if auth_type == "oauth" {
+            betas.push("claude-code-20250219");
+            betas.push("oauth-2025-04-20");
+        }
+        if use_1m_context && crate::core::models::model_supports_1m(model) {
+            betas.push("context-1m-2025-08-07");
+        }
+        if betas.is_empty() {
+            None
+        } else {
+            Some(betas.join(","))
+        }
+    }
+
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(super) async fn call_api_stream(
         auth: &Arc<RwLock<AuthState>>,
@@ -57,17 +90,8 @@ impl ApiMethods {
         use_1m_context: bool,
     ) -> Result<Value> {
         // Read auth state for this API call
-        let (auth_token, auth_type) = {
-            let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone())
-        };
+        let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
-        let auth_header = if auth_type == "oauth" {
-            ("authorization".to_string(), format!("Bearer {}", auth_token))
-        } else {
-            ("x-api-key".to_string(), auth_token.clone())
-        };
-        
         tracing::info!(model = %model, "Starting API request");
         
         // Manual cache breakpoints for optimal prompt caching.
@@ -156,7 +180,7 @@ impl ApiMethods {
                 // Rebuild request (consumed on send)
                 let mut req = client
                     .post("https://api.anthropic.com/v1/messages")
-                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
                 // Build the anthropic-beta header. The 1M-context opt-in
@@ -165,16 +189,8 @@ impl ApiMethods {
                 // this opt-in, all models default to 200k mode — which is the
                 // documented "smarter" inference regime (see
                 // anthropic.com/engineering/effective-context-engineering).
-                let mut betas: Vec<&str> = Vec::new();
-                if auth_type == "oauth" {
-                    betas.push("claude-code-20250219");
-                    betas.push("oauth-2025-04-20");
-                }
-                if use_1m_context && crate::core::models::model_supports_1m(model) {
-                    betas.push("context-1m-2025-08-07");
-                }
-                if !betas.is_empty() {
-                    req = req.header("anthropic-beta", betas.join(","));
+                if let Some(beta) = Self::build_beta_header(&auth_type, use_1m_context, model) {
+                    req = req.header("anthropic-beta", beta);
                 }
 
                 match req.json(&body).send().await {
@@ -632,16 +648,7 @@ impl ApiMethods {
         messages: &[Value],
         max_retries: u32,
     ) -> Result<String> {
-        let (auth_token, auth_type) = {
-            let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone())
-        };
-
-        let auth_header = if auth_type == "oauth" {
-            ("authorization".to_string(), format!("Bearer {}", auth_token))
-        } else {
-            ("x-api-key".to_string(), auth_token.clone())
-        };
+        let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
         let mut body = json!({
             "model": model,
@@ -695,16 +702,11 @@ impl ApiMethods {
 
                 let mut req = client
                     .post("https://api.anthropic.com/v1/messages")
-                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
-                let mut betas: Vec<&str> = Vec::new();
-                if auth_type == "oauth" {
-                    betas.push("claude-code-20250219");
-                    betas.push("oauth-2025-04-20");
-                }
-                if !betas.is_empty() {
-                    req = req.header("anthropic-beta", betas.join(","));
+                if let Some(beta) = Self::build_beta_header(&auth_type, false, model) {
+                    req = req.header("anthropic-beta", beta);
                 }
 
                 match req.json(&body).send().await {
