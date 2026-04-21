@@ -77,6 +77,7 @@ fn apply_setting(
 }
 
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
+    app.messages.clear();
     for msg in api_messages {
         // Skip compaction summary messages — internal context, not user-visible
         if let Some(content) = msg["content"].as_str() {
@@ -318,8 +319,8 @@ pub async fn run(
                             let old_id = app.session.id.clone();
                             let new_session = Session::new_from_compaction(&app.session, summary.clone());
                             let new_id = new_session.id.clone();
-                            app.session.compacted_into = Some(new_id.clone());
-                            app.session.save().await.ok();
+                            // Save new session FIRST — if we crash after this but before
+                            // saving old, the new session still exists and chain is intact
                             app.session = new_session;
                             app.api_messages = app.session.api_messages.clone();
                             app.total_input_tokens = 0;
@@ -328,6 +329,11 @@ pub async fn run(
                             let msgs = app.api_messages.clone();
                             rebuild_display_messages(&msgs, &mut app);
                             app.save_session().await;
+                            // NOW update old session's compacted_into and save it
+                            let mut old_session = app.session.clone();
+                            old_session.id = old_id.clone();
+                            old_session.compacted_into = Some(new_id.clone());
+                            old_session.save().await.ok();
                             app.push_msg(ChatMessage::System(format!(
                                 "✓ compacted {} messages → new session {} (from {})",
                                 msg_count, new_id, old_id

@@ -54,21 +54,29 @@ impl Tool for SubagentStatusTool {
             ))?;
 
         // ── Build response ─────────────────────────────────────────────────────
+        // Clone all needed data under the lock, then drop lock before char traversal
+        let full: String = handle.partial_output();
+        let agent_name = handle.agent_name.clone();
+        let status_str = handle.status().as_str().to_string();
+        let elapsed = handle.elapsed_secs();
+        let tool_count = handle.tool_log().len();
+        let _ = handle;
+        drop(reg);
 
-        let full = handle.partial_output();
-        let partial_output: String = if full.chars().count() > 500 {
-            full.chars().skip(full.chars().count() - 500).collect()
+        let char_count = full.chars().count();
+        let partial_output: String = if char_count > 500 {
+            full.chars().skip(char_count - 500).collect()
         } else {
             full
         };
 
         Ok(json!({
             "handle_id":      handle_id,
-            "agent_name":     handle.agent_name,
-            "status":         handle.status().as_str(),
+            "agent_name":     agent_name,
+            "status":         status_str,
             "partial_output": partial_output,
-            "elapsed_secs":   (handle.elapsed_secs() * 10.0).round() / 10.0,
-            "tool_count":     handle.tool_log().len()
+            "elapsed_secs":   (elapsed * 10.0).round() / 10.0,
+            "tool_count":     tool_count
         }).to_string())
     }
 }
