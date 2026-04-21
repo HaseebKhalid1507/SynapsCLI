@@ -82,8 +82,8 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
                     }
                     s
                 }
-                (Some(ActiveEditor::CustomModel { buffer }), _)
-                    if def.key == "model" => {
+                (Some(ActiveEditor::CustomModel { buffer, setting_key }), _)
+                    if *setting_key == def.key => {
                     format!("[{}_]", buffer)
                 }
                 (None, EditorKind::Cycler(_)) => {
