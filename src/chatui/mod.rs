@@ -233,10 +233,19 @@ pub async fn run(
         while let Some(event) = runtime.event_queue().pop() {
             let formatted = synaps_cli::events::format_event_for_agent(&event);
             app.push_msg(ChatMessage::System(formatted.clone()));
-            app.api_messages.push(serde_json::json!({
-                "role": "user",
-                "content": formatted
-            }));
+
+            if app.streaming {
+                // Steer the event into the active stream so the model sees it NOW
+                if let Some(ref tx) = steer_tx {
+                    let _ = tx.send(formatted);
+                }
+            } else {
+                // Queue for next turn
+                app.api_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": formatted
+                }));
+            }
             app.invalidate();
             event_received = true;
         }
