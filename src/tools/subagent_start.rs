@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-use super::subagent_handle::{SubagentHandle, SubagentResult, SubagentStatus};
+use super::subagent_handle::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
 pub struct SubagentStartTool;
 
@@ -87,10 +87,7 @@ impl Tool for SubagentStartTool {
         tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
 
         // ── Shared state ───────────────────────────────────────────────────────
-        let status            = Arc::new(Mutex::new(SubagentStatus::Running));
-        let partial_text      = Arc::new(Mutex::new(String::new()));
-        let tool_log          = Arc::new(Mutex::new(Vec::<String>::new()));
-        let conversation_state = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let state = Arc::new(Mutex::new(SubagentState::new()));
 
         // ── Channels ───────────────────────────────────────────────────────────
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
@@ -107,9 +104,7 @@ impl Tool for SubagentStartTool {
         }
 
         // ── Clone state for the spawned thread ─────────────────────────────────
-        let status_t         = Arc::clone(&status);
-        let partial_text_t   = Arc::clone(&partial_text);
-        let tool_log_t       = Arc::clone(&tool_log);
+        let state_t          = Arc::clone(&state);
         let label_inner      = label.clone();
         let model_inner      = model.clone();
         let tx_events_inner  = ctx.tx_events.clone();
@@ -124,16 +119,14 @@ impl Tool for SubagentStartTool {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        *status_t.lock().unwrap() =
+                        state_t.lock().unwrap().status =
                             SubagentStatus::Failed(format!("tokio runtime: {}", e));
                         return;
                     }
                 };
 
                 // Clones for the async block — the outer closure still needs the originals.
-                let status_a       = Arc::clone(&status_t);
-                let partial_text_a = Arc::clone(&partial_text_t);
-                let tool_log_a     = Arc::clone(&tool_log_t);
+                let state_a        = Arc::clone(&state_t);
                 let label_a        = label_inner.clone();
                 let model_a        = model_inner.clone();
                 let tx_events_a    = tx_events_inner.clone();
@@ -183,7 +176,7 @@ impl Tool for SubagentStartTool {
                                         }
                                     }
                                     crate::StreamEvent::Text(text) => {
-                                        partial_text_a.lock().unwrap().push_str(&text);
+                                        state_a.lock().unwrap().partial_text.push_str(&text);
                                     }
                                     crate::StreamEvent::ToolUseStart(name) => {
                                         tool_count += 1;
@@ -198,7 +191,7 @@ impl Tool for SubagentStartTool {
                                     crate::StreamEvent::ToolUse { tool_name, input, .. } => {
                                         let input_str = input.to_string();
                                         let input_preview: String = input_str.chars().take(200).collect();
-                                        tool_log_a.lock().unwrap()
+                                        state_a.lock().unwrap().tool_log
                                             .push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                                         let detail = match tool_name.as_str() {
                                             "bash" => {
@@ -230,7 +223,7 @@ impl Tool for SubagentStartTool {
                                     }
                                     crate::StreamEvent::ToolResult { result, .. } => {
                                         let preview: String = result.chars().take(300).collect();
-                                        tool_log_a.lock().unwrap()
+                                        state_a.lock().unwrap().tool_log
                                             .push(format!("[tool_result]: {}", preview));
                                     }
                                     crate::StreamEvent::Usage {
@@ -249,8 +242,11 @@ impl Tool for SubagentStartTool {
                                 }
                             }
                             _ = &mut timeout_fut => {
-                                let partial = partial_text_a.lock().unwrap().clone();
-                                let log = tool_log_a.lock().unwrap().clone();
+                                let (partial, log) = {
+                                    let mut s = state_a.lock().unwrap();
+                                    s.status = SubagentStatus::TimedOut;
+                                    (s.partial_text.clone(), s.tool_log.clone())
+                                };
                                 let mut text = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
                                 if !log.is_empty() {
                                     text.push_str(&log.join("\n"));
@@ -260,7 +256,6 @@ impl Tool for SubagentStartTool {
                                     text.push_str("\n[partial response]:\n");
                                     text.push_str(&partial);
                                 }
-                                *status_a.lock().unwrap() = SubagentStatus::TimedOut;
                                 return Ok(SubagentResult {
                                     text,
                                     model: model_a.clone(),
@@ -275,7 +270,7 @@ impl Tool for SubagentStartTool {
                     }
 
                     Ok(SubagentResult {
-                        text: partial_text_a.lock().unwrap().clone(),
+                        text: state_a.lock().unwrap().partial_text.clone(),
                         model: model_a.clone(),
                         input_tokens: total_input_tokens,
                         output_tokens: total_output_tokens,
@@ -289,9 +284,9 @@ impl Tool for SubagentStartTool {
                     Ok(sa_result) => {
                         // Only overwrite Running → Completed (don't stomp TimedOut).
                         {
-                            let mut s = status_t.lock().unwrap();
-                            if matches!(*s, SubagentStatus::Running) {
-                                *s = SubagentStatus::Completed;
+                            let mut s = state_t.lock().unwrap();
+                            if matches!(s.status, SubagentStatus::Running) {
+                                s.status = SubagentStatus::Completed;
                             }
                         }
                         let elapsed = start_time.elapsed().as_secs_f64();
@@ -307,7 +302,7 @@ impl Tool for SubagentStartTool {
                         let _ = result_tx.send(sa_result);
                     }
                     Err(e) => {
-                        *status_t.lock().unwrap() = SubagentStatus::Failed(e.clone());
+                        state_t.lock().unwrap().status = SubagentStatus::Failed(e.clone());
                         let elapsed = start_time.elapsed().as_secs_f64();
                         if let Some(ref tx) = tx_events_inner {
                             let _ = tx.send(crate::StreamEvent::SubagentDone {
@@ -331,7 +326,7 @@ impl Tool for SubagentStartTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Subagent thread panicked: {}", msg);
-                *status_t.lock().unwrap() = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.lock().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
         });
 
@@ -342,10 +337,7 @@ impl Tool for SubagentStartTool {
             task_preview,
             model,
             timeout_secs,
-            status,
-            partial_text,
-            tool_log,
-            conversation_state,
+            state,
             Some(steer_tx),
             Some(shutdown_tx),
             Some(result_rx),

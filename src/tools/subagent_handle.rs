@@ -25,6 +25,32 @@ pub enum SubagentStatus {
     Failed(String),
 }
 
+// ── SubagentState ────────────────────────────────────────────────────────────────
+
+/// All mutable state shared between the subagent thread and its handle.
+/// Collapsed behind a single Mutex so a status poll takes exactly one lock.
+pub struct SubagentState {
+    pub status: SubagentStatus,
+    pub partial_text: String,
+    pub tool_log: Vec<String>,
+    pub conversation_state: Vec<Value>,
+}
+
+impl SubagentState {
+    pub fn new() -> Self {
+        Self {
+            status: SubagentStatus::Running,
+            partial_text: String::new(),
+            tool_log: Vec::new(),
+            conversation_state: Vec::new(),
+        }
+    }
+}
+
+impl Default for SubagentState {
+    fn default() -> Self { Self::new() }
+}
+
 // ── SubagentHandle ───────────────────────────────────────────────────────────────
 
 pub struct SubagentHandle {
@@ -35,11 +61,8 @@ pub struct SubagentHandle {
     pub started_at: std::time::Instant,
     pub timeout_secs: u64,
 
-    // Shared state updated by the subagent thread
-    status: Arc<Mutex<SubagentStatus>>,
-    partial_text: Arc<Mutex<String>>,
-    tool_log: Arc<Mutex<Vec<String>>>,
-    conversation_state: Arc<Mutex<Vec<Value>>>,
+    // Shared state updated by the subagent thread — one lock for everything.
+    state: Arc<Mutex<SubagentState>>,
 
     // Channels
     steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -50,8 +73,7 @@ pub struct SubagentHandle {
 }
 
 impl SubagentHandle {
-    /// Construct a new handle. All Arc fields are provided by the caller (shared with the
-    /// spawned subagent thread). Channel halves are split before construction.
+    /// Construct a new handle. The state Arc is shared with the spawned subagent thread.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -59,10 +81,7 @@ impl SubagentHandle {
         task_preview: String,
         model: String,
         timeout_secs: u64,
-        status: Arc<Mutex<SubagentStatus>>,
-        partial_text: Arc<Mutex<String>>,
-        tool_log: Arc<Mutex<Vec<String>>>,
-        conversation_state: Arc<Mutex<Vec<Value>>>,
+        state: Arc<Mutex<SubagentState>>,
         steer_tx: Option<mpsc::UnboundedSender<String>>,
         shutdown_tx: Option<oneshot::Sender<()>>,
         result_rx: Option<oneshot::Receiver<SubagentResult>>,
@@ -74,10 +93,7 @@ impl SubagentHandle {
             model,
             started_at: std::time::Instant::now(),
             timeout_secs,
-            status,
-            partial_text,
-            tool_log,
-            conversation_state,
+            state,
             steer_tx,
             shutdown_tx,
             result_rx,
@@ -86,22 +102,22 @@ impl SubagentHandle {
 
     /// Current status snapshot.
     pub fn status(&self) -> SubagentStatus {
-        self.status.lock().unwrap().clone()
+        self.state.lock().unwrap().status.clone()
     }
 
     /// Partial output accumulated so far.
     pub fn partial_output(&self) -> String {
-        self.partial_text.lock().unwrap().clone()
+        self.state.lock().unwrap().partial_text.clone()
     }
 
     /// Snapshot of the tool log.
     pub fn tool_log(&self) -> Vec<String> {
-        self.tool_log.lock().unwrap().clone()
+        self.state.lock().unwrap().tool_log.clone()
     }
 
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
-        self.conversation_state.lock().unwrap().clone()
+        self.state.lock().unwrap().conversation_state.clone()
     }
 
     /// Seconds since this handle was created.

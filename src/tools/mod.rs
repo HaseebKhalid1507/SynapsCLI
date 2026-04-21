@@ -41,7 +41,7 @@ pub use grep::GrepTool;
 pub use find::FindTool;
 pub use ls::LsTool;
 pub use subagent::SubagentTool;
-pub use subagent_handle::{SubagentResult, SubagentHandle, SubagentRegistry, SubagentStatus};
+pub use subagent_handle::{SubagentResult, SubagentHandle, SubagentRegistry, SubagentStatus, SubagentState};
 pub use watcher_exit::WatcherExitTool;
 pub use registry::ToolRegistry;
 pub use agent::resolve_agent_prompt;
