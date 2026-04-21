@@ -121,6 +121,7 @@ pub async fn compact_conversation(
                     // Tool results are shaped as user messages with tool_result blocks.
                     for block in content {
                         if block["type"].as_str() == Some("tool_result") {
+                            let id = block["tool_use_id"].as_str().unwrap_or("?");
                             let text = block["content"].as_str()
                                 .or_else(|| block["content"].as_array()
                                     .and_then(|a| a.first())
@@ -128,7 +129,7 @@ pub async fn compact_conversation(
                                 .unwrap_or("");
                             let truncated: String = text.chars().take(2000).collect();
                             if !truncated.is_empty() {
-                                parts.push(format!("[Tool result]: {}", truncated));
+                                parts.push(format!("[Tool result #{}]: {}", id, truncated));
                             }
                         }
                     }
@@ -150,6 +151,7 @@ pub async fn compact_conversation(
                                 }
                             }
                             Some("tool_use") => {
+                                let id = block["id"].as_str().unwrap_or("?");
                                 let name = block["name"].as_str().unwrap_or("");
                                 let input = &block["input"];
                                 if let Some(path) = input["path"].as_str() {
@@ -162,7 +164,7 @@ pub async fn compact_conversation(
                                 }
                                 let args_str = serde_json::to_string(input).unwrap_or_default();
                                 let truncated: String = args_str.chars().take(500).collect();
-                                parts.push(format!("[Tool call]: {}({})", name, truncated));
+                                parts.push(format!("[Tool call #{}: {}({})]", id, name, truncated));
                             }
                             _ => {}
                         }
