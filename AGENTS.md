@@ -178,21 +178,6 @@ The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step
 3. Add a match arm in `handle_command()` (commands.rs).
 4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `mod.rs` event loop.
 
-### `/compact` — Context Compaction
-
-Summarizes the entire conversation into a structured checkpoint and replaces the message history. Useful when context window is filling up.
-
-**Flow:** `/compact [optional focus]` → `CommandAction::Compact` → `compact_conversation()` serializes messages → `Runtime::compact_call()` → `ApiMethods::call_api_simple()` (no tools, low effort, dedicated system prompt) → structured summary replaces `api_messages`.
-
-**Key files:**
-- `src/chatui/mod.rs` — `compact_conversation()`, `SUMMARIZATION_PROMPT`, `UPDATE_SUMMARIZATION_PROMPT`, `FileOps`, and the `CommandAction::Compact` handler in the event loop.
-- `src/runtime/mod.rs` — `Runtime::compact_call()` with `COMPACTION_SYSTEM_PROMPT`.
-- `src/runtime/api.rs` — `ApiMethods::call_api_simple()` (no-tools, non-streaming API call).
-
-**Iterative:** If the first message already contains `<context-summary>`, the update prompt is used instead of the initial prompt — merges new work into the existing summary rather than starting fresh.
-
-**File tracking:** Tool calls to `read`/`write`/`edit` are extracted and appended as `<read-files>` / `<modified-files>` blocks so the model retains awareness of which files were touched.
-
 ---
 
 ## Prompt Caching Strategy
