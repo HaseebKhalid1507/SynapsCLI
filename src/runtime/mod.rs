@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use crate::{Result, RuntimeError, ToolRegistry};
+use std::sync::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,7 @@ mod auth;
 mod api;
 mod stream;
 mod helpers;
+pub mod subagent;
 
 pub use types::StreamEvent;
 use types::AuthState;
@@ -37,6 +39,12 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
+    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    compaction_model: Option<String>,
+    /// Shared registry for reactive subagent handles.
+    subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    /// Shared event queue — for Event Bus tooling.
+    event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -86,6 +94,9 @@ impl Runtime {
             system_prompt: None,
             thinking_budget: 4096,
             context_window_override: None,
+            compaction_model: None,
+            subagent_registry: Arc::new(Mutex::new(crate::runtime::subagent::SubagentRegistry::new())),
+            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -114,6 +125,14 @@ impl Runtime {
         self.tools = Arc::new(RwLock::new(tools));
     }
 
+    pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
+        &self.subagent_registry
+    }
+
+    pub fn event_queue(&self) -> &Arc<crate::events::EventQueue> {
+        &self.event_queue
+    }
+
     /// Get a shared reference to the tool registry (for MCP lazy loading).
     pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
         Arc::clone(&self.tools)
@@ -127,12 +146,20 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    pub fn set_compaction_model(&mut self, model: Option<String>) {
+        self.compaction_model = model;
+    }
+
     pub fn set_context_window(&mut self, window: Option<u64>) {
         self.context_window_override = window;
     }
 
     /// Effective context window for the current model — user override if set,
     /// otherwise the model's native window from `models::context_window_for_model`.
+    pub fn compaction_model(&self) -> &str {
+        self.compaction_model.as_deref().unwrap_or("claude-sonnet-4-6")
+    }
+
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
@@ -147,6 +174,7 @@ impl Runtime {
             self.set_thinking_budget(budget);
         }
         self.context_window_override = config.context_window;
+        self.compaction_model = config.compaction_model.clone();
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -215,12 +243,12 @@ impl Runtime {
     pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
         self.refresh_if_needed().await?;
 
-        const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+        use crate::core::compaction::COMPACTION_SYSTEM_PROMPT;
 
         ApiMethods::call_api_simple(
             &self.auth,
             &self.client,
-            &self.model,
+            self.compaction_model(),
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
             &messages,
@@ -246,7 +274,9 @@ impl Runtime {
                 self.thinking_budget,
                 &messages,
                 self.api_retries,
-                self.context_window_override == Some(1_000_000),
+                &api::ApiOptions {
+                    use_1m_context: self.context_window_override == Some(1_000_000),
+                },
             ).await?;
             
             // Check if Claude wants to use tools
@@ -303,7 +333,8 @@ impl Runtime {
                                     bash_timeout: self.bash_timeout,
                                     bash_max_timeout: self.bash_max_timeout,
                                     subagent_timeout: self.subagent_timeout,
-                                };
+                                subagent_registry: Some(self.subagent_registry.clone()),
+                                event_queue: Some(self.event_queue.clone()), };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -327,6 +358,8 @@ impl Runtime {
                     let cfg_bash_max_timeout = self.bash_max_timeout;
                     let cfg_subagent_timeout = self.subagent_timeout;
                     let session_mgr = self.session_manager.clone();
+                    let cfg_subagent_registry = self.subagent_registry.clone();
+                    let cfg_event_queue = self.event_queue.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -337,6 +370,8 @@ impl Runtime {
                             let tool = self.tools.read().await.get(&tool_name).cloned();
                             let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
+                            let registry_inner = cfg_subagent_registry.clone();
+                            let event_queue_inner = cfg_event_queue.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -351,7 +386,8 @@ impl Runtime {
                                             bash_timeout: cfg_bash_timeout,
                                             bash_max_timeout: cfg_bash_max_timeout,
                                             subagent_timeout: cfg_subagent_timeout,
-                                        };
+                                        subagent_registry: Some(registry_inner),
+                                        event_queue: Some(event_queue_inner), };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -447,14 +483,18 @@ impl Runtime {
         // Opt into the 1M-context beta header only when the user explicitly
         // requested 1M (via context_window setting). Default 200k matches
         // Anthropic's claude-code default and gives smarter inference.
-        let use_1m_context = self.context_window_override == Some(1_000_000);
+        let subagent_registry = self.subagent_registry.clone();
+        let event_queue = self.event_queue.clone();
+        let options = api::ApiOptions {
+            use_1m_context: self.context_window_override == Some(1_000_000),
+        };
 
         tokio::spawn(async move {
             if let Err(e) = StreamMethods::run_stream_internal(
                 auth, client, model, tools, system_prompt, thinking_budget,
                 messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
                 max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
-                session_manager, use_1m_context,
+                session_manager, options, subagent_registry, event_queue,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
@@ -475,6 +515,9 @@ impl Clone for Runtime {
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
             context_window_override: self.context_window_override,
+            compaction_model: self.compaction_model.clone(),
+            subagent_registry: self.subagent_registry.clone(),
+            event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,

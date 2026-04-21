@@ -45,6 +45,7 @@ pub(crate) struct RuntimeSnapshot {
     pub model: String,
     pub thinking: String,
     pub context_window: String,
+    pub compaction_model: String,
     pub max_tool_output: usize,
     pub bash_timeout: u64,
     pub bash_max_timeout: u64,
@@ -67,6 +68,7 @@ impl RuntimeSnapshot {
         Self {
             model: runtime.model().to_string(),
             thinking: runtime.thinking_level().to_string(),
+            compaction_model: runtime.compaction_model().to_string(),
             context_window: {
                 match config.context_window {
                     Some(200_000) => "200k".to_string(),
@@ -96,7 +98,7 @@ pub(super) enum Focus {
 pub(super) enum ActiveEditor {
     Text { buffer: String, setting_key: &'static str, numeric: bool, error: Option<String> },
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
-    CustomModel { buffer: String },
+    CustomModel { buffer: String, setting_key: &'static str },
 }
 
 pub(super) struct SettingsState {

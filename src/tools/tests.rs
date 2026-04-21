@@ -161,6 +161,8 @@ fn create_tool_context() -> ToolContext {
         bash_timeout: 30,
         bash_max_timeout: 300,
         subagent_timeout: 300,
+        subagent_registry: None,
+        event_queue: None,
     }
 }
 
@@ -371,7 +373,7 @@ fn test_tool_registry_new() {
     let registry = ToolRegistry::new();
     
     // Should have 11 tools including subagent + 3 shell tools
-    assert_eq!(registry.tools_schema().len(), 11);
+    assert_eq!(registry.tools_schema().len(), 15);
     
     // Should find bash tool
     assert!(registry.get("bash").is_some());

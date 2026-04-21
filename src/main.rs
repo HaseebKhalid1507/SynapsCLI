@@ -66,6 +66,19 @@ enum Command {
     },
     /// OAuth login
     Login,
+    /// Send an event to the inbox (picked up by running session)
+    Send {
+        /// Message text
+        message: String,
+        #[arg(long, default_value = "cli")]
+        source: String,
+        #[arg(long, default_value = "medium")]
+        severity: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long = "content-type", default_value = "message")]
+        content_type: String,
+    },
 }
 
 #[tokio::main]
@@ -99,6 +112,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Login) => {
             cmd::login::run(cli.profile).await;
+        }
+        Some(Command::Send { message, source, severity, channel, content_type }) => {
+            cmd::send::run(message, source, severity, channel, content_type).await?;
         }
     }
     Ok(())

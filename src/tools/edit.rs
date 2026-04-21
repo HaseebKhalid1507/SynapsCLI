@@ -64,9 +64,20 @@ impl Tool for EditTool {
 
         let new_content = content.replacen(old_string, new_string, 1);
 
+        // Preserve original file permissions (executable bits, etc.)
+        let original_perms = tokio::fs::metadata(&path).await
+            .map(|m| m.permissions())
+            .ok();
+
         let tmp_path = path.with_extension("agent-tmp");
         tokio::fs::write(&tmp_path, &new_content).await
             .map_err(|e| RuntimeError::Tool(format!("Failed to write file: {}", e)))?;
+
+        // Restore original permissions on the temp file before rename
+        if let Some(perms) = original_perms {
+            let _ = tokio::fs::set_permissions(&tmp_path, perms).await;
+        }
+
         tokio::fs::rename(&tmp_path, &path).await
             .map_err(|e| {
                 let tmp = tmp_path.clone();

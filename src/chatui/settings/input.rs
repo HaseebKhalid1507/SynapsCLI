@@ -144,11 +144,12 @@ pub(crate) fn handle_event(
                         let mut opts: Vec<String> = synaps_cli::models::KNOWN_MODELS
                             .iter().map(|(id, desc)| format!("{}  — {}", id, desc)).collect();
                         opts.push("Custom…".to_string());
+                        let current = current_value_for(def, snap);
                         let cursor = opts.iter()
-                            .position(|o| o.starts_with(&snap.model))
+                            .position(|o| o.starts_with(&current))
                             .unwrap_or(0);
                         state.edit_mode = Some(ActiveEditor::Picker {
-                            setting_key: "model",
+                            setting_key: def.key,
                             options: opts,
                             cursor,
                         });
@@ -216,8 +217,8 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 }
                 KeyCode::Enter => {
                     let selection = options[*cursor].clone();
-                    if *setting_key == "model" && selection == "Custom…" {
-                        state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new() });
+                    if (*setting_key == "model" || *setting_key == "compaction_model") && selection == "Custom…" {
+                        state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new(), setting_key });
                         return InputOutcome::None;
                     }
                     let value = selection.split("  —").next().unwrap_or(&selection).trim().to_string();
@@ -230,13 +231,13 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
-        ActiveEditor::CustomModel { buffer } => {
+        ActiveEditor::CustomModel { buffer, setting_key } => {
             match key.code {
                 KeyCode::Enter => {
                     if buffer.trim().is_empty() {
                         return InputOutcome::None;
                     }
-                    InputOutcome::Apply { key: "model", value: buffer.trim().to_string() }
+                    InputOutcome::Apply { key: setting_key, value: buffer.trim().to_string() }
                 }
                 KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
                 KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }

@@ -82,8 +82,8 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
                     }
                     s
                 }
-                (Some(ActiveEditor::CustomModel { buffer }), _)
-                    if def.key == "model" => {
+                (Some(ActiveEditor::CustomModel { buffer, setting_key }), _)
+                    if *setting_key == def.key => {
                     format!("[{}_]", buffer)
                 }
                 (None, EditorKind::Cycler(_)) => {
@@ -227,6 +227,7 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
         "model" => snap.model.clone(),
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
+        "compaction_model" => snap.compaction_model.clone(),
         "api_retries" => snap.api_retries.to_string(),
         "subagent_timeout" => format!("{}s", snap.subagent_timeout),
         "max_tool_output" => snap.max_tool_output.to_string(),

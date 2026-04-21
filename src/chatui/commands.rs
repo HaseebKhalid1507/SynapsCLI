@@ -52,6 +52,8 @@ pub(super) enum CommandAction {
     Compact {
         custom_instructions: Option<String>,
     },
+    /// Show the session compaction chain.
+    Chain,
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -209,6 +211,7 @@ pub(super) async fn handle_command(
             let help_lines = [
                 "/clear — reset conversation",
                 "/compact [focus] — summarize & compact conversation history",
+                "/chain — show session compaction history",
                 "/model [name] — show or set model",
                 "/system <prompt|show|save> — system prompt",
                 "/thinking [low|medium|high|xhigh] — thinking budget",
@@ -260,6 +263,9 @@ pub(super) async fn handle_command(
             return CommandAction::Compact {
                 custom_instructions: if arg.is_empty() { None } else { Some(arg.to_string()) },
             };
+        }
+        "chain" => {
+            return CommandAction::Chain;
         }
         _ => {
             match registry.resolve(cmd) {

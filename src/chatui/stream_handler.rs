@@ -11,6 +11,8 @@ pub(super) enum StreamAction {
     Continue,
     /// Stream completed and a queued message should be auto-sent.
     AutoSendQueued(String),
+    /// Stream completed and buffered events need a model turn.
+    AutoTriggerEvents,
 }
 
 /// Returns true if the event should trigger an immediate redraw.
@@ -154,10 +156,29 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Done => {
             app.streaming = false;
             app.subagents.clear();
+            // Clean up finished reactive subagent handles
+            if let Some(registry) = runtime.subagent_registry().lock().ok().as_mut() {
+                registry.cleanup_finished();
+            }
+
+            // Flush events that arrived during streaming into api_messages
+            let had_pending = !app.pending_events.is_empty();
+            for formatted in app.pending_events.drain(..) {
+                app.api_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": formatted
+                }));
+            }
 
             // Check for queued message to auto-send
             if let Some(queued) = app.queued_message.take() {
                 return StreamAction::AutoSendQueued(queued);
+            }
+
+            // If events arrived during streaming, trigger a new model turn
+            if had_pending {
+                app.save_session().await;
+                return StreamAction::AutoTriggerEvents;
             }
         }
         StreamEvent::Error(err) => {
