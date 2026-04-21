@@ -236,3 +236,160 @@ impl SubagentStatus {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{mpsc, oneshot};
+
+    // Keep receivers alive so channels don't close during tests
+    struct TestHandle {
+        handle: SubagentHandle,
+        _steer_rx: mpsc::UnboundedReceiver<String>,
+        _shutdown_rx: oneshot::Receiver<()>,
+    }
+
+    fn make_test_handle(id: &str) -> TestHandle {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (_result_tx, result_rx) = oneshot::channel();
+        TestHandle {
+            handle: SubagentHandle::new(
+                id.to_string(),
+                "test-agent".to_string(),
+                "test task".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                300,
+                state,
+                Some(steer_tx),
+                Some(shutdown_tx),
+                Some(result_rx),
+            ),
+            _steer_rx: steer_rx,
+            _shutdown_rx: shutdown_rx,
+        }
+    }
+
+    fn make_handle(id: &str) -> SubagentHandle {
+        make_test_handle(id).handle
+    }
+
+    #[test]
+    fn handle_initial_status_is_running() {
+        let h = make_handle("sa_1");
+        assert_eq!(h.status(), SubagentStatus::Running);
+        assert!(!h.is_finished());
+    }
+
+    #[test]
+    fn handle_partial_output_empty_initially() {
+        let h = make_handle("sa_1");
+        assert_eq!(h.partial_output(), "");
+        assert!(h.tool_log().is_empty());
+        assert!(h.conversation_state().is_empty());
+    }
+
+    #[test]
+    fn handle_status_reflects_state_change() {
+        let h = make_handle("sa_1");
+        {
+            let mut s = h.state.write().unwrap();
+            s.status = SubagentStatus::Completed;
+            s.partial_text = "done!".to_string();
+        }
+        assert_eq!(h.status(), SubagentStatus::Completed);
+        assert!(h.is_finished());
+        assert_eq!(h.partial_output(), "done!");
+    }
+
+    #[test]
+    fn handle_steer_sends_message() {
+        let th = make_test_handle("sa_1");
+        assert!(th.handle.steer("redirect").is_ok());
+    }
+
+    #[test]
+    fn handle_steer_fails_without_channel() {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        let (_shutdown_tx, _) = oneshot::channel::<()>();
+        let (_, result_rx) = oneshot::channel();
+        let h = SubagentHandle::new(
+            "sa_1".into(), "test".into(), "task".into(),
+            "model".into(), 300, state, None, None, Some(result_rx),
+        );
+        assert!(h.steer("msg").is_err());
+    }
+
+    #[test]
+    fn handle_cancel_consumes_shutdown() {
+        let mut h = make_handle("sa_1");
+        h.cancel(); // first call sends
+        h.cancel(); // second call is no-op (already taken)
+    }
+
+    #[test]
+    fn handle_elapsed_increases() {
+        let h = make_handle("sa_1");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(h.elapsed_secs() > 0.0);
+    }
+
+    #[test]
+    fn registry_register_and_get() {
+        let mut reg = SubagentRegistry::new();
+        let h = make_handle("sa_1");
+        reg.register(h);
+        assert!(reg.get("sa_1").is_some());
+        assert!(reg.get("sa_99").is_none());
+    }
+
+    #[test]
+    fn registry_remove() {
+        let mut reg = SubagentRegistry::new();
+        reg.register(make_handle("sa_1"));
+        assert!(reg.remove("sa_1").is_some());
+        assert!(reg.get("sa_1").is_none());
+    }
+
+    #[test]
+    fn registry_list_active() {
+        let mut reg = SubagentRegistry::new();
+        reg.register(make_handle("sa_1"));
+        reg.register(make_handle("sa_2"));
+        let active = reg.list_active();
+        assert_eq!(active.len(), 2);
+    }
+
+    #[test]
+    fn registry_cleanup_finished() {
+        let mut reg = SubagentRegistry::new();
+        let h = make_handle("sa_1");
+        {
+            let mut s = h.state.write().unwrap();
+            s.status = SubagentStatus::Completed;
+        }
+        reg.register(h);
+        reg.register(make_handle("sa_2")); // still running
+        reg.cleanup_finished();
+        assert!(reg.get("sa_1").is_none()); // completed, cleaned up
+        assert!(reg.get("sa_2").is_some()); // still running, kept
+    }
+
+    #[test]
+    fn subagent_state_new_defaults() {
+        let s = SubagentState::new();
+        assert_eq!(s.status, SubagentStatus::Running);
+        assert!(s.partial_text.is_empty());
+        assert!(s.tool_log.is_empty());
+        assert!(s.conversation_state.is_empty());
+    }
+
+    #[test]
+    fn subagent_status_as_str() {
+        assert_eq!(SubagentStatus::Running.as_str(), "running");
+        assert_eq!(SubagentStatus::Completed.as_str(), "completed");
+        assert_eq!(SubagentStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(SubagentStatus::Failed("oops".into()).as_str(), "failed");
+    }
+}
