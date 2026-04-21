@@ -81,6 +81,7 @@ impl Tool for SubagentStartTool {
         let label = agent_name.as_deref().unwrap_or("inline").to_string();
         let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
         let task_preview: String = task.chars().take(80).collect();
+        let task_full = task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
 
@@ -105,6 +106,7 @@ impl Tool for SubagentStartTool {
 
         // ── Clone state for the spawned thread ─────────────────────────────────
         let state_t          = Arc::clone(&state);
+        let task_full_a      = task_full.clone();
         let label_inner      = label.clone();
         let model_inner      = model.clone();
         let tx_events_inner  = ctx.tx_events.clone();
@@ -130,6 +132,8 @@ impl Tool for SubagentStartTool {
                 let label_a        = label_inner.clone();
                 let model_a        = model_inner.clone();
                 let tx_events_a    = tx_events_inner.clone();
+                let task_for_timeout = task_full_a.clone();
+                let task_for_complete = task_full_a;
 
                 let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
                     use futures::StreamExt;
@@ -245,6 +249,10 @@ impl Tool for SubagentStartTool {
                                 let (partial, log) = {
                                     let mut s = state_a.lock().unwrap();
                                     s.status = SubagentStatus::TimedOut;
+                                    s.conversation_state = vec![
+                                        serde_json::json!({"role": "user", "content": task_for_timeout.clone()}),
+                                        serde_json::json!({"role": "assistant", "content": &s.partial_text}),
+                                    ];
                                     (s.partial_text.clone(), s.tool_log.clone())
                                 };
                                 let mut text = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
@@ -287,6 +295,10 @@ impl Tool for SubagentStartTool {
                             let mut s = state_t.lock().unwrap();
                             if matches!(s.status, SubagentStatus::Running) {
                                 s.status = SubagentStatus::Completed;
+                                s.conversation_state = vec![
+                                    serde_json::json!({"role": "user", "content": task_for_complete.clone()}),
+                                    serde_json::json!({"role": "assistant", "content": sa_result.text.clone()}),
+                                ];
                             }
                         }
                         let elapsed = start_time.elapsed().as_secs_f64();
