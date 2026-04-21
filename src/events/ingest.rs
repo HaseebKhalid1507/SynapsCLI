@@ -91,9 +91,11 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
                 for path in &paths {
                     process_file(path, queue_ref).await;
                 }
+                // Sweep for any files inotify missed in the batch
+                scan_inbox(dir_ref, queue_ref).await;
             }
-            // Safety scan every 10s in case inotify misses something
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            // Safety scan every 2s in case inotify misses something
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                 scan_inbox(dir_ref, queue_ref).await;
             }
         }
