@@ -47,7 +47,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 synaps
 ```
 
-`/help` for commands. `/theme` to browse the candy store.
+`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long.
 
 ---
 
@@ -132,6 +132,19 @@ Full schema in [AGENTS.md](AGENTS.md). Agents checkpoint state on exit and resum
 | `load_skill` | Load behavioral guidelines from markdown |
 
 See [AGENTS.md](AGENTS.md) for parameters and behavior.
+
+---
+
+## Context Compaction
+
+Long sessions eat context. `/compact` fixes that.
+
+```
+/compact                          # summarize & replace history
+/compact focus on the auth module  # with custom focus
+```
+
+The LLM produces a structured checkpoint (goals, progress, decisions, file ops, next steps) and the entire message history is replaced with that summary. Iterative — `/compact` again merges new work into the existing summary. Inspired by [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
 
 ---
 

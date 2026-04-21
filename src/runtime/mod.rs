@@ -207,6 +207,27 @@ impl Runtime {
         AuthMethods::refresh_if_needed(Arc::clone(&self.auth), &self.client).await
     }
 
+    /// Make a simple non-streaming API call for compaction (no tools).
+    ///
+    /// Uses a dedicated summarization system prompt (not the user's), omits
+    /// all tools, and returns the raw text response. Caller supplies the
+    /// full message array including the serialized conversation.
+    pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
+        self.refresh_if_needed().await?;
+
+        const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
+        ApiMethods::call_api_simple(
+            &self.auth,
+            &self.client,
+            &self.model,
+            COMPACTION_SYSTEM_PROMPT,
+            self.thinking_budget,
+            &messages,
+            self.api_retries,
+        ).await
+    }
+
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {

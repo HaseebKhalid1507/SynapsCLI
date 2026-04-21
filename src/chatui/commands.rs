@@ -48,6 +48,10 @@ pub(super) enum CommandAction {
         skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
         arg: String,
     },
+    /// Compact the conversation history into a summary.
+    Compact {
+        custom_instructions: Option<String>,
+    },
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -204,6 +208,7 @@ pub(super) async fn handle_command(
         "help" => {
             let help_lines = [
                 "/clear — reset conversation",
+                "/compact [focus] — summarize & compact conversation history",
                 "/model [name] — show or set model",
                 "/system <prompt|show|save> — system prompt",
                 "/thinking [low|medium|high|xhigh] — thinking budget",
@@ -250,6 +255,11 @@ pub(super) async fn handle_command(
                 return CommandAction::ReloadPlugins;
             }
             return CommandAction::OpenPlugins;
+        }
+        "compact" => {
+            return CommandAction::Compact {
+                custom_instructions: if arg.is_empty() { None } else { Some(arg.to_string()) },
+            };
         }
         _ => {
             match registry.resolve(cmd) {

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`/compact` slash command**: summarize & compact conversation history when context gets long
+  - Structured checkpoint format (goals, progress, decisions, file ops, next steps)
+  - Iterative compaction — re-compacting merges new work into existing summary
+  - File operation tracking (read/write/edit paths preserved across compactions)
+  - Custom focus instructions via `/compact <focus>`
+  - Uses dedicated low-effort API call (no tools, summarization system prompt)
 - **Single binary architecture**: all 8 binaries consolidated into `synaps`
   - `synaps` (no args) = TUI (was `chatui`)
   - `synaps run` = one-shot prompt (was `cli run`)

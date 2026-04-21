@@ -618,4 +618,162 @@ impl ApiMethods {
 
         Ok(json)
     }
+
+    /// Simple non-streaming API call without tools (used for compaction).
+    /// Uses a caller-supplied system prompt (replaces the runtime's) and forces
+    /// "low" effort on adaptive models — summarization doesn't benefit from
+    /// heavy reasoning budgets.
+    pub(super) async fn call_api_simple(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        model: &str,
+        system_prompt: &str,
+        thinking_budget: u32,
+        messages: &[Value],
+        max_retries: u32,
+    ) -> Result<String> {
+        let (auth_token, auth_type) = {
+            let a = auth.read().await;
+            (a.auth_token.clone(), a.auth_type.clone())
+        };
+
+        let auth_header = if auth_type == "oauth" {
+            ("authorization".to_string(), format!("Bearer {}", auth_token))
+        } else {
+            ("x-api-key".to_string(), auth_token.clone())
+        };
+
+        let mut body = json!({
+            "model": model,
+            "max_tokens": HelperMethods::max_tokens_for_model(model),
+            "messages": messages,
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                let budget = if thinking_budget == 0 {
+                    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+                } else {
+                    thinking_budget
+                };
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                    "display": "summarized"
+                })
+            }
+        });
+
+        // Force low effort on adaptive models — compaction is a structured
+        // summarization task; heavy reasoning wastes tokens.
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            body["output_config"] = json!({"effort": "low"});
+        }
+
+        if auth_type == "oauth" {
+            let system_blocks = vec![
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
+                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
+                json!({"type": "text", "text": system_prompt}),
+            ];
+            body["system"] = json!(system_blocks);
+        } else {
+            body["system"] = json!([
+                {"type": "text", "text": system_prompt}
+            ]);
+        }
+
+        // Retry loop for transient errors
+        let json: Value = {
+            let mut last_err = String::new();
+            let mut result_json = None;
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
+                    tracing::warn!("Compaction API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
+                    tokio::time::sleep(delay).await;
+                }
+
+                let mut req = client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json");
+                let mut betas: Vec<&str> = Vec::new();
+                if auth_type == "oauth" {
+                    betas.push("claude-code-20250219");
+                    betas.push("oauth-2025-04-20");
+                }
+                if !betas.is_empty() {
+                    req = req.header("anthropic-beta", betas.join(","));
+                }
+
+                match req.json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            match resp.json::<Value>().await {
+                                Ok(j) => {
+                                    if j["error"].is_object() {
+                                        if let Some(error_type) = j["error"]["type"].as_str() {
+                                            return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+                                        }
+                                    }
+                                    result_json = Some(j);
+                                    break;
+                                }
+                                Err(e) => {
+                                    if attempt == max_retries {
+                                        return Err(RuntimeError::Api(e));
+                                    }
+                                    last_err = e.to_string();
+                                }
+                            }
+                        } else {
+                            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let error_text = resp.text().await.unwrap_or_default();
+                            if !is_retryable || attempt == max_retries {
+                                return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+                            }
+                            last_err = format!("{}: {}", status, error_text);
+                        }
+                    }
+                    Err(e) => {
+                        if attempt == max_retries {
+                            return Err(RuntimeError::Api(e));
+                        }
+                        last_err = e.to_string();
+                    }
+                }
+            }
+
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
+        };
+
+        // Log usage
+        if let Some(usage) = json.get("usage") {
+            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+        }
+
+        // Extract text content from the response (skip thinking blocks)
+        let mut out = String::new();
+        if let Some(content) = json["content"].as_array() {
+            for block in content {
+                if block["type"].as_str() == Some("text") {
+                    if let Some(t) = block["text"].as_str() {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+
+        if out.is_empty() {
+            return Err(RuntimeError::Tool("Compaction returned empty response".to_string()));
+        }
+
+        Ok(out)
+    }
 }
