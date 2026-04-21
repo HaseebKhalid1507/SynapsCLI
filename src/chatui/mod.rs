@@ -87,7 +87,7 @@ fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
         }
         // Skip event messages — already displayed as event cards
         if let Some(content) = msg["content"].as_str() {
-            if content.starts_with("[") && content.contains(" from ") && content.contains("]") {
+            if content.starts_with("<event ") && content.ends_with("</event>") {
                 continue;
             }
         }
@@ -329,11 +329,16 @@ pub async fn run(
                             let msgs = app.api_messages.clone();
                             rebuild_display_messages(&msgs, &mut app);
                             app.save_session().await;
-                            // NOW update old session's compacted_into and save it
-                            let mut old_session = app.session.clone();
-                            old_session.id = old_id.clone();
-                            old_session.compacted_into = Some(new_id.clone());
-                            old_session.save().await.ok();
+                            // Load old session fresh from disk and update its forward link
+                            match synaps_cli::core::session::Session::load(&old_id) {
+                                Ok(mut old_session) => {
+                                    old_session.compacted_into = Some(new_id.clone());
+                                    old_session.save().await.ok();
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to update old session {}: {}", old_id, e);
+                                }
+                            }
                             app.push_msg(ChatMessage::System(format!(
                                 "✓ compacted {} messages → new session {} (from {})",
                                 msg_count, new_id, old_id

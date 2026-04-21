@@ -44,10 +44,10 @@ impl Tool for SendChannelTool {
         );
 
         Ok(json!({
-            "sent": true,
+            "sent": false,
+            "error": "send_channel is not yet implemented — no channel dispatch wired",
             "channel_type": channel_type,
             "channel_id": channel_id,
-            "_stub": true,
         }).to_string())
     }
 }
