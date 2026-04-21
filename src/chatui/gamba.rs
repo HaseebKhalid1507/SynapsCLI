@@ -6,7 +6,7 @@ fn which_gamba() -> Option<std::path::PathBuf> {
     // 1. Check next to our own binary (bundled build)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join("gamblers-den");
+            let sibling = dir.join("hidden");
             if sibling.exists() {
                 return Some(sibling);
             }
@@ -14,7 +14,7 @@ fn which_gamba() -> Option<std::path::PathBuf> {
     }
     // 2. Check $PATH
     if let Ok(output) = std::process::Command::new("which")
-        .arg("gamblers-den")
+        .arg("hidden")
         .output()
     {
         if output.status.success() {
@@ -26,7 +26,7 @@ fn which_gamba() -> Option<std::path::PathBuf> {
     }
     // 3. Fallback: dev build path
     std::env::var("HOME").ok()
-        .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
+        .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/hidden"))
         .filter(|p| p.exists())
 }
 

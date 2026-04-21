@@ -77,7 +77,7 @@ impl Default for SaveData {
 fn save_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("gamblers-den")
+        .join("hidden")
         .join("save.json")
 }
 

@@ -67,8 +67,8 @@ name = "synaps"
 path = "src/main.rs"
 
 [[bin]]
-name = "gamblers-den"
-path = "src/bin/gamblers-den/main.rs"
+name = "hidden"
+path = "src/bin/hidden/main.rs"
 
 
 [profile.release]
