@@ -257,7 +257,7 @@ pub async fn run(
                         text: event.content.text.clone(),
                     });
 
-                    if app.streaming {
+                    if app.streaming || app.compact_task.is_some() {
                         // Buffer during streaming — inject after MessageHistory
                         app.pending_events.push(formatted);
                     } else {

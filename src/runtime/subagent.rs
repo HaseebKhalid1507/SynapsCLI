@@ -169,14 +169,12 @@ impl SubagentHandle {
 
 pub struct SubagentRegistry {
     handles: HashMap<String, SubagentHandle>,
-    next_id: u64,
 }
 
 impl SubagentRegistry {
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
-            next_id: 0,
         }
     }
 
@@ -184,7 +182,6 @@ impl SubagentRegistry {
     pub fn register(&mut self, handle: SubagentHandle) -> String {
         let id = handle.id.clone();
         self.handles.insert(id.clone(), handle);
-        self.next_id += 1;
         id
     }
 

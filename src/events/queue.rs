@@ -33,7 +33,7 @@ impl EventQueue {
                 while idx < q.len()
                     && matches!(
                         q[idx].content.severity,
-                        Some(Severity::Critical)
+                        Some(Severity::Critical) | Some(Severity::High)
                     )
                 {
                     idx += 1;
