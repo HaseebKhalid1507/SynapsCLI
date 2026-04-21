@@ -43,7 +43,7 @@ impl EventQueue {
             _ => q.push_back(event),
         }
         drop(q);
-        self.notify.notify_one();
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -55,7 +55,7 @@ impl EventQueue {
         }
         q.push_front(event);
         drop(q);
-        self.notify.notify_one();
+        self.notify.notify_waiters();
     }
 
     pub fn pop(&self) -> Option<Event> {
