@@ -20,6 +20,7 @@ use input::InputAction;
 use stream_handler::StreamAction;
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, find_session};
+use synaps_cli::core::compaction::compact_conversation;
 use crossterm::{
     event::{EventStream, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
     execute,
@@ -76,7 +77,20 @@ fn apply_setting(
 }
 
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
+    app.messages.clear();
     for msg in api_messages {
+        // Skip compaction summary messages — internal context, not user-visible
+        if let Some(content) = msg["content"].as_str() {
+            if content.contains("<context-summary>") {
+                continue;
+            }
+        }
+        // Skip event messages — already displayed as event cards
+        if let Some(content) = msg["content"].as_str() {
+            if content.starts_with("<event ") && content.ends_with("</event>") {
+                continue;
+            }
+        }
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
@@ -110,222 +124,6 @@ fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
             _ => {}
         }
     }
-}
-
-// ── Compaction ──
-
-const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-
-Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [Ordered list of what should happen next]
-
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages."#;
-
-const UPDATE_SUMMARIZATION_PROMPT: &str = r#"The messages above are NEW conversation messages to incorporate into the existing summary provided earlier in the conversation.
-
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
-
-Use this EXACT format:
-
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages."#;
-
-struct FileOps {
-    read: std::collections::HashSet<String>,
-    written: std::collections::HashSet<String>,
-    edited: std::collections::HashSet<String>,
-}
-
-impl FileOps {
-    fn new() -> Self {
-        Self {
-            read: std::collections::HashSet::new(),
-            written: std::collections::HashSet::new(),
-            edited: std::collections::HashSet::new(),
-        }
-    }
-}
-
-/// Serialize the in-memory API message history into a readable transcript and
-/// ask the LLM to produce a structured summary. Called by `/compact`.
-async fn compact_conversation(
-    api_messages: &[Value],
-    runtime: &Runtime,
-    custom_instructions: Option<&str>,
-) -> Result<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut file_ops = FileOps::new();
-
-    for msg in api_messages {
-        match msg["role"].as_str() {
-            Some("user") => {
-                if let Some(content) = msg["content"].as_str() {
-                    if content.contains("<context-summary>") {
-                        parts.push(format!("[Previous Summary]: {}", content));
-                    } else {
-                        parts.push(format!("[User]: {}", content));
-                    }
-                } else if let Some(content) = msg["content"].as_array() {
-                    // Tool results are shaped as user messages with tool_result blocks.
-                    for block in content {
-                        if block["type"].as_str() == Some("tool_result") {
-                            let text = block["content"].as_str()
-                                .or_else(|| block["content"].as_array()
-                                    .and_then(|a| a.first())
-                                    .and_then(|b| b["text"].as_str()))
-                                .unwrap_or("");
-                            let truncated: String = text.chars().take(2000).collect();
-                            if !truncated.is_empty() {
-                                parts.push(format!("[Tool result]: {}", truncated));
-                            }
-                        }
-                    }
-                }
-            }
-            Some("assistant") => {
-                if let Some(content) = msg["content"].as_array() {
-                    for block in content {
-                        match block["type"].as_str() {
-                            Some("thinking") => {
-                                if let Some(text) = block["thinking"].as_str() {
-                                    let preview: String = text.chars().take(500).collect();
-                                    parts.push(format!("[Assistant thinking]: {}", preview));
-                                }
-                            }
-                            Some("text") => {
-                                if let Some(text) = block["text"].as_str() {
-                                    parts.push(format!("[Assistant]: {}", text));
-                                }
-                            }
-                            Some("tool_use") => {
-                                let name = block["name"].as_str().unwrap_or("");
-                                let input = &block["input"];
-                                if let Some(path) = input["path"].as_str() {
-                                    match name {
-                                        "read" => { file_ops.read.insert(path.to_string()); }
-                                        "write" => { file_ops.written.insert(path.to_string()); }
-                                        "edit" => { file_ops.edited.insert(path.to_string()); }
-                                        _ => {}
-                                    }
-                                }
-                                let args_str = serde_json::to_string(input).unwrap_or_default();
-                                let truncated: String = args_str.chars().take(500).collect();
-                                parts.push(format!("[Tool call]: {}({})", name, truncated));
-                            }
-                            _ => {}
-                        }
-                    }
-                } else if let Some(content) = msg["content"].as_str() {
-                    parts.push(format!("[Assistant]: {}", content));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let conversation_text = parts.join("\n\n");
-
-    // Build file-operations summary (read-only = read but not modified).
-    let modified: std::collections::HashSet<String> =
-        file_ops.written.union(&file_ops.edited).cloned().collect();
-    let read_only: Vec<String> = file_ops.read.difference(&modified).cloned().collect();
-    let modified_list: Vec<String> = modified.into_iter().collect();
-
-    let mut file_section = String::new();
-    if !read_only.is_empty() {
-        file_section.push_str(&format!(
-            "\n\n<read-files>\n{}\n</read-files>",
-            read_only.join("\n")
-        ));
-    }
-    if !modified_list.is_empty() {
-        file_section.push_str(&format!(
-            "\n\n<modified-files>\n{}\n</modified-files>",
-            modified_list.join("\n")
-        ));
-    }
-
-    // Iterative compaction — if the first user message already contains a
-    // summary wrapper, we're compacting on top of a previous compaction.
-    let has_previous_summary = api_messages.first()
-        .and_then(|m| m["content"].as_str())
-        .is_some_and(|c| c.contains("<context-summary>"));
-
-    let base_prompt = if has_previous_summary {
-        UPDATE_SUMMARIZATION_PROMPT
-    } else {
-        SUMMARIZATION_PROMPT
-    };
-
-    let mut prompt_text = format!("<conversation>\n{}\n</conversation>\n\n", conversation_text);
-    if let Some(instructions) = custom_instructions {
-        prompt_text.push_str(&format!("{}\n\nAdditional focus: {}", base_prompt, instructions));
-    } else {
-        prompt_text.push_str(base_prompt);
-    }
-    prompt_text.push_str(&format!(
-        "\n\nAlso append these file operation records to the end of your summary:{}",
-        file_section
-    ));
-
-    let user_msg = json!({"role": "user", "content": prompt_text});
-    runtime.compact_call(vec![user_msg]).await
 }
 
 pub async fn run(
@@ -426,6 +224,15 @@ pub async fn run(
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
+    // Start inbox watcher — file-drop ingestion for external events
+    {
+        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
+        let event_queue = runtime.event_queue().clone();
+        tokio::spawn(async move {
+            synaps_cli::events::watch_inbox(inbox_dir, event_queue).await;
+        });
+    }
+
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
@@ -433,8 +240,54 @@ pub async fn run(
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
+
+            // ── Event bus wake — fires instantly when an event is pushed to the queue ──
+            _ = runtime.event_queue().notified() => {
+                let mut event_received = false;
+                while let Some(event) = runtime.event_queue().pop() {
+                    event_received = true;
+                    let formatted = synaps_cli::events::format_event_for_agent(&event);
+                    let severity_str = event.content.severity
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "medium".to_string());
+                    app.push_msg(ChatMessage::Event {
+                        source: event.source.source_type.clone(),
+                        severity: severity_str,
+                        text: event.content.text.clone(),
+                    });
+
+                    if app.streaming || app.compact_task.is_some() {
+                        // Buffer during streaming — inject after MessageHistory
+                        app.pending_events.push(formatted);
+                    } else {
+                        app.api_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": formatted
+                        }));
+                    }
+                    app.invalidate();
+                }
+
+                // Auto-trigger model turn when idle — only if we actually received events
+                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                    if let Some(last) = app.api_messages.last() {
+                        if last["role"].as_str() == Some("user") {
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
+                    }
+                }
+            }
+
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
@@ -443,7 +296,7 @@ pub async fn run(
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
                 }
-                if !app.subagents.is_empty() || app.streaming {
+                if !app.subagents.is_empty() || app.streaming || app.compact_task.is_some() {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                     if app.spinner_frame % 3 == 0 {
                         app.invalidate();
@@ -456,6 +309,61 @@ pub async fn run(
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                }
+                // Poll background compaction task
+                if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
+                    let handle = app.compact_task.take().unwrap();
+                    let msg_count = app.api_messages.len();
+                    match handle.await {
+                        Ok(Ok(summary)) => {
+                            let old_id = app.session.id.clone();
+                            let new_session = Session::new_from_compaction(&app.session, summary.clone());
+                            let new_id = new_session.id.clone();
+                            // Save new session FIRST — if we crash after this but before
+                            // saving old, the new session still exists and chain is intact
+                            app.session = new_session;
+                            app.api_messages = app.session.api_messages.clone();
+                            app.total_input_tokens = 0;
+                            app.total_output_tokens = 0;
+                            app.session_cost = 0.0;
+                            let msgs = app.api_messages.clone();
+                            rebuild_display_messages(&msgs, &mut app);
+                            app.save_session().await;
+                            // Load old session fresh from disk and update its forward link
+                            match synaps_cli::core::session::Session::load(&old_id) {
+                                Ok(mut old_session) => {
+                                    old_session.compacted_into = Some(new_id.clone());
+                                    old_session.save().await.ok();
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to update old session {}: {}", old_id, e);
+                                }
+                            }
+                            // Flush any events that arrived during compaction
+                            for formatted in app.pending_events.drain(..) {
+                                app.api_messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": formatted
+                                }));
+                            }
+                            if let Some(queued) = app.queued_message.take() {
+                                app.api_messages.push(serde_json::json!({"role": "user", "content": queued}));
+                                app.push_msg(ChatMessage::System(format!("queued message restored: {}", queued)));
+                            }
+                            app.push_msg(ChatMessage::System(format!(
+                                "✓ compacted {} messages → new session {} (from {})",
+                                msg_count, new_id, old_id
+                            )));
+                        }
+                        Ok(Err(e)) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
+                        }
+                        Err(e) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction task panicked: {}", e)));
+                        }
+                    }
+                    app.status_text = None;
+                    app.invalidate();
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -485,6 +393,15 @@ pub async fn run(
                                 steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
+                                // Cancel all running reactive subagents
+                                {
+                                    let mut registry = runtime.subagent_registry().lock().unwrap();
+                                    for handle in registry.iter_mut_handles() {
+                                        if handle.status() == synaps_cli::runtime::subagent::SubagentStatus::Running {
+                                            handle.cancel();
+                                        }
+                                    }
+                                }
                                 let abort_msg = if app.abort_context.is_some() {
                                     "aborted — context saved for next message"
                                 } else {
@@ -585,50 +502,82 @@ pub async fn run(
                                             app.push_msg(ChatMessage::System(
                                                 "nothing to compact (need at least 2 turns)".to_string(),
                                             ));
+                                        } else if app.compact_task.is_some() {
+                                            app.push_msg(ChatMessage::System(
+                                                "compaction already in progress".to_string(),
+                                            ));
                                         } else {
                                             app.push_msg(ChatMessage::System(
                                                 "compacting conversation...".to_string(),
                                             ));
                                             app.status_text = Some("compacting…".to_string());
-                                            let elapsed = last_frame.elapsed();
-                                            last_frame = Instant::now();
-                                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                                            app.spinner_frame = 0;
 
-                                            let msg_count = app.api_messages.len();
-                                            let summary_result = compact_conversation(
-                                                &app.api_messages,
-                                                &runtime,
-                                                custom_instructions.as_deref(),
-                                            ).await;
+                                            let msgs = app.api_messages.clone();
+                                            let rt = runtime.clone();
+                                            let instr = custom_instructions.clone();
+                                            let handle = tokio::spawn(async move {
+                                                compact_conversation(&msgs, &rt, instr.as_deref()).await
+                                            });
+                                            app.compact_task = Some(handle);
+                                        }
+                                    }
+                                    CommandAction::Chain => {
+                                        // Walk the parent_session chain backward from current session
+                                        let mut chain: Vec<(String, String, usize)> = Vec::new(); // (id, title, msg_count)
 
-                                            match summary_result {
-                                                Ok(summary) => {
-                                                    let summary_msg = format!(
-                                                        "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary above contains all the context you need from our previous conversation.",
-                                                        summary
-                                                    );
-                                                    app.api_messages = vec![
-                                                        json!({"role": "user", "content": summary_msg}),
-                                                        json!({"role": "assistant", "content": "Understood. I've reviewed the conversation summary and I'm ready to continue from where we left off. What would you like to work on next?"}),
-                                                    ];
-                                                    app.push_msg(ChatMessage::System(format!(
-                                                        "✓ compacted {} messages → summary ({} chars)",
-                                                        msg_count, summary.len()
-                                                    )));
-                                                    app.save_session().await;
+                                        // Current session first
+                                        chain.push((
+                                            app.session.id.clone(),
+                                            if app.session.title.is_empty() { "(untitled)".to_string() } else { app.session.title.clone() },
+                                            app.api_messages.len(),
+                                        ));
+
+                                        // Walk backward through parents
+                                        let mut current_parent = app.session.parent_session.clone();
+                                        while let Some(ref parent_id) = current_parent {
+                                            match synaps_cli::core::session::Session::load(parent_id) {
+                                                Ok(parent) => {
+                                                    let title = if parent.title.is_empty() { "(untitled)".to_string() } else { parent.title.clone() };
+                                                    let msg_count = parent.api_messages.len();
+                                                    chain.push((parent.id.clone(), title, msg_count));
+                                                    current_parent = parent.parent_session.clone();
                                                 }
-                                                Err(e) => {
-                                                    app.push_msg(ChatMessage::Error(format!(
-                                                        "compaction failed: {}", e
-                                                    )));
+                                                Err(_) => {
+                                                    chain.push((parent_id.clone(), "(not found)".to_string(), 0));
+                                                    break;
                                                 }
                                             }
-                                            app.status_text = None;
+                                        }
+
+                                        // Reverse so root is first
+                                        chain.reverse();
+
+                                        if chain.len() <= 1 {
+                                            app.push_msg(ChatMessage::System("no compaction history — this is the root session".to_string()));
+                                        } else {
+                                            let mut lines = vec!["Session chain:".to_string()];
+                                            for (i, (id, title, msgs)) in chain.iter().enumerate() {
+                                                let marker = if i == chain.len() - 1 { " ← active" } else { "" };
+                                                let short_id: String = id.chars().take(19).collect();
+                                                let short_title: String = title.chars().take(40).collect();
+                                                lines.push(format!("  {} {} ({} msgs) {}{}",
+                                                    if i == 0 { "●" } else { "→" },
+                                                    short_id, msgs, short_title, marker
+                                                ));
+                                            }
+                                            app.push_msg(ChatMessage::System(lines.join("\n")));
                                         }
                                     }
                                 }
                             }
                             InputAction::Submit(input) => {
+                                // Queue input during compaction — will be sent after session swap
+                                if app.compact_task.is_some() {
+                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                    app.queued_message = Some(input);
+                                    continue;
+                                }
                                 // Build display text with paste info
                                 let display_text = if app.pasted_char_count > 0 {
                                     let typed = app.input_before_paste.as_deref().unwrap_or("");
@@ -727,6 +676,7 @@ pub async fn run(
                                         // handle_streaming_command never returns LoadSkill or Compact.
                                         CommandAction::LoadSkill { .. } => {}
                                         CommandAction::Compact { .. } => {}
+                                        CommandAction::Chain => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -876,6 +826,19 @@ pub async fn run(
                             let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                             app.status_text = None;
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
+                        StreamAction::AutoTriggerEvents => {
+                            drop(stream.take());
+                            drop(cancel_token.take());
+                            drop(steer_tx.take());
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);

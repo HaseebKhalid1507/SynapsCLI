@@ -57,6 +57,12 @@ pub(crate) struct Theme {
     pub(crate) subagent_status: Color,
     pub(crate) subagent_done: Color,
     pub(crate) subagent_time: Color,
+
+    // Event bus
+    pub(crate) event_icon: Color,
+    pub(crate) event_source: Color,
+    pub(crate) event_text: Color,
+    pub(crate) event_critical: Color,
 }
 
 impl Default for Theme {
@@ -102,6 +108,11 @@ impl Default for Theme {
             subagent_status: Color::Rgb(120, 140, 170),
             subagent_done: Color::Rgb(50, 195, 190),
             subagent_time: Color::Rgb(80, 95, 120),
+
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 }

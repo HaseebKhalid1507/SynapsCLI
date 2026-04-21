@@ -14,6 +14,7 @@ pub(crate) enum ChatMessage {
     ToolResult { content: String, elapsed_ms: Option<u64> },
     Error(String),
     System(String),
+    Event { source: String, severity: String, text: String },
 }
 
 pub(crate) struct TimestampedMsg {
@@ -92,6 +93,10 @@ pub(crate) struct App {
     pub(crate) settings: Option<super::settings::SettingsState>,
     /// Active plugins modal state (Some while /plugins is open).
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
+    /// Background compaction task — polled in the event loop so /compact doesn't block.
+    pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
+    /// Events buffered during streaming — injected into api_messages after stream completes
+    pub(crate) pending_events: Vec<String>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -150,6 +155,8 @@ impl App {
             gamba_child: None,
             settings: None,
             plugins: None,
+            compact_task: None,
+            pending_events: Vec::new(),
         }
     }
 
