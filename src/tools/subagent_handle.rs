@@ -184,6 +184,11 @@ impl SubagentRegistry {
     }
 
     /// Drop handles that are no longer running.
+    /// Iterate over all handles mutably (for bulk operations like cancel-all).
+    pub fn iter_mut_handles(&mut self) -> impl Iterator<Item = &mut SubagentHandle> {
+        self.handles.values_mut()
+    }
+
     pub fn cleanup_finished(&mut self) {
         self.handles.retain(|_, h| !h.is_finished());
     }

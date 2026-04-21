@@ -328,6 +328,15 @@ pub async fn run(
                                 steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
+                                // Cancel all running reactive subagents
+                                {
+                                    let mut registry = runtime.subagent_registry().lock().unwrap();
+                                    for handle in registry.iter_mut_handles() {
+                                        if handle.status() == synaps_cli::tools::subagent_handle::SubagentStatus::Running {
+                                            handle.cancel();
+                                        }
+                                    }
+                                }
                                 let abort_msg = if app.abort_context.is_some() {
                                     "aborted — context saved for next message"
                                 } else {

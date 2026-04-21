@@ -124,6 +124,10 @@ impl Runtime {
         self.tools = Arc::new(RwLock::new(tools));
     }
 
+    pub fn subagent_registry(&self) -> &Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>> {
+        &self.subagent_registry
+    }
+
     pub fn event_queue(&self) -> &Arc<crate::events::EventQueue> {
         &self.event_queue
     }
