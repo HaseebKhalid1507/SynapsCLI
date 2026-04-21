@@ -480,6 +480,12 @@ pub async fn run(
                                 }
                             }
                             InputAction::Submit(input) => {
+                                // Queue input during compaction — will be sent after session swap
+                                if app.compact_task.is_some() {
+                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                    app.queued_message = Some(input);
+                                    continue;
+                                }
                                 // Build display text with paste info
                                 let display_text = if app.pasted_char_count > 0 {
                                     let typed = app.input_before_paste.as_deref().unwrap_or("");
