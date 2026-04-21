@@ -95,7 +95,7 @@ async fn fetch_usage() -> std::result::Result<String, String> {
     let data: serde_json::Value = resp.json().await
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    fn format_row(label: &str, data: &serde_json::Value) -> Option<String> {
+    fn format_block(label: &str, data: &serde_json::Value) -> Option<String> {
         let util = data["utilization"].as_f64()?;
         let resets = data["resets_at"].as_str()?;
         let reset_display = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(resets) {
@@ -104,19 +104,21 @@ async fn fetch_usage() -> std::result::Result<String, String> {
             let mins = diff.num_minutes() % 60;
             if hours > 24 { format!("{}d {}h", hours / 24, hours % 24) }
             else if hours > 0 { format!("{}h {}m", hours, mins) }
-            else { format!("{}m", mins) }
+            else { format!("{}m", diff.num_minutes()) }
         } else { "—".to_string() };
 
-        let filled = ((util / 100.0) * 15.0) as usize;
-        let empty = 15usize.saturating_sub(filled);
+        let filled = ((util / 100.0) * 20.0) as usize;
+        let empty = 20usize.saturating_sub(filled);
         let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-        Some(format!("{:>10}: {} {:>3.0}%  resets in {}", label, bar, util, reset_display))
+        Some(format!("{}
+{} {:.0}%
+resets in {}", label, bar, util, reset_display))
     }
 
-    let mut lines = vec!["Account Usage:".to_string()];
-    if let Some(row) = format_row("5-hour", &data["five_hour"]) { lines.push(row); }
-    if let Some(row) = format_row("7-day", &data["seven_day"]) { lines.push(row); }
-    if let Some(row) = format_row("Sonnet", &data["seven_day_sonnet"]) { lines.push(row); }
+    let mut lines = vec!["⚡ Account Usage".to_string(), String::new()];
+    if let Some(row) = format_block("5-hour window", &data["five_hour"]) { lines.push(row); lines.push(String::new()); }
+    if let Some(row) = format_block("7-day window", &data["seven_day"]) { lines.push(row); lines.push(String::new()); }
+    if let Some(row) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) { lines.push(row); }
 
     Ok(lines.join("\n"))
 }
