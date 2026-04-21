@@ -21,10 +21,23 @@ pub fn is_safe_plugin_name(name: &str) -> bool {
 }
 
 /// Convert a user-provided URL to the HTTPS URL that yields `marketplace.json`.
-/// - `https://github.com/<owner>/<repo>[.git][/]` → raw.githubusercontent.com form.
+/// Returns only the first-choice candidate; prefer [`marketplace_url_candidates`]
+/// when fallback probing is desired (e.g., Claude Code marketplaces).
+///
+/// - `https://github.com/<owner>/<repo>[.git][/]` → raw.githubusercontent.com form
+///   targeting `.synaps-plugin/marketplace.json`.
 /// - Any other `https://…` URL is returned unchanged (caller assumed to have pasted a raw URL).
 /// - `http://`, `ssh://`, `git@…`, empty → error.
 pub fn normalize_marketplace_url(input: &str) -> Result<String, String> {
+    marketplace_url_candidates(input).map(|mut v| v.remove(0))
+}
+
+/// Ordered list of URLs to probe when fetching a marketplace manifest. For
+/// `github.com/<owner>/<repo>` URLs, returns both `.synaps-plugin/` and
+/// `.claude-plugin/` manifest paths so Claude Code marketplaces can be
+/// consumed transparently. For any other `https://` URL, returns a single
+/// element (pass-through).
+pub fn marketplace_url_candidates(input: &str) -> Result<Vec<String>, String> {
     let s = input.trim();
     if s.is_empty() {
         return Err("URL is empty".into());
@@ -32,7 +45,6 @@ pub fn normalize_marketplace_url(input: &str) -> Result<String, String> {
     if !s.starts_with("https://") {
         return Err("only https:// URLs are supported".into());
     }
-    // GitHub rewrite.
     let gh_prefix = "https://github.com/";
     if let Some(rest) = s.strip_prefix(gh_prefix) {
         let rest = rest.trim_end_matches('/');
@@ -41,12 +53,48 @@ pub fn normalize_marketplace_url(input: &str) -> Result<String, String> {
         if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err("GitHub URL must be https://github.com/<owner>/<repo>".into());
         }
-        return Ok(format!(
-            "https://raw.githubusercontent.com/{}/{}/HEAD/.synaps-plugin/marketplace.json",
-            parts[0], parts[1]
-        ));
+        return Ok(vec![
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/HEAD/.synaps-plugin/marketplace.json",
+                parts[0], parts[1]
+            ),
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/HEAD/.claude-plugin/marketplace.json",
+                parts[0], parts[1]
+            ),
+        ]);
     }
-    Ok(s.to_string())
+    Ok(vec![s.to_string()])
+}
+
+/// Derive a `git clone`-able URL for the marketplace repo from either a
+/// `https://github.com/<owner>/<repo>[/...]` URL or a
+/// `https://raw.githubusercontent.com/<owner>/<repo>/...` URL. Used for
+/// plugins with repo-relative (`./subdir`) sources, which need to clone
+/// the parent marketplace repo. Returns `Err` for non-GitHub URLs.
+pub fn derive_git_clone_url(input: &str) -> Result<String, String> {
+    let s = input.trim();
+    if !s.starts_with("https://") {
+        return Err("only https:// supported".into());
+    }
+    let (owner, repo) = if let Some(rest) = s.strip_prefix("https://github.com/") {
+        let rest = rest.trim_end_matches('/');
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err("expected github.com/<owner>/<repo>".into());
+        }
+        (parts[0].to_string(), parts[1].to_string())
+    } else if let Some(rest) = s.strip_prefix("https://raw.githubusercontent.com/") {
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err("expected raw.githubusercontent.com/<owner>/<repo>/...".into());
+        }
+        (parts[0].to_string(), parts[1].to_string())
+    } else {
+        return Err("not a GitHub URL".into());
+    };
+    Ok(format!("https://github.com/{}/{}.git", owner, repo))
 }
 
 /// Owner-scoped host key for TOFU trust: `github.com/<owner>`.
@@ -89,15 +137,27 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
             ));
         }
         let s = p.source.trim();
-        if s.starts_with("./") || s.starts_with("../") || !s.contains("://") {
+        // Repo-relative source: "./<safe-name>" — a direct child subdir of
+        // the marketplace repo. Claude Code marketplaces use this form.
+        if let Some(subdir) = s.strip_prefix("./") {
+            if !is_safe_plugin_name(subdir) {
+                return Err(format!(
+                    "plugin '{}' uses unsafe relative source path '{}' \
+                    (only a single safe subdir name is allowed after './')",
+                    p.name, s
+                ));
+            }
+            continue;
+        }
+        if s.starts_with("../") || !s.contains("://") {
             return Err(format!(
-                "plugin '{}' uses unsupported relative source path '{}'",
+                "plugin '{}' uses unsupported source path '{}'",
                 p.name, s
             ));
         }
         if !s.starts_with("https://") {
             return Err(format!(
-                "plugin '{}' source must be https:// (got '{}')",
+                "plugin '{}' source must be https:// or ./<name> (got '{}')",
                 p.name, s
             ));
         }
@@ -116,6 +176,21 @@ pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
         .map_err(|e| format!("invalid marketplace.json: {}", e))?;
     validate_manifest(&m)?;
     Ok(m)
+}
+
+/// Resolve a user-entered URL to a marketplace manifest. For GitHub URLs,
+/// probes both `.synaps-plugin/` and `.claude-plugin/` layouts; returns the
+/// first success along with the URL that worked (caller typically stores this).
+pub async fn fetch_marketplace(input: &str) -> Result<(MarketplaceManifest, String), String> {
+    let candidates = marketplace_url_candidates(input)?;
+    let mut last_err: Option<String> = None;
+    for url in &candidates {
+        match fetch_manifest(url).await {
+            Ok(m) => return Ok((m, url.clone())),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no candidates to try".into()))
 }
 
 /// Fetches raw JSON bytes from a URL.
@@ -146,6 +221,45 @@ mod tests {
     fn normalize_github_url_to_raw() {
         let out = normalize_marketplace_url("https://github.com/maha-media/pi-skills").unwrap();
         assert_eq!(out, "https://raw.githubusercontent.com/maha-media/pi-skills/HEAD/.synaps-plugin/marketplace.json");
+    }
+
+    #[test]
+    fn github_candidates_include_both_layouts_in_order() {
+        let v = marketplace_url_candidates("https://github.com/maha-media/pi-skills").unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v[0].ends_with("/.synaps-plugin/marketplace.json"));
+        assert!(v[1].ends_with("/.claude-plugin/marketplace.json"));
+    }
+
+    #[test]
+    fn non_github_candidates_has_single_element() {
+        let v = marketplace_url_candidates("https://example.com/m.json").unwrap();
+        assert_eq!(v, vec!["https://example.com/m.json".to_string()]);
+    }
+
+    #[test]
+    fn derive_git_clone_url_from_github_url() {
+        let got = derive_git_clone_url("https://github.com/maha-media/pi-skills/").unwrap();
+        assert_eq!(got, "https://github.com/maha-media/pi-skills.git");
+    }
+
+    #[test]
+    fn derive_git_clone_url_from_github_url_with_git_suffix() {
+        let got = derive_git_clone_url("https://github.com/a/b.git").unwrap();
+        assert_eq!(got, "https://github.com/a/b.git");
+    }
+
+    #[test]
+    fn derive_git_clone_url_from_raw_content_url() {
+        let got = derive_git_clone_url(
+            "https://raw.githubusercontent.com/maha-media/pi-skills/HEAD/.claude-plugin/marketplace.json"
+        ).unwrap();
+        assert_eq!(got, "https://github.com/maha-media/pi-skills.git");
+    }
+
+    #[test]
+    fn derive_git_clone_url_rejects_non_github() {
+        assert!(derive_git_clone_url("https://gitlab.com/x/y").is_err());
     }
 
     #[test]
@@ -225,13 +339,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_manifest_rejects_relative_source() {
+    fn validate_manifest_accepts_relative_subdir_source() {
         let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
-            {"name":"x","plugins":[{"name":"p","source":"./p"}]}
+            {"name":"x","plugins":[{"name":"p","source":"./web-tools-plugin"}]}
         "#).unwrap();
-        let err = validate_manifest(&m).unwrap_err();
-        assert!(err.contains("relative"));
-        assert!(err.contains("'p'"));
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_parent_traversal_source() {
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[{"name":"p","source":"../elsewhere"}]}
+        "#).unwrap();
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_nested_relative_source() {
+        // "./a/b" is rejected: only a single-component subdir is allowed.
+        let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
+            {"name":"x","plugins":[{"name":"p","source":"./a/b"}]}
+        "#).unwrap();
+        assert!(validate_manifest(&m).is_err());
     }
 
     #[test]
@@ -248,7 +377,7 @@ mod tests {
         let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
             {"name":"x","plugins":[
                 {"name":"ok","source":"https://github.com/a/b.git"},
-                {"name":"bad","source":"./b"}
+                {"name":"bad","source":"../escape"}
             ]}
         "#).unwrap();
         let err = validate_manifest(&m).unwrap_err();

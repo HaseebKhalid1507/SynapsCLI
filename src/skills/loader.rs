@@ -1,4 +1,4 @@
-//! SKILL.md parsing, {baseDir} substitution, and filesystem discovery.
+//! SKILL.md parsing, {baseDir}/${CLAUDE_PLUGIN_ROOT} substitution, and discovery.
 
 use std::path::{Path, PathBuf};
 use crate::skills::LoadedSkill;
@@ -27,9 +27,17 @@ pub(super) fn parse_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
     }
 }
 
-/// Load a SKILL.md file into a `LoadedSkill`. Applies `{baseDir}` substitution.
+/// Load a SKILL.md file into a `LoadedSkill`. Applies two substitutions:
+/// - `{baseDir}` → the skill's own directory (native SynapsCLI form).
+/// - `${CLAUDE_PLUGIN_ROOT}` / `$CLAUDE_PLUGIN_ROOT` → the plugin's root
+///   directory (Claude Code compat), when the skill belongs to a plugin.
+///
 /// Returns None if required frontmatter is missing or body is empty.
-pub fn load_skill_file(skill_md: &Path, plugin: Option<&str>) -> Option<LoadedSkill> {
+pub fn load_skill_file(
+    skill_md: &Path,
+    plugin: Option<&str>,
+    plugin_root: Option<&Path>,
+) -> Option<LoadedSkill> {
     let content = std::fs::read_to_string(skill_md).ok()?;
     let (fields, body) = parse_frontmatter(&content);
 
@@ -41,7 +49,13 @@ pub fn load_skill_file(skill_md: &Path, plugin: Option<&str>) -> Option<LoadedSk
     }
 
     let base_dir = skill_md.parent()?.canonicalize().ok()?;
-    let body = body.replace("{baseDir}", base_dir.to_str()?);
+    let mut body = body.replace("{baseDir}", base_dir.to_str()?);
+    if let Some(root) = plugin_root.and_then(|p| p.canonicalize().ok()) {
+        let root_str = root.to_str()?;
+        // Replace braced form first so the plain-$ pass doesn't see a partial match.
+        body = body.replace("${CLAUDE_PLUGIN_ROOT}", root_str);
+        body = body.replace("$CLAUDE_PLUGIN_ROOT", root_str);
+    }
 
     Some(LoadedSkill {
         name,
@@ -82,6 +96,27 @@ pub fn load_all(roots: &[PathBuf]) -> (Vec<Plugin>, Vec<LoadedSkill>) {
     (plugins, skills)
 }
 
+/// Return the first existing path from a list of candidates, or None.
+/// Used to accept both `.synaps-plugin/` (native) and `.claude-plugin/`
+/// (Claude Code compat) manifest directories.
+fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.exists()).cloned()
+}
+
+fn marketplace_json_for(root: &Path) -> Option<PathBuf> {
+    first_existing(&[
+        root.join(".synaps-plugin").join("marketplace.json"),
+        root.join(".claude-plugin").join("marketplace.json"),
+    ])
+}
+
+fn plugin_json_for(plugin_root: &Path) -> Option<PathBuf> {
+    first_existing(&[
+        plugin_root.join(".synaps-plugin").join("plugin.json"),
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+    ])
+}
+
 fn walk_root(
     root: &Path,
     plugins: &mut Vec<Plugin>,
@@ -91,8 +126,7 @@ fn walk_root(
     if !root.exists() { return; }
 
     // 1. Marketplace pass
-    let marketplace_json = root.join(".synaps-plugin").join("marketplace.json");
-    let marketplace_name = if marketplace_json.exists() {
+    let marketplace_name = if let Some(marketplace_json) = marketplace_json_for(root) {
         match std::fs::read_to_string(&marketplace_json)
             .ok()
             .and_then(|c| serde_json::from_str::<MarketplaceManifest>(&c).ok())
@@ -113,19 +147,17 @@ fn walk_root(
         None
     };
 
-    // 2. Plugin pass (subdirs with .synaps-plugin/plugin.json)
-    //    Additionally, if a subdir contains .synaps-plugin/marketplace.json,
-    //    treat it as a nested discovery root and recurse once. This supports
-    //    the common "clone marketplace repo into plugins/" install pattern.
+    // 2. Plugin pass (subdirs with .synaps-plugin/plugin.json or .claude-plugin/plugin.json)
+    //    Additionally, if a subdir contains a marketplace.json, treat it as a
+    //    nested discovery root and recurse once. This supports the common
+    //    "clone marketplace repo into plugins/" install pattern.
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() { continue; }
-            let subdir_synaps = path.join(".synaps-plugin");
-            if subdir_synaps.join("marketplace.json").exists() {
-                // Nested marketplace — recurse into this subdir.
+            if marketplace_json_for(&path).is_some() {
                 walk_root(&path, plugins, skills, seen);
-            } else if subdir_synaps.join("plugin.json").exists() {
+            } else if plugin_json_for(&path).is_some() {
                 load_plugin(&path, marketplace_name.as_deref(), plugins, skills, seen);
             }
         }
@@ -140,7 +172,7 @@ fn walk_root(
                 if !path.is_dir() { continue; }
                 let skill_md = path.join("SKILL.md");
                 if skill_md.exists() {
-                    if let Some(s) = load_skill_file(&skill_md, None) {
+                    if let Some(s) = load_skill_file(&skill_md, None, None) {
                         let key = (None, s.name.clone());
                         if seen.insert(key) { skills.push(s); }
                     }
@@ -157,7 +189,10 @@ fn load_plugin(
     skills: &mut Vec<LoadedSkill>,
     seen: &mut std::collections::HashSet<(Option<String>, String)>,
 ) {
-    let manifest_path = plugin_root.join(".synaps-plugin").join("plugin.json");
+    let Some(manifest_path) = plugin_json_for(plugin_root) else {
+        tracing::warn!("no plugin.json under {}", plugin_root.display());
+        return;
+    };
     let Ok(content) = std::fs::read_to_string(&manifest_path) else {
         tracing::warn!("failed to read {}", manifest_path.display());
         return;
@@ -187,7 +222,7 @@ fn load_plugin(
         if !path.is_dir() { continue; }
         let skill_md = path.join("SKILL.md");
         if !skill_md.exists() { continue; }
-        if let Some(s) = load_skill_file(&skill_md, Some(&m.name)) {
+        if let Some(s) = load_skill_file(&skill_md, Some(&m.name), Some(plugin_root)) {
             let key = (Some(m.name.clone()), s.name.clone());
             if seen.insert(key) { skills.push(s); }
         }
@@ -227,7 +262,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("my-skill");
         let path = write_skill(&skill_dir, "---\nname: my-skill\ndescription: desc\n---\nBody");
-        let s = load_skill_file(&path, Some("plugin-x")).unwrap();
+        let s = load_skill_file(&path, Some("plugin-x"), None).unwrap();
         assert_eq!(s.name, "my-skill");
         assert_eq!(s.description, "desc");
         assert_eq!(s.body, "Body");
@@ -240,7 +275,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("skill");
         let path = write_skill(&skill_dir, "---\nname: s\ndescription: d\n---\nRun {baseDir}/x.js");
-        let s = load_skill_file(&path, None).unwrap();
+        let s = load_skill_file(&path, None, None).unwrap();
         let expected = format!("Run {}/x.js", s.base_dir.to_str().unwrap());
         assert_eq!(s.body, expected);
     }
@@ -250,7 +285,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("bad");
         let path = write_skill(&skill_dir, "no frontmatter here");
-        assert!(load_skill_file(&path, None).is_none());
+        assert!(load_skill_file(&path, None, None).is_none());
     }
 
     #[test]
@@ -258,7 +293,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("bad2");
         let path = write_skill(&skill_dir, "---\nname: x\n---\nbody");
-        assert!(load_skill_file(&path, None).is_none());
+        assert!(load_skill_file(&path, None, None).is_none());
     }
 
     #[test]
@@ -266,7 +301,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("bad3");
         let path = write_skill(&skill_dir, "---\ndescription: d\n---\nbody");
-        assert!(load_skill_file(&path, None).is_none());
+        assert!(load_skill_file(&path, None, None).is_none());
     }
 
     #[test]
@@ -274,7 +309,7 @@ mod tests {
         let tmp = tempdir();
         let skill_dir = tmp.join("empty-body");
         let path = write_skill(&skill_dir, "---\nname: x\ndescription: d\n---\n");
-        assert!(load_skill_file(&path, None).is_none());
+        assert!(load_skill_file(&path, None, None).is_none());
     }
 
     #[test]
@@ -283,7 +318,7 @@ mod tests {
         let skill_dir = tmp.join("unclosed");
         // No closing `---`; parse_frontmatter returns ([], full_text) so name/description missing → None.
         let path = write_skill(&skill_dir, "---\nname: x\ndescription: d\nbody without closing fence");
-        assert!(load_skill_file(&path, None).is_none());
+        assert!(load_skill_file(&path, None, None).is_none());
     }
 
     #[test]
@@ -294,9 +329,41 @@ mod tests {
             &skill_dir,
             "---\nname: m\ndescription: d\n---\n{baseDir}/a and {baseDir}/b",
         );
-        let s = load_skill_file(&path, None).unwrap();
+        let s = load_skill_file(&path, None, None).unwrap();
         let bd = s.base_dir.to_str().unwrap();
         assert_eq!(s.body, format!("{}/a and {}/b", bd, bd));
+    }
+
+    #[test]
+    fn load_skill_substitutes_claude_plugin_root_braced_and_plain() {
+        // Regression: Claude-Code-style skills reference ${CLAUDE_PLUGIN_ROOT}
+        // (and the bare $CLAUDE_PLUGIN_ROOT form) which must be substituted
+        // to the plugin's canonical root before the body is handed to the model.
+        let tmp = tempdir();
+        let plugin_root = tmp.join("my-plugin");
+        fs::create_dir_all(&plugin_root).unwrap();
+        let skill_dir = plugin_root.join("skills").join("exa");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: exa\ndescription: d\n---\nbash ${CLAUDE_PLUGIN_ROOT}/scripts/a.js then $CLAUDE_PLUGIN_ROOT/b.js",
+        );
+        let s = load_skill_file(&path, Some("my-plugin"), Some(&plugin_root)).unwrap();
+        let root_abs = plugin_root.canonicalize().unwrap();
+        let r = root_abs.to_str().unwrap();
+        assert_eq!(s.body, format!("bash {}/scripts/a.js then {}/b.js", r, r));
+    }
+
+    #[test]
+    fn load_skill_leaves_claude_plugin_root_alone_when_not_in_plugin() {
+        // Loose skills (plugin_root = None) should not receive the substitution.
+        let tmp = tempdir();
+        let skill_dir = tmp.join("loose");
+        let path = write_skill(
+            &skill_dir,
+            "---\nname: loose\ndescription: d\n---\n${CLAUDE_PLUGIN_ROOT}/x",
+        );
+        let s = load_skill_file(&path, None, None).unwrap();
+        assert_eq!(s.body, "${CLAUDE_PLUGIN_ROOT}/x");
     }
 
     #[test]
@@ -408,6 +475,48 @@ mod tests {
         assert_eq!(skills[0].plugin.as_deref(), Some("web"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_all_accepts_claude_plugin_marketplace_layout() {
+        // Claude-Code-style: marketplace.json under .claude-plugin/, plugin.json
+        // also under .claude-plugin/.
+        let tmp = tempdir();
+        fs::create_dir_all(tmp.join(".claude-plugin")).unwrap();
+        fs::write(tmp.join(".claude-plugin").join("marketplace.json"),
+            r#"{"name":"cc-mp","plugins":[{"name":"web","source":"./web"}]}"#).unwrap();
+        let plugin_dir = tmp.join("web");
+        fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
+        fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"web"}"#).unwrap();
+        write_skill(&plugin_dir.join("skills").join("search"),
+            "---\nname: search\ndescription: d\n---\nBody");
+
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].marketplace.as_deref(), Some("cc-mp"));
+        assert_eq!(plugins[0].name, "web");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "search");
+    }
+
+    #[test]
+    fn load_all_prefers_synaps_plugin_over_claude_plugin() {
+        // When both layouts are present, .synaps-plugin/ wins.
+        let tmp = tempdir();
+        let plugin_dir = tmp.join("dual");
+        fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+        fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
+        fs::write(plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"native"}"#).unwrap();
+        fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"claude"}"#).unwrap();
+        write_skill(&plugin_dir.join("skills").join("s"),
+            "---\nname: s\ndescription: d\n---\nBody");
+
+        let (plugins, _skills) = load_all(std::slice::from_ref(&tmp));
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "native", "synaps-plugin layout must win");
     }
 
     #[test]
