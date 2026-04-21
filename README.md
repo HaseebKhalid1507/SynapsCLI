@@ -49,7 +49,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 synaps
 ```
 
-`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long.
+`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long. `/status` to check usage.
 
 ```bash
 synaps send "alert" --source monitoring  # inject events from anywhere
@@ -78,6 +78,12 @@ Streaming, markdown, syntax highlighting, and a live panel showing every subagen
 │  ⠹ zero     thinking...                   4.2s  │
 ╰─────────────────────────────────────────────────╯
 ```
+
+### Usage Status
+```bash
+synaps status                    # check account usage + reset times
+```
+Or use `/status` inside the TUI.
 
 ### One-Shot
 ```bash
