@@ -34,6 +34,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::subagent_status::SubagentStatusTool),
             Arc::new(crate::tools::subagent_steer::SubagentSteerTool),
             Arc::new(crate::tools::subagent_collect::SubagentCollectTool),
+            Arc::new(crate::tools::subagent_resume::SubagentResumeTool),
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
