@@ -217,6 +217,15 @@ pub async fn run(
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
+    // Start inbox watcher — file-drop ingestion for external events
+    {
+        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
+        let event_queue = runtime.event_queue().clone();
+        tokio::spawn(async move {
+            synaps_cli::events::watch_inbox(inbox_dir, event_queue).await;
+        });
+    }
+
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
@@ -224,6 +233,15 @@ pub async fn run(
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
+            // ── Event queue poll (inbox, etc.) — every 250ms regardless of UI state ──
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                while let Some(event) = runtime.event_queue().pop() {
+                    let formatted = synaps_cli::events::format_event_for_agent(&event);
+                    app.push_msg(ChatMessage::System(formatted));
+                    app.invalidate();
+                    // TODO: inject into api_messages for the model to see
+                }
+            }
             // ── Tick: animations + spinner (~60fps) ──
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 if let Some(ref mut t) = app.logo_build_t {
