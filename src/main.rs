@@ -66,6 +66,8 @@ enum Command {
     },
     /// OAuth login
     Login,
+    /// Show account usage and reset times
+    Status,
     /// Send an event to the inbox (picked up by running session)
     Send {
         /// Message text
@@ -112,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Login) => {
             cmd::login::run(cli.profile).await;
+        }
+        Some(Command::Status) => {
+            cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
         Some(Command::Send { message, source, severity, channel, content_type }) => {
             cmd::send::run(message, source, severity, channel, content_type).await?;
