@@ -16,6 +16,7 @@ mod auth;
 mod api;
 mod stream;
 mod helpers;
+pub mod subagent;
 
 pub use types::StreamEvent;
 use types::AuthState;
@@ -41,7 +42,7 @@ pub struct Runtime {
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Shared registry for reactive subagent handles.
-    subagent_registry: Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>>,
+    subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     /// Shared event queue — for Event Bus tooling.
     event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
@@ -94,7 +95,7 @@ impl Runtime {
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
-            subagent_registry: Arc::new(Mutex::new(crate::tools::subagent_handle::SubagentRegistry::new())),
+            subagent_registry: Arc::new(Mutex::new(crate::runtime::subagent::SubagentRegistry::new())),
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -124,7 +125,7 @@ impl Runtime {
         self.tools = Arc::new(RwLock::new(tools));
     }
 
-    pub fn subagent_registry(&self) -> &Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>> {
+    pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
         &self.subagent_registry
     }
 
