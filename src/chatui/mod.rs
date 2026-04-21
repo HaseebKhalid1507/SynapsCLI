@@ -228,48 +228,6 @@ pub async fn run(
 
     // ── Event loop ──
     loop {
-        // Drain event queue on every loop iteration — events show up immediately
-        let mut event_received = false;
-        while let Some(event) = runtime.event_queue().pop() {
-            let formatted = synaps_cli::events::format_event_for_agent(&event);
-            let severity_str = event.content.severity
-                .as_ref()
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "medium".to_string());
-            app.push_msg(ChatMessage::Event {
-                source: event.source.source_type.clone(),
-                severity: severity_str,
-                text: event.content.text.clone(),
-            });
-
-            if app.streaming {
-                // Steer the event into the active stream so the model sees it NOW
-                if let Some(ref tx) = steer_tx {
-                    let _ = tx.send(formatted);
-                }
-            } else {
-                // Queue for next turn
-                app.api_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": formatted
-                }));
-            }
-            app.invalidate();
-            event_received = true;
-        }
-
-        // Auto-trigger model turn when events arrive and agent is idle
-        if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() {
-            let ct = CancellationToken::new();
-            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            app.streaming = true;
-            app.spinner_frame = 0;
-            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
-            app.push_msg(ChatMessage::Thinking("…".to_string()));
-            cancel_token = Some(ct);
-            steer_tx = Some(s_tx);
-        }
-
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
@@ -278,8 +236,46 @@ pub async fn run(
 
             // ── Event bus wake — fires instantly when an event is pushed to the queue ──
             _ = runtime.event_queue().notified() => {
-                // Loop will iterate, drain happens at the top
-                continue;
+                while let Some(event) = runtime.event_queue().pop() {
+                    let formatted = synaps_cli::events::format_event_for_agent(&event);
+                    let severity_str = event.content.severity
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "medium".to_string());
+                    app.push_msg(ChatMessage::Event {
+                        source: event.source.source_type.clone(),
+                        severity: severity_str,
+                        text: event.content.text.clone(),
+                    });
+
+                    if app.streaming {
+                        if let Some(ref tx) = steer_tx {
+                            let _ = tx.send(formatted);
+                        }
+                    } else {
+                        app.api_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": formatted
+                        }));
+                    }
+                    app.invalidate();
+                }
+
+                // Auto-trigger model turn when idle
+                if !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                    if let Some(last) = app.api_messages.last() {
+                        if last["role"].as_str() == Some("user") {
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
+                    }
+                }
             }
 
             // ── Tick: animations + spinner (~60fps) ──
