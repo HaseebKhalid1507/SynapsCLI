@@ -136,15 +136,9 @@ pub async fn run(
     let tools_shared = runtime.tools_shared();
     let registry = synaps_cli::skills::register(&tools_shared, &config).await;
     let skill_count = registry.all_skills().len();
-    if skill_count > 0 {
-        eprintln!("\x1b[2m  📚 {} skills available (type / to list)\x1b[0m", skill_count);
-    }
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
     let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
-    if mcp_server_count > 0 {
-        eprintln!("\x1b[2m  ⚡ {} MCP servers available (use mcp_connect to activate)\x1b[0m", mcp_server_count);
-    }
 
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
 
@@ -182,6 +176,23 @@ pub async fn run(
             App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
         }
     };
+
+    if skill_count > 0 {
+        app.push_msg(ChatMessage::System(format!(
+            "📚 {} skills available (type / to list)",
+            skill_count
+        )));
+    }
+
+    // Sync the context bar denominator with the runtime's effective window
+    // (respects config override like `context_window = 200k`).
+    app.last_turn_context_window = runtime.context_window();
+    if mcp_server_count > 0 {
+        app.push_msg(ChatMessage::System(format!(
+            "⚡ {} MCP servers available (use mcp_connect to activate)",
+            mcp_server_count
+        )));
+    }
 
     // ── Terminal setup ──
     enable_raw_mode().map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
@@ -501,12 +512,30 @@ pub async fn run(
                                             plugins::actions::apply_refresh_marketplace(state, name).await;
                                         }
                                         PO::RemoveMarketplace(name) => {
-                                            plugins::actions::apply_remove_marketplace(state, name);
+                                            plugins::actions::apply_remove_marketplace(
+                                                state, name, &registry, &config,
+                                            ).await;
                                         }
                                         PO::TogglePlugin { name, enabled } => {
                                             plugins::actions::apply_toggle_plugin(
                                                 state, name, enabled, &registry, &mut config,
                                             );
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::OpenPluginsMarketplace => {
+                                let path = synaps_cli::skills::state::PluginsState::default_path();
+                                match synaps_cli::skills::state::PluginsState::load_from(&path) {
+                                    Ok(file) => {
+                                        app.plugins = Some(plugins::PluginsModalState::new_from_settings(file));
+                                    }
+                                    Err(e) => {
+                                        if let Some(s) = app.settings.as_mut() {
+                                            s.row_error = Some((
+                                                "plugins".to_string(),
+                                                format!("failed to load plugins.json: {}", e),
+                                            ));
                                         }
                                     }
                                 }

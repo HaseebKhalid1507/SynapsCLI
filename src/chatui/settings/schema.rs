@@ -45,7 +45,9 @@ pub(crate) struct SettingDef {
     pub label: &'static str,
     pub category: Category,
     pub editor: EditorKind,
-    // Reserved for settings UI tooltip wiring (TODO).
+    /// Kept on each setting so the settings modal can render an inline
+    /// help line later without reshuffling the schema. Referenced by
+    /// drafts of the per-setting hint UI; retain even while unused.
     #[allow(dead_code)]
     pub help: &'static str,
 }
