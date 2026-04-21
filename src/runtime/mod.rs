@@ -478,6 +478,8 @@ impl Runtime {
         // Opt into the 1M-context beta header only when the user explicitly
         // requested 1M (via context_window setting). Default 200k matches
         // Anthropic's claude-code default and gives smarter inference.
+        let subagent_registry = self.subagent_registry.clone();
+        let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
         };
@@ -487,7 +489,7 @@ impl Runtime {
                 auth, client, model, tools, system_prompt, thinking_budget,
                 messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
                 max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
-                session_manager, options,
+                session_manager, options, subagent_registry, event_queue,
             ).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }

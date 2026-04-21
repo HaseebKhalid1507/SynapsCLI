@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use serde_json::{json, Value};
@@ -32,6 +32,8 @@ impl StreamMethods {
         api_retries: u32,
         session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
         options: super::api::ApiOptions,
+        subagent_registry: Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>>,
+        event_queue: Arc<crate::events::EventQueue>,
     ) -> Result<()> {
         let mut messages = initial_messages;
 
@@ -172,7 +174,7 @@ impl StreamMethods {
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, subagent_registry: None, event_queue: None }) => {
+                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()) }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -230,6 +232,8 @@ impl StreamMethods {
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
                         let session_mgr = session_manager.clone();
+                        let registry_inner = subagent_registry.clone();
+                        let eq_inner = event_queue.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -247,7 +251,7 @@ impl StreamMethods {
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, subagent_registry: None, event_queue: None }) => {
+                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()) }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
