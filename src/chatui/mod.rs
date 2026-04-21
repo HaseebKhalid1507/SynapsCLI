@@ -233,6 +233,7 @@ pub async fn run(
         });
     }
 
+    let mut last_event_trigger = std::time::Instant::now() - std::time::Duration::from_secs(10);
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
@@ -269,8 +270,9 @@ pub async fn run(
                     app.invalidate();
                 }
 
-                // Auto-trigger model turn when idle — only if we actually received events
-                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                // Auto-trigger model turn when idle — cooldown prevents flooding
+                let since_last = last_event_trigger.elapsed().as_secs();
+                if event_received && since_last >= 3 && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
                     if let Some(last) = app.api_messages.last() {
                         if last["role"].as_str() == Some("user") {
                             let ct = CancellationToken::new();
@@ -281,6 +283,7 @@ pub async fn run(
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
+                            last_event_trigger = std::time::Instant::now();
                         }
                     }
                 }
