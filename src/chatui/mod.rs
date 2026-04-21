@@ -228,20 +228,23 @@ pub async fn run(
 
     // ── Event loop ──
     loop {
+        // Drain event queue on every loop iteration — events show up immediately
+        while let Some(event) = runtime.event_queue().pop() {
+            let formatted = synaps_cli::events::format_event_for_agent(&event);
+            app.push_msg(ChatMessage::System(formatted.clone()));
+            app.api_messages.push(serde_json::json!({
+                "role": "user",
+                "content": formatted
+            }));
+            app.invalidate();
+        }
+
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
-            // ── Event queue poll (inbox, etc.) — every 250ms regardless of UI state ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                while let Some(event) = runtime.event_queue().pop() {
-                    let formatted = synaps_cli::events::format_event_for_agent(&event);
-                    app.push_msg(ChatMessage::System(formatted));
-                    app.invalidate();
-                    // TODO: inject into api_messages for the model to see
-                }
-            }
+
             // ── Tick: animations + spinner (~60fps) ──
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 if let Some(ref mut t) = app.logo_build_t {
