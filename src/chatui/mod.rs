@@ -76,7 +76,7 @@ fn apply_setting(
     }
 }
 
-async fn fetch_usage() -> std::result::Result<String, String> {
+async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
     let auth_path = synaps_cli::config::base_dir().join("auth.json");
     let content = std::fs::read_to_string(&auth_path)
         .map_err(|e| format!("Auth read failed: {}", e))?;
@@ -95,7 +95,7 @@ async fn fetch_usage() -> std::result::Result<String, String> {
     let data: serde_json::Value = resp.json().await
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    fn format_block(label: &str, data: &serde_json::Value) -> Option<String> {
+    fn format_block(label: &str, data: &serde_json::Value) -> Option<Vec<String>> {
         let util = data["utilization"].as_f64()?;
         let resets = data["resets_at"].as_str()?;
         let reset_display = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(resets) {
@@ -110,17 +110,19 @@ async fn fetch_usage() -> std::result::Result<String, String> {
         let filled = ((util / 100.0) * 20.0) as usize;
         let empty = 20usize.saturating_sub(filled);
         let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-        Some(format!("{}
-{} {:.0}%
-resets in {}", label, bar, util, reset_display))
+        Some(vec![
+            label.to_string(),
+            format!("{} {:.0}%", bar, util),
+            format!("resets in {}", reset_display),
+        ])
     }
 
-    let mut lines = vec!["⚡ Account Usage".to_string(), String::new()];
-    if let Some(row) = format_block("5-hour window", &data["five_hour"]) { lines.push(row); lines.push(String::new()); }
-    if let Some(row) = format_block("7-day window", &data["seven_day"]) { lines.push(row); lines.push(String::new()); }
-    if let Some(row) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) { lines.push(row); }
+    let mut lines = vec!["⚡ Account Usage".to_string()];
+    if let Some(rows) = format_block("5-hour window", &data["five_hour"]) { lines.extend(rows); lines.push(String::new()); }
+    if let Some(rows) = format_block("7-day window", &data["seven_day"]) { lines.extend(rows); lines.push(String::new()); }
+    if let Some(rows) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) { lines.extend(rows); }
 
-    Ok(lines.join("\n"))
+    Ok(lines)
 }
 
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
@@ -619,7 +621,11 @@ pub async fn run(
                                     CommandAction::Status => {
                                         app.push_msg(ChatMessage::System("Checking usage...".to_string()));
                                         match fetch_usage().await {
-                                            Ok(msg) => app.push_msg(ChatMessage::System(msg)),
+                                            Ok(lines) => {
+                                                for line in lines {
+                                                    app.push_msg(ChatMessage::System(line));
+                                                }
+                                            }
                                             Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
                                         }
                                     }
