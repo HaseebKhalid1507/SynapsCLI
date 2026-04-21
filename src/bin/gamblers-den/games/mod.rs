@@ -1,0 +1,9 @@
+pub mod blackjack;
+pub mod slots;
+pub mod roulette;
+pub mod war;
+pub mod baccarat;
+pub mod video_poker;
+pub mod keno;
+pub mod sicbo;
+pub mod craps;
