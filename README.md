@@ -28,17 +28,23 @@ Chat, orchestrate a crew of named subagents, or leave autonomous workers running
 ## Quick Start
 
 ```bash
+cargo install synaps-cli
+synaps login              # OAuth (Claude Pro/Max/Team)
+synaps                    # Launch TUI
+```
+
+Or build from source:
+```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
 cargo build --release
-./target/release/synaps login              # OAuth (Claude Pro/Max/Team)
-./target/release/synaps                    # Launch TUI
+./target/release/synaps
 ```
 
 Or use an API key instead of OAuth:
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-./target/release/synaps
+synaps
 ```
 
 `/help` for commands. `/theme` to browse the candy store.

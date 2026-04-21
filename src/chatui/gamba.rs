@@ -1,9 +1,18 @@
 //! GamblersDen integration — casino subprocess spawning and terminal handoff.
 use super::app::App;
 
-/// Find the GamblersDen binary: check $PATH first, then the dev build path.
+/// Find the GamblersDen binary: check sibling to current exe, then $PATH, then dev path.
 fn which_gamba() -> Option<std::path::PathBuf> {
-    // 1. Check $PATH (works if user installed to /usr/local/bin, ~/.cargo/bin, etc.)
+    // 1. Check next to our own binary (bundled build)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("gamblers-den");
+            if sibling.exists() {
+                return Some(sibling);
+            }
+        }
+    }
+    // 2. Check $PATH
     if let Ok(output) = std::process::Command::new("which")
         .arg("gamblers-den")
         .output()
@@ -15,7 +24,7 @@ fn which_gamba() -> Option<std::path::PathBuf> {
             }
         }
     }
-    // 2. Fallback: dev build path
+    // 3. Fallback: dev build path
     std::env::var("HOME").ok()
         .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/gamblers-den"))
         .filter(|p| p.exists())
@@ -37,7 +46,7 @@ impl App {
             return Err("🎰 Casino already running!".to_string());
         }
         let bin = which_gamba().ok_or_else(|| {
-            "GamblersDen binary not found. Install it to $PATH or ~/Projects/GamblersDen/target/release/".to_string()
+            "🎰 Nothing to see here...".to_string()
         })?;
 
         // Tear down our TUI
