@@ -42,6 +42,8 @@ pub struct Runtime {
     compaction_model: Option<String>,
     /// Shared registry for reactive subagent handles.
     subagent_registry: Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>>,
+    /// Shared event queue — for Event Bus tooling.
+    event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -93,6 +95,7 @@ impl Runtime {
             context_window_override: None,
             compaction_model: None,
             subagent_registry: Arc::new(Mutex::new(crate::tools::subagent_handle::SubagentRegistry::new())),
+            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -119,6 +122,10 @@ impl Runtime {
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
         self.tools = Arc::new(RwLock::new(tools));
+    }
+
+    pub fn event_queue(&self) -> &Arc<crate::events::EventQueue> {
+        &self.event_queue
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -321,7 +328,8 @@ impl Runtime {
                                     bash_timeout: self.bash_timeout,
                                     bash_max_timeout: self.bash_max_timeout,
                                     subagent_timeout: self.subagent_timeout,
-                                subagent_registry: Some(self.subagent_registry.clone()), };
+                                subagent_registry: Some(self.subagent_registry.clone()),
+                                event_queue: Some(self.event_queue.clone()), };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -346,6 +354,7 @@ impl Runtime {
                     let cfg_subagent_timeout = self.subagent_timeout;
                     let session_mgr = self.session_manager.clone();
                     let cfg_subagent_registry = self.subagent_registry.clone();
+                    let cfg_event_queue = self.event_queue.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -357,6 +366,7 @@ impl Runtime {
                             let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
                             let registry_inner = cfg_subagent_registry.clone();
+                            let event_queue_inner = cfg_event_queue.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -371,7 +381,8 @@ impl Runtime {
                                             bash_timeout: cfg_bash_timeout,
                                             bash_max_timeout: cfg_bash_max_timeout,
                                             subagent_timeout: cfg_subagent_timeout,
-                                        subagent_registry: Some(registry_inner), };
+                                        subagent_registry: Some(registry_inner),
+                                        event_queue: Some(event_queue_inner), };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -499,6 +510,7 @@ impl Clone for Runtime {
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
             subagent_registry: self.subagent_registry.clone(),
+            event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,

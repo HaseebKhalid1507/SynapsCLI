@@ -92,6 +92,7 @@ mod tests {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             subagent_registry: None,
+            event_queue: None,
         }
     }
 

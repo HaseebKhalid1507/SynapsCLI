@@ -28,6 +28,8 @@ pub mod subagent_status;
 pub mod subagent_steer;
 pub mod subagent_collect;
 pub mod subagent_resume;
+pub mod respond;
+pub mod send_channel;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,8 @@ pub use subagent_status::SubagentStatusTool;
 pub use subagent_steer::SubagentSteerTool;
 pub use subagent_collect::SubagentCollectTool;
 pub use subagent_resume::SubagentResumeTool;
+pub use respond::RespondTool;
+pub use send_channel::SendChannelTool;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -68,6 +72,9 @@ pub struct ToolContext {
     /// read by SubagentStatusTool, and mutated by SubagentSteerTool / SubagentCollectTool.
     /// `None` in contexts that don't support reactive subagents (e.g. subagent runtimes).
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
+    /// Event queue for tools that need to interact with the event bus.
+    /// `None` in contexts without an event bus (e.g. subagent runtimes, tests).
+    pub event_queue: Option<Arc<crate::events::EventQueue>>,
     // Configuration parameters
     pub max_tool_output: usize,
     pub bash_timeout: u64,

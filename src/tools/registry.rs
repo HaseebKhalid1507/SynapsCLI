@@ -38,6 +38,8 @@ impl ToolRegistry {
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
+            Arc::new(crate::tools::respond::RespondTool),
+            Arc::new(crate::tools::send_channel::SendChannelTool),
         ];
         Self::from_tools(tools)
     }
