@@ -45,6 +45,10 @@ impl Theme {
             subagent_status: Color::Rgb(160, 120, 200),
             subagent_done: Color::Rgb(0, 240, 255),
             subagent_time: Color::Rgb(106, 90, 122),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -91,6 +95,10 @@ impl Theme {
             subagent_status: Color::Rgb(160, 140, 90),
             subagent_done: Color::Rgb(200, 170, 50),
             subagent_time: Color::Rgb(120, 100, 60),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -137,6 +145,10 @@ impl Theme {
             subagent_status: Color::Rgb(40, 160, 60),
             subagent_done: Color::Rgb(80, 255, 120),
             subagent_time: Color::Rgb(30, 100, 50),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -183,6 +195,10 @@ impl Theme {
             subagent_status: Color::Rgb(88, 110, 117),
             subagent_done: Color::Rgb(42, 161, 152),
             subagent_time: Color::Rgb(88, 110, 117),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -229,6 +245,10 @@ impl Theme {
             subagent_status: Color::Rgb(160, 80, 80),
             subagent_done: Color::Rgb(200, 80, 60),
             subagent_time: Color::Rgb(100, 50, 50),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -275,6 +295,10 @@ impl Theme {
             subagent_status: Color::Rgb(100, 149, 237),
             subagent_done: Color::Rgb(64, 224, 208),
             subagent_time: Color::Rgb(72, 118, 155),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -321,6 +345,10 @@ impl Theme {
             subagent_status: Color::Rgb(196, 167, 231),
             subagent_done: Color::Rgb(234, 154, 151),
             subagent_time: Color::Rgb(144, 122, 169),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -367,6 +395,10 @@ impl Theme {
             subagent_status: Color::Rgb(180, 142, 173),
             subagent_done: Color::Rgb(136, 192, 208),
             subagent_time: Color::Rgb(94, 129, 172),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -413,6 +445,10 @@ impl Theme {
             subagent_status: Color::Rgb(255, 121, 198),
             subagent_done: Color::Rgb(139, 233, 253),
             subagent_time: Color::Rgb(98, 114, 164),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -459,6 +495,10 @@ impl Theme {
             subagent_status: Color::Rgb(174, 129, 255),
             subagent_done: Color::Rgb(166, 226, 46),
             subagent_time: Color::Rgb(117, 113, 94),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -505,6 +545,10 @@ impl Theme {
             subagent_status: Color::Rgb(177, 98, 134),
             subagent_done: Color::Rgb(184, 187, 38),
             subagent_time: Color::Rgb(146, 131, 116),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -551,6 +595,10 @@ impl Theme {
             subagent_status: Color::Rgb(180, 190, 254),
             subagent_done: Color::Rgb(166, 227, 161),
             subagent_time: Color::Rgb(108, 112, 134),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -597,6 +645,10 @@ impl Theme {
             subagent_status: Color::Rgb(122, 162, 247),
             subagent_done: Color::Rgb(158, 206, 106),
             subagent_time: Color::Rgb(86, 95, 137),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -643,6 +695,10 @@ impl Theme {
             subagent_status: Color::Rgb(220, 130, 90),
             subagent_done: Color::Rgb(255, 160, 110),
             subagent_time: Color::Rgb(180, 90, 60),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -689,6 +745,10 @@ impl Theme {
             subagent_status: Color::Rgb(150, 190, 230),
             subagent_done: Color::Rgb(180, 220, 255),
             subagent_time: Color::Rgb(120, 160, 200),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -735,6 +795,10 @@ impl Theme {
             subagent_status: Color::Rgb(110, 160, 90),
             subagent_done: Color::Rgb(130, 190, 110),
             subagent_time: Color::Rgb(90, 130, 70),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 
@@ -781,6 +845,10 @@ impl Theme {
             subagent_status: Color::Rgb(155, 110, 240),
             subagent_done: Color::Rgb(160, 220, 200),
             subagent_time: Color::Rgb(120, 85, 190),
+            event_icon: Color::Rgb(255, 180, 50),
+            event_source: Color::Rgb(120, 180, 255),
+            event_text: Color::Rgb(200, 200, 210),
+            event_critical: Color::Rgb(255, 80, 80),
         }
     }
 }

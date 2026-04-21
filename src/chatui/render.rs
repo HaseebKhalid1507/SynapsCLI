@@ -516,6 +516,22 @@ impl App {
                         Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM),
                     )));
                 }
+
+                ChatMessage::Event { source, severity, text } => {
+                    let theme = THEME.load();
+                    let (icon, sev_color) = match severity.as_str() {
+                        "critical" => ("🔴", theme.event_critical),
+                        "high"     => ("🟠", theme.event_icon),
+                        "medium"   => ("🟡", theme.event_icon),
+                        "low"      => ("🔵", theme.event_source),
+                        _          => ("📨", theme.event_icon),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}  {} ", m, icon), Style::default().fg(sev_color)),
+                        Span::styled(format!("[{}] ", source), Style::default().fg(theme.event_source).add_modifier(Modifier::BOLD)),
+                        Span::styled(text.clone(), Style::default().fg(theme.event_text)),
+                    ]));
+                }
             }
         }
 

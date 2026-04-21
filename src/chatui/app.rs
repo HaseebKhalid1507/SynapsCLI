@@ -14,6 +14,7 @@ pub(crate) enum ChatMessage {
     ToolResult { content: String, elapsed_ms: Option<u64> },
     Error(String),
     System(String),
+    Event { source: String, severity: String, text: String },
 }
 
 pub(crate) struct TimestampedMsg {

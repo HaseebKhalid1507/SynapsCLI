@@ -232,7 +232,15 @@ pub async fn run(
         let mut event_received = false;
         while let Some(event) = runtime.event_queue().pop() {
             let formatted = synaps_cli::events::format_event_for_agent(&event);
-            app.push_msg(ChatMessage::System(formatted.clone()));
+            let severity_str = event.content.severity
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "medium".to_string());
+            app.push_msg(ChatMessage::Event {
+                source: event.source.source_type.clone(),
+                severity: severity_str,
+                text: event.content.text.clone(),
+            });
 
             if app.streaming {
                 // Steer the event into the active stream so the model sees it NOW
