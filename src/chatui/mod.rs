@@ -229,6 +229,7 @@ pub async fn run(
     // ── Event loop ──
     loop {
         // Drain event queue on every loop iteration — events show up immediately
+        let mut event_received = false;
         while let Some(event) = runtime.event_queue().pop() {
             let formatted = synaps_cli::events::format_event_for_agent(&event);
             app.push_msg(ChatMessage::System(formatted.clone()));
@@ -237,6 +238,19 @@ pub async fn run(
                 "content": formatted
             }));
             app.invalidate();
+            event_received = true;
+        }
+
+        // Auto-trigger model turn when events arrive and agent is idle
+        if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() {
+            let ct = CancellationToken::new();
+            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            app.streaming = true;
+            app.spinner_frame = 0;
+            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+            app.push_msg(ChatMessage::Thinking("…".to_string()));
+            cancel_token = Some(ct);
+            steer_tx = Some(s_tx);
         }
 
         let elapsed = last_frame.elapsed();
