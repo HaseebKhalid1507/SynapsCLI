@@ -388,19 +388,30 @@ pub async fn run(
 
                                             match summary_result {
                                                 Ok(summary) => {
-                                                    let summary_msg = format!(
-                                                        "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary above contains all the context you need from our previous conversation.",
-                                                        summary
-                                                    );
-                                                    app.api_messages = vec![
-                                                        json!({"role": "user", "content": summary_msg}),
-                                                        json!({"role": "assistant", "content": "Understood. I've reviewed the conversation summary and I'm ready to continue from where we left off. What would you like to work on next?"}),
-                                                    ];
-                                                    app.push_msg(ChatMessage::System(format!(
-                                                        "✓ compacted {} messages → summary ({} chars)",
-                                                        msg_count, summary.len()
-                                                    )));
+                                                    let old_id = app.session.id.clone();
+
+                                                    // Create new linked session
+                                                    let new_session = Session::new_from_compaction(&app.session, summary.clone());
+                                                    let new_id = new_session.id.clone();
+
+                                                    // Mark old session as compacted
+                                                    app.session.compacted_into = Some(new_id.clone());
+                                                    app.session.save().await.ok();
+
+                                                    // Swap to new session
+                                                    app.session = new_session;
+                                                    app.api_messages = app.session.api_messages.clone();
+                                                    app.total_input_tokens = 0;
+                                                    app.total_output_tokens = 0;
+                                                    app.session_cost = 0.0;
+                                                    let msgs = app.api_messages.clone();
+                                                    rebuild_display_messages(&msgs, &mut app);
                                                     app.save_session().await;
+
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "✓ compacted {} messages → new session {} (from {})",
+                                                        msg_count, new_id, old_id
+                                                    )));
                                                 }
                                                 Err(e) => {
                                                     app.push_msg(ChatMessage::Error(format!(
