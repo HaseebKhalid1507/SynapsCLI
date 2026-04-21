@@ -93,7 +93,7 @@ impl Tool for SubagentStartTool {
         let conversation_state = Arc::new(Mutex::new(Vec::<Value>::new()));
 
         // ── Channels ───────────────────────────────────────────────────────────
-        let (_steer_tx, _steer_rx) = mpsc::unbounded_channel::<String>();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
 
@@ -157,7 +157,7 @@ impl Tool for SubagentStartTool {
                         cancel_inner.cancel();
                     });
 
-                    let mut stream = runtime.run_stream(task, cancel).await;
+                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx)).await;
 
                     let mut tool_count = 0u32;
                     let mut total_input_tokens = 0u64;
@@ -346,7 +346,7 @@ impl Tool for SubagentStartTool {
             partial_text,
             tool_log,
             conversation_state,
-            Some(_steer_tx),
+            Some(steer_tx),
             Some(shutdown_tx),
             Some(result_rx),
         );
