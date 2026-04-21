@@ -9,6 +9,16 @@ use super::types::Event;
 use notify::Watcher;
 
 async fn process_file(path: &Path, queue: &EventQueue) {
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
+            if meta.file_type().is_symlink() {
+                tracing::warn!("refusing symlink in inbox: {}", path.display());
+                let _ = tokio::fs::remove_file(path).await;
+                return;
+            }
+        }
+    }
     if path.extension().is_some_and(|e| e == "json") {
         match tokio::fs::read_to_string(path).await {
             Ok(content) => match serde_json::from_str::<Event>(&content) {
@@ -39,6 +49,15 @@ async fn scan_inbox(dir: &Path, queue: &EventQueue) {
 
 pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = tokio::fs::metadata(&inbox_dir).await {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = tokio::fs::set_permissions(&inbox_dir, perms).await;
+        }
+    }
     scan_inbox(&inbox_dir, &queue).await;
 
     // Use a tokio channel so the async runtime isn't blocked

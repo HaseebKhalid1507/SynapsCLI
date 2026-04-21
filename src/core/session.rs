@@ -86,7 +86,10 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
-            api_messages: vec![serde_json::json!({"role": "user", "content": summary_parts})],
+            api_messages: vec![
+                serde_json::json!({"role": "user", "content": summary_parts}),
+                serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
+            ],
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,

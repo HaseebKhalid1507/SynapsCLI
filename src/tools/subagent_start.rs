@@ -23,8 +23,8 @@ impl Tool for SubagentStartTool {
     fn description(&self) -> &str {
         "Dispatch a reactive subagent and return immediately with a handle_id. \
          The subagent runs in the background — use subagent_status to poll, \
-         subagent_steer to inject guidance mid-run, and subagent_collect to \
-         block until it finishes. Use this for parallel execution or when you \
+         subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call \
+         repeatedly until done). Use this for parallel execution or when you \
          want to continue working while the subagent runs. For simple sequential \
          delegation, use subagent instead. Provide either an agent name (resolves \
          from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."

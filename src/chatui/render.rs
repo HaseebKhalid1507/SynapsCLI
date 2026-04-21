@@ -553,6 +553,7 @@ impl App {
                     }
                     // Bottom padding
                     lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                    lines.push(Line::from(""));
                 }
             }
         }

@@ -34,8 +34,10 @@ pub async fn run(
     let inbox_dir = synaps_cli::config::base_dir().join("inbox");
     std::fs::create_dir_all(&inbox_dir)?;
     let filename = format!("{}-{}.json", Utc::now().timestamp_nanos_opt().unwrap_or(0), Uuid::new_v4().simple());
-    let path = inbox_dir.join(filename);
-    std::fs::write(&path, serde_json::to_string_pretty(&event)?)?;
+    let path = inbox_dir.join(&filename);
+    let tmp_path = inbox_dir.join(format!(".tmp-{}", filename));
+    std::fs::write(&tmp_path, serde_json::to_string_pretty(&event)?)?;
+    std::fs::rename(&tmp_path, &path)?;
     eprintln!("Event sent to inbox: {}", path.display());
     Ok(())
 }

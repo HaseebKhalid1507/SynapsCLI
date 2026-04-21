@@ -156,6 +156,10 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Done => {
             app.streaming = false;
             app.subagents.clear();
+            // Clean up finished reactive subagent handles
+            if let Some(registry) = runtime.subagent_registry().lock().ok().as_mut() {
+                registry.cleanup_finished();
+            }
 
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();
