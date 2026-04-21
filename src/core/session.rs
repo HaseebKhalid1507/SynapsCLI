@@ -67,10 +67,14 @@ impl Session {
     pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
         let now = Utc::now();
         let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().to_string()[..4]);
-        let summary_msg = format!(
-            "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary above contains all the context you need from our previous conversation.",
+        let mut summary_parts = String::new();
+        if let Some(ref sp) = parent.system_prompt {
+            summary_parts.push_str(&format!("<system-prompt>\n{}\n</system-prompt>\n\n", sp));
+        }
+        summary_parts.push_str(&format!(
+            "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary and system prompt above contain all the context you need.",
             summary
-        );
+        ));
         Session {
             id,
             title: format!("↳ {}", if parent.title.is_empty() { &parent.id } else { &parent.title }),
@@ -82,7 +86,7 @@ impl Session {
             total_input_tokens: 0,
             total_output_tokens: 0,
             session_cost: 0.0,
-            api_messages: vec![serde_json::json!({"role": "user", "content": summary_msg})],
+            api_messages: vec![serde_json::json!({"role": "user", "content": summary_parts})],
             abort_context: None,
             parent_session: Some(parent.id.clone()),
             compacted_into: None,
