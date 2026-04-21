@@ -422,6 +422,53 @@ pub async fn run(
                                             app.status_text = None;
                                         }
                                     }
+                                    CommandAction::Chain => {
+                                        // Walk the parent_session chain backward from current session
+                                        let mut chain: Vec<(String, String, usize)> = Vec::new(); // (id, title, msg_count)
+
+                                        // Current session first
+                                        chain.push((
+                                            app.session.id.clone(),
+                                            if app.session.title.is_empty() { "(untitled)".to_string() } else { app.session.title.clone() },
+                                            app.api_messages.len(),
+                                        ));
+
+                                        // Walk backward through parents
+                                        let mut current_parent = app.session.parent_session.clone();
+                                        while let Some(ref parent_id) = current_parent {
+                                            match synaps_cli::core::session::Session::load(parent_id) {
+                                                Ok(parent) => {
+                                                    let title = if parent.title.is_empty() { "(untitled)".to_string() } else { parent.title.clone() };
+                                                    let msg_count = parent.api_messages.len();
+                                                    chain.push((parent.id.clone(), title, msg_count));
+                                                    current_parent = parent.parent_session.clone();
+                                                }
+                                                Err(_) => {
+                                                    chain.push((parent_id.clone(), "(not found)".to_string(), 0));
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // Reverse so root is first
+                                        chain.reverse();
+
+                                        if chain.len() <= 1 {
+                                            app.push_msg(ChatMessage::System("no compaction history — this is the root session".to_string()));
+                                        } else {
+                                            let mut lines = vec!["Session chain:".to_string()];
+                                            for (i, (id, title, msgs)) in chain.iter().enumerate() {
+                                                let marker = if i == chain.len() - 1 { " ← active" } else { "" };
+                                                let short_id: String = id.chars().take(19).collect();
+                                                let short_title: String = title.chars().take(40).collect();
+                                                lines.push(format!("  {} {} ({} msgs) {}{}",
+                                                    if i == 0 { "●" } else { "→" },
+                                                    short_id, msgs, short_title, marker
+                                                ));
+                                            }
+                                            app.push_msg(ChatMessage::System(lines.join("\n")));
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -523,6 +570,7 @@ pub async fn run(
                                         // handle_streaming_command never returns LoadSkill or Compact.
                                         CommandAction::LoadSkill { .. } => {}
                                         CommandAction::Compact { .. } => {}
+                                        CommandAction::Chain => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue

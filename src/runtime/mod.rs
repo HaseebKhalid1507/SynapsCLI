@@ -37,6 +37,8 @@ pub struct Runtime {
     /// `models::context_window_for_model`. Lets users cap context at e.g.
     /// 200k even on models that natively support 1M.
     context_window_override: Option<u64>,
+    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    compaction_model: Option<String>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -86,6 +88,7 @@ impl Runtime {
             system_prompt: None,
             thinking_budget: 4096,
             context_window_override: None,
+            compaction_model: None,
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -127,12 +130,20 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    pub fn set_compaction_model(&mut self, model: Option<String>) {
+        self.compaction_model = model;
+    }
+
     pub fn set_context_window(&mut self, window: Option<u64>) {
         self.context_window_override = window;
     }
 
     /// Effective context window for the current model — user override if set,
     /// otherwise the model's native window from `models::context_window_for_model`.
+    pub fn compaction_model(&self) -> &str {
+        self.compaction_model.as_deref().unwrap_or("claude-sonnet-4-6")
+    }
+
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
@@ -147,6 +158,7 @@ impl Runtime {
             self.set_thinking_budget(budget);
         }
         self.context_window_override = config.context_window;
+        self.compaction_model = config.compaction_model.clone();
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -220,7 +232,7 @@ impl Runtime {
         ApiMethods::call_api_simple(
             &self.auth,
             &self.client,
-            &self.model,
+            self.compaction_model(),
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
             &messages,
@@ -479,6 +491,7 @@ impl Clone for Runtime {
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
             context_window_override: self.context_window_override,
+            compaction_model: self.compaction_model.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,
