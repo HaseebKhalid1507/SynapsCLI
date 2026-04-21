@@ -194,12 +194,28 @@ fn refresh_selected_marketplace(state: &mut PluginsModalState) -> InputOutcome {
 }
 
 fn ask_remove_marketplace(state: &mut PluginsModalState) -> InputOutcome {
-    if let Some(LeftRow::Marketplace(n)) = state.left_rows().get(state.selected_left) {
-        state.mode = RightMode::Confirm {
-            prompt: format!("Remove marketplace '{}'? y/n", n),
-            on_yes: crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(n.clone()),
-        };
-    }
+    let name = match state.left_rows().get(state.selected_left) {
+        Some(LeftRow::Marketplace(n)) => n.clone(),
+        _ => return InputOutcome::None,
+    };
+    let cascade = state
+        .file
+        .installed
+        .iter()
+        .filter(|p| p.marketplace.as_deref() == Some(name.as_str()))
+        .count();
+    let prompt = if cascade > 0 {
+        format!(
+            "Remove marketplace '{}' and uninstall {} plugin(s) from it? y/n",
+            name, cascade
+        )
+    } else {
+        format!("Remove marketplace '{}'? y/n", name)
+    };
+    state.mode = RightMode::Confirm {
+        prompt,
+        on_yes: crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(name),
+    };
     InputOutcome::None
 }
 
@@ -294,5 +310,39 @@ mod tests {
         s.mode = RightMode::Detail { row_idx: 0 };
         handle_event(&mut s, key(KeyCode::Esc));
         assert!(matches!(s.mode, RightMode::List));
+    }
+
+    #[test]
+    fn capital_r_on_marketplace_warns_about_cascade_uninstall() {
+        use synaps_cli::skills::state::{Marketplace, InstalledPlugin};
+        let mut file = PluginsState::default();
+        file.marketplaces.push(Marketplace {
+            name: "mp".into(),
+            url: "https://example/mp".into(),
+            description: None,
+            last_refreshed: None,
+            cached_plugins: vec![],
+            repo_url: None,
+        });
+        for plugin in ["a", "b"] {
+            file.installed.push(InstalledPlugin {
+                name: plugin.into(),
+                marketplace: Some("mp".into()),
+                source_url: "https://github.com/u/r".into(),
+                installed_commit: "abc".into(),
+                latest_commit: None,
+                installed_at: "now".into(),
+                source_subdir: None,
+            });
+        }
+        let mut s = crate::chatui::plugins::PluginsModalState::new(file);
+        s.selected_left = 1; // first marketplace row
+        handle_event(&mut s, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        match &s.mode {
+            RightMode::Confirm { prompt, .. } => {
+                assert!(prompt.contains("2 plugin"));
+            }
+            other => panic!("expected Confirm, got {:?}", other),
+        }
     }
 }

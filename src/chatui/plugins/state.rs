@@ -17,6 +17,7 @@ pub enum RightRow<'a> {
 
 pub enum Focus { Left, Right }
 
+#[derive(Debug)]
 pub enum RightMode {
     List,
     Detail { row_idx: usize },
@@ -25,6 +26,7 @@ pub enum RightMode {
     Confirm { prompt: String, on_yes: ConfirmAction },
 }
 
+#[derive(Debug)]
 pub enum ConfirmAction {
     Uninstall(String),       // plugin name
     RemoveMarketplace(String),
@@ -49,6 +51,25 @@ impl PluginsModalState {
             mode: RightMode::List,
             row_error: None,
         }
+    }
+
+    /// Build a PluginsModalState from persisted file state, pre-positioning the
+    /// cursor based on whether any marketplaces exist. Mirrors the landing
+    /// behavior wanted when the nested overlay is opened from /settings.
+    ///
+    /// - With marketplaces: land on the first marketplace row (index 1) and
+    ///   focus the right pane so the user immediately sees its cached plugins.
+    /// - Without marketplaces: rows are `[Installed, AddMarketplace]`, so land
+    ///   on the `AddMarketplace` row (index 1) with default (Left) focus so
+    ///   Enter opens the add-marketplace editor.
+    pub(crate) fn new_from_settings(file: PluginsState) -> Self {
+        let has_marketplaces = !file.marketplaces.is_empty();
+        let mut st = Self::new(file);
+        st.selected_left = 1;
+        if has_marketplaces {
+            st.focus = Focus::Right;
+        }
+        st
     }
 
     pub fn left_rows(&self) -> Vec<LeftRow> {
@@ -117,6 +138,7 @@ mod tests {
                             description: None,
                         },
                     ],
+                    repo_url: None,
                 },
             ],
             installed: vec![
@@ -127,6 +149,7 @@ mod tests {
                     installed_commit: "aaa".into(),
                     latest_commit: Some("aaa".into()),
                     installed_at: "now".into(),
+                    source_subdir: None,
                 },
             ],
             trusted_hosts: vec![],
@@ -175,5 +198,32 @@ mod tests {
         let last = s.left_rows().len() - 1;
         for _ in 0..100 { s.move_left_down(); }
         assert_eq!(s.selected_left, last);
+    }
+
+    #[test]
+    fn new_from_settings_with_marketplaces_focuses_right_and_selects_first() {
+        let file = PluginsState {
+            marketplaces: vec![Marketplace {
+                name: "pi".into(),
+                url: "https://github.com/m/pi".into(),
+                description: None,
+                last_refreshed: None,
+                cached_plugins: vec![],
+                repo_url: None,
+            }],
+            installed: vec![],
+            trusted_hosts: vec![],
+        };
+        let st = PluginsModalState::new_from_settings(file);
+        assert_eq!(st.selected_left, 1);
+        assert!(matches!(st.focus, Focus::Right));
+    }
+
+    #[test]
+    fn new_from_settings_without_marketplaces_stays_on_add_row() {
+        let file = PluginsState::default();
+        let st = PluginsModalState::new_from_settings(file);
+        // Rows are [Installed, AddMarketplace]; index 1 is the AddMarketplace row.
+        assert_eq!(st.selected_left, 1);
     }
 }

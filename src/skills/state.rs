@@ -23,6 +23,10 @@ pub struct Marketplace {
     pub last_refreshed: Option<String>,
     #[serde(default)]
     pub cached_plugins: Vec<CachedPlugin>,
+    /// Git clone URL for the marketplace repo. Set when the marketplace
+    /// hosts Claude-Code-style plugins whose `source` is `./<subdir>`.
+    #[serde(default)]
+    pub repo_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +49,11 @@ pub struct InstalledPlugin {
     #[serde(default)]
     pub latest_commit: Option<String>,
     pub installed_at: String,
+    /// When the plugin was installed from a subdir of a marketplace repo
+    /// (Claude-Code-style layout), this is the subdir name. `source_url`
+    /// then refers to the marketplace repo, not a standalone plugin repo.
+    #[serde(default)]
+    pub source_subdir: Option<String>,
 }
 
 impl PluginsState {
@@ -93,6 +102,7 @@ mod tests {
                     version: Some("1.0".into()),
                     description: Some("Web tools".into()),
                 }],
+                repo_url: Some("https://github.com/maha-media/pi-skills.git".into()),
             }],
             installed: vec![InstalledPlugin {
                 name: "web".into(),
@@ -101,6 +111,7 @@ mod tests {
                 installed_commit: "abc123".into(),
                 latest_commit: Some("abc123".into()),
                 installed_at: "2026-04-18T12:01:00Z".into(),
+                source_subdir: None,
             }],
             trusted_hosts: vec!["github.com/maha-media".into()],
         };

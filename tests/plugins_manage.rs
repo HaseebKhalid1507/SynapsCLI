@@ -78,6 +78,7 @@ async fn end_to_end_add_install_uninstall() {
             version: None,
             description: None,
         }).collect(),
+        repo_url: None,
     });
 
     // Step 2: install.
@@ -91,6 +92,7 @@ async fn end_to_end_add_install_uninstall() {
         installed_commit: sha,
         latest_commit: None,
         installed_at: "now".into(),
+        source_subdir: None,
     });
 
     let state_path = tmp.path().join("plugins.json");
