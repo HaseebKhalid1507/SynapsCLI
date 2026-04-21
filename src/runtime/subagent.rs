@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use serde_json::Value;
 
@@ -28,7 +28,7 @@ pub enum SubagentStatus {
 // ── SubagentState ────────────────────────────────────────────────────────────────
 
 /// All mutable state shared between the subagent thread and its handle.
-/// Collapsed behind a single Mutex so a status poll takes exactly one lock.
+/// Collapsed behind a single RwLock so a status poll takes exactly one lock.
 pub struct SubagentState {
     pub status: SubagentStatus,
     pub partial_text: String,
@@ -62,7 +62,7 @@ pub struct SubagentHandle {
     pub timeout_secs: u64,
 
     // Shared state updated by the subagent thread — one lock for everything.
-    state: Arc<Mutex<SubagentState>>,
+    state: Arc<RwLock<SubagentState>>,
 
     // Channels
     steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -81,7 +81,7 @@ impl SubagentHandle {
         task_preview: String,
         model: String,
         timeout_secs: u64,
-        state: Arc<Mutex<SubagentState>>,
+        state: Arc<RwLock<SubagentState>>,
         steer_tx: Option<mpsc::UnboundedSender<String>>,
         shutdown_tx: Option<oneshot::Sender<()>>,
         result_rx: Option<oneshot::Receiver<SubagentResult>>,
@@ -102,22 +102,22 @@ impl SubagentHandle {
 
     /// Current status snapshot.
     pub fn status(&self) -> SubagentStatus {
-        self.state.lock().unwrap().status.clone()
+        self.state.read().unwrap().status.clone()
     }
 
     /// Partial output accumulated so far.
     pub fn partial_output(&self) -> String {
-        self.state.lock().unwrap().partial_text.clone()
+        self.state.read().unwrap().partial_text.clone()
     }
 
     /// Snapshot of the tool log.
     pub fn tool_log(&self) -> Vec<String> {
-        self.state.lock().unwrap().tool_log.clone()
+        self.state.read().unwrap().tool_log.clone()
     }
 
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
-        self.state.lock().unwrap().conversation_state.clone()
+        self.state.read().unwrap().conversation_state.clone()
     }
 
     /// Seconds since this handle was created.

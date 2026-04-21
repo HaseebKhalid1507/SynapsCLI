@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -88,7 +88,7 @@ impl Tool for SubagentStartTool {
         tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
 
         // ── Shared state ───────────────────────────────────────────────────────
-        let state = Arc::new(Mutex::new(SubagentState::new()));
+        let state = Arc::new(RwLock::new(SubagentState::new()));
 
         // ── Channels ───────────────────────────────────────────────────────────
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
@@ -121,7 +121,7 @@ impl Tool for SubagentStartTool {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        state_t.lock().unwrap().status =
+                        state_t.write().unwrap().status =
                             SubagentStatus::Failed(format!("tokio runtime: {}", e));
                         return;
                     }
@@ -180,7 +180,7 @@ impl Tool for SubagentStartTool {
                                         }
                                     }
                                     crate::StreamEvent::Text(text) => {
-                                        state_a.lock().unwrap().partial_text.push_str(&text);
+                                        state_a.write().unwrap().partial_text.push_str(&text);
                                     }
                                     crate::StreamEvent::ToolUseStart(name) => {
                                         tool_count += 1;
@@ -195,7 +195,7 @@ impl Tool for SubagentStartTool {
                                     crate::StreamEvent::ToolUse { tool_name, input, .. } => {
                                         let input_str = input.to_string();
                                         let input_preview: String = input_str.chars().take(200).collect();
-                                        state_a.lock().unwrap().tool_log
+                                        state_a.write().unwrap().tool_log
                                             .push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                                         let detail = match tool_name.as_str() {
                                             "bash" => {
@@ -227,7 +227,7 @@ impl Tool for SubagentStartTool {
                                     }
                                     crate::StreamEvent::ToolResult { result, .. } => {
                                         let preview: String = result.chars().take(300).collect();
-                                        state_a.lock().unwrap().tool_log
+                                        state_a.write().unwrap().tool_log
                                             .push(format!("[tool_result]: {}", preview));
                                     }
                                     crate::StreamEvent::Usage {
@@ -247,7 +247,7 @@ impl Tool for SubagentStartTool {
                             }
                             _ = &mut timeout_fut => {
                                 let (partial, log) = {
-                                    let mut s = state_a.lock().unwrap();
+                                    let mut s = state_a.write().unwrap();
                                     s.status = SubagentStatus::TimedOut;
                                     s.conversation_state = vec![
                                         serde_json::json!({"role": "user", "content": task_for_timeout.clone()}),
@@ -278,7 +278,7 @@ impl Tool for SubagentStartTool {
                     }
 
                     Ok(SubagentResult {
-                        text: state_a.lock().unwrap().partial_text.clone(),
+                        text: state_a.write().unwrap().partial_text.clone(),
                         model: model_a.clone(),
                         input_tokens: total_input_tokens,
                         output_tokens: total_output_tokens,
@@ -292,7 +292,7 @@ impl Tool for SubagentStartTool {
                     Ok(sa_result) => {
                         // Only overwrite Running → Completed (don't stomp TimedOut).
                         {
-                            let mut s = state_t.lock().unwrap();
+                            let mut s = state_t.write().unwrap();
                             if matches!(s.status, SubagentStatus::Running) {
                                 s.status = SubagentStatus::Completed;
                                 s.conversation_state = vec![
@@ -314,7 +314,7 @@ impl Tool for SubagentStartTool {
                         let _ = result_tx.send(sa_result);
                     }
                     Err(e) => {
-                        state_t.lock().unwrap().status = SubagentStatus::Failed(e.clone());
+                        state_t.write().unwrap().status = SubagentStatus::Failed(e.clone());
                         let elapsed = start_time.elapsed().as_secs_f64();
                         if let Some(ref tx) = tx_events_inner {
                             let _ = tx.send(crate::StreamEvent::SubagentDone {
@@ -338,7 +338,7 @@ impl Tool for SubagentStartTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Subagent thread panicked: {}", msg);
-                state_t.lock().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
         });
 
