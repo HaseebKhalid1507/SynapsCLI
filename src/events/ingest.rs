@@ -26,8 +26,14 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
                                     event.id,
                                     event.source.source_type
                                 );
-                                let _ = queue.push(event);
-                                let _ = tokio::fs::remove_file(&path).await;
+                                match queue.push(event) {
+                                    Ok(()) => {
+                                        let _ = tokio::fs::remove_file(&path).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Event queue full, leaving file for retry: {}", e);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(

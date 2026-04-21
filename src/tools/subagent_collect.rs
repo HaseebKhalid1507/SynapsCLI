@@ -1,15 +1,10 @@
-//! SubagentCollectTool — block until a reactive subagent finishes and return its full result.
+//! SubagentCollectTool — check if a reactive subagent is done and return its result.
 //!
-//! Polls the registry with a short sleep interval until the subagent's status
-//! leaves `Running`, or until an optional additional timeout expires. This is
-//! the natural pair to `subagent_start` — start async, collect when you need
-//! the answer.
+//! Non-blocking — checks the registry once and returns immediately.
+//! If the subagent is still running, returns status + partial output.
+//! If done, returns the full result. The natural pair to `subagent_start` —
+//! start async, check when you want the answer.
 //!
-//! ## Design note on blocking
-//! We use `tokio::time::sleep` between polls rather than a true oneshot channel
-//! because the registry is the authoritative state store. A completion-notify
-//! channel will be added to `SubagentHandle` in a later step, at which point this
-//! tool can switch to `tokio::select!` with zero poll overhead.
 
 use serde_json::{json, Value};
 use crate::{Result, RuntimeError};
@@ -24,10 +19,9 @@ impl Tool for SubagentCollectTool {
     fn name(&self) -> &str { "subagent_collect" }
 
     fn description(&self) -> &str {
-        "Block until a reactive subagent finishes and return its full output. \
-         Optionally supply an additional timeout (seconds) to cap how long to \
-         wait beyond the subagent's own timeout. Use after subagent_start when \
-         you need the complete result before continuing."
+        "Check if a reactive subagent is done and return its result. Non-blocking — \
+         returns immediately. If still running, returns status and partial output. \
+         If finished, returns the full result. Call repeatedly to poll for completion."
     }
 
     fn parameters(&self) -> Value {
