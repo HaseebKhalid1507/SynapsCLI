@@ -67,6 +67,9 @@ pub struct SubagentHandle {
     // Channels
     steer_tx: Option<mpsc::UnboundedSender<String>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// OS thread running the subagent. Stored for graceful shutdown (join).
+    // OS thread handle for graceful shutdown
+    thread_handle: Option<std::thread::JoinHandle<()>>,
 
     // Final result
     result_rx: Option<oneshot::Receiver<SubagentResult>>,
@@ -96,6 +99,7 @@ impl SubagentHandle {
             state,
             steer_tx,
             shutdown_tx,
+            thread_handle: None,
             result_rx,
         }
     }
@@ -136,6 +140,11 @@ impl SubagentHandle {
     }
 
     /// Signal the subagent to shut down.
+    /// Store the OS thread handle for graceful shutdown.
+    pub fn set_thread_handle(&mut self, handle: std::thread::JoinHandle<()>) {
+        self.thread_handle = Some(handle);
+    }
+
     pub fn cancel(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -226,3 +235,4 @@ impl SubagentStatus {
         }
     }
 }
+

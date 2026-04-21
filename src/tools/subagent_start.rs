@@ -113,7 +113,7 @@ impl Tool for SubagentStartTool {
         let start_time       = std::time::Instant::now();
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
-        let _thread_handle = std::thread::spawn(move || {
+        let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -356,7 +356,11 @@ impl Tool for SubagentStartTool {
         );
 
         if let Some(registry) = &ctx.subagent_registry {
-            registry.lock().unwrap().register(handle);
+            let mut reg = registry.lock().unwrap();
+            reg.register(handle);
+            if let Some(h) = reg.get_mut(&handle_id) {
+                h.set_thread_handle(thread_handle);
+            }
         } else {
             return Err(RuntimeError::Tool(
                 "subagent_start requires a subagent_registry in ToolContext".to_string()
