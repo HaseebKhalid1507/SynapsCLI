@@ -3,16 +3,16 @@
 //! Unlike the one-shot `subagent` tool, this tool returns *before* the subagent
 //! finishes. The caller gets a `handle_id` they can poll via `subagent_status`,
 //! steer via `subagent_steer`, or block on via `subagent_collect`.
-//!
-//! ## Spawn logic
-//! The actual spawn logic (thread + runtime creation) will be wired in a separate step
-//! once `SubagentHandle`'s background task interface is finalised. For now this stub
-//! validates parameters, inserts a handle into the registry, and returns the handle_id.
 
 use serde_json::{json, Value};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
-use std::sync::atomic::Ordering;
+use super::subagent_handle::{SubagentHandle, SubagentResult, SubagentStatus};
 
 pub struct SubagentStartTool;
 
@@ -34,13 +34,11 @@ impl Tool for SubagentStartTool {
             "properties": {
                 "agent": {
                     "type": "string",
-                    "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. \
-                                    Mutually exclusive with system_prompt."
+                    "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt."
                 },
                 "system_prompt": {
                     "type": "string",
-                    "description": "Inline system prompt for the subagent. \
-                                    Use when you don't have a named agent file."
+                    "description": "Inline system prompt for the subagent. Use when you don't have a named agent file."
                 },
                 "task": {
                     "type": "string",
@@ -48,13 +46,11 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override (default: claude-opus-4-7). \
-                                    Use claude-sonnet-4-6 for lighter tasks."
+                    "description": "Model override (default: claude-opus-4-7). Use claude-sonnet-4-6 for lighter tasks."
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 300). \
-                                    Increase for long-running tasks."
+                    "description": "Timeout in seconds (default: 300). Increase for long-running tasks."
                 }
             },
             "required": ["task"]
@@ -62,62 +58,306 @@ impl Tool for SubagentStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        // ── Parameter validation (mirrors subagent.rs) ─────────────────────────
-
+        // ── Parse params ───────────────────────────────────────────────────────
         let task = params["task"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
         let agent_name    = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
-        let _model        = params["model"].as_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| crate::models::default_model().to_string());
-        let _timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
+        let model_override = params["model"].as_str().map(|s| s.to_string());
+        let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
 
-        // Resolve agent label — validates agent/system_prompt exclusivity.
-        let label = match (&agent_name, &inline_prompt) {
-            (Some(name), _) => {
-                // Eagerly validate the agent file exists — fail fast before we allocate a handle.
-                resolve_agent_prompt(name).map_err(RuntimeError::Tool)?;
-                name.clone()
-            }
-            (None, Some(_)) => "inline".to_string(),
+        let system_prompt = match (&agent_name, &inline_prompt) {
+            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
+            (None, Some(p)) => p.clone(),
             (None, None) => {
                 return Err(RuntimeError::Tool(
-                    "Must provide either 'agent' (name) or 'system_prompt' (inline). \
-                     Got neither.".to_string()
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
                 ));
             }
         };
 
-        let _task_preview: String = task.chars().take(80).collect();
-        let _subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
+        let label = agent_name.as_deref().unwrap_or("inline").to_string();
+        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
+        let task_preview: String = task.chars().take(80).collect();
+        let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
+        let handle_id = format!("sa_{}", subagent_id);
 
-        // ── STUB: allocate placeholder handle_id ───────────────────────────────
-        //
-        // Actual SubagentHandle construction requires channel halves + Arc state
-        // shared with the spawned thread. That wiring lives in the background
-        // spawn step. Until then we just mint a deterministic id so callers can
-        // reason about response shape.
+        tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
 
-        let handle_id = format!("sa_stub_{}", _subagent_id);
-        let _ = &ctx.subagent_registry; // suppress unused until spawn is wired
+        // ── Shared state ───────────────────────────────────────────────────────
+        let status            = Arc::new(Mutex::new(SubagentStatus::Running));
+        let partial_text      = Arc::new(Mutex::new(String::new()));
+        let tool_log          = Arc::new(Mutex::new(Vec::<String>::new()));
+        let conversation_state = Arc::new(Mutex::new(Vec::<Value>::new()));
 
-        // ── TODO (next step): spawn background task ────────────────────────────
-        //
-        // The actual spawn logic will be extracted from subagent.rs execute():
-        //   1. std::thread::spawn with a new tokio::runtime::Builder::new_current_thread()
-        //   2. Runtime::new() → set_system_prompt → set_model → set_tools
-        //   3. run_stream() event loop writing into registry handle fields
-        //   4. On completion: set handle.status, handle.final_context
-        //
-        // That wiring happens once SubagentHandle's background task API is locked in.
+        // ── Channels ───────────────────────────────────────────────────────────
+        let (_steer_tx, _steer_rx) = mpsc::unbounded_channel::<String>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
 
-        tracing::info!(
-            "subagent_start: dispatched stub handle '{}' for agent '{}'",
-            handle_id, label
+        // ── Forward SubagentStart event to TUI ─────────────────────────────────
+        if let Some(ref tx) = ctx.tx_events {
+            let _ = tx.send(crate::StreamEvent::SubagentStart {
+                subagent_id,
+                agent_name: label.clone(),
+                task_preview: task_preview.clone(),
+            });
+        }
+
+        // ── Clone state for the spawned thread ─────────────────────────────────
+        let status_t         = Arc::clone(&status);
+        let partial_text_t   = Arc::clone(&partial_text);
+        let tool_log_t       = Arc::clone(&tool_log);
+        let label_inner      = label.clone();
+        let model_inner      = model.clone();
+        let tx_events_inner  = ctx.tx_events.clone();
+        let start_time       = std::time::Instant::now();
+
+        // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
+        let _thread_handle = std::thread::spawn(move || {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        *status_t.lock().unwrap() =
+                            SubagentStatus::Failed(format!("tokio runtime: {}", e));
+                        return;
+                    }
+                };
+
+                // Clones for the async block — the outer closure still needs the originals.
+                let status_a       = Arc::clone(&status_t);
+                let partial_text_a = Arc::clone(&partial_text_t);
+                let tool_log_a     = Arc::clone(&tool_log_t);
+                let label_a        = label_inner.clone();
+                let model_a        = model_inner.clone();
+                let tx_events_a    = tx_events_inner.clone();
+
+                let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
+                    use futures::StreamExt;
+
+                    let mut runtime = match crate::Runtime::new().await {
+                        Ok(r) => r,
+                        Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
+                    };
+
+                    runtime.set_system_prompt(system_prompt);
+                    runtime.set_model(model_a.clone());
+                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+
+                    let cancel = crate::CancellationToken::new();
+                    let cancel_inner = cancel.clone();
+                    tokio::spawn(async move {
+                        let _ = shutdown_rx.await;
+                        cancel_inner.cancel();
+                    });
+
+                    let mut stream = runtime.run_stream(task, cancel).await;
+
+                    let mut tool_count = 0u32;
+                    let mut total_input_tokens = 0u64;
+                    let mut total_output_tokens = 0u64;
+                    let mut total_cache_read = 0u64;
+                    let mut total_cache_creation = 0u64;
+
+                    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
+                    tokio::pin!(timeout_fut);
+
+                    loop {
+                        tokio::select! {
+                            event = stream.next() => {
+                                let Some(event) = event else { break };
+                                match event {
+                                    crate::StreamEvent::Thinking(_) => {
+                                        if let Some(ref tx) = tx_events_a {
+                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                                subagent_id,
+                                                agent_name: label_a.clone(),
+                                                status: "💭 thinking...".to_string(),
+                                            });
+                                        }
+                                    }
+                                    crate::StreamEvent::Text(text) => {
+                                        partial_text_a.lock().unwrap().push_str(&text);
+                                    }
+                                    crate::StreamEvent::ToolUseStart(name) => {
+                                        tool_count += 1;
+                                        if let Some(ref tx) = tx_events_a {
+                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                                subagent_id,
+                                                agent_name: label_a.clone(),
+                                                status: format!("⚙ {} (tool #{})", name, tool_count),
+                                            });
+                                        }
+                                    }
+                                    crate::StreamEvent::ToolUse { tool_name, input, .. } => {
+                                        let input_str = input.to_string();
+                                        let input_preview: String = input_str.chars().take(200).collect();
+                                        tool_log_a.lock().unwrap()
+                                            .push(format!("[tool_use]: {} — {}", tool_name, input_preview));
+                                        let detail = match tool_name.as_str() {
+                                            "bash" => {
+                                                let cmd = input["command"].as_str().unwrap_or("");
+                                                let preview: String = cmd.chars().take(60).collect();
+                                                format!("$ {}", preview)
+                                            }
+                                            "read"  => format!("reading {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
+                                            "write" => format!("writing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
+                                            "edit"  => format!("editing {}", input["path"].as_str().unwrap_or("?").rsplit('/').next().unwrap_or("?")),
+                                            "grep"  => format!("grep /{}/", input["pattern"].as_str().unwrap_or("?").chars().take(30).collect::<String>()),
+                                            "find"  => format!("find {}", input["pattern"].as_str().unwrap_or("?")),
+                                            "ls"    => format!("ls {}", input["path"].as_str().unwrap_or(".").rsplit('/').next().unwrap_or(".")),
+                                            other   => {
+                                                if other.starts_with("mcp__") {
+                                                    other.splitn(3, "__").last().unwrap_or(other).to_string()
+                                                } else {
+                                                    other.to_string()
+                                                }
+                                            }
+                                        };
+                                        if let Some(ref tx) = tx_events_a {
+                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                                subagent_id,
+                                                agent_name: label_a.clone(),
+                                                status: detail,
+                                            });
+                                        }
+                                    }
+                                    crate::StreamEvent::ToolResult { result, .. } => {
+                                        let preview: String = result.chars().take(300).collect();
+                                        tool_log_a.lock().unwrap()
+                                            .push(format!("[tool_result]: {}", preview));
+                                    }
+                                    crate::StreamEvent::Usage {
+                                        input_tokens, output_tokens,
+                                        cache_read_input_tokens, cache_creation_input_tokens,
+                                        model: _,
+                                    } => {
+                                        total_input_tokens    += input_tokens;
+                                        total_output_tokens   += output_tokens;
+                                        total_cache_read      += cache_read_input_tokens;
+                                        total_cache_creation  += cache_creation_input_tokens;
+                                    }
+                                    crate::StreamEvent::Error(e) => return Err(e),
+                                    crate::StreamEvent::Done => break,
+                                    _ => {}
+                                }
+                            }
+                            _ = &mut timeout_fut => {
+                                let partial = partial_text_a.lock().unwrap().clone();
+                                let log = tool_log_a.lock().unwrap().clone();
+                                let mut text = format!("[TIMED OUT after {}s — partial results below]\n\n", timeout_secs);
+                                if !log.is_empty() {
+                                    text.push_str(&log.join("\n"));
+                                    text.push('\n');
+                                }
+                                if !partial.is_empty() {
+                                    text.push_str("\n[partial response]:\n");
+                                    text.push_str(&partial);
+                                }
+                                *status_a.lock().unwrap() = SubagentStatus::TimedOut;
+                                return Ok(SubagentResult {
+                                    text,
+                                    model: model_a.clone(),
+                                    input_tokens: total_input_tokens,
+                                    output_tokens: total_output_tokens,
+                                    cache_read: total_cache_read,
+                                    cache_creation: total_cache_creation,
+                                    tool_count,
+                                });
+                            }
+                        }
+                    }
+
+                    Ok(SubagentResult {
+                        text: partial_text_a.lock().unwrap().clone(),
+                        model: model_a.clone(),
+                        input_tokens: total_input_tokens,
+                        output_tokens: total_output_tokens,
+                        cache_read: total_cache_read,
+                        cache_creation: total_cache_creation,
+                        tool_count,
+                    })
+                });
+
+                match outcome {
+                    Ok(sa_result) => {
+                        // Only overwrite Running → Completed (don't stomp TimedOut).
+                        {
+                            let mut s = status_t.lock().unwrap();
+                            if matches!(*s, SubagentStatus::Running) {
+                                *s = SubagentStatus::Completed;
+                            }
+                        }
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        let preview: String = sa_result.text.chars().take(120).collect();
+                        if let Some(ref tx) = tx_events_inner {
+                            let _ = tx.send(crate::StreamEvent::SubagentDone {
+                                subagent_id,
+                                agent_name: label_inner.clone(),
+                                result_preview: preview,
+                                duration_secs: elapsed,
+                            });
+                        }
+                        let _ = result_tx.send(sa_result);
+                    }
+                    Err(e) => {
+                        *status_t.lock().unwrap() = SubagentStatus::Failed(e.clone());
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        if let Some(ref tx) = tx_events_inner {
+                            let _ = tx.send(crate::StreamEvent::SubagentDone {
+                                subagent_id,
+                                agent_name: label_inner.clone(),
+                                result_preview: format!("ERROR: {}", e),
+                                duration_secs: elapsed,
+                            });
+                        }
+                        // drop result_tx — collect() will surface the closed channel
+                    }
+                }
+            }));
+
+            if let Err(panic_info) = panic_result {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("Subagent thread panicked: {}", msg);
+                *status_t.lock().unwrap() = SubagentStatus::Failed(format!("panic: {}", msg));
+            }
+        });
+
+        // ── Build handle + register ────────────────────────────────────────────
+        let handle = SubagentHandle::new(
+            handle_id.clone(),
+            label.clone(),
+            task_preview,
+            model,
+            timeout_secs,
+            status,
+            partial_text,
+            tool_log,
+            conversation_state,
+            Some(_steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
         );
+
+        if let Some(registry) = &ctx.subagent_registry {
+            registry.lock().unwrap().register(handle);
+        } else {
+            return Err(RuntimeError::Tool(
+                "subagent_start requires a subagent_registry in ToolContext".to_string()
+            ));
+        }
 
         Ok(json!({
             "handle_id":  handle_id,

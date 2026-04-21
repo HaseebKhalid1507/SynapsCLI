@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use crate::{Result, RuntimeError, ToolRegistry};
+use std::sync::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +40,8 @@ pub struct Runtime {
     context_window_override: Option<u64>,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
+    /// Shared registry for reactive subagent handles.
+    subagent_registry: Arc<Mutex<crate::tools::subagent_handle::SubagentRegistry>>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -89,6 +92,7 @@ impl Runtime {
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
+            subagent_registry: Arc::new(Mutex::new(crate::tools::subagent_handle::SubagentRegistry::new())),
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -317,7 +321,7 @@ impl Runtime {
                                     bash_timeout: self.bash_timeout,
                                     bash_max_timeout: self.bash_max_timeout,
                                     subagent_timeout: self.subagent_timeout,
-                                subagent_registry: None, };
+                                subagent_registry: Some(self.subagent_registry.clone()), };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -341,6 +345,7 @@ impl Runtime {
                     let cfg_bash_max_timeout = self.bash_max_timeout;
                     let cfg_subagent_timeout = self.subagent_timeout;
                     let session_mgr = self.session_manager.clone();
+                    let cfg_subagent_registry = self.subagent_registry.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -351,6 +356,7 @@ impl Runtime {
                             let tool = self.tools.read().await.get(&tool_name).cloned();
                             let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
+                            let registry_inner = cfg_subagent_registry.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -365,7 +371,7 @@ impl Runtime {
                                             bash_timeout: cfg_bash_timeout,
                                             bash_max_timeout: cfg_bash_max_timeout,
                                             subagent_timeout: cfg_subagent_timeout,
-                                        subagent_registry: None, };
+                                        subagent_registry: Some(registry_inner), };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -492,6 +498,7 @@ impl Clone for Runtime {
             thinking_budget: self.thinking_budget,
             context_window_override: self.context_window_override,
             compaction_model: self.compaction_model.clone(),
+            subagent_registry: self.subagent_registry.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,
