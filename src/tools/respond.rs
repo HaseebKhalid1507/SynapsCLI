@@ -30,13 +30,11 @@ impl Tool for RespondTool {
 
         tracing::info!(event_id = %event_id, "respond tool invoked: {}", text);
 
-        // STUB: real impl will look up the event and POST to its callback URL.
+        // NOT YET IMPLEMENTED — return clear failure so the model knows
         Ok(json!({
-            "responded": true,
+            "responded": false,
+            "error": "respond tool is not yet implemented — callback dispatch not wired",
             "event_id": event_id,
-            "text": text,
-            "note": "response logged (stub — no callback dispatch yet)",
-            "_stub": true,
         }).to_string())
     }
 }

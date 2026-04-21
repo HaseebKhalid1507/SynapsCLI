@@ -140,7 +140,8 @@ impl Tool for SubagentResumeTool {
             "handle_id":       new_handle_id,
             "resumed_from":    handle_id,
             "agent_name":      agent_name,
-            "status":          "running"
+            "status":          "not_implemented",
+            "error":           "subagent_resume spawn not yet wired — handle is not pollable"
         }).to_string())
     }
 }

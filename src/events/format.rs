@@ -1,7 +1,9 @@
 use super::types::Event;
 
 /// Format an event as a system message the agent can understand.
-/// Example: `[alert/high from uptime-kuma #alerts] Jellyfin is DOWN. Status 503.`
+/// Wrapped in XML tags to prevent prompt injection — the model should treat
+/// content inside <event> tags as DATA, not instructions.
+/// Example: `<event id="abc" type="alert" severity="high" source="uptime-kuma" channel="alerts">Jellyfin is DOWN.</event>`
 pub fn format_event_for_agent(event: &Event) -> String {
     let sev = event
         .content
@@ -10,26 +12,29 @@ pub fn format_event_for_agent(event: &Event) -> String {
         .map(|s| s.as_str())
         .unwrap_or("medium");
 
-    let header = match &event.channel {
-        Some(ch) => format!(
-            "[{}/{} from {} #{}]",
-            event.content.content_type, sev, event.source.source_type, ch.name
-        ),
-        None => format!(
-            "[{}/{} from {}]",
-            event.content.content_type, sev, event.source.source_type
-        ),
+    let channel_attr = match &event.channel {
+        Some(ch) => format!(" channel=\"{}\"", ch.name.replace('"', "'")),
+        None => String::new(),
     };
 
-    let mut out = format!("{} {}", header, event.content.text);
+    // Sanitize text — strip any closing </event> tags to prevent breakout
+    let safe_text = event.content.text.replace("</event>", "");
+    let safe_source = event.source.source_type.replace('"', "'");
+    let safe_content_type = event.content.content_type.replace('"', "'");
+
+    let mut out = format!(
+        "<event id=\"{}\" type=\"{}\" severity=\"{}\" source=\"{}\"{}>{}",
+        event.id, safe_content_type, sev, safe_source, channel_attr, safe_text
+    );
 
     if let Some(data) = &event.content.data {
-        out.push_str(&format!(
-            "\nData: {}",
-            serde_json::to_string(data).unwrap_or_default()
-        ));
+        let data_str = serde_json::to_string(data).unwrap_or_default();
+        // Cap data size to prevent token abuse
+        let truncated: String = data_str.chars().take(1000).collect();
+        out.push_str(&format!("\nData: {}", truncated));
     }
 
+    out.push_str("</event>");
     out
 }
 
@@ -43,7 +48,12 @@ mod tests {
     fn format_without_channel() {
         let e = Event::simple("cli", "ping", Some(Severity::Low));
         let s = format_event_for_agent(&e);
-        assert_eq!(s, "[message/low from cli] ping");
+        assert!(s.starts_with("<event id="));
+        assert!(s.contains("type=\"message\""));
+        assert!(s.contains("severity=\"low\""));
+        assert!(s.contains("source=\"cli\""));
+        assert!(s.contains("ping"));
+        assert!(s.ends_with("</event>"));
     }
 
     #[test]
@@ -55,17 +65,18 @@ mod tests {
             name: "alerts".into(),
         });
         let s = format_event_for_agent(&e);
-        assert_eq!(
-            s,
-            "[alert/high from uptime-kuma #alerts] Jellyfin is DOWN. Status 503."
-        );
+        assert!(s.contains("source=\"uptime-kuma\""));
+        assert!(s.contains("channel=\"alerts\""));
+        assert!(s.contains("severity=\"high\""));
+        assert!(s.contains("Jellyfin is DOWN. Status 503."));
+        assert!(s.ends_with("</event>"));
     }
 
     #[test]
     fn format_defaults_to_medium_when_no_severity() {
         let e = Event::simple("cli", "hi", None);
         let s = format_event_for_agent(&e);
-        assert!(s.starts_with("[message/medium from cli]"));
+        assert!(s.contains("severity=\"medium\""));
     }
 
     #[test]
