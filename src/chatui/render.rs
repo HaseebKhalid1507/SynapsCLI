@@ -532,14 +532,14 @@ impl App {
                     lines.push(Line::from(""));
                     // Top padding
                     lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
-                    // Header: icon + source + severity tag
-                    let header = format!("{}  {} [{}] {}", m, icon, source, severity);
+                    // Header: icon + source (severity is not rendered as a span)
+                    let header = format!("{}  {} [{}]", m, icon, source);
                     let ts_str = format!("{} ", ts);
                     let gap = width.saturating_sub(header.chars().count() + ts_str.chars().count());
                     lines.push(Line::from(vec![
                         Span::styled(format!("{}  {} ", m, icon), Style::default().fg(sev_color).bg(event_bg)),
                         Span::styled(format!("[{}]", source), Style::default().fg(theme.event_source).bg(event_bg).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("{}", " ".repeat(gap + severity.len() + 1)), Style::default().bg(event_bg)),
+                        Span::styled(format!("{}", " ".repeat(gap)), Style::default().bg(event_bg)),
                         Span::styled(ts_str, Style::default().fg(theme.muted).bg(event_bg)),
                     ]));
                     // Content

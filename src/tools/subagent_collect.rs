@@ -31,12 +31,6 @@ impl Tool for SubagentCollectTool {
                 "handle_id": {
                     "type": "string",
                     "description": "Handle ID returned by subagent_start (e.g. \"sa_3\")."
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Additional seconds to wait beyond the subagent's own \
-                                    timeout before giving up. Optional — defaults to waiting \
-                                    indefinitely (bounded only by the subagent's own timeout)."
                 }
             },
             "required": ["handle_id"]
@@ -59,20 +53,26 @@ impl Tool for SubagentCollectTool {
                 format!("No subagent found with handle_id '{}'", handle_id)
             ))?;
 
+        // Clone all needed data under the lock, then drop before char traversal
         let status = handle.status();
-        let output = handle.partial_output();
+        let output: String = handle.partial_output();
+        let elapsed = handle.elapsed_secs();
+        let _ = handle;
+        drop(reg);
 
         if status == SubagentStatus::Running {
             // Still going — return current state, don't block
+            let char_count = output.chars().count();
+            let output_so_far: String = if char_count > 500 {
+                output.chars().skip(char_count - 500).collect()
+            } else {
+                output
+            };
             return Ok(json!({
                 "handle_id":    handle_id,
                 "status":       "running",
-                "elapsed_secs": (handle.elapsed_secs() * 10.0).round() / 10.0,
-                "output_so_far": if output.chars().count() > 500 {
-                    output.chars().skip(output.chars().count() - 500).collect::<String>()
-                } else {
-                    output.clone()
-                }
+                "elapsed_secs": (elapsed * 10.0).round() / 10.0,
+                "output_so_far": output_so_far
             }).to_string());
         }
 
