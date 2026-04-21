@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
   - File operation tracking (read/write/edit paths preserved across compactions)
   - Custom focus instructions via `/compact <focus>`
   - Uses dedicated low-effort API call (no tools, summarization system prompt)
+- **`context_window` setting wired to API**: `200k` (default) omits beta header; `1m` sends `context-1m-2025-08-07` on supported models (Opus 4.6+, Sonnet 4.x); previously was UI-only display cap
+- **Claude Code marketplace compatibility**: probe both `.synaps-plugin` and `.claude-plugin` layouts, `${CLAUDE_PLUGIN_ROOT}` substitution in skill bodies
+- **Plugins subdir sources and cascade uninstall**: install from subdir-based plugin repos, cascade-remove plugins when their marketplace is deleted
+- **Settings → Plugins marketplace overlay**: "Open Plugin Marketplace" action row in Settings, opens plugins modal as nested overlay
+- **Hidden binary**: GamblersDen bundled as `hidden` binary alongside `synaps`
 - **Single binary architecture**: all 8 binaries consolidated into `synaps`
   - `synaps` (no args) = TUI (was `chatui`)
   - `synaps run` = one-shot prompt (was `cli run`)
@@ -35,6 +40,9 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- **Session file corruption**: atomic writes via write-to-tmp then rename
+- **Tool input parse errors surfaced to model**: malformed tool_use JSON no longer silently falls through to empty input; model sees `invalid tool input JSON: ...` and can self-correct
+- **Custom theme crash**: `unreachable!()` in draw replaced with graceful fallback colors for non-Rgb themes
 - ASCII logo alignment: use unicode display width for consistent centering
 - 'default' theme missing from settings picker
 - Context bar pinned at 100% after 2-3 turns (was using cumulative tokens / hardcoded 200K)
@@ -45,8 +53,10 @@ All notable changes to this project will be documented in this file.
 - Usage log world-readable at `/tmp/` → moved to `~/.cache/` with 0600
 
 ### Changed
+- **`define_settings!` macro**: settings schema + apply handler defined once in `settings/defs.rs` via declarative macro — zero drift possible (replaced manual sync + parity tests)
+- **Single source of truth for commands**: removed duplicate `ALL_COMMANDS` array; `commands.rs` now sources from `skills::BUILTIN_COMMANDS`
+- **`src/cmd_*.rs` → `src/cmd/` module**: subcommand handlers moved to dedicated directory, `cmd_` prefix stripped
 - Binary name: `chatui`/`synaps-cli`/`synaps-agent` → `synaps` (single binary with subcommands)
-- `src/bin/` directory removed — commands live at `src/cmd_*.rs`
 - `src/chatui/main.rs` → `src/chatui/mod.rs` (module, not binary)
 - watcher spawns `synaps agent` instead of standalone `synaps-agent`
 - `thinking_level_for_budget()` consolidated from 4 copies into single source of truth in `core/models.rs`
