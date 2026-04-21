@@ -35,8 +35,9 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
+        use_1m_context: bool,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, use_1m_context).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -53,6 +54,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
+        use_1m_context: bool,
     ) -> Result<Value> {
         // Read auth state for this API call
         let (auth_token, auth_type) = {
@@ -157,8 +159,22 @@ impl ApiMethods {
                     .header(auth_header.0.clone(), auth_header.1.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
+                // Build the anthropic-beta header. The 1M-context opt-in
+                // (`context-1m-2025-08-07`) is only added when the user
+                // explicitly requested 1M AND the model supports it. Without
+                // this opt-in, all models default to 200k mode — which is the
+                // documented "smarter" inference regime (see
+                // anthropic.com/engineering/effective-context-engineering).
+                let mut betas: Vec<&str> = Vec::new();
                 if auth_type == "oauth" {
-                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                    betas.push("claude-code-20250219");
+                    betas.push("oauth-2025-04-20");
+                }
+                if use_1m_context && crate::core::models::model_supports_1m(model) {
+                    betas.push("context-1m-2025-08-07");
+                }
+                if !betas.is_empty() {
+                    req = req.header("anthropic-beta", betas.join(","));
                 }
 
                 match req.json(&body).send().await {
@@ -448,6 +464,7 @@ impl ApiMethods {
         thinking_budget: u32,
         messages: &[Value],
         max_retries: u32,
+        use_1m_context: bool,
     ) -> Result<Value> {
         // Read auth state
         let (auth_token, auth_type) = {
@@ -535,8 +552,16 @@ impl ApiMethods {
                     .header(auth_header.0.clone(), auth_header.1.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
+                let mut betas: Vec<&str> = Vec::new();
                 if auth_type == "oauth" {
-                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                    betas.push("claude-code-20250219");
+                    betas.push("oauth-2025-04-20");
+                }
+                if use_1m_context && crate::core::models::model_supports_1m(model) {
+                    betas.push("context-1m-2025-08-07");
+                }
+                if !betas.is_empty() {
+                    req = req.header("anthropic-beta", betas.join(","));
                 }
 
                 match req.json(&body).send().await {
