@@ -141,7 +141,7 @@ pub(crate) fn draw(
             )
         } else if app.streaming {
             let pulse = ((app.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-            let Color::Rgb(sr, sg, sb) = THEME.load().status_streaming else { unreachable!() };
+            let (sr, sg, sb) = match THEME.load().status_streaming { Color::Rgb(r, g, b) => (r, g, b), _ => (128, 128, 128) };
             let r = (sr as f64 * pulse) as u8;
             let g = (sg as f64 * pulse) as u8;
             let b = (sb as f64 * pulse) as u8;
@@ -247,13 +247,13 @@ pub(crate) fn draw(
                     let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
                     let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
                     let breathe = phase1 * 0.7 + phase2 * 0.3;
-                    let Color::Rgb(ar, ag, ab) = THEME.load().border_active else { unreachable!() };
+                    let (ar, ag, ab) = match THEME.load().border_active { Color::Rgb(r, g, b) => (r, g, b), _ => (128, 128, 128) };
                     let breathe_scale = 0.7 + 0.3 * breathe; // breathe is -1..1, scale is 0.4..1.0
                     let r = (ar as f64 * breathe_scale) as u8;
                     let g = (ag as f64 * breathe_scale) as u8;
                     let b = (ab as f64 * breathe_scale) as u8;
                     let art_style = Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD);
-                    let Color::Rgb(mr, mg, mb) = THEME.load().muted else { unreachable!() };
+                    let (mr, mg, mb) = match THEME.load().muted { Color::Rgb(r, g, b) => (r, g, b), _ => (64, 64, 64) };
                     let sub_style = Style::default().fg(Color::Rgb(
                         (mr as f64 * breathe_scale) as u8,
                         (mg as f64 * breathe_scale) as u8,
