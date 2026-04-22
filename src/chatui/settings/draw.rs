@@ -175,6 +175,7 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
 
 fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let providers = synaps_cli::runtime::openai::registry::providers();
+    let total_rows = providers.len() + 1; // +1 for Local
     let visible_height = area.height as usize;
     let selected = if state.focus == Focus::Right { state.setting_idx } else { usize::MAX };
 
@@ -186,8 +187,63 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
     };
 
     let mut lines = Vec::new();
-    for (i, p) in providers.iter().enumerate().skip(scroll_offset).take(visible_height) {
-        let is_selected = i == selected;
+
+    // Row 0: Local models
+    if scroll_offset == 0 {
+        let is_selected = 0 == selected;
+        let style = if is_selected {
+            Style::default().fg(THEME.load().claude_label)
+        } else {
+            Style::default().fg(THEME.load().claude_text)
+        };
+        let local_url = snap.provider_keys.get("local.url")
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .or_else(|| std::env::var("LOCAL_ENDPOINT").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "localhost:11434".to_string());
+
+        let local_status = if snap.provider_keys.contains_key("local.url")
+            || std::env::var("LOCAL_ENDPOINT").is_ok_and(|s| !s.is_empty())
+        {
+            format!("✅ {}", local_url)
+        } else {
+            format!("⬚ default ({})", local_url)
+        };
+
+        // Show editor if active on this row
+        let display = if let Some(ActiveEditor::ApiKey { provider_id, buffer }) = &state.edit_mode {
+            if provider_id == "local.url" {
+                format!("[{}_]", buffer)
+            } else {
+                local_status
+            }
+        } else {
+            local_status
+        };
+
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            format!("  {:<20} {}", "Local (Ollama/etc)", display),
+            style,
+        )]));
+
+        if let Some((key, msg)) = &state.row_error {
+            if key == "provider.local.url" && is_selected {
+                let is_note = msg.starts_with("saved");
+                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                lines.push(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
+                ]));
+            }
+        }
+    }
+
+    // Rows 1..=N: Registry providers
+    for (i, p) in providers.iter().enumerate() {
+        let row_idx = i + 1; // offset by 1 for Local row
+        if row_idx < scroll_offset || row_idx >= scroll_offset + visible_height {
+            continue;
+        }
+        let is_selected = row_idx == selected;
         let style = if is_selected {
             Style::default().fg(THEME.load().claude_label)
         } else {
@@ -227,7 +283,7 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
             "  ▲ more", Style::default().fg(THEME.load().help_fg),
         )]));
     }
-    if scroll_offset + visible_height < providers.len() {
+    if scroll_offset + visible_height < total_rows {
         lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
             "  ▼ more", Style::default().fg(THEME.load().help_fg),
         )]));

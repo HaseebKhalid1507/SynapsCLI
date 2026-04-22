@@ -38,29 +38,58 @@ pub(crate) fn handle_event(
     if state.focus == Focus::Right {
         let cat = super::schema::CATEGORIES[state.category_idx];
         if cat == super::schema::Category::Providers {
-            let providers = synaps_cli::runtime::openai::registry::providers();
-            if let Some(p) = providers.get(state.setting_idx) {
+            // Row 0 = Local (edits URL), Rows 1+ = registry providers (edit API key)
+            if state.setting_idx == 0 {
+                // Local provider — edit URL
                 match key.code {
                     KeyCode::Enter => {
                         state.row_error = None;
+                        let current_url = snap.provider_keys.get("local.url")
+                            .cloned()
+                            .unwrap_or_default();
                         state.edit_mode = Some(ActiveEditor::ApiKey {
-                            provider_id: p.key.to_string(),
-                            buffer: String::new(),
+                            provider_id: "local.url".to_string(),
+                            buffer: current_url,
                         });
                         return InputOutcome::None;
                     }
                     KeyCode::Delete | KeyCode::Char('d') => {
-                        let has_key = snap.provider_keys.get(p.key).map(|v| !v.is_empty()).unwrap_or(false);
-                        if has_key {
+                        if snap.provider_keys.contains_key("local.url") {
                             state.row_error = None;
                             return InputOutcome::SetProviderKey {
-                                provider_id: p.key.to_string(),
+                                provider_id: "local.url".to_string(),
                                 value: String::new(),
                             };
                         }
                         return InputOutcome::None;
                     }
                     _ => {}
+                }
+            } else {
+                let providers = synaps_cli::runtime::openai::registry::providers();
+                if let Some(p) = providers.get(state.setting_idx - 1) {
+                    match key.code {
+                        KeyCode::Enter => {
+                            state.row_error = None;
+                            state.edit_mode = Some(ActiveEditor::ApiKey {
+                                provider_id: p.key.to_string(),
+                                buffer: String::new(),
+                            });
+                            return InputOutcome::None;
+                        }
+                        KeyCode::Delete | KeyCode::Char('d') => {
+                            let has_key = snap.provider_keys.get(p.key).map(|v| !v.is_empty()).unwrap_or(false);
+                            if has_key {
+                                state.row_error = None;
+                                return InputOutcome::SetProviderKey {
+                                    provider_id: p.key.to_string(),
+                                    value: String::new(),
+                                };
+                            }
+                            return InputOutcome::None;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -333,7 +362,7 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
     } else if cat == super::schema::Category::Providers {
-        synaps_cli::runtime::openai::registry::providers().len()
+        synaps_cli::runtime::openai::registry::providers().len() + 1 // +1 for Local row
     } else {
         state.current_settings().len()
     }
