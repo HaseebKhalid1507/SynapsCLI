@@ -114,6 +114,8 @@ impl Tool for SubagentStartTool {
         let tx_events_inner  = ctx.channels.tx_events.clone();
         let start_time       = std::time::Instant::now();
 
+        let tmux_ctrl = ctx.capabilities.tmux_controller.clone();
+
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
         let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -148,6 +150,9 @@ impl Tool for SubagentStartTool {
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
                     runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    if let Some(ctrl) = tmux_ctrl {
+                        runtime.set_tmux_controller(ctrl);
+                    }
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

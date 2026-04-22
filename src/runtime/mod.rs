@@ -381,6 +381,7 @@ impl Runtime {
                     let session_mgr = self.session_manager.clone();
                     let cfg_subagent_registry = self.subagent_registry.clone();
                     let cfg_event_queue = self.event_queue.clone();
+                    let cfg_tmux_controller = self.tmux_controller.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -393,6 +394,7 @@ impl Runtime {
                             let session_mgr_inner = session_mgr.clone();
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
+                            let tmux_ctrl_inner = cfg_tmux_controller.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -408,7 +410,7 @@ impl Runtime {
                                                 session_manager: Some(session_mgr_inner),
                                                 subagent_registry: Some(registry_inner),
                                                 event_queue: Some(event_queue_inner),
-                                                tmux_controller: None,
+                                                tmux_controller: tmux_ctrl_inner,
                                             },
                                             limits: crate::tools::ToolLimits {
                                                 max_tool_output: cfg_max_tool_output,

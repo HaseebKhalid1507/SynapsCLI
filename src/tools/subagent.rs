@@ -91,6 +91,8 @@ impl Tool for SubagentTool {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        let tmux_ctrl = ctx.capabilities.tmux_controller.clone();
+
         let _thread_handle = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -115,6 +117,9 @@ impl Tool for SubagentTool {
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model);
                     runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    if let Some(ctrl) = tmux_ctrl {
+                        runtime.set_tmux_controller(ctrl);
+                    }
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
