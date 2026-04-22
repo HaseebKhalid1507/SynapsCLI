@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Session Naming** — `/saveas <name>` aliases for sessions
+  - Name format `[a-z0-9-]{1,40}`, validated and collision-checked
+  - `/saveas` (no arg) clears the name
+  - `synaps --continue <name>` resolves session names
+  - `/sessions` shows `[@name]` tags on named sessions
+- **Chain Naming** — `/chain name/list/unname` bookmarks for compaction lineages with auto-advance
+  - `/chain name <name>` bookmarks the current session's lineage
+  - `/chain list` shows all named chains (`*` marks active)
+  - `/chain unname <name>` removes a bookmark
+  - `/chain` (no args) shows lineage + "bookmarked by: @name" if present
+  - Chain pointers stored at `~/.synaps-cli/chains/<name>.json`
+  - On `/compact`, chain pointers auto-advance to the new session
+- **Unified Session Resolution** — `resolve_session()`: chain name → session name → partial ID, used by `--continue` and `/resume`
+  - Shared by `synaps --continue`, `/resume`, and server `--continue`
+  - Resolution path surfaced as a system message (`↳ resolved via chain 'foo'` / `↳ resolved via name 'bar'`)
+  - `--continue` value_name changed from `SESSION_ID` to `NAME_OR_ID`
 - **Event Bus** — universal message ingestion for agent sessions
   - `synaps send` CLI command with atomic file writes
   - inotify inbox watcher via `notify` crate (spawn_blocking, non-blocking)
@@ -74,6 +90,8 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- **MCP tool name causes 400 errors** — Anthropic rejects `mcp_` prefixed tool names (rate limit pool misrouting). Renamed `mcp_connect` → `connect_mcp_server`, tool prefix `mcp__server__tool` → `ext__server__tool`.
+- **`/saveas` on empty sessions** — `save_session()` bailed on empty `api_messages`, so the name never persisted. Now calls `session.save()` directly.
 - Compaction no longer overwrites original session (loads from disk)
 - Event content sanitized against prompt injection (XML tags, case-insensitive)
 - Atomic inbox writes (.json.tmp → .json rename)

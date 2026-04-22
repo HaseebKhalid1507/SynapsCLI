@@ -2,7 +2,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~24K lines](https://img.shields.io/badge/lines-~24K-green.svg)
+![~32K lines](https://img.shields.io/badge/lines-~32K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
@@ -15,7 +15,7 @@ Chat, orchestrate a crew of named subagents, or leave autonomous workers running
 
 ## Why SynapsCLI?
 
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~24K lines, `cargo build` and you're done.
+- ⚡ **Sub-100ms cold start.** Single Rust binary, ~32K lines, `cargo build` and you're done.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
 - 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
 - 🔄 **Reactive Subagents.** Dispatch, poll, steer, collect. Five tools that turn fire-and-forget into collaborative orchestration.
@@ -49,7 +49,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 synaps
 ```
 
-`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long. `/status` to check usage.
+`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long. `/status` to check usage. `/saveas <name>` to alias a session. `/chain name <name>` to bookmark a compaction lineage.
 
 ```bash
 synaps send "alert" --source monitoring  # inject events from anywhere
@@ -65,8 +65,11 @@ One binary, every mode as a subcommand.
 ```bash
 synaps                              # launch TUI
 synaps --continue                   # resume last session
+synaps --continue my-project        # resume by name (session alias or chain bookmark)
 synaps --system prompt.md           # custom system prompt
 ```
+
+Name a session with `/saveas my-project`, or bookmark a compaction lineage with `/chain name my-project` — then `synaps --continue my-project` picks up where you left off. Resolution tries chain name → session name → partial ID.
 
 Streaming, markdown, syntax highlighting, and a live panel showing every subagent you dispatched.
 
@@ -154,7 +157,7 @@ Events appear as styled cards in the TUI and auto-trigger the agent to respond. 
 | `subagent_steer` | Inject guidance into running subagent |
 | `subagent_collect` | Check if subagent is done, get result |
 | `shell_start/send/end` | Interactive PTY sessions |
-| `mcp_connect` | Load tools from MCP servers |
+| `connect_mcp_server` | Load tools from MCP servers |
 | `load_skill` | Load behavioral guidelines from markdown |
 
 See [AGENTS.md](AGENTS.md) for parameters and behavior.
@@ -197,7 +200,7 @@ src/
 ├── cmd_*.rs     # subcommand handlers (run, chat, server, client, agent, login, watcher)
 ├── chatui/      # TUI: event loop, rendering, markdown, themes, settings
 ├── watcher/     # supervisor daemon, IPC, heartbeats
-├── core/        # config, session, auth, protocol, logging
+├── core/        # config, session, chain, auth, protocol, logging
 ├── events/      # event bus: types, priority queue, inotify watcher, formatting
 ├── runtime/     # orchestration, SSE streaming, parallel tool exec
 ├── tools/       # bash, read, write, edit, grep, find, ls, subagent, mcp
