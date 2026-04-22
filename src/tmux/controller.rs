@@ -1,11 +1,10 @@
 //! TmuxController — manages the control mode connection to tmux.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{oneshot, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use std::sync::atomic::AtomicU64;
 
 use super::protocol::TmuxEvent;
 use super::state::TmuxState;
@@ -25,15 +24,11 @@ pub struct TmuxController {
     writer: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
     /// Tracked state of all tmux objects
     state: Arc<RwLock<TmuxState>>,
-    /// Channel for incoming parsed events
-    event_tx: mpsc::UnboundedSender<TmuxEvent>,
-    /// Receiver for events (consumed by event loop)
-    event_rx: Option<mpsc::UnboundedReceiver<TmuxEvent>>,
-    /// Pending command responses: command_num -> sender
-    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<CommandResult>>>>,
-    /// Next command number
-    #[allow(dead_code)]
-    next_cmd: AtomicU64,
+    /// FIFO queue of pending command response waiters.
+    /// Commands are serialized through `writer` mutex, so responses arrive
+    /// in the same order. The reader task pops the front waiter on each
+    /// `%begin`, collects data lines, and resolves on `%end`/`%error`.
+    response_queue: Arc<tokio::sync::Mutex<VecDeque<oneshot::Sender<CommandResult>>>>,
     /// Session name
     pub session_name: String,
 }
@@ -50,15 +45,11 @@ impl TmuxController {
 
     /// Create a new controller (does not start the connection yet).
     pub fn new(session_name: String) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
             child: None,
             writer: None,
             state: Arc::new(RwLock::new(TmuxState::new("", &session_name))),
-            event_tx,
-            event_rx: Some(event_rx),
-            pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            next_cmd: AtomicU64::new(0),
+            response_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             session_name,
         }
     }
@@ -66,11 +57,6 @@ impl TmuxController {
     /// Get a handle to the shared state.
     pub fn state(&self) -> Arc<RwLock<TmuxState>> {
         Arc::clone(&self.state)
-    }
-
-    /// Take the event receiver (can only be called once).
-    pub fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<TmuxEvent>> {
-        self.event_rx.take()
     }
 
     /// Start a tmux session and connect via control mode.
@@ -115,56 +101,62 @@ impl TmuxController {
         self.writer = Some(writer);
         self.child = Some(child);
 
-        // Start reader task
-        let event_tx = self.event_tx.clone();
-        let pending = Arc::clone(&self.pending);
+        // Start reader task — reads control mode output lines and dispatches
+        // command responses to the FIFO queue of oneshot senders.
+        let response_queue = Arc::clone(&self.response_queue);
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
-            let mut current_cmd: Option<u64> = None;
+            // Current waiter being filled (popped from queue on %begin)
+            let mut current_waiter: Option<oneshot::Sender<CommandResult>> = None;
             let mut current_lines: Vec<String> = Vec::new();
+            let mut in_command = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(event) = TmuxEvent::parse(&line) {
                     match &event {
-                        TmuxEvent::Begin { command_num, .. } => {
-                            current_cmd = Some(*command_num);
+                        TmuxEvent::Begin { .. } => {
+                            // Pop the next waiter from the FIFO queue
+                            let mut q = response_queue.lock().await;
+                            current_waiter = q.pop_front();
                             current_lines.clear();
+                            in_command = true;
                         }
-                        TmuxEvent::End { command_num, .. } => {
-                            if Some(*command_num) == current_cmd {
-                                let mut map = pending.lock().await;
-                                if let Some(sender) = map.remove(command_num) {
+                        TmuxEvent::End { .. } => {
+                            if in_command {
+                                if let Some(sender) = current_waiter.take() {
                                     let _ = sender.send(CommandResult {
                                         lines: current_lines.drain(..).collect(),
                                         success: true,
                                     });
                                 }
-                                current_cmd = None;
+                                in_command = false;
                             }
                         }
-                        TmuxEvent::Error { command_num, .. } => {
-                            if Some(*command_num) == current_cmd {
-                                let mut map = pending.lock().await;
-                                if let Some(sender) = map.remove(command_num) {
+                        TmuxEvent::Error { .. } => {
+                            if in_command {
+                                if let Some(sender) = current_waiter.take() {
                                     let _ = sender.send(CommandResult {
                                         lines: current_lines.drain(..).collect(),
                                         success: false,
                                     });
                                 }
-                                current_cmd = None;
+                                in_command = false;
                             }
                         }
                         TmuxEvent::Data(data) => {
-                            if current_cmd.is_some() {
+                            if in_command {
                                 current_lines.push(data.clone());
                             }
                         }
-                        _ => {}
+                        _ => {
+                            // Notifications (%output, %window-add, etc.) — log for now
+                            tracing::trace!("tmux event: {:?}", event);
+                        }
                     }
-                    let _ = event_tx.send(event);
                 }
             }
+            tracing::debug!("tmux control mode reader exited");
         });
 
         tracing::info!("tmux control mode connected to session '{}'", self.session_name);
@@ -172,13 +164,27 @@ impl TmuxController {
     }
 
     /// Send a command to tmux control mode and wait for its response.
+    ///
+    /// Commands are serialized: the writer mutex ensures only one command
+    /// is in-flight at a time, and the reader task resolves responses in
+    /// FIFO order via the `response_queue`.
     pub async fn execute(&self, cmd: &str, args: &[&str]) -> Result<CommandResult, String> {
         let writer = self.writer.as_ref()
             .ok_or_else(|| "Control mode not connected".to_string())?;
 
         let formatted = Self::format_command(cmd, args);
 
-        // Write to stdin
+        // Create a oneshot channel for this command's response
+        let (tx, rx) = oneshot::channel();
+
+        // Enqueue the waiter BEFORE writing the command (so the reader
+        // task can find it when %begin arrives).
+        {
+            let mut q = self.response_queue.lock().await;
+            q.push_back(tx);
+        }
+
+        // Write to stdin (serialized by the mutex)
         {
             let mut w = writer.lock().await;
             w.write_all(formatted.as_bytes()).await
@@ -187,14 +193,12 @@ impl TmuxController {
                 .map_err(|e| format!("Failed to flush: {}", e))?;
         }
 
-        // For now, commands are fire-and-forget since control mode
-        // command numbering needs the server to assign numbers.
-        // We return a synthetic success. Full request-response tracking
-        // will be wired when we process %begin/%end with server-assigned numbers.
-        Ok(CommandResult {
-            lines: vec![],
-            success: true,
-        })
+        // Wait for the reader task to resolve our response
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err("Response channel closed — tmux control mode may have exited".to_string()),
+            Err(_) => Err("Timed out waiting for tmux response (10s)".to_string()),
+        }
     }
 
     /// Execute a command and return the first line of output.
@@ -256,5 +260,39 @@ mod tests {
             let result = controller.start().await;
             assert!(result.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn test_response_queue_ordering() {
+        // Verify that the response queue is FIFO
+        let queue: Arc<tokio::sync::Mutex<VecDeque<oneshot::Sender<CommandResult>>>> =
+            Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+
+        {
+            let mut q = queue.lock().await;
+            q.push_back(tx1);
+            q.push_back(tx2);
+        }
+
+        // Pop first — should be tx1
+        {
+            let mut q = queue.lock().await;
+            let sender = q.pop_front().unwrap();
+            sender.send(CommandResult { lines: vec!["first".to_string()], success: true }).unwrap();
+        }
+        // Pop second — should be tx2
+        {
+            let mut q = queue.lock().await;
+            let sender = q.pop_front().unwrap();
+            sender.send(CommandResult { lines: vec!["second".to_string()], success: true }).unwrap();
+        }
+
+        let r1 = rx1.await.unwrap();
+        let r2 = rx2.await.unwrap();
+        assert_eq!(r1.lines, vec!["first"]);
+        assert_eq!(r2.lines, vec!["second"]);
     }
 }
