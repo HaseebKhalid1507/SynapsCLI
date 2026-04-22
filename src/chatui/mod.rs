@@ -701,25 +701,6 @@ pub async fn run(
                                             }
                                         }
                                     }
-                                    CommandAction::SaveAs { name } => {
-                                        // handle_command already applies + saves inline; kept for API completeness.
-                                        match name {
-                                            Some(n) => {
-                                                match app.session.set_name(&n) {
-                                                    Ok(()) => {
-                                                        app.save_session().await;
-                                                        app.push_msg(ChatMessage::System(format!("session named '{}'", n)));
-                                                    }
-                                                    Err(e) => app.push_msg(ChatMessage::Error(format!("saveas failed: {}", e))),
-                                                }
-                                            }
-                                            None => {
-                                                app.session.clear_name();
-                                                app.save_session().await;
-                                                app.push_msg(ChatMessage::System("session name cleared".into()));
-                                            }
-                                        }
-                                    }
                                     CommandAction::Status => {
                                         app.push_msg(ChatMessage::System("Checking usage...".to_string()));
                                         match fetch_usage().await {
@@ -842,7 +823,6 @@ pub async fn run(
                                         CommandAction::ChainList => {}
                                         CommandAction::ChainName { .. } => {}
                                         CommandAction::ChainUnname { .. } => {}
-                                        CommandAction::SaveAs { .. } => {}
                                         CommandAction::Status => {}
                                     }
                                 } else {

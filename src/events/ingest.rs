@@ -75,7 +75,7 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: A
 
     // Spawn the blocking notify watcher on a dedicated thread
     let inbox_clone = inbox_dir.clone();
-    let watcher_handle = tokio::task::spawn_blocking(move || {
+    let _watcher_handle = tokio::task::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut _watcher: notify::RecommendedWatcher = match notify::RecommendedWatcher::new(
             tx,

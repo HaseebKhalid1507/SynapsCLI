@@ -61,7 +61,6 @@ pub(super) enum CommandAction {
     /// Delete a named chain.
     ChainUnname { name: String },
     /// Assign (or clear, if empty) a name to the current session. Persists via save.
-    SaveAs { name: Option<String> },
     /// Show account usage and reset times.
     Status,
 }
