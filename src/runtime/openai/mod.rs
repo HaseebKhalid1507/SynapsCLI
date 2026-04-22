@@ -34,7 +34,7 @@ pub enum Provider {
 /// - anything else → `Anthropic` (backward compat)
 pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> Provider {
     if let Some((prefix, _rest)) = model.split_once('/') {
-        if registry::providers().iter().any(|s| s.key == prefix) {
+        if prefix == "local" || registry::providers().iter().any(|s| s.key == prefix) {
             if let Some(cfg) = registry::resolve_shorthand(model, provider_keys) {
                 return Provider::OpenAi(cfg);
             }

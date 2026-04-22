@@ -253,6 +253,10 @@ pub fn resolve_provider_model(
     model: &str,
     overrides: &BTreeMap<String, String>,
 ) -> Option<ProviderConfig> {
+    // Special case: local provider — dynamic URL from config/env
+    if key == "local" {
+        return resolve_local(model, overrides);
+    }
     let specs = providers();
     let spec = specs.into_iter().find(|s| s.key == key)?;
     let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)?;
@@ -267,6 +271,32 @@ pub fn resolve_provider_model(
 pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
     let (provider_key, model) = s.split_once('/')?;
     resolve_provider_model(provider_key, model, overrides)
+}
+
+/// Resolve a local model endpoint (Ollama, LM Studio, vLLM, llama.cpp, etc.)
+///
+/// URL resolution: `provider.local.url` in config → `LOCAL_ENDPOINT` env → `http://localhost:11434/v1`
+/// API key: `provider.local` in config → `LOCAL_API_KEY` env → `"local"` (most local servers don't need one)
+fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
+    let base_url = overrides
+        .get("local.url")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("LOCAL_ENDPOINT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+
+    let api_key = overrides
+        .get("local")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("LOCAL_API_KEY").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "local".to_string());
+
+    Some(ProviderConfig {
+        base_url,
+        api_key,
+        model: model.to_string(),
+    })
 }
 
 /// List all providers with key status.
