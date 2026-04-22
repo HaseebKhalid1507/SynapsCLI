@@ -19,7 +19,7 @@ use commands::CommandAction;
 use input::InputAction;
 use stream_handler::StreamAction;
 
-use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, find_session};
+use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, resolve_session};
 use synaps_cli::core::compaction::compact_conversation;
 use crossterm::{
     event::{EventStream, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
@@ -207,9 +207,9 @@ pub async fn run(
 
     // Session: continue existing or create new
     let mut app = match continue_session {
-        Some(maybe_id) => {
+        Some(ref maybe_id) => {
             let session = match maybe_id {
-                Some(id) => find_session(&id).unwrap_or_else(|e| {
+                Some(ref id) => resolve_session(id).unwrap_or_else(|e| {
                     eprintln!("Failed to load session '{}': {}", id, e);
                     std::process::exit(1);
                 }),
@@ -230,6 +230,16 @@ pub async fn run(
             app.abort_context = session.abort_context.clone();
             rebuild_display_messages(&session.api_messages, &mut app);
             app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
+            match continue_session.as_ref().and_then(|o| o.as_ref()) {
+                Some(q) if *q != session.id => {
+                    if synaps_cli::chain::load_chain(q).is_ok() {
+                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via chain '{}'", q)));
+                    } else if synaps_cli::session::find_session_by_name(q).is_ok() {
+                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via name '{}'", q)));
+                    }
+                }
+                _ => {}
+            }
             if app.abort_context.is_some() {
                 app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
             }
@@ -366,6 +376,9 @@ pub async fn run(
                     match handle.await {
                         Ok(Ok(summary)) => {
                             let old_id = app.session.id.clone();
+                            // Find chains pointing at the old head before we swap
+                            let chains_to_advance = synaps_cli::chain::find_all_chains_by_head(&old_id)
+                                .unwrap_or_default();
                             let new_session = Session::new_from_compaction(&app.session, summary.clone());
                             let new_id = new_session.id.clone();
                             // Save new session FIRST — if we crash after this but before
@@ -386,6 +399,22 @@ pub async fn run(
                                 }
                                 Err(e) => {
                                     tracing::warn!("Failed to update old session {}: {}", old_id, e);
+                                }
+                            }
+                            // Advance any named chains that pointed at the old head
+                            for ch in &chains_to_advance {
+                                match synaps_cli::chain::save_chain(&ch.name, &new_id) {
+                                    Ok(()) => {
+                                        app.push_msg(ChatMessage::System(format!(
+                                            "chain '{}' advanced: {} → {}",
+                                            ch.name, old_id, new_id
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        app.push_msg(ChatMessage::Error(format!(
+                                            "failed to advance chain '{}': {}", ch.name, e
+                                        )));
+                                    }
                                 }
                             }
                             // Flush any events that arrived during compaction
@@ -617,6 +646,77 @@ pub async fn run(
                                             }
                                             app.push_msg(ChatMessage::System(lines.join("\n")));
                                         }
+
+                                        // Show any named chain bookmarking the active head
+                                        match synaps_cli::chain::find_all_chains_by_head(&app.session.id) {
+                                            Ok(named) if !named.is_empty() => {
+                                                let names: Vec<String> = named.iter().map(|c| format!("@{}", c.name)).collect();
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "bookmarked by: {}", names.join(", ")
+                                                )));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    CommandAction::ChainList => {
+                                        match synaps_cli::chain::list_chains() {
+                                            Ok(chains) if chains.is_empty() => {
+                                                app.push_msg(ChatMessage::System("no named chains".to_string()));
+                                            }
+                                            Ok(chains) => {
+                                                app.push_msg(ChatMessage::System(format!("{} chain(s):", chains.len())));
+                                                for c in chains {
+                                                    let active = if c.head == app.session.id { " *" } else { "" };
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "  @{} → {}{}", c.name, c.head, active
+                                                    )));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("failed to list chains: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ChainName { name } => {
+                                        match synaps_cli::chain::save_chain(&name, &app.session.id) {
+                                            Ok(()) => {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "chain '{}' → {}", name, app.session.id
+                                                )));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("chain name failed: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ChainUnname { name } => {
+                                        match synaps_cli::chain::delete_chain(&name) {
+                                            Ok(()) => {
+                                                app.push_msg(ChatMessage::System(format!("chain '{}' deleted", name)));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("chain unname failed: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::SaveAs { name } => {
+                                        // handle_command already applies + saves inline; kept for API completeness.
+                                        match name {
+                                            Some(n) => {
+                                                match app.session.set_name(&n) {
+                                                    Ok(()) => {
+                                                        app.save_session().await;
+                                                        app.push_msg(ChatMessage::System(format!("session named '{}'", n)));
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!("saveas failed: {}", e))),
+                                                }
+                                            }
+                                            None => {
+                                                app.session.clear_name();
+                                                app.save_session().await;
+                                                app.push_msg(ChatMessage::System("session name cleared".into()));
+                                            }
+                                        }
                                     }
                                     CommandAction::Status => {
                                         app.push_msg(ChatMessage::System("Checking usage...".to_string()));
@@ -737,6 +837,10 @@ pub async fn run(
                                         CommandAction::LoadSkill { .. } => {}
                                         CommandAction::Compact { .. } => {}
                                         CommandAction::Chain => {}
+                                        CommandAction::ChainList => {}
+                                        CommandAction::ChainName { .. } => {}
+                                        CommandAction::ChainUnname { .. } => {}
+                                        CommandAction::SaveAs { .. } => {}
                                         CommandAction::Status => {}
                                     }
                                 } else {

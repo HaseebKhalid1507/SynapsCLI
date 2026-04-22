@@ -97,7 +97,7 @@ pub async fn run(
         match continue_session {
             Some(maybe_id) => {
                 let session = match maybe_id {
-                    Some(id) => synaps_cli::find_session(&id)?,
+                    Some(id) => synaps_cli::resolve_session(&id)?,
                     None => synaps_cli::latest_session()?,
                 };
                 runtime.set_model(session.model.clone());

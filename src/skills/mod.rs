@@ -48,7 +48,7 @@ pub struct LoadedSkill {
 /// `src/chatui/commands.rs::handle_command`.
 pub const BUILTIN_COMMANDS: &[&str] = &[
     "clear", "compact", "chain", "model", "system", "thinking", "sessions",
-    "resume", "theme", "gamba", "help", "quit", "exit",
+    "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
     "settings", "plugins", "status",
 ];
 
