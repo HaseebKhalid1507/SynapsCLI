@@ -157,10 +157,14 @@ impl StreamDecoder {
                         sink.extend(Some(OaiEvent::TextDelta(text)));
                     }
                 }
-                // Finish-chunk de-dup: ignore tool_calls on frames with finish_reason.
-                if !is_finish {
-                    if let Some(tcs) = delta.tool_calls {
-                        for tc in tcs {
+                // Process tool_calls — but de-dup finish-chunk re-sends.
+                // Some providers re-send the full tool_calls on the finish frame.
+                // We only skip if the chunk has finish_reason AND the tool_call
+                // has an id (indicating a full re-send, not a final argument delta).
+                if let Some(tcs) = delta.tool_calls {
+                    for tc in tcs {
+                        let is_resend = is_finish && tc.id.as_ref().is_some_and(|id| !id.is_empty());
+                        if !is_resend {
                             self.apply_tool_call_delta(tc, sink);
                         }
                     }
