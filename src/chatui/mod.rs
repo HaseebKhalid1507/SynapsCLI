@@ -282,13 +282,15 @@ pub async fn run(
     let mut last_frame = Instant::now();
 
     // Start inbox watcher — file-drop ingestion for external events
-    {
+    let watcher_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_task = {
         let inbox_dir = synaps_cli::config::base_dir().join("inbox");
         let event_queue = runtime.event_queue().clone();
+        let shutdown = watcher_shutdown.clone();
         tokio::spawn(async move {
-            synaps_cli::events::watch_inbox(inbox_dir, event_queue).await;
-        });
-    }
+            synaps_cli::events::watch_inbox(inbox_dir, event_queue, shutdown).await;
+        })
+    };
 
     // ── Event loop ──
     loop {
@@ -1022,6 +1024,10 @@ pub async fn run(
 
     // Save session on exit
     app.save_session().await;
+
+    // Signal the inbox watcher's blocking thread to exit, then abort the async task.
+    watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher_task.abort();
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();

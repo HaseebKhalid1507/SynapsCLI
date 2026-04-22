@@ -54,7 +54,7 @@ async fn scan_inbox(dir: &Path, queue: &EventQueue) {
     }
 }
 
-pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
+pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: Arc<std::sync::atomic::AtomicBool>) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
     #[cfg(unix)]
     {
@@ -69,6 +69,9 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
 
     // Use a tokio channel so the async runtime isn't blocked
     let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+
+    // Shutdown signal passed in from caller
+    let shutdown_flag = shutdown.clone();
 
     // Spawn the blocking notify watcher on a dedicated thread
     let inbox_clone = inbox_dir.clone();
@@ -91,17 +94,20 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>) {
         }
         tracing::info!("Inbox watcher (inotify) on {}", inbox_clone.display());
 
-        // Blocking loop on its own thread — doesn't touch tokio
+        // Blocking loop — checks shutdown flag every 500ms
         loop {
-            match rx.recv() {
+            if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(Ok(event)) => {
                     if !event.paths.is_empty() {
                         let _ = async_tx.send(event.paths);
                     }
                 }
                 Ok(Err(e)) => tracing::warn!("notify error: {}", e),
-                Err(_) => {
-                    tracing::error!("notify disconnected");
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     break;
                 }
             }
@@ -141,7 +147,7 @@ mod tests {
         let queue = Arc::new(EventQueue::new(10));
         let q = queue.clone();
         let ibx = inbox.clone();
-        let handle = tokio::spawn(async move { watch_inbox(ibx, q).await });
+        let handle = tokio::spawn(async move { watch_inbox(ibx, q, Arc::new(std::sync::atomic::AtomicBool::new(false))).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let event = Event::simple("test", "hello inbox", Some(Severity::High));
@@ -164,7 +170,7 @@ mod tests {
         let queue = Arc::new(EventQueue::new(10));
         let q = queue.clone();
         let ibx = inbox.clone();
-        let handle = tokio::spawn(async move { watch_inbox(ibx, q).await });
+        let handle = tokio::spawn(async move { watch_inbox(ibx, q, Arc::new(std::sync::atomic::AtomicBool::new(false))).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let path = inbox.join("bad.json");
