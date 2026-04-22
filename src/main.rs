@@ -11,7 +11,7 @@ struct Cli {
     profile: Option<String>,
 
     /// Continue a previous session (TUI only). Optionally provide a session ID.
-    #[arg(long = "continue", value_name = "SESSION_ID")]
+    #[arg(long = "continue", value_name = "NAME_OR_ID")]
     continue_session: Option<Option<String>>,
 
     /// System prompt: a string or path to a file (TUI only).
@@ -42,7 +42,7 @@ enum Command {
         host: String,
         #[arg(long = "system", short = 's')]
         system: Option<String>,
-        #[arg(long = "continue", value_name = "SESSION_ID")]
+        #[arg(long = "continue", value_name = "NAME_OR_ID")]
         continue_session: Option<Option<String>>,
     },
     /// WebSocket client

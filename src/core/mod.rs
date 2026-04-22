@@ -9,3 +9,4 @@ pub mod error;
 pub mod watcher_types;
 pub mod models;
 pub mod compaction;
+pub mod chain;

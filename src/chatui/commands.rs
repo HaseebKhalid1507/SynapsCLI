@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use synaps_cli::{Runtime, Session, list_sessions, find_session};
+use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
 
@@ -54,6 +54,14 @@ pub(super) enum CommandAction {
     },
     /// Show the session compaction chain.
     Chain,
+    /// List named chains.
+    ChainList,
+    /// Create/update a named chain pointing at the current session.
+    ChainName { name: String },
+    /// Delete a named chain.
+    ChainUnname { name: String },
+    /// Assign (or clear, if empty) a name to the current session. Persists via save.
+    SaveAs { name: Option<String> },
     /// Show account usage and reset times.
     Status,
 }
@@ -168,9 +176,10 @@ pub(super) async fn handle_command(
                     for s in sessions.iter().take(20) {
                         let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
                         let active = if s.id == app.session.id { " *" } else { "" };
+                        let name_tag = s.name.as_deref().map(|n| format!(" [@{}]", n)).unwrap_or_default();
                         app.push_msg(ChatMessage::System(format!(
-                            "  {} — {} [{}] ${:.4}{}",
-                            &s.id, title, s.model, s.session_cost, active
+                            "  {}{} — {} [{}] ${:.4}{}",
+                            &s.id, name_tag, title, s.model, s.session_cost, active
                         )));
                     }
                 }
@@ -181,9 +190,9 @@ pub(super) async fn handle_command(
         }
         "resume" => {
             if arg.is_empty() {
-                app.push_msg(ChatMessage::System("usage: /resume <session_id>".to_string()));
+                app.push_msg(ChatMessage::System("usage: /resume <name_or_id>".to_string()));
             } else {
-                match find_session(arg) {
+                match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
                         if let Some(ref sp) = session.system_prompt {
@@ -198,13 +207,39 @@ pub(super) async fn handle_command(
                         app.total_output_tokens = session.total_output_tokens;
                         app.session_cost = session.session_cost;
                         super::rebuild_display_messages(&session.api_messages, app);
+                        let new_id = session.id.clone();
                         app.session = session;
+                        let via = if synaps_cli::chain::load_chain(arg).is_ok() {
+                            format!(" (via chain '{}')", arg)
+                        } else if synaps_cli::session::find_session_by_name(arg).is_ok() {
+                            format!(" (via name '{}')", arg)
+                        } else {
+                            String::new()
+                        };
                         app.push_msg(ChatMessage::System(
-                            format!("switched from {} to {}", old_id, app.session.id)
+                            format!("switched from {} to {}{}", old_id, new_id, via)
                         ));
                     }
                     Err(e) => {
                         app.push_msg(ChatMessage::Error(format!("failed to load session: {}", e)));
+                    }
+                }
+            }
+        }
+        "saveas" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() {
+                app.session.clear_name();
+                app.save_session().await;
+                app.push_msg(ChatMessage::System("session name cleared".into()));
+            } else {
+                match app.session.set_name(trimmed) {
+                    Ok(()) => {
+                        app.save_session().await;
+                        app.push_msg(ChatMessage::System(format!("session named '{}'", trimmed)));
+                    }
+                    Err(e) => {
+                        app.push_msg(ChatMessage::Error(format!("saveas failed: {}", e)));
                     }
                 }
             }
@@ -214,11 +249,15 @@ pub(super) async fn handle_command(
                 "/clear — reset conversation",
                 "/compact [focus] — summarize & compact conversation history",
                 "/chain — show session compaction history",
+                "/chain list — list named chains",
+                "/chain name <name> — bookmark current session as <name> (auto-advances on compaction)",
+                "/chain unname <name> — delete a named chain",
+                "/saveas [name] — name the current session, or clear if empty",
                 "/model [name] — show or set model",
                 "/system <prompt|show|save> — system prompt",
                 "/thinking [low|medium|high|xhigh] — thinking budget",
                 "/sessions — list saved sessions",
-                "/resume <id> — switch to a different session",
+                "/resume <name_or_id> — switch to a different session (chain > name > id)",
                 "/help — show this",
                 "/theme — list available themes",
                 "/settings — open the settings menu",
@@ -268,7 +307,30 @@ pub(super) async fn handle_command(
             };
         }
         "chain" => {
-            return CommandAction::Chain;
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            let sub = parts.next().unwrap_or("").trim();
+            let rest = parts.next().unwrap_or("").trim();
+            match sub {
+                "" => return CommandAction::Chain,
+                "list" | "ls" => return CommandAction::ChainList,
+                "name" => {
+                    if rest.is_empty() {
+                        app.push_msg(ChatMessage::System("usage: /chain name <name>".into()));
+                        return CommandAction::None;
+                    }
+                    return CommandAction::ChainName { name: rest.to_string() };
+                }
+                "unname" | "rm" => {
+                    if rest.is_empty() {
+                        app.push_msg(ChatMessage::System("usage: /chain unname <name>".into()));
+                        return CommandAction::None;
+                    }
+                    return CommandAction::ChainUnname { name: rest.to_string() };
+                }
+                _ => {
+                    app.push_msg(ChatMessage::Error(format!("unknown /chain subcommand: {}", sub)));
+                }
+            }
         }
         "status" => {
             return CommandAction::Status;
