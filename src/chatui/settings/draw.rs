@@ -212,7 +212,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState) {
     let hint = if on_plugins_right && state.setting_idx == 0 {
         "↑↓ navigate  Tab switch pane  Enter open marketplace  Esc close"
     } else if on_plugins_right && state.setting_idx > 0 {
-        "↑↓ navigate  Tab switch pane  Enter/Space toggle  Esc close"
+        "↑↓ navigate  Tab switch pane  Space toggle  Esc close"
     } else {
         "↑↓ navigate  Tab switch pane  Enter edit  Esc close"
     };
