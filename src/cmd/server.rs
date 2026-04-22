@@ -1,4 +1,4 @@
-use synaps_cli::{Runtime, StreamEvent, CancellationToken, Session, truncate_str};
+use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, CancellationToken, Session, truncate_str};
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -307,7 +307,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     while let Some(event) = stream.next().await {
         let ts = ServerState::timestamp();
         match event {
-            StreamEvent::Thinking(text) => {
+            StreamEvent::Llm(LlmEvent::Thinking(text)) => {
                 let _ = broadcast.send(ServerMessage::Thinking { content: text.clone() });
                 // Append to last thinking entry or create new
                 let mut history = state.display_history.write().await;
@@ -317,7 +317,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     history.push(HistoryEntry::Thinking { content: text, time: ts });
                 }
             }
-            StreamEvent::Text(text) => {
+            StreamEvent::Llm(LlmEvent::Text(text)) => {
                 let _ = broadcast.send(ServerMessage::Text { content: text.clone() });
                 let mut history = state.display_history.write().await;
                 if let Some(HistoryEntry::Text { content: ref mut c, .. }) = history.last_mut() {
@@ -326,13 +326,13 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     history.push(HistoryEntry::Text { content: text, time: ts });
                 }
             }
-            StreamEvent::ToolUseStart(tool_name) => {
+            StreamEvent::Llm(LlmEvent::ToolUseStart(tool_name)) => {
                 let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
             }
-            StreamEvent::ToolUseDelta(delta) => {
+            StreamEvent::Llm(LlmEvent::ToolUseDelta(delta)) => {
                 let _ = broadcast.send(ServerMessage::ToolUseDelta(delta));
             }
-            StreamEvent::ToolUse { tool_name, tool_id, input } => {
+            StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
                 let _ = broadcast.send(ServerMessage::ToolUse {
                     tool_name: tool_name.clone(),
                     tool_id: tool_id.clone(),
@@ -344,13 +344,13 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     time: ts,
                 }).await;
             }
-            StreamEvent::ToolResultDelta { tool_id, delta } => {
+            StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, delta }) => {
                 let _ = broadcast.send(ServerMessage::ToolResultDelta {
                     tool_id,
                     delta,
                 });
             }
-            StreamEvent::ToolResult { tool_id: _, result } => {
+            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: _, result }) => {
                 let _ = broadcast.send(ServerMessage::ToolResult {
                     tool_id: String::new(),
                     result: result.clone(),
@@ -360,29 +360,29 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     time: ts,
                 }).await;
             }
-            StreamEvent::MessageHistory(history) => {
+            StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                 *state.api_messages.write().await = history;
                 state.save_session().await;
             }
-            StreamEvent::Usage {
+            StreamEvent::Session(SessionEvent::Usage {
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens: _,
                 cache_creation_input_tokens: _,
                 model: _,
-            } => {
+            }) => {
                 state.add_usage(input_tokens, output_tokens, &model).await;
                 let _ = broadcast.send(ServerMessage::Usage { input_tokens, output_tokens });
             }
-            StreamEvent::Done => {
+            StreamEvent::Session(SessionEvent::Done) => {
                 let _ = broadcast.send(ServerMessage::Done);
             }
             // Subagent events — not yet wired to server protocol
-            StreamEvent::SubagentStart { .. }
-            | StreamEvent::SubagentUpdate { .. }
-            | StreamEvent::SubagentDone { .. }
-            | StreamEvent::SteeringDelivered { .. } => {}
-            StreamEvent::Error(err) => {
+            StreamEvent::Agent(AgentEvent::SubagentStart { .. })
+            | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
+            | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
+            | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. }) => {}
+            StreamEvent::Session(SessionEvent::Error(err)) => {
                 let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
                 state.push_history(HistoryEntry::Error {
                     content: err,

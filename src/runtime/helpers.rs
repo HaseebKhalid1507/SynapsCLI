@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use super::types::StreamEvent;
+use super::types::{StreamEvent, AgentEvent};
 use crate::truncate_str;
 
 pub(super) struct HelperMethods;
@@ -21,7 +21,7 @@ impl HelperMethods {
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
             tracing::info!("Steering message injected: {}", truncate_str(&msg, 80));
-            let _ = tx.send(StreamEvent::SteeringDelivered { message: msg.clone() });
+            let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered { message: msg.clone() }));
             messages.push(json!({"role": "user", "content": msg}));
             injected = true;
         }

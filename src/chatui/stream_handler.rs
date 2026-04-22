@@ -1,7 +1,7 @@
 //! Stream event handling — processes StreamEvent variants from the runtime.
 
 
-use synaps_cli::{Runtime, StreamEvent};
+use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 
 use super::app::{App, ChatMessage, SubagentState};
 
@@ -18,14 +18,14 @@ pub(super) enum StreamAction {
 /// Returns true if the event should trigger an immediate redraw.
 pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
     matches!(event,
-        StreamEvent::ToolUse { .. }
-        | StreamEvent::ToolResult { .. }
-        | StreamEvent::SubagentStart { .. }
-        | StreamEvent::SubagentUpdate { .. }
-        | StreamEvent::SubagentDone { .. }
-        | StreamEvent::SteeringDelivered { .. }
-        | StreamEvent::Done
-        | StreamEvent::Error(_)
+        StreamEvent::Llm(LlmEvent::ToolUse { .. })
+        | StreamEvent::Llm(LlmEvent::ToolResult { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
+        | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
+        | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. })
+        | StreamEvent::Session(SessionEvent::Done)
+        | StreamEvent::Session(SessionEvent::Error(_))
     )
 }
 
@@ -36,17 +36,17 @@ pub(super) async fn handle_stream_event(
     runtime: &Runtime,
 ) -> StreamAction {
     match event {
-        StreamEvent::Thinking(text) => {
+        StreamEvent::Llm(LlmEvent::Thinking(text)) => {
             app.append_or_update_thinking(&text);
         }
-        StreamEvent::Text(text) => {
+        StreamEvent::Llm(LlmEvent::Text(text)) => {
             app.append_or_update_text(&text);
         }
-        StreamEvent::ToolUseStart(name) => {
+        StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
             app.tool_start_time = Some(std::time::Instant::now());
             app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
         }
-        StreamEvent::ToolUseDelta(delta) => {
+        StreamEvent::Llm(LlmEvent::ToolUseDelta(delta)) => {
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
                     partial.push_str(&delta);
@@ -54,7 +54,7 @@ pub(super) async fn handle_stream_event(
                 }
             }
         }
-        StreamEvent::ToolUse { tool_name, input, .. } => {
+        StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
             app.tool_start_time = Some(std::time::Instant::now());
             let input_str = serde_json::to_string(&input).unwrap_or_default();
             if let Some(last) = app.messages.last_mut() {
@@ -68,7 +68,7 @@ pub(super) async fn handle_stream_event(
             }
             app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
         }
-        StreamEvent::ToolResultDelta { delta, .. } => {
+        StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, .. }) => {
             if let Some(last) = app.messages.last_mut() {
                 if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
                     content.push_str(&delta);
@@ -78,7 +78,7 @@ pub(super) async fn handle_stream_event(
             }
             app.push_msg(ChatMessage::ToolResult { content: delta, elapsed_ms: None });
         }
-        StreamEvent::ToolResult { result, .. } => {
+        StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
             let elapsed = app.tool_start_time.take()
                 .map(|t| t.elapsed().as_millis() as u64);
             if let Some(last) = app.messages.last_mut() {
@@ -91,11 +91,11 @@ pub(super) async fn handle_stream_event(
             }
             app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms: elapsed });
         }
-        StreamEvent::MessageHistory(history) => {
+        StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             app.api_messages = history;
             app.save_session().await;
         }
-        StreamEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+        StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
             app.subagents.push(SubagentState {
                 id: subagent_id,
                 name: agent_name,
@@ -106,13 +106,13 @@ pub(super) async fn handle_stream_event(
             });
             app.invalidate();
         }
-        StreamEvent::SubagentUpdate { subagent_id, status, .. } => {
+        StreamEvent::Agent(AgentEvent::SubagentUpdate { subagent_id, status, .. }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.status = status;
             }
             app.invalidate();
         }
-        StreamEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. } => {
+        StreamEvent::Agent(AgentEvent::SubagentDone { subagent_id, result_preview, duration_secs, .. }) => {
             if let Some(sa) = app.subagents.iter_mut().find(|s| s.id == subagent_id) {
                 sa.done = true;
                 sa.duration_secs = Some(duration_secs);
@@ -127,7 +127,7 @@ pub(super) async fn handle_stream_event(
             }
             app.invalidate();
         }
-        StreamEvent::SteeringDelivered { message } => {
+        StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
             app.push_msg(ChatMessage::User(message.clone()));
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
@@ -136,13 +136,13 @@ pub(super) async fn handle_stream_event(
             app.scroll_pinned = true;
             app.invalidate();
         }
-        StreamEvent::Usage {
+        StreamEvent::Session(SessionEvent::Usage {
             input_tokens,
             output_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
             model: usage_model,
-        } => {
+        }) => {
             let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
             app.add_usage(
                 input_tokens,
@@ -153,7 +153,7 @@ pub(super) async fn handle_stream_event(
                 Some(runtime.context_window()),
             );
         }
-        StreamEvent::Done => {
+        StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
             app.subagents.clear();
             // Clean up finished reactive subagent handles
@@ -181,7 +181,7 @@ pub(super) async fn handle_stream_event(
                 return StreamAction::AutoTriggerEvents;
             }
         }
-        StreamEvent::Error(err) => {
+        StreamEvent::Session(SessionEvent::Error(err)) => {
             app.push_msg(ChatMessage::Error(err));
             app.streaming = false;
             app.subagents.clear();

@@ -16,7 +16,7 @@ pub use core::watcher_types;
 pub use core::models;
 pub use core::chain;
 
-pub use runtime::{Runtime, StreamEvent};
+pub use runtime::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, resolve_session, find_session_by_name, validate_name};
 pub use error::{RuntimeError, Result};
