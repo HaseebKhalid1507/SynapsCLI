@@ -1,11 +1,16 @@
 //! TmuxController — manages the control mode connection to tmux.
+//!
+//! tmux requires a real PTY even for control mode (`tmux -CC`).
+//! We use `portable-pty` to provide one, then read/write the master fd
+//! for the control mode protocol.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{oneshot, RwLock};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::protocol::TmuxEvent;
 use super::state::TmuxState;
@@ -19,19 +24,16 @@ pub struct CommandResult {
 
 /// The main tmux controller. Owns the control mode process and state.
 pub struct TmuxController {
-    /// Child process handle for the control mode client
-    child: Option<Child>,
-    /// Writer to control mode stdin (wrapped in Mutex for interior mutability)
-    writer: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
+    /// Writer to the PTY master (sends commands to tmux CC stdin)
+    writer: Option<Arc<std::sync::Mutex<Box<dyn Write + Send>>>>,
     /// Tracked state of all tmux objects
     state: Arc<RwLock<TmuxState>>,
     /// FIFO queue of pending command response waiters.
-    /// Commands are serialized through `writer` mutex, so responses arrive
-    /// in the same order. The reader task pops the front waiter on each
-    /// `%begin`, collects data lines, and resolves on `%end`/`%error`.
     response_queue: Arc<tokio::sync::Mutex<VecDeque<oneshot::Sender<CommandResult>>>>,
-    /// Set to true when the reader task detects the control mode pipe has closed.
+    /// Set to false when the reader task detects the control mode pipe has closed.
     alive: Arc<AtomicBool>,
+    /// Child process killer handle
+    child_killer: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     /// Session name
     pub session_name: String,
 }
@@ -49,11 +51,11 @@ impl TmuxController {
     /// Create a new controller (does not start the connection yet).
     pub fn new(session_name: String) -> Self {
         Self {
-            child: None,
             writer: None,
             state: Arc::new(RwLock::new(TmuxState::new("", &session_name))),
             response_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             alive: Arc::new(AtomicBool::new(false)),
+            child_killer: None,
             session_name,
         }
     }
@@ -70,90 +72,127 @@ impl TmuxController {
 
     /// Start a tmux session and connect via control mode.
     ///
-    /// Uses a single `tmux -CC new-session` call to create the session
-    /// AND connect in control mode atomically.  Waits for the initial
-    /// `%begin`/`%end` handshake before returning to guarantee the pipe
-    /// is live.
+    /// Spawns `tmux -CC new-session` inside a real PTY (tmux requires one
+    /// even for control mode). Waits for the initial `%begin`/`%end`
+    /// handshake before returning.
     pub async fn start(&mut self) -> Result<(), String> {
         let tmux_path = crate::tmux::find_tmux()
             .ok_or_else(|| "tmux not found in PATH".to_string())?;
 
         // Kill any stale session with the same name (clean slate model)
-        let has_existing = Command::new(&tmux_path)
+        let has_existing = std::process::Command::new(&tmux_path)
             .args(["has-session", "-t", &self.session_name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .await
             .map(|s| s.success())
             .unwrap_or(false);
 
         if has_existing {
             tracing::info!("killing stale tmux session '{}'", self.session_name);
-            let _ = Command::new(&tmux_path)
+            let _ = std::process::Command::new(&tmux_path)
                 .args(["kill-session", "-t", &self.session_name])
-                .status()
-                .await;
+                .status();
         }
 
         // Get terminal size
         let (cols, rows) = crossterm::terminal::size().unwrap_or((200, 50));
 
-        // Single-step: create session AND attach in control mode.
-        // This is the canonical way to use tmux control mode — avoids the
-        // race between create-detached and attach that caused broken pipes.
-        let mut child = Command::new(&tmux_path)
-            .args([
-                "-CC", "new-session",
-                "-s", &self.session_name,
-                "-x", &cols.to_string(),
-                "-y", &rows.to_string(),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start tmux control mode: {}", e))?;
+        // Open a PTY pair — tmux needs a real terminal even for -CC mode
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Failed to open PTY for tmux: {}", e))?;
 
-        let stdout = child.stdout.take()
-            .ok_or_else(|| "Failed to capture stdout".to_string())?;
-        let stdin = child.stdin.take()
-            .ok_or_else(|| "Failed to capture stdin".to_string())?;
-        let stderr = child.stderr.take();
+        // Build the command: tmux -CC new-session -s <name> -x <cols> -y <rows>
+        let mut cmd = CommandBuilder::new(&tmux_path);
+        cmd.args([
+            "-CC", "new-session",
+            "-s", &self.session_name,
+            "-x", &cols.to_string(),
+            "-y", &rows.to_string(),
+        ]);
+        cmd.env("TERM", "xterm-256color");
 
-        // Spawn a task to drain stderr and log it (so we can diagnose failures)
-        if let Some(stderr) = stderr {
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!("tmux stderr: {}", line);
-                }
-            });
-        }
+        // Spawn on the slave side of the PTY
+        let mut child = pair.slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("Failed to spawn tmux control mode: {}", e))?;
 
-        let writer = Arc::new(tokio::sync::Mutex::new(stdin));
-        self.writer = Some(writer);
-        self.child = Some(child);
+        // Drop the slave — the child process owns its end now
+        drop(pair.slave);
+
+        // Get writer (master → child stdin)
+        let writer = pair.master
+            .take_writer()
+            .map_err(|e| format!("Failed to take PTY writer: {}", e))?;
+
+        // Get reader (child stdout → master)
+        let reader = pair.master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
+
+        // Keep master alive so the PTY doesn't close
+        // (portable-pty drops the fd when the master is dropped)
+        std::mem::forget(pair.master);
+
+        self.writer = Some(Arc::new(std::sync::Mutex::new(writer)));
+        self.child_killer = Some(child.clone_killer());
         self.alive.store(true, Ordering::Relaxed);
 
-        // Channel for the reader task to signal that the initial handshake
-        // (%begin/%end for the implicit command on connect) has completed.
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        // Channel for readiness signal
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        // Start reader task
+        // Spawn blocking reader task — reads control mode output from the PTY
         let response_queue = Arc::clone(&self.response_queue);
         let alive = Arc::clone(&self.alive);
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
+        tokio::task::spawn_blocking(move || {
+            let buf_reader = BufReader::new(reader);
             let mut current_waiter: Option<oneshot::Sender<CommandResult>> = None;
             let mut current_lines: Vec<String> = Vec::new();
             let mut in_command = false;
             let mut ready_tx = Some(ready_tx);
             let mut handshake_done = false;
 
-            while let Ok(Some(line)) = lines.next_line().await {
+            for line_result in buf_reader.lines() {
+                let line = match line_result {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+
+                // Strip DCS escape sequences that tmux sends on connect.
+                // The DCS `\x1bP1000p` may be glued to the first real line
+                // (no newline separator), so we strip it rather than skip.
+                let line = if let Some(pos) = line.find("%begin") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%end") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%error") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%output") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%window") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%session") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%layout") {
+                    line[pos..].to_string()
+                } else if let Some(pos) = line.find("%pane") {
+                    line[pos..].to_string()
+                } else if line.starts_with('\x1b') || line.starts_with('\u{1b}') {
+                    // Pure escape sequence with no tmux event — skip
+                    continue;
+                } else if line.is_empty() {
+                    continue;
+                } else {
+                    line
+                };
+
                 if let Some(event) = TmuxEvent::parse(&line) {
                     match &event {
                         TmuxEvent::Begin { .. } => {
@@ -162,20 +201,23 @@ impl TmuxController {
 
                             if handshake_done {
                                 // Normal command — pop waiter from FIFO queue
-                                let mut q = response_queue.lock().await;
-                                current_waiter = q.pop_front();
+                                // Use blocking approach: try_lock in a loop
+                                let rt = tokio::runtime::Handle::current();
+                                if let Ok(mut q) = rt.block_on(async {
+                                    Ok::<_, ()>(response_queue.lock().await)
+                                }) {
+                                    current_waiter = q.pop_front();
+                                }
                             }
-                            // First %begin is the implicit handshake — no waiter
                         }
                         TmuxEvent::End { .. } | TmuxEvent::Error { .. } => {
                             let success = matches!(&event, TmuxEvent::End { .. });
 
                             if in_command {
                                 if !handshake_done {
-                                    // Initial handshake complete — signal readiness
                                     handshake_done = true;
                                     if let Some(tx) = ready_tx.take() {
-                                        let _ = tx.send(());
+                                        let _ = tx.send(Ok(()));
                                     }
                                 } else if let Some(sender) = current_waiter.take() {
                                     let _ = sender.send(CommandResult {
@@ -199,60 +241,58 @@ impl TmuxController {
                 }
             }
 
-            // Stdout closed — control mode process has exited
+            // Reader exited — control mode is dead
             alive.store(false, Ordering::Relaxed);
 
-            // Drain any remaining waiters with an error
-            let mut q = response_queue.lock().await;
-            while let Some(sender) = q.pop_front() {
-                let _ = sender.send(CommandResult {
-                    lines: vec!["control mode disconnected".to_string()],
-                    success: false,
-                });
+            // Drain pending waiters
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(async {
+                let mut q = response_queue.lock().await;
+                while let Some(sender) = q.pop_front() {
+                    let _ = sender.send(CommandResult {
+                        lines: vec!["control mode disconnected".to_string()],
+                        success: false,
+                    });
+                }
+            });
+
+            // If we never completed handshake, signal failure
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err("tmux control mode exited before handshake completed".to_string()));
             }
 
-            // If we never completed the handshake, unblock start()
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(());
-            }
+            // Wait for child to exit
+            let _ = child.wait();
 
             tracing::debug!("tmux control mode reader exited");
         });
 
-        // Wait for the initial handshake with a timeout.
-        // tmux sends %begin/%end on connect — if we don't see it within 5s,
-        // the process probably died immediately.
+        // Wait for handshake with timeout
         match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await {
-            Ok(Ok(())) if self.alive.load(Ordering::Relaxed) => {
+            Ok(Ok(Ok(()))) => {
                 tracing::info!("tmux control mode connected to session '{}'", self.session_name);
                 Ok(())
             }
-            _ => {
-                // Try to get exit status for a better error message
-                let exit_info = if let Some(ref mut child) = self.child {
-                    match child.try_wait() {
-                        Ok(Some(status)) => format!(" (exit status: {})", status),
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
+            Ok(Ok(Err(e))) => {
+                self.alive.store(false, Ordering::Relaxed);
+                Err(e)
+            }
+            Ok(Err(_)) => {
+                self.alive.store(false, Ordering::Relaxed);
+                Err("tmux control mode channel dropped before handshake".to_string())
+            }
+            Err(_) => {
                 self.alive.store(false, Ordering::Relaxed);
                 Err(format!(
-                    "tmux control mode failed to start{} — check `tmux` version and session name '{}'",
-                    exit_info, self.session_name
+                    "tmux control mode timed out waiting for handshake (5s) — session '{}'",
+                    self.session_name
                 ))
             }
         }
     }
 
     /// Send a command to tmux control mode and wait for its response.
-    ///
-    /// Commands are serialized: the writer mutex ensures only one command
-    /// is in-flight at a time, and the reader task resolves responses in
-    /// FIFO order via the `response_queue`.
     pub async fn execute(&self, cmd: &str, args: &[&str]) -> Result<CommandResult, String> {
-        // Check liveness before attempting to write
         if !self.alive.load(Ordering::Relaxed) {
             return Err("tmux control mode is not running".to_string());
         }
@@ -262,32 +302,30 @@ impl TmuxController {
 
         let formatted = Self::format_command(cmd, args);
 
-        // Create a oneshot channel for this command's response
+        // Create oneshot for response
         let (tx, rx) = oneshot::channel();
 
-        // Enqueue the waiter BEFORE writing the command
+        // Enqueue waiter BEFORE writing
         {
             let mut q = self.response_queue.lock().await;
             q.push_back(tx);
         }
 
-        // Write to stdin (serialized by the mutex)
+        // Write to PTY (synchronous write via std::sync::Mutex)
         {
-            let mut w = writer.lock().await;
-            if let Err(e) = w.write_all(formatted.as_bytes()).await {
-                // Write failed — remove our waiter and report
-                let mut q = self.response_queue.lock().await;
-                q.pop_back(); // best-effort remove (it's the last one we pushed)
-                return Err(format!("Failed to write command: {} — control mode may have exited", e));
-            }
-            if let Err(e) = w.flush().await {
-                let mut q = self.response_queue.lock().await;
-                q.pop_back();
-                return Err(format!("Failed to flush command: {} — control mode may have exited", e));
-            }
+            let mut w = writer.lock()
+                .map_err(|_| "Writer mutex poisoned".to_string())?;
+            w.write_all(formatted.as_bytes())
+                .map_err(|e| {
+                    format!("Failed to write command: {} — control mode may have exited", e)
+                })?;
+            w.flush()
+                .map_err(|e| {
+                    format!("Failed to flush command: {} — control mode may have exited", e)
+                })?;
         }
 
-        // Wait for the reader task to resolve our response
+        // Wait for response
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(result)) => {
                 if result.success {
@@ -311,13 +349,12 @@ impl TmuxController {
     pub async fn shutdown(&mut self) -> Result<(), String> {
         self.alive.store(false, Ordering::Relaxed);
         if let Some(tmux_path) = crate::tmux::find_tmux() {
-            let _ = Command::new(&tmux_path)
+            let _ = std::process::Command::new(&tmux_path)
                 .args(["kill-session", "-t", &self.session_name])
-                .status()
-                .await;
+                .status();
         }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
+        if let Some(ref mut killer) = self.child_killer {
+            let _ = killer.kill();
         }
         self.writer = None;
         Ok(())
@@ -397,9 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_when_dead() {
-        // Simulate a controller where alive=false but writer exists
         let controller = TmuxController::new("test-dead".to_string());
-        // alive defaults to false, so execute should fail immediately
         let result = controller.execute("list-windows", &[]).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not running"));
