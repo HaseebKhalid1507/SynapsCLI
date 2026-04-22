@@ -52,7 +52,7 @@ impl Tool for SubagentTool {
         let agent_name = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
         let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => {
@@ -74,7 +74,7 @@ impl Tool for SubagentTool {
 
         tracing::info!("Dispatching subagent '{}' (id={}) with model {}", label, subagent_id, model);
 
-        if let Some(ref tx) = ctx.tx_events {
+        if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::SubagentStart {
                 subagent_id,
                 agent_name: label.clone(),
@@ -87,7 +87,7 @@ impl Tool for SubagentTool {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
         let label_inner = label.clone();
         let model_inner = model.clone();
-        let tx_events_inner = ctx.tx_events.clone();
+        let tx_events_inner = ctx.channels.tx_events.clone();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -314,7 +314,7 @@ impl Tool for SubagentTool {
             Ok(Ok(sa_result)) => {
                 let preview: String = sa_result.text.chars().take(120).collect();
 
-                if let Some(ref tx) = ctx.tx_events {
+                if let Some(ref tx) = ctx.channels.tx_events {
                     let _ = tx.send(crate::StreamEvent::Usage {
                         input_tokens: sa_result.input_tokens,
                         output_tokens: sa_result.output_tokens,
@@ -344,7 +344,7 @@ impl Tool for SubagentTool {
                 Ok(format!("[subagent:{}] {}", label, sa_result.text))
             }
             Ok(Err(e)) => {
-                if let Some(ref tx) = ctx.tx_events {
+                if let Some(ref tx) = ctx.channels.tx_events {
                     let _ = tx.send(crate::StreamEvent::SubagentDone {
                         subagent_id,
                         agent_name: label.clone(),
@@ -357,7 +357,7 @@ impl Tool for SubagentTool {
                 Ok(format!("[subagent:{} ERROR] {}", label, e))
             }
             Err(_) => {
-                if let Some(ref tx) = ctx.tx_events {
+                if let Some(ref tx) = ctx.channels.tx_events {
                     let _ = tx.send(crate::StreamEvent::SubagentDone {
                         subagent_id,
                         agent_name: label.clone(),

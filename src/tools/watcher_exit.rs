@@ -64,7 +64,7 @@ impl Tool for WatcherExitTool {
         };
 
         // Write handoff state to the specified path if provided
-        if let Some(ref path) = ctx.watcher_exit_path {
+        if let Some(ref path) = ctx.capabilities.watcher_exit_path {
             let json_content = serde_json::to_string_pretty(&handoff)
                 .map_err(|e| RuntimeError::Tool(format!("Failed to serialize handoff: {}", e)))?;
             

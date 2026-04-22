@@ -28,7 +28,7 @@ impl Tool for ShellEndTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let mgr = ctx.session_manager.as_ref()
+        let mgr = ctx.capabilities.session_manager.as_ref()
             .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
         
         let session_id = params["session_id"].as_str()

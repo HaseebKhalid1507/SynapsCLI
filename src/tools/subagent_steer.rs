@@ -55,7 +55,7 @@ impl Tool for SubagentSteerTool {
 
         // ── Registry lookup ────────────────────────────────────────────────────
 
-        let registry = ctx.subagent_registry.as_ref()
+        let registry = ctx.capabilities.subagent_registry.as_ref()
             .ok_or_else(|| RuntimeError::Tool(
                 "SubagentRegistry not available on this ToolContext".to_string()
             ))?;

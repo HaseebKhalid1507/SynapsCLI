@@ -123,7 +123,7 @@ impl Tool for McpConnectTool {
         }
 
         // Send new tools to the runtime for registration (via channel, no circular Arc)
-        if let Some(ref tx) = ctx.tool_register_tx {
+        if let Some(ref tx) = ctx.capabilities.tool_register_tx {
             let _ = tx.send(new_tools);
         }
 
