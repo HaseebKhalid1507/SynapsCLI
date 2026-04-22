@@ -260,11 +260,9 @@ pub async fn run(
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
     app.last_turn_context_window = runtime.context_window();
+    // MCP server count logged but not shown — the banner hides the ASCII art.
     if mcp_server_count > 0 {
-        app.push_msg(ChatMessage::System(format!(
-            "⚡ {} MCP servers available (use connect_mcp_server to activate)",
-            mcp_server_count
-        )));
+        tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
     }
 
     // ── Terminal setup ──
@@ -395,6 +393,8 @@ pub async fn run(
                             match synaps_cli::core::session::Session::load(&old_id) {
                                 Ok(mut old_session) => {
                                     old_session.compacted_into = Some(new_id.clone());
+                                    // Clear name from old session — it transferred to the new one
+                                    old_session.name = None;
                                     old_session.save().await.ok();
                                 }
                                 Err(e) => {

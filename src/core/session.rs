@@ -72,6 +72,10 @@ impl Session {
     pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
         let now = Utc::now();
         let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().to_string()[..4]);
+        // Transfer session name from parent — the compacted session is the
+        // continuation, so the name should follow. Parent's name will be
+        // cleared when the caller saves it with compacted_into set.
+        let name = parent.name.clone();
         let mut summary_parts = String::new();
         if let Some(ref sp) = parent.system_prompt {
             summary_parts.push_str(&format!("<system-prompt>\n{}\n</system-prompt>\n\n", sp));
@@ -83,7 +87,7 @@ impl Session {
         Session {
             id,
             title: format!("↳ {}", if parent.title.is_empty() { &parent.id } else { &parent.title }),
-            name: None,
+            name,
             model: parent.model.clone(),
             thinking_level: parent.thinking_level.clone(),
             system_prompt: parent.system_prompt.clone(),
