@@ -274,6 +274,7 @@ mod tests {
             model: "m".into(),
             thinking: "medium".into(),
             context_window: "auto".into(),
+            compaction_model: "m".into(),
             max_tool_output: 0,
             bash_timeout: 0,
             bash_max_timeout: 0,

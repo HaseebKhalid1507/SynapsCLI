@@ -321,7 +321,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str) {
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let hint = match (&state.focus, &state.mode) {
-        (_, RightMode::Detail { .. }) => "Esc back",
+        (_, RightMode::Detail { .. }) => "Esc back  i install  u update  U uninstall",
         (_, RightMode::AddMarketplaceEditor { .. }) => "Type URL  Enter submit  Esc cancel",
         (_, RightMode::TrustPrompt { .. }) => "y trust  n cancel",
         (_, RightMode::Confirm { .. }) => "y yes  n no  Esc cancel",

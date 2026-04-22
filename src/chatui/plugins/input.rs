@@ -135,6 +135,32 @@ fn confirm_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
 fn detail_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
     match key.code {
         KeyCode::Esc => { state.mode = RightMode::List; InputOutcome::None }
+        KeyCode::Char('U') => {
+            // Grab the row index from the detail, switch back to list, then
+            // use ask_uninstall which reads selected_right.
+            let RightMode::Detail { row_idx } = state.mode else {
+                return InputOutcome::None;
+            };
+            state.selected_right = row_idx;
+            state.mode = RightMode::List;
+            ask_uninstall(state)
+        }
+        KeyCode::Char('u') => {
+            let RightMode::Detail { row_idx } = state.mode else {
+                return InputOutcome::None;
+            };
+            state.selected_right = row_idx;
+            state.mode = RightMode::List;
+            update_on_row(state)
+        }
+        KeyCode::Char('i') => {
+            let RightMode::Detail { row_idx } = state.mode else {
+                return InputOutcome::None;
+            };
+            state.selected_right = row_idx;
+            state.mode = RightMode::List;
+            install_on_row(state)
+        }
         _ => InputOutcome::None,
     }
 }
@@ -169,18 +195,24 @@ fn toggle_installed(state: &mut PluginsModalState, enabled: bool) -> InputOutcom
 
 fn update_on_row(state: &mut PluginsModalState) -> InputOutcome {
     let rows = state.right_rows();
-    if let Some(super::state::RightRow::Installed(p)) = rows.get(state.selected_right) {
-        return InputOutcome::Update(p.name.clone());
+    match rows.get(state.selected_right) {
+        Some(super::state::RightRow::Installed(p)) => InputOutcome::Update(p.name.clone()),
+        Some(super::state::RightRow::Browseable { plugin, installed: true }) => InputOutcome::Update(plugin.name.clone()),
+        _ => InputOutcome::None,
     }
-    InputOutcome::None
 }
 
 fn ask_uninstall(state: &mut PluginsModalState) -> InputOutcome {
     let rows = state.right_rows();
-    if let Some(super::state::RightRow::Installed(p)) = rows.get(state.selected_right) {
+    let name = match rows.get(state.selected_right) {
+        Some(super::state::RightRow::Installed(p)) => Some(p.name.clone()),
+        Some(super::state::RightRow::Browseable { plugin, installed: true }) => Some(plugin.name.clone()),
+        _ => None,
+    };
+    if let Some(name) = name {
         state.mode = RightMode::Confirm {
-            prompt: format!("Uninstall '{}'? y/n", p.name),
-            on_yes: crate::chatui::plugins::state::ConfirmAction::Uninstall(p.name.clone()),
+            prompt: format!("Uninstall '{}'? y/n", name),
+            on_yes: crate::chatui::plugins::state::ConfirmAction::Uninstall(name),
         };
     }
     InputOutcome::None
@@ -343,6 +375,87 @@ mod tests {
                 assert!(prompt.contains("2 plugin"));
             }
             other => panic!("expected Confirm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn uninstall_from_marketplace_browseable_view() {
+        use synaps_cli::skills::state::{Marketplace, InstalledPlugin, CachedPlugin};
+        use crate::chatui::plugins::state::{RightMode, ConfirmAction};
+        let mut file = PluginsState::default();
+        file.marketplaces.push(Marketplace {
+            name: "mp".into(),
+            url: "https://example/mp".into(),
+            description: None,
+            last_refreshed: None,
+            cached_plugins: vec![
+                CachedPlugin {
+                    name: "web".into(),
+                    source: "https://github.com/x/web.git".into(),
+                    version: None,
+                    description: None,
+                },
+            ],
+            repo_url: None,
+        });
+        file.installed.push(InstalledPlugin {
+            name: "web".into(),
+            marketplace: Some("mp".into()),
+            source_url: "https://github.com/x/web.git".into(),
+            installed_commit: "abc".into(),
+            latest_commit: None,
+            installed_at: "now".into(),
+            source_subdir: None,
+        });
+        let mut s = crate::chatui::plugins::PluginsModalState::new(file);
+        s.selected_left = 1; // marketplace row
+        s.selected_right = 0; // "web" plugin (Browseable { installed: true })
+        s.focus = crate::chatui::plugins::state::Focus::Right;
+
+        // Press U to ask uninstall
+        handle_event(&mut s, KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
+        match &s.mode {
+            RightMode::Confirm { prompt, on_yes } => {
+                assert!(prompt.contains("web"), "prompt should mention plugin name, got: {}", prompt);
+                assert!(matches!(on_yes, ConfirmAction::Uninstall(n) if n == "web"));
+            }
+            other => panic!("expected Confirm dialog, got {:?}", other),
+        }
+
+        // Pressing y should emit Uninstall outcome
+        let out = handle_event(&mut s, key(KeyCode::Char('y')));
+        assert!(matches!(out, InputOutcome::Uninstall(ref n) if n == "web"));
+    }
+
+    #[test]
+    fn uninstall_from_detail_view() {
+        use synaps_cli::skills::state::InstalledPlugin;
+        use crate::chatui::plugins::state::{RightMode, ConfirmAction};
+        let mut file = PluginsState::default();
+        file.installed.push(InstalledPlugin {
+            name: "tools".into(),
+            marketplace: None,
+            source_url: "https://github.com/x/tools.git".into(),
+            installed_commit: "abc".into(),
+            latest_commit: None,
+            installed_at: "now".into(),
+            source_subdir: None,
+        });
+        let mut s = crate::chatui::plugins::PluginsModalState::new(file);
+        s.selected_left = 0; // Installed
+        s.selected_right = 0;
+        s.focus = crate::chatui::plugins::state::Focus::Right;
+        // Enter detail view
+        s.mode = RightMode::Detail { row_idx: 0 };
+
+        // Press U while in detail view
+        handle_event(&mut s, KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
+        match &s.mode {
+            RightMode::Confirm { prompt, on_yes } => {
+                assert!(prompt.contains("tools"), "prompt should mention plugin name, got: {}", prompt);
+                assert!(matches!(on_yes, ConfirmAction::Uninstall(n) if n == "tools"));
+            }
+            other => panic!("expected Confirm dialog, got {:?}", other),
         }
     }
 }
