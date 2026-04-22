@@ -120,8 +120,13 @@ pub(crate) fn handle_event(
                 KeyCode::Char(' ') if state.setting_idx == 0 => {
                     return InputOutcome::None;
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => {
+                // Only Space toggles — Enter is reserved for drill-down (future).
+                KeyCode::Char(' ') => {
                     return toggle_at(state.setting_idx - 1);
+                }
+                KeyCode::Enter => {
+                    // TODO: drill into plugin detail view
+                    return InputOutcome::None;
                 }
                 _ => {}
             }
@@ -446,10 +451,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_plugin_row_toggles_off() {
-        // Row 1 is the first plugin (p1).
+    fn enter_on_plugin_row_is_noop() {
+        // Enter on a plugin row should NOT toggle — only Space does.
         let mut state = plugins_state_at(1);
         let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        assert!(matches!(out, InputOutcome::None));
+    }
+
+    #[test]
+    fn space_on_plugin_row_toggles_off() {
+        // Row 1 is the first plugin (p1).
+        let mut state = plugins_state_at(1);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p1");
@@ -460,10 +473,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_disabled_plugin_toggles_on() {
-        // Row 2 is the second plugin (p2, disabled).
+    fn enter_on_disabled_plugin_is_noop() {
+        // Enter on a disabled plugin row should NOT toggle.
         let mut state = plugins_state_at(2);
         let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        assert!(matches!(out, InputOutcome::None));
+    }
+
+    #[test]
+    fn space_on_disabled_plugin_toggles_on() {
+        // Row 2 is the second plugin (p2, disabled).
+        let mut state = plugins_state_at(2);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p2");

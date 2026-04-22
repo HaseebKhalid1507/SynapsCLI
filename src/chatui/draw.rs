@@ -489,6 +489,40 @@ pub(crate) fn draw(
                 col += cw;
             }
             rows.push(current_row);
+
+            // Ghost text hint: show fuzzy command suggestion as dimmed text
+            if app.input.starts_with('/') && app.input.len() > 1 && !app.input[1..].contains(' ') {
+                let partial = &app.input[1..];
+                let commands = super::commands::all_commands_with_skills(registry);
+                // Try prefix match first, then fuzzy
+                let hint: Option<&String> = {
+                    let prefix_matches: Vec<&String> = commands.iter()
+                        .filter(|c| c.starts_with(partial))
+                        .collect();
+                    if prefix_matches.len() == 1 {
+                        Some(prefix_matches[0])
+                    } else {
+                        super::commands::fuzzy_match(partial, &commands)
+                    }
+                };
+                if let Some(cmd) = hint {
+                    if cmd.as_str() != partial {
+                        let ghost_style = Style::default()
+                            .fg(THEME.load().border)
+                            .add_modifier(Modifier::DIM);
+                        // Show the remaining chars for prefix match, or full command for fuzzy
+                        let ghost_text = if cmd.starts_with(partial) {
+                            cmd[partial.len()..].to_string()
+                        } else {
+                            format!(" → /{}", cmd)
+                        };
+                        if let Some(last_row) = rows.last_mut() {
+                            last_row.push(Span::styled(ghost_text, ghost_style));
+                        }
+                    }
+                }
+            }
+
             rows.into_iter().map(Line::from).collect()
         };
 
