@@ -230,12 +230,14 @@ pub(super) async fn handle_command(
             let trimmed = arg.trim();
             if trimmed.is_empty() {
                 app.session.clear_name();
-                app.save_session().await;
+                // Force save even with no messages — persist the name change
+                let _ = app.session.save().await;
                 app.push_msg(ChatMessage::System("session name cleared".into()));
             } else {
                 match app.session.set_name(trimmed) {
                     Ok(()) => {
-                        app.save_session().await;
+                        // Force save even with no messages — persist the name change
+                        let _ = app.session.save().await;
                         app.push_msg(ChatMessage::System(format!("session named '{}'", trimmed)));
                     }
                     Err(e) => {
