@@ -179,8 +179,10 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
     let visible_height = area.height as usize;
     let selected = if state.focus == Focus::Right { state.setting_idx } else { usize::MAX };
 
-    // Scroll offset — keep selected row in view
-    let scroll_offset = if selected >= visible_height {
+    // Scroll offset — keep selected row in view (no scroll when focus is on left pane)
+    let scroll_offset = if selected == usize::MAX {
+        0
+    } else if selected >= visible_height {
         selected.saturating_sub(visible_height - 1)
     } else {
         0
