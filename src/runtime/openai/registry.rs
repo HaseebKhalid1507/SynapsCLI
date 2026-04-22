@@ -266,8 +266,7 @@ pub fn resolve_provider_model(
 /// Resolve `"provider/model"` shorthand.
 pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
     let (provider_key, model) = s.split_once('/')?;
-    resolve_provider_model(provider_key, &format!("{}/{}", provider_key, model), overrides)
-        .or_else(|| resolve_provider_model(provider_key, model, overrides))
+    resolve_provider_model(provider_key, model, overrides)
 }
 
 /// List all providers with key status.
