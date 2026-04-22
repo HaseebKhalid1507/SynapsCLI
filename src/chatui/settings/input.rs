@@ -169,12 +169,28 @@ pub(crate) fn handle_event(
                     }
                     EditorKind::ModelPicker => {
                         state.row_error = None;
-                        let mut opts: Vec<String> = synaps_cli::models::KNOWN_MODELS
-                            .iter().map(|(id, desc)| format!("{}  — {}", id, desc)).collect();
+                        // Anthropic models
+                        let mut opts: Vec<String> = vec!["── Anthropic ──".to_string()];
+                        opts.extend(synaps_cli::models::KNOWN_MODELS
+                            .iter().map(|(id, desc)| format!("  {}  — {}", id, desc)));
+
+                        // Provider models (only for configured providers)
+                        let registry = synaps_cli::runtime::openai::registry::providers();
+                        for spec in &registry {
+                            let has_config_key = snap.provider_keys.contains_key(spec.key);
+                            let has_env_key = spec.env_vars.iter()
+                                .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
+                            if !has_config_key && !has_env_key { continue; }
+                            opts.push(format!("── {} ──", spec.name));
+                            for (id, label, tier) in spec.models {
+                                opts.push(format!("  {}/{}  — {} [{}]", spec.key, id, label, tier));
+                            }
+                        }
                         opts.push("Custom…".to_string());
+
                         let current = current_value_for(def, snap);
                         let cursor = opts.iter()
-                            .position(|o| o.starts_with(&current))
+                            .position(|o| o.trim_start().starts_with(&current))
                             .unwrap_or(0);
                         state.edit_mode = Some(ActiveEditor::Picker {
                             setting_key: def.key,
@@ -230,14 +246,26 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
         ActiveEditor::Picker { setting_key, options, cursor } => {
             match key.code {
                 KeyCode::Up => {
-                    if *cursor > 0 { *cursor -= 1; }
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                        // Skip header rows
+                        while *cursor > 0 && options[*cursor].starts_with("──") {
+                            *cursor -= 1;
+                        }
+                    }
                     if *setting_key == "theme" {
                         return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
                     }
                     InputOutcome::None
                 }
                 KeyCode::Down => {
-                    if *cursor + 1 < options.len() { *cursor += 1; }
+                    if *cursor + 1 < options.len() {
+                        *cursor += 1;
+                        // Skip header rows
+                        while *cursor + 1 < options.len() && options[*cursor].starts_with("──") {
+                            *cursor += 1;
+                        }
+                    }
                     if *setting_key == "theme" {
                         return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
                     }
@@ -245,6 +273,10 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 }
                 KeyCode::Enter => {
                     let selection = options[*cursor].clone();
+                    // Skip header rows (e.g. "── Groq ──")
+                    if selection.starts_with("──") {
+                        return InputOutcome::None;
+                    }
                     if (*setting_key == "model" || *setting_key == "compaction_model") && selection == "Custom…" {
                         state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new(), setting_key });
                         return InputOutcome::None;
