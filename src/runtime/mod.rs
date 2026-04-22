@@ -489,13 +489,17 @@ impl Runtime {
             use_1m_context: self.context_window_override == Some(1_000_000),
         };
 
+        let session = crate::runtime::stream::StreamSession {
+            auth, client, options, api_retries,
+            model, tools, system_prompt, thinking_budget,
+            tx: tx.clone(), cancel, steering_rx,
+            watcher_exit_path, max_tool_output,
+            bash_timeout, bash_max_timeout, subagent_timeout,
+            session_manager, subagent_registry, event_queue,
+        };
+
         tokio::spawn(async move {
-            if let Err(e) = StreamMethods::run_stream_internal(
-                auth, client, model, tools, system_prompt, thinking_budget,
-                messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
-                max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
-                session_manager, options, subagent_registry, event_queue,
-            ).await {
+            if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
                 let _ = tx.send(StreamEvent::Error(e.to_string()));
             }
             let _ = tx.send(StreamEvent::Done);

@@ -9,32 +9,52 @@ use super::types::{AuthState, StreamEvent};
 use super::helpers::HelperMethods;
 use super::api::ApiMethods;
 
+/// Bundle of all dependencies needed to drive a streaming agent loop.
+/// Constructed once by `Runtime::run_stream_with_messages` before spawning the stream task.
+pub(super) struct StreamSession {
+    // Auth & network
+    pub(super) auth: Arc<RwLock<AuthState>>,
+    pub(super) client: Client,
+    pub(super) options: super::api::ApiOptions,
+    pub(super) api_retries: u32,
+
+    // Model config
+    pub(super) model: String,
+    pub(super) tools: Arc<RwLock<ToolRegistry>>,
+    pub(super) system_prompt: Option<String>,
+    pub(super) thinking_budget: u32,
+
+    // Channels
+    pub(super) tx: mpsc::UnboundedSender<StreamEvent>,
+    pub(super) cancel: CancellationToken,
+    pub(super) steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+
+    // Tool config
+    pub(super) watcher_exit_path: Option<PathBuf>,
+    pub(super) max_tool_output: usize,
+    pub(super) bash_timeout: u64,
+    pub(super) bash_max_timeout: u64,
+    pub(super) subagent_timeout: u64,
+    pub(super) session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    pub(super) event_queue: Arc<crate::events::EventQueue>,
+}
+
 pub(super) struct StreamMethods;
 
 impl StreamMethods {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_stream_internal(
-        auth: Arc<RwLock<AuthState>>,
-        client: Client,
-        model: String,
-        tools: Arc<RwLock<ToolRegistry>>,
-        system_prompt: Option<String>,
-        thinking_budget: u32,
+        session: StreamSession,
         initial_messages: Vec<Value>,
-        tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-        mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
-        watcher_exit_path: Option<PathBuf>,
-        max_tool_output: usize,
-        bash_timeout: u64,
-        bash_max_timeout: u64,
-        subagent_timeout: u64,
-        api_retries: u32,
-        session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
-        options: super::api::ApiOptions,
-        subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
-        event_queue: Arc<crate::events::EventQueue>,
     ) -> Result<()> {
+        let StreamSession {
+            auth, client, options, api_retries,
+            model, tools, system_prompt, thinking_budget,
+            tx, cancel, mut steering_rx,
+            watcher_exit_path, max_tool_output,
+            bash_timeout, bash_max_timeout, subagent_timeout,
+            session_manager, subagent_registry, event_queue,
+        } = session;
         let mut messages = initial_messages;
 
         loop {
