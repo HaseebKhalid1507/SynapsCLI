@@ -54,6 +54,7 @@ pub(crate) struct RuntimeSnapshot {
     pub theme_name: String,
     pub plugins: Vec<PluginRow>,
     pub disabled_plugins: Vec<String>,
+    pub provider_keys: std::collections::BTreeMap<String, String>,
 }
 
 impl RuntimeSnapshot {
@@ -85,6 +86,7 @@ impl RuntimeSnapshot {
             theme_name: config.theme.unwrap_or_else(|| "(default)".to_string()),
             plugins,
             disabled_plugins: config.disabled_plugins.clone(),
+            provider_keys: config.provider_keys.clone(),
         }
     }
 }
@@ -99,6 +101,7 @@ pub(super) enum ActiveEditor {
     Text { buffer: String, setting_key: &'static str, numeric: bool, error: Option<String> },
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
     CustomModel { buffer: String, setting_key: &'static str },
+    ApiKey { provider_id: String, buffer: String },
 }
 
 pub(super) struct SettingsState {
@@ -127,7 +130,9 @@ impl SettingsState {
     /// Settings in the currently selected category.
     pub fn current_settings(&self) -> Vec<&'static SettingDef> {
         let cat = schema::CATEGORIES[self.category_idx];
-        if cat == schema::Category::Plugins { return Vec::new(); }
+        if cat == schema::Category::Plugins || cat == schema::Category::Providers {
+            return Vec::new();
+        }
         schema::ALL_SETTINGS.iter().filter(|s| s.category == cat).collect()
     }
 

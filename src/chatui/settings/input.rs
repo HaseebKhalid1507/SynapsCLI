@@ -7,6 +7,7 @@ pub(crate) enum InputOutcome {
     None,
     Close,
     Apply { key: &'static str, value: String },
+    SetProviderKey { provider_id: String, value: String },
     TogglePlugin { name: String, enabled: bool },
     PreviewTheme { name: String },
     RevertTheme,
@@ -36,6 +37,33 @@ pub(crate) fn handle_event(
     }
     if state.focus == Focus::Right {
         let cat = super::schema::CATEGORIES[state.category_idx];
+        if cat == super::schema::Category::Providers {
+            let providers = synaps_cli::runtime::openai::registry::providers();
+            if let Some(p) = providers.get(state.setting_idx) {
+                match key.code {
+                    KeyCode::Enter => {
+                        state.row_error = None;
+                        state.edit_mode = Some(ActiveEditor::ApiKey {
+                            provider_id: p.key.to_string(),
+                            buffer: String::new(),
+                        });
+                        return InputOutcome::None;
+                    }
+                    KeyCode::Delete | KeyCode::Char('d') => {
+                        let has_key = snap.provider_keys.get(p.key).map(|v| !v.is_empty()).unwrap_or(false);
+                        if has_key {
+                            state.row_error = None;
+                            return InputOutcome::SetProviderKey {
+                                provider_id: p.key.to_string(),
+                                value: String::new(),
+                            };
+                        }
+                        return InputOutcome::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
         if cat == super::schema::Category::Plugins {
             // Row 0 is the "Open Plugin Marketplace…" action row.
             // Rows 1..=n map to snap.plugins[idx - 1].
@@ -244,6 +272,19 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
+        ActiveEditor::ApiKey { provider_id, buffer } => {
+            match key.code {
+                KeyCode::Enter => {
+                    InputOutcome::SetProviderKey {
+                        provider_id: provider_id.clone(),
+                        value: buffer.trim().to_string(),
+                    }
+                }
+                KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
+                KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }
+                _ => InputOutcome::None,
+            }
+        }
     }
 }
 
@@ -259,6 +300,8 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     let cat = super::schema::CATEGORIES[state.category_idx];
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
+    } else if cat == super::schema::Category::Providers {
+        synaps_cli::runtime::openai::registry::providers().len()
     } else {
         state.current_settings().len()
     }
@@ -274,6 +317,7 @@ mod tests {
             model: "m".into(),
             thinking: "medium".into(),
             context_window: "auto".into(),
+            compaction_model: "m".into(),
             max_tool_output: 0,
             bash_timeout: 0,
             bash_max_timeout: 0,
@@ -285,6 +329,7 @@ mod tests {
                 super::super::PluginRow { name: "p2".into(), skill_count: 2 },
             ],
             disabled_plugins: vec!["p2".into()],
+            provider_keys: std::collections::BTreeMap::new(),
         }
     }
 

@@ -61,6 +61,10 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_plugins_list(frame, area, state, snap);
         return;
     }
+    if current_cat == super::schema::Category::Providers {
+        render_providers_list(frame, area, state, snap);
+        return;
+    }
     let settings = state.current_settings();
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = Vec::new();
@@ -169,6 +173,62 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+    let providers = synaps_cli::runtime::openai::registry::providers();
+    let mut lines = Vec::new();
+    for (i, p) in providers.iter().enumerate() {
+        let selected = i == state.setting_idx && state.focus == Focus::Right;
+        let style = if selected {
+            Style::default().fg(THEME.load().claude_label)
+        } else {
+            Style::default().fg(THEME.load().claude_text)
+        };
+
+        let status = if let Some(ActiveEditor::ApiKey { provider_id, buffer }) = &state.edit_mode {
+            if provider_id == p.key {
+                let masked: String = "*".repeat(buffer.len().min(32));
+                format!("[{}_]", masked)
+            } else {
+                provider_status(p, snap)
+            }
+        } else {
+            provider_status(p, snap)
+        };
+
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            format!("  {:<20} {}", p.name, status),
+            style,
+        )]));
+
+        if let Some((key, msg)) = &state.row_error {
+            if key == &format!("provider.{}", p.key) && selected {
+                let is_note = msg.starts_with("saved");
+                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                lines.push(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
+                ]));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap: &RuntimeSnapshot) -> String {
+    if let Some(k) = snap.provider_keys.get(p.key).filter(|s| !s.is_empty()) {
+        format!("✅ {}", mask_key(k))
+    } else if p.env_vars.iter().any(|v| std::env::var(v).is_ok()) {
+        "✅ (from env)".to_string()
+    } else {
+        "⬚ not set".to_string()
+    }
+}
+
+fn mask_key(key: &str) -> String {
+    let n = key.len();
+    if n <= 12 { return "*".repeat(n.min(8)); }
+    format!("{}...{}", &key[..8], &key[n - 4..])
+}
+
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
     let w = area.width.saturating_sub(4).clamp(20, 60);
     let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
@@ -207,12 +267,20 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState) {
-    let on_plugins_right = CATEGORIES[state.category_idx] == super::schema::Category::Plugins
+    let cat = CATEGORIES[state.category_idx];
+    let on_plugins_right = cat == super::schema::Category::Plugins
         && state.focus == Focus::Right;
-    let hint = if on_plugins_right && state.setting_idx == 0 {
+    let on_providers_right = cat == super::schema::Category::Providers
+        && state.focus == Focus::Right;
+    let in_api_key_editor = matches!(state.edit_mode, Some(ActiveEditor::ApiKey { .. }));
+    let hint = if in_api_key_editor {
+        "type key  Enter save  Esc cancel"
+    } else if on_plugins_right && state.setting_idx == 0 {
         "↑↓ navigate  Tab switch pane  Enter open marketplace  Esc close"
     } else if on_plugins_right && state.setting_idx > 0 {
         "↑↓ navigate  Tab switch pane  Enter/Space toggle  Esc close"
+    } else if on_providers_right {
+        "↑↓ navigate  Tab switch pane  Enter set key  d/Del clear  Esc close"
     } else {
         "↑↓ navigate  Tab switch pane  Enter edit  Esc close"
     };

@@ -7,6 +7,7 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Category {
     Model,
+    Providers,
     Agent,
     ToolLimits,
     Appearance,
@@ -17,6 +18,7 @@ impl Category {
     pub fn label(&self) -> &'static str {
         match self {
             Category::Model => "Model",
+            Category::Providers => "Providers",
             Category::Agent => "Agent",
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
@@ -25,8 +27,9 @@ impl Category {
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 5] = [
+pub(crate) const CATEGORIES: [Category; 6] = [
     Category::Model,
+    Category::Providers,
     Category::Agent,
     Category::ToolLimits,
     Category::Appearance,

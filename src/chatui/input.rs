@@ -64,6 +64,18 @@ pub(super) fn handle_event(
                 super::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
+                super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
+                    let cfg_key = format!("provider.{}", provider_id);
+                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((cfg_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((cfg_key, e.to_string()));
+                        }
+                    }
+                }
                 super::settings::InputOutcome::TogglePlugin { name, enabled } => {
                     let mut config = synaps_cli::config::load_config();
                     match super::plugins::actions::toggle_plugin_config(
