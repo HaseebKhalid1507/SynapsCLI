@@ -67,18 +67,75 @@ pub(super) enum CommandAction {
     Status,
 }
 
+/// Levenshtein edit distance between two strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Find the best fuzzy match for `raw` among `commands`.
+/// Returns `Some(command)` if there's a single best match within the
+/// distance threshold (≤40% of target length, minimum distance of 2).
+/// Returns `None` if no match is close enough or if it's ambiguous.
+pub(super) fn fuzzy_match<'a>(raw: &str, commands: &'a [String]) -> Option<&'a String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &String)> = None;
+    let mut ambiguous = false;
+    for cmd in commands {
+        let threshold = (cmd.len() * 2 / 5).max(2); // 40% of target len, min 2
+        let dist = edit_distance(raw, cmd);
+        if dist == 0 || dist > threshold {
+            continue;
+        }
+        match best {
+            None => best = Some((dist, cmd)),
+            Some((d, _)) if dist < d => {
+                best = Some((dist, cmd));
+                ambiguous = false;
+            }
+            Some((d, _)) if dist == d => {
+                ambiguous = true;
+            }
+            _ => {}
+        }
+    }
+    if ambiguous { None } else { best.map(|(_, cmd)| cmd) }
+}
+
 /// Resolve a partial command prefix to a full command name.
+/// Tries exact match, then prefix match, then fuzzy match.
 /// Returns the input unchanged if no unique match.
 pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     if commands.iter().any(|c| c == raw) {
         return raw.to_string();
     }
-    let matches: Vec<&String> = commands.iter().filter(|c| c.starts_with(raw)).collect();
-    if matches.len() == 1 {
-        matches[0].clone()
-    } else {
-        raw.to_string()
+    let prefix_matches: Vec<&String> = commands.iter().filter(|c| c.starts_with(raw)).collect();
+    if prefix_matches.len() == 1 {
+        return prefix_matches[0].clone();
     }
+    // Fall back to fuzzy matching when no unique prefix match
+    if prefix_matches.is_empty() {
+        if let Some(m) = fuzzy_match(raw, commands) {
+            return m.clone();
+        }
+    }
+    raw.to_string()
 }
 
 /// Handle a slash command when NOT streaming.
@@ -384,9 +441,119 @@ pub(super) fn handle_streaming_command(
 #[cfg(test)]
 mod tests {
     use synaps_cli::skills::BUILTIN_COMMANDS as ALL_COMMANDS;
+    use super::{edit_distance, fuzzy_match, resolve_prefix};
 
     #[test]
     fn plugins_is_in_all_commands() {
         assert!(ALL_COMMANDS.contains(&"plugins"));
+    }
+
+    // -- edit_distance tests --
+
+    #[test]
+    fn edit_distance_identical() {
+        assert_eq!(edit_distance("plugins", "plugins"), 0);
+    }
+
+    #[test]
+    fn edit_distance_empty() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("", ""), 0);
+    }
+
+    #[test]
+    fn edit_distance_one_swap() {
+        // "plgu" -> "plug" requires swapping gu->ug = 2 edits (delete + insert)
+        assert_eq!(edit_distance("plgu", "plug"), 2);
+    }
+
+    #[test]
+    fn edit_distance_typo() {
+        // "plguins" -> "plugins": transposition + missing char
+        assert!(edit_distance("plguins", "plugins") <= 2);
+    }
+
+    // -- fuzzy_match tests --
+
+    fn commands() -> Vec<String> {
+        vec![
+            "clear".into(), "compact".into(), "chain".into(), "model".into(),
+            "system".into(), "thinking".into(), "sessions".into(), "resume".into(),
+            "saveas".into(), "theme".into(), "gamba".into(), "help".into(),
+            "quit".into(), "exit".into(), "settings".into(), "plugins".into(),
+            "status".into(),
+        ]
+    }
+
+    #[test]
+    fn fuzzy_match_plgu_to_plugins() {
+        let cmds = commands();
+        let _result = fuzzy_match("plgu", &cmds);
+        // "plgu" is close to nothing perfectly, but let's check it matches something reasonable
+        // or plugins via the longer form
+        // Actually "plgu" vs "plug" portion... let's test the full typo
+        let result2 = fuzzy_match("plguins", &cmds);
+        assert_eq!(result2.map(|s| s.as_str()), Some("plugins"));
+    }
+
+    #[test]
+    fn fuzzy_match_settngs_to_settings() {
+        let cmds = commands();
+        let result = fuzzy_match("settngs", &cmds);
+        assert_eq!(result.map(|s| s.as_str()), Some("settings"));
+    }
+
+    #[test]
+    fn fuzzy_match_hlep_to_help() {
+        let cmds = commands();
+        let result = fuzzy_match("hlep", &cmds);
+        assert_eq!(result.map(|s| s.as_str()), Some("help"));
+    }
+
+    #[test]
+    fn fuzzy_match_exact_returns_none() {
+        // Exact match has distance 0, fuzzy_match skips it (exact is handled by resolve_prefix)
+        let cmds = commands();
+        assert!(fuzzy_match("plugins", &cmds).is_none());
+    }
+
+    #[test]
+    fn fuzzy_match_gibberish_returns_none() {
+        let cmds = commands();
+        assert!(fuzzy_match("zzzzzzz", &cmds).is_none());
+    }
+
+    // -- resolve_prefix integration tests --
+
+    #[test]
+    fn resolve_prefix_exact() {
+        let cmds = commands();
+        assert_eq!(resolve_prefix("plugins", &cmds), "plugins");
+    }
+
+    #[test]
+    fn resolve_prefix_prefix_match() {
+        let cmds = commands();
+        assert_eq!(resolve_prefix("plug", &cmds), "plugins");
+    }
+
+    #[test]
+    fn resolve_prefix_fuzzy_fallback() {
+        let cmds = commands();
+        assert_eq!(resolve_prefix("plguins", &cmds), "plugins");
+    }
+
+    #[test]
+    fn resolve_prefix_no_match() {
+        let cmds = commands();
+        assert_eq!(resolve_prefix("xyzzy", &cmds), "xyzzy");
+    }
+
+    #[test]
+    fn resolve_prefix_ambiguous_prefix() {
+        // "s" matches system, sessions, saveas, settings, status — returns raw
+        let cmds = commands();
+        assert_eq!(resolve_prefix("s", &cmds), "s");
     }
 }

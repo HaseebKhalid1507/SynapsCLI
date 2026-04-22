@@ -75,9 +75,25 @@ impl RuntimeSnapshot {
         model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     ) -> Self {
         let config = synaps_cli::config::load_config();
-        let plugins: Vec<PluginRow> = registry.plugins().into_iter()
-            .map(|p| PluginRow { name: p.name, skill_count: p.skill_count })
+        // Build the plugin list from *all* discovered plugins on disk (not
+        // just the registry, which excludes disabled plugins).  This ensures
+        // disabled plugins remain visible in the settings list so the user
+        // can re-enable them.
+        let registry_map: std::collections::HashMap<String, usize> = registry
+            .plugins()
+            .into_iter()
+            .map(|p| (p.name, p.skill_count))
             .collect();
+        let (all_plugins, _all_skills) =
+            synaps_cli::skills::loader::load_all(&synaps_cli::skills::loader::default_roots());
+        let mut plugins: Vec<PluginRow> = all_plugins
+            .into_iter()
+            .map(|p| {
+                let skill_count = registry_map.get(&p.name).copied().unwrap_or(0);
+                PluginRow { name: p.name, skill_count }
+            })
+            .collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
             model: runtime.model().to_string(),
             thinking: runtime.thinking_level().to_string(),
