@@ -13,6 +13,10 @@ pub fn tools_to_oai(schema: &[Value]) -> Vec<ToolDefinition> {
         .iter()
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
+            // Skip empty names and internal-only tools
+            if name.is_empty() || name == "respond" || name == "send_channel" || name == "watcher_exit" {
+                return None;
+            }
             let description = t
                 .get("description")
                 .and_then(|d| d.as_str())
@@ -162,7 +166,16 @@ pub fn messages_to_oai(
         }
     }
 
-    out
+    // Fixup: OpenAI requires that a 'tool' message is never followed
+    // directly by a 'user' message. Insert an empty assistant message if needed.
+    let mut fixed = Vec::with_capacity(out.len());
+    for msg in out {
+        if msg.role == "user" && fixed.last().map(|m: &ChatMessage| m.role == "tool").unwrap_or(false) {
+            fixed.push(ChatMessage::assistant("".to_string()));
+        }
+        fixed.push(msg);
+    }
+    fixed
 }
 
 /// Translate an [`OaiEvent`] into a synaps [`StreamEvent`].
