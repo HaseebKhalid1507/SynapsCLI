@@ -47,9 +47,9 @@ pub struct LoadedSkill {
 /// Built-in command names. Keep in sync with the match in
 /// `src/chatui/commands.rs::handle_command`.
 pub const BUILTIN_COMMANDS: &[&str] = &[
-    "clear", "model", "system", "thinking", "sessions",
-    "resume", "theme", "gamba", "help", "quit", "exit",
-    "settings", "plugins",
+    "clear", "compact", "chain", "model", "system", "thinking", "sessions",
+    "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
+    "settings", "plugins", "status",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,

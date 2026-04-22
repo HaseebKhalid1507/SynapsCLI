@@ -19,7 +19,8 @@ use commands::CommandAction;
 use input::InputAction;
 use stream_handler::StreamAction;
 
-use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, find_session};
+use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, resolve_session};
+use synaps_cli::core::compaction::compact_conversation;
 use crossterm::{
     event::{EventStream, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste},
     execute,
@@ -75,8 +76,70 @@ fn apply_setting(
     }
 }
 
+async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
+    let auth_path = synaps_cli::config::base_dir().join("auth.json");
+    let content = std::fs::read_to_string(&auth_path)
+        .map_err(|e| format!("Auth read failed: {}", e))?;
+    let auth: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Auth parse failed: {}", e))?;
+    let access = auth["anthropic"]["access"].as_str()
+        .ok_or("No OAuth token")?;
+
+    let client = reqwest::Client::new();
+    let resp = client.get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {}", access))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send().await
+        .map_err(|e| format!("API error: {}", e))?;
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    fn format_block(label: &str, data: &serde_json::Value) -> Option<Vec<String>> {
+        let util = data["utilization"].as_f64()?;
+        let resets = data["resets_at"].as_str()?;
+        let reset_display = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(resets) {
+            let diff = dt.signed_duration_since(chrono::Utc::now());
+            let hours = diff.num_hours();
+            let mins = diff.num_minutes() % 60;
+            if hours > 24 { format!("{}d {}h", hours / 24, hours % 24) }
+            else if hours > 0 { format!("{}h {}m", hours, mins) }
+            else { format!("{}m", diff.num_minutes()) }
+        } else { "—".to_string() };
+
+        let filled = ((util / 100.0) * 20.0) as usize;
+        let empty = 20usize.saturating_sub(filled);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+        Some(vec![
+            label.to_string(),
+            format!("{} {:.0}%", bar, util),
+            format!("resets in {}", reset_display),
+        ])
+    }
+
+    let mut lines = vec!["⚡ Account Usage".to_string()];
+    if let Some(rows) = format_block("5-hour window", &data["five_hour"]) { lines.extend(rows); lines.push(String::new()); }
+    if let Some(rows) = format_block("7-day window", &data["seven_day"]) { lines.extend(rows); lines.push(String::new()); }
+    if let Some(rows) = format_block("Sonnet (7-day)", &data["seven_day_sonnet"]) { lines.extend(rows); }
+
+    Ok(lines)
+}
+
 fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
+    app.messages.clear();
     for msg in api_messages {
+        // Skip compaction summary messages — internal context, not user-visible
+        if let Some(content) = msg["content"].as_str() {
+            if content.contains("<context-summary>") {
+                continue;
+            }
+        }
+        // Skip event messages — already displayed as event cards
+        if let Some(content) = msg["content"].as_str() {
+            if content.starts_with("<event ") && content.ends_with("</event>") {
+                continue;
+            }
+        }
         match msg["role"].as_str() {
             Some("user") => {
                 if let Some(content) = msg["content"].as_str() {
@@ -136,23 +199,17 @@ pub async fn run(
     let tools_shared = runtime.tools_shared();
     let registry = synaps_cli::skills::register(&tools_shared, &config).await;
     let skill_count = registry.all_skills().len();
-    if skill_count > 0 {
-        eprintln!("\x1b[2m  📚 {} skills available (type / to list)\x1b[0m", skill_count);
-    }
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
     let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
-    if mcp_server_count > 0 {
-        eprintln!("\x1b[2m  ⚡ {} MCP servers available (use mcp_connect to activate)\x1b[0m", mcp_server_count);
-    }
 
     let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
 
     // Session: continue existing or create new
     let mut app = match continue_session {
-        Some(maybe_id) => {
+        Some(ref maybe_id) => {
             let session = match maybe_id {
-                Some(id) => find_session(&id).unwrap_or_else(|e| {
+                Some(ref id) => resolve_session(id).unwrap_or_else(|e| {
                     eprintln!("Failed to load session '{}': {}", id, e);
                     std::process::exit(1);
                 }),
@@ -173,6 +230,16 @@ pub async fn run(
             app.abort_context = session.abort_context.clone();
             rebuild_display_messages(&session.api_messages, &mut app);
             app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
+            match continue_session.as_ref().and_then(|o| o.as_ref()) {
+                Some(q) if *q != session.id => {
+                    if synaps_cli::chain::load_chain(q).is_ok() {
+                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via chain '{}'", q)));
+                    } else if synaps_cli::session::find_session_by_name(q).is_ok() {
+                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via name '{}'", q)));
+                    }
+                }
+                _ => {}
+            }
             if app.abort_context.is_some() {
                 app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
             }
@@ -182,6 +249,21 @@ pub async fn run(
             App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
         }
     };
+
+    if skill_count > 0 {
+        app.push_msg(ChatMessage::System(format!(
+            "📚 {} skills available (type / to list)",
+            skill_count
+        )));
+    }
+
+    // Sync the context bar denominator with the runtime's effective window
+    // (respects config override like `context_window = 200k`).
+    app.last_turn_context_window = runtime.context_window();
+    // MCP server count logged but not shown — the banner hides the ASCII art.
+    if mcp_server_count > 0 {
+        tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
+    }
 
     // ── Terminal setup ──
     enable_raw_mode().map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
@@ -199,6 +281,17 @@ pub async fn run(
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
+    // Start inbox watcher — file-drop ingestion for external events
+    let watcher_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_task = {
+        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
+        let event_queue = runtime.event_queue().clone();
+        let shutdown = watcher_shutdown.clone();
+        tokio::spawn(async move {
+            synaps_cli::events::watch_inbox(inbox_dir, event_queue, shutdown).await;
+        })
+    };
+
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
@@ -206,8 +299,54 @@ pub async fn run(
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
 
         tokio::select! {
+
+            // ── Event bus wake — fires instantly when an event is pushed to the queue ──
+            _ = runtime.event_queue().notified() => {
+                let mut event_received = false;
+                while let Some(event) = runtime.event_queue().pop() {
+                    event_received = true;
+                    let formatted = synaps_cli::events::format_event_for_agent(&event);
+                    let severity_str = event.content.severity
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "medium".to_string());
+                    app.push_msg(ChatMessage::Event {
+                        source: event.source.source_type.clone(),
+                        severity: severity_str,
+                        text: event.content.text.clone(),
+                    });
+
+                    if app.streaming || app.compact_task.is_some() {
+                        // Buffer during streaming — inject after MessageHistory
+                        app.pending_events.push(formatted);
+                    } else {
+                        app.api_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": formatted
+                        }));
+                    }
+                    app.invalidate();
+                }
+
+                // Auto-trigger model turn when idle — only if we actually received events
+                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                    if let Some(last) = app.api_messages.last() {
+                        if last["role"].as_str() == Some("user") {
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
+                    }
+                }
+            }
+
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
@@ -216,7 +355,7 @@ pub async fn run(
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
                 }
-                if !app.subagents.is_empty() || app.streaming {
+                if !app.subagents.is_empty() || app.streaming || app.compact_task.is_some() {
                     app.spinner_frame = app.spinner_frame.wrapping_add(1);
                     if app.spinner_frame % 3 == 0 {
                         app.invalidate();
@@ -229,6 +368,82 @@ pub async fn run(
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                }
+                // Poll background compaction task
+                if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
+                    let handle = app.compact_task.take().unwrap();
+                    let msg_count = app.api_messages.len();
+                    match handle.await {
+                        Ok(Ok(summary)) => {
+                            let old_id = app.session.id.clone();
+                            // Find chains pointing at the old head before we swap
+                            let chains_to_advance = synaps_cli::chain::find_all_chains_by_head(&old_id)
+                                .unwrap_or_default();
+                            let new_session = Session::new_from_compaction(&app.session, summary.clone());
+                            let new_id = new_session.id.clone();
+                            // Save new session FIRST — if we crash after this but before
+                            // saving old, the new session still exists and chain is intact
+                            app.session = new_session;
+                            app.api_messages = app.session.api_messages.clone();
+                            app.total_input_tokens = 0;
+                            app.total_output_tokens = 0;
+                            app.session_cost = 0.0;
+                            let msgs = app.api_messages.clone();
+                            rebuild_display_messages(&msgs, &mut app);
+                            app.save_session().await;
+                            // Load old session fresh from disk and update its forward link
+                            match synaps_cli::core::session::Session::load(&old_id) {
+                                Ok(mut old_session) => {
+                                    old_session.compacted_into = Some(new_id.clone());
+                                    // Clear name from old session — it transferred to the new one
+                                    old_session.name = None;
+                                    old_session.save().await.ok();
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to update old session {}: {}", old_id, e);
+                                }
+                            }
+                            // Advance any named chains that pointed at the old head
+                            for ch in &chains_to_advance {
+                                match synaps_cli::chain::save_chain(&ch.name, &new_id) {
+                                    Ok(()) => {
+                                        app.push_msg(ChatMessage::System(format!(
+                                            "chain '{}' advanced: {} → {}",
+                                            ch.name, old_id, new_id
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        app.push_msg(ChatMessage::Error(format!(
+                                            "failed to advance chain '{}': {}", ch.name, e
+                                        )));
+                                    }
+                                }
+                            }
+                            // Flush any events that arrived during compaction
+                            for formatted in app.pending_events.drain(..) {
+                                app.api_messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": formatted
+                                }));
+                            }
+                            if let Some(queued) = app.queued_message.take() {
+                                app.api_messages.push(serde_json::json!({"role": "user", "content": queued}));
+                                app.push_msg(ChatMessage::System(format!("queued message restored: {}", queued)));
+                            }
+                            app.push_msg(ChatMessage::System(format!(
+                                "✓ compacted {} messages → new session {} (from {})",
+                                msg_count, new_id, old_id
+                            )));
+                        }
+                        Ok(Err(e)) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction failed: {}", e)));
+                        }
+                        Err(e) => {
+                            app.push_msg(ChatMessage::Error(format!("compaction task panicked: {}", e)));
+                        }
+                    }
+                    app.status_text = None;
+                    app.invalidate();
                 }
                 if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
                     break;
@@ -258,6 +473,15 @@ pub async fn run(
                                 steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
+                                // Cancel all running reactive subagents
+                                {
+                                    let mut registry = runtime.subagent_registry().lock().unwrap();
+                                    for handle in registry.iter_mut_handles() {
+                                        if handle.status() == synaps_cli::runtime::subagent::SubagentStatus::Running {
+                                            handle.cancel();
+                                        }
+                                    }
+                                }
                                 let abort_msg = if app.abort_context.is_some() {
                                     "aborted — context saved for next message"
                                 } else {
@@ -352,9 +576,151 @@ pub async fn run(
                                         cancel_token = Some(ct);
                                         steer_tx = Some(s_tx);
                                     }
+                                    CommandAction::Compact { custom_instructions } => {
+                                        // Need at least 2 full turns (user + assistant = 2 messages each).
+                                        if app.api_messages.len() < 4 {
+                                            app.push_msg(ChatMessage::System(
+                                                "nothing to compact (need at least 2 turns)".to_string(),
+                                            ));
+                                        } else if app.compact_task.is_some() {
+                                            app.push_msg(ChatMessage::System(
+                                                "compaction already in progress".to_string(),
+                                            ));
+                                        } else {
+                                            app.push_msg(ChatMessage::System(
+                                                "compacting conversation...".to_string(),
+                                            ));
+                                            app.status_text = Some("compacting…".to_string());
+                                            app.spinner_frame = 0;
+
+                                            let msgs = app.api_messages.clone();
+                                            let rt = runtime.clone();
+                                            let instr = custom_instructions.clone();
+                                            let handle = tokio::spawn(async move {
+                                                compact_conversation(&msgs, &rt, instr.as_deref()).await
+                                            });
+                                            app.compact_task = Some(handle);
+                                        }
+                                    }
+                                    CommandAction::Chain => {
+                                        // Walk the parent_session chain backward from current session
+                                        let mut chain: Vec<(String, String, usize)> = Vec::new(); // (id, title, msg_count)
+
+                                        // Current session first
+                                        chain.push((
+                                            app.session.id.clone(),
+                                            if app.session.title.is_empty() { "(untitled)".to_string() } else { app.session.title.clone() },
+                                            app.api_messages.len(),
+                                        ));
+
+                                        // Walk backward through parents
+                                        let mut current_parent = app.session.parent_session.clone();
+                                        while let Some(ref parent_id) = current_parent {
+                                            match synaps_cli::core::session::Session::load(parent_id) {
+                                                Ok(parent) => {
+                                                    let title = if parent.title.is_empty() { "(untitled)".to_string() } else { parent.title.clone() };
+                                                    let msg_count = parent.api_messages.len();
+                                                    chain.push((parent.id.clone(), title, msg_count));
+                                                    current_parent = parent.parent_session.clone();
+                                                }
+                                                Err(_) => {
+                                                    chain.push((parent_id.clone(), "(not found)".to_string(), 0));
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // Reverse so root is first
+                                        chain.reverse();
+
+                                        if chain.len() <= 1 {
+                                            app.push_msg(ChatMessage::System("no compaction history — this is the root session".to_string()));
+                                        } else {
+                                            let mut lines = vec!["Session chain:".to_string()];
+                                            for (i, (id, title, msgs)) in chain.iter().enumerate() {
+                                                let marker = if i == chain.len() - 1 { " ← active" } else { "" };
+                                                let short_id: String = id.chars().take(19).collect();
+                                                let short_title: String = title.chars().take(40).collect();
+                                                lines.push(format!("  {} {} ({} msgs) {}{}",
+                                                    if i == 0 { "●" } else { "→" },
+                                                    short_id, msgs, short_title, marker
+                                                ));
+                                            }
+                                            app.push_msg(ChatMessage::System(lines.join("\n")));
+                                        }
+
+                                        // Show any named chain bookmarking the active head
+                                        match synaps_cli::chain::find_all_chains_by_head(&app.session.id) {
+                                            Ok(named) if !named.is_empty() => {
+                                                let names: Vec<String> = named.iter().map(|c| format!("@{}", c.name)).collect();
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "bookmarked by: {}", names.join(", ")
+                                                )));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    CommandAction::ChainList => {
+                                        match synaps_cli::chain::list_chains() {
+                                            Ok(chains) if chains.is_empty() => {
+                                                app.push_msg(ChatMessage::System("no named chains".to_string()));
+                                            }
+                                            Ok(chains) => {
+                                                app.push_msg(ChatMessage::System(format!("{} chain(s):", chains.len())));
+                                                for c in chains {
+                                                    let active = if c.head == app.session.id { " *" } else { "" };
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "  @{} → {}{}", c.name, c.head, active
+                                                    )));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("failed to list chains: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ChainName { name } => {
+                                        match synaps_cli::chain::save_chain(&name, &app.session.id) {
+                                            Ok(()) => {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "chain '{}' → {}", name, app.session.id
+                                                )));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("chain name failed: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ChainUnname { name } => {
+                                        match synaps_cli::chain::delete_chain(&name) {
+                                            Ok(()) => {
+                                                app.push_msg(ChatMessage::System(format!("chain '{}' deleted", name)));
+                                            }
+                                            Err(e) => {
+                                                app.push_msg(ChatMessage::Error(format!("chain unname failed: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    CommandAction::Status => {
+                                        app.push_msg(ChatMessage::System("Checking usage...".to_string()));
+                                        match fetch_usage().await {
+                                            Ok(lines) => {
+                                                for line in lines {
+                                                    app.push_msg(ChatMessage::System(line));
+                                                }
+                                            }
+                                            Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
+                                // Queue input during compaction — will be sent after session swap
+                                if app.compact_task.is_some() {
+                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
+                                    app.queued_message = Some(input);
+                                    continue;
+                                }
                                 // Build display text with paste info
                                 let display_text = if app.pasted_char_count > 0 {
                                     let typed = app.input_before_paste.as_deref().unwrap_or("");
@@ -450,8 +816,14 @@ pub async fn run(
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
                                         CommandAction::ReloadPlugins => {}
-                                        // handle_streaming_command never returns LoadSkill.
+                                        // handle_streaming_command never returns LoadSkill or Compact.
                                         CommandAction::LoadSkill { .. } => {}
+                                        CommandAction::Compact { .. } => {}
+                                        CommandAction::Chain => {}
+                                        CommandAction::ChainList => {}
+                                        CommandAction::ChainName { .. } => {}
+                                        CommandAction::ChainUnname { .. } => {}
+                                        CommandAction::Status => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -501,12 +873,30 @@ pub async fn run(
                                             plugins::actions::apply_refresh_marketplace(state, name).await;
                                         }
                                         PO::RemoveMarketplace(name) => {
-                                            plugins::actions::apply_remove_marketplace(state, name);
+                                            plugins::actions::apply_remove_marketplace(
+                                                state, name, &registry, &config,
+                                            ).await;
                                         }
                                         PO::TogglePlugin { name, enabled } => {
                                             plugins::actions::apply_toggle_plugin(
                                                 state, name, enabled, &registry, &mut config,
                                             );
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::OpenPluginsMarketplace => {
+                                let path = synaps_cli::skills::state::PluginsState::default_path();
+                                match synaps_cli::skills::state::PluginsState::load_from(&path) {
+                                    Ok(file) => {
+                                        app.plugins = Some(plugins::PluginsModalState::new_from_settings(file));
+                                    }
+                                    Err(e) => {
+                                        if let Some(s) = app.settings.as_mut() {
+                                            s.row_error = Some((
+                                                "plugins".to_string(),
+                                                format!("failed to load plugins.json: {}", e),
+                                            ));
                                         }
                                     }
                                 }
@@ -587,6 +977,19 @@ pub async fn run(
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
                         }
+                        StreamAction::AutoTriggerEvents => {
+                            drop(stream.take());
+                            drop(cancel_token.take());
+                            drop(steer_tx.take());
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            cancel_token = Some(ct);
+                            steer_tx = Some(s_tx);
+                        }
                     }
 
                     if do_draw {
@@ -601,6 +1004,10 @@ pub async fn run(
 
     // Save session on exit
     app.save_session().await;
+
+    // Signal the inbox watcher's blocking thread to exit, then abort the async task.
+    watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher_task.abort();
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();

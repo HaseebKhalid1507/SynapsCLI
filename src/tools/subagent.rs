@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use crate::{Result, RuntimeError};
+use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
+pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;
 
@@ -11,7 +12,7 @@ impl Tool for SubagentTool {
     fn name(&self) -> &str { "subagent" }
 
     fn description(&self) -> &str {
-        "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use for delegation — give a focused task to a specialist agent. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
+        "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
     }
 
     fn parameters(&self) -> Value {
@@ -51,7 +52,7 @@ impl Tool for SubagentTool {
         let agent_name = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
         let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => {
@@ -73,12 +74,12 @@ impl Tool for SubagentTool {
 
         tracing::info!("Dispatching subagent '{}' (id={}) with model {}", label, subagent_id, model);
 
-        if let Some(ref tx) = ctx.tx_events {
-            let _ = tx.send(crate::StreamEvent::SubagentStart {
+        if let Some(ref tx) = ctx.channels.tx_events {
+            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentStart {
                 subagent_id,
                 agent_name: label.clone(),
                 task_preview: task_preview.clone(),
-            });
+            }));
         }
 
         let start_time = std::time::Instant::now();
@@ -86,7 +87,7 @@ impl Tool for SubagentTool {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<std::result::Result<SubagentResult, String>>();
         let label_inner = label.clone();
         let model_inner = model.clone();
-        let tx_events_inner = ctx.tx_events.clone();
+        let tx_events_inner = ctx.channels.tx_events.clone();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -141,29 +142,29 @@ impl Tool for SubagentTool {
                         event = stream.next() => {
                             let Some(event) = event else { break };
                             match event {
-                                crate::StreamEvent::Thinking(_) => {
+                                crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                                     if let Some(ref tx) = tx_events_inner {
-                                        let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                             subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: "💭 thinking...".to_string(),
-                                        });
+                                        }));
                                     }
                                 }
-                                crate::StreamEvent::Text(text) => {
+                                crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                     final_text.push_str(&text);
                                 }
-                                crate::StreamEvent::ToolUseStart(name) => {
+                                crate::StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
                                     tool_count += 1;
                                     if let Some(ref tx) = tx_events_inner {
-                                        let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                             subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: format!("⚙ {} (tool #{})", name, tool_count),
-                                        });
+                                        }));
                                     }
                                 }
-                                crate::StreamEvent::ToolUse { tool_name, input, .. } => {
+                                crate::StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
                                     let input_str = input.to_string();
                                     let input_preview: String = input_str.chars().take(200).collect();
                                     tool_log.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
@@ -211,7 +212,7 @@ impl Tool for SubagentTool {
                                         }
                                         other => {
                                             // MCP or unknown tools — show tool name + first param
-                                            let short_name = if other.starts_with("mcp__") {
+                                            let short_name = if other.starts_with("ext__") {
                                                 other.splitn(3, "__").last().unwrap_or(other)
                                             } else {
                                                 other
@@ -220,31 +221,31 @@ impl Tool for SubagentTool {
                                         }
                                     };
                                     if let Some(ref tx) = tx_events_inner {
-                                        let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                        let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                             subagent_id,
                                             agent_name: label_inner.clone(),
                                             status: detail,
-                                        });
+                                        }));
                                     }
                                 }
-                                crate::StreamEvent::ToolResult { result, .. } => {
+                                crate::StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
                                     let preview: String = result.chars().take(300).collect();
                                     tool_log.push(format!("[tool_result]: {}", preview));
                                 }
-                                crate::StreamEvent::Usage {
+                                crate::StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens, output_tokens,
                                     cache_read_input_tokens, cache_creation_input_tokens,
                                     model: _,
-                                } => {
+                                }) => {
                                     total_input_tokens += input_tokens;
                                     total_output_tokens += output_tokens;
                                     total_cache_read += cache_read_input_tokens;
                                     total_cache_creation += cache_creation_input_tokens;
                                 }
-                                crate::StreamEvent::Error(e) => {
+                                crate::StreamEvent::Session(SessionEvent::Error(e)) => {
                                     return Err(e);
                                 }
-                                crate::StreamEvent::Done => break,
+                                crate::StreamEvent::Session(SessionEvent::Done) => break,
                                 _ => {}
                             }
                         }
@@ -313,20 +314,20 @@ impl Tool for SubagentTool {
             Ok(Ok(sa_result)) => {
                 let preview: String = sa_result.text.chars().take(120).collect();
 
-                if let Some(ref tx) = ctx.tx_events {
-                    let _ = tx.send(crate::StreamEvent::Usage {
+                if let Some(ref tx) = ctx.channels.tx_events {
+                    let _ = tx.send(crate::StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: sa_result.input_tokens,
                         output_tokens: sa_result.output_tokens,
                         cache_read_input_tokens: sa_result.cache_read,
                         cache_creation_input_tokens: sa_result.cache_creation,
                         model: Some(sa_result.model),
-                    });
-                    let _ = tx.send(crate::StreamEvent::SubagentDone {
+                    }));
+                    let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
                         subagent_id,
                         agent_name: label.clone(),
                         result_preview: preview,
                         duration_secs: elapsed,
-                    });
+                    }));
                 }
 
                 let log_content = format!(
@@ -343,26 +344,26 @@ impl Tool for SubagentTool {
                 Ok(format!("[subagent:{}] {}", label, sa_result.text))
             }
             Ok(Err(e)) => {
-                if let Some(ref tx) = ctx.tx_events {
-                    let _ = tx.send(crate::StreamEvent::SubagentDone {
+                if let Some(ref tx) = ctx.channels.tx_events {
+                    let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
                         subagent_id,
                         agent_name: label.clone(),
                         result_preview: format!("ERROR: {}", e),
                         duration_secs: elapsed,
-                    });
+                    }));
                 }
                 let log_path = log_dir.join(format!("{}-{}-error.md", timestamp, label));
                 let _ = tokio::fs::write(&log_path, format!("# Subagent ERROR: {}\nTask: {}\nError: {}\n", label, task_preview, e)).await;
                 Ok(format!("[subagent:{} ERROR] {}", label, e))
             }
             Err(_) => {
-                if let Some(ref tx) = ctx.tx_events {
-                    let _ = tx.send(crate::StreamEvent::SubagentDone {
+                if let Some(ref tx) = ctx.channels.tx_events {
+                    let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
                         subagent_id,
                         agent_name: label.clone(),
                         result_preview: "Task panicked or dropped".to_string(),
                         duration_secs: elapsed,
-                    });
+                    }));
                 }
                 Ok(format!("[subagent:{} ERROR] Subagent task panicked or was dropped", label))
             }
@@ -370,12 +371,3 @@ impl Tool for SubagentTool {
     }
 }
 
-pub struct SubagentResult {
-    pub text: String,
-    pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read: u64,
-    pub cache_creation: u64,
-    pub tool_count: u32,
-}

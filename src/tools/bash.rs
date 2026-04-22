@@ -33,8 +33,8 @@ impl Tool for BashTool {
         let command = params["command"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.bash_timeout).min(ctx.bash_max_timeout);
-        let max_output = ctx.max_tool_output;
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.bash_timeout).min(ctx.limits.bash_max_timeout);
+        let max_output = ctx.limits.max_tool_output;
 
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
@@ -54,7 +54,7 @@ impl Tool for BashTool {
         let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         let tx_o = tx_inter.clone();
-        let txd1 = ctx.tx_delta.clone();
+        let txd1 = ctx.channels.tx_delta.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stdout).lines();
@@ -66,7 +66,7 @@ impl Tool for BashTool {
         });
 
         let tx_e = tx_inter.clone();
-        let txd2 = ctx.tx_delta.clone();
+        let txd2 = ctx.channels.tx_delta.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(stderr).lines();

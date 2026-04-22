@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 pub struct Session {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub model: String,
     pub thinking_level: String,
     pub system_prompt: Option<String>,
@@ -21,6 +23,12 @@ pub struct Session {
     /// Saved abort context — injected into the next user message on /continue
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_context: Option<String>,
+    /// ID of the session this was compacted from (backward link)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// ID of the session created by compacting this one (forward link)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_into: Option<String>,
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -28,6 +36,8 @@ pub struct Session {
 pub struct SessionInfo {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub model: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -42,6 +52,7 @@ impl Session {
         Session {
             id,
             title: String::new(),
+            name: None,
             model: model.to_string(),
             thinking_level: thinking_level.to_string(),
             system_prompt: system_prompt.map(|s| s.to_string()),
@@ -52,6 +63,46 @@ impl Session {
             session_cost: 0.0,
             api_messages: Vec::new(),
             abort_context: None,
+            parent_session: None,
+            compacted_into: None,
+        }
+    }
+
+    /// Create a new session from a compaction summary, linked to the parent.
+    pub fn new_from_compaction(parent: &Session, summary: String) -> Self {
+        let now = Utc::now();
+        let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), &uuid::Uuid::new_v4().to_string()[..4]);
+        // Transfer session name from parent — the compacted session is the
+        // continuation, so the name should follow. Parent's name will be
+        // cleared when the caller saves it with compacted_into set.
+        let name = parent.name.clone();
+        let mut summary_parts = String::new();
+        if let Some(ref sp) = parent.system_prompt {
+            summary_parts.push_str(&format!("<system-prompt>\n{}\n</system-prompt>\n\n", sp));
+        }
+        summary_parts.push_str(&format!(
+            "The conversation history before this point was compacted into the following summary:\n\n<context-summary>\n{}\n</context-summary>\n\nContinue from where we left off. The summary and system prompt above contain all the context you need.",
+            summary
+        ));
+        Session {
+            id,
+            title: format!("↳ {}", if parent.title.is_empty() { &parent.id } else { &parent.title }),
+            name,
+            model: parent.model.clone(),
+            thinking_level: parent.thinking_level.clone(),
+            system_prompt: parent.system_prompt.clone(),
+            created_at: now,
+            updated_at: now,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            session_cost: 0.0,
+            api_messages: vec![
+                serde_json::json!({"role": "user", "content": summary_parts}),
+                serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
+            ],
+            abort_context: None,
+            parent_session: Some(parent.id.clone()),
+            compacted_into: None,
         }
     }
 
@@ -92,12 +143,44 @@ impl Session {
         SessionInfo {
             id: self.id.clone(),
             title: self.title.clone(),
+            name: self.name.clone(),
             model: self.model.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             session_cost: self.session_cost,
             message_count: self.api_messages.len(),
         }
+    }
+
+    /// Assign a name to this session. Validates name, enforces uniqueness
+    /// across sessions, and rejects collisions with existing chain names.
+    /// Idempotent: re-applying the current name is a no-op.
+    pub fn set_name(&mut self, name: &str) -> std::io::Result<()> {
+        validate_name(name).map_err(std::io::Error::other)?;
+        if self.name.as_deref() == Some(name) {
+            return Ok(());
+        }
+        let sessions = list_sessions()?;
+        for s in &sessions {
+            if s.name.as_deref() == Some(name) && s.id != self.id {
+                return Err(std::io::Error::other(format!(
+                    "name '{}' already used by session {}",
+                    name, s.id
+                )));
+            }
+        }
+        if crate::core::chain::load_chain(name).is_ok() {
+            return Err(std::io::Error::other(format!(
+                "name '{}' conflicts with an existing chain name",
+                name
+            )));
+        }
+        self.name = Some(name.to_string());
+        Ok(())
+    }
+
+    pub fn clear_name(&mut self) {
+        self.name = None;
     }
 }
 
@@ -152,6 +235,8 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
         id: String,
         #[serde(default)]
         title: String,
+        #[serde(default)]
+        name: Option<String>,
         model: String,
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
@@ -176,6 +261,7 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
                     sessions.push(SessionInfo {
                         id: meta.id,
                         title: meta.title,
+                        name: meta.name,
                         model: meta.model,
                         created_at: meta.created_at,
                         updated_at: meta.updated_at,
@@ -193,6 +279,64 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
 
 fn sessions_dir() -> PathBuf {
     crate::config::get_active_config_dir().join("sessions")
+}
+
+/// Validate a session or chain name: [a-z0-9-]{1,40}.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if name.len() > 40 {
+        return Err(format!("invalid name '{}': must be 40 chars or less", name));
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!(
+            "invalid name '{}': allowed characters are lowercase letters, digits, and '-'",
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// Find a session by its assigned name (not partial ID).
+pub fn find_session_by_name(name: &str) -> std::io::Result<Session> {
+    let sessions = list_sessions()?;
+    for s in &sessions {
+        if s.name.as_deref() == Some(name) {
+            return Session::load(&s.id);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no session named '{}'", name),
+    ))
+}
+
+/// Resolve a query string to a Session. Resolution order:
+/// 1. Chain name  2. Session name  3. Partial session ID
+pub fn resolve_session(query: &str) -> std::io::Result<Session> {
+    if let Ok(ptr) = crate::core::chain::load_chain(query) {
+        match Session::load(&ptr.head) {
+            Ok(s) => {
+                tracing::info!("resolved '{}' via chain → session {}", query, ptr.head);
+                return Ok(s);
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "chain '{}' points to session '{}' which failed to load: {} (try /chain unname {})",
+                        query, ptr.head, e, query
+                    ),
+                ));
+            }
+        }
+    }
+    if let Ok(s) = find_session_by_name(query) {
+        tracing::info!("resolved '{}' via session name → {}", query, s.id);
+        return Ok(s);
+    }
+    find_session(query)
 }
 
 #[cfg(test)]
@@ -314,6 +458,7 @@ mod tests {
         let session_info = SessionInfo {
             id: "test-id".to_string(),
             title: "Test Title".to_string(),
+            name: None,
             model: "gpt-4".to_string(),
             created_at: now,
             updated_at: now,
@@ -488,5 +633,32 @@ mod tests {
         // Verify timestamps are not in the future
         assert!(session.created_at <= after);
         assert!(session.updated_at <= after);
+    }
+
+    #[test]
+    fn test_validate_name() {
+        assert!(validate_name("work").is_ok());
+        assert!(validate_name("my-project-2").is_ok());
+        assert!(validate_name("a").is_ok());
+        assert!(validate_name(&"a".repeat(40)).is_ok());
+
+        assert!(validate_name("").is_err());
+        assert!(validate_name(&"a".repeat(41)).is_err());
+        assert!(validate_name("UPPER").is_err());
+        assert!(validate_name("has space").is_err());
+        assert!(validate_name("under_score").is_err());
+        assert!(validate_name("dots.bad").is_err());
+
+        let err = validate_name("Bad").unwrap_err();
+        assert!(err.contains("Bad"));
+        assert!(err.contains("lowercase") || err.contains("a-z") || err.contains("allowed"));
+    }
+
+    #[test]
+    fn test_clear_name() {
+        let mut s = Session::new("m", "brief", None);
+        s.name = Some("foo".into());
+        s.clear_name();
+        assert_eq!(s.name, None);
     }
 }

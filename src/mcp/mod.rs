@@ -76,7 +76,7 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
                         for tool_def in tools {
                             // Prefix tool names with server name to avoid collisions
                             // e.g. "filesystem__read_file" for server "filesystem"
-                            let prefixed_name = format!("mcp__{}__{}", server_name, tool_def.name);
+                            let prefixed_name = format!("ext__{}__{}", server_name, tool_def.name);
                             
                             let mcp_tool = McpTool {
                                 tool_name: prefixed_name,
@@ -112,7 +112,7 @@ pub async fn connect_mcp_servers(registry: &mut ToolRegistry) -> usize {
     total_tools
 }
 
-/// Set up lazy MCP loading: parse config, register the mcp_connect gateway tool.
+/// Set up lazy MCP loading: parse config, register the connect_mcp_server gateway tool.
 /// Returns the number of available (but not yet connected) servers.
 pub async fn setup_lazy_mcp(registry: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>) -> usize {
     let config = match load_mcp_config() {

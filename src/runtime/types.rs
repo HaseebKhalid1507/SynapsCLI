@@ -1,8 +1,16 @@
 use serde_json::Value;
 use serde::Deserialize;
 
+/// Top-level stream event — grouped into concern-specific sub-enums.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    Llm(LlmEvent),
+    Session(SessionEvent),
+    Agent(AgentEvent),
+}
+
+#[derive(Debug, Clone)]
+pub enum LlmEvent {
     Thinking(String),
     Text(String),
     ToolUseStart(String),
@@ -20,7 +28,24 @@ pub enum StreamEvent {
         tool_id: String,
         delta: String,
     },
-    /// Subagent lifecycle events — rendered as a live status panel in the TUI
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    MessageHistory(Vec<Value>),
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        model: Option<String>,
+    },
+    Done,
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
     SubagentStart {
         subagent_id: u64,
         agent_name: String,
@@ -37,22 +62,9 @@ pub enum StreamEvent {
         result_preview: String,
         duration_secs: f64,
     },
-    /// A steering message was delivered mid-stream (between tool rounds)
     SteeringDelivered {
         message: String,
     },
-    /// Full message history after the tool loop completes, for multi-turn context
-    MessageHistory(Vec<Value>),
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_read_input_tokens: u64,
-        cache_creation_input_tokens: u64,
-        /// Model that generated this usage. None = use parent runtime's model.
-        model: Option<String>,
-    },
-    Done,
-    Error(String),
 }
 
 /// Shared mutable auth state. Lives behind `Arc<RwLock<_>>` so the spawned

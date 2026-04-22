@@ -21,6 +21,7 @@ cargo clippy --all-targets               # linting
 **Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
 
 - `synaps` (no args) — interactive TUI (the main product)
+- `synaps --continue [NAME_OR_ID]` — resume last session, or resolve a chain bookmark / session alias / partial session ID via `resolve_session()` (chain name → session name → partial ID)
 - `synaps chat` — single-shot CLI chat
 - `synaps run` — non-interactive one-shot command
 - `synaps agent` — headless worker managed by the watcher
@@ -44,7 +45,8 @@ src/
 ├── core/                 — shared primitives
 │   ├── config.rs         — SynapsConfig, load/write, profile resolution
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
-│   ├── session.rs        — on-disk session persistence (JSONL)
+│   ├── session.rs        — on-disk session persistence (JSONL), `/saveas` naming, `resolve_session()` (chain → name → partial ID)
+│   ├── chain.rs          — named chain bookmarks (`~/.synaps-cli/chains/<name>.json`), auto-advance on `/compact`
 │   ├── auth/             — OAuth PKCE flow, token storage (fs4-locked, mode 600)
 │   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
@@ -87,7 +89,7 @@ src/
 │   └── display.rs        — `watcher status` renderer
 ├── mcp/                  — Model Context Protocol client
 │   ├── connection.rs     — JSON-RPC over stdio to MCP servers
-│   ├── lazy.rs           — lazy server spawn (don't pay until mcp_connect called)
+│   ├── lazy.rs           — lazy server spawn (don't pay until connect_mcp_server called)
 │   └── tool.rs           — MCP tools wrapped as Tool impls
 └── skills/               — skill discovery + command registry
     ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
@@ -173,10 +175,10 @@ The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step
 
 ### Adding a New Slash Command
 
-1. Add name to both `ALL_COMMANDS` (commands.rs:13) AND `BUILTIN_COMMANDS` (skills/mod.rs:49). Yes, both.
+1. Add name to `BUILTIN_COMMANDS` (skills/mod.rs:49).
 2. If it should work during streaming, add to `STREAMING_COMMANDS` (commands.rs:20).
 3. Add a match arm in `handle_command()` (commands.rs).
-4. If it opens a modal, extend `CommandAction` enum and handle in `main.rs` event loop.
+4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `mod.rs` event loop.
 
 ---
 
@@ -243,9 +245,9 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 4. **PTY tests fail under parallel.** Use `--test-threads=1`. Not a bug — TTY fd contention.
 5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes. (Obvious once you know it, confusing the first time.)
 6. **Two command lists** (`ALL_COMMANDS` vs `BUILTIN_COMMANDS`). Tech debt. Keep in sync or tab-complete breaks silently.
-7. **Subagent has NO subagent.** No recursion. Subagents also lack `mcp_connect`, `load_skill`, `watcher_exit`. Enforced by skipping registration in `tools/subagent.rs`.
+7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced by skipping registration in `tools/subagent.rs`.
 8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
-9. **MCP servers are lazy-spawned.** First `mcp_connect` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
+9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
 10. **OAuth tokens are file-locked** via `fs4`. Concurrent chatui + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
 
 ---
@@ -408,8 +410,10 @@ Dispatch a specialist. **Not available to subagents.**
 
 Runs in isolated thread with its own tokio runtime. Core tools only (no subagent/MCP). Logs to `~/.synaps-cli/logs/subagents/`. Output prefixed `[subagent:{name}]`. Returns partial results on timeout.
 
-### `mcp_connect`
-Connect to an MCP server defined in `~/.synaps-cli/mcp.json`. Tools registered as `mcp__{server}__{tool}`. 30s request timeout.
+### `connect_mcp_server`
+Connect to an MCP server defined in `~/.synaps-cli/mcp.json`. Tools registered as `ext__{server}__{tool}`. 30s request timeout.
+
+(Renamed from `mcp_connect` — Anthropic's API rejects tool names starting with lowercase `mcp_` due to rate limit pool misrouting, yielding 400s.)
 
 | `server` (string, req) |
 
@@ -445,14 +449,53 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `find` | pattern | path, type | File discovery |
 | `ls` | — | path | Directory listing |
 | `subagent` | task | agent, system_prompt, model, timeout | Agent dispatch |
-| `mcp_connect` | server | — | MCP server connection |
+| `connect_mcp_server` | server | — | MCP server connection |
 | `load_skill` | skill | — | Behavioral guidelines |
 | `shell_start` | — | cwd, env, … | Start PTY session |
 | `shell_send` | session_id, input | timeout_ms | Interact with PTY |
 | `shell_end` | session_id | — | Close PTY |
 | `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
-*Watcher agents only. Subagents cannot use `subagent`, `mcp_connect`, `load_skill`, `watcher_exit`.
+*Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`.
+
+---
+
+## Reactive Subagent Tools
+
+```
+subagent_start(agent, task, ...)   → {"handle_id": "sa_1", "status": "running"}
+subagent_status(handle_id)         → {"status": "running", "partial_output": "..."}
+subagent_steer(handle_id, message) → {"acknowledged": true}
+subagent_collect(handle_id)        → {"status": "completed", "output": "full result"}
+```
+
+Use `subagent` for simple sequential delegation (blocks until done).
+Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
+
+---
+
+## Session & Chain Naming
+
+Sessions and compaction lineages can be aliased for easy resume.
+
+- `/saveas <name>` — alias the current session (`[a-z0-9-]{1,40}`, unique, collision-checked). `/saveas` (no arg) clears it. `/sessions` shows `[@name]` on named sessions.
+- `/chain name <name>` — bookmark the current session's lineage. Stored at `~/.synaps-cli/chains/<name>.json`. On `/compact`, the pointer auto-advances to the new session.
+- `/chain list` — all named chains (`*` marks the active one).
+- `/chain unname <name>` — remove a chain bookmark.
+- `/chain` (no args) — show lineage + "bookmarked by: @name" if present.
+
+Resolution (`core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
+
+---
+
+## Event Bus
+
+External systems push events into running sessions via `synaps send`:
+```bash
+synaps send "message" --source cli --severity medium
+```
+
+Events appear as styled cards and auto-trigger model turns. During streaming, events buffer and flush after the current response.
 
 ---
 

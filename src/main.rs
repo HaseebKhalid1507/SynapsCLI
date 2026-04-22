@@ -11,7 +11,7 @@ struct Cli {
     profile: Option<String>,
 
     /// Continue a previous session (TUI only). Optionally provide a session ID.
-    #[arg(long = "continue", value_name = "SESSION_ID")]
+    #[arg(long = "continue", value_name = "NAME_OR_ID")]
     continue_session: Option<Option<String>>,
 
     /// System prompt: a string or path to a file (TUI only).
@@ -42,7 +42,7 @@ enum Command {
         host: String,
         #[arg(long = "system", short = 's')]
         system: Option<String>,
-        #[arg(long = "continue", value_name = "SESSION_ID")]
+        #[arg(long = "continue", value_name = "NAME_OR_ID")]
         continue_session: Option<Option<String>>,
     },
     /// WebSocket client
@@ -66,6 +66,21 @@ enum Command {
     },
     /// OAuth login
     Login,
+    /// Show account usage and reset times
+    Status,
+    /// Send an event to the inbox (picked up by running session)
+    Send {
+        /// Message text
+        message: String,
+        #[arg(long, default_value = "cli")]
+        source: String,
+        #[arg(long, default_value = "medium")]
+        severity: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long = "content-type", default_value = "message")]
+        content_type: String,
+    },
 }
 
 #[tokio::main]
@@ -99,6 +114,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Login) => {
             cmd::login::run(cli.profile).await;
+        }
+        Some(Command::Status) => {
+            cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        Some(Command::Send { message, source, severity, channel, content_type }) => {
+            cmd::send::run(message, source, severity, channel, content_type).await?;
         }
     }
     Ok(())

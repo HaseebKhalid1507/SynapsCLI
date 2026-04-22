@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Session Naming** — `/saveas <name>` aliases for sessions
+  - Name format `[a-z0-9-]{1,40}`, validated and collision-checked
+  - `/saveas` (no arg) clears the name
+  - `synaps --continue <name>` resolves session names
+  - `/sessions` shows `[@name]` tags on named sessions
+- **Chain Naming** — `/chain name/list/unname` bookmarks for compaction lineages with auto-advance
+  - `/chain name <name>` bookmarks the current session's lineage
+  - `/chain list` shows all named chains (`*` marks active)
+  - `/chain unname <name>` removes a bookmark
+  - `/chain` (no args) shows lineage + "bookmarked by: @name" if present
+  - Chain pointers stored at `~/.synaps-cli/chains/<name>.json`
+  - On `/compact`, chain pointers auto-advance to the new session
+- **Unified Session Resolution** — `resolve_session()`: chain name → session name → partial ID, used by `--continue` and `/resume`
+  - Shared by `synaps --continue`, `/resume`, and server `--continue`
+  - Resolution path surfaced as a system message (`↳ resolved via chain 'foo'` / `↳ resolved via name 'bar'`)
+  - `--continue` value_name changed from `SESSION_ID` to `NAME_OR_ID`
+- **Event Bus** — universal message ingestion for agent sessions
+  - `synaps send` CLI command with atomic file writes
+  - inotify inbox watcher via `notify` crate (spawn_blocking, non-blocking)
+  - Priority EventQueue with severity ordering (Critical→front, High→after)
+  - `tokio::sync::Notify` for instant TUI wake on event push
+  - Events auto-trigger model turns when agent is idle
+  - Events buffer during streaming via `pending_events`, flush on completion
+  - Styled TUI event cards with severity icons (🔴🟠🟡🔵)
+  - XML-wrapped event format with prompt injection hardening
+  - 256KB file size cap, symlink guard, 0700 permissions
+- **Reactive Subagents** — dispatch, poll, steer, collect
+  - `subagent_start` — spawn and return handle_id immediately
+  - `subagent_status` — non-blocking progress snapshot
+  - `subagent_steer` — inject guidance mid-flight via steering channel
+  - `subagent_collect` — non-blocking result check
+  - `subagent_resume` — restart timed-out agents (stub)
+  - `SubagentHandle` with shared `RwLock<SubagentState>`
+  - `SubagentRegistry` with cleanup_finished on stream Done
+  - Abort cancels all running reactive subagents
+  - Thread handles stored for graceful shutdown
+  - 13 unit tests for handle + registry
+- **Chain Sessions** — `/compact` creates linked child session
+  - Old session preserved on disk with `compacted_into` forward link
+  - New session starts with `parent_session` back link
+  - `/chain` command walks the session lineage
+  - System prompt included in compaction summary
+  - Configurable compaction model (defaults to Sonnet)
+  - ModelPicker for compaction model in settings
+  - Non-blocking compaction with spinner animation
+  - Compacted summary hidden from TUI display
+  - Message queuing during compaction
+- **`respond` tool** (stub — returns honest failure until wired)
+- **`send_channel` tool** (stub — returns honest failure until wired)
+- **`/status` command + `synaps status` subcommand**: check account usage (5-hour, 7-day, Sonnet) with progress bars and reset countdowns. Hits OAuth usage API.
+- **`/compact` slash command**: summarize & compact conversation history when context gets long
+  - Structured checkpoint format (goals, progress, decisions, file ops, next steps)
+  - Iterative compaction — re-compacting merges new work into existing summary
+  - File operation tracking (read/write/edit paths preserved across compactions)
+  - Custom focus instructions via `/compact <focus>`
+  - Uses dedicated low-effort API call (no tools, summarization system prompt)
+- **`context_window` setting wired to API**: `200k` (default) omits beta header; `1m` sends `context-1m-2025-08-07` on supported models (Opus 4.6+, Sonnet 4.x); previously was UI-only display cap
+- **Claude Code marketplace compatibility**: probe both `.synaps-plugin` and `.claude-plugin` layouts, `${CLAUDE_PLUGIN_ROOT}` substitution in skill bodies
+- **Plugins subdir sources and cascade uninstall**: install from subdir-based plugin repos, cascade-remove plugins when their marketplace is deleted
+- **Settings → Plugins marketplace overlay**: "Open Plugin Marketplace" action row in Settings, opens plugins modal as nested overlay
+- **Hidden binary**: GamblersDen bundled as `hidden` binary alongside `synaps`
 - **Single binary architecture**: all 8 binaries consolidated into `synaps`
   - `synaps` (no args) = TUI (was `chatui`)
   - `synaps run` = one-shot prompt (was `cli run`)
@@ -29,6 +90,23 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- **MCP tool name causes 400 errors** — Anthropic rejects `mcp_` prefixed tool names (rate limit pool misrouting). Renamed `mcp_connect` → `connect_mcp_server`, tool prefix `mcp__server__tool` → `ext__server__tool`.
+- **`/saveas` on empty sessions** — `save_session()` bailed on empty `api_messages`, so the name never persisted. Now calls `session.save()` directly.
+- Compaction no longer overwrites original session (loads from disk)
+- Event content sanitized against prompt injection (XML tags, case-insensitive)
+- Atomic inbox writes (.json.tmp → .json rename)
+- inotify watcher runs on spawn_blocking (no longer starves tokio runtime)
+- Events during streaming buffered and flushed after MessageHistory
+- Spurious auto-triggers prevented by event_received guard
+- push() calls notify_one() (was missing — events silently queued)
+- Session save ordering: new session saved before old session updated
+- chars().count() moved outside lock scope
+- High-priority event FIFO ordering (was LIFO among Highs)
+- Queue-full events left in inbox for retry (not silently dropped)
+- push_priority logs evicted event ID
+- **Session file corruption**: atomic writes via write-to-tmp then rename
+- **Tool input parse errors surfaced to model**: malformed tool_use JSON no longer silently falls through to empty input; model sees `invalid tool input JSON: ...` and can self-correct
+- **Custom theme crash**: `unreachable!()` in draw replaced with graceful fallback colors for non-Rgb themes
 - ASCII logo alignment: use unicode display width for consistent centering
 - 'default' theme missing from settings picker
 - Context bar pinned at 100% after 2-3 turns (was using cumulative tokens / hardcoded 200K)
@@ -39,8 +117,19 @@ All notable changes to this project will be documented in this file.
 - Usage log world-readable at `/tmp/` → moved to `~/.cache/` with 0600
 
 ### Changed
+- Compaction logic moved from chatui to `core/compaction.rs`
+- `SubagentHandle`/`Registry`/`Status` moved to `runtime/subagent.rs`
+- `ApiOptions` struct replaces `use_1m_context: bool` threading
+- `build_auth_header` + `build_beta_header` extracted as helpers
+- `clone_repo` helper deduplicates plugin installer
+- All compaction prompts colocated in `core/compaction.rs`
+- Tool descriptions guide model choice (subagent vs subagent_start)
+- Stub tools unregistered from tool registry (model doesn't see unimplemented tools)
+- SubagentState uses RwLock instead of Mutex
+- **`define_settings!` macro**: settings schema + apply handler defined once in `settings/defs.rs` via declarative macro — zero drift possible (replaced manual sync + parity tests)
+- **Single source of truth for commands**: removed duplicate `ALL_COMMANDS` array; `commands.rs` now sources from `skills::BUILTIN_COMMANDS`
+- **`src/cmd_*.rs` → `src/cmd/` module**: subcommand handlers moved to dedicated directory, `cmd_` prefix stripped
 - Binary name: `chatui`/`synaps-cli`/`synaps-agent` → `synaps` (single binary with subcommands)
-- `src/bin/` directory removed — commands live at `src/cmd_*.rs`
 - `src/chatui/main.rs` → `src/chatui/mod.rs` (module, not binary)
 - watcher spawns `synaps agent` instead of standalone `synaps-agent`
 - `thinking_level_for_budget()` consolidated from 4 copies into single source of truth in `core/models.rs`

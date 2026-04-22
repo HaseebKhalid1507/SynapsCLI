@@ -78,6 +78,8 @@ pub fn get_active_config_dir() -> PathBuf {
 pub struct SynapsConfig {
     pub model: Option<String>,
     pub thinking_budget: Option<u32>,
+    pub context_window: Option<u64>,   // override auto-detected context window (tokens)
+    pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
     pub max_tool_output: usize,        // default 30000
     pub bash_timeout: u64,             // default 30
     pub bash_max_timeout: u64,         // default 300
@@ -94,6 +96,8 @@ impl Default for SynapsConfig {
         Self {
             model: None,
             thinking_budget: None,
+            context_window: None,
+            compaction_model: None,
             max_tool_output: 30000,
             bash_timeout: 30,
             bash_max_timeout: 300,
@@ -207,6 +211,15 @@ pub fn load_config() -> SynapsConfig {
         match key {
             "model" => config.model = Some(val.to_string()),
             "thinking" => config.thinking_budget = parse_thinking_budget(val),
+            "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "context_window" => {
+                let parsed = match val {
+                    "200k" | "200K" => Some(200_000),
+                    "1m" | "1M" => Some(1_000_000),
+                    _ => val.parse::<u64>().ok(),
+                };
+                config.context_window = parsed;
+            }
             "max_tool_output" => {
                 if let Ok(size) = val.parse::<usize>() {
                     config.max_tool_output = size;

@@ -34,7 +34,7 @@ impl McpConnectTool {
 
 #[async_trait::async_trait]
 impl Tool for McpConnectTool {
-    fn name(&self) -> &str { "mcp_connect" }
+    fn name(&self) -> &str { "connect_mcp_server" }
 
     fn description(&self) -> &str {
         "Connect to an MCP server and load its tools. Call this before using tools from an external MCP server. Available servers are listed in the description below. Once connected, the server's tools become available for the rest of the session."
@@ -106,7 +106,7 @@ impl Tool for McpConnectTool {
         let mut new_tools: Vec<Arc<dyn crate::Tool>> = Vec::new();
 
         for tool_def in tools {
-            let prefixed_name = format!("mcp__{}__{}", server_name, tool_def.name);
+            let prefixed_name = format!("ext__{}__{}", server_name, tool_def.name);
             tool_names.push(format!("{} — {}", tool_def.name,
                 tool_def.description.chars().take(60).collect::<String>()));
 
@@ -123,7 +123,7 @@ impl Tool for McpConnectTool {
         }
 
         // Send new tools to the runtime for registration (via channel, no circular Arc)
-        if let Some(ref tx) = ctx.tool_register_tx {
+        if let Some(ref tx) = ctx.capabilities.tool_register_tx {
             let _ = tx.send(new_tools);
         }
 

@@ -79,33 +79,37 @@ pub fn thinking_level_for_budget(budget: u32) -> &'static str {
 /// (0) leaks into the non-adaptive request path. Matches the "high" tier.
 pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
 
+/// Returns true for models that *support* opting into the 1M context window
+/// via the `context-1m-2025-08-07` beta header.
+///
+/// Without that header, all current Claude models operate at the default
+/// 200k window — including those documented as "1M tokens", because the
+/// extended window is gated behind the beta opt-in. This matches Anthropic's
+/// own claude-code logic (`modelSupports1M` in src/utils/context.ts).
+pub fn model_supports_1m(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Opus 4.6+, Sonnet 4 family. Newer models (5.x) assumed supported.
+    m.contains("opus-4-6") || m.contains("opus-4-7")
+        || m.contains("opus-4-8") || m.contains("opus-4-9")
+        || m.contains("sonnet-4")
+        || m.contains("opus-5") || m.contains("sonnet-5")
+}
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
 ///
-/// Values verified against Anthropic model cards as of 2026-04:
-/// - Opus 4.x family: 1M default (S171 limit-test confirmed 270K+ per-turn
-///   input succeeded without `CONTEXT_1M_BETA_HEADER` — Anthropic raised the
-///   default silently with this generation).
-/// - Sonnet 4.x family: 200K default; 1M available via beta header opt-in
-///   (we don't send it in api.rs, so the effective limit is 200K).
-/// - Haiku (all versions): 200K.
-/// - Opus 3.x / unknown models: 200K conservative default.
-pub fn context_window_for_model(model: &str) -> u64 {
-    let m = model.to_ascii_lowercase();
-    if m.contains("opus-4") || m.contains("opus4") {
-        1_000_000
-    } else if m.contains("sonnet-4") || m.contains("sonnet4") {
-        200_000
-    } else if m.contains("haiku") {
-        200_000
-    } else if m.contains("opus") {
-        // Opus 3.x — 200K
-        200_000
-    } else {
-        // Unknown — conservative default.
-        200_000
-    }
+/// **All models default to 200k** — matching Anthropic's claude-code
+/// behavior. Models that support a larger window (Opus 4.6+, Sonnet 4)
+/// require explicit opt-in via the `context-1m-2025-08-07` beta header.
+/// Without the header, the model operates in 200k mode (better inference
+/// quality — context rot at long contexts is real).
+///
+/// Use [`model_supports_1m`] to check whether a model *can* opt into 1M;
+/// the actual decision happens at request time based on the user's
+/// `context_window` setting.
+pub fn context_window_for_model(_model: &str) -> u64 {
+    200_000
 }
 
 #[cfg(test)]
@@ -133,14 +137,39 @@ mod tests {
     }
 
     #[test]
-    fn context_window_opus4_is_1m() {
-        assert_eq!(context_window_for_model("claude-opus-4-7"), 1_000_000);
-        assert_eq!(context_window_for_model("claude-opus-4-5"), 1_000_000);
+    fn context_window_default_is_200k_for_all_models() {
+        // Without explicit 1M opt-in (context-1m beta), every model is 200k.
+        assert_eq!(context_window_for_model("claude-opus-4-7"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
+        assert_eq!(context_window_for_model("claude-opus-4-5-20251101"), 200_000);
+        assert_eq!(context_window_for_model("claude-haiku-4-5-20251001"), 200_000);
     }
 
     #[test]
-    fn context_window_sonnet4_is_200k() {
-        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
+    fn model_supports_1m_for_opus_46_and_sonnet_4() {
+        assert!(model_supports_1m("claude-opus-4-6"));
+        assert!(model_supports_1m("claude-opus-4-7"));
+        assert!(model_supports_1m("claude-sonnet-4-6"));
+        assert!(model_supports_1m("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn model_supports_1m_rejects_older_and_haiku() {
+        assert!(!model_supports_1m("claude-opus-4-5"));
+        assert!(!model_supports_1m("claude-haiku-4-5-20251001"));
+        assert!(!model_supports_1m("claude-opus-3-5"));
+    }
+
+    #[test]
+    fn model_supports_1m_assumed_for_5x() {
+        assert!(model_supports_1m("claude-opus-5-0"));
+        assert!(model_supports_1m("claude-sonnet-5-1"));
+    }
+
+    #[test]
+    fn model_supports_1m_case_insensitive() {
+        assert!(model_supports_1m("CLAUDE-OPUS-4-6"));
     }
 
     #[test]
@@ -157,11 +186,6 @@ mod tests {
     fn context_window_unknown_defaults_200k() {
         assert_eq!(context_window_for_model("some-future-model"), 200_000);
         assert_eq!(context_window_for_model(""), 200_000);
-    }
-
-    #[test]
-    fn context_window_is_case_insensitive() {
-        assert_eq!(context_window_for_model("CLAUDE-OPUS-4-7"), 1_000_000);
     }
 
     #[test]

@@ -152,15 +152,23 @@ use tokio;
 
 fn create_tool_context() -> ToolContext {
     ToolContext {
-        tx_delta: None,
-        tx_events: None,
-        watcher_exit_path: None,
-        tool_register_tx: None,
-        session_manager: None,
-        max_tool_output: 30000,
-        bash_timeout: 30,
-        bash_max_timeout: 300,
-        subagent_timeout: 300,
+        channels: crate::tools::ToolChannels {
+            tx_delta: None,
+            tx_events: None,
+        },
+        capabilities: crate::tools::ToolCapabilities {
+            watcher_exit_path: None,
+            tool_register_tx: None,
+            session_manager: None,
+            subagent_registry: None,
+            event_queue: None,
+        },
+        limits: crate::tools::ToolLimits {
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+        },
     }
 }
 
@@ -371,7 +379,7 @@ fn test_tool_registry_new() {
     let registry = ToolRegistry::new();
     
     // Should have 11 tools including subagent + 3 shell tools
-    assert_eq!(registry.tools_schema().len(), 11);
+    assert_eq!(registry.tools_schema().len(), 16);
     
     // Should find bash tool
     assert!(registry.get("bash").is_some());

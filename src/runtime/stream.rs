@@ -1,43 +1,66 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use serde_json::{json, Value};
 use reqwest::Client;
 use crate::{Result, RuntimeError, ToolRegistry};
-use super::types::{AuthState, StreamEvent};
+use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 use super::api::ApiMethods;
+
+/// Bundle of all dependencies needed to drive a streaming agent loop.
+/// Constructed once by `Runtime::run_stream_with_messages` before spawning the stream task.
+pub(super) struct StreamSession {
+    // Auth & network
+    pub(super) auth: Arc<RwLock<AuthState>>,
+    pub(super) client: Client,
+    pub(super) options: super::api::ApiOptions,
+    pub(super) api_retries: u32,
+
+    // Model config
+    pub(super) model: String,
+    pub(super) tools: Arc<RwLock<ToolRegistry>>,
+    pub(super) system_prompt: Option<String>,
+    pub(super) thinking_budget: u32,
+
+    // Channels
+    pub(super) tx: mpsc::UnboundedSender<StreamEvent>,
+    pub(super) cancel: CancellationToken,
+    pub(super) steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+
+    // Tool config
+    pub(super) watcher_exit_path: Option<PathBuf>,
+    pub(super) max_tool_output: usize,
+    pub(super) bash_timeout: u64,
+    pub(super) bash_max_timeout: u64,
+    pub(super) subagent_timeout: u64,
+    pub(super) session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    pub(super) event_queue: Arc<crate::events::EventQueue>,
+}
 
 pub(super) struct StreamMethods;
 
 impl StreamMethods {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_stream_internal(
-        auth: Arc<RwLock<AuthState>>,
-        client: Client,
-        model: String,
-        tools: Arc<RwLock<ToolRegistry>>,
-        system_prompt: Option<String>,
-        thinking_budget: u32,
+        session: StreamSession,
         initial_messages: Vec<Value>,
-        tx: mpsc::UnboundedSender<StreamEvent>,
-        cancel: CancellationToken,
-        mut steering_rx: Option<mpsc::UnboundedReceiver<String>>,
-        watcher_exit_path: Option<PathBuf>,
-        max_tool_output: usize,
-        bash_timeout: u64,
-        bash_max_timeout: u64,
-        subagent_timeout: u64,
-        api_retries: u32,
-        session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     ) -> Result<()> {
+        let StreamSession {
+            auth, client, options, api_retries,
+            model, tools, system_prompt, thinking_budget,
+            tx, cancel, mut steering_rx,
+            watcher_exit_path, max_tool_output,
+            bash_timeout, bash_max_timeout, subagent_timeout,
+            session_manager, subagent_registry, event_queue,
+        } = session;
         let mut messages = initial_messages;
 
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
-                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 return Ok(());
             }
 
@@ -75,12 +98,12 @@ impl StreamMethods {
             let tools_snapshot = tools.read().await.clone();
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
-                &messages, tx.clone(), &cancel, api_retries,
+                &messages, tx.clone(), &cancel, api_retries, &options,
             ).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Err(e);
                 }
             };
@@ -108,7 +131,7 @@ impl StreamMethods {
                     let steered = HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
                         // No steering, truly done
-                        let _ = tx.send(StreamEvent::MessageHistory(messages));
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Ok(());
                     }
                     // Steering message injected — continue the loop for another LLM call
@@ -154,7 +177,7 @@ impl StreamMethods {
                             "content": err,
                             "is_error": true
                         }));
-                        let _ = tx.send(StreamEvent::ToolResult { tool_id, result: err.to_string() });
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result: err.to_string() }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
@@ -163,15 +186,19 @@ impl StreamMethods {
                                 let t_id = tool_id.clone();
                                 tokio::spawn(async move {
                                     while let Some(msg) = rx_d.recv().await {
-                                        let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                        let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
                                             tool_id: t_id.clone(),
                                             delta: msg,
-                                        });
+                                        }));
                                     }
                                 });
 
                                 tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                    res = tool.execute(input, crate::ToolContext {
+                                        channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
+                                        capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()) },
+                                        limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
+                                    }) => {
                                         match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
@@ -186,10 +213,10 @@ impl StreamMethods {
                             None => format!("Unknown tool: {}", tool_name),
                         };
 
-                        let _ = tx.send(StreamEvent::ToolResult {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.clone(),
                             result: result.clone(),
-                        });
+                        }));
 
                         tool_results.push(json!({
                             "type": "tool_result",
@@ -217,7 +244,7 @@ impl StreamMethods {
                             let tid = tool_id.clone();
                             let tx_c = tx.clone();
                             join_set.spawn(async move {
-                                let _ = tx_c.send(StreamEvent::ToolResult { tool_id: tid.clone(), result: err.clone() });
+                                let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id: tid.clone(), result: err.clone() }));
                                 (tid, false, format!("Tool execution failed: {}", err))
                             });
                             continue;
@@ -229,6 +256,8 @@ impl StreamMethods {
                         let exit_path = watcher_exit_path.clone();
                         let tool_reg_tx_inner = tool_reg_tx.clone();
                         let session_mgr = session_manager.clone();
+                        let registry_inner = subagent_registry.clone();
+                        let eq_inner = event_queue.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -238,15 +267,19 @@ impl StreamMethods {
                                     let t_id = tool_id.clone();
                                     tokio::spawn(async move {
                                         while let Some(msg) = rx_d.recv().await {
-                                            let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                            let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
                                                 tool_id: t_id.clone(),
                                                 delta: msg,
-                                            });
+                                            }));
                                         }
                                     });
 
                                     tokio::select! {
-                                        res = t.execute(input, crate::ToolContext { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout }) => {
+                                        res = t.execute(input, crate::ToolContext {
+                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()) },
+                                            limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
+                                        }) => {
                                             match res {
                                                 Ok(output) => (false, output),
                                                 Err(e) => (false, format!("Tool execution failed: {}", e)),
@@ -260,10 +293,10 @@ impl StreamMethods {
                                 None => (false, format!("Unknown tool: {}", tool_name)),
                             };
 
-                            let _ = tx_stream.send(StreamEvent::ToolResult {
+                            let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                 tool_id: tool_id.clone(),
                                 result: result.1.clone(),
-                            });
+                            }));
 
                             (tool_id, result.0, result.1)
                         });
@@ -315,7 +348,7 @@ impl StreamMethods {
 
                 if cancelled {
                     // Send final history on cancellation so session can be saved
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Ok(());
                 }
 
@@ -326,7 +359,7 @@ impl StreamMethods {
 
                 // Continue the loop to get Claude's response with tool results
             } else {
-                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use crate::{Result, RuntimeError, ToolRegistry};
+use std::sync::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -15,8 +16,9 @@ mod auth;
 mod api;
 mod stream;
 mod helpers;
+pub mod subagent;
 
-pub use types::StreamEvent;
+pub use types::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 use types::AuthState;
 use auth::AuthMethods;
 use api::ApiMethods;
@@ -32,6 +34,17 @@ pub struct Runtime {
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
     thinking_budget: u32,
+    /// User override for context window size (tokens). When set, takes
+    /// precedence over the model's auto-detected window from
+    /// `models::context_window_for_model`. Lets users cap context at e.g.
+    /// 200k even on models that natively support 1M.
+    context_window_override: Option<u64>,
+    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    compaction_model: Option<String>,
+    /// Shared registry for reactive subagent handles.
+    subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
+    /// Shared event queue — for Event Bus tooling.
+    event_queue: Arc<crate::events::EventQueue>,
     /// Path for watcher_exit tool to write handoff state (agent mode only)
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
@@ -80,6 +93,10 @@ impl Runtime {
             tools: Arc::new(RwLock::new(ToolRegistry::new())),
             system_prompt: None,
             thinking_budget: 4096,
+            context_window_override: None,
+            compaction_model: None,
+            subagent_registry: Arc::new(Mutex::new(crate::runtime::subagent::SubagentRegistry::new())),
+            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
             bash_timeout: 30,
@@ -108,6 +125,14 @@ impl Runtime {
         self.tools = Arc::new(RwLock::new(tools));
     }
 
+    pub fn subagent_registry(&self) -> &Arc<Mutex<crate::runtime::subagent::SubagentRegistry>> {
+        &self.subagent_registry
+    }
+
+    pub fn event_queue(&self) -> &Arc<crate::events::EventQueue> {
+        &self.event_queue
+    }
+
     /// Get a shared reference to the tool registry (for MCP lazy loading).
     pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
         Arc::clone(&self.tools)
@@ -121,6 +146,25 @@ impl Runtime {
         self.thinking_budget = budget;
     }
 
+    pub fn set_compaction_model(&mut self, model: Option<String>) {
+        self.compaction_model = model;
+    }
+
+    pub fn set_context_window(&mut self, window: Option<u64>) {
+        self.context_window_override = window;
+    }
+
+    /// Effective context window for the current model — user override if set,
+    /// otherwise the model's native window from `models::context_window_for_model`.
+    pub fn compaction_model(&self) -> &str {
+        self.compaction_model.as_deref().unwrap_or("claude-sonnet-4-6")
+    }
+
+    pub fn context_window(&self) -> u64 {
+        self.context_window_override
+            .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
+    }
+
     /// Apply a parsed config file to this runtime (model, thinking budget, etc.)
     pub fn apply_config(&mut self, config: &crate::config::SynapsConfig) {
         if let Some(ref model) = config.model {
@@ -129,6 +173,8 @@ impl Runtime {
         if let Some(budget) = config.thinking_budget {
             self.set_thinking_budget(budget);
         }
+        self.context_window_override = config.context_window;
+        self.compaction_model = config.compaction_model.clone();
         self.max_tool_output = config.max_tool_output;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -189,6 +235,27 @@ impl Runtime {
         AuthMethods::refresh_if_needed(Arc::clone(&self.auth), &self.client).await
     }
 
+    /// Make a simple non-streaming API call for compaction (no tools).
+    ///
+    /// Uses a dedicated summarization system prompt (not the user's), omits
+    /// all tools, and returns the raw text response. Caller supplies the
+    /// full message array including the serialized conversation.
+    pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
+        self.refresh_if_needed().await?;
+
+        use crate::core::compaction::COMPACTION_SYSTEM_PROMPT;
+
+        ApiMethods::call_api_simple(
+            &self.auth,
+            &self.client,
+            self.compaction_model(),
+            COMPACTION_SYSTEM_PROMPT,
+            self.thinking_budget,
+            &messages,
+            self.api_retries,
+        ).await
+    }
+
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
@@ -207,6 +274,9 @@ impl Runtime {
                 self.thinking_budget,
                 &messages,
                 self.api_retries,
+                &api::ApiOptions {
+                    use_1m_context: self.context_window_override == Some(1_000_000),
+                },
             ).await?;
             
             // Check if Claude wants to use tools
@@ -253,16 +323,24 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let ctx = crate::ToolContext { 
-                                    tx_delta: None, 
-                                    tx_events: None, 
-                                    watcher_exit_path: self.watcher_exit_path.clone(), 
-                                    tool_register_tx: None, 
-                                    session_manager: Some(self.session_manager.clone()),
-                                    max_tool_output: self.max_tool_output,
-                                    bash_timeout: self.bash_timeout,
-                                    bash_max_timeout: self.bash_max_timeout,
-                                    subagent_timeout: self.subagent_timeout,
+                                let ctx = crate::ToolContext {
+                                    channels: crate::tools::ToolChannels {
+                                        tx_delta: None,
+                                        tx_events: None,
+                                    },
+                                    capabilities: crate::tools::ToolCapabilities {
+                                        watcher_exit_path: self.watcher_exit_path.clone(),
+                                        tool_register_tx: None,
+                                        session_manager: Some(self.session_manager.clone()),
+                                        subagent_registry: Some(self.subagent_registry.clone()),
+                                        event_queue: Some(self.event_queue.clone()),
+                                    },
+                                    limits: crate::tools::ToolLimits {
+                                        max_tool_output: self.max_tool_output,
+                                        bash_timeout: self.bash_timeout,
+                                        bash_max_timeout: self.bash_max_timeout,
+                                        subagent_timeout: self.subagent_timeout,
+                                    },
                                 };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
@@ -287,6 +365,8 @@ impl Runtime {
                     let cfg_bash_max_timeout = self.bash_max_timeout;
                     let cfg_subagent_timeout = self.subagent_timeout;
                     let session_mgr = self.session_manager.clone();
+                    let cfg_subagent_registry = self.subagent_registry.clone();
+                    let cfg_event_queue = self.event_queue.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -297,20 +377,30 @@ impl Runtime {
                             let tool = self.tools.read().await.get(&tool_name).cloned();
                             let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
+                            let registry_inner = cfg_subagent_registry.clone();
+                            let event_queue_inner = cfg_event_queue.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let ctx = crate::ToolContext { 
-                                            tx_delta: None, 
-                                            tx_events: None, 
-                                            watcher_exit_path: exit_path, 
-                                            tool_register_tx: None, 
-                                            session_manager: Some(session_mgr_inner),
-                                            max_tool_output: cfg_max_tool_output,
-                                            bash_timeout: cfg_bash_timeout,
-                                            bash_max_timeout: cfg_bash_max_timeout,
-                                            subagent_timeout: cfg_subagent_timeout,
+                                        let ctx = crate::ToolContext {
+                                            channels: crate::tools::ToolChannels {
+                                                tx_delta: None,
+                                                tx_events: None,
+                                            },
+                                            capabilities: crate::tools::ToolCapabilities {
+                                                watcher_exit_path: exit_path,
+                                                tool_register_tx: None,
+                                                session_manager: Some(session_mgr_inner),
+                                                subagent_registry: Some(registry_inner),
+                                                event_queue: Some(event_queue_inner),
+                                            },
+                                            limits: crate::tools::ToolLimits {
+                                                max_tool_output: cfg_max_tool_output,
+                                                bash_timeout: cfg_bash_timeout,
+                                                bash_max_timeout: cfg_bash_max_timeout,
+                                                subagent_timeout: cfg_subagent_timeout,
+                                            },
                                         };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
@@ -384,8 +474,8 @@ impl Runtime {
 
         // Refresh OAuth token if expired before starting the stream.
         if let Err(e) = self.refresh_if_needed().await {
-            let _ = tx.send(StreamEvent::Error(e.to_string()));
-            let _ = tx.send(StreamEvent::Done);
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
 
@@ -404,17 +494,29 @@ impl Runtime {
         let subagent_timeout = self.subagent_timeout;
         let api_retries = self.api_retries;
         let session_manager = self.session_manager.clone();
+        // Opt into the 1M-context beta header only when the user explicitly
+        // requested 1M (via context_window setting). Default 200k matches
+        // Anthropic's claude-code default and gives smarter inference.
+        let subagent_registry = self.subagent_registry.clone();
+        let event_queue = self.event_queue.clone();
+        let options = api::ApiOptions {
+            use_1m_context: self.context_window_override == Some(1_000_000),
+        };
+
+        let session = crate::runtime::stream::StreamSession {
+            auth, client, options, api_retries,
+            model, tools, system_prompt, thinking_budget,
+            tx: tx.clone(), cancel, steering_rx,
+            watcher_exit_path, max_tool_output,
+            bash_timeout, bash_max_timeout, subagent_timeout,
+            session_manager, subagent_registry, event_queue,
+        };
 
         tokio::spawn(async move {
-            if let Err(e) = StreamMethods::run_stream_internal(
-                auth, client, model, tools, system_prompt, thinking_budget,
-                messages, tx.clone(), cancel, steering_rx, watcher_exit_path,
-                max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout, api_retries,
-                session_manager,
-            ).await {
-                let _ = tx.send(StreamEvent::Error(e.to_string()));
+            if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
             }
-            let _ = tx.send(StreamEvent::Done);
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
         Box::pin(UnboundedReceiverStream::new(rx))
@@ -430,6 +532,10 @@ impl Clone for Runtime {
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
             thinking_budget: self.thinking_budget,
+            context_window_override: self.context_window_override,
+            compaction_model: self.compaction_model.clone(),
+            subagent_registry: self.subagent_registry.clone(),
+            event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             bash_timeout: self.bash_timeout,

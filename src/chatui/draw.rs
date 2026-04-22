@@ -34,9 +34,9 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
 }
 
 /// Format a tool name for display. Returns (icon, display_name, optional_server_tag).
-/// MCP tools like "mcp__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
+/// MCP tools like "ext__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
 pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
-    if tool_name.starts_with("mcp__") {
+    if tool_name.starts_with("ext__") {
         let parts: Vec<&str> = tool_name.splitn(3, "__").collect();
         let server = parts.get(1).unwrap_or(&"mcp").to_string();
         let tool = parts.get(2).unwrap_or(&tool_name).to_string();

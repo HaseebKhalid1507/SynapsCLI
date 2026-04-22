@@ -3,6 +3,7 @@ pub mod runtime;
 pub mod tools;
 pub mod mcp;
 pub mod skills;
+pub mod events;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -13,10 +14,11 @@ pub use core::protocol;
 pub use core::error;
 pub use core::watcher_types;
 pub use core::models;
+pub use core::chain;
 
-pub use runtime::{Runtime, StreamEvent};
+pub use runtime::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
-pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions};
+pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, resolve_session, find_session_by_name, validate_name};
 pub use error::{RuntimeError, Result};
 pub use config::{SynapsConfig, load_config, resolve_system_prompt};
 pub use watcher_types::{

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use reqwest::Client;
 use futures::StreamExt;
 use crate::{Result, RuntimeError, ToolRegistry};
-use super::types::{AuthState, StreamEvent};
+use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 
 /// Parse accumulated tool input JSON. On failure, returns a JSON object with
@@ -21,9 +21,50 @@ fn parse_tool_input(raw: &str) -> Value {
     }
 }
 
+/// Options that modify API request behavior beyond the core parameters.
+/// Extensible — new flags go here instead of adding parameters to 4 signatures.
+#[derive(Debug, Clone, Default)]
+pub struct ApiOptions {
+    /// Opt into the 1M context window beta header.
+    pub use_1m_context: bool,
+}
+
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
+    /// Build the auth header for Anthropic requests.
+    /// Returns `(header_name, header_value, auth_type)`.
+    async fn build_auth_header(auth: &Arc<RwLock<AuthState>>) -> (String, String, String) {
+        let (auth_token, auth_type) = {
+            let a = auth.read().await;
+            (a.auth_token.clone(), a.auth_type.clone())
+        };
+        let (name, value) = if auth_type == "oauth" {
+            ("authorization".to_string(), format!("Bearer {}", auth_token))
+        } else {
+            ("x-api-key".to_string(), auth_token)
+        };
+        (name, value, auth_type)
+    }
+
+    /// Build the `anthropic-beta` header value. Returns `None` when no beta
+    /// flags apply.
+    fn build_beta_header(auth_type: &str, options: &ApiOptions, model: &str) -> Option<String> {
+        let mut betas: Vec<&str> = Vec::new();
+        if auth_type == "oauth" {
+            betas.push("claude-code-20250219");
+            betas.push("oauth-2025-04-20");
+        }
+        if options.use_1m_context && crate::core::models::model_supports_1m(model) {
+            betas.push("context-1m-2025-08-07");
+        }
+        if betas.is_empty() {
+            None
+        } else {
+            Some(betas.join(","))
+        }
+    }
+
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(super) async fn call_api_stream(
         auth: &Arc<RwLock<AuthState>>,
@@ -35,8 +76,9 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
+        options: &ApiOptions,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -53,19 +95,11 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
+        options: &ApiOptions,
     ) -> Result<Value> {
         // Read auth state for this API call
-        let (auth_token, auth_type) = {
-            let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone())
-        };
+        let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
-        let auth_header = if auth_type == "oauth" {
-            ("authorization".to_string(), format!("Bearer {}", auth_token))
-        } else {
-            ("x-api-key".to_string(), auth_token.clone())
-        };
-        
         tracing::info!(model = %model, "Starting API request");
         
         // Manual cache breakpoints for optimal prompt caching.
@@ -143,7 +177,7 @@ impl ApiMethods {
                 if attempt > 0 {
                     let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
                     tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    let _ = tx.send(StreamEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries)));
+                    let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries))));
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
@@ -154,11 +188,17 @@ impl ApiMethods {
                 // Rebuild request (consumed on send)
                 let mut req = client
                     .post("https://api.anthropic.com/v1/messages")
-                    .header(auth_header.0.clone(), auth_header.1.clone())
+                    .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
-                if auth_type == "oauth" {
-                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                // Build the anthropic-beta header. The 1M-context opt-in
+                // (`context-1m-2025-08-07`) is only added when the user
+                // explicitly requested 1M AND the model supports it. Without
+                // this opt-in, all models default to 200k mode — which is the
+                // documented "smarter" inference regime (see
+                // anthropic.com/engineering/effective-context-engineering).
+                if let Some(beta) = Self::build_beta_header(&auth_type, options, model) {
+                    req = req.header("anthropic-beta", beta);
                 }
 
                 match req.json(&body).send().await {
@@ -248,7 +288,7 @@ impl ApiMethods {
                                     current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
                                     current_tool_input_json.clear();
                                     in_tool_use = true;
-                                    let _ = tx.send(StreamEvent::ToolUseStart(current_tool_name.clone()));
+                                    let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart(current_tool_name.clone())));
                                 }
                                 Some("text") => {
                                     if !current_text.is_empty() {
@@ -269,14 +309,14 @@ impl ApiMethods {
                                 Some("text_delta") => {
                                     if let Some(text) = delta["text"].as_str() {
                                         current_text.push_str(text);
-                                        let _ = tx.send(StreamEvent::Text(text.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(text.to_string())));
                                     }
                                 }
                                 Some("thinking_delta") => {
                                     // Anthropic sends thinking text in delta.thinking
                                     if let Some(text) = delta["thinking"].as_str() {
                                         current_thinking.push_str(text);
-                                        let _ = tx.send(StreamEvent::Thinking(text.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Thinking(text.to_string())));
                                     }
                                 }
                                 Some("signature_delta") => {
@@ -287,7 +327,7 @@ impl ApiMethods {
                                 Some("input_json_delta") => {
                                     if let Some(json_chunk) = delta["partial_json"].as_str() {
                                         current_tool_input_json.push_str(json_chunk);
-                                        let _ = tx.send(StreamEvent::ToolUseDelta(json_chunk.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta(json_chunk.to_string())));
                                     }
                                 }
                                 _ => {}
@@ -318,11 +358,11 @@ impl ApiMethods {
                             // so the call appears during the assistant's stream — before
                             // we hand off to the tool executor. Without this the call
                             // only becomes visible immediately prior to its result.
-                            let _ = tx.send(StreamEvent::ToolUse {
+                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
                                 tool_name: current_tool_name.clone(),
                                 tool_id: current_tool_id.clone(),
                                 input: input.clone(),
-                            });
+                            }));
 
                             in_tool_use = false;
                         } else if !current_text.is_empty() {
@@ -343,13 +383,13 @@ impl ApiMethods {
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                                 HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                 tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                let _ = tx.send(StreamEvent::Usage {
+                                let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens: input_t,
                                     output_tokens: output_t,
                                     cache_read_input_tokens: cache_read,
                                     cache_creation_input_tokens: cache_create,
                                     model: None,
-                                });
+                                }));
                             }
                         }
                     }
@@ -363,13 +403,13 @@ impl ApiMethods {
                                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                    let _ = tx.send(StreamEvent::Usage {
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
                                         input_tokens: input_t,
                                         output_tokens: output_t,
                                         cache_read_input_tokens: cache_read,
                                         cache_creation_input_tokens: cache_create,
                                         model: None,
-                                    });
+                                    }));
                                 }
                             }
                         }
@@ -400,11 +440,11 @@ impl ApiMethods {
                                 "name": current_tool_name.clone(),
                                 "input": input.clone()
                             }));
-                            let _ = tx.send(StreamEvent::ToolUse {
+                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
                                 tool_name: current_tool_name.clone(),
                                 tool_id: current_tool_id.clone(),
                                 input,
-                            });
+                            }));
                         }
                     }
                 }
@@ -448,6 +488,7 @@ impl ApiMethods {
         thinking_budget: u32,
         messages: &[Value],
         max_retries: u32,
+        options: &ApiOptions,
     ) -> Result<Value> {
         // Read auth state
         let (auth_token, auth_type) = {
@@ -535,8 +576,16 @@ impl ApiMethods {
                     .header(auth_header.0.clone(), auth_header.1.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
+                let mut betas: Vec<&str> = Vec::new();
                 if auth_type == "oauth" {
-                    req = req.header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+                    betas.push("claude-code-20250219");
+                    betas.push("oauth-2025-04-20");
+                }
+                if options.use_1m_context && crate::core::models::model_supports_1m(model) {
+                    betas.push("context-1m-2025-08-07");
+                }
+                if !betas.is_empty() {
+                    req = req.header("anthropic-beta", betas.join(","));
                 }
 
                 match req.json(&body).send().await {
@@ -592,5 +641,149 @@ impl ApiMethods {
         }
 
         Ok(json)
+    }
+
+    /// Simple non-streaming API call without tools (used for compaction).
+    /// Uses a caller-supplied system prompt (replaces the runtime's) and forces
+    /// "low" effort on adaptive models — summarization doesn't benefit from
+    /// heavy reasoning budgets.
+    pub(super) async fn call_api_simple(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        model: &str,
+        system_prompt: &str,
+        thinking_budget: u32,
+        messages: &[Value],
+        max_retries: u32,
+    ) -> Result<String> {
+        let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
+
+        let mut body = json!({
+            "model": model,
+            "max_tokens": HelperMethods::max_tokens_for_model(model),
+            "messages": messages,
+            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+                json!({ "type": "adaptive", "display": "summarized" })
+            } else {
+                let budget = if thinking_budget == 0 {
+                    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+                } else {
+                    thinking_budget
+                };
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                    "display": "summarized"
+                })
+            }
+        });
+
+        // Force low effort on adaptive models — compaction is a structured
+        // summarization task; heavy reasoning wastes tokens.
+        if crate::core::models::model_supports_adaptive_thinking(model) {
+            body["output_config"] = json!({"effort": "low"});
+        }
+
+        if auth_type == "oauth" {
+            let system_blocks = vec![
+                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
+                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
+                json!({"type": "text", "text": system_prompt}),
+            ];
+            body["system"] = json!(system_blocks);
+        } else {
+            body["system"] = json!([
+                {"type": "text", "text": system_prompt}
+            ]);
+        }
+
+        // Retry loop for transient errors
+        let json: Value = {
+            let mut last_err = String::new();
+            let mut result_json = None;
+            for attempt in 0..=max_retries {
+                if attempt > 0 {
+                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
+                    tracing::warn!("Compaction API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
+                    tokio::time::sleep(delay).await;
+                }
+
+                let mut req = client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header(auth_header_name.clone(), auth_header_value.clone())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json");
+                if let Some(beta) = Self::build_beta_header(&auth_type, &ApiOptions::default(), model) {
+                    req = req.header("anthropic-beta", beta);
+                }
+
+                match req.json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            match resp.json::<Value>().await {
+                                Ok(j) => {
+                                    if j["error"].is_object() {
+                                        if let Some(error_type) = j["error"]["type"].as_str() {
+                                            return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+                                        }
+                                    }
+                                    result_json = Some(j);
+                                    break;
+                                }
+                                Err(e) => {
+                                    if attempt == max_retries {
+                                        return Err(RuntimeError::Api(e));
+                                    }
+                                    last_err = e.to_string();
+                                }
+                            }
+                        } else {
+                            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let error_text = resp.text().await.unwrap_or_default();
+                            if !is_retryable || attempt == max_retries {
+                                return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+                            }
+                            last_err = format!("{}: {}", status, error_text);
+                        }
+                    }
+                    Err(e) => {
+                        if attempt == max_retries {
+                            return Err(RuntimeError::Api(e));
+                        }
+                        last_err = e.to_string();
+                    }
+                }
+            }
+
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
+        };
+
+        // Log usage
+        if let Some(usage) = json.get("usage") {
+            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+        }
+
+        // Extract text content from the response (skip thinking blocks)
+        let mut out = String::new();
+        if let Some(content) = json["content"].as_array() {
+            for block in content {
+                if block["type"].as_str() == Some("text") {
+                    if let Some(t) = block["text"].as_str() {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+
+        if out.is_empty() {
+            return Err(RuntimeError::Tool("Compaction returned empty response".to_string()));
+        }
+
+        Ok(out)
     }
 }
