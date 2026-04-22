@@ -212,7 +212,7 @@ impl Tool for SubagentTool {
                                         }
                                         other => {
                                             // MCP or unknown tools — show tool name + first param
-                                            let short_name = if other.starts_with("mcp__") {
+                                            let short_name = if other.starts_with("ext__") {
                                                 other.splitn(3, "__").last().unwrap_or(other)
                                             } else {
                                                 other

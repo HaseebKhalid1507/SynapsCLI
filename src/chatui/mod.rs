@@ -252,7 +252,7 @@ pub async fn run(
     app.last_turn_context_window = runtime.context_window();
     if mcp_server_count > 0 {
         app.push_msg(ChatMessage::System(format!(
-            "⚡ {} MCP servers available (use mcp_connect to activate)",
+            "⚡ {} MCP servers available (use connect_mcp_server to activate)",
             mcp_server_count
         )));
     }

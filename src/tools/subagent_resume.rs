@@ -234,7 +234,7 @@ impl Tool for SubagentResumeTool {
                                             "find"  => format!("find {}", input["pattern"].as_str().unwrap_or("?")),
                                             "ls"    => format!("ls {}", input["path"].as_str().unwrap_or(".").rsplit('/').next().unwrap_or(".")),
                                             other   => {
-                                                if other.starts_with("mcp__") {
+                                                if other.starts_with("ext__") {
                                                     other.splitn(3, "__").last().unwrap_or(other).to_string()
                                                 } else {
                                                     other.to_string()
