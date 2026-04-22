@@ -97,6 +97,22 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
+        // Route to OpenAI-compat provider if the model id resolves to one.
+        // Keys come from the config cache (`provider.*` lines); registry
+        // falls back to env vars (e.g. GROQ_API_KEY) when the map is empty.
+        let provider_keys = crate::core::config::get_provider_keys();
+        if let crate::runtime::openai::Provider::OpenAi(cfg) =
+            crate::runtime::openai::resolve_route(model, &provider_keys)
+        {
+            let _ = (thinking_budget, cancel, max_retries, options);
+            let tools_schema = tools.tools_schema();
+            return crate::runtime::openai::stream::call_oai_stream_inner(
+                &cfg, client, &tools_schema, system_prompt, messages, &tx, model,
+            )
+            .await
+            .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
+        }
+
         // Read auth state for this API call
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 

@@ -17,6 +17,7 @@ mod api;
 mod stream;
 mod helpers;
 pub mod subagent;
+pub mod openai;
 
 pub use types::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 use types::AuthState;

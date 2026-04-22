@@ -1,8 +1,17 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use crate::tools::shell::config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
+static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+/// Provider API keys parsed from `provider.<name> = ...` lines in config.
+/// Empty if `load_config()` hasn't been called. The registry falls back to
+/// env vars, so e.g. `GROQ_API_KEY` works even with an empty map.
+pub fn get_provider_keys() -> BTreeMap<String, String> {
+    PROVIDER_KEYS.get().cloned().unwrap_or_default()
+}
 
 /// Returns the active profile name, if any.
 /// Reads from `SYNAPS_PROFILE` environment variable if not already set programmatically.
@@ -89,6 +98,7 @@ pub struct SynapsConfig {
     pub disabled_plugins: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
+    pub provider_keys: BTreeMap<String, String>,
 }
 
 impl Default for SynapsConfig {
@@ -107,6 +117,7 @@ impl Default for SynapsConfig {
             disabled_plugins: Vec::new(),
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
+            provider_keys: BTreeMap::new(),
         }
     }
 }
@@ -262,12 +273,18 @@ pub fn load_config() -> SynapsConfig {
                 // Handle shell.* keys
                 if key.starts_with("shell.") {
                     parse_shell_config_key(&mut config.shell, key, val);
+                } else if let Some(provider_key) = key.strip_prefix("provider.") {
+                    config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 }
                 // Other unknown keys silently ignored
             }
         }
     }
-    
+
+    // Publish provider keys to the process-wide cache for the API router.
+    // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
+    let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
+
     config
 }
 
