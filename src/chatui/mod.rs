@@ -1031,6 +1031,28 @@ pub async fn run(
     // Save session on exit
     app.save_session().await;
 
+    // Shut down tmux session (clean slate — session dies with Synaps)
+    if let Some(ctrl) = tmux_controller {
+        // Arc::try_unwrap to get owned value; if other refs exist, force kill via CLI
+        match std::sync::Arc::try_unwrap(ctrl) {
+            Ok(mut owned) => {
+                if let Err(e) = owned.shutdown().await {
+                    tracing::warn!("tmux shutdown error: {}", e);
+                }
+            }
+            Err(arc) => {
+                // Other references still held — fall back to kill-session via CLI
+                tracing::debug!("tmux controller still shared, killing session via CLI");
+                if let Some(tmux_path) = synaps_cli::tmux::find_tmux() {
+                    let _ = tokio::process::Command::new(&tmux_path)
+                        .args(["kill-session", "-t", &arc.session_name])
+                        .status()
+                        .await;
+                }
+            }
+        }
+    }
+
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher_task.abort();

@@ -64,6 +64,24 @@ impl TmuxController {
         let tmux_path = crate::tmux::find_tmux()
             .ok_or_else(|| "tmux not found in PATH".to_string())?;
 
+        // Kill any stale session with the same name (clean slate model)
+        let has_existing = Command::new(&tmux_path)
+            .args(["has-session", "-t", &self.session_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if has_existing {
+            tracing::info!("killing stale tmux session '{}'", self.session_name);
+            let _ = Command::new(&tmux_path)
+                .args(["kill-session", "-t", &self.session_name])
+                .status()
+                .await;
+        }
+
         // Get terminal size
         let (cols, rows) = crossterm::terminal::size().unwrap_or((200, 50));
 
