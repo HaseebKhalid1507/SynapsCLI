@@ -175,10 +175,20 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
 
 fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let providers = synaps_cli::runtime::openai::registry::providers();
+    let visible_height = area.height as usize;
+    let selected = if state.focus == Focus::Right { state.setting_idx } else { usize::MAX };
+
+    // Scroll offset — keep selected row in view
+    let scroll_offset = if selected >= visible_height {
+        selected.saturating_sub(visible_height - 1)
+    } else {
+        0
+    };
+
     let mut lines = Vec::new();
-    for (i, p) in providers.iter().enumerate() {
-        let selected = i == state.setting_idx && state.focus == Focus::Right;
-        let style = if selected {
+    for (i, p) in providers.iter().enumerate().skip(scroll_offset).take(visible_height) {
+        let is_selected = i == selected;
+        let style = if is_selected {
             Style::default().fg(THEME.load().claude_label)
         } else {
             Style::default().fg(THEME.load().claude_text)
@@ -201,7 +211,7 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
         )]));
 
         if let Some((key, msg)) = &state.row_error {
-            if key == &format!("provider.{}", p.key) && selected {
+            if key == &format!("provider.{}", p.key) && is_selected {
                 let is_note = msg.starts_with("saved");
                 let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
                 lines.push(ratatui::text::Line::from(vec![
@@ -210,6 +220,19 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
             }
         }
     }
+
+    // Scroll indicators
+    if scroll_offset > 0 {
+        lines.insert(0, ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            "  ▲ more", Style::default().fg(THEME.load().help_fg),
+        )]));
+    }
+    if scroll_offset + visible_height < providers.len() {
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            "  ▼ more", Style::default().fg(THEME.load().help_fg),
+        )]));
+    }
+
     frame.render_widget(Paragraph::new(lines), area);
 }
 
