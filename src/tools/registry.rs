@@ -38,6 +38,12 @@ impl ToolRegistry {
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
+            Arc::new(crate::tools::tmux_split::TmuxSplitTool),
+            Arc::new(crate::tools::tmux_send::TmuxSendTool),
+            Arc::new(crate::tools::tmux_capture::TmuxCaptureTool),
+            Arc::new(crate::tools::tmux_layout::TmuxLayoutTool),
+            Arc::new(crate::tools::tmux_window::TmuxWindowTool),
+            Arc::new(crate::tools::tmux_resize::TmuxResizeTool),
         ];
         Self::from_tools(tools)
     }

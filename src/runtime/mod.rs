@@ -54,6 +54,8 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    /// tmux controller for tmux-native mode (None when not in tmux mode).
+    tmux_controller: Option<std::sync::Arc<crate::tmux::TmuxController>>,
     // Held to keep the reaper task alive for the Runtime's lifetime; never read directly.
     #[allow(dead_code)]
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
@@ -104,6 +106,7 @@ impl Runtime {
             subagent_timeout: 300,
             api_retries: 3,
             session_manager,
+            tmux_controller: None,
             reaper_handle: Some(reaper_handle),
             reaper_cancel: Some(cancel),
         })
@@ -136,6 +139,16 @@ impl Runtime {
     /// Get a shared reference to the tool registry (for MCP lazy loading).
     pub fn tools_shared(&self) -> Arc<RwLock<ToolRegistry>> {
         Arc::clone(&self.tools)
+    }
+
+    /// Get the tmux controller (if tmux mode is active).
+    pub fn tmux_controller(&self) -> Option<&std::sync::Arc<crate::tmux::TmuxController>> {
+        self.tmux_controller.as_ref()
+    }
+
+    /// Set the tmux controller (activates tmux mode).
+    pub fn set_tmux_controller(&mut self, controller: std::sync::Arc<crate::tmux::TmuxController>) {
+        self.tmux_controller = Some(controller);
     }
 
     pub fn model(&self) -> &str {
@@ -334,6 +347,7 @@ impl Runtime {
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         event_queue: Some(self.event_queue.clone()),
+                                        tmux_controller: self.tmux_controller.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -394,6 +408,7 @@ impl Runtime {
                                                 session_manager: Some(session_mgr_inner),
                                                 subagent_registry: Some(registry_inner),
                                                 event_queue: Some(event_queue_inner),
+                                                tmux_controller: None,
                                             },
                                             limits: crate::tools::ToolLimits {
                                                 max_tool_output: cfg_max_tool_output,
@@ -543,6 +558,7 @@ impl Clone for Runtime {
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
             session_manager: self.session_manager.clone(),
+            tmux_controller: self.tmux_controller.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
             reaper_cancel: None,  // Cloned runtimes don't own the reaper
         }

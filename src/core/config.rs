@@ -89,6 +89,7 @@ pub struct SynapsConfig {
     pub disabled_plugins: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
+    pub tmux: crate::tmux::TmuxConfig,
 }
 
 impl Default for SynapsConfig {
@@ -107,6 +108,7 @@ impl Default for SynapsConfig {
             disabled_plugins: Vec::new(),
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
+            tmux: crate::tmux::TmuxConfig::default(),
         }
     }
 }
@@ -192,6 +194,44 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
     }
 }
 
+/// Parse tmux.* configuration keys and update the TmuxConfig.
+fn parse_tmux_config_key(config: &mut crate::tmux::TmuxConfig, key: &str, val: &str) {
+    let sub_key = key.strip_prefix("tmux.").unwrap_or(key);
+    match sub_key {
+        "enabled" => config.enabled = val.eq_ignore_ascii_case("true"),
+        "session_name" => config.session_name = Some(val.to_string()),
+        "default_layout" => {
+            config.default_layout = match val.to_lowercase().as_str() {
+                "split" => crate::tmux::config::LayoutPreset::Split,
+                "fullscreen" => crate::tmux::config::LayoutPreset::Fullscreen,
+                "tiled" => crate::tmux::config::LayoutPreset::Tiled,
+                other => crate::tmux::config::LayoutPreset::Custom(other.to_string()),
+            };
+        }
+        "subagent_display" => {
+            config.subagent_display = match val.to_lowercase().as_str() {
+                "window" => crate::tmux::config::SubagentDisplay::Window,
+                _ => crate::tmux::config::SubagentDisplay::Pane,
+            };
+        }
+        "mouse" => config.mouse = val.eq_ignore_ascii_case("true"),
+        "split_ratio" => {
+            if let Ok(ratio) = val.parse::<u32>() {
+                if ratio > 0 && ratio < 100 {
+                    config.split_ratio = ratio;
+                }
+            }
+        }
+        "shell_position" => {
+            config.shell_position = match val.to_lowercase().as_str() {
+                "bottom" => "bottom".to_string(),
+                _ => "right".to_string(),
+            };
+        }
+        _ => {} // silently ignore unknown tmux keys
+    }
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -262,6 +302,8 @@ pub fn load_config() -> SynapsConfig {
                 // Handle shell.* keys
                 if key.starts_with("shell.") {
                     parse_shell_config_key(&mut config.shell, key, val);
+                } else if key.starts_with("tmux.") {
+                    parse_tmux_config_key(&mut config.tmux, key, val);
                 }
                 // Other unknown keys silently ignored
             }

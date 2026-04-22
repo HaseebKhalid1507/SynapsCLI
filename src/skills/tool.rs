@@ -92,6 +92,7 @@ mod tests {
                 session_manager: None,
                 subagent_registry: None,
                 event_queue: None,
+                tmux_controller: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

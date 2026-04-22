@@ -162,6 +162,7 @@ fn create_tool_context() -> ToolContext {
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
+            tmux_controller: None,
         },
         limits: crate::tools::ToolLimits {
             max_tool_output: 30000,
@@ -379,7 +380,7 @@ fn test_tool_registry_new() {
     let registry = ToolRegistry::new();
     
     // Should have 11 tools including subagent + 3 shell tools
-    assert_eq!(registry.tools_schema().len(), 16);
+    assert_eq!(registry.tools_schema().len(), 22);
     
     // Should find bash tool
     assert!(registry.get("bash").is_some());
@@ -396,6 +397,12 @@ fn test_tool_registry_new() {
     assert!(registry.get("find").is_some());
     assert!(registry.get("ls").is_some());
     assert!(registry.get("subagent").is_some());
+    assert!(registry.get("tmux_split").is_some());
+    assert!(registry.get("tmux_send").is_some());
+    assert!(registry.get("tmux_capture").is_some());
+    assert!(registry.get("tmux_layout").is_some());
+    assert!(registry.get("tmux_window").is_some());
+    assert!(registry.get("tmux_resize").is_some());
 }
 
 #[test]

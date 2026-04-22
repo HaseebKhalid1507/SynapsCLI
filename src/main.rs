@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
 
+    /// Launch in tmux mode with optional session name.
+    #[arg(long = "tmux", value_name = "SESSION_NAME")]
+    tmux: Option<Option<String>>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }

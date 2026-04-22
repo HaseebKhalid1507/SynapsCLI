@@ -4,6 +4,7 @@ pub mod tools;
 pub mod mcp;
 pub mod skills;
 pub mod events;
+pub mod tmux;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;

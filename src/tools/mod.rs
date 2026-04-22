@@ -30,6 +30,12 @@ pub mod subagent_collect;
 pub mod subagent_resume;
 pub mod respond;
 pub mod send_channel;
+pub mod tmux_split;
+pub mod tmux_send;
+pub mod tmux_capture;
+pub mod tmux_layout;
+pub mod tmux_window;
+pub mod tmux_resize;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +59,12 @@ pub use subagent_collect::SubagentCollectTool;
 pub use subagent_resume::SubagentResumeTool;
 pub use respond::RespondTool;
 pub use send_channel::SendChannelTool;
+pub use tmux_split::TmuxSplitTool;
+pub use tmux_send::TmuxSendTool;
+pub use tmux_capture::TmuxCaptureTool;
+pub use tmux_layout::TmuxLayoutTool;
+pub use tmux_window::TmuxWindowTool;
+pub use tmux_resize::TmuxResizeTool;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -72,6 +84,7 @@ pub struct ToolCapabilities {
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
+    pub tmux_controller: Option<std::sync::Arc<crate::tmux::TmuxController>>,
 }
 
 /// Configuration limits and timeouts.
