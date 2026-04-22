@@ -30,7 +30,7 @@ pub(crate) async fn call_oai_stream_inner(
     let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
 
     let body = ChatRequest {
-        model: model.to_string(),
+        model: cfg.model.clone(),
         messages: oai_messages,
         stream: true,
         stream_options: Some(StreamOptions { include_usage: true }),
