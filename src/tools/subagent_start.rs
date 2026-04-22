@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Result, RuntimeError};
+use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
 use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
@@ -99,11 +99,11 @@ impl Tool for SubagentStartTool {
 
         // ── Forward SubagentStart event to TUI ─────────────────────────────────
         if let Some(ref tx) = ctx.channels.tx_events {
-            let _ = tx.send(crate::StreamEvent::SubagentStart {
+            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentStart {
                 subagent_id,
                 agent_name: label.clone(),
                 task_preview: task_preview.clone(),
-            });
+            }));
         }
 
         // ── Clone state for the spawned thread ─────────────────────────────────
@@ -172,29 +172,29 @@ impl Tool for SubagentStartTool {
                             event = stream.next() => {
                                 let Some(event) = event else { break };
                                 match event {
-                                    crate::StreamEvent::Thinking(_) => {
+                                    crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                                         if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,
                                                 agent_name: label_a.clone(),
                                                 status: "💭 thinking...".to_string(),
-                                            });
+                                            }));
                                         }
                                     }
-                                    crate::StreamEvent::Text(text) => {
+                                    crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                         state_a.write().unwrap().partial_text.push_str(&text);
                                     }
-                                    crate::StreamEvent::ToolUseStart(name) => {
+                                    crate::StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
                                         tool_count += 1;
                                         if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,
                                                 agent_name: label_a.clone(),
                                                 status: format!("⚙ {} (tool #{})", name, tool_count),
-                                            });
+                                            }));
                                         }
                                     }
-                                    crate::StreamEvent::ToolUse { tool_name, input, .. } => {
+                                    crate::StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
                                         let input_str = input.to_string();
                                         let input_preview: String = input_str.chars().take(200).collect();
                                         state_a.write().unwrap().tool_log
@@ -220,30 +220,30 @@ impl Tool for SubagentStartTool {
                                             }
                                         };
                                         if let Some(ref tx) = tx_events_a {
-                                            let _ = tx.send(crate::StreamEvent::SubagentUpdate {
+                                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {
                                                 subagent_id,
                                                 agent_name: label_a.clone(),
                                                 status: detail,
-                                            });
+                                            }));
                                         }
                                     }
-                                    crate::StreamEvent::ToolResult { result, .. } => {
+                                    crate::StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
                                         let preview: String = result.chars().take(300).collect();
                                         state_a.write().unwrap().tool_log
                                             .push(format!("[tool_result]: {}", preview));
                                     }
-                                    crate::StreamEvent::Usage {
+                                    crate::StreamEvent::Session(SessionEvent::Usage {
                                         input_tokens, output_tokens,
                                         cache_read_input_tokens, cache_creation_input_tokens,
                                         model: _,
-                                    } => {
+                                    }) => {
                                         total_input_tokens    += input_tokens;
                                         total_output_tokens   += output_tokens;
                                         total_cache_read      += cache_read_input_tokens;
                                         total_cache_creation  += cache_creation_input_tokens;
                                     }
-                                    crate::StreamEvent::Error(e) => return Err(e),
-                                    crate::StreamEvent::Done => break,
+                                    crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
+                                    crate::StreamEvent::Session(SessionEvent::Done) => break,
                                     _ => {}
                                 }
                             }
@@ -306,12 +306,12 @@ impl Tool for SubagentStartTool {
                         let elapsed = start_time.elapsed().as_secs_f64();
                         let preview: String = sa_result.text.chars().take(120).collect();
                         if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::SubagentDone {
+                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
                                 subagent_id,
                                 agent_name: label_inner.clone(),
                                 result_preview: preview,
                                 duration_secs: elapsed,
-                            });
+                            }));
                         }
                         let _ = result_tx.send(sa_result);
                     }
@@ -319,12 +319,12 @@ impl Tool for SubagentStartTool {
                         state_t.write().unwrap().status = SubagentStatus::Failed(e.clone());
                         let elapsed = start_time.elapsed().as_secs_f64();
                         if let Some(ref tx) = tx_events_inner {
-                            let _ = tx.send(crate::StreamEvent::SubagentDone {
+                            let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {
                                 subagent_id,
                                 agent_name: label_inner.clone(),
                                 result_preview: format!("ERROR: {}", e),
                                 duration_secs: elapsed,
-                            });
+                            }));
                         }
                         // drop result_tx — collect() will surface the closed channel
                     }

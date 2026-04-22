@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use reqwest::Client;
 use futures::StreamExt;
 use crate::{Result, RuntimeError, ToolRegistry};
-use super::types::{AuthState, StreamEvent};
+use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 
 /// Parse accumulated tool input JSON. On failure, returns a JSON object with
@@ -177,7 +177,7 @@ impl ApiMethods {
                 if attempt > 0 {
                     let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
                     tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    let _ = tx.send(StreamEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries)));
+                    let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries))));
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
@@ -288,7 +288,7 @@ impl ApiMethods {
                                     current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
                                     current_tool_input_json.clear();
                                     in_tool_use = true;
-                                    let _ = tx.send(StreamEvent::ToolUseStart(current_tool_name.clone()));
+                                    let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart(current_tool_name.clone())));
                                 }
                                 Some("text") => {
                                     if !current_text.is_empty() {
@@ -309,14 +309,14 @@ impl ApiMethods {
                                 Some("text_delta") => {
                                     if let Some(text) = delta["text"].as_str() {
                                         current_text.push_str(text);
-                                        let _ = tx.send(StreamEvent::Text(text.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(text.to_string())));
                                     }
                                 }
                                 Some("thinking_delta") => {
                                     // Anthropic sends thinking text in delta.thinking
                                     if let Some(text) = delta["thinking"].as_str() {
                                         current_thinking.push_str(text);
-                                        let _ = tx.send(StreamEvent::Thinking(text.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Thinking(text.to_string())));
                                     }
                                 }
                                 Some("signature_delta") => {
@@ -327,7 +327,7 @@ impl ApiMethods {
                                 Some("input_json_delta") => {
                                     if let Some(json_chunk) = delta["partial_json"].as_str() {
                                         current_tool_input_json.push_str(json_chunk);
-                                        let _ = tx.send(StreamEvent::ToolUseDelta(json_chunk.to_string()));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta(json_chunk.to_string())));
                                     }
                                 }
                                 _ => {}
@@ -358,11 +358,11 @@ impl ApiMethods {
                             // so the call appears during the assistant's stream — before
                             // we hand off to the tool executor. Without this the call
                             // only becomes visible immediately prior to its result.
-                            let _ = tx.send(StreamEvent::ToolUse {
+                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
                                 tool_name: current_tool_name.clone(),
                                 tool_id: current_tool_id.clone(),
                                 input: input.clone(),
-                            });
+                            }));
 
                             in_tool_use = false;
                         } else if !current_text.is_empty() {
@@ -383,13 +383,13 @@ impl ApiMethods {
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                                 HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                 tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                let _ = tx.send(StreamEvent::Usage {
+                                let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens: input_t,
                                     output_tokens: output_t,
                                     cache_read_input_tokens: cache_read,
                                     cache_creation_input_tokens: cache_create,
                                     model: None,
-                                });
+                                }));
                             }
                         }
                     }
@@ -403,13 +403,13 @@ impl ApiMethods {
                                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                    let _ = tx.send(StreamEvent::Usage {
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
                                         input_tokens: input_t,
                                         output_tokens: output_t,
                                         cache_read_input_tokens: cache_read,
                                         cache_creation_input_tokens: cache_create,
                                         model: None,
-                                    });
+                                    }));
                                 }
                             }
                         }
@@ -440,11 +440,11 @@ impl ApiMethods {
                                 "name": current_tool_name.clone(),
                                 "input": input.clone()
                             }));
-                            let _ = tx.send(StreamEvent::ToolUse {
+                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
                                 tool_name: current_tool_name.clone(),
                                 tool_id: current_tool_id.clone(),
                                 input,
-                            });
+                            }));
                         }
                     }
                 }

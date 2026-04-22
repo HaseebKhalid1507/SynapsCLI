@@ -18,7 +18,7 @@ mod stream;
 mod helpers;
 pub mod subagent;
 
-pub use types::StreamEvent;
+pub use types::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 use types::AuthState;
 use auth::AuthMethods;
 use api::ApiMethods;
@@ -474,8 +474,8 @@ impl Runtime {
 
         // Refresh OAuth token if expired before starting the stream.
         if let Err(e) = self.refresh_if_needed().await {
-            let _ = tx.send(StreamEvent::Error(e.to_string()));
-            let _ = tx.send(StreamEvent::Done);
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
             return Box::pin(UnboundedReceiverStream::new(rx));
         }
 
@@ -514,9 +514,9 @@ impl Runtime {
 
         tokio::spawn(async move {
             if let Err(e) = StreamMethods::run_stream_internal(session, messages).await {
-                let _ = tx.send(StreamEvent::Error(e.to_string()));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Error(e.to_string())));
             }
-            let _ = tx.send(StreamEvent::Done);
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
         });
 
         Box::pin(UnboundedReceiverStream::new(rx))

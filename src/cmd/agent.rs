@@ -5,7 +5,7 @@
 //!
 //! Usage: synaps-agent --config <path/to/config.toml>
 
-use synaps_cli::{Runtime, StreamEvent, AgentConfig, HandoffState, watcher_types::{AgentStats, DailyStats}};
+use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentConfig, HandoffState, watcher_types::{AgentStats, DailyStats}};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -299,7 +299,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         let mut turn_done = false;
         while let Some(event) = stream.next().await {
             match event {
-                StreamEvent::Text(text) => {
+                StreamEvent::Llm(LlmEvent::Text(text)) => {
                     // Log significant text output
                     if text.len() > 100 {
                         log(agent_name, &format!("output: {}...", &text[..100]));
@@ -311,7 +311,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                         }));
                     }
                 }
-                StreamEvent::ToolUseStart(name) => {
+                StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
                     total_tool_calls += 1;
                     tool_call_num += 1;
                     log(agent_name, &format!("tool: {}", name));
@@ -328,7 +328,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                         watcher_exit_called = true;
                     }
                 }
-                StreamEvent::ToolResult { result, .. } => {
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
                     let preview: String = result.chars().take(100).collect();
                     log(agent_name, &format!("  result: {}", preview));
                     
@@ -339,7 +339,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                         "preview": result.chars().take(200).collect::<String>()
                     }));
                 }
-                StreamEvent::Usage { input_tokens, output_tokens, model, .. } => {
+                StreamEvent::Session(SessionEvent::Usage { input_tokens, output_tokens, model, .. }) => {
                     total_tokens += input_tokens + output_tokens;
                     total_cost += estimate_cost(input_tokens, output_tokens, model.as_deref().unwrap_or("sonnet"));
                     log(agent_name, &format!("  tokens: +{}/+{} (total: {}, cost: ${:.4})",
@@ -361,17 +361,17 @@ pub async fn run(config_path: String, trigger_context: String) {
                         log(agent_name, "limit reached during streaming — will exit after this turn");
                     }
                 }
-                StreamEvent::MessageHistory(history) => {
+                StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                     messages = history;
                     turn_done = true;
                 }
-                StreamEvent::Done => {
+                StreamEvent::Session(SessionEvent::Done) => {
                     if !turn_done {
                         // Stream ended without MessageHistory — single turn, no tool use
                         turn_done = true;
                     }
                 }
-                StreamEvent::Error(e) => {
+                StreamEvent::Session(SessionEvent::Error(e)) => {
                     log(agent_name, &format!("ERROR: {}", e));
                     turn_done = true;
                 }
@@ -422,10 +422,10 @@ pub async fn run(config_path: String, trigger_context: String) {
             tokio::select! {
                 event = stream.next() => {
                     match event {
-                        Some(StreamEvent::ToolUseStart(name)) if name == "watcher_exit" => {
+                        Some(StreamEvent::Llm(LlmEvent::ToolUseStart(name))) if name == "watcher_exit" => {
                             watcher_exit_called = true;
                         }
-                        Some(StreamEvent::Done) | None => break,
+                        Some(StreamEvent::Session(SessionEvent::Done)) | None => break,
                         _ => {}
                     }
                 }

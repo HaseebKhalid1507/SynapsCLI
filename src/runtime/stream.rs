@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use serde_json::{json, Value};
 use reqwest::Client;
 use crate::{Result, RuntimeError, ToolRegistry};
-use super::types::{AuthState, StreamEvent};
+use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 use super::api::ApiMethods;
 
@@ -60,7 +60,7 @@ impl StreamMethods {
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
-                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 return Ok(());
             }
 
@@ -103,7 +103,7 @@ impl StreamMethods {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Err(e);
                 }
             };
@@ -131,7 +131,7 @@ impl StreamMethods {
                     let steered = HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
                         // No steering, truly done
-                        let _ = tx.send(StreamEvent::MessageHistory(messages));
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Ok(());
                     }
                     // Steering message injected — continue the loop for another LLM call
@@ -177,7 +177,7 @@ impl StreamMethods {
                             "content": err,
                             "is_error": true
                         }));
-                        let _ = tx.send(StreamEvent::ToolResult { tool_id, result: err.to_string() });
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result: err.to_string() }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
@@ -186,10 +186,10 @@ impl StreamMethods {
                                 let t_id = tool_id.clone();
                                 tokio::spawn(async move {
                                     while let Some(msg) = rx_d.recv().await {
-                                        let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                        let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
                                             tool_id: t_id.clone(),
                                             delta: msg,
-                                        });
+                                        }));
                                     }
                                 });
 
@@ -213,10 +213,10 @@ impl StreamMethods {
                             None => format!("Unknown tool: {}", tool_name),
                         };
 
-                        let _ = tx.send(StreamEvent::ToolResult {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.clone(),
                             result: result.clone(),
-                        });
+                        }));
 
                         tool_results.push(json!({
                             "type": "tool_result",
@@ -244,7 +244,7 @@ impl StreamMethods {
                             let tid = tool_id.clone();
                             let tx_c = tx.clone();
                             join_set.spawn(async move {
-                                let _ = tx_c.send(StreamEvent::ToolResult { tool_id: tid.clone(), result: err.clone() });
+                                let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id: tid.clone(), result: err.clone() }));
                                 (tid, false, format!("Tool execution failed: {}", err))
                             });
                             continue;
@@ -267,10 +267,10 @@ impl StreamMethods {
                                     let t_id = tool_id.clone();
                                     tokio::spawn(async move {
                                         while let Some(msg) = rx_d.recv().await {
-                                            let _ = tx_k.send(StreamEvent::ToolResultDelta {
+                                            let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
                                                 tool_id: t_id.clone(),
                                                 delta: msg,
-                                            });
+                                            }));
                                         }
                                     });
 
@@ -293,10 +293,10 @@ impl StreamMethods {
                                 None => (false, format!("Unknown tool: {}", tool_name)),
                             };
 
-                            let _ = tx_stream.send(StreamEvent::ToolResult {
+                            let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                 tool_id: tool_id.clone(),
                                 result: result.1.clone(),
-                            });
+                            }));
 
                             (tool_id, result.0, result.1)
                         });
@@ -348,7 +348,7 @@ impl StreamMethods {
 
                 if cancelled {
                     // Send final history on cancellation so session can be saved
-                    let _ = tx.send(StreamEvent::MessageHistory(messages));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Ok(());
                 }
 
@@ -359,7 +359,7 @@ impl StreamMethods {
 
                 // Continue the loop to get Claude's response with tool results
             } else {
-                let _ = tx.send(StreamEvent::MessageHistory(messages));
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }
