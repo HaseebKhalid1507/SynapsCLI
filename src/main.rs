@@ -4,6 +4,33 @@ mod chatui;
 mod watcher;
 mod cmd;
 
+/// Global tmux session name for cleanup on any exit.
+/// Written once during startup, read by the atexit handler.
+static TMUX_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Kill the tmux session. Called from atexit and Drop guard.
+/// Uses synchronous std::process::Command — no async runtime needed.
+fn kill_tmux_session() {
+    if let Ok(mut guard) = TMUX_SESSION_NAME.lock() {
+        if let Some(name) = guard.take() {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Guard that kills the tmux session on drop (covers normal exit paths).
+struct TmuxSessionGuard;
+
+impl Drop for TmuxSessionGuard {
+    fn drop(&mut self) {
+        kill_tmux_session();
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "synaps", about = "Neural interface for Claude", version)]
 struct Cli {
@@ -97,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => {
             // Resolve tmux controller if --tmux flag was passed
+            // _tmux_guard lives on the stack — Drop fires on normal exit
+            let _tmux_guard: Option<TmuxSessionGuard>;
+
             let tmux_controller = if cli.tmux.is_some() {
                 // Ensure tmux binary is available
                 if synaps_cli::tmux::find_tmux().is_none() {
@@ -117,13 +147,21 @@ async fn main() -> anyhow::Result<()> {
                     _ => synaps_cli::tmux::auto_session_name(),
                 };
 
-                let mut tmux_ctrl = synaps_cli::tmux::TmuxController::new(session_name);
+                let mut tmux_ctrl = synaps_cli::tmux::TmuxController::new(session_name.clone());
                 if let Err(e) = tmux_ctrl.start().await {
                     eprintln!("error: failed to start tmux session: {}", e);
                     std::process::exit(1);
                 }
+
+                // Arm cleanup: store session name globally + arm drop guard.
+                // The global covers SIGTERM/SIGINT via the atexit handler.
+                // The drop guard covers normal function return.
+                *TMUX_SESSION_NAME.lock().unwrap() = Some(session_name);
+                _tmux_guard = Some(TmuxSessionGuard);
+
                 Some(std::sync::Arc::new(tmux_ctrl))
             } else {
+                _tmux_guard = None;
                 None
             };
 
