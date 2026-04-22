@@ -506,6 +506,26 @@ impl ApiMethods {
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
+        // Route through OpenAI-compat provider if model resolves to one
+        let provider_keys = crate::core::config::get_provider_keys();
+        if let crate::runtime::openai::Provider::OpenAi(cfg) =
+            crate::runtime::openai::resolve_route(model, &provider_keys)
+        {
+            let _ = (thinking_budget, options, auth);
+            let tools_schema = tools.tools_schema();
+            // Use the streaming path and collect the result
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let result = crate::runtime::openai::stream::call_oai_stream_inner(
+                &cfg, client, &tools_schema, system_prompt, messages, &tx, model,
+            )
+            .await
+            .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+            drop(tx);
+            // Drain any remaining events
+            while rx.recv().await.is_some() {}
+            return Ok(result);
+        }
+
         // Read auth state
         let (auth_token, auth_type) = {
             let a = auth.read().await;

@@ -51,6 +51,26 @@ pub fn messages_to_oai(
         }
     }
 
+    // Build a map of tool_use_id → tool_name from assistant messages
+    // so we can populate the name field on tool result messages.
+    let mut tool_name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for msg in anthropic_messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(Value::Array(blocks)) = msg.get("content") {
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        if let (Some(id), Some(name)) = (
+                            block.get("id").and_then(|v| v.as_str()),
+                            block.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            tool_name_map.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for msg in anthropic_messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let content = msg.get("content");
@@ -91,7 +111,8 @@ pub fn messages_to_oai(
                                         Some(other) => other.to_string(),
                                         None => String::new(),
                                     };
-                                    out.push(ChatMessage::tool_result(tool_id, "", result_content));
+                                    let tool_name = tool_name_map.get(&tool_id).cloned().unwrap_or_default();
+                                    out.push(ChatMessage::tool_result(tool_id, tool_name, result_content));
                                 }
                                 _ => {}
                             }
