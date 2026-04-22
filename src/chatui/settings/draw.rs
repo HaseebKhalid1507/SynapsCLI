@@ -311,7 +311,7 @@ fn mask_key(key: &str) -> String {
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
-    let w = area.width.saturating_sub(4).clamp(20, 60);
+    let w = area.width.saturating_sub(4).clamp(20, 100);
     let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let x = area.x + 2;
     let y = area.y + 2;
