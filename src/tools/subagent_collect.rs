@@ -42,7 +42,7 @@ impl Tool for SubagentCollectTool {
             .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.subagent_registry.as_ref()
+        let registry = ctx.capabilities.subagent_registry.as_ref()
             .ok_or_else(|| RuntimeError::Tool(
                 "SubagentRegistry not available on this ToolContext".to_string()
             ))?;

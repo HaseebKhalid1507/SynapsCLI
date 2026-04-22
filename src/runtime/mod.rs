@@ -323,18 +323,25 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let ctx = crate::ToolContext { 
-                                    tx_delta: None, 
-                                    tx_events: None, 
-                                    watcher_exit_path: self.watcher_exit_path.clone(), 
-                                    tool_register_tx: None, 
-                                    session_manager: Some(self.session_manager.clone()),
-                                    max_tool_output: self.max_tool_output,
-                                    bash_timeout: self.bash_timeout,
-                                    bash_max_timeout: self.bash_max_timeout,
-                                    subagent_timeout: self.subagent_timeout,
-                                subagent_registry: Some(self.subagent_registry.clone()),
-                                event_queue: Some(self.event_queue.clone()), };
+                                let ctx = crate::ToolContext {
+                                    channels: crate::tools::ToolChannels {
+                                        tx_delta: None,
+                                        tx_events: None,
+                                    },
+                                    capabilities: crate::tools::ToolCapabilities {
+                                        watcher_exit_path: self.watcher_exit_path.clone(),
+                                        tool_register_tx: None,
+                                        session_manager: Some(self.session_manager.clone()),
+                                        subagent_registry: Some(self.subagent_registry.clone()),
+                                        event_queue: Some(self.event_queue.clone()),
+                                    },
+                                    limits: crate::tools::ToolLimits {
+                                        max_tool_output: self.max_tool_output,
+                                        bash_timeout: self.bash_timeout,
+                                        bash_max_timeout: self.bash_max_timeout,
+                                        subagent_timeout: self.subagent_timeout,
+                                    },
+                                };
                                 match tool.execute(input.clone(), ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
@@ -376,18 +383,25 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let ctx = crate::ToolContext { 
-                                            tx_delta: None, 
-                                            tx_events: None, 
-                                            watcher_exit_path: exit_path, 
-                                            tool_register_tx: None, 
-                                            session_manager: Some(session_mgr_inner),
-                                            max_tool_output: cfg_max_tool_output,
-                                            bash_timeout: cfg_bash_timeout,
-                                            bash_max_timeout: cfg_bash_max_timeout,
-                                            subagent_timeout: cfg_subagent_timeout,
-                                        subagent_registry: Some(registry_inner),
-                                        event_queue: Some(event_queue_inner), };
+                                        let ctx = crate::ToolContext {
+                                            channels: crate::tools::ToolChannels {
+                                                tx_delta: None,
+                                                tx_events: None,
+                                            },
+                                            capabilities: crate::tools::ToolCapabilities {
+                                                watcher_exit_path: exit_path,
+                                                tool_register_tx: None,
+                                                session_manager: Some(session_mgr_inner),
+                                                subagent_registry: Some(registry_inner),
+                                                event_queue: Some(event_queue_inner),
+                                            },
+                                            limits: crate::tools::ToolLimits {
+                                                max_tool_output: cfg_max_tool_output,
+                                                bash_timeout: cfg_bash_timeout,
+                                                bash_max_timeout: cfg_bash_max_timeout,
+                                                subagent_timeout: cfg_subagent_timeout,
+                                            },
+                                        };
                                         match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),

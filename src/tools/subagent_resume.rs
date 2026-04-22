@@ -55,7 +55,7 @@ impl Tool for SubagentResumeTool {
             .ok_or_else(|| RuntimeError::Tool("Missing 'instructions' parameter".to_string()))?
             .to_string();
 
-        let registry = ctx.subagent_registry.as_ref()
+        let registry = ctx.capabilities.subagent_registry.as_ref()
             .ok_or_else(|| RuntimeError::Tool(
                 "SubagentRegistry not available on this ToolContext".to_string()
             ))?;
@@ -101,7 +101,7 @@ impl Tool for SubagentResumeTool {
                              Pick up where the previous agent left off.".to_string();
 
         let label = agent_name.clone();
-        let timeout_secs = ctx.subagent_timeout;
+        let timeout_secs = ctx.limits.subagent_timeout;
         let task_preview: String = resumed_task.chars().take(80).collect();
         let task_full = resumed_task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -118,7 +118,7 @@ impl Tool for SubagentResumeTool {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
 
-        if let Some(ref tx) = ctx.tx_events {
+        if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::SubagentStart {
                 subagent_id,
                 agent_name: label.clone(),
@@ -130,7 +130,7 @@ impl Tool for SubagentResumeTool {
         let task_full_a     = task_full.clone();
         let label_inner     = label.clone();
         let model_inner     = model.clone();
-        let tx_events_inner = ctx.tx_events.clone();
+        let tx_events_inner = ctx.channels.tx_events.clone();
         let start_time      = std::time::Instant::now();
 
         let thread_handle = std::thread::spawn(move || {

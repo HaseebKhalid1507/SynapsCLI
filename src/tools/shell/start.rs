@@ -53,7 +53,7 @@ impl Tool for ShellStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let mgr = ctx.session_manager.as_ref()
+        let mgr = ctx.capabilities.session_manager.as_ref()
             .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
         
         let command = params["command"].as_str().map(|s| s.to_string());
@@ -74,7 +74,7 @@ impl Tool for ShellStartTool {
             readiness_timeout_ms, idle_timeout,
         };
         
-        let (session_id, output, status) = mgr.create_session(opts, ctx.tx_delta.as_ref()).await?;
+        let (session_id, output, status) = mgr.create_session(opts, ctx.channels.tx_delta.as_ref()).await?;
         
         let mut result = format!("[Session {} | {}]\n", session_id, status);
         if !output.is_empty() {

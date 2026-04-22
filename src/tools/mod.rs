@@ -59,27 +59,34 @@ pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
 
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 
-/// Context passed to tool execution — channels for streaming output and events.
-pub struct ToolContext {
+/// Streaming channels — carry partial tool output and stream events.
+pub struct ToolChannels {
     pub tx_delta: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+}
+
+/// Runtime capability handles — shared services a tool may require.
+pub struct ToolCapabilities {
     pub watcher_exit_path: Option<PathBuf>,
-    /// Channel for tools that need to register new tools at runtime (e.g. MCP).
-    /// Breaks the circular Arc — tools send registrations, runtime applies them.
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
-    /// Shared registry of reactive subagent handles — populated by SubagentStartTool,
-    /// read by SubagentStatusTool, and mutated by SubagentSteerTool / SubagentCollectTool.
-    /// `None` in contexts that don't support reactive subagents (e.g. subagent runtimes).
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
-    /// Event queue for tools that need to interact with the event bus.
-    /// `None` in contexts without an event bus (e.g. subagent runtimes, tests).
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
-    // Configuration parameters
+}
+
+/// Configuration limits and timeouts.
+pub struct ToolLimits {
     pub max_tool_output: usize,
     pub bash_timeout: u64,
     pub bash_max_timeout: u64,
     pub subagent_timeout: u64,
+}
+
+/// Context passed to tool execution — composition of channels, capabilities, and limits.
+pub struct ToolContext {
+    pub channels: ToolChannels,
+    pub capabilities: ToolCapabilities,
+    pub limits: ToolLimits,
 }
 
 /// The core trait for all tools. Implement this to add a new tool.

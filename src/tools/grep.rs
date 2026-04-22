@@ -74,8 +74,8 @@ impl Tool for GrepTool {
             Ok("No matches found.".to_string())
         } else {
             let result = stdout.to_string();
-            if result.len() > ctx.max_tool_output {
-                let truncated: String = result.chars().take(ctx.max_tool_output).collect();
+            if result.len() > ctx.limits.max_tool_output {
+                let truncated: String = result.chars().take(ctx.limits.max_tool_output).collect();
                 Ok(format!("{}\n\n... (output truncated, {} total bytes)", truncated, result.len()))
             } else {
                 Ok(result)

@@ -68,7 +68,7 @@ impl Tool for SubagentStartTool {
         let agent_name    = params["agent"].as_str().map(|s| s.to_string());
         let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
         let model_override = params["model"].as_str().map(|s| s.to_string());
-        let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.subagent_timeout);
+        let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
         let system_prompt = match (&agent_name, &inline_prompt) {
             (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
@@ -98,7 +98,7 @@ impl Tool for SubagentStartTool {
         let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
 
         // ── Forward SubagentStart event to TUI ─────────────────────────────────
-        if let Some(ref tx) = ctx.tx_events {
+        if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::SubagentStart {
                 subagent_id,
                 agent_name: label.clone(),
@@ -111,7 +111,7 @@ impl Tool for SubagentStartTool {
         let task_full_a      = task_full.clone();
         let label_inner      = label.clone();
         let model_inner      = model.clone();
-        let tx_events_inner  = ctx.tx_events.clone();
+        let tx_events_inner  = ctx.channels.tx_events.clone();
         let start_time       = std::time::Instant::now();
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
@@ -357,7 +357,7 @@ impl Tool for SubagentStartTool {
             Some(result_rx),
         );
 
-        if let Some(registry) = &ctx.subagent_registry {
+        if let Some(registry) = &ctx.capabilities.subagent_registry {
             let mut reg = registry.lock().unwrap();
             reg.register(handle);
             if let Some(h) = reg.get_mut(&handle_id) {

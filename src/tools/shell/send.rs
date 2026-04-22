@@ -36,7 +36,7 @@ impl Tool for ShellSendTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let mgr = ctx.session_manager.as_ref()
+        let mgr = ctx.capabilities.session_manager.as_ref()
             .ok_or_else(|| RuntimeError::Tool("Shell sessions not available".into()))?;
         
         let session_id = params["session_id"].as_str()
@@ -45,7 +45,7 @@ impl Tool for ShellSendTool {
             .ok_or_else(|| RuntimeError::Tool("Missing input parameter".into()))?;
         let timeout_ms = params["timeout_ms"].as_u64();
         
-        let result = mgr.send_input(session_id, input, timeout_ms, ctx.tx_delta.as_ref()).await?;
+        let result = mgr.send_input(session_id, input, timeout_ms, ctx.channels.tx_delta.as_ref()).await?;
         
         if result.status == "active" {
             Ok(result.output)
