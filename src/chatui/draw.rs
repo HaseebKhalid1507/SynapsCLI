@@ -208,6 +208,41 @@ pub(crate) fn draw(
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
 
+        // Save message area geometry so input.rs can map mouse coordinates
+        app.msg_area_rect = Some(msg_area);
+        app.visible_line_range = Some((start, end));
+
+        // Render text selection highlight overlay
+        if let Some((sc, sr, ec, er)) = app.selection_range() {
+            let content_x = msg_area.x + 1; // horizontal padding
+            let content_y = msg_area.y + 1; // top border
+            let content_h = msg_area.height.saturating_sub(2);
+            let content_w = msg_area.width.saturating_sub(2);
+
+            for y in sr..=er {
+                if y < content_y || y >= content_y + content_h {
+                    continue;
+                }
+                let row_start = if y == sr { sc.max(content_x) } else { content_x };
+                let row_end = if y == er { ec.min(content_x + content_w) } else { content_x + content_w };
+
+                for x in row_start..row_end {
+                    if x >= content_x && x < content_x + content_w {
+                        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                            // Invert colors for selection highlight
+                            let fg = cell.fg;
+                            let bg = cell.bg;
+                            cell.set_fg(bg);
+                            cell.set_bg(match fg {
+                                Color::Reset => Color::Rgb(100, 140, 180),
+                                other => other,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Empty state: SYNAPS with CRT dismiss animation
         let show_logo = app.messages.is_empty() || app.logo_dismiss_t.is_some();
         if show_logo && visible.is_empty() {
