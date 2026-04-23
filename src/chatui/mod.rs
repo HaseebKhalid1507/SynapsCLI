@@ -312,6 +312,33 @@ pub async fn run(
 
         tokio::select! {
 
+            // ── Ping results — fires when a model ping completes ──
+            result = app.ping_rx.recv() => {
+                if let Some((key, status, ms)) = result {
+                    if key.is_empty() {
+                        tracing::debug!("ping select: received sentinel");
+                        app.ping_print = false;
+                    } else {
+                        tracing::debug!(key=%key, status=?status, ms=%ms, "ping select: received result");
+                        if app.ping_print {
+                            let detail = match status {
+                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
+                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
+                            };
+                            app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
+                        }
+                        app.model_health.insert(key, (status, ms));
+                    }
+                    let elapsed = last_frame.elapsed();
+                    last_frame = Instant::now();
+                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                }
+            }
+
             // ── Event bus wake — fires instantly when an event is pushed to the queue ──
             _ = runtime.event_queue().notified() => {
                 let mut event_received = false;
@@ -377,33 +404,6 @@ pub async fn run(
                     terminal.clear().ok();
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate();
-                    // Drain any pending ping results into model_health cache
-                    let mut drained = 0u32;
-                    while let Ok((key, status, ms)) = app.ping_rx.try_recv() {
-                        if key.is_empty() {
-                            // Sentinel: all pings done
-                            tracing::debug!("ping drain: received sentinel, turning off ping_print");
-                            app.ping_print = false;
-                            continue;
-                        }
-                        drained += 1;
-                        tracing::debug!(key=%key, status=?status, ms=%ms, "ping drain: received result");
-                        if app.ping_print {
-                            let detail = match status {
-                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
-                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
-                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
-                            };
-                            app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
-                        }
-                        app.model_health.insert(key, (status, ms));
-                    }
-                    if drained > 0 {
-                        tracing::debug!(count=%drained, "ping drain: drained results this tick");
-                    }
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
