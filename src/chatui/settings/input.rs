@@ -319,7 +319,13 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new(), setting_key });
                         return InputOutcome::None;
                     }
-                    let value = selection.split("  —").next().unwrap_or(&selection).trim().to_string();
+                    let raw = selection.split("  —").next().unwrap_or(&selection).trim();
+                    // Strip health prefix (e.g. "✅  79ms  ") — model IDs start with a letter
+                    let value = raw.chars()
+                        .position(|c| c.is_ascii_alphabetic())
+                        .map(|i| &raw[i..])
+                        .unwrap_or(raw)
+                        .to_string();
                     let key = *setting_key;
                     if key == "theme" {
                         state.original_theme_name = None;
