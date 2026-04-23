@@ -298,13 +298,9 @@ pub async fn run(
         let provider_keys = synaps_cli::config::get_provider_keys();
         let health_tx = app.ping_tx.clone();
         tokio::spawn(async move {
-            let results = synaps_cli::runtime::openai::ping::ping_all_configured(
-                &client, &provider_keys
+            synaps_cli::runtime::openai::ping::ping_all_configured(
+                &client, &provider_keys, health_tx,
             ).await;
-            for r in results {
-                let key = format!("{}/{}", r.provider_key, r.model_id);
-                let _ = health_tx.send((key, r.status, r.latency_ms));
-            }
         });
     }
 
@@ -755,15 +751,9 @@ pub async fn run(
                                         let provider_keys = synaps_cli::config::get_provider_keys();
                                         let health_tx = app.ping_tx.clone();
                                         tokio::spawn(async move {
-                                            let results = synaps_cli::runtime::openai::ping::ping_all_configured(
-                                                &client, &provider_keys
+                                            synaps_cli::runtime::openai::ping::ping_all_configured(
+                                                &client, &provider_keys, health_tx,
                                             ).await;
-                                            for r in results {
-                                                let key = format!("{}/{}", r.provider_key, r.model_id);
-                                                let _ = health_tx.send((key, r.status, r.latency_ms));
-                                            }
-                                            // Sentinel: empty key signals "all done"
-                                            let _ = health_tx.send((String::new(), synaps_cli::runtime::openai::ping::PingStatus::Error, 0));
                                         });
                                     }
                                 }
@@ -961,13 +951,9 @@ pub async fn run(
                                 let provider_keys = synaps_cli::config::get_provider_keys();
                                 let health_tx = app.ping_tx.clone();
                                 tokio::spawn(async move {
-                                    let results = synaps_cli::runtime::openai::ping::ping_all_configured(
-                                        &client, &provider_keys
+                                    synaps_cli::runtime::openai::ping::ping_all_configured(
+                                        &client, &provider_keys, health_tx,
                                     ).await;
-                                    for r in results {
-                                        let key = format!("{}/{}", r.provider_key, r.model_id);
-                                        let _ = health_tx.send((key, r.status, r.latency_ms));
-                                    }
                                 });
                             }
                         }
