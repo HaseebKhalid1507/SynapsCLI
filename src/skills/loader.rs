@@ -163,9 +163,9 @@ fn walk_root(
         }
     }
 
-    // 3. Loose-skill pass (root/skills/<name>/SKILL.md)
-    let loose_dir = root.join("skills");
-    if loose_dir.is_dir() {
+    // 3. Loose-skill pass — scan both root/ and root/skills/ for <name>/SKILL.md
+    for loose_dir in [root.to_path_buf(), root.join("skills")] {
+        if !loose_dir.is_dir() { continue; }
         if let Ok(entries) = std::fs::read_dir(&loose_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
