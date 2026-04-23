@@ -362,7 +362,7 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.ping_print => {
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
@@ -383,6 +383,11 @@ pub async fn run(
                     app.invalidate();
                     // Drain any pending ping results into model_health cache
                     while let Ok((key, status, ms)) = app.ping_rx.try_recv() {
+                        if key.is_empty() {
+                            // Sentinel: all pings done
+                            app.ping_print = false;
+                            continue;
+                        }
                         if app.ping_print {
                             let detail = match status {
                                 synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
@@ -757,6 +762,8 @@ pub async fn run(
                                                 let key = format!("{}/{}", r.provider_key, r.model_id);
                                                 let _ = health_tx.send((key, r.status, r.latency_ms));
                                             }
+                                            // Sentinel: empty key signals "all done"
+                                            let _ = health_tx.send((String::new(), synaps_cli::runtime::openai::ping::PingStatus::Error, 0));
                                         });
                                     }
                                 }
