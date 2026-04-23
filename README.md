@@ -7,7 +7,7 @@
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
 
-Chat, orchestrate a crew of named subagents, or leave autonomous workers running 24/7 — all from **one** static binary. No Node. No Python. No Electron. No excuses.
+One binary, any model. Start with Claude, drop in a free Groq key, point at localhost for private — same subagents, same TUI, same config. No Node. No Python. No Electron. No excuses.
 
 <!-- screenshot: chatui with subagent panel + cyberpunk theme -->
 
@@ -16,6 +16,7 @@ Chat, orchestrate a crew of named subagents, or leave autonomous workers running
 ## Why SynapsCLI?
 
 - ⚡ **Sub-100ms cold start.** Single Rust binary, ~32K lines, `cargo build` and you're done.
+- 🌐 **Any model, any provider.** Claude, Groq, Cerebras, NVIDIA NIM, OpenRouter, or your local Ollama. 17 providers, 55+ models. Set a key, pick a model, go.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
 - 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
 - 🔄 **Reactive Subagents.** Dispatch, poll, steer, collect. Five tools that turn fire-and-forget into collaborative orchestration.
@@ -48,6 +49,38 @@ Or use an API key instead of OAuth:
 export ANTHROPIC_API_KEY="sk-ant-..."
 synaps
 ```
+
+### Other Models
+
+No Claude key? No problem. SynapsCLI works with any OpenAI-compatible provider.
+
+```bash
+# Set a free provider key (Groq, Cerebras, NVIDIA — no credit card)
+export GROQ_API_KEY="gsk_..."
+synaps
+/model groq/llama-3.3-70b-versatile
+```
+
+Or configure in `~/.synaps-cli/config`:
+```
+provider.groq = gsk_...
+provider.cerebras = csk-...
+provider.nvidia = nvapi-...
+provider.local.url = http://localhost:11434/v1
+model = groq/llama-3.3-70b-versatile
+```
+
+17 providers supported. `/ping` to health-check them all. Manage keys in `/settings → Providers`.
+
+| Provider | Free tier | Models |
+|----------|-----------|--------|
+| Groq | 30 RPM, 14.4K req/day | Llama 3.3 70B, Llama 4 Scout |
+| Cerebras | 30 RPM, 1M tokens/day | Qwen3 235B (S+ tier) |
+| NVIDIA NIM | ~40 RPM | Qwen3 Coder 480B, Devstral 2, Mistral Large 675B |
+| Google AI Studio | 60 RPM | Gemini 2.5 Flash |
+| Local (Ollama/vLLM) | Unlimited | Any local model |
+
+Full list: `synaps` → `/settings` → Providers.
 
 `/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long. `/status` to check usage. `/saveas <name>` to alias a session. `/chain name <name>` to bookmark a compaction lineage.
 
@@ -186,6 +219,31 @@ The LLM produces a structured checkpoint (goals, progress, decisions, file ops, 
 `minimal` · `cyberpunk` · `tokyo-night` · `gruvbox` · `catppuccin` · `nord` · `dracula` · `solarized-dark` · `solarized-light` · `monokai` · `one-dark` · `rose-pine` · `kanagawa` · `ayu-dark` · `ayu-light` · `github-dark` · `github-light` · `terminal` · `default`
 
 Preview live in `/settings` (scroll to preview, Enter to confirm, Esc to revert). Or hot-swap instantly with `/theme <name>`.
+
+---
+
+## Configuration
+
+Config lives at `~/.synaps-cli/config`. Simple `key = value` format.
+
+```
+# Model
+model = claude-opus-4-7
+thinking = high
+context_window = 200k
+compaction_model = claude-sonnet-4-6
+
+# Provider API keys
+provider.groq = gsk_...
+provider.cerebras = csk-...
+provider.nvidia = nvapi-...
+provider.local.url = http://localhost:11434/v1
+
+# Appearance
+theme = cyberpunk
+```
+
+Provider keys can also be set via environment variables (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.) or through `/settings → Providers` in the TUI.
 
 ---
 
