@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="SynapsCLI" />
+</p>
+
 # SynapsCLI
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
