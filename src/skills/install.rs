@@ -186,6 +186,118 @@ fn rev_parse_head(repo: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+// ── Plugin agent symlinks ────────────────────────────────────────────────────
+
+/// Scan a plugin directory for agent `.md` files and create symlinks in the
+/// global agents directory (`~/.synaps-cli/agents/`). Uses the frontmatter
+/// `name` field as the symlink basename. Skips files without a frontmatter
+/// name, and never clobbers regular (non-symlink) files.
+pub fn sync_plugin_agent_symlinks(plugin_dir: &Path, agents_dir: &Path) {
+    let _ = std::fs::create_dir_all(agents_dir);
+    for agent_path in discover_plugin_agents(plugin_dir) {
+        let Some(name) = parse_agent_frontmatter_name(&agent_path) else { continue };
+        let link_path = agents_dir.join(format!("{}.md", name));
+        let abs_target = match agent_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Don't clobber user-owned regular files
+        if link_path.symlink_metadata().is_ok()
+            && !link_path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            tracing::debug!(
+                "skipping agent symlink '{}': regular file exists",
+                link_path.display()
+            );
+            continue;
+        }
+
+        // Remove existing symlink (idempotent update)
+        let _ = std::fs::remove_file(&link_path);
+
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&abs_target, &link_path) {
+                tracing::warn!("failed to symlink agent '{}': {}", name, e);
+            }
+        }
+    }
+}
+
+/// Remove symlinks in the global agents directory that point into the given
+/// plugin directory. Only removes symlinks, never regular files. Safe to
+/// call even if the plugin is already partially deleted.
+pub fn remove_plugin_agent_symlinks(plugin_dir: &Path, agents_dir: &Path) {
+    let canonical_plugin = plugin_dir
+        .canonicalize()
+        .unwrap_or_else(|_| plugin_dir.to_path_buf());
+    for agent_path in discover_plugin_agents(plugin_dir) {
+        let Some(name) = parse_agent_frontmatter_name(&agent_path) else { continue };
+        let link_path = agents_dir.join(format!("{}.md", name));
+
+        // Only remove if it's a symlink pointing into this plugin
+        let Ok(meta) = link_path.symlink_metadata() else { continue };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(&link_path) else { continue };
+        let resolved = target.canonicalize().unwrap_or(target);
+        if resolved.starts_with(&canonical_plugin) {
+            let _ = std::fs::remove_file(&link_path);
+        }
+    }
+}
+
+/// Walk `plugin_dir/skills/*/agents/*.md` and return all `.md` paths found.
+fn discover_plugin_agents(plugin_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    let skills_dir = plugin_dir.join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return result;
+    };
+    for entry in entries.flatten() {
+        let agents_dir = entry.path().join("agents");
+        if !agents_dir.is_dir() {
+            continue;
+        }
+        let Ok(agents) = std::fs::read_dir(&agents_dir) else {
+            continue;
+        };
+        for agent in agents.flatten() {
+            let path = agent.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                result.push(path);
+            }
+        }
+    }
+    result
+}
+
+/// Parse just the `name` field from YAML frontmatter of an agent file.
+fn parse_agent_frontmatter_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if !content.starts_with("---") {
+        return None;
+    }
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let frontmatter = &rest[..end];
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("name:") {
+            let name = value.trim().trim_matches('"');
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +468,184 @@ mod tests {
         let updated_sha = update_plugin(&dest).unwrap();
         assert_eq!(updated_sha.len(), 40);
         assert_ne!(updated_sha, initial_sha);
+    }
+
+    // ── Agent symlink tests ───────────────────────────────────���──────────────
+
+    /// Helper: create a plugin dir with an agent file under skills/<skill>/agents/.
+    fn mk_plugin_with_agent(
+        root: &std::path::Path,
+        plugin: &str,
+        skill: &str,
+        agent_file: &str,
+        agent_content: &str,
+    ) -> std::path::PathBuf {
+        let plugin_dir = root.join(plugin);
+        let agents_dir = plugin_dir.join("skills").join(skill).join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join(agent_file), agent_content).unwrap();
+        plugin_dir
+    }
+
+    #[test]
+    fn sync_plugin_agent_symlinks_creates_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "my-plugin", "bbe", "sage.md",
+            "---\nname: bbe-sage\ndescription: test\n---\nYou are sage.",
+        );
+
+        let global_agents = tmp.path().join("agents");
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        let link = global_agents.join("bbe-sage.md");
+        assert!(link.exists(), "symlink should exist");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        let content = std::fs::read_to_string(&link).unwrap();
+        assert!(content.contains("You are sage."));
+    }
+
+    #[test]
+    fn remove_plugin_agent_symlinks_removes_only_owned_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "my-plugin", "bbe", "sage.md",
+            "---\nname: bbe-sage\ndescription: test\n---\nYou are sage.",
+        );
+
+        let global_agents = tmp.path().join("agents");
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+        assert!(global_agents.join("bbe-sage.md").exists());
+
+        // Also create a regular file that should NOT be removed
+        std::fs::write(global_agents.join("my-custom.md"), "custom").unwrap();
+
+        remove_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        assert!(!global_agents.join("bbe-sage.md").exists(), "symlink should be removed");
+        assert!(global_agents.join("my-custom.md").exists(), "regular file should remain");
+    }
+
+    #[test]
+    fn sync_does_not_clobber_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "my-plugin", "bbe", "sage.md",
+            "---\nname: my-agent\ndescription: d\n---\nbody",
+        );
+
+        let global_agents = tmp.path().join("agents");
+        std::fs::create_dir_all(&global_agents).unwrap();
+        std::fs::write(global_agents.join("my-agent.md"), "user content").unwrap();
+
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        // Regular file should remain untouched
+        let content = std::fs::read_to_string(global_agents.join("my-agent.md")).unwrap();
+        assert_eq!(content, "user content");
+    }
+
+    #[test]
+    fn sync_skips_agents_without_frontmatter_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "my-plugin", "bbe", "noname.md",
+            "No frontmatter here",
+        );
+
+        let global_agents = tmp.path().join("agents");
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        // agents/ dir should be created but empty
+        assert!(global_agents.exists());
+        assert_eq!(std::fs::read_dir(&global_agents).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_replaces_stale_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "my-plugin", "bbe", "sage.md",
+            "---\nname: bbe-sage\ndescription: d\n---\nbody",
+        );
+
+        let global_agents = tmp.path().join("agents");
+        std::fs::create_dir_all(&global_agents).unwrap();
+
+        // Create a stale symlink pointing nowhere
+        std::os::unix::fs::symlink("/nonexistent/path", global_agents.join("bbe-sage.md")).unwrap();
+
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        let link = global_agents.join("bbe-sage.md");
+        assert!(link.exists(), "symlink should point to real file now");
+        let content = std::fs::read_to_string(&link).unwrap();
+        assert!(content.contains("body"));
+    }
+
+    #[test]
+    fn sync_handles_multiple_skills_with_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("my-plugin");
+
+        // Two skills each with agents
+        let agents1 = plugin_dir.join("skills").join("bbe").join("agents");
+        std::fs::create_dir_all(&agents1).unwrap();
+        std::fs::write(agents1.join("sage.md"),
+            "---\nname: bbe-sage\ndescription: d\n---\nsage body").unwrap();
+        std::fs::write(agents1.join("quinn.md"),
+            "---\nname: bbe-quinn\ndescription: d\n---\nquinn body").unwrap();
+
+        let agents2 = plugin_dir.join("skills").join("other").join("agents");
+        std::fs::create_dir_all(&agents2).unwrap();
+        std::fs::write(agents2.join("helper.md"),
+            "---\nname: other-helper\ndescription: d\n---\nhelper body").unwrap();
+
+        let global_agents = tmp.path().join("agents");
+        sync_plugin_agent_symlinks(&plugin_dir, &global_agents);
+
+        assert!(global_agents.join("bbe-sage.md").exists());
+        assert!(global_agents.join("bbe-quinn.md").exists());
+        assert!(global_agents.join("other-helper.md").exists());
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_name_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.md");
+        std::fs::write(&path, "---\nname: my-agent\ndescription: d\n---\nbody").unwrap();
+        assert_eq!(parse_agent_frontmatter_name(&path), Some("my-agent".to_string()));
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_name_returns_none_without_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.md");
+        std::fs::write(&path, "Just some text").unwrap();
+        assert_eq!(parse_agent_frontmatter_name(&path), None);
+    }
+
+    #[test]
+    fn parse_agent_frontmatter_name_returns_none_for_empty_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.md");
+        std::fs::write(&path, "---\nname: \ndescription: d\n---\nbody").unwrap();
+        assert_eq!(parse_agent_frontmatter_name(&path), None);
+    }
+
+    #[test]
+    fn discover_plugin_agents_finds_md_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = mk_plugin_with_agent(
+            tmp.path(), "p", "s", "a.md", "content",
+        );
+        // Also add a non-md file that should be ignored
+        let agents_dir = plugin_dir.join("skills").join("s").join("agents");
+        std::fs::write(agents_dir.join("readme.txt"), "ignore").unwrap();
+
+        let found = discover_plugin_agents(&plugin_dir);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("a.md"));
     }
 }
