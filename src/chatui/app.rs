@@ -106,6 +106,20 @@ pub(crate) struct App {
     /// Channel for receiving async ping results.
     pub(crate) ping_tx: tokio::sync::mpsc::UnboundedSender<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     pub(crate) ping_rx: tokio::sync::mpsc::UnboundedReceiver<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// Text selection state for the message area.
+    /// Anchor is where the mouse was first pressed (col, row in terminal coords).
+    /// End is the current drag position. Both are absolute terminal coordinates.
+    pub(crate) selection_anchor: Option<(u16, u16)>,
+    pub(crate) selection_end: Option<(u16, u16)>,
+    /// The message area rect from the last draw, used by input.rs to map mouse
+    /// coordinates to message content.
+    pub(crate) msg_area_rect: Option<ratatui::layout::Rect>,
+    /// The visible line range from the last draw: (start_line_index, end_line_index)
+    /// into the line_cache, so we can extract text from screen coordinates.
+    pub(crate) visible_line_range: Option<(usize, usize)>,
+    /// Suppress the next Event::Paste — set after a right-click copy to prevent
+    /// terminals that auto-paste on right-click from inserting into the input box.
+    pub(crate) suppress_next_paste: bool,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -172,6 +186,11 @@ impl App {
             ping_pending: 0,
             ping_tx: ping_tx_init,
             ping_rx: ping_rx_init,
+            selection_anchor: None,
+            selection_end: None,
+            msg_area_rect: None,
+            visible_line_range: None,
+            suppress_next_paste: false,
         }
     }
 
@@ -425,6 +444,95 @@ impl App {
             }
             self.cursor_pos = self.input.chars().count();
         }
+    }
+
+    /// Returns true if there is an active text selection in the message area.
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some() && self.selection_end.is_some()
+    }
+
+    /// Clear the current text selection.
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_end = None;
+    }
+
+    /// Get the normalized selection range: (start_col, start_row, end_col, end_row)
+    /// where start <= end in reading order. Returns None if no selection.
+    pub(crate) fn selection_range(&self) -> Option<(u16, u16, u16, u16)> {
+        let (ac, ar) = self.selection_anchor?;
+        let (ec, er) = self.selection_end?;
+        // Normalize: start is the earlier position in reading order
+        if ar < er || (ar == er && ac <= ec) {
+            Some((ac, ar, ec, er))
+        } else {
+            Some((ec, er, ac, ar))
+        }
+    }
+
+    /// Extract the selected text from the visible line cache.
+    /// Uses msg_area_rect and visible_line_range to map terminal coordinates
+    /// back to line content.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (sc, sr, ec, er) = self.selection_range()?;
+        let rect = self.msg_area_rect?;
+        let (vis_start, vis_end) = self.visible_line_range?;
+        let (_, ref all_lines) = self.line_cache.as_ref()?;
+
+        // The message content area starts at rect.x + 1 (horizontal padding)
+        // and rect.y + 1 (top border)
+        let content_x = rect.x + 1;
+        let content_y = rect.y + 1;
+        let content_h = rect.height.saturating_sub(2) as u16;
+
+        // Convert terminal y-coordinates to line indices
+        let mut result = String::new();
+        for term_y in sr..=er {
+            if term_y < content_y || term_y >= content_y + content_h {
+                continue;
+            }
+            let line_offset = (term_y - content_y) as usize;
+            let line_idx = vis_start + line_offset;
+            if line_idx >= vis_end || line_idx >= all_lines.len() {
+                continue;
+            }
+            let line = &all_lines[line_idx];
+            // Extract text from the line spans
+            let full_text: String = line.spans.iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+
+            // Determine character range on this line
+            let line_start_col = if term_y == sr {
+                (sc.saturating_sub(content_x)) as usize
+            } else {
+                0
+            };
+            let line_end_col = if term_y == er {
+                (ec.saturating_sub(content_x)) as usize
+            } else {
+                full_text.len()
+            };
+
+            let chars: Vec<char> = full_text.chars().collect();
+            let start = line_start_col.min(chars.len());
+            let end = line_end_col.min(chars.len());
+            if start < end {
+                let selected: String = chars[start..end].iter().collect();
+                let trimmed = selected.trim_end();
+                let trimmed = if result.is_empty() {
+                    trimmed.trim_start()
+                } else {
+                    trimmed.strip_prefix("     ").unwrap_or(trimmed)
+                };
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(trimmed);
+            }
+        }
+
+        if result.is_empty() { None } else { Some(result) }
     }
 
     pub(crate) fn append_or_update_text(&mut self, text: &str) {

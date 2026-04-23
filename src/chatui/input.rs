@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, Event};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, MouseButton, Event};
 use synaps_cli::skills::registry::CommandRegistry;
 use super::app::{App, ChatMessage};
 
@@ -129,22 +129,16 @@ pub(super) fn handle_event(
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry),
         Event::Mouse(mouse) => {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    app.scroll_back = app.scroll_back.saturating_add(3);
-                    app.scroll_pinned = false;
-                }
-                MouseEventKind::ScrollDown => {
-                    app.scroll_back = app.scroll_back.saturating_sub(3);
-                    if app.scroll_back == 0 {
-                        app.scroll_pinned = true;
-                    }
-                }
-                _ => {}
-            }
-            InputAction::None
+            handle_mouse(mouse, app)
         }
         Event::Paste(text) => {
+            // Suppress paste events that fire immediately after a right-click copy.
+            // Some terminals send both a Mouse(Down(Right)) AND an Event::Paste
+            // when the user right-clicks, causing unintended paste into the input box.
+            if app.suppress_next_paste {
+                app.suppress_next_paste = false;
+                return InputAction::None;
+            }
             const MAX_PASTE_CHARS: usize = 100_000;
             if !streaming || !app.input.is_empty() {
                 let text = if text.chars().count() > MAX_PASTE_CHARS {
@@ -170,6 +164,124 @@ pub(super) fn handle_event(
     }
 }
 
+/// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
+fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputAction {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.clear_selection();
+            app.scroll_back = app.scroll_back.saturating_add(3);
+            app.scroll_pinned = false;
+        }
+        MouseEventKind::ScrollDown => {
+            app.clear_selection();
+            app.scroll_back = app.scroll_back.saturating_sub(3);
+            if app.scroll_back == 0 {
+                app.scroll_pinned = true;
+            }
+        }
+
+        // Left-click starts a new selection (clears any existing one)
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Only start selection if click is inside the message area
+            if is_in_msg_area(app, mouse.column, mouse.row) {
+                app.selection_anchor = Some((mouse.column, mouse.row));
+                app.selection_end = None;
+            } else {
+                app.clear_selection();
+            }
+        }
+
+        // Left-drag extends the selection
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.selection_anchor.is_some() {
+                app.selection_end = Some((mouse.column, mouse.row));
+            }
+        }
+
+        // Left-release finalizes the selection
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(anchor) = app.selection_anchor {
+                let end = (mouse.column, mouse.row);
+                // If start == end, it was a click not a drag — clear selection
+                if anchor == end {
+                    app.clear_selection();
+                } else {
+                    app.selection_end = Some(end);
+                }
+            }
+        }
+
+        // Right-click: copy if selection exists, paste if not
+        MouseEventKind::Down(MouseButton::Right) => {
+            if app.has_selection() {
+                // Copy selected text to clipboard — right-click with selection is COPY ONLY
+                if let Some(text) = app.selected_text() {
+                    copy_to_clipboard(&text);
+                    app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
+                }
+                // Suppress any terminal-generated paste event that follows this right-click
+                app.suppress_next_paste = true;
+                // Clear selection after copy
+                app.clear_selection();
+            } else {
+                // No selection — paste from clipboard at cursor position
+                if let Some(text) = paste_from_clipboard() {
+                    if !text.is_empty() {
+                        if app.input_before_paste.is_none() {
+                            app.input_before_paste = Some(app.input.clone());
+                        }
+                        let byte_pos = app.cursor_byte_pos();
+                        app.input.insert_str(byte_pos, &text);
+                        app.cursor_pos += text.chars().count();
+                        app.pasted_char_count += text.chars().count();
+                    }
+                }
+                // Suppress the terminal-generated paste event that follows this right-click
+                app.suppress_next_paste = true;
+            }
+        }
+
+        _ => {}
+    }
+    InputAction::None
+}
+
+/// Check if a terminal coordinate is inside the message area.
+fn is_in_msg_area(app: &App, col: u16, row: u16) -> bool {
+    if let Some(rect) = app.msg_area_rect {
+        col >= rect.x && col < rect.x + rect.width
+            && row >= rect.y + 1 && row < rect.y + rect.height.saturating_sub(1)
+    } else {
+        false
+    }
+}
+
+/// Copy text to system clipboard. Spawns a background thread to hold
+/// clipboard ownership long enough for clipboard managers to read it
+/// (X11/Wayland require the owner process to serve selection requests).
+fn copy_to_clipboard(text: &str) {
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(&text);
+            // Hold ownership so clipboard managers / other apps can read it
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
+/// Read text from system clipboard. Returns None if clipboard is empty or inaccessible.
+fn paste_from_clipboard() -> Option<String> {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if let Ok(text) = clipboard.get_text() {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 /// Handle a key event.
 fn handle_key(
     code: KeyCode,
@@ -178,6 +290,8 @@ fn handle_key(
     streaming: bool,
     registry: &Arc<CommandRegistry>,
 ) -> InputAction {
+    // Clear text selection on any keypress (typing dismisses selection)
+    app.clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
