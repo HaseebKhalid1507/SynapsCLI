@@ -251,7 +251,7 @@ pub fn resolve_provider_model(
 ) -> Option<ProviderConfig> {
     // Special case: local provider — dynamic URL from config/env
     if key == "local" {
-        return resolve_local(model, overrides);
+        return Some(resolve_local(model, overrides));
     }
     let specs = providers();
     let spec = specs.into_iter().find(|s| s.key == key)?;
@@ -273,7 +273,7 @@ pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Optio
 ///
 /// URL resolution: `provider.local.url` in config → `LOCAL_ENDPOINT` env → `http://localhost:11434/v1`
 /// API key: `provider.local` in config → `LOCAL_API_KEY` env → `"local"` (most local servers don't need one)
-fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
+fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> ProviderConfig {
     let base_url = overrides
         .get("local.url")
         .filter(|s| !s.is_empty())
@@ -288,11 +288,11 @@ fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> Option<Pr
         .or_else(|| std::env::var("LOCAL_API_KEY").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "local".to_string());
 
-    Some(ProviderConfig {
+    ProviderConfig {
         base_url,
         api_key,
         model: model.to_string(),
-    })
+    }
 }
 
 /// List all providers with key status.
