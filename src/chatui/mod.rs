@@ -383,6 +383,17 @@ pub async fn run(
                     app.invalidate();
                     // Drain any pending ping results into model_health cache
                     while let Ok((key, status, ms)) = app.ping_rx.try_recv() {
+                        if app.ping_print {
+                            let detail = match status {
+                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
+                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
+                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
+                            };
+                            app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
+                        }
                         app.model_health.insert(key, (status, ms));
                     }
                     let elapsed = last_frame.elapsed();
@@ -734,31 +745,19 @@ pub async fn run(
                                     }
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
+                                        app.ping_print = true;
                                         let client = runtime.http_client().clone();
                                         let provider_keys = synaps_cli::config::get_provider_keys();
-                                        let results = synaps_cli::runtime::openai::ping::ping_all_configured(
-                                            &client, &provider_keys
-                                        ).await;
-                                        let mut lines: Vec<(String, String)> = Vec::new();
-                                        for r in &results {
-                                            let key = format!("{}/{}", r.provider_key, r.model_id);
-                                            let icon = r.status.icon();
-                                            let detail = match r.status {
-                                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", r.latency_ms),
-                                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
-                                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
-                                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
-                                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
-                                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
-                                            };
-                                            app.model_health.insert(key.clone(), (r.status, r.latency_ms));
-                                            lines.push((key, format!("{} {}", icon, detail)));
-                                        }
-                                        lines.sort_by(|a, b| a.0.cmp(&b.0));
-                                        app.push_msg(ChatMessage::System("📡 Model Health Check".to_string()));
-                                        for (key, status) in &lines {
-                                            app.push_msg(ChatMessage::System(format!("  {:<55} — {}", key, status)));
-                                        }
+                                        let health_tx = app.ping_tx.clone();
+                                        tokio::spawn(async move {
+                                            let results = synaps_cli::runtime::openai::ping::ping_all_configured(
+                                                &client, &provider_keys
+                                            ).await;
+                                            for r in results {
+                                                let key = format!("{}/{}", r.provider_key, r.model_id);
+                                                let _ = health_tx.send((key, r.status, r.latency_ms));
+                                            }
+                                        });
                                     }
                                 }
                             }
