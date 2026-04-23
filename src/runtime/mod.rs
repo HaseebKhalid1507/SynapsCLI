@@ -119,11 +119,18 @@ impl Runtime {
     }
 
     pub fn set_model(&mut self, model: String) {
-        // Strip any health/status prefix (e.g. "✅  79ms  groq/..." → "groq/...")
-        let cleaned = model.chars()
-            .position(|c| c.is_ascii_alphabetic())
-            .map(|i| model[i..].to_string())
-            .unwrap_or(model);
+        // Strip any health/status prefix (e.g. "✅  339ms  groq/..." → "groq/...")
+        let cleaned = if let Some(pos) = model.find("claude-") {
+            model[pos..].to_string()
+        } else if let Some(pos) = model.find('/') {
+            let before = &model[..pos];
+            let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
+                .unwrap_or(0);
+            model[key_start..].to_string()
+        } else {
+            model
+        };
         self.model = cleaned;
     }
 
