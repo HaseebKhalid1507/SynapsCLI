@@ -107,7 +107,7 @@ impl ApiMethods {
             let _ = (thinking_budget, cancel, max_retries, options);
             let tools_schema = tools.tools_schema();
             return crate::runtime::openai::stream::call_oai_stream_inner(
-                &cfg, client, &tools_schema, system_prompt, messages, &tx, model,
+                &cfg, client, &tools_schema, system_prompt, messages, &tx,
             )
             .await
             .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
@@ -516,7 +516,7 @@ impl ApiMethods {
             // Use the streaming path and collect the result
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let result = crate::runtime::openai::stream::call_oai_stream_inner(
-                &cfg, client, &tools_schema, system_prompt, messages, &tx, model,
+                &cfg, client, &tools_schema, system_prompt, messages, &tx,
             )
             .await
             .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;

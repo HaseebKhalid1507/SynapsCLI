@@ -23,7 +23,6 @@ pub(crate) async fn call_oai_stream_inner(
     system_prompt: &Option<String>,
     messages: &[Value],
     tx: &mpsc::UnboundedSender<StreamEvent>,
-    model: &str,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let oai_messages = translate::messages_to_oai(messages, system_prompt);
     let oai_tools = translate::tools_to_oai(tools_schema);
@@ -42,7 +41,7 @@ pub(crate) async fn call_oai_stream_inner(
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
 
-    tracing::debug!(url=%url, model=%model, "openai stream request");
+    tracing::debug!(url=%url, model=%cfg.model, "openai stream request");
 
     let resp = client
         .post(&url)
