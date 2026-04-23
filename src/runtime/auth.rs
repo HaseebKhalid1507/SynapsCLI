@@ -100,6 +100,8 @@ impl AuthMethods {
             return Ok((api_key, "api_key".to_string(), None, None));
         }
         
-        Err(RuntimeError::Auth("No Anthropic credentials found. Run `login` to authenticate.".to_string()))
+        // No Anthropic credentials — allow startup anyway for non-Anthropic providers.
+        // Auth will fail lazily on the first actual Anthropic API call.
+        Ok(("".to_string(), "none".to_string(), None, None))
     }
 }

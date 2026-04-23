@@ -109,6 +109,13 @@ impl ApiMethods {
         // Read auth state for this API call
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
+        // Fail early with a clear message if no Anthropic credentials
+        if auth_type == "none" {
+            return Err(RuntimeError::Auth(
+                "No Anthropic credentials. Run `synaps login` or set ANTHROPIC_API_KEY, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
+            ));
+        }
+
         tracing::info!(model = %model, "Starting API request");
         
         // Manual cache breakpoints for optimal prompt caching.
@@ -516,6 +523,12 @@ impl ApiMethods {
             let a = auth.read().await;
             (a.auth_token.clone(), a.auth_type.clone())
         };
+
+        if auth_type == "none" {
+            return Err(RuntimeError::Auth(
+                "No Anthropic credentials. Run `synaps login` or set ANTHROPIC_API_KEY, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
+            ));
+        }
 
         let auth_header = if auth_type == "oauth" {
             ("authorization".to_string(), format!("Bearer {}", auth_token))
