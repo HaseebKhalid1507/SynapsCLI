@@ -119,7 +119,12 @@ impl Runtime {
     }
 
     pub fn set_model(&mut self, model: String) {
-        self.model = model;
+        // Strip any health/status prefix (e.g. "✅  79ms  groq/..." → "groq/...")
+        let cleaned = model.chars()
+            .position(|c| c.is_ascii_alphabetic())
+            .map(|i| model[i..].to_string())
+            .unwrap_or(model);
+        self.model = cleaned;
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
