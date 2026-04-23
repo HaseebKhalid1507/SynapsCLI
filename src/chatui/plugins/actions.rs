@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use synaps_cli::skills::{
-    install::{
-        self, sync_plugin_agent_symlinks, remove_plugin_agent_symlinks,
-    },
+    install,
     marketplace::{
         derive_git_clone_url, fetch_manifest, fetch_marketplace, is_safe_plugin_name, is_trusted,
         trust_host_for_source,
@@ -39,11 +37,6 @@ fn install_dir_for(name: &str) -> Result<PathBuf, String> {
         return Err("refused to install plugin with unsafe name".into());
     }
     Ok(synaps_cli::config::resolve_write_path("plugins").join(name))
-}
-
-/// Resolve `~/.synaps-cli/agents/` (profile-aware).
-fn global_agents_dir() -> PathBuf {
-    synaps_cli::config::resolve_write_path("agents")
 }
 
 fn now_rfc3339() -> String {
@@ -272,7 +265,6 @@ async fn run_install_flow(
         return;
     }
     reload_registry(registry, config);
-    sync_plugin_agent_symlinks(&dest, &global_agents_dir());
     state.mode = RightMode::List;
     state.row_error = None;
 }
@@ -290,7 +282,6 @@ pub(crate) async fn apply_uninstall(
             return;
         }
     };
-    remove_plugin_agent_symlinks(&dir, &global_agents_dir());
     let uninstall_res = tokio::task::spawn_blocking(move || install::uninstall_plugin(&dir)).await;
     match uninstall_res {
         Ok(Ok(())) => {}
@@ -367,9 +358,6 @@ pub(crate) async fn apply_update(
         return;
     }
     reload_registry(registry, config);
-    if let Ok(dir) = install_dir_for(&name) {
-        sync_plugin_agent_symlinks(&dir, &global_agents_dir());
-    }
     state.row_error = None;
 }
 
@@ -472,7 +460,6 @@ pub(crate) async fn apply_remove_marketplace(
             Ok(d) => d,
             Err(e) => { failed.push(format!("{}: {}", plugin_name, e)); continue; }
         };
-        remove_plugin_agent_symlinks(&dir, &global_agents_dir());
         let res = tokio::task::spawn_blocking(move || install::uninstall_plugin(&dir)).await;
         match res {
             Ok(Ok(())) => {}

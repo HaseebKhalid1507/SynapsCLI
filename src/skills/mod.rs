@@ -70,15 +70,6 @@ pub async fn register(
     let registry = Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, skills));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
-
-    // Sync agent symlinks for all discovered plugins so that plugin-provided
-    // agents (e.g. BBE's bbe-sage, bbe-quinn) are available by bare name via
-    // ~/.synaps-cli/agents/<name>.md. Idempotent — safe to run every startup.
-    let global_agents_dir = crate::config::resolve_write_path("agents");
-    for plugin in &plugins {
-        install::sync_plugin_agent_symlinks(&plugin.root, &global_agents_dir);
-    }
-
     registry
 }
 
