@@ -292,6 +292,22 @@ pub async fn run(
         })
     };
 
+    // Auto-ping all configured provider models on boot (background)
+    {
+        let client = runtime.http_client().clone();
+        let provider_keys = synaps_cli::config::get_provider_keys();
+        let health_tx = app.ping_tx.clone();
+        tokio::spawn(async move {
+            let results = synaps_cli::runtime::openai::ping::ping_all_configured(
+                &client, &provider_keys
+            ).await;
+            for r in results {
+                let key = format!("{}/{}", r.provider_key, r.model_id);
+                let _ = health_tx.send((key, r.status, r.latency_ms));
+            }
+        });
+    }
+
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
