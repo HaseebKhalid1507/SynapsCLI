@@ -53,14 +53,26 @@ pub(crate) async fn call_oai_stream_inner(
 
     tracing::debug!(url=%url, model=%cfg.model, "openai stream request");
 
-    let resp = client
+    let resp = match client
         .post(&url)
         .bearer_auth(&cfg.api_key)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
         .json(&body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_connect() && url.contains("localhost") {
+                return Err(format!(
+                    "Can't reach local endpoint at {} — is Ollama/LM Studio running?",
+                    url
+                ).into());
+            }
+            return Err(e.into());
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
