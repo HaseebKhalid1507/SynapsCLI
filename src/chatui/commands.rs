@@ -313,7 +313,7 @@ pub(super) async fn handle_command(
                 "/chain name <name> — bookmark current session as <name> (auto-advances on compaction)",
                 "/chain unname <name> — delete a named chain",
                 "/saveas [name] — name the current session, or clear if empty",
-                "/model [name] — show or set model",
+                "/model [name] — show or set model (e.g. groq/llama-3.3-70b-versatile)",
                 "/system <prompt|show|save> — system prompt",
                 "/thinking [low|medium|high|xhigh] — thinking budget",
                 "/sessions — list saved sessions",
@@ -323,7 +323,7 @@ pub(super) async fn handle_command(
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
                 "/status — show account usage and reset times",
-                "/ping — health-check all configured provider models",
+                "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
