@@ -335,8 +335,8 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
 
 fn mask_key(key: &str) -> String {
     let n = key.len();
-    if n <= 12 { return "*".repeat(n.min(8)); }
-    format!("{}...{}", &key[..8], &key[n - 4..])
+    if n <= 8 { return "*".repeat(n); }
+    format!("***...{}", &key[n - 4..])
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
