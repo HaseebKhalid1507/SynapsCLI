@@ -135,9 +135,12 @@ pub(super) fn handle_event(
             // Suppress paste events that fire immediately after a right-click copy.
             // Some terminals send both a Mouse(Down(Right)) AND an Event::Paste
             // when the user right-clicks, causing unintended paste into the input box.
-            if app.suppress_next_paste {
-                app.suppress_next_paste = false;
-                return InputAction::None;
+            if let Some(deadline) = app.suppress_paste_until {
+                if std::time::Instant::now() < deadline {
+                    app.suppress_paste_until = None;
+                    return InputAction::None;
+                }
+                app.suppress_paste_until = None;
             }
             const MAX_PASTE_CHARS: usize = 100_000;
             if !streaming || !app.input.is_empty() {
@@ -220,7 +223,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputActi
                     app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
-                app.suppress_next_paste = true;
+                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
                 app.clear_selection();
             } else {
@@ -237,7 +240,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputActi
                     }
                 }
                 // Suppress the terminal-generated paste event that follows this right-click
-                app.suppress_next_paste = true;
+                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
             }
         }
 
@@ -246,28 +249,34 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputActi
     InputAction::None
 }
 
-/// Check if a terminal coordinate is inside the message area.
+/// Check if a terminal coordinate is inside the message content area.
+/// msg_area_rect stores the inner rect (after borders/padding), so no offset needed.
 fn is_in_msg_area(app: &App, col: u16, row: u16) -> bool {
     if let Some(rect) = app.msg_area_rect {
         col >= rect.x && col < rect.x + rect.width
-            && row >= rect.y + 1 && row < rect.y + rect.height.saturating_sub(1)
+            && row >= rect.y && row < rect.y + rect.height
     } else {
         false
     }
 }
 
-/// Copy text to system clipboard. Spawns a background thread to hold
-/// clipboard ownership long enough for clipboard managers to read it
-/// (X11/Wayland require the owner process to serve selection requests).
+/// Copy text to system clipboard. Uses a singleton background thread that
+/// holds one clipboard handle for the lifetime of the app. New copies replace
+/// the previous content atomically — no thread accumulation, no races.
 fn copy_to_clipboard(text: &str) {
-    let text = text.to_string();
-    std::thread::spawn(move || {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(&text);
-            // Hold ownership so clipboard managers / other apps can read it
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        }
+    use std::sync::{OnceLock, mpsc};
+    static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
+    let sender = TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+            while let Ok(text) = rx.recv() {
+                let _ = clipboard.set_text(&text);
+            }
+        });
+        tx
     });
+    let _ = sender.send(text.to_string());
 }
 
 /// Read text from system clipboard. Returns None if clipboard is empty or inaccessible.

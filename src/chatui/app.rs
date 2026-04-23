@@ -117,9 +117,11 @@ pub(crate) struct App {
     /// The visible line range from the last draw: (start_line_index, end_line_index)
     /// into the line_cache, so we can extract text from screen coordinates.
     pub(crate) visible_line_range: Option<(usize, usize)>,
-    /// Suppress the next Event::Paste — set after a right-click copy to prevent
-    /// terminals that auto-paste on right-click from inserting into the input box.
-    pub(crate) suppress_next_paste: bool,
+    /// Suppress paste events arriving shortly after a right-click copy/paste.
+    /// Terminals that auto-paste on right-click generate a spurious Event::Paste
+    /// immediately after MouseDown(Right). We suppress only within a short TTL
+    /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
+    pub(crate) suppress_paste_until: Option<std::time::Instant>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -190,7 +192,7 @@ impl App {
             selection_end: None,
             msg_area_rect: None,
             visible_line_range: None,
-            suppress_next_paste: false,
+            suppress_paste_until: None,
         }
     }
 
@@ -470,20 +472,23 @@ impl App {
         }
     }
 
+    /// Rendering margin used in render.rs for message continuation lines.
+    /// 3-char margin + 2-char content indent = 5 chars total.
+    const MSG_LINE_INDENT: &'static str = "     ";
+
     /// Extract the selected text from the visible line cache.
     /// Uses msg_area_rect and visible_line_range to map terminal coordinates
-    /// back to line content.
+    /// back to line content. msg_area_rect stores the inner content rect
+    /// (after borders/padding), so no offset arithmetic is needed here.
     pub(crate) fn selected_text(&self) -> Option<String> {
         let (sc, sr, ec, er) = self.selection_range()?;
         let rect = self.msg_area_rect?;
         let (vis_start, vis_end) = self.visible_line_range?;
         let (_, ref all_lines) = self.line_cache.as_ref()?;
 
-        // The message content area starts at rect.x + 1 (horizontal padding)
-        // and rect.y + 1 (top border)
-        let content_x = rect.x + 1;
-        let content_y = rect.y + 1;
-        let content_h = rect.height.saturating_sub(2) as u16;
+        let content_x = rect.x;
+        let content_y = rect.y;
+        let content_h = rect.height;
 
         // Convert terminal y-coordinates to line indices
         let mut result = String::new();
@@ -523,7 +528,7 @@ impl App {
                 let trimmed = if result.is_empty() {
                     trimmed.trim_start()
                 } else {
-                    trimmed.strip_prefix("     ").unwrap_or(trimmed)
+                    trimmed.strip_prefix(Self::MSG_LINE_INDENT).unwrap_or(trimmed)
                 };
                 if !result.is_empty() {
                     result.push('\n');
