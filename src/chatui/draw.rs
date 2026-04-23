@@ -204,9 +204,47 @@ pub(crate) fn draw(
             .border_type(BorderType::Plain)
             .border_style(Style::default().fg(THEME.load().border))
             .padding(Padding::horizontal(1));
+        // Compute inner rect before block is consumed by Paragraph
+        let msg_inner = msg_block.inner(msg_area);
         let messages_widget = Paragraph::new(visible.clone()).block(msg_block);
         frame.render_widget(Clear, msg_area);
         frame.render_widget(messages_widget, msg_area);
+
+        // Save inner content rect (after borders + padding) so input.rs can
+        // map mouse coordinates without hardcoded offsets.
+        app.msg_area_rect = Some(msg_inner);
+        app.visible_line_range = Some((start, end));
+
+        // Render text selection highlight overlay
+        if let Some((sc, sr, ec, er)) = app.selection_range() {
+            let content_x = msg_inner.x;
+            let content_y = msg_inner.y;
+            let content_h = msg_inner.height;
+            let content_w = msg_inner.width;
+
+            for y in sr..=er {
+                if y < content_y || y >= content_y + content_h {
+                    continue;
+                }
+                let row_start = if y == sr { sc.max(content_x) } else { content_x };
+                let row_end = if y == er { ec.min(content_x + content_w) } else { content_x + content_w };
+
+                for x in row_start..row_end {
+                    if x >= content_x && x < content_x + content_w {
+                        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                            // Invert colors for selection highlight
+                            let fg = cell.fg;
+                            let bg = cell.bg;
+                            cell.set_fg(bg);
+                            cell.set_bg(match fg {
+                                Color::Reset => THEME.load().border_active,
+                                other => other,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         // Empty state: SYNAPS with CRT dismiss animation
         let show_logo = app.messages.is_empty() || app.logo_dismiss_t.is_some();
