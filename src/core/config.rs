@@ -321,6 +321,12 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
 
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, out)?;
+    // Config may contain API keys — restrict to owner-only
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
