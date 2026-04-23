@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Multi-Provider Runtime** — OpenAI-compatible provider engine
+  - 17 providers: Groq, Cerebras, NVIDIA NIM, OpenRouter, Google AI Studio, DeepInfra, HuggingFace, Fireworks, Hyperbolic, Scaleway, SiliconFlow, Together, Chutes, Codestral, Perplexity, OVHcloud, + Local (Ollama/LM Studio/vLLM)
+  - 55+ models cataloged with tier ratings (S+/S/A+/A/B)
+  - `provider/model` shorthand: `/model groq/llama-3.3-70b-versatile`
+  - SSE streaming with tool calling across all providers
+  - StreamDecoder with HashMap-based tool call accumulation
+  - Anthropic↔OpenAI message/tool translation layer
+  - Provider router in `api.rs` — model prefix routes automatically
+  - Config: `provider.<name> = <key>` in `~/.synaps-cli/config`
+  - Env var fallback: `GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.
+  - Local model support: `provider.local.url = http://localhost:11434/v1`
+- **`/ping` command** — health-check all configured provider models
+  - Non-blocking, results stream in live as each model responds
+  - Shows ✅/❌/⏳/🔒/⌛ with latency per model
+  - Results cached for model picker display
+- **Settings → Providers** — TUI panel for API key management
+  - View all 17 providers with key status (✅ set / ⬚ not set)
+  - Enter to set/update key, d/Del to clear
+  - Key masking (last 4 chars only)
+  - Local endpoint URL editing
+  - Press `p` to ping all models
+  - Scrollable list with overflow indicators
+- **Settings → Model Picker** — expanded to show provider models
+  - Models grouped by provider with headers (── Groq ──, etc.)
+  - Only shows providers with keys configured
+  - Header rows are unselectable (skip on navigation)
+  - Health status shown when ping data available
+- **App starts without Anthropic credentials** — users with only provider keys can boot the TUI and use free models
 - **Session Naming** — `/saveas <name>` aliases for sessions
   - Name format `[a-z0-9-]{1,40}`, validated and collision-checked
   - `/saveas` (no arg) clears the name
@@ -90,6 +118,22 @@ All notable changes to this project will be documented in this file.
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
 
 ### Fixed
+- **Config file permissions** — now 0600 (was 0644, world-readable with API keys)
+- **API key masking** — shows last 4 chars only (was showing first 8 + last 4)
+- **ProviderConfig Debug** — custom impl redacts `api_key` as `[REDACTED]` in logs
+- **Provider base URLs** — corrected siliconflow (.com→.cn), chutes (→llm.chutes.ai)
+- **Dead models removed** — groq/llama-3.1-70b, groq/qwen-qwq-32b, groq/gemma2-9b (all decommissioned)
+- **Google stream_options** — skip `include_usage` for googleapis.com (rejects it)
+- **Tool→user message ordering** — insert space-content assistant between tool result and user message for strict providers
+- **Finish-frame tool call dedup** — NVIDIA sends final argument chunk with finish_reason; was being dropped as "resend"
+- **Model ID extraction** — health prefix (✅ 253ms) no longer embedded in model string sent to API
+- **`/status` on non-Anthropic** — shows friendly message instead of crashing
+- **"Calling Claude..."** — now shows actual model name in `synaps run`
+- **Paste in settings** — `Event::Paste` now handled in API key, text, and custom model editors
+- **Missing provider key** — `/model sambanova/llama` with no key shows clear error instead of silent Anthropic misroute
+- **Local model connection** — friendly "is Ollama running?" instead of raw TCP error
+- **`/help` updated** — mentions provider/model syntax and /settings for key management
+- **`ping_print` lifecycle** — resets after all results arrive via pending counter
 - **MCP tool name causes 400 errors** — Anthropic rejects `mcp_` prefixed tool names (rate limit pool misrouting). Renamed `mcp_connect` → `connect_mcp_server`, tool prefix `mcp__server__tool` → `ext__server__tool`.
 - **`/saveas` on empty sessions** — `save_session()` bailed on empty `api_messages`, so the name never persisted. Now calls `session.save()` directly.
 - Compaction no longer overwrites original session (loads from disk)
