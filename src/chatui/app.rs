@@ -99,6 +99,8 @@ pub(crate) struct App {
     pub(crate) pending_events: Vec<String>,
     /// Cached model ping results: "provider/model" -> (status, latency_ms).
     pub(crate) model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// Print ping results to chat as they arrive (set by /ping command).
+    pub(crate) ping_print: bool,
     /// Channel for receiving async ping results.
     pub(crate) ping_tx: tokio::sync::mpsc::UnboundedSender<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     pub(crate) ping_rx: tokio::sync::mpsc::UnboundedReceiver<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
@@ -164,6 +166,7 @@ impl App {
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
+            ping_print: false,
             ping_tx: ping_tx_init,
             ping_rx: ping_rx_init,
         }
