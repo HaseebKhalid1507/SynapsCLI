@@ -28,11 +28,18 @@ pub(crate) async fn call_oai_stream_inner(
     let oai_tools = translate::tools_to_oai(tools_schema);
     let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
 
+    // Google's OpenAI-compat endpoint rejects stream_options
+    let stream_options = if cfg.base_url.contains("googleapis.com") {
+        None
+    } else {
+        Some(StreamOptions { include_usage: true })
+    };
+
     let body = ChatRequest {
         model: cfg.model.clone(),
         messages: oai_messages,
         stream: true,
-        stream_options: Some(StreamOptions { include_usage: true }),
+        stream_options,
         max_tokens: None,
         temperature: None,
         tools: tools_opt,
