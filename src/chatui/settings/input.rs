@@ -12,6 +12,7 @@ pub(crate) enum InputOutcome {
     PreviewTheme { name: String },
     RevertTheme,
     OpenPluginsMarketplace,
+    PingModels,
 }
 
 pub(crate) fn handle_event(
@@ -38,6 +39,10 @@ pub(crate) fn handle_event(
     if state.focus == Focus::Right {
         let cat = super::schema::CATEGORIES[state.category_idx];
         if cat == super::schema::Category::Providers {
+            // 'p' key — ping all models from any row
+            if matches!(key.code, KeyCode::Char('p')) && state.edit_mode.is_none() {
+                return InputOutcome::PingModels;
+            }
             // Row 0 = Local (edits URL), Rows 1+ = registry providers (edit API key)
             if state.setting_idx == 0 {
                 // Local provider — edit URL
@@ -214,9 +219,9 @@ pub(crate) fn handle_event(
                             for (id, label, tier) in spec.models {
                                 let full = format!("{}/{}", spec.key, id);
                                 let health = snap.model_health.get(&full)
-                                    .map(|(s, ms)| format!(" {} {}", s.icon(), fmt_latency(*s, *ms)))
-                                    .unwrap_or_default();
-                                opts.push(format!("  {}  — {} [{}]{}", full, label, tier, health));
+                                    .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
+                                    .unwrap_or_else(|| "⏳        ".to_string());
+                                opts.push(format!("  {}{}  — {} [{}]", health, full, label, tier));
                             }
                         }
                         opts.push("Custom…".to_string());
@@ -230,6 +235,8 @@ pub(crate) fn handle_event(
                             options: opts,
                             cursor,
                         });
+                        // Auto-trigger ping when model picker opens
+                        return InputOutcome::PingModels;
                     }
                     EditorKind::ThemePicker => {
                         state.row_error = None;

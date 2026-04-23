@@ -27,6 +27,7 @@ pub(super) enum InputAction {
     PluginsOutcome(super::plugins::InputOutcome),
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
+    PingModels,
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -100,6 +101,9 @@ pub(super) fn handle_event(
                 }
                 super::settings::InputOutcome::OpenPluginsMarketplace => {
                     return InputAction::OpenPluginsMarketplace;
+                }
+                super::settings::InputOutcome::PingModels => {
+                    return InputAction::PingModels;
                 }
             }
         }

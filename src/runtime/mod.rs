@@ -143,6 +143,9 @@ impl Runtime {
         &self.model
     }
 
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
     pub fn set_thinking_budget(&mut self, budget: u32) {
         self.thinking_budget = budget;
     }

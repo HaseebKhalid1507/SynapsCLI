@@ -63,8 +63,6 @@ pub(super) enum CommandAction {
     /// Assign (or clear, if empty) a name to the current session. Persists via save.
     /// Show account usage and reset times.
     Status,
-    /// Ping all configured models and display health/latency.
-    Ping,
 }
 
 /// Resolve a partial command prefix to a full command name.
@@ -266,7 +264,6 @@ pub(super) async fn handle_command(
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
                 "/status — show account usage and reset times",
-                "/ping — health-check all configured models",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
@@ -338,9 +335,6 @@ pub(super) async fn handle_command(
         }
         "status" => {
             return CommandAction::Status;
-        }
-        "ping" => {
-            return CommandAction::Ping;
         }
         _ => {
             match registry.resolve(cmd) {

@@ -365,6 +365,10 @@ pub async fn run(
                     terminal.clear().ok();
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate();
+                    // Drain any pending ping results into model_health cache
+                    while let Ok((key, status, ms)) = app.ping_rx.try_recv() {
+                        app.model_health.insert(key, (status, ms));
+                    }
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
                     let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
@@ -712,38 +716,6 @@ pub async fn run(
                                             Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
                                         }
                                     }
-                                    CommandAction::Ping => {
-                                        app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
-                                        let overrides = synaps_cli::config::load_config().provider_keys.clone();
-                                        let client = reqwest::Client::new();
-                                        let results = synaps_cli::runtime::openai::ping::ping_all_configured(&client, &overrides).await;
-                                        if results.is_empty() {
-                                            app.push_msg(ChatMessage::System("no configured providers — add an API key in /settings".to_string()));
-                                        } else {
-                                            app.push_msg(ChatMessage::System("📡 Model Health Check".to_string()));
-                                            // stable sort: provider, then model
-                                            let mut sorted = results.clone();
-                                            sorted.sort_by(|a, b| a.provider_key.cmp(&b.provider_key).then(a.model_id.cmp(&b.model_id)));
-                                            for r in &sorted {
-                                                let tag = format!("{}/{}", r.provider_key, r.model_id);
-                                                use synaps_cli::runtime::openai::ping::PingStatus;
-                                                let detail = match r.status {
-                                                    PingStatus::Online => format!("{}ms", r.latency_ms),
-                                                    other => other.label().to_string(),
-                                                };
-                                                app.push_msg(ChatMessage::System(format!(
-                                                    "{}  {:<55} — {}",
-                                                    r.status.icon(), tag, detail
-                                                )));
-                                            }
-                                        }
-                                        for r in results {
-                                            app.model_health.insert(
-                                                format!("{}/{}", r.provider_key, r.model_id),
-                                                (r.status, r.latency_ms),
-                                            );
-                                        }
-                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -856,7 +828,7 @@ pub async fn run(
                                         CommandAction::ChainName { .. } => {}
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
-                                        CommandAction::Ping => {}
+                                        // (ping is handled through settings, not commands)
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -933,6 +905,20 @@ pub async fn run(
                                         }
                                     }
                                 }
+                            }
+                            InputAction::PingModels => {
+                                let client = runtime.http_client().clone();
+                                let provider_keys = synaps_cli::config::get_provider_keys();
+                                let health_tx = app.ping_tx.clone();
+                                tokio::spawn(async move {
+                                    let results = synaps_cli::runtime::openai::ping::ping_all_configured(
+                                        &client, &provider_keys
+                                    ).await;
+                                    for r in results {
+                                        let key = format!("{}/{}", r.provider_key, r.model_id);
+                                        let _ = health_tx.send((key, r.status, r.latency_ms));
+                                    }
+                                });
                             }
                         }
                     }

@@ -295,13 +295,42 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
 }
 
 fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap: &RuntimeSnapshot) -> String {
-    if let Some(k) = snap.provider_keys.get(p.key).filter(|s| !s.is_empty()) {
+    let key_status = if let Some(k) = snap.provider_keys.get(p.key).filter(|s| !s.is_empty()) {
         format!("✅ {}", mask_key(k))
     } else if p.env_vars.iter().any(|v| std::env::var(v).is_ok()) {
         "✅ (from env)".to_string()
     } else {
-        "⬚ not set".to_string()
+        return "⬚ not set".to_string(); // No key = no ping data relevant
+    };
+
+    // Append ping summary if available — count online/total models for this provider
+    let models: Vec<_> = p.models.iter()
+        .filter_map(|(id, _, _)| {
+            let full_key = format!("{}/{}", p.key, id);
+            snap.model_health.get(&full_key).map(|(s, ms)| (s, *ms))
+        })
+        .collect();
+
+    if models.is_empty() {
+        return key_status;
     }
+
+    let online = models.iter().filter(|(s, _)| {
+        matches!(s, synaps_cli::runtime::openai::ping::PingStatus::Online)
+    }).count();
+    let total = models.len();
+    let fastest = models.iter()
+        .filter(|(s, _)| matches!(s, synaps_cli::runtime::openai::ping::PingStatus::Online))
+        .map(|(_, ms)| *ms)
+        .min();
+
+    let ping_str = if let Some(ms) = fastest {
+        format!("  ({}/{} online, fastest {}ms)", online, total, ms)
+    } else {
+        format!("  (0/{} online)", total)
+    };
+
+    format!("{}{}", key_status, ping_str)
 }
 
 fn mask_key(key: &str) -> String {
@@ -361,7 +390,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState) {
     } else if on_plugins_right && state.setting_idx > 0 {
         "↑↓ navigate  Tab switch pane  Enter/Space toggle  Esc close"
     } else if on_providers_right {
-        "↑↓ navigate  Tab switch pane  Enter set key  d/Del clear  Esc close"
+        "↑↓ navigate  Tab switch pane  Enter set key  d/Del clear  p ping  Esc close"
     } else {
         "↑↓ navigate  Tab switch pane  Enter edit  Esc close"
     };
