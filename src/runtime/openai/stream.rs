@@ -71,7 +71,8 @@ pub(crate) async fn call_oai_stream_inner(
     let mut decoder = StreamDecoder::new();
     let mut accumulated_text = String::new();
     let mut tool_use_blocks: Vec<Value> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
+    let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = tokio::select! {
@@ -83,31 +84,25 @@ pub(crate) async fn call_oai_stream_inner(
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
 
-        // Scan for newline-delimited SSE lines
-        loop {
-            let nl = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => i,
-                None => break,
-            };
-            let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
-            let line = std::str::from_utf8(&line_bytes[..line_bytes.len() - 1])
-                .unwrap_or("")
-                .to_string();
+        // Scan for newline-delimited SSE lines (SIMD-accelerated via memchr)
+        while let Some(nl) = memchr::memchr(b'\n', &buf) {
+            let line_bytes = buf.split_to(nl + 1); // O(1) — ref-counted split
+            let line = std::str::from_utf8(&line_bytes[..nl]).unwrap_or("");
 
-            let mut sink: Vec<OaiEvent> = Vec::new();
-            decoder.push_line(&line, &mut sink);
+            sink.clear();
+            decoder.push_line(line, &mut sink);
             handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
         }
     }
 
     // Flush any remaining buffered line + final Done
     if !buf.is_empty() {
-        let line = std::str::from_utf8(&buf).unwrap_or("").to_string();
-        let mut sink: Vec<OaiEvent> = Vec::new();
-        decoder.push_line(&line, &mut sink);
+        let line = std::str::from_utf8(&buf).unwrap_or("");
+        sink.clear();
+        decoder.push_line(line, &mut sink);
         handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
     }
-    let mut sink: Vec<OaiEvent> = Vec::new();
+    sink.clear();
     decoder.finish(&mut sink);
     handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
 
