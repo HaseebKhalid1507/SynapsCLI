@@ -212,7 +212,11 @@ pub(crate) fn handle_event(
                             if !has_config_key && !has_env_key { continue; }
                             opts.push(format!("── {} ──", spec.name));
                             for (id, label, tier) in spec.models {
-                                opts.push(format!("  {}/{}  — {} [{}]", spec.key, id, label, tier));
+                                let full = format!("{}/{}", spec.key, id);
+                                let health = snap.model_health.get(&full)
+                                    .map(|(s, ms)| format!(" {} {}", s.icon(), fmt_latency(*s, *ms)))
+                                    .unwrap_or_default();
+                                opts.push(format!("  {}  — {} [{}]{}", full, label, tier, health));
                             }
                         }
                         opts.push("Custom…".to_string());
@@ -368,6 +372,17 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
     }
 }
 
+fn fmt_latency(status: synaps_cli::runtime::openai::ping::PingStatus, ms: u64) -> String {
+    use synaps_cli::runtime::openai::ping::PingStatus;
+    match status {
+        PingStatus::Online => {
+            if ms >= 1000 { format!("{:.1}s", ms as f64 / 1000.0) }
+            else { format!("{}ms", ms) }
+        }
+        other => other.label().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +406,7 @@ mod tests {
             ],
             disabled_plugins: vec!["p2".into()],
             provider_keys: std::collections::BTreeMap::new(),
+            model_health: std::collections::HashMap::new(),
         }
     }
 

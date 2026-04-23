@@ -11,6 +11,7 @@ pub mod wire;
 pub mod registry;
 pub mod translate;
 pub mod stream;
+pub mod ping;
 
 pub use types::{
     ChatMessage, ChatOptions, ChatRequest, FinishReason, FunctionCall, FunctionDefinition,

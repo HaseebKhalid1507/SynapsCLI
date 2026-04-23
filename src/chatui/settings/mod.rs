@@ -55,12 +55,24 @@ pub(crate) struct RuntimeSnapshot {
     pub plugins: Vec<PluginRow>,
     pub disabled_plugins: Vec<String>,
     pub provider_keys: std::collections::BTreeMap<String, String>,
+    /// Cached ping results for models. Key format: "provider/model" (or bare
+    /// model id for Anthropic). Empty until `/ping` has been run.
+    pub model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
 }
 
 impl RuntimeSnapshot {
+    #[allow(dead_code)]
     pub fn from_runtime(
         runtime: &synaps_cli::Runtime,
         registry: &synaps_cli::skills::registry::CommandRegistry,
+    ) -> Self {
+        Self::from_runtime_with_health(runtime, registry, Default::default())
+    }
+
+    pub fn from_runtime_with_health(
+        runtime: &synaps_cli::Runtime,
+        registry: &synaps_cli::skills::registry::CommandRegistry,
+        model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     ) -> Self {
         let config = synaps_cli::config::load_config();
         let plugins: Vec<PluginRow> = registry.plugins().into_iter()
@@ -87,6 +99,7 @@ impl RuntimeSnapshot {
             plugins,
             disabled_plugins: config.disabled_plugins.clone(),
             provider_keys: config.provider_keys.clone(),
+            model_health,
         }
     }
 }

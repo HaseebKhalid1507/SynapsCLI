@@ -57,7 +57,7 @@ pub(super) fn handle_event(
     // Route events to the settings modal while it's open.
     if let Some(state) = app.settings.as_mut() {
         if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime(runtime, registry);
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
             match super::settings::handle_event(state, key, &snap) {
                 super::settings::InputOutcome::Close => { app.settings = None; }
                 super::settings::InputOutcome::None => {}

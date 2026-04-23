@@ -97,6 +97,8 @@ pub(crate) struct App {
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
     pub(crate) pending_events: Vec<String>,
+    /// Cached model ping results: "provider/model" -> (status, latency_ms).
+    pub(crate) model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -157,6 +159,7 @@ impl App {
             plugins: None,
             compact_task: None,
             pending_events: Vec::new(),
+            model_health: std::collections::HashMap::new(),
         }
     }
 

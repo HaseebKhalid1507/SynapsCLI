@@ -630,7 +630,7 @@ pub(crate) fn draw(
         }
 
         if let Some(ref state) = app.settings {
-            let snap = super::settings::RuntimeSnapshot::from_runtime(runtime, registry);
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
             super::settings::render(frame, frame.area(), state, &snap);
         }
         if let Some(ref state) = app.plugins {
