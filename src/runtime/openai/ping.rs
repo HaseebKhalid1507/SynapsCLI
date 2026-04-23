@@ -67,8 +67,6 @@ pub async fn ping_model(
         "max_tokens": 1,
     });
 
-    tracing::debug!(provider=%provider_key, model=%cfg.model, url=%url, "ping: sending request");
-
     let start = Instant::now();
     let fut = client
         .post(&url)
@@ -77,17 +75,10 @@ pub async fn ping_model(
         .send();
 
     let status = match tokio::time::timeout(TIMEOUT, fut).await {
-        Err(_) => {
-            tracing::debug!(provider=%provider_key, model=%cfg.model, "ping: timeout");
-            PingStatus::Timeout
-        }
-        Ok(Err(e)) => {
-            tracing::debug!(provider=%provider_key, model=%cfg.model, error=%e, "ping: request error");
-            PingStatus::Error
-        }
+        Err(_) => PingStatus::Timeout,
+        Ok(Err(_)) => PingStatus::Error,
         Ok(Ok(resp)) => {
             let code = resp.status().as_u16();
-            tracing::debug!(provider=%provider_key, model=%cfg.model, status=%code, ms=%start.elapsed().as_millis(), "ping: response");
             match code {
                 200..=299 => PingStatus::Online,
                 401 | 403 => PingStatus::Unauthorized,
@@ -116,14 +107,10 @@ pub async fn ping_all_configured(
     let specs = registry::providers();
     let mut handles = Vec::new();
 
-    tracing::info!("ping: starting ping_all_configured");
-
     for spec in specs {
         let Some(base_cfg) = registry::resolve_provider_model(spec.key, spec.default_model, overrides) else {
-            tracing::debug!(provider=%spec.key, "ping: skipping — no API key");
             continue;
         };
-        tracing::debug!(provider=%spec.key, model_count=%spec.models.len(), "ping: queueing provider");
         for (model_id, _label, _tier) in spec.models {
             let cfg = ProviderConfig {
                 base_url: base_cfg.base_url.clone(),
@@ -136,18 +123,14 @@ pub async fn ping_all_configured(
             handles.push(tokio::spawn(async move {
                 let result = ping_model(&client, &cfg, &key).await;
                 let full_key = format!("{}/{}", result.provider_key, result.model_id);
-                tracing::debug!(key=%full_key, status=?result.status, ms=%result.latency_ms, "ping: sending result to channel");
                 let _ = tx.send((full_key, result.status, result.latency_ms));
             }));
         }
     }
 
-    tracing::info!(task_count=%handles.len(), "ping: waiting for all tasks");
-
-    // Wait for all to complete, then send sentinel
     for h in handles {
         let _ = h.await;
     }
-    tracing::info!("ping: all done, sending sentinel");
+    // Sentinel: empty key signals all pings complete
     let _ = tx.send((String::new(), PingStatus::Error, 0));
 }

@@ -29,17 +29,6 @@ pub(crate) async fn call_oai_stream_inner(
     let oai_tools = translate::tools_to_oai(tools_schema);
     let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
 
-    // Debug: log tool names and message roles being sent
-    if let Some(ref tools) = tools_opt {
-        let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
-        tracing::debug!(tools = ?names, "openai tools being sent");
-    }
-    tracing::debug!(
-        message_count = oai_messages.len(),
-        roles = ?oai_messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-        "openai messages being sent"
-    );
-
     let body = ChatRequest {
         model: cfg.model.clone(),
         messages: oai_messages,
@@ -50,11 +39,6 @@ pub(crate) async fn call_oai_stream_inner(
         tools: tools_opt,
         tool_choice: None,
     };
-
-    // Debug: log the full request body
-    if let Ok(body_json) = serde_json::to_string_pretty(&body) {
-        tracing::debug!(body = %body_json, "openai request body");
-    }
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
 

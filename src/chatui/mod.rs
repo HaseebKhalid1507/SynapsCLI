@@ -316,10 +316,8 @@ pub async fn run(
             result = app.ping_rx.recv() => {
                 if let Some((key, status, ms)) = result {
                     if key.is_empty() {
-                        tracing::debug!("ping select: received sentinel");
                         app.ping_print = false;
                     } else {
-                        tracing::debug!(key=%key, status=?status, ms=%ms, "ping select: received result");
                         if app.ping_print {
                             let detail = match status {
                                 synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
