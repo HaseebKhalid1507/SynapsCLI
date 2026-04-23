@@ -27,12 +27,8 @@ pub fn providers() -> Vec<ProviderSpec> {
             models: &[
                 ("llama-3.3-70b-versatile", "Llama 3.3 70B", "S"),
                 ("llama-3.1-8b-instant", "Llama 3.1 8B", "B"),
-                ("llama-3.1-70b-versatile", "Llama 3.1 70B", "A"),
                 ("meta-llama/llama-4-scout-17b-16e-instruct", "Llama 4 Scout", "A"),
                 ("meta-llama/llama-4-maverick-17b-128e-instruct", "Llama 4 Maverick", "S"),
-                ("qwen-qwq-32b", "QwQ 32B", "A+"),
-                ("mistral-saba-24b", "Mistral Saba 24B", "B+"),
-                ("gemma2-9b-it", "Gemma 2 9B", "B"),
             ],
         },
         ProviderSpec {
@@ -165,7 +161,7 @@ pub fn providers() -> Vec<ProviderSpec> {
         ProviderSpec {
             key: "siliconflow",
             name: "SiliconFlow",
-            base_url: "https://api.siliconflow.com/v1",
+            base_url: "https://api.siliconflow.cn/v1",
             env_vars: &["SILICONFLOW_API_KEY"],
             default_model: "Qwen/Qwen3-8B",
             models: &[
@@ -188,7 +184,7 @@ pub fn providers() -> Vec<ProviderSpec> {
         ProviderSpec {
             key: "chutes",
             name: "Chutes AI",
-            base_url: "https://chutes.ai/v1",
+            base_url: "https://llm.chutes.ai/v1",
             env_vars: &["CHUTES_API_KEY"],
             default_model: "deepseek-ai/DeepSeek-V3-0324",
             models: &[
