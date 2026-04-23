@@ -741,14 +741,18 @@ pub async fn run(
                                         }
                                     }
                                     CommandAction::Status => {
-                                        app.push_msg(ChatMessage::System("Checking usage...".to_string()));
-                                        match fetch_usage().await {
-                                            Ok(lines) => {
-                                                for line in lines {
-                                                    app.push_msg(ChatMessage::System(line));
+                                        if runtime.model().contains('/') {
+                                            app.push_msg(ChatMessage::System("Usage stats are only available for Anthropic models.".to_string()));
+                                        } else {
+                                            app.push_msg(ChatMessage::System("Checking usage...".to_string()));
+                                            match fetch_usage().await {
+                                                Ok(lines) => {
+                                                    for line in lines {
+                                                        app.push_msg(ChatMessage::System(line));
+                                                    }
                                                 }
+                                                Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
                                             }
-                                            Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
                                         }
                                     }
                                     CommandAction::Ping => {
