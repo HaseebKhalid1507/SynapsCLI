@@ -320,12 +320,20 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         return InputOutcome::None;
                     }
                     let raw = selection.split("  —").next().unwrap_or(&selection).trim();
-                    // Strip health prefix (e.g. "✅  79ms  ") — model IDs start with a letter
-                    let value = raw.chars()
-                        .position(|c| c.is_ascii_alphabetic())
-                        .map(|i| &raw[i..])
-                        .unwrap_or(raw)
-                        .to_string();
+                    // Strip health prefix (e.g. "✅  79ms  groq/..." or "✅  1304ms  nvidia/...")
+                    // Find the model ID by looking for known provider prefixes or "claude-"
+                    let value = if let Some(pos) = raw.find("claude-") {
+                        raw[pos..].to_string()
+                    } else if let Some(pos) = raw.find('/') {
+                        // Find start of provider key before the slash (e.g. "groq/", "nvidia/")
+                        let before = &raw[..pos];
+                        let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                            .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
+                            .unwrap_or(0);
+                        raw[key_start..].to_string()
+                    } else {
+                        raw.to_string()
+                    };
                     let key = *setting_key;
                     if key == "theme" {
                         state.original_theme_name = None;
