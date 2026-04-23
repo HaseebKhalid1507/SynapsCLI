@@ -98,19 +98,11 @@ impl ApiMethods {
         options: &ApiOptions,
     ) -> Result<Value> {
         // Route to OpenAI-compat provider if the model id resolves to one.
-        // Keys come from the config cache (`provider.*` lines); registry
-        // falls back to env vars (e.g. GROQ_API_KEY) when the map is empty.
-        let provider_keys = crate::core::config::get_provider_keys();
-        if let crate::runtime::openai::Provider::OpenAi(cfg) =
-            crate::runtime::openai::resolve_route(model, &provider_keys)
-        {
-            let _ = (thinking_budget, cancel, max_retries, options);
-            let tools_schema = tools.tools_schema();
-            return crate::runtime::openai::stream::call_oai_stream_inner(
-                &cfg, client, &tools_schema, system_prompt, messages, &tx,
-            )
-            .await
-            .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
+        let tools_schema = tools.tools_schema();
+        if let Some(result) = crate::runtime::openai::try_route(
+            model, client, &tools_schema, system_prompt, messages, &tx,
+        ).await {
+            return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
 
         // Read auth state for this API call
@@ -507,23 +499,14 @@ impl ApiMethods {
         options: &ApiOptions,
     ) -> Result<Value> {
         // Route through OpenAI-compat provider if model resolves to one
-        let provider_keys = crate::core::config::get_provider_keys();
-        if let crate::runtime::openai::Provider::OpenAi(cfg) =
-            crate::runtime::openai::resolve_route(model, &provider_keys)
-        {
-            let _ = (thinking_budget, options, auth);
-            let tools_schema = tools.tools_schema();
-            // Use the streaming path and collect the result
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let result = crate::runtime::openai::stream::call_oai_stream_inner(
-                &cfg, client, &tools_schema, system_prompt, messages, &tx,
-            )
-            .await
-            .map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+        let tools_schema = tools.tools_schema();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Some(result) = crate::runtime::openai::try_route(
+            model, client, &tools_schema, system_prompt, messages, &tx,
+        ).await {
             drop(tx);
-            // Drain any remaining events
             while rx.recv().await.is_some() {}
-            return Ok(result);
+            return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
 
         // Read auth state

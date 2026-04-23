@@ -43,3 +43,31 @@ pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> P
     }
     Provider::Anthropic
 }
+
+/// Try to route a request through an OpenAI-compatible provider.
+///
+/// Returns `Some(Ok(value))` if the model resolved to an OpenAI provider and the
+/// request completed (successfully or with error). Returns `None` if the model
+/// should be handled by the Anthropic path.
+///
+/// This is the single routing entry point — both streaming and non-streaming
+/// callers in `api.rs` use this instead of duplicating the routing logic.
+pub async fn try_route(
+    model: &str,
+    client: &reqwest::Client,
+    tools_schema: &std::sync::Arc<Vec<serde_json::Value>>,
+    system_prompt: &Option<String>,
+    messages: &[serde_json::Value],
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::runtime::types::StreamEvent>,
+) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    let provider_keys = crate::core::config::get_provider_keys();
+    match resolve_route(model, &provider_keys) {
+        Provider::OpenAi(cfg) => {
+            let result = stream::call_oai_stream_inner(
+                &cfg, client, tools_schema, system_prompt, messages, tx,
+            ).await;
+            Some(result)
+        }
+        Provider::Anthropic => None,
+    }
+}
