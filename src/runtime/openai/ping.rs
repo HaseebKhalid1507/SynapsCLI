@@ -65,6 +65,7 @@ pub async fn ping_model(
         "model": cfg.model,
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 1,
+        "stream": false,
     });
 
     let start = Instant::now();
