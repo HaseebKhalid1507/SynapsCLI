@@ -378,12 +378,16 @@ pub async fn run(
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate();
                     // Drain any pending ping results into model_health cache
+                    let mut drained = 0u32;
                     while let Ok((key, status, ms)) = app.ping_rx.try_recv() {
                         if key.is_empty() {
                             // Sentinel: all pings done
+                            tracing::debug!("ping drain: received sentinel, turning off ping_print");
                             app.ping_print = false;
                             continue;
                         }
+                        drained += 1;
+                        tracing::debug!(key=%key, status=?status, ms=%ms, "ping drain: received result");
                         if app.ping_print {
                             let detail = match status {
                                 synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
@@ -396,6 +400,9 @@ pub async fn run(
                             app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
                         }
                         app.model_health.insert(key, (status, ms));
+                    }
+                    if drained > 0 {
+                        tracing::debug!(count=%drained, "ping drain: drained results this tick");
                     }
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
