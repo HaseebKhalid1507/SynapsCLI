@@ -198,7 +198,7 @@ pub async fn run(
     // Discover plugins/skills, build command registry, register load_skill tool.
     let tools_shared = runtime.tools_shared();
     let registry = synaps_cli::skills::register(&tools_shared, &config).await;
-    let skill_count = registry.all_skills().len();
+    let _skill_count = registry.all_skills().len();
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
     let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
