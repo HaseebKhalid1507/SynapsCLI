@@ -250,20 +250,29 @@ Provider keys can also be set via environment variables (`GROQ_API_KEY`, `CEREBR
 <details>
 <summary><b>🧬 Architecture (for the curious)</b></summary>
 
-One binary. Subcommands dispatched from `main.rs`.
+One binary. Subcommands dispatched from `main.rs`. Two API paths: Anthropic (native) and OpenAI-compatible (17 providers).
 
 ```
 src/
-├── main.rs      # unified CLI entry point + subcommand dispatch
-├── cmd_*.rs     # subcommand handlers (run, chat, server, client, agent, login, watcher)
-├── chatui/      # TUI: event loop, rendering, markdown, themes, settings
-├── watcher/     # supervisor daemon, IPC, heartbeats
-├── core/        # config, session, chain, auth, protocol, logging
-├── events/      # event bus: types, priority queue, inotify watcher, formatting
-├── runtime/     # orchestration, SSE streaming, parallel tool exec
-├── tools/       # bash, read, write, edit, grep, find, ls, subagent, mcp
-├── mcp/         # JSON-RPC client, lazy server spawning
-└── skills/      # markdown-driven behavioral guidelines + plugin marketplace
+├── main.rs          # unified CLI entry point + subcommand dispatch
+├── cmd/             # subcommand handlers (run, chat, server, client, agent, login, watcher)
+├── chatui/          # TUI: event loop, rendering, markdown, themes, settings, plugins
+│   └── settings/    # /settings modal — model picker, provider keys, themes
+├── runtime/         # THE BRAIN
+│   ├── api.rs       # Anthropic API + provider router (try_route)
+│   ├── stream.rs    # tool dispatch loop (provider-agnostic)
+│   └── openai/      # OpenAI-compatible provider engine
+│       ├── registry.rs   # 17 providers, 55+ models
+│       ├── stream.rs     # SSE streaming + BytesMut/memchr parsing
+│       ├── translate.rs  # Anthropic↔OpenAI format bridge
+│       ├── wire.rs       # StreamDecoder + tool call accumulation
+│       └── ping.rs       # /ping health check
+├── core/            # config, session, chain, auth, models, logging
+├── events/          # event bus: types, priority queue, inotify watcher
+├── tools/           # 15 built-in tools (bash, read, write, edit, subagent*, shell*, etc.)
+├── mcp/             # Model Context Protocol client, lazy server spawning
+├── watcher/         # supervisor daemon, IPC, heartbeats
+└── skills/          # markdown-driven behavioral guidelines + plugin marketplace
 ```
 
 | Subcommand | Purpose |
@@ -275,8 +284,12 @@ src/
 | `agent` | Worker runtime spawned by watcher |
 | `watcher` | Supervisor daemon for autonomous agents |
 | `login` | OAuth flow |
+| `send` | Push events into a running session |
+| `status` | Check account usage |
 
-Config lives at `~/.synaps-cli/` — skills, plugins, sessions, agents, mcp.json. Project-local `.synaps-cli/` overrides global.
+**Provider routing:** Model IDs with a `/` (e.g. `groq/llama-3.3-70b`) route through `runtime/openai/`. Everything else goes to Anthropic. Both paths emit the same `StreamEvent` type — the TUI and tool loop are provider-blind.
+
+Config lives at `~/.synaps-cli/` — config, sessions, agents, plugins, skills, chains, mcp.json. Project-local `.synaps-cli/` overrides global. Provider API keys stored with `0600` permissions.
 
 </details>
 
