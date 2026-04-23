@@ -25,7 +25,7 @@ pub async fn run(prompt: String, agent: Option<String>, system: Option<String>) 
         runtime.set_system_prompt(prompt);
     }
 
-    println!("🤖 Calling Claude...");
+    println!("🤖 Calling {}...", runtime.model());
     let response = runtime.run_single(&prompt).await?;
     println!("{}", response);
     Ok(())
