@@ -314,10 +314,8 @@ pub async fn run(
 
             // ── Ping results — fires when a model ping completes ──
             result = app.ping_rx.recv() => {
-                if let Some((key, status, ms)) = result {
-                    if key.is_empty() {
-                        app.ping_print = false;
-                    } else {
+                match result {
+                    Some((key, status, ms)) => {
                         if app.ping_print {
                             let detail = match status {
                                 synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", ms),
@@ -330,10 +328,14 @@ pub async fn run(
                             app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
                         }
                         app.model_health.insert(key, (status, ms));
+                        let elapsed = last_frame.elapsed();
+                        last_frame = Instant::now();
+                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
                     }
-                    let elapsed = last_frame.elapsed();
-                    last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                    None => {
+                        // All ping tasks done (tx dropped) — stop printing
+                        app.ping_print = false;
+                    }
                 }
             }
 

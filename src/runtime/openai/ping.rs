@@ -131,6 +131,5 @@ pub async fn ping_all_configured(
     for h in handles {
         let _ = h.await;
     }
-    // Sentinel: empty key signals all pings complete
-    let _ = tx.send((String::new(), PingStatus::Error, 0));
+    // tx drops here — receiver sees None and knows all pings are done
 }
