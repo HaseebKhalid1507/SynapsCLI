@@ -250,13 +250,6 @@ pub async fn run(
         }
     };
 
-    if skill_count > 0 {
-        app.push_msg(ChatMessage::System(format!(
-            "📚 {} skills available (type / to list)",
-            skill_count
-        )));
-    }
-
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
     app.last_turn_context_window = runtime.context_window();
