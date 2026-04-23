@@ -16,8 +16,8 @@ pub struct ProviderSpec {
     pub models: &'static [(&'static str, &'static str, &'static str)], // (id, label, tier)
 }
 
-pub fn providers() -> Vec<ProviderSpec> {
-    vec![
+pub fn providers() -> &'static [ProviderSpec] {
+    static PROVIDERS: std::sync::LazyLock<Vec<ProviderSpec>> = std::sync::LazyLock::new(|| vec![
         ProviderSpec {
             key: "groq",
             name: "Groq",
@@ -222,7 +222,8 @@ pub fn providers() -> Vec<ProviderSpec> {
                 ("Qwen/QwQ-32B", "QwQ 32B", "A+"),
             ],
         },
-    ]
+    ]);
+    &PROVIDERS
 }
 
 /// Look up a provider by key and resolve its API key (config override first, then env vars).

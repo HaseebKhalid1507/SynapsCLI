@@ -215,7 +215,7 @@ pub(crate) fn handle_event(
 
                         // Provider models (only for configured providers)
                         let registry = synaps_cli::runtime::openai::registry::providers();
-                        for spec in &registry {
+                        for spec in registry {
                             let has_config_key = snap.provider_keys.contains_key(spec.key);
                             let has_env_key = spec.env_vars.iter()
                                 .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
