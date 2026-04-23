@@ -14,10 +14,10 @@ pub mod stream;
 pub mod ping;
 
 pub use types::{
-    ChatMessage, ChatOptions, ChatRequest, FinishReason, FunctionCall, FunctionDefinition,
+    ChatMessage, ChatOptions, ChatRequest, FunctionCall, FunctionDefinition,
     OaiEvent, ProviderConfig, StreamOptions, ToolCall, ToolChoice, ToolDefinition,
 };
-pub use wire::{parse_sse_line, StreamDecoder};
+pub use wire::StreamDecoder;
 
 /// Routing decision for a given model id.
 #[derive(Debug, Clone)]
