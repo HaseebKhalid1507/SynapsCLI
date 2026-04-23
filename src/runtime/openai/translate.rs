@@ -192,7 +192,7 @@ pub fn messages_to_oai(
     let mut fixed = Vec::with_capacity(out.len());
     for msg in out {
         if msg.role == "user" && fixed.last().map(|m: &ChatMessage| m.role == "tool").unwrap_or(false) {
-            fixed.push(ChatMessage::assistant("".to_string()));
+            fixed.push(ChatMessage::assistant(" ".to_string()));
         }
         fixed.push(msg);
     }
