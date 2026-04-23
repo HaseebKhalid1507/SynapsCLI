@@ -236,9 +236,19 @@ pub enum OaiEvent {
 
 // ─── Provider config ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .finish()
+    }
 }
