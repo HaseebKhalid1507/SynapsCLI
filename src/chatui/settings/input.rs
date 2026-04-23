@@ -220,7 +220,7 @@ pub(crate) fn handle_event(
                                 let full = format!("{}/{}", spec.key, id);
                                 let health = snap.model_health.get(&full)
                                     .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
-                                    .unwrap_or_else(|| "⏳        ".to_string());
+                                    .unwrap_or_default();
                                 opts.push(format!("  {}{}  — {} [{}]", health, full, label, tier));
                             }
                         }
@@ -235,8 +235,6 @@ pub(crate) fn handle_event(
                             options: opts,
                             cursor,
                         });
-                        // Auto-trigger ping when model picker opens
-                        return InputOutcome::PingModels;
                     }
                     EditorKind::ThemePicker => {
                         state.row_error = None;
