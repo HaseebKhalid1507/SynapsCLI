@@ -57,6 +57,22 @@ pub(super) fn handle_event(
     }
     // Route events to the settings modal while it's open.
     if let Some(state) = app.settings.as_mut() {
+        // Handle paste into active editors (API key, text, custom model)
+        if let Event::Paste(text) = event {
+            match &mut state.edit_mode {
+                Some(super::settings::ActiveEditor::ApiKey { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::Text { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::CustomModel { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
         if let Event::Key(key) = event {
             let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
             match super::settings::handle_event(state, key, &snap) {
