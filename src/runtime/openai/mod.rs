@@ -26,6 +26,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI-compatible provider with a resolved config.
     OpenAi(ProviderConfig),
+    /// Known provider prefix but no API key configured.
+    MissingKey(String),
 }
 
 /// Decide which backend a model should route to.
@@ -39,6 +41,8 @@ pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> P
             if let Some(cfg) = registry::resolve_shorthand(model, provider_keys) {
                 return Provider::OpenAi(cfg);
             }
+            // Known provider but no key
+            return Provider::MissingKey(prefix.to_string());
         }
     }
     Provider::Anthropic
@@ -73,5 +77,11 @@ pub async fn try_route(
             Some(result)
         }
         Provider::Anthropic => None,
+        Provider::MissingKey(provider) => {
+            Some(Err(format!(
+                "No API key for '{}'. Set provider.{} in ~/.synaps-cli/config or the corresponding env var.",
+                provider, provider
+            ).into()))
+        }
     }
 }
