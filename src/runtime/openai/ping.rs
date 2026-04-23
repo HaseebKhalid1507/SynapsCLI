@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use futures::future::join_all;
 use serde_json::json;
 
 use super::registry;
@@ -99,15 +98,16 @@ pub async fn ping_model(
 }
 
 /// Ping every model of every configured provider in parallel.
+/// Results are sent through `tx` as they arrive (not batched).
 pub async fn ping_all_configured(
     client: &reqwest::Client,
     overrides: &BTreeMap<String, String>,
-) -> Vec<PingResult> {
+    tx: tokio::sync::mpsc::UnboundedSender<(String, PingStatus, u64)>,
+) {
     let specs = registry::providers();
-    let mut tasks = Vec::new();
+    let mut handles = Vec::new();
 
     for spec in specs {
-        // Skip providers with no resolvable key.
         let Some(base_cfg) = registry::resolve_provider_model(spec.key, spec.default_model, overrides) else {
             continue;
         };
@@ -119,9 +119,18 @@ pub async fn ping_all_configured(
             };
             let client = client.clone();
             let key = spec.key.to_string();
-            tasks.push(async move { ping_model(&client, &cfg, &key).await });
+            let tx = tx.clone();
+            handles.push(tokio::spawn(async move {
+                let result = ping_model(&client, &cfg, &key).await;
+                let full_key = format!("{}/{}", result.provider_key, result.model_id);
+                let _ = tx.send((full_key, result.status, result.latency_ms));
+            }));
         }
     }
 
-    join_all(tasks).await
+    // Wait for all to complete, then send sentinel
+    for h in handles {
+        let _ = h.await;
+    }
+    let _ = tx.send((String::new(), PingStatus::Error, 0));
 }
