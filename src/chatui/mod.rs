@@ -732,6 +732,34 @@ pub async fn run(
                                             Err(e) => app.push_msg(ChatMessage::Error(format!("Usage check failed: {}", e))),
                                         }
                                     }
+                                    CommandAction::Ping => {
+                                        app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
+                                        let client = runtime.http_client().clone();
+                                        let provider_keys = synaps_cli::config::get_provider_keys();
+                                        let results = synaps_cli::runtime::openai::ping::ping_all_configured(
+                                            &client, &provider_keys
+                                        ).await;
+                                        let mut lines: Vec<(String, String)> = Vec::new();
+                                        for r in &results {
+                                            let key = format!("{}/{}", r.provider_key, r.model_id);
+                                            let icon = r.status.icon();
+                                            let detail = match r.status {
+                                                synaps_cli::runtime::openai::ping::PingStatus::Online => format!("{}ms", r.latency_ms),
+                                                synaps_cli::runtime::openai::ping::PingStatus::RateLimited => "429 rate limited".to_string(),
+                                                synaps_cli::runtime::openai::ping::PingStatus::Unauthorized => "401 unauthorized".to_string(),
+                                                synaps_cli::runtime::openai::ping::PingStatus::NotFound => "404 not found".to_string(),
+                                                synaps_cli::runtime::openai::ping::PingStatus::Timeout => "timeout".to_string(),
+                                                synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
+                                            };
+                                            app.model_health.insert(key.clone(), (r.status, r.latency_ms));
+                                            lines.push((key, format!("{} {}", icon, detail)));
+                                        }
+                                        lines.sort_by(|a, b| a.0.cmp(&b.0));
+                                        app.push_msg(ChatMessage::System("📡 Model Health Check".to_string()));
+                                        for (key, status) in &lines {
+                                            app.push_msg(ChatMessage::System(format!("  {:<55} — {}", key, status)));
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -844,7 +872,7 @@ pub async fn run(
                                         CommandAction::ChainName { .. } => {}
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
-                                        // (ping is handled through settings, not commands)
+                                        CommandAction::Ping => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue

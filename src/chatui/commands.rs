@@ -52,6 +52,8 @@ pub(super) enum CommandAction {
     Compact {
         custom_instructions: Option<String>,
     },
+    /// Ping all configured provider models.
+    Ping,
     /// Show the session compaction chain.
     Chain,
     /// List named chains.
@@ -264,6 +266,7 @@ pub(super) async fn handle_command(
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
                 "/status — show account usage and reset times",
+                "/ping — health-check all configured provider models",
                 "/gamba — open the casino 🎰",
             ];
             for line in help_lines {
@@ -335,6 +338,9 @@ pub(super) async fn handle_command(
         }
         "status" => {
             return CommandAction::Status;
+        }
+        "ping" => {
+            return CommandAction::Ping;
         }
         _ => {
             match registry.resolve(cmd) {
