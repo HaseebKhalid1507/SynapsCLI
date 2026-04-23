@@ -61,13 +61,14 @@ pub async fn try_route(
     tx: &tokio::sync::mpsc::UnboundedSender<crate::runtime::types::StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     let provider_keys = crate::core::config::get_provider_keys();
     match resolve_route(model, &provider_keys) {
         Provider::OpenAi(cfg) => {
             let result = stream::call_oai_stream_inner(
                 &cfg, client, tools_schema, system_prompt, messages, tx,
-                temperature, max_tokens,
+                temperature, max_tokens, cancel,
             ).await;
             Some(result)
         }

@@ -25,6 +25,7 @@ pub(crate) async fn call_oai_stream_inner(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let oai_messages = translate::messages_to_oai(messages, system_prompt);
     let oai_tools = translate::tools_to_oai(tools_schema);
@@ -73,7 +74,12 @@ pub(crate) async fn call_oai_stream_inner(
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::select! {
+        chunk = stream.next() => chunk,
+        _ = cancel.cancelled() => {
+            return Err("request cancelled".into());
+        }
+    } {
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
 

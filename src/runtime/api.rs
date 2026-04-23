@@ -101,7 +101,7 @@ impl ApiMethods {
         let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, // temperature + max_tokens (TODO: thread from config)
+            None, None, cancel,
         ).await {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
@@ -504,7 +504,7 @@ impl ApiMethods {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None,
+            None, None, &tokio_util::sync::CancellationToken::new(),
         ).await {
             drop(tx);
             while rx.recv().await.is_some() {}
