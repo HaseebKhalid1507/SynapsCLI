@@ -2,7 +2,7 @@
 
 This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API, streams SSE, dispatches tools, renders a TUI.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -58,7 +58,15 @@ src/
 │   ├── stream.rs         — tool dispatch from streamed tool_use events
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
 │   ├── types.rs          — StreamEvent enum (the wire between runtime and UIs)
-│   └── auth.rs           — auth token refresh before request
+│   ├── auth.rs           — auth token refresh before request
+│   └── openai/           — OpenAI-compatible provider engine
+│       ├── mod.rs        — Provider enum, resolve_route(), try_route()
+│       ├── registry.rs   — 17 providers, 55+ models, env+config key resolution
+│       ├── types.rs      — ChatMessage, ToolCall, ChatRequest, OaiEvent, ProviderConfig
+│       ├── wire.rs       — SSE parser + StreamDecoder (HashMap-based tool call accumulation)
+│       ├── translate.rs  — Anthropic↔OpenAI message/tool/event translation
+│       ├── stream.rs     — call_oai_stream_inner (streaming path)
+│       └── ping.rs       — /ping health check (parallel, non-blocking)
 ├── tools/                — 10 built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
@@ -108,6 +116,7 @@ This is the single most important flow to understand.
 1. **User input** → `chatui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
 2. **Stream kickoff** → `Runtime::run_stream_with_messages()` in `runtime/mod.rs` (~line 377).
 3. **API body build** → `runtime/api.rs::call_api_stream()` (~line 30). Steps:
+   - **Provider routing** → `openai::try_route(model, ...)` checks if the model has a provider prefix (e.g. `groq/llama-3.3-70b`). If yes, routes through `openai/stream.rs` instead of Anthropic. If no, falls through to Anthropic.
    - Clone messages, strip UI-only fields.
    - `HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages)` — see caching section below.
    - Look up thinking config based on model: adaptive (`{type: "adaptive"}` + `output_config.effort`) for Opus 4.7+ / Sonnet 4.7+ / 5.x, else legacy (`{type: "enabled", budget_tokens: N}`). Gated by `model_supports_adaptive_thinking()` in `core/models.rs`.
@@ -160,11 +169,46 @@ The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step
 
 ### Adding a New Model
 
-1. `src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple.
-2. If it supports adaptive thinking: update `model_supports_adaptive_thinking()` (~line 26).
-3. If context window differs: update `context_window_for_model()` (~line 94).
-4. Pricing: update the match in `src/chatui/app.rs::record_cost()` (~line 256). Default falls back to Sonnet pricing.
-5. There are existing tests in `core/models.rs` — extend them.
+1. `src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple (Anthropic models only).
+2. For OpenAI-compatible provider models: add to `src/runtime/openai/registry.rs` in the provider's `models` array as `(model_id, label, tier)`.
+3. If it supports adaptive thinking: update `model_supports_adaptive_thinking()` (~line 26).
+4. If context window differs: update `context_window_for_model()` (~line 94).
+5. Pricing: update the match in `src/chatui/app.rs::record_cost()` (~line 256). Default falls back to Sonnet pricing.
+6. There are existing tests in `core/models.rs` — extend them.
+
+### Adding a New Provider
+
+All OpenAI-compatible providers live in `src/runtime/openai/registry.rs`.
+
+1. Add a `ProviderSpec` entry to the `providers()` function:
+   ```rust
+   ProviderSpec {
+       key: "myprovider",                              // used in provider/model shorthand
+       name: "My Provider",                            // display name in settings
+       base_url: "https://api.myprovider.com/v1",     // OpenAI-compat chat/completions
+       env_vars: &["MYPROVIDER_API_KEY"],              // env var fallback(s)
+       default_model: "some-model-id",                 // used by resolve_provider()
+       models: &[
+           ("model-id", "Display Name", "S"),          // (api_id, label, tier)
+       ],
+   }
+   ```
+2. That's it for most providers. The router, settings UI, model picker, and `/ping` all pick it up automatically.
+
+**Special cases:**
+- If the provider rejects `stream_options`: add a URL check in `stream.rs` (see Google gate).
+- If auth isn't `Bearer`: needs a new code path in `stream.rs` (currently only Bearer supported).
+- For local providers: use `local` key with dynamic URL from `provider.local.url` config.
+
+**Provider key resolution order:** `provider.<key>` in config → env var → absent.
+
+**The translation layer** (`translate.rs`) handles Anthropic↔OpenAI format differences:
+- `tools_to_oai()` — converts `input_schema` → `parameters`
+- `messages_to_oai()` — flattens content blocks, maps tool_result/tool_use
+- `oai_event_to_llm()` — maps OaiEvent → StreamEvent (provider-agnostic)
+- `tool_calls_to_content_blocks()` — converts back to Anthropic shape for the agent loop
+
+The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return identical Anthropic-shaped `Value`s.
 
 ### Adding a New Theme
 
@@ -249,13 +293,19 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
 10. **OAuth tokens are file-locked** via `fs4`. Concurrent chatui + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
+11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
+12. **Anthropic auth is optional.** `get_auth_token()` returns `auth_type: "none"` if no credentials found. The app boots fine. Anthropic API calls fail lazily with a clear message pointing to `synaps login` or `/model groq/...`.
+13. **`/compact` doesn't route through providers** — uses `call_api_simple` which is Anthropic-only. Known issue (see `docs/open-provider-issues.md`).
+14. **Cost display is Claude-only.** The `$X.XX` in the status bar uses Claude pricing for all models. Non-Claude shows wrong numbers. Known issue.
+15. **Config file contains API keys.** Written with `0600` permissions. `ProviderConfig` Debug impl redacts `api_key`. Don't log raw config values.
 
 ---
 
 ## Dependencies (key ones)
 
 - **`tokio` 1.x** — async runtime. `features = ["full"]`. Everything is async.
-- **`reqwest` 0.11** — HTTP client for Anthropic API.
+- **`reqwest` 0.11** — HTTP client for Anthropic + OpenAI-compatible APIs.
+- **`bytes` 1 + `memchr` 2** — zero-copy SSE line parsing (BytesMut::split_to + SIMD newline search).
 - **`ratatui` 0.29 + `crossterm` 0.28** — TUI framework.
 - **`tachyonfx` 0.9** — TUI visual effects (the gamba easter egg).
 - **`serde_json`** — everything JSON (messages, tool schemas, API bodies).
