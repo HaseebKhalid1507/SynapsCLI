@@ -23,6 +23,8 @@ pub(crate) async fn call_oai_stream_inner(
     system_prompt: &Option<String>,
     messages: &[Value],
     tx: &mpsc::UnboundedSender<StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let oai_messages = translate::messages_to_oai(messages, system_prompt);
     let oai_tools = translate::tools_to_oai(tools_schema);
@@ -40,8 +42,8 @@ pub(crate) async fn call_oai_stream_inner(
         messages: oai_messages,
         stream: true,
         stream_options,
-        max_tokens: None,
-        temperature: None,
+        max_tokens,
+        temperature,
         tools: tools_opt,
         tool_choice: None,
     };
