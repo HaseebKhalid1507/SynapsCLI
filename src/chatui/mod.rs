@@ -315,6 +315,10 @@ pub async fn run(
                                 synaps_cli::runtime::openai::ping::PingStatus::Error => "error".to_string(),
                             };
                             app.push_msg(ChatMessage::System(format!("  {} {:<50} — {}", status.icon(), key, detail)));
+                            app.ping_pending = app.ping_pending.saturating_sub(1);
+                            if app.ping_pending == 0 {
+                                app.ping_print = false;
+                            }
                         }
                         app.model_health.insert(key, (status, ms));
                         let elapsed = last_frame.elapsed();
@@ -749,6 +753,12 @@ pub async fn run(
                                         app.ping_print = true;
                                         let client = runtime.http_client().clone();
                                         let provider_keys = synaps_cli::config::get_provider_keys();
+                                        // Count how many models will be pinged
+                                        let count: usize = synaps_cli::runtime::openai::registry::providers().iter()
+                                            .filter(|s| synaps_cli::runtime::openai::registry::resolve_provider_model(s.key, s.default_model, &provider_keys).is_some())
+                                            .map(|s| s.models.len())
+                                            .sum();
+                                        app.ping_pending = count;
                                         let health_tx = app.ping_tx.clone();
                                         tokio::spawn(async move {
                                             synaps_cli::runtime::openai::ping::ping_all_configured(
