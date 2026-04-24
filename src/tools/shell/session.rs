@@ -211,7 +211,11 @@ async fn wait_for_output(
 
         // Check if output exceeds the max size — truncate and return early.
         if output.len() > max_output {
-            output.truncate(max_output);
+            let mut trunc = max_output;
+            while trunc > 0 && !output.is_char_boundary(trunc) {
+                trunc -= 1;
+            }
+            output.truncate(trunc);
             return (normalize_output(&output), "active".into());
         }
 

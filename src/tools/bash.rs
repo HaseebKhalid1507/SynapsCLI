@@ -84,7 +84,12 @@ impl Tool for BashTool {
             while let Some(line) = rx_inter.recv().await {
                 full_output.push_str(&line);
                 if full_output.len() > max_output {
-                    full_output.truncate(max_output);
+                    // Find a valid UTF-8 char boundary at or before max_output
+                    let mut trunc = max_output;
+                    while trunc > 0 && !full_output.is_char_boundary(trunc) {
+                        trunc -= 1;
+                    }
+                    full_output.truncate(trunc);
                     full_output.push_str(&format!("\n\n[output truncated at {}]", max_output));
                     break;
                 }
