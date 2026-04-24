@@ -146,6 +146,7 @@ pub(super) async fn handle_command(
     runtime: &mut Runtime,
     system_prompt_path: &PathBuf,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {
     use synaps_cli::skills::registry::Resolution;
     match cmd {
@@ -398,6 +399,24 @@ pub(super) async fn handle_command(
         }
         "ping" => {
             return CommandAction::Ping;
+        }
+        "keybinds" => {
+            let custom = keybind_registry.custom_binds();
+            if custom.is_empty() {
+                app.push_msg(ChatMessage::System("No plugin or user keybinds registered.".to_string()));
+            } else {
+                let mut lines = vec!["Keybinds:".to_string()];
+                for bind in &custom {
+                    let key = synaps_cli::skills::keybinds::format_key(&bind.key);
+                    let source = match &bind.source {
+                        synaps_cli::skills::keybinds::KeybindSource::Plugin(name) => format!(" ({})", name),
+                        synaps_cli::skills::keybinds::KeybindSource::User => " (user)".to_string(),
+                        _ => String::new(),
+                    };
+                    lines.push(format!("  {:18} {}{}", key, bind.description, source));
+                }
+                app.push_msg(ChatMessage::System(lines.join("\n")));
+            }
         }
         _ => {
             match registry.resolve(cmd) {
