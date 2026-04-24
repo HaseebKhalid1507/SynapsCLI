@@ -32,6 +32,7 @@ pub struct Plugin {
     pub marketplace: Option<String>,
     pub version: Option<String>,
     pub description: Option<String>,
+    pub manifest: Option<manifest::PluginManifest>,
 }
 
 /// A skill discovered during loading.
@@ -54,11 +55,12 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 ];
 
 /// Load all skills, apply disable filters, build the command registry,
-/// and register the `load_skill` tool. Returns the registry for chatui wiring.
+/// build the keybind registry, and register the `load_skill` tool.
+/// Returns (command_registry, keybind_registry).
 pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
-) -> Arc<CommandRegistry> {
+) -> (Arc<CommandRegistry>, Arc<keybinds::KeybindRegistry>) {
     let (plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
 
@@ -68,10 +70,30 @@ pub async fn register(
         "loaded plugins and skills"
     );
 
+    // Build keybind registry from plugin manifests
+    let mut kb_registry = keybinds::KeybindRegistry::new();
+    for plugin in &plugins {
+        if let Some(ref manifest) = plugin.manifest {
+            if !manifest.keybinds.is_empty() {
+                kb_registry.register_plugin(&manifest.name, &manifest.keybinds, &plugin.root);
+                tracing::info!(
+                    plugin = manifest.name.as_str(),
+                    count = manifest.keybinds.len(),
+                    "registered plugin keybinds"
+                );
+            }
+        }
+    }
+
+    // Apply user keybind overrides from config
+    if !config.keybinds.is_empty() {
+        kb_registry.register_user(&config.keybinds);
+    }
+
     let registry = Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, skills));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
-    registry
+    (registry, Arc::new(kb_registry))
 }
 
 /// Re-walks discovery roots and swaps in the new skill set atomically.

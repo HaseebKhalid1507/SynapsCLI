@@ -197,7 +197,7 @@ pub async fn run(
 
     // Discover plugins/skills, build command registry, register load_skill tool.
     let tools_shared = runtime.tools_shared();
-    let registry = synaps_cli::skills::register(&tools_shared, &config).await;
+    let (registry, keybind_registry) = synaps_cli::skills::register(&tools_shared, &config).await;
     let _skill_count = registry.all_skills().len();
 
     // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
@@ -481,7 +481,7 @@ pub async fn run(
                 match maybe_event {
                     Some(Ok(event)) => {
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry);
+                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
                         match action {
                             InputAction::None => {}
                             InputAction::Quit => {

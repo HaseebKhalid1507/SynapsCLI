@@ -212,6 +212,7 @@ fn load_plugin(
         marketplace: marketplace.map(str::to_string),
         version: m.version.clone(),
         description: m.description.clone(),
+        manifest: Some(m.clone()),
     });
 
     let skills_dir = plugin_root.join("skills");
