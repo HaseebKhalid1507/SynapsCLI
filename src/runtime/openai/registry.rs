@@ -19,6 +19,21 @@ pub struct ProviderSpec {
 pub fn providers() -> &'static [ProviderSpec] {
     static PROVIDERS: std::sync::LazyLock<Vec<ProviderSpec>> = std::sync::LazyLock::new(|| vec![
         ProviderSpec {
+            key: "openai",
+            name: "OpenAI",
+            base_url: "https://api.openai.com/v1",
+            env_vars: &["OPENAI_API_KEY"],
+            default_model: "gpt-4.1",
+            models: &[
+                ("gpt-4.1", "GPT-4.1", "A+"),
+                ("gpt-4.1-mini", "GPT-4.1 Mini", "B+"),
+                ("gpt-4.1-nano", "GPT-4.1 Nano", "B"),
+                ("o3", "o3", "S+"),
+                ("o4-mini", "o4-mini", "A+"),
+                ("codex-mini", "Codex Mini", "A"),
+            ],
+        },
+        ProviderSpec {
             key: "groq",
             name: "Groq",
             base_url: "https://api.groq.com/openai/v1",
@@ -340,7 +355,21 @@ fn resolve_api_key(
             return Some(v.clone());
         }
     }
-    env_vars.iter().find_map(|var| {
+    let from_env = env_vars.iter().find_map(|var| {
         std::env::var(var).ok().filter(|v| !v.is_empty())
-    })
+    });
+    if from_env.is_some() {
+        return from_env;
+    }
+
+    // For "openai" provider, also check OAuth credentials in auth.json
+    if provider_key == "openai" {
+        if let Ok(Some(openai_creds)) = crate::auth::load_openai_auth() {
+            if openai_creds.auth_type == "oauth" && !openai_creds.access.is_empty() {
+                return Some(openai_creds.access.clone());
+            }
+        }
+    }
+
+    None
 }
