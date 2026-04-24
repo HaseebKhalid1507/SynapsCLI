@@ -3,8 +3,83 @@
 **Goal:** Add native OpenAI OAuth ("Sign in with ChatGPT") + OpenAI model routing so users can use GPT-4.1, o3, etc. with their ChatGPT subscription.  
 **Architecture:** Extend existing OAuth auth module to support multiple providers; add `openai` as a first-class provider in the OpenAI-compat registry; reuse existing Chat Completions streaming path.  
 **Design Doc:** `docs/plans/2025-07-27-openai-integration-design.md`  
-**Estimated Tasks:** 10 tasks  
+**Estimated Tasks:** 11 tasks  
 **Complexity:** Medium
+
+---
+
+### Task 0: Redesign `synaps login` as a Provider Dashboard
+
+**Files:**
+- Modify: `src/cmd/login.rs`
+- Modify: `src/main.rs`
+
+**Goal:** Replace the current single-provider login with an interactive dashboard that shows status for all OAuth-capable providers, then lets the user pick which one to log into.
+
+**Step 1: Update main.rs**
+
+Add `--provider` arg (optional) to the Login subcommand:
+```rust
+Login {
+    /// Which provider to log into (anthropic, openai). Omit for interactive selection.
+    #[arg(long)]
+    provider: Option<String>,
+},
+```
+
+Pass it through: `cmd::login::run(cli.profile, provider).await;`
+
+**Step 2: Rewrite login.rs with a dashboard**
+
+When no `--provider` is given, show a status dashboard:
+
+```
+╔══════════════════════════════════════════════════╗
+║              SynapsCLI — Login                   ║
+╠══════════════════════════════════════════════════╣
+║                                                  ║
+║  OAuth Providers:                                ║
+║                                                  ║
+║   1. Anthropic (Claude)                          ║
+║      ✓ Logged in — expires in 6 days, 3 hours    ║
+║                                                  ║
+║   2. OpenAI (ChatGPT)                            ║
+║      ✗ Not logged in                             ║
+║                                                  ║
+║  API Key Providers:                              ║
+║                                                  ║
+║   ✓ Groq          (GROQ_API_KEY)                 ║
+║   ✓ Google         (GOOGLE_API_KEY)              ║
+║   ✗ Cerebras       —                             ║
+║   ✗ NVIDIA NIM     —                             ║
+║   ... (only show configured ones + first few)    ║
+║                                                  ║
+╚══════════════════════════════════════════════════╝
+
+Select a provider to log in (1-2), or press Enter to cancel:
+```
+
+- Read `auth.json` to check Anthropic and OpenAI OAuth status
+- Use `list_providers()` from the registry to show API key provider status
+- If user picks 1 → Anthropic OAuth flow (existing)
+- If user picks 2 → OpenAI OAuth flow (new, Task 5)
+
+**Step 3: Support `--provider` for non-interactive use**
+```bash
+synaps login --provider anthropic   # skip dashboard, go straight to Anthropic
+synaps login --provider openai      # skip dashboard, go straight to OpenAI
+synaps login                        # show dashboard
+```
+
+**Step 4: Verify**
+```bash
+cargo build 2>&1 | head -20
+```
+
+**Step 5: Commit**
+```bash
+git add -A && git commit -m "feat(login): provider dashboard with status for OAuth and API key providers"
+```
 
 ---
 
@@ -301,7 +376,7 @@ git add -A && git commit -m "feat(cli): add 'synaps login --openai' command"
 
 ---
 
-### Task 9: Wire everything together & test build
+### Task 10: Wire everything together & test build
 
 **Files:**
 - Modify: `src/lib.rs` (ensure new exports if needed)
@@ -325,7 +400,7 @@ git add -A && git commit -m "fix: resolve compilation issues for OpenAI integrat
 
 ---
 
-### Task 10: Manual integration test
+### Task 11: Manual integration test
 
 **Step 1: Test login flow**
 ```bash

@@ -95,11 +95,34 @@ Extend `AuthMethods` to also check/refresh OpenAI tokens when an OpenAI model is
 
 #### D. Login Command (`src/cmd/login.rs`)
 
-Add `--openai` flag:
+Redesign `synaps login` as a **provider dashboard**:
+
 ```
-synaps login          # Anthropic (default)  
-synaps login --openai # OpenAI (Sign in with ChatGPT)
+╔══════════════════════════════════════════════════╗
+║              SynapsCLI — Login                   ║
+╠══════════════════════════════════════════════════╣
+║                                                  ║
+║  OAuth Providers:                                ║
+║                                                  ║
+║   1. Anthropic (Claude)                          ║
+║      ✓ Logged in — expires in 6 days, 3 hours    ║
+║                                                  ║
+║   2. OpenAI (ChatGPT)                            ║
+║      ✗ Not logged in                             ║
+║                                                  ║
+║  API Key Providers:                              ║
+║   ✓ Groq          ✓ Google        ✗ Cerebras     ║
+║   ✗ NVIDIA NIM    ✗ OpenRouter    ...            ║
+║                                                  ║
+╚══════════════════════════════════════════════════╝
+
+Select provider to log in (1-2):
 ```
+
+- Shows real-time status of OAuth tokens (logged in / expired / not set)
+- Shows which API key providers are configured
+- Interactive selection to trigger the appropriate login flow
+- `synaps login --provider openai` for non-interactive / scripted use
 
 #### E. Model Usage
 
