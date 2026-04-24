@@ -99,6 +99,7 @@ pub struct SynapsConfig {
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
     pub provider_keys: BTreeMap<String, String>,
+    pub keybinds: std::collections::HashMap<String, String>,
 }
 
 impl Default for SynapsConfig {
@@ -118,6 +119,7 @@ impl Default for SynapsConfig {
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
             provider_keys: BTreeMap::new(),
+            keybinds: std::collections::HashMap::new(),
         }
     }
 }
@@ -275,6 +277,8 @@ pub fn load_config() -> SynapsConfig {
                     parse_shell_config_key(&mut config.shell, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
+                } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
+                    config.keybinds.insert(keybind_key.to_string(), val.to_string());
                 }
                 // Other unknown keys silently ignored
             }

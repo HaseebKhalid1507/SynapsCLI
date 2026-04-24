@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use super::keybinds::ManifestKeybind;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -9,6 +11,8 @@ pub struct PluginManifest {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub keybinds: Vec<ManifestKeybind>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -37,6 +37,7 @@ pub(super) fn handle_event(
     runtime: &synaps_cli::Runtime,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
+    keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
     // Route events to the plugins modal while it's open. Most outcomes run
     // async side-effects (fetch manifest, git clone, etc.), so we delegate
@@ -127,7 +128,7 @@ pub(super) fn handle_event(
         return InputAction::None;
     }
     match event {
-        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry),
+        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
             handle_mouse(mouse, app)
         }
@@ -298,6 +299,7 @@ fn handle_key(
     app: &mut App,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
+    keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
     // Clear text selection on any keypress (typing dismisses selection)
     app.clear_selection();
@@ -305,6 +307,31 @@ fn handle_key(
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
         app.tab_cycle = None;
+    }
+
+    // Plugin/user keybinds — check before core binds, but only when not streaming
+    if !streaming {
+        if let Some(bind) = keybinds.match_key(code, modifiers) {
+            use synaps_cli::skills::keybinds::KeybindAction;
+            return match &bind.action {
+                KeybindAction::SlashCommand(cmd) => {
+                    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+                    let resolved = super::commands::resolve_prefix(parts[0], &super::commands::all_commands_with_skills(registry));
+                    InputAction::SlashCommand(resolved, parts.get(1).unwrap_or(&"").to_string())
+                }
+                KeybindAction::LoadSkill(skill) => {
+                    InputAction::SlashCommand("load".to_string(), skill.clone())
+                }
+                KeybindAction::InjectPrompt(text) => {
+                    InputAction::Submit(text.clone())
+                }
+                KeybindAction::Disabled => InputAction::None,
+                KeybindAction::RunScript { .. } => {
+                    // TODO: execute script and inject output
+                    InputAction::None
+                }
+            };
+        }
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
