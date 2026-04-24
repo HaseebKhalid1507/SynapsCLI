@@ -141,7 +141,8 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     }
 
     eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
+    // Use OSC 8 hyperlink so the entire URL is one clickable link in the terminal
+    eprintln!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\n", auth_url, auth_url);
 
     // Also provide manual paste option
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
@@ -229,7 +230,8 @@ pub async fn login_openai() -> std::result::Result<OAuthCredentials, String> {
     }
 
     eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
+    // Use OSC 8 hyperlink so the entire URL is one clickable link in the terminal
+    eprintln!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\n", auth_url, auth_url);
 
     // Also provide manual paste option
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
