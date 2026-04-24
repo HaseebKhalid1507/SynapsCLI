@@ -20,9 +20,12 @@ mod browser;
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use pkce::{generate_code_verifier, generate_code_challenge, generate_state, build_auth_url};
+pub use pkce::build_openai_auth_url;
 pub use callback::{CallbackServerHandle, start_callback_server};
 pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token};
+pub use token::{exchange_code_for_tokens_openai, refresh_openai_token, ensure_fresh_openai_token};
 pub use storage::{auth_file_path, load_auth, save_auth};
+pub use storage::{save_openai_auth, load_openai_auth};
 pub use browser::open_browser;
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
@@ -200,6 +203,94 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 
     // 8. Save to auth.json
     save_auth(&creds)?;
+
+    Ok(creds)
+}
+
+/// Run the full OAuth login flow for OpenAI (Sign in with ChatGPT).
+pub async fn login_openai() -> std::result::Result<OAuthCredentials, String> {
+    let port = OPENAI_CALLBACK_PORT;
+
+    // 1. Generate PKCE
+    let verifier = generate_code_verifier();
+    let challenge = generate_code_challenge(&verifier);
+    let state = generate_state();
+
+    // 2. Start callback server (with OpenAI callback path)
+    let (rx, server_handle) = start_callback_server(state.clone(), port, OPENAI_CALLBACK_PATH).await?;
+
+    // 3. Build URL and open browser
+    let auth_url = build_openai_auth_url(&challenge, &state, port);
+
+    eprintln!("\n\x1b[1mOpening browser to sign in with ChatGPT...\x1b[0m\n");
+
+    if let Err(e) = open_browser(&auth_url) {
+        eprintln!("Could not open browser automatically: {}", e);
+    }
+
+    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
+    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
+
+    // Also provide manual paste option
+    let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
+    let manual_state = state.clone();
+    let stdin_task = tokio::spawn(async move {
+        eprintln!("\x1b[2mOr paste the authorization code here:\x1b[0m");
+
+        let mut line = String::new();
+        let result = tokio::task::spawn_blocking(move || {
+            std::io::stdin().read_line(&mut line).ok();
+            line.trim().to_string()
+        })
+        .await;
+
+        if let Ok(input) = result {
+            if !input.is_empty() {
+                let (code, parsed_state) = parse_manual_input(&input);
+                if let Some(code) = code {
+                    let _ = manual_tx.send(CallbackResult {
+                        code,
+                        state: parsed_state.unwrap_or(manual_state),
+                    });
+                }
+            }
+        }
+    });
+
+    // 4. Wait for either callback or manual input
+    let result = tokio::select! {
+        callback = rx => {
+            match callback {
+                Ok(result) => result,
+                Err(_) => return Err("Callback channel closed".to_string()),
+            }
+        }
+        manual = manual_rx => {
+            match manual {
+                Ok(result) => result,
+                Err(_) => return Err("Manual input channel closed".to_string()),
+            }
+        }
+    };
+
+    stdin_task.abort();
+
+    // 5. Verify state
+    if result.state != state {
+        server_handle.shutdown().await;
+        return Err("OAuth state mismatch — possible CSRF attack".to_string());
+    }
+
+    eprintln!("\n\x1b[1mExchanging code for tokens...\x1b[0m");
+
+    // 6. Exchange code for tokens
+    let creds = exchange_code_for_tokens_openai(&result.code, &result.state, &verifier, port).await?;
+
+    // 7. Shut down callback server
+    server_handle.shutdown().await;
+
+    // 8. Save to auth.json (under the openai key)
+    save_openai_auth(&creds)?;
 
     Ok(creds)
 }
