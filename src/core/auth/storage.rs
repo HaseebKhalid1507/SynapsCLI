@@ -30,9 +30,19 @@ pub fn save_auth(creds: &OAuthCredentials) -> std::result::Result<(), String> {
             .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
     }
 
+    // Preserve existing OpenAI creds if present
+    let existing_openai = if path.exists() {
+        let content = std::fs::read_to_string(&path).ok();
+        content
+            .and_then(|c| serde_json::from_str::<AuthFile>(&c).ok())
+            .and_then(|a| a.openai)
+    } else {
+        None
+    };
+
     let auth = AuthFile {
         anthropic: creds.clone(),
-        openai: None,
+        openai: existing_openai,
     };
 
     let json = serde_json::to_string_pretty(&auth)
