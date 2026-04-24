@@ -514,7 +514,8 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
         let effective_width = if is_first_line { width } else { wrap_width };
         if wlen > effective_width {
             let chars: Vec<char> = word.chars().collect();
-            for chunk in chars.chunks(effective_width) {
+            let chunk_size = effective_width.max(1); // Prevent panic on zero-width terminal
+            for chunk in chars.chunks(chunk_size) {
                 if !current.is_empty() && current != indent {
                     lines.push(current.trim_end().to_string());
                     current = indent.clone();
