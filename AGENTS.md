@@ -224,6 +224,46 @@ The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return
 3. Add a match arm in `handle_command()` (commands.rs).
 4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `mod.rs` event loop.
 
+### Adding a Plugin Keybind
+
+Plugins declare keybinds in `plugin.json`:
+
+```json
+{
+  "keybinds": [
+    {
+      "key": "F5",
+      "action": "slash_command",
+      "command": "compact",
+      "description": "Quick compact"
+    }
+  ]
+}
+```
+
+**Key notation:** `C` = Ctrl, `A` = Alt, `S` = Shift. Combine with `-`: `C-S-s` = Ctrl+Shift+S. Special keys: `F1`–`F12`, `Space`, `Tab`, `Enter`, `Esc`.
+
+**Action types:**
+- `slash_command` — runs a `/command` (field: `command`)
+- `load_skill` — loads a skill (field: `skill`)
+- `inject_prompt` — submits text as user message (field: `prompt`)
+- `run_script` — runs a script from the plugin dir (field: `script`)
+
+**Implementation path:**
+1. `ManifestKeybind` (skills/keybinds.rs) — serde struct for plugin.json parsing
+2. `KeybindRegistry` (skills/keybinds.rs) — collects + resolves conflicts
+3. Built during `skills::register()` (skills/mod.rs) alongside command registry
+4. Checked in `handle_key()` (chatui/input.rs) before the core match block
+5. `parse_key()` / `format_key()` for notation ↔ KeyCombo conversion
+
+**Priority:** Core (Ctrl+C, Esc, etc.) > user config (`keybind.*`) > plugin. Core binds are never overridable. User config always wins over plugins.
+
+**User overrides** in `~/.synaps-cli/config`:
+```
+keybind.F5 = /compact        # override or add
+keybind.F6 = disabled        # block a plugin bind
+```
+
 ---
 
 ## Prompt Caching Strategy
