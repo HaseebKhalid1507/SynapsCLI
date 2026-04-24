@@ -16,6 +16,7 @@ pub mod tool;
 pub mod state;
 pub mod marketplace;
 pub mod install;
+pub mod keybinds;
 
 use std::path::PathBuf;
 use std::sync::Arc;
