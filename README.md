@@ -245,9 +245,69 @@ provider.local.url = http://localhost:11434/v1
 
 # Appearance
 theme = cyberpunk
+
+# Custom keybinds
+keybind.F5 = /compact
+keybind.A-h = /help
+keybind.A-k = /keybinds
+keybind.F6 = disabled
 ```
 
 Provider keys can also be set via environment variables (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.) or through `/settings → Providers` in the TUI.
+
+---
+
+## Keybinds
+
+Plugins can register keyboard shortcuts, and users can override or add their own.
+
+### User keybinds (in config)
+
+```
+keybind.F5 = /compact           # F5 runs /compact
+keybind.A-s = /scholar          # Alt+S runs /scholar
+keybind.A-k = /keybinds         # Alt+K shows all keybinds
+keybind.F6 = disabled           # Disable a plugin keybind
+```
+
+### Plugin keybinds (in plugin.json)
+
+Plugins declare keybinds in their manifest:
+
+```json
+{
+  "name": "my-plugin",
+  "keybinds": [
+    {
+      "key": "F5",
+      "action": "slash_command",
+      "command": "compact",
+      "description": "Quick compact"
+    },
+    {
+      "key": "A-r",
+      "action": "load_skill",
+      "skill": "code-review",
+      "description": "Load code review"
+    }
+  ]
+}
+```
+
+### Key notation
+
+| Notation | Meaning |
+|----------|---------|
+| `C-x` | Ctrl+X |
+| `A-x` | Alt+X |
+| `S-x` | Shift+X |
+| `C-A-x` | Ctrl+Alt+X |
+| `F1`–`F12` | Function keys |
+| `Space`, `Tab`, `Enter`, `Esc` | Special keys |
+
+### Priority
+
+Core keybinds (Ctrl+C, Esc, Enter, etc.) are never overridable. User config overrides plugins. `/keybinds` to see what's registered.
 
 ---
 

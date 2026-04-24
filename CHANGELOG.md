@@ -116,6 +116,25 @@ All notable changes to this project will be documented in this file.
 - **Usage log opt-in**: `SYNAPS_USAGE_LOG=1` writes to `~/.cache/synaps/usage.log` (0600, O_NOFOLLOW)
 - **Opus 4.6 in model picker**: was missing from `/settings` model list
 - **`settings` + `plugins` in tab-complete**: were missing from `BUILTIN_COMMANDS`
+- **Plugin Keybinds** — plugins declare custom keyboard shortcuts in `plugin.json`
+  - `KeybindRegistry` with parser, matching, and conflict resolution
+  - Key notation: `C-x` (Ctrl), `A-x` (Alt), `S-x` (Shift), `F1`–`F12`, special keys
+  - 4 action types: `slash_command`, `load_skill`, `inject_prompt`, `run_script`
+  - User overrides via `keybind.*` in config — override or disable plugin binds
+  - Priority: core > user > plugin (core binds never overridable)
+  - `/keybinds` command shows all registered binds with source attribution
+  - 23 unit tests for parser, registry, conflicts, overrides
+- **Plugin Agent Namespaced Resolution** — `subagent(agent: "dev-tools:sage")` resolves plugin agents via `plugin:agent` syntax
+  - Searches `plugins/<plugin>/skills/*/agents/<agent>.md`
+  - Input validation, path traversal protection, ambiguity detection
+  - Updated error messages to mention `plugin:agent` syntax
+- **Mouse Text Selection & Clipboard** — left-click drag to select text in chat area
+  - Right-click with selection → copy to system clipboard
+  - Right-click without selection → paste from clipboard
+  - Singleton clipboard thread (no thread-per-copy accumulation)
+  - Paste suppression with 150ms TTL (prevents terminal double-paste)
+  - Selection highlight via `Block::inner()` computed content rect
+  - Theme-aware highlight color
 
 ### Fixed
 - **Config file permissions** — now 0600 (was 0644, world-readable with API keys)
@@ -131,6 +150,7 @@ All notable changes to this project will be documented in this file.
 - **"Calling Claude..."** — now shows actual model name in `synaps run`
 - **Paste in settings** — `Event::Paste` now handled in API key, text, and custom model editors
 - **Missing provider key** — `/model sambanova/llama` with no key shows clear error instead of silent Anthropic misroute
+- **UTF-8 truncation panic** — `bash` and `shell` output truncation now finds valid char boundaries before truncating, preventing crash on multi-byte characters (emoji, CJK)
 - **Local model connection** — friendly "is Ollama running?" instead of raw TCP error
 - **`/help` updated** — mentions provider/model syntax and /settings for key management
 - **`ping_print` lifecycle** — resets after all results arrive via pending counter
