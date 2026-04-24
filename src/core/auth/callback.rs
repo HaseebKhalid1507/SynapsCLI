@@ -53,6 +53,7 @@ impl CallbackServerHandle {
 pub async fn start_callback_server(
     expected_state: String,
     port: u16,
+    callback_path: &str,
 ) -> std::result::Result<(oneshot::Receiver<CallbackResult>, CallbackServerHandle), String> {
     let (tx, rx) = oneshot::channel::<CallbackResult>();
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -60,8 +61,9 @@ pub async fn start_callback_server(
     let expected = expected_state.clone();
     let tx_clone = tx.clone();
 
+    let path = callback_path.to_string();
     let app = axum::Router::new().route(
-        "/callback",
+        &path,
         axum::routing::get(move |query: axum::extract::Query<std::collections::HashMap<String, String>>| {
             let tx = tx_clone.clone();
             let expected = expected.clone();

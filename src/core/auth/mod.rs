@@ -126,7 +126,7 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
     let state = generate_state();
 
     // 2. Start callback server
-    let (rx, server_handle) = start_callback_server(state.clone(), port).await?;
+    let (rx, server_handle) = start_callback_server(state.clone(), port, "/callback").await?;
 
     // 3. Build URL and open browser
     let auth_url = build_auth_url(&challenge, &state, port);
