@@ -28,7 +28,9 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 - 🎨 **18 themes.** cyberpunk, tokyo-night, gruvbox, catppuccin, nord, dracula, and friends. Live preview in `/settings`, hot-reload with `/theme`.
 - 🧠 **90%+ prompt cache hit rate.** Hand-tuned cache breakpoints beat auto-cache (tested: 90% vs 53%). Built for multi-hour sessions.
 - ✍️ **Mid-stream steering.** Type while the model is generating to redirect in real time.
+- 🖱️ **Mouse text selection.** Left-click drag to select, right-click to copy/paste. Works in the TUI.
 - 🔌 **MCP + plugins + skills.** Model Context Protocol servers spawn lazily. Skills load from markdown. Plugins ship as marketplaces.
+- 🔗 **Plugin agent resolution.** `subagent(agent: "dev-tools:sage")` — dispatch agents from installed plugins via `plugin:agent` syntax.
 
 ---
 

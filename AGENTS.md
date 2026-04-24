@@ -224,6 +224,21 @@ The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return
 3. Add a match arm in `handle_command()` (commands.rs).
 4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `mod.rs` event loop.
 
+### Plugin Agent Resolution
+
+Agents from installed plugins can be dispatched via `plugin:agent` namespaced syntax:
+
+```
+subagent(agent: "dev-tools:sage", task: "...")
+```
+
+Resolution order in `resolve_agent_prompt()` (src/tools/agent.rs):
+1. Name contains `/` → file path (read directly)
+2. Name contains `:` → `plugin:agent` namespaced lookup → searches `~/.synaps-cli/plugins/<plugin>/skills/*/agents/<agent>.md`
+3. Bare name → `~/.synaps-cli/agents/<name>.md`
+
+Safety: both sides of `:` validated as identifiers (no path traversal). Ambiguous matches (agent exists in multiple skills) return an error. I/O errors propagated, not swallowed.
+
 ### Adding a Plugin Keybind
 
 Plugins declare keybinds in `plugin.json`:

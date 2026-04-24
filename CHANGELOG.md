@@ -151,6 +151,7 @@ All notable changes to this project will be documented in this file.
 - **Paste in settings** — `Event::Paste` now handled in API key, text, and custom model editors
 - **Missing provider key** — `/model sambanova/llama` with no key shows clear error instead of silent Anthropic misroute
 - **UTF-8 truncation panic** — `bash` and `shell` output truncation now finds valid char boundaries before truncating, preventing crash on multi-byte characters (emoji, CJK)
+- **Zero-width terminal panic** — markdown word-wrap `chunks(0)` crash on rapid tmux pane resize, clamped to `.max(1)`
 - **Local model connection** — friendly "is Ollama running?" instead of raw TCP error
 - **`/help` updated** — mentions provider/model syntax and /settings for key management
 - **`ping_print` lifecycle** — resets after all results arrive via pending counter
