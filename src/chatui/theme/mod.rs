@@ -121,6 +121,7 @@ impl Theme {
     /// Dispatcher for builtin themes
     fn builtin(name: &str) -> Option<Self> {
         match name {
+            "default" => Some(Self::default()),
             "neon-rain" => Some(Self::neon_rain()),
             "amber" => Some(Self::amber()),
             "phosphor" => Some(Self::phosphor()),
