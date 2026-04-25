@@ -87,6 +87,24 @@ enum Command {
         #[arg(long)]
         broadcast: bool,
     },
+    /// Persistent headless agent — idles, wakes on events, responds, sleeps
+    Daemon {
+        /// Load agent prompt from ~/.synaps-cli/agents/<name>.md
+        #[arg(long, short)]
+        agent: Option<String>,
+        /// Inline system prompt
+        #[arg(long, short = 'S')]
+        system: Option<String>,
+        /// Human-readable session name for targeting via `synaps send --session`
+        #[arg(long)]
+        name: Option<String>,
+        /// Override model
+        #[arg(long)]
+        model: Option<String>,
+        /// Override thinking level
+        #[arg(long)]
+        thinking: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -126,6 +144,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
             cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
+        }
+        Some(Command::Daemon { agent, system, name, model, thinking }) => {
+            cmd::daemon::run(agent, system, name, model, thinking).await?;
         }
     }
     Ok(())
