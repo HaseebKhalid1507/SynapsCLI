@@ -80,6 +80,12 @@ enum Command {
         channel: Option<String>,
         #[arg(long = "content-type", default_value = "message")]
         content_type: String,
+        /// Target a specific session by ID, name, or prefix
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Send to all active sessions
+        #[arg(long)]
+        broadcast: bool,
     },
 }
 
@@ -118,8 +124,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::Send { message, source, severity, channel, content_type }) => {
-            cmd::send::run(message, source, severity, channel, content_type).await?;
+        Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
+            cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
         }
     }
     Ok(())
