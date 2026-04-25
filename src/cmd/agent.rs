@@ -230,6 +230,36 @@ pub async fn run(config_path: String, trigger_context: String) {
         }
     });
 
+    // Per-session event socket + registry (so `synaps send` can reach this agent)
+    let agent_session_id = format!("{}-{}", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let socket_shutdown = Arc::new(AtomicBool::new(false));
+    let agent_socket_path = synaps_cli::events::registry::socket_path_for_session(&agent_session_id);
+    let socket_task = synaps_cli::events::socket::listen_session_socket(
+        agent_socket_path.clone(),
+        runtime.event_queue().clone(),
+        socket_shutdown.clone(),
+    );
+    // Also start inbox watcher for file-drop fallback
+    let inbox_shutdown = Arc::new(AtomicBool::new(false));
+    let inbox_task = {
+        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
+        let eq = runtime.event_queue().clone();
+        let sd = inbox_shutdown.clone();
+        tokio::spawn(async move {
+            synaps_cli::events::watch_inbox(inbox_dir, eq, sd).await;
+        })
+    };
+    let agent_registration = synaps_cli::events::registry::SessionRegistration {
+        session_id: agent_session_id.clone(),
+        name: Some(agent_name.clone()),
+        socket_path: agent_socket_path.clone(),
+        pid: std::process::id(),
+        started_at: chrono::Utc::now(),
+    };
+    if let Err(e) = synaps_cli::events::registry::register_session(&agent_registration) {
+        log(agent_name, &format!("WARNING: failed to register session: {}", e));
+    }
+
     // Setup signal handling for graceful shutdown
     let interrupted = Arc::new(AtomicBool::new(false));
     let int_flag = interrupted.clone();
@@ -439,6 +469,13 @@ pub async fn run(config_path: String, trigger_context: String) {
 
     // Stop heartbeat
     hb_running.store(false, Ordering::Relaxed);
+
+    // Stop event socket + unregister
+    socket_shutdown.store(true, Ordering::Relaxed);
+    socket_task.abort();
+    inbox_shutdown.store(true, Ordering::Relaxed);
+    inbox_task.abort();
+    synaps_cli::events::registry::unregister_session(&agent_session_id);
 
     // If we still don't have a handoff, write a minimal one
     if !watcher_exit_called {
