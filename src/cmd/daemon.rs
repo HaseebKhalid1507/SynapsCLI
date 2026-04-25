@@ -26,6 +26,7 @@ pub async fn run(
     name: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    max_history: usize,
 ) -> synaps_cli::Result<()> {
     let _log_guard = synaps_cli::logging::init_logging();
     let mut runtime = Runtime::new().await?;
@@ -181,6 +182,13 @@ pub async fn run(
                         }
                         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                             messages = history;
+                            // Prune old messages to stay within context limits.
+                            // Keep the most recent max_history messages.
+                            if messages.len() > max_history {
+                                let trim = messages.len() - max_history;
+                                log(&format!("  pruned {} old messages (keeping {})", trim, max_history));
+                                messages = messages.split_off(trim);
+                            }
                         }
                         StreamEvent::Session(SessionEvent::Done) => {
                             break;
@@ -195,6 +203,13 @@ pub async fn run(
 
                 println!(); // newline after response text
                 log("idle — waiting for events...");
+
+                // Check for events that arrived during the model turn.
+                // notified() may have fired while we were streaming — those
+                // events are in the queue but nobody polled select! to see them.
+                if !runtime.event_queue().is_empty() {
+                    continue;
+                }
             }
 
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {

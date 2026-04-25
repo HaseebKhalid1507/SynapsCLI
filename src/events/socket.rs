@@ -12,9 +12,20 @@ use super::types::Event;
 const MAX_PAYLOAD: usize = 256 * 1024; // 256KB
 
 /// Remove socket file if it exists. Best-effort, never panics.
+/// Checks for symlinks to prevent symlink attacks on /tmp.
 pub fn cleanup_socket(socket_path: &str) {
-    if std::path::Path::new(socket_path).exists() {
-        let _ = std::fs::remove_file(socket_path);
+    let path = std::path::Path::new(socket_path);
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                tracing::warn!("socket: refusing to remove symlink at {}", socket_path);
+                return;
+            }
+        }
+    }
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
