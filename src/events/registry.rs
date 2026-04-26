@@ -52,7 +52,7 @@ pub fn register_session(reg: &SessionRegistration) -> Result<(), String> {
     register_session_in(reg, &registry_dir())
 }
 
-fn register_session_in(reg: &SessionRegistration, dir: &PathBuf) -> Result<(), String> {
+fn register_session_in(reg: &SessionRegistration, dir: &std::path::Path) -> Result<(), String> {
     let safe_id = sanitize_session_id(&reg.session_id);
     let path = dir.join(format!("{}.json", safe_id));
     let tmp = path.with_extension("tmp");
@@ -81,7 +81,7 @@ pub fn unregister_session(session_id: &str) {
     unregister_session_in(session_id, &registry_dir());
 }
 
-fn unregister_session_in(session_id: &str, dir: &PathBuf) {
+fn unregister_session_in(session_id: &str, dir: &std::path::Path) {
     let safe_id = sanitize_session_id(session_id);
     let path = dir.join(format!("{}.json", safe_id));
 
@@ -121,7 +121,7 @@ pub fn list_active_sessions() -> Vec<SessionRegistration> {
     list_active_sessions_in(&registry_dir())
 }
 
-fn list_active_sessions_in(dir: &PathBuf) -> Vec<SessionRegistration> {
+fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -140,10 +140,7 @@ fn list_active_sessions_in(dir: &PathBuf) -> Vec<SessionRegistration> {
             if pid_is_alive(reg.pid) {
                 live.push(reg);
             } else {
-                let sock = std::path::Path::new(&reg.socket_path);
-                if sock.exists() {
-                    let _ = std::fs::remove_file(sock);
-                }
+                let _ = std::fs::remove_file(std::path::Path::new(&reg.socket_path));
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -160,7 +157,7 @@ pub fn find_session_registration(query: &str) -> Option<SessionRegistration> {
     find_session_registration_in(query, &registry_dir())
 }
 
-fn find_session_registration_in(query: &str, dir: &PathBuf) -> Option<SessionRegistration> {
+fn find_session_registration_in(query: &str, dir: &std::path::Path) -> Option<SessionRegistration> {
     let sessions = list_active_sessions_in(dir);
 
     // 1. Exact ID

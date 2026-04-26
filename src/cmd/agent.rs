@@ -220,7 +220,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     let hb_running = Arc::new(AtomicBool::new(true));
     let hb_flag = hb_running.clone();
     tokio::spawn(async move {
-        while hb_flag.load(Ordering::Relaxed) {
+        while hb_flag.load(Ordering::Acquire) {
             let ts = chrono::Utc::now().timestamp().to_string();
             // Atomic heartbeat write
             let tmp = hb_path.with_extension("tmp");
@@ -231,7 +231,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     });
 
     // Per-session event socket + registry (so `synaps send` can reach this agent)
-    let agent_session_id = format!("{}-{}", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let agent_session_id = format!("{}-{}-{}", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"), std::process::id());
     let socket_shutdown = Arc::new(AtomicBool::new(false));
     let agent_socket_path = synaps_cli::events::registry::socket_path_for_session(&agent_session_id);
     let socket_task = synaps_cli::events::socket::listen_session_socket(
@@ -265,7 +265,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     let int_flag = interrupted.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        int_flag.store(true, Ordering::Relaxed);
+        int_flag.store(true, Ordering::Release);
     });
 
     // Session tracking
@@ -299,7 +299,7 @@ pub async fn run(config_path: String, trigger_context: String) {
             log(agent_name, &format!("tool call limit reached ({}/{})", total_tool_calls, config.limits.max_tool_calls));
             break;
         }
-        if interrupted.load(Ordering::Relaxed) {
+        if interrupted.load(Ordering::Acquire) {
             log(agent_name, "interrupted by signal");
             break;
         }
@@ -313,7 +313,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                if int_check.load(Ordering::Relaxed) {
+                if int_check.load(Ordering::Acquire) {
                     cancel_clone.cancel();
                     break;
                 }
@@ -436,7 +436,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     }
 
     // Exit phase — if we didn't get a clean watcher_exit, ask for handoff
-    if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
+    if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
         log(agent_name, "requesting handoff before shutdown...");
         messages.push(json!({
             "role": "user",
@@ -468,12 +468,12 @@ pub async fn run(config_path: String, trigger_context: String) {
     }
 
     // Stop heartbeat
-    hb_running.store(false, Ordering::Relaxed);
+    hb_running.store(false, Ordering::Release);
 
     // Stop event socket + inbox — signal then await cooperative shutdown
     // (socket task removes the socket file on exit; aborting races that).
-    socket_shutdown.store(true, Ordering::Relaxed);
-    inbox_shutdown.store(true, Ordering::Relaxed);
+    socket_shutdown.store(true, Ordering::Release);
+    inbox_shutdown.store(true, Ordering::Release);
     let _ = tokio::join!(socket_task, inbox_task);
     synaps_cli::events::registry::unregister_session(&agent_session_id);
 
@@ -495,7 +495,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Log exit event
     let exit_reason = if watcher_exit_called {
         "watcher_exit"
-    } else if interrupted.load(Ordering::Relaxed) {
+    } else if interrupted.load(Ordering::Acquire) {
         "signal"
     } else if total_tokens >= config.limits.max_session_tokens {
         "token_limit"
@@ -543,7 +543,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         stats.today.tokens += total_tokens;
         
         // If we crashed (non-clean exit), record it
-        if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
+        if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
             stats.crashes += 1;
             stats.last_crash = Some(format!("{}: {}", 
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),

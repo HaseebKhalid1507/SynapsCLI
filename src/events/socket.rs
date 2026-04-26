@@ -69,7 +69,7 @@ pub fn listen_session_socket(
         tracing::info!("socket: listening on {}", socket_path);
 
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 break;
             }
 
@@ -83,7 +83,11 @@ pub fn listen_session_socket(
                 Ok(Ok((mut stream, _addr))) => {
                     let queue = queue.clone();
                     tokio::spawn(async move {
-                        handle_connection(&mut stream, &queue).await;
+                        // 5s timeout prevents slow-send DoS from parking tasks indefinitely
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle_connection(&mut stream, &queue),
+                        ).await;
                     });
                 }
                 Ok(Err(e)) => {
@@ -198,7 +202,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
 
         let popped = queue.pop().expect("event should be in queue");
@@ -223,7 +227,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
 
         assert_eq!(queue.len(), 0, "oversized payload should not reach queue");
@@ -258,7 +262,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
 
         assert_eq!(queue.len(), 1);
@@ -279,7 +283,7 @@ mod tests {
         let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
         wait_for_socket(&path).await;
 
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Release);
         handle.await.unwrap();
     }
 }

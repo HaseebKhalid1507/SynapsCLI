@@ -151,7 +151,7 @@ pub async fn run(
         let flag = interrupted.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::Release);
         });
     }
     #[cfg(unix)]
@@ -162,7 +162,7 @@ pub async fn run(
                 tokio::signal::unix::SignalKind::terminate(),
             ).expect("failed to register SIGTERM handler");
             sigterm.recv().await;
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::Release);
         });
         let flag = interrupted.clone();
         tokio::spawn(async move {
@@ -170,7 +170,7 @@ pub async fn run(
                 tokio::signal::unix::SignalKind::hangup(),
             ).expect("failed to register SIGHUP handler");
             sighup.recv().await;
-            flag.store(true, Ordering::Relaxed);
+            flag.store(true, Ordering::Release);
         });
     }
 
@@ -316,7 +316,7 @@ pub async fn run(
             }
 
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                if interrupted.load(Ordering::Relaxed) {
+                if interrupted.load(Ordering::Acquire) {
                     log("interrupted — shutting down");
                     break;
                 }
@@ -330,8 +330,8 @@ pub async fn run(
 
     // Shutdown — signal tasks to stop, then await them for clean cleanup
     // (socket task removes the socket file on exit; aborting races that).
-    socket_shutdown.store(true, Ordering::Relaxed);
-    inbox_shutdown.store(true, Ordering::Relaxed);
+    socket_shutdown.store(true, Ordering::Release);
+    inbox_shutdown.store(true, Ordering::Release);
     let _ = tokio::join!(socket_task, inbox_task);
     synaps_cli::events::registry::unregister_session(&session_id);
 
