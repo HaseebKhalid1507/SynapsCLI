@@ -104,9 +104,9 @@ enum Command {
         /// Override thinking level
         #[arg(long)]
         thinking: Option<String>,
-        /// Max conversation messages to keep (oldest pruned). Default: 200
-        #[arg(long, default_value = "200")]
-        max_history: usize,
+        /// Token threshold for auto-compaction (oldest messages summarized). Default: 80000
+        #[arg(long, default_value = "80000")]
+        compact_at: usize,
     },
 }
 
@@ -148,8 +148,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
             cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
         }
-        Some(Command::Daemon { agent, system, name, model, thinking, max_history }) => {
-            cmd::daemon::run(agent, system, name, model, thinking, max_history).await?;
+        Some(Command::Daemon { agent, system, name, model, thinking, compact_at }) => {
+            cmd::daemon::run(agent, system, name, model, thinking, compact_at).await?;
         }
     }
     Ok(())

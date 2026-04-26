@@ -5,11 +5,40 @@
 //! with full tool access, then goes back to sleep. Stays alive until killed.
 
 use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent};
+use synaps_cli::core::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
+
+/// Estimate token count for a message array.
+/// Uses chars/4 heuristic — good enough for triggering compaction thresholds.
+fn estimate_tokens(messages: &[Value]) -> usize {
+    let mut total_chars = 0usize;
+    for msg in messages {
+        if let Some(s) = msg["content"].as_str() {
+            total_chars += s.len();
+        } else if let Some(arr) = msg["content"].as_array() {
+            for block in arr {
+                if let Some(s) = block["text"].as_str() {
+                    total_chars += s.len();
+                }
+                if let Some(s) = block["thinking"].as_str() {
+                    total_chars += s.len();
+                }
+                if let Some(s) = block["content"].as_str() {
+                    total_chars += s.len();
+                }
+                // tool_use inputs
+                if let Some(input) = block.get("input") {
+                    total_chars += input.to_string().len();
+                }
+            }
+        }
+    }
+    total_chars / 4
+}
 
 fn load_agent_prompt(name: &str) -> std::result::Result<String, String> {
     synaps_cli::tools::resolve_agent_prompt(name)
@@ -26,7 +55,7 @@ pub async fn run(
     name: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
-    max_history: usize,
+    compact_at: usize,
 ) -> synaps_cli::Result<()> {
     let _log_guard = synaps_cli::logging::init_logging();
     let mut runtime = Runtime::new().await?;
@@ -182,13 +211,6 @@ pub async fn run(
                         }
                         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
                             messages = history;
-                            // Prune old messages to stay within context limits.
-                            // Keep the most recent max_history messages.
-                            if messages.len() > max_history {
-                                let trim = messages.len() - max_history;
-                                log(&format!("  pruned {} old messages (keeping {})", trim, max_history));
-                                messages = messages.split_off(trim);
-                            }
                         }
                         StreamEvent::Session(SessionEvent::Done) => {
                             break;
@@ -202,6 +224,35 @@ pub async fn run(
                 }
 
                 println!(); // newline after response text
+
+                // Auto-compact when token estimate exceeds threshold.
+                let est = estimate_tokens(&messages);
+                if est > compact_at && messages.len() >= 4 {
+                    log(&format!(
+                        "token estimate {} exceeds threshold {} — compacting {} messages...",
+                        est, compact_at, messages.len()
+                    ));
+                    match compact_conversation(&messages, &runtime, None).await {
+                        Ok(summary) => {
+                            let summary_tokens = summary.len() / 4;
+                            log(&format!(
+                                "compacted ~{} tokens → ~{} token summary",
+                                est, summary_tokens
+                            ));
+                            messages = vec![json!({
+                                "role": "user",
+                                "content": format!(
+                                    "<context-summary>\n{}\n</context-summary>",
+                                    summary
+                                )
+                            })];
+                        }
+                        Err(e) => {
+                            log(&format!("compaction failed: {} — continuing with full history", e));
+                        }
+                    }
+                }
+
                 log("idle — waiting for events...");
 
                 // Check for events that arrived during the model turn.
