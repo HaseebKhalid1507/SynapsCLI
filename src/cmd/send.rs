@@ -104,6 +104,13 @@ async fn send_to_socket_or_inbox(reg: &SessionRegistration, json: &str, event: &
 }
 
 async fn send_via_socket(socket_path: &str, json: &str) -> anyhow::Result<()> {
+    // Validate socket_path is inside the registry dir — prevents a crafted
+    // registration JSON from redirecting sends to an attacker-controlled socket.
+    let sock = std::path::Path::new(socket_path);
+    let run_dir = synaps_cli::events::registry::registry_dir();
+    if !sock.starts_with(&run_dir) {
+        anyhow::bail!("socket path {:?} is outside registry dir — refusing to connect", socket_path);
+    }
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(json.as_bytes()).await?;
     stream.shutdown().await?;

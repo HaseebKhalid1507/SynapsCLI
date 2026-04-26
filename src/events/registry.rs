@@ -89,7 +89,9 @@ fn unregister_session_in(session_id: &str, dir: &PathBuf) {
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(reg) = serde_json::from_str::<SessionRegistration>(&content) {
             let sock = std::path::Path::new(&reg.socket_path);
-            if sock.exists() {
+            // Only delete if socket_path is inside the registry dir — prevents
+            // a crafted JSON from causing arbitrary file deletion.
+            if sock.starts_with(dir) && sock.extension().is_some_and(|e| e == "sock") {
                 let _ = std::fs::remove_file(sock);
             }
         }
