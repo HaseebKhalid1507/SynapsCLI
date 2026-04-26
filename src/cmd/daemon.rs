@@ -213,10 +213,11 @@ pub async fn run(
 
                 log(&format!("processing {} event(s)...", event_count));
 
-                // Run model turn(s) — agent may use tools, triggering follow-up turns
+                // Run model turn(s) — agent may use tools, triggering follow-up turns.
+                // mem::take avoids cloning the full history; MessageHistory restores it.
                 let cancel = CancellationToken::new();
                 let mut stream = runtime.run_stream_with_messages(
-                    messages.clone(),
+                    std::mem::take(&mut messages),
                     cancel,
                     None,
                 ).await;
