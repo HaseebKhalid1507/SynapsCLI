@@ -27,11 +27,22 @@ pub fn registry_dir() -> PathBuf {
     dir
 }
 
+/// Sanitize a session ID for safe use in filenames and socket paths.
+/// Rejects path separators, `..`, and non-printable characters.
+/// Returns the sanitized string (replaces unsafe chars with `_`).
+pub fn sanitize_session_id(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect::<String>()
+        .replace("..", "_")
+}
+
 /// Returns the Unix domain socket path for a session.
 /// Sockets live in the registry dir (~/.synaps-cli/run/) which is user-owned
 /// and mode 0700, avoiding /tmp symlink squatting and TOCTOU races.
 pub fn socket_path_for_session(session_id: &str) -> String {
-    registry_dir().join(format!("{}.sock", session_id))
+    let safe_id = sanitize_session_id(session_id);
+    registry_dir().join(format!("{}.sock", safe_id))
         .to_string_lossy()
         .into_owned()
 }
@@ -42,7 +53,8 @@ pub fn register_session(reg: &SessionRegistration) -> Result<(), String> {
 }
 
 fn register_session_in(reg: &SessionRegistration, dir: &PathBuf) -> Result<(), String> {
-    let path = dir.join(format!("{}.json", reg.session_id));
+    let safe_id = sanitize_session_id(&reg.session_id);
+    let path = dir.join(format!("{}.json", safe_id));
     let tmp = path.with_extension("tmp");
 
     let json = serde_json::to_string(reg)
@@ -70,7 +82,8 @@ pub fn unregister_session(session_id: &str) {
 }
 
 fn unregister_session_in(session_id: &str, dir: &PathBuf) {
-    let path = dir.join(format!("{}.json", session_id));
+    let safe_id = sanitize_session_id(session_id);
+    let path = dir.join(format!("{}.json", safe_id));
 
     // Load first so we can clean up the socket.
     if let Ok(content) = std::fs::read_to_string(&path) {
