@@ -285,6 +285,25 @@ pub async fn run(
         })
     };
 
+    // Start per-session Unix socket listener + register in session registry
+    let socket_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session_socket_path = synaps_cli::events::registry::socket_path_for_session(&app.session.id);
+    let socket_task = synaps_cli::events::socket::listen_session_socket(
+        session_socket_path.clone(),
+        runtime.event_queue().clone(),
+        socket_shutdown.clone(),
+    );
+    let session_registration = synaps_cli::events::registry::SessionRegistration {
+        session_id: app.session.id.clone(),
+        name: app.session.name.clone(),
+        socket_path: session_socket_path.clone(),
+        pid: std::process::id(),
+        started_at: chrono::Utc::now(),
+    };
+    if let Err(e) = synaps_cli::events::registry::register_session(&session_registration) {
+        tracing::warn!("Failed to register session: {}", e);
+    }
+
 
     // ── Event loop ──
     loop {
@@ -1066,6 +1085,11 @@ pub async fn run(
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher_task.abort();
+
+    // Shut down per-session socket + unregister from registry
+    socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    socket_task.abort();
+    synaps_cli::events::registry::unregister_session(&app.session.id);
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();

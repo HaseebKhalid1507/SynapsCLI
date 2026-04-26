@@ -10,6 +10,33 @@ use std::sync::LazyLock;
 
 use super::theme::THEME;
 
+/// Clamp a `Line` to fit within `width` terminal columns.
+/// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
+/// Avoids rendering artifacts from lines that exceed terminal width.
+pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let mut remaining = width;
+    let mut clamped: Vec<Span<'static>> = Vec::new();
+    for span in line.spans {
+        let span_len = span.content.chars().count();
+        if remaining == 0 {
+            break;
+        }
+        if span_len <= remaining {
+            remaining -= span_len;
+            clamped.push(span);
+        } else {
+            // Truncate this span to fit
+            let truncated: String = span.content.chars().take(remaining).collect();
+            clamped.push(Span::styled(truncated, span.style));
+            remaining = 0;
+        }
+    }
+    Line::from(clamped)
+}
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
@@ -108,11 +135,11 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         }
 
         // Detect patterns and colorize
-        if trimmed.starts_with("error") || trimmed.starts_with("Error") || trimmed.starts_with("ERROR")
-            || trimmed.starts_with("fatal") || trimmed.starts_with("FATAL") {
+        let lc = trimmed.to_ascii_lowercase();
+        if lc.starts_with("error") || lc.starts_with("fatal") {
             // Errors → red
             spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().error_color)));
-        } else if trimmed.starts_with("warning") || trimmed.starts_with("Warning") || trimmed.starts_with("WARN") {
+        } else if lc.starts_with("warning") || lc.starts_with("warn") {
             // Warnings → yellow
             spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().warning_color)));
         } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")

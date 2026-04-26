@@ -80,6 +80,33 @@ enum Command {
         channel: Option<String>,
         #[arg(long = "content-type", default_value = "message")]
         content_type: String,
+        /// Target a specific session by ID, name, or prefix
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Send to all active sessions
+        #[arg(long)]
+        broadcast: bool,
+    },
+    /// Persistent headless agent — idles, wakes on events, responds, sleeps
+    Daemon {
+        /// Load agent prompt from ~/.synaps-cli/agents/<name>.md
+        #[arg(long, short)]
+        agent: Option<String>,
+        /// Inline system prompt
+        #[arg(long, short = 'S')]
+        system: Option<String>,
+        /// Human-readable session name for targeting via `synaps send --session`
+        #[arg(long)]
+        name: Option<String>,
+        /// Override model
+        #[arg(long)]
+        model: Option<String>,
+        /// Override thinking level
+        #[arg(long)]
+        thinking: Option<String>,
+        /// Token threshold for auto-compaction (oldest messages summarized). Default: 80000
+        #[arg(long, default_value = "80000")]
+        compact_at: usize,
     },
 }
 
@@ -118,8 +145,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::Send { message, source, severity, channel, content_type }) => {
-            cmd::send::run(message, source, severity, channel, content_type).await?;
+        Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
+            cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
+        }
+        Some(Command::Daemon { agent, system, name, model, thinking, compact_at }) => {
+            cmd::daemon::run(agent, system, name, model, thinking, compact_at).await?;
         }
     }
     Ok(())
