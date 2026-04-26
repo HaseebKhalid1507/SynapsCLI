@@ -338,3 +338,83 @@ pub async fn run(
     log("daemon stopped.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_string_content() {
+        let msgs = vec![json!({"role": "user", "content": "aaaa"})]; // 4 chars → 1 token
+        assert_eq!(estimate_tokens(&msgs), 1);
+    }
+
+    #[test]
+    fn estimate_empty_messages() {
+        assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_array_content_text_and_thinking() {
+        let msgs = vec![json!({"role": "assistant", "content": [
+            {"type": "text", "text": "aaaaaaaa"},          // 8 chars
+            {"type": "thinking", "thinking": "aaaa"},       // 4 chars
+        ]})];
+        assert_eq!(estimate_tokens(&msgs), 3); // 12 / 4
+    }
+
+    #[test]
+    fn estimate_tool_result_string() {
+        let msgs = vec![json!({"role": "user", "content": [
+            {"type": "tool_result", "content": "aaaaaaaaaaaa"} // 12 chars
+        ]})];
+        assert_eq!(estimate_tokens(&msgs), 3); // 12 / 4
+    }
+
+    #[test]
+    fn estimate_tool_result_array_mcp() {
+        let msgs = vec![json!({"role": "user", "content": [
+            {"type": "tool_result", "content": [{"text": "aaaaaaaaaaaaaaaa"}]} // 16 chars
+        ]})];
+        assert_eq!(estimate_tokens(&msgs), 4); // 16 / 4
+    }
+
+    #[test]
+    fn estimate_tool_use_input() {
+        let msgs = vec![json!({"role": "assistant", "content": [
+            {"type": "tool_use", "input": {"key": "val"}}
+        ]})];
+        let est = estimate_tokens(&msgs);
+        assert!(est > 0, "tool_use input should contribute tokens");
+    }
+
+    // --- Compaction threshold / hysteresis ---
+
+    fn should_compact(est: usize, last_compacted: usize, compact_at: usize, msg_count: usize) -> bool {
+        let threshold = if last_compacted > 0 { last_compacted + compact_at } else { compact_at };
+        est > threshold && msg_count >= 4
+    }
+
+    #[test]
+    fn first_compaction_triggers() {
+        assert!(should_compact(90000, 0, 80000, 10));
+    }
+
+    #[test]
+    fn post_compact_hysteresis_suppresses() {
+        // Just compacted at ~5000 tokens. Grew to 50000. Threshold = 5000 + 80000 = 85000.
+        assert!(!should_compact(50000, 5000, 80000, 10));
+    }
+
+    #[test]
+    fn hysteresis_allows_after_growth() {
+        // Grew past baseline + compact_at
+        assert!(should_compact(90000, 5000, 80000, 10));
+    }
+
+    #[test]
+    fn too_few_messages_blocks_compaction() {
+        assert!(!should_compact(90000, 0, 80000, 2));
+    }
+}
