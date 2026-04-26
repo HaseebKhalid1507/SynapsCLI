@@ -164,6 +164,14 @@ pub async fn run(
             sigterm.recv().await;
             flag.store(true, Ordering::Relaxed);
         });
+        let flag = interrupted.clone();
+        tokio::spawn(async move {
+            let mut sighup = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ).expect("failed to register SIGHUP handler");
+            sighup.recv().await;
+            flag.store(true, Ordering::Relaxed);
+        });
     }
 
     // Conversation history — persists across event batches
