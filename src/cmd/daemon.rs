@@ -319,6 +319,10 @@ pub async fn run(
                     log("interrupted — shutting down");
                     break;
                 }
+                // Catch events whose Notify was lost during a model turn
+                if !runtime.event_queue().is_empty() {
+                    continue;
+                }
             }
         }
     }

@@ -135,11 +135,11 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
         }
 
         // Detect patterns and colorize
-        if trimmed.starts_with("error") || trimmed.starts_with("Error") || trimmed.starts_with("ERROR")
-            || trimmed.starts_with("fatal") || trimmed.starts_with("FATAL") {
+        let lc = trimmed.to_ascii_lowercase();
+        if lc.starts_with("error") || lc.starts_with("fatal") {
             // Errors → red
             spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().error_color)));
-        } else if trimmed.starts_with("warning") || trimmed.starts_with("Warning") || trimmed.starts_with("WARN") {
+        } else if lc.starts_with("warning") || lc.starts_with("warn") {
             // Warnings → yellow
             spans.push(Span::styled(line.to_string(), Style::default().fg(THEME.load().warning_color)));
         } else if trimmed.starts_with("✅") || trimmed.starts_with("ok") || trimmed.starts_with("OK")
