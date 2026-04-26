@@ -470,11 +470,11 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Stop heartbeat
     hb_running.store(false, Ordering::Relaxed);
 
-    // Stop event socket + unregister
+    // Stop event socket + inbox — signal then await cooperative shutdown
+    // (socket task removes the socket file on exit; aborting races that).
     socket_shutdown.store(true, Ordering::Relaxed);
-    socket_task.abort();
     inbox_shutdown.store(true, Ordering::Relaxed);
-    inbox_task.abort();
+    let _ = tokio::join!(socket_task, inbox_task);
     synaps_cli::events::registry::unregister_session(&agent_session_id);
 
     // If we still don't have a handoff, write a minimal one
