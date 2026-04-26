@@ -13,16 +13,27 @@ pub struct SessionRegistration {
     pub started_at: DateTime<Utc>,
 }
 
-/// Returns `~/.synaps-cli/run/`, creating it if it doesn't exist.
+/// Returns `~/.synaps-cli/run/`, creating it (mode 0700) if it doesn't exist.
 pub fn registry_dir() -> PathBuf {
     let dir = base_dir().join("run");
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("registry: failed to create run dir {:?}: {}", dir, e);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     dir
 }
 
 /// Returns the Unix domain socket path for a session.
+/// Sockets live in the registry dir (~/.synaps-cli/run/) which is user-owned
+/// and mode 0700, avoiding /tmp symlink squatting and TOCTOU races.
 pub fn socket_path_for_session(session_id: &str) -> String {
-    format!("/tmp/synaps-{}.sock", session_id)
+    registry_dir().join(format!("{}.sock", session_id))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Write `{session_id}.json` atomically (tmp + rename). Chmod 0600 on Unix.
@@ -296,10 +307,10 @@ mod tests {
 
     #[test]
     fn socket_path_format() {
-        assert_eq!(
-            socket_path_for_session("20240101-120000-ab12"),
-            "/tmp/synaps-20240101-120000-ab12.sock"
-        );
+        let path = socket_path_for_session("20240101-120000-ab12");
+        // Sockets now live in the registry dir, not /tmp
+        assert!(path.ends_with("/run/20240101-120000-ab12.sock"), "got: {}", path);
+        assert!(!path.contains("/tmp/"), "socket should not be in /tmp");
     }
 
     #[cfg(unix)]

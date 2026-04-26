@@ -102,11 +102,13 @@ pub async fn run(
         runtime.set_thinking_budget(budget);
     }
 
-    // Generate session ID and determine registry name
+    // Generate session ID — includes PID for collision resistance when
+    // two daemons with the same agent name start in the same second.
     let session_id = format!(
-        "{}-{}",
+        "{}-{}-{}",
         display_name,
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        std::process::id()
     );
     let session_name = name.or_else(|| Some(display_name.clone()));
 
@@ -300,11 +302,11 @@ pub async fn run(
         }
     }
 
-    // Shutdown
+    // Shutdown — signal tasks to stop, then await them for clean cleanup
+    // (socket task removes the socket file on exit; aborting races that).
     socket_shutdown.store(true, Ordering::Relaxed);
-    socket_task.abort();
     inbox_shutdown.store(true, Ordering::Relaxed);
-    inbox_task.abort();
+    let _ = tokio::join!(socket_task, inbox_task);
     synaps_cli::events::registry::unregister_session(&session_id);
 
     log("daemon stopped.");
