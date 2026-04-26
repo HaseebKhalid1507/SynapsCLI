@@ -10,6 +10,33 @@ use std::sync::LazyLock;
 
 use super::theme::THEME;
 
+/// Clamp a `Line` to fit within `width` terminal columns.
+/// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
+/// Avoids rendering artifacts from lines that exceed terminal width.
+pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let mut remaining = width;
+    let mut clamped: Vec<Span<'static>> = Vec::new();
+    for span in line.spans {
+        let span_len = span.content.chars().count();
+        if remaining == 0 {
+            break;
+        }
+        if span_len <= remaining {
+            remaining -= span_len;
+            clamped.push(span);
+        } else {
+            // Truncate this span to fit
+            let truncated: String = span.content.chars().take(remaining).collect();
+            clamped.push(Span::styled(truncated, span.style));
+            remaining = 0;
+        }
+    }
+    Line::from(clamped)
+}
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
