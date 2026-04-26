@@ -27,8 +27,15 @@ fn estimate_tokens(messages: &[Value]) -> usize {
                 if let Some(s) = block["thinking"].as_str() {
                     total_chars += s.len();
                 }
+                // tool_result content — can be string or array of text blocks (MCP)
                 if let Some(s) = block["content"].as_str() {
                     total_chars += s.len();
+                } else if let Some(content_arr) = block["content"].as_array() {
+                    for inner in content_arr {
+                        if let Some(s) = inner["text"].as_str() {
+                            total_chars += s.len();
+                        }
+                    }
                 }
                 // tool_use inputs
                 if let Some(input) = block.get("input") {
@@ -146,6 +153,9 @@ pub async fn run(
 
     // Conversation history — persists across event batches
     let mut messages: Vec<Value> = Vec::new();
+    // Token count after last compaction — prevents thrashing by requiring
+    // growth beyond the post-compaction baseline before re-triggering.
+    let mut last_compacted_tokens: usize = 0;
 
     log(&format!(
         "ready — listening on {} (name: {})",
@@ -192,7 +202,9 @@ pub async fn run(
                     match event {
                         StreamEvent::Llm(LlmEvent::Text(text)) => {
                             if !text.is_empty() {
-                                print!("{}", text);
+                                // Daemon is headless — response text goes to stderr
+                                // alongside structured logs. stdout may be piped/buffered.
+                                eprint!("{}", text);
                             }
                         }
                         StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
@@ -223,17 +235,29 @@ pub async fn run(
                     }
                 }
 
-                println!(); // newline after response text
+                eprintln!(); // newline after response text
 
                 // Auto-compact when token estimate exceeds threshold.
+                // Hysteresis: after compaction, don't re-trigger until tokens have
+                // grown past compact_at from the post-compaction baseline. This
+                // prevents thrashing where a busy agent compacts every single turn.
                 let est = estimate_tokens(&messages);
-                if est > compact_at && messages.len() >= 4 {
+                let effective_threshold = if last_compacted_tokens > 0 {
+                    last_compacted_tokens + compact_at
+                } else {
+                    compact_at
+                };
+                // Guard: need at least 4 messages (2 full turns) for a meaningful summary.
+                if est > effective_threshold && messages.len() >= 4 {
                     log(&format!(
                         "token estimate {} exceeds threshold {} — compacting {} messages...",
-                        est, compact_at, messages.len()
+                        est, effective_threshold, messages.len()
                     ));
-                    match compact_conversation(&messages, &runtime, None).await {
-                        Ok(summary) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(90),
+                        compact_conversation(&messages, &runtime, None),
+                    ).await {
+                        Ok(Ok(summary)) => {
                             let summary_tokens = summary.len() / 4;
                             log(&format!(
                                 "compacted ~{} tokens → ~{} token summary",
@@ -246,9 +270,13 @@ pub async fn run(
                                     summary
                                 )
                             })];
+                            last_compacted_tokens = estimate_tokens(&messages);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             log(&format!("compaction failed: {} — continuing with full history", e));
+                        }
+                        Err(_) => {
+                            log("compaction timed out (90s) — continuing with full history");
                         }
                     }
                 }
