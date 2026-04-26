@@ -145,13 +145,26 @@ pub async fn run(
         })
     };
 
-    // Signal handler
+    // Signal handlers — catch both SIGINT (ctrl-c) and SIGTERM (systemd, docker stop)
     let interrupted = Arc::new(AtomicBool::new(false));
-    let int_flag = interrupted.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        int_flag.store(true, Ordering::Relaxed);
-    });
+    {
+        let flag = interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            flag.store(true, Ordering::Relaxed);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let flag = interrupted.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ).expect("failed to register SIGTERM handler");
+            sigterm.recv().await;
+            flag.store(true, Ordering::Relaxed);
+        });
+    }
 
     // Conversation history — persists across event batches
     let mut messages: Vec<Value> = Vec::new();
