@@ -2517,7 +2517,6 @@ dependencies = [
  "fs4",
  "futures",
  "globset",
- "libc",
  "memchr",
  "notify",
  "portable-pty",

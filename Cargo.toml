@@ -61,7 +61,6 @@ regex = "1"
 
 # Hidden deps
 dirs = "5"
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -288,9 +288,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 )));
 
                 // Code body (highlight_code_block already adds prefix + │ per line)
-                for hl_line in highlight_code_block(&code_buf, &code_lang, prefix) {
-                    lines.push(super::highlight::clamp_line(hl_line, width));
-                }
+                lines.extend(highlight_code_block(&code_buf, &code_lang, prefix));
 
                 // Bottom border rule
                 lines.push(Line::from(Span::styled(

@@ -6,7 +6,7 @@ use ratatui::{
 
 use super::app::{App, ChatMessage, SPINNER_FRAMES};
 use super::theme::THEME;
-use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
+use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output};
 use super::markdown::{render_markdown, wrap_text};
 use super::draw::{bash_trace, format_tool_name};
 
@@ -335,15 +335,13 @@ impl App {
                                         let is_code_param = k == "content" || k == "old_string" || k == "new_string";
                                         if is_code_param && !file_ext.is_empty() {
                                             let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, m, marker, marker_color);
-                                            for hl_line in hl_lines {
-                                                lines.push(clamp_line(hl_line, width));
-                                            }
+                                            lines.extend(hl_lines);
                                         } else {
                                             for (ci, cline) in content_lines.iter().take(show).enumerate() {
-                                                lines.push(clamp_line(Line::from(vec![
+                                                lines.push(Line::from(vec![
                                                     Span::styled(format!("{}    {:>3} {} ", m, ci + 1, marker), Style::default().fg(marker_color)),
                                                     Span::styled(cline.to_string(), param_style),
-                                                ]), width));
+                                                ]));
                                             }
                                         }
                                         if total > max_preview {
@@ -476,19 +474,17 @@ impl App {
                                 let dimmed_spans: Vec<Span> = hl_line.spans.into_iter().map(|span| {
                                     Span::styled(span.content, span.style.add_modifier(Modifier::DIM))
                                 }).collect();
-                                lines.push(clamp_line(Line::from(dimmed_spans), width));
+                                lines.push(Line::from(dimmed_spans));
                             }
                         } else {
-                            for hl_line in hl_lines {
-                                lines.push(clamp_line(hl_line, width));
-                            }
+                            lines.extend(hl_lines);
                         }
                     } else {
                         for line in &result_lines[..show] {
                             // Try to detect and highlight grep output (skip for timeout/error)
                             if !is_timeout && !is_error {
                                 if let Some(grep_spans) = try_highlight_grep_line(line, m) {
-                                    lines.push(clamp_line(Line::from(grep_spans), width));
+                                    lines.push(Line::from(grep_spans));
                                     continue;
                                 }
                             }

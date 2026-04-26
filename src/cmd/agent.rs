@@ -220,7 +220,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     let hb_running = Arc::new(AtomicBool::new(true));
     let hb_flag = hb_running.clone();
     tokio::spawn(async move {
-        while hb_flag.load(Ordering::Acquire) {
+        while hb_flag.load(Ordering::Relaxed) {
             let ts = chrono::Utc::now().timestamp().to_string();
             // Atomic heartbeat write
             let tmp = hb_path.with_extension("tmp");
@@ -230,42 +230,12 @@ pub async fn run(config_path: String, trigger_context: String) {
         }
     });
 
-    // Per-session event socket + registry (so `synaps send` can reach this agent)
-    let agent_session_id = format!("{}-{}-{}", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"), std::process::id());
-    let socket_shutdown = Arc::new(AtomicBool::new(false));
-    let agent_socket_path = synaps_cli::events::registry::socket_path_for_session(&agent_session_id);
-    let socket_task = synaps_cli::events::socket::listen_session_socket(
-        agent_socket_path.clone(),
-        runtime.event_queue().clone(),
-        socket_shutdown.clone(),
-    );
-    // Also start inbox watcher for file-drop fallback
-    let inbox_shutdown = Arc::new(AtomicBool::new(false));
-    let inbox_task = {
-        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
-        let eq = runtime.event_queue().clone();
-        let sd = inbox_shutdown.clone();
-        tokio::spawn(async move {
-            synaps_cli::events::watch_inbox(inbox_dir, eq, sd).await;
-        })
-    };
-    let agent_registration = synaps_cli::events::registry::SessionRegistration {
-        session_id: agent_session_id.clone(),
-        name: Some(agent_name.clone()),
-        socket_path: agent_socket_path.clone(),
-        pid: std::process::id(),
-        started_at: chrono::Utc::now(),
-    };
-    if let Err(e) = synaps_cli::events::registry::register_session(&agent_registration) {
-        log(agent_name, &format!("WARNING: failed to register session: {}", e));
-    }
-
     // Setup signal handling for graceful shutdown
     let interrupted = Arc::new(AtomicBool::new(false));
     let int_flag = interrupted.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        int_flag.store(true, Ordering::Release);
+        int_flag.store(true, Ordering::Relaxed);
     });
 
     // Session tracking
@@ -299,7 +269,7 @@ pub async fn run(config_path: String, trigger_context: String) {
             log(agent_name, &format!("tool call limit reached ({}/{})", total_tool_calls, config.limits.max_tool_calls));
             break;
         }
-        if interrupted.load(Ordering::Acquire) {
+        if interrupted.load(Ordering::Relaxed) {
             log(agent_name, "interrupted by signal");
             break;
         }
@@ -313,7 +283,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                if int_check.load(Ordering::Acquire) {
+                if int_check.load(Ordering::Relaxed) {
                     cancel_clone.cancel();
                     break;
                 }
@@ -436,7 +406,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     }
 
     // Exit phase — if we didn't get a clean watcher_exit, ask for handoff
-    if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
+    if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
         log(agent_name, "requesting handoff before shutdown...");
         messages.push(json!({
             "role": "user",
@@ -468,14 +438,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     }
 
     // Stop heartbeat
-    hb_running.store(false, Ordering::Release);
-
-    // Stop event socket + inbox — signal then await cooperative shutdown
-    // (socket task removes the socket file on exit; aborting races that).
-    socket_shutdown.store(true, Ordering::Release);
-    inbox_shutdown.store(true, Ordering::Release);
-    let _ = tokio::join!(socket_task, inbox_task);
-    synaps_cli::events::registry::unregister_session(&agent_session_id);
+    hb_running.store(false, Ordering::Relaxed);
 
     // If we still don't have a handoff, write a minimal one
     if !watcher_exit_called {
@@ -495,7 +458,7 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Log exit event
     let exit_reason = if watcher_exit_called {
         "watcher_exit"
-    } else if interrupted.load(Ordering::Acquire) {
+    } else if interrupted.load(Ordering::Relaxed) {
         "signal"
     } else if total_tokens >= config.limits.max_session_tokens {
         "token_limit"
@@ -543,7 +506,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         stats.today.tokens += total_tokens;
         
         // If we crashed (non-clean exit), record it
-        if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
+        if !watcher_exit_called && !interrupted.load(Ordering::Relaxed) {
             stats.crashes += 1;
             stats.last_crash = Some(format!("{}: {}", 
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
