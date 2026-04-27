@@ -121,6 +121,9 @@ impl ApiMethods {
         // Manual cache breakpoints for optimal prompt caching.
         // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
         let mut cleaned_messages = messages.to_vec();
+        // Strip empty/invalid thinking blocks before they hit the API. See
+        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
         // Derive the thinking level from the budget for effort mapping.
@@ -352,12 +355,19 @@ impl ApiMethods {
                     }
                     Some("content_block_stop") => {
                         if in_thinking {
-                            // Flush thinking block with signature so it's echoed back in tool loops
-                            accumulated_content.push(json!({
-                                "type": "thinking",
-                                "thinking": current_thinking,
-                                "signature": current_thinking_signature
-                            }));
+                            // Flush thinking block with signature so it's echoed back in tool loops.
+                            // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
+                            // such blocks on the next turn with
+                            // `messages.N.content.M.thinking: each thinking block must contain thinking`.
+                            // Empty blocks happen when the stream produced only a signature delta
+                            // (or none at all) before the block_stop arrived.
+                            if !current_thinking.is_empty() {
+                                accumulated_content.push(json!({
+                                    "type": "thinking",
+                                    "thinking": current_thinking,
+                                    "signature": current_thinking_signature
+                                }));
+                            }
                             in_thinking = false;
                         } else if in_tool_use {
                             // Parse the accumulated JSON input
@@ -443,11 +453,13 @@ impl ApiMethods {
                 if let Ok(event) = serde_json::from_str::<Value>(data_part) {
                     if event["type"].as_str() == Some("content_block_stop") {
                         if in_thinking {
-                            accumulated_content.push(json!({
-                                "type": "thinking",
-                                "thinking": current_thinking,
-                                "signature": current_thinking_signature
-                            }));
+                            if !current_thinking.is_empty() {
+                                accumulated_content.push(json!({
+                                    "type": "thinking",
+                                    "thinking": current_thinking,
+                                    "signature": current_thinking_signature
+                                }));
+                            }
                         } else if in_tool_use {
                             let input = parse_tool_input(&current_tool_input_json);
                             accumulated_content.push(json!({
@@ -469,11 +481,13 @@ impl ApiMethods {
 
         // Return accumulated content in the expected format
         if in_thinking {
-            accumulated_content.push(json!({
-                "type": "thinking",
-                "thinking": current_thinking,
-                "signature": current_thinking_signature
-            }));
+            if !current_thinking.is_empty() {
+                accumulated_content.push(json!({
+                    "type": "thinking",
+                    "thinking": current_thinking,
+                    "signature": current_thinking_signature
+                }));
+            }
         } else if in_tool_use {
             let input = parse_tool_input(&current_tool_input_json);
             accumulated_content.push(json!({
@@ -538,6 +552,9 @@ impl ApiMethods {
         
         // Avoid modifying past messages to maintain a 100% stable prefix for Anthropic caching.
         let mut cleaned_messages = messages.to_vec();
+        // Strip empty/invalid thinking blocks before they hit the API. See
+        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
         let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
