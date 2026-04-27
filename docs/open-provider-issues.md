@@ -52,3 +52,27 @@ pub models: &'static [(&'static str, &'static str, &'static str, u64)], // (id, 
 Have `context_window_for_model` and `max_tokens_for_model` consult the registry first, fall back to Claude defaults only for `claude-*` models.
 
 **Files:** `src/core/models.rs`, `src/runtime/openai/registry.rs`
+
+---
+
+## 5. Codex Responses API: `function_call.id` must start with `fc_` ✅ FIXED 2026-04-27
+
+**Symptom:** `400 Bad Request: Invalid 'input[N].id': 'call_…'. Expected
+an ID that begins with 'fc'.` after the second turn of any tool-using
+conversation routed through `openai-codex`.
+
+**Cause:** `codex_input_messages` echoed `call.id` (a `call_…` value) in
+both the `id` and `call_id` fields. The Responses API requires `id` to
+be the original `fc_…` output-item id, not the call correlation id.
+
+**Hotfix (Option A, this commit):** Emit `id` only when the stored value
+already starts with `fc`; otherwise omit the field. `call_id` alone is
+sufficient to correlate `function_call_output` rows. Covered by 3 unit
+tests in `codex_input_messages_tests`.
+
+**Follow-up (Option B, deferred):** Track the `fc_` *output-item id* and
+the `call_` *correlation id* as separate fields end-to-end (decoder →
+`ToolCall` → re-emit). Only worth the diff if a future Responses
+feature actually consumes the `fc_` id round-trip. Not needed today.
+
+**Files:** `src/runtime/openai/stream.rs`

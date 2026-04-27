@@ -3,6 +3,7 @@
 //! Ported from `openai-runtime::registry`, extended to accept a config map
 //! override for API keys (checked before env vars).
 
+use serde::Deserialize;
 use super::types::ProviderConfig;
 use std::collections::BTreeMap;
 
@@ -14,6 +15,37 @@ pub struct ProviderSpec {
     pub env_vars: &'static [&'static str],
     pub default_model: &'static str,
     pub models: &'static [(&'static str, &'static str, &'static str)], // (id, label, tier)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModelInfo {
+    pub id: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderModelsResponse {
+    data: Vec<ProviderModelsItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderModelsItem {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+pub fn parse_provider_models_response(body: &str) -> Result<Vec<ProviderModelInfo>, serde_json::Error> {
+    let response: ProviderModelsResponse = serde_json::from_str(body)?;
+    Ok(response
+        .data
+        .into_iter()
+        .filter(|item| !item.id.trim().is_empty())
+        .map(|item| ProviderModelInfo {
+            id: item.id,
+            name: item.name.filter(|name| !name.trim().is_empty()),
+        })
+        .collect())
 }
 
 pub fn providers() -> &'static [ProviderSpec] {
@@ -239,6 +271,7 @@ pub fn resolve_provider(
             base_url: spec.base_url.to_string(),
             api_key,
             model: spec.default_model.to_string(),
+            provider: spec.key.to_string(),
         },
         spec.default_model,
     ))
@@ -261,6 +294,7 @@ pub fn resolve_provider_model(
         base_url: spec.base_url.to_string(),
         api_key,
         model: model.to_string(),
+        provider: spec.key.to_string(),
     })
 }
 
@@ -268,6 +302,23 @@ pub fn resolve_provider_model(
 pub fn resolve_shorthand(s: &str, overrides: &BTreeMap<String, String>) -> Option<ProviderConfig> {
     let (provider_key, model) = s.split_once('/')?;
     resolve_provider_model(provider_key, model, overrides)
+}
+
+/// Resolve `"openai-codex/model"` shorthand if Codex OAuth is configured.
+pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
+    let (provider_key, model) = s.split_once('/')?;
+    if provider_key != "openai-codex" {
+        return None;
+    }
+    let token = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    Some(ProviderConfig {
+        base_url: "https://chatgpt.com/backend-api".to_string(),
+        api_key: token.unwrap_or_default(),
+        model: model.to_string(),
+        provider: "openai-codex".to_string(),
+    })
 }
 
 /// Resolve a local model endpoint (Ollama, LM Studio, vLLM, llama.cpp, etc.)
@@ -293,7 +344,37 @@ fn resolve_local(model: &str, overrides: &BTreeMap<String, String>) -> ProviderC
         base_url,
         api_key,
         model: model.to_string(),
+        provider: "local".to_string(),
     }
+}
+
+pub async fn fetch_provider_models(
+    client: &reqwest::Client,
+    provider_key: &str,
+    overrides: &BTreeMap<String, String>,
+) -> Result<Vec<ProviderModelInfo>, String> {
+    let spec = providers()
+        .iter()
+        .find(|spec| spec.key == provider_key)
+        .ok_or_else(|| format!("unknown provider: {provider_key}"))?;
+    let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)
+        .ok_or_else(|| format!("{} is not configured", spec.name))?;
+    let url = format!("{}/models", spec.base_url.trim_end_matches('/'));
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("model list failed: HTTP {status}"));
+    }
+    parse_provider_models_response(&body).map_err(|e| format!("failed to parse model list: {e}"))
 }
 
 /// List all providers with key status.
@@ -343,4 +424,26 @@ fn resolve_api_key(
     env_vars.iter().find_map(|var| {
         std::env::var(var).ok().filter(|v| !v.is_empty())
     })
+}
+
+#[cfg(test)]
+mod model_list_tests {
+    use super::*;
+
+    #[test]
+    fn parses_openrouter_models_response() {
+        let json = r#"{
+            "data": [
+                { "id": "qwen/qwen3-coder", "name": "Qwen: Qwen3 Coder" },
+                { "id": "openai/gpt-oss-120b" }
+            ]
+        }"#;
+
+        let models = parse_provider_models_response(json).expect("parse models");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "qwen/qwen3-coder");
+        assert_eq!(models[0].name.as_deref(), Some("Qwen: Qwen3 Coder"));
+        assert_eq!(models[1].id, "openai/gpt-oss-120b");
+        assert_eq!(models[1].name, None);
+    }
 }
