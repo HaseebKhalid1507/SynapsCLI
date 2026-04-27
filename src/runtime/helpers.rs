@@ -28,6 +28,103 @@ impl HelperMethods {
         injected
     }
 
+    /// Strip invalid thinking blocks from assistant messages before sending to the API.
+    ///
+    /// Anthropic rejects any `{"type": "thinking", ...}` block whose `thinking` field
+    /// is missing or empty:
+    ///
+    /// > messages.N.content.M.thinking: each thinking block must contain thinking
+    ///
+    /// And rejects empty text blocks:
+    ///
+    /// > messages: text content blocks must be non-empty
+    ///
+    /// These can sneak in from (a) older sessions persisted before the streaming
+    /// accumulator was hardened, (b) redacted-thinking blocks that lost their data, or
+    /// (c) any future provider quirk. We drop them defensively so a single bad block
+    /// can't permanently brick a session.
+    ///
+    /// Algorithm:
+    ///   1. For each assistant message, retain only valid (`thinking` non-empty,
+    ///      `redacted_thinking` data non-empty, or any other type).
+    ///   2. Also drop any text blocks that are empty/whitespace-only — those would
+    ///      trigger the "text content blocks must be non-empty" error.
+    ///   3. If an assistant message ends up with no content at all, mark it for
+    ///      removal — it produced no real output and is not safe to ship as `[]`
+    ///      (the API rejects empty content arrays too).
+    ///   4. Remove the marked messages, and merge any resulting consecutive
+    ///      same-role messages so we don't violate Anthropic's alternation rule.
+    pub(super) fn sanitize_thinking_blocks(messages: &mut Vec<Value>) {
+        // Pass 1: filter blocks within each assistant message.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for (i, msg) in messages.iter_mut().enumerate() {
+            if msg["role"].as_str() != Some("assistant") {
+                continue;
+            }
+            let content = match msg["content"].as_array_mut() {
+                Some(c) => c,
+                None => continue,
+            };
+            content.retain(|block| {
+                match block["type"].as_str() {
+                    Some("thinking") => block["thinking"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false),
+                    Some("redacted_thinking") => block["data"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false),
+                    Some("text") => block["text"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false),
+                    _ => true,
+                }
+            });
+            if content.is_empty() {
+                // No salvageable content. The API rejects empty content arrays
+                // and empty text placeholders alike, so we must drop the whole message.
+                to_remove.push(i);
+            }
+        }
+
+        // Pass 2: drop the empty assistant messages (back-to-front so indices stay valid).
+        for &i in to_remove.iter().rev() {
+            messages.remove(i);
+        }
+
+        // Pass 3: merge any consecutive same-role messages that now sit adjacent.
+        // Dropping an assistant message between two user messages would otherwise
+        // violate Anthropic's strict role-alternation rule.
+        let mut i = 0;
+        while i + 1 < messages.len() {
+            let same_role = messages[i]["role"] == messages[i + 1]["role"];
+            if same_role {
+                // Coerce both contents to arrays, then concatenate.
+                let next = messages.remove(i + 1);
+                let next_blocks = Self::coerce_content_to_blocks(next["content"].clone());
+                let current_blocks = Self::coerce_content_to_blocks(messages[i]["content"].clone());
+                let mut merged = current_blocks;
+                merged.extend(next_blocks);
+                messages[i]["content"] = Value::Array(merged);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Normalize a `content` value to a Vec of content blocks. Anthropic accepts
+    /// either a string or an array; we always want an array for merge operations.
+    fn coerce_content_to_blocks(content: Value) -> Vec<Value> {
+        match content {
+            Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+            Value::String(_) => Vec::new(),
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        }
+    }
+
     /// Annotate a cache breakpoint on the conversation prefix.
     /// To maximize cache hits, we must place stationary boundaries. Modifying an old marker
     /// breaks the cache for that prefix. We retain up to 2 conversational markers.
@@ -173,5 +270,160 @@ impl HelperMethods {
                 input_t, cache_read, cache_create, output_t, pct
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sanitize_drops_empty_thinking_blocks() {
+        let mut msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig1"},
+                    {"type": "text", "text": "hello"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn sanitize_keeps_non_empty_thinking_blocks() {
+        let mut msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning here", "signature": "sig1"},
+                    {"type": "text", "text": "hello"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sanitize_drops_thinking_with_missing_field() {
+        let mut msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "signature": "sig1"},
+                    {"type": "text", "text": "hello"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn sanitize_replaces_emptied_content_with_placeholder() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig1"},
+                ]
+            }),
+            json!({"role": "user", "content": "second"}),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        // Empty assistant message must be dropped entirely (cannot be turned into
+        // an empty text block — the API rejects those too).
+        // The two surrounding user messages must then be merged.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "first");
+        assert_eq!(content[1]["text"], "second");
+    }
+
+    #[test]
+    fn sanitize_drops_empty_text_blocks() {
+        let mut msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "real content"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "real content");
+    }
+
+    #[test]
+    fn sanitize_merges_consecutive_user_messages_after_drop() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "b"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn sanitize_preserves_alternation_when_no_drops_needed() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
+            json!({"role": "user", "content": "c"}),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn sanitize_skips_user_messages() {
+        let mut msgs = vec![
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig1"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        // We only police assistant messages — user messages would be malformed for
+        // a different reason and aren't ours to rewrite.
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sanitize_drops_redacted_thinking_with_empty_data() {
+        let mut msgs = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": ""},
+                    {"type": "text", "text": "hi"},
+                ]
+            }),
+        ];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
     }
 }

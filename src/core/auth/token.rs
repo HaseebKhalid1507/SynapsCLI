@@ -1,7 +1,7 @@
 use reqwest::Client;
 
-use super::{OAuthCredentials, AuthFile, TokenResponse, now_millis, is_token_expired, CLIENT_ID, TOKEN_URL};
-use super::storage::auth_file_path;
+use super::{is_token_expired, now_millis, AuthFile, OAuthCredentials, TokenResponse, CLIENT_ID, TOKEN_URL};
+use super::storage::{auth_file_path, load_provider_auth, save_provider_auth};
 
 /// Exchange an authorization code for access + refresh tokens.
 pub async fn exchange_code_for_tokens(
@@ -54,6 +54,7 @@ pub async fn exchange_code_for_tokens(
         refresh: token_resp.refresh_token,
         access: token_resp.access_token,
         expires,
+        account_id: None,
     })
 }
 
@@ -92,6 +93,7 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> std::result::Resul
         refresh: token_resp.refresh_token,
         access: token_resp.access_token,
         expires,
+        account_id: None,
     })
 }
 
@@ -149,6 +151,7 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
 
     let new_auth = AuthFile {
         anthropic: new_creds.clone(),
+        openai_codex: auth.openai_codex,
     };
     let new_json = serde_json::to_string_pretty(&new_auth)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;
@@ -169,4 +172,25 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
     }
 
     Ok(new_creds)
+}
+
+/// Ensure a non-Anthropic OAuth provider has a fresh token.
+pub async fn ensure_fresh_provider_token(
+    client: &Client,
+    provider: &str,
+) -> std::result::Result<OAuthCredentials, String> {
+    let Some(creds) = load_provider_auth(provider)? else {
+        return Err(format!("No credentials for {}. Run `synaps login`.", provider));
+    };
+
+    if !is_token_expired(&creds) {
+        return Ok(creds);
+    }
+
+    let fresh = match provider {
+        "openai-codex" => super::openai_codex::refresh_token(client, &creds.refresh).await?,
+        other => return Err(format!("No refresh handler for OAuth provider {}", other)),
+    };
+    save_provider_auth(provider, &fresh)?;
+    Ok(fresh)
 }

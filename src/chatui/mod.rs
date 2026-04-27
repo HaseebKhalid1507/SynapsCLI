@@ -12,6 +12,7 @@ mod input;
 mod stream_handler;
 mod settings;
 mod plugins;
+mod models;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -344,6 +345,15 @@ pub async fn run(
                 }
             }
 
+            // ── Expanded model-list results ──
+            result = app.model_list_rx.recv() => {
+                if let Some((provider_key, models_result)) = result {
+                    if let Some(state) = app.models.as_mut() {
+                        models::set_expanded_models(state, &provider_key, models_result);
+                    }
+                }
+            }
+
             // ── Event bus wake — fires instantly when an event is pushed to the queue ──
             _ = runtime.event_queue().notified() => {
                 let mut event_received = false;
@@ -551,6 +561,9 @@ pub async fn run(
                                             }
                                         }
                                         event_reader = EventStream::new();
+                                    }
+                                    CommandAction::OpenModels => {
+                                        app.models = Some(models::ModelsModalState::new());
                                     }
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
@@ -879,6 +892,7 @@ pub async fn run(
                                             event_reader = EventStream::new();
                                         }
                                         CommandAction::StartStream => {}
+                                        CommandAction::OpenModels => {}
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
                                         CommandAction::ReloadPlugins => {}
@@ -904,6 +918,50 @@ pub async fn run(
                                     }
                                     app.queued_message = Some(input);
                                 }
+                            }
+                            InputAction::ModelsApply(model) => {
+                                runtime.set_model(model.clone());
+                                let applied = runtime.model().to_string();
+                                let _ = synaps_cli::config::write_config_value("model", &applied);
+                                app.session.model = applied.clone();
+                                app.push_msg(ChatMessage::System(format!("model set to: {}", applied)));
+                            }
+                            InputAction::ModelsExpandProvider(provider_key) => {
+                                let client = runtime.http_client().clone();
+                                let provider_keys = synaps_cli::config::get_provider_keys();
+                                let tx = app.model_list_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = synaps_cli::runtime::openai::catalog::fetch_catalog_models(
+                                        &client,
+                                        &provider_key,
+                                        &provider_keys,
+                                    ).await.map(|models| {
+                                        models.into_iter().map(|model| {
+                                            let full_id = model.runtime_id();
+                                            let label = model.display_label().to_string();
+                                            let mut metadata = Vec::new();
+                                            if let Some(context) = model.context_tokens {
+                                                metadata.push(if context >= 1_000_000 {
+                                                    format!("{}M ctx", context / 1_000_000)
+                                                } else if context >= 1_000 {
+                                                    format!("{}K ctx", context / 1_000)
+                                                } else {
+                                                    format!("{context} ctx")
+                                                });
+                                            }
+                                            match model.reasoning {
+                                                synaps_cli::runtime::openai::catalog::ReasoningSupport::None => {}
+                                                synaps_cli::runtime::openai::catalog::ReasoningSupport::Unknown => {}
+                                                _ => metadata.push("thinking".to_string()),
+                                            }
+                                            if model.pricing.has_internal_reasoning_cost() {
+                                                metadata.push("reasoning $".to_string());
+                                            }
+                                            models::ExpandedModelEntry::with_metadata(full_id, label, false, metadata)
+                                        }).collect()
+                                    });
+                                    let _ = tx.send((provider_key, result));
+                                });
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);

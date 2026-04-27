@@ -96,6 +96,7 @@ pub struct SynapsConfig {
     pub api_retries: u32,              // default 3
     pub theme: Option<String>,
     pub disabled_plugins: Vec<String>,
+    pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
     pub provider_keys: BTreeMap<String, String>,
@@ -116,6 +117,7 @@ impl Default for SynapsConfig {
             api_retries: 3,
             theme: None,
             disabled_plugins: Vec::new(),
+            favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
             provider_keys: BTreeMap::new(),
@@ -134,6 +136,17 @@ fn parse_thinking_budget(val: &str) -> Option<u32> {
         "adaptive" => Some(0), // sentinel: model decides depth
         _ => val.parse::<u32>().ok(),
     }
+}
+
+fn parse_comma_list(val: &str) -> Vec<String> {
+    val.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
+    write_config_value(key, &values.join(", "))
 }
 
 /// Parse shell.* configuration keys and update the ShellConfig.
@@ -260,16 +273,13 @@ pub fn load_config() -> SynapsConfig {
             }
             "theme" => config.theme = Some(val.to_string()),
             "disabled_plugins" => {
-                config.disabled_plugins = val.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                config.disabled_plugins = parse_comma_list(val);
+            }
+            "favorite_models" => {
+                config.favorite_models = parse_comma_list(val);
             }
             "disabled_skills" => {
-                config.disabled_skills = val.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                config.disabled_skills = parse_comma_list(val);
             }
             _ => {
                 // Handle shell.* keys
@@ -333,6 +343,32 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
     }
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Add a favorite model id (`provider/model`) to config, preserving sort/dedup.
+pub fn add_favorite_model(id: &str) -> std::io::Result<()> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let mut values = load_config().favorite_models;
+    if !values.iter().any(|v| v == trimmed) {
+        values.push(trimmed.to_string());
+        values.sort();
+    }
+    write_comma_list("favorite_models", &values)
+}
+
+/// Remove a favorite model id (`provider/model`) from config.
+pub fn remove_favorite_model(id: &str) -> std::io::Result<()> {
+    let mut values = load_config().favorite_models;
+    values.retain(|v| v != id.trim());
+    write_comma_list("favorite_models", &values)
+}
+
+/// Return whether a model id is marked as favorite.
+pub fn is_favorite_model(id: &str) -> bool {
+    load_config().favorite_models.iter().any(|v| v == id.trim())
 }
 
 /// Resolve the system prompt from CLI flag, config file, or default.
@@ -406,6 +442,7 @@ mod tests {
         assert_eq!(config.api_retries, 3);
         assert_eq!(config.theme, None);
         assert!(config.disabled_plugins.is_empty());
+        assert!(config.favorite_models.is_empty());
         assert!(config.disabled_skills.is_empty());
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
@@ -537,6 +574,8 @@ mod tests {
 
         let config_content = r#"
 # Test config with disable lists
+favorite_models = claude/claude-opus-4-7, groq/llama-3.3-70b-versatile
+
 disabled_plugins = foo, bar
 disabled_skills = baz, plug:qual
 "#;
@@ -556,7 +595,33 @@ disabled_skills = baz, plug:qual
         let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-disable-lists");
 
         assert_eq!(config.disabled_plugins, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(config.favorite_models, vec![
+            "claude/claude-opus-4-7".to_string(),
+            "groq/llama-3.3-70b-versatile".to_string(),
+        ]);
         assert_eq!(config.disabled_skills, vec!["baz".to_string(), "plug:qual".to_string()]);
+    }
+
+    #[test]
+    fn favorite_model_helpers_round_trip_through_config_file() {
+        let home = make_test_home("favorite-models");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-7\n").unwrap();
+
+        with_home(&home, || {
+            add_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            add_favorite_model("claude/claude-opus-4-7").unwrap();
+            add_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            assert!(is_favorite_model("groq/llama-3.3-70b-versatile"));
+            remove_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            assert!(!is_favorite_model("groq/llama-3.3-70b-versatile"));
+            assert!(is_favorite_model("claude/claude-opus-4-7"));
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-opus-4-7"));
+        assert!(contents.contains("favorite_models = claude/claude-opus-4-7"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

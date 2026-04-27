@@ -117,6 +117,7 @@ pub async fn ping_all_configured(
                 base_url: base_cfg.base_url.clone(),
                 api_key: base_cfg.api_key.clone(),
                 model: (*model_id).to_string(),
+                provider: base_cfg.provider.clone(),
             };
             let client = client.clone();
             let key = spec.key.to_string();

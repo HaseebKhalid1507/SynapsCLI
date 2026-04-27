@@ -325,8 +325,8 @@ problem on the next turn.
 
 **File:** `src/chatui/draw.rs:144`, `:250`, `:256`
 
-Three `unreachable!()` calls on theme-colour lookups. If theme loading
-ever produces a `Theme` missing one of those colours (user-supplied
+Three `unreachable!()` calls on theme-color lookups. If theme loading
+ever produces a `Theme` missing one of those colors (user-supplied
 theme, future theme with a typo), the TUI panics mid-render.
 
 **Fix:** Replace each with `.unwrap_or_else(|| Color::Rgb(128, 128, 128))`
@@ -356,7 +356,7 @@ Default `--host` is `127.0.0.1` (verified at `main.rs:47`), so the safe
 case is safe. However, a user who passes `--host 0.0.0.0` (or a LAN
 address) exposes full runtime control — `/ws` accepts `ClientMessage`
 frames that drive the agent — with no authentication, no TLS, and no
-rate-limiting. The current behaviour silently binds and prints the URL.
+rate-limiting. The current behavior silently binds and prints the URL.
 
 **Fix:**
 

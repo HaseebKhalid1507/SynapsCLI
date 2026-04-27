@@ -22,6 +22,10 @@ pub(super) enum InputAction {
     Abort,
     /// Settings modal requested an apply — (key, value).
     SettingsApply(&'static str, String),
+    /// Models modal requested switching to a runtime model id.
+    ModelsApply(String),
+    /// Models modal requested expanding provider models.
+    ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
     PluginsOutcome(super::plugins::InputOutcome),
@@ -39,6 +43,24 @@ pub(super) fn handle_event(
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
+    // Route events to the models modal while it's open.
+    if let Some(state) = app.models.as_mut() {
+        if let Event::Key(key) = event {
+            match super::models::handle_event(state, key, runtime.model()) {
+                super::models::InputOutcome::Close => {
+                    app.models = None;
+                    return InputAction::None;
+                }
+                super::models::InputOutcome::Apply(model) => {
+                    app.models = None;
+                    return InputAction::ModelsApply(model);
+                }
+                super::models::InputOutcome::None => return InputAction::None,
+                super::models::InputOutcome::ExpandProvider(provider) => return InputAction::ModelsExpandProvider(provider),
+            }
+        }
+        return InputAction::None;
+    }
     // Route events to the plugins modal while it's open. Most outcomes run
     // async side-effects (fetch manifest, git clone, etc.), so we delegate
     // them to the main loop via `InputAction::PluginsOutcome`.

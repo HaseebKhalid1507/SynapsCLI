@@ -16,14 +16,16 @@ mod callback;
 mod token;
 mod storage;
 mod browser;
+mod openai_codex;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
 pub use pkce::{generate_code_verifier, generate_code_challenge, generate_state, build_auth_url};
 pub use callback::{CallbackServerHandle, start_callback_server};
-pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token};
-pub use storage::{auth_file_path, load_auth, save_auth};
+pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token, ensure_fresh_provider_token};
+pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
 pub use browser::open_browser;
+pub use openai_codex::{extract_account_id as extract_codex_account_id, login as login_openai_codex};
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
@@ -43,11 +45,15 @@ pub struct OAuthCredentials {
     pub refresh: String,
     pub access: String,
     pub expires: u64,
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthFile {
     pub anthropic: OAuthCredentials,
+    #[serde(rename = "openai-codex", default, skip_serializing_if = "Option::is_none")]
+    pub openai_codex: Option<OAuthCredentials>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +255,7 @@ mod tests {
             refresh: "test_refresh".to_string(),
             access: "test_access".to_string(),
             expires: 0,
+            account_id: None,
         };
         assert!(is_token_expired(&expired_creds));
 
@@ -258,6 +265,7 @@ mod tests {
             refresh: "test_refresh".to_string(),
             access: "test_access".to_string(),
             expires: future_time,
+            account_id: None,
         };
         assert!(!is_token_expired(&fresh_creds));
         assert_eq!(fresh_creds.auth_type, "oauth");
@@ -308,6 +316,7 @@ mod tests {
             refresh: "test_refresh".to_string(),
             access: "test_access".to_string(),
             expires: current_time,
+            account_id: None,
         };
         assert!(is_token_expired(&exactly_now_creds));
         
@@ -316,6 +325,7 @@ mod tests {
             refresh: "test_refresh".to_string(),
             access: "test_access".to_string(),
             expires: current_time + 1,
+            account_id: None,
         };
         assert!(!is_token_expired(&one_ms_future_creds));
     }
@@ -334,6 +344,7 @@ mod tests {
             refresh: "test_refresh_token".to_string(),
             access: "test_access_token".to_string(),
             expires: 1234567890,
+            account_id: None,
         };
         
         let json = serde_json::to_string(&original_creds).expect("Should serialize");

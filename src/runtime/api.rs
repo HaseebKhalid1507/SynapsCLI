@@ -32,6 +32,22 @@ pub struct ApiOptions {
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
+    /// Concatenate the `text` fields of every block in an Anthropic-shaped
+    /// response `content` array. Returns the empty string if the value is
+    /// not an array or contains no text blocks.
+    fn concat_response_text(response: &Value) -> String {
+        response["content"]
+            .as_array()
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    }
+
     /// Build the auth header for Anthropic requests.
     /// Returns `(header_name, header_value, auth_type)`.
     async fn build_auth_header(auth: &Arc<RwLock<AuthState>>) -> (String, String, String) {
@@ -101,7 +117,7 @@ impl ApiMethods {
         let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, cancel,
+            None, None, thinking_budget, cancel,
         ).await {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
@@ -121,6 +137,9 @@ impl ApiMethods {
         // Manual cache breakpoints for optimal prompt caching.
         // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
         let mut cleaned_messages = messages.to_vec();
+        // Strip empty/invalid thinking blocks before they hit the API. See
+        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
         // Derive the thinking level from the budget for effort mapping.
@@ -197,7 +216,7 @@ impl ApiMethods {
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
-                        return Err(RuntimeError::Cancelled);
+                        return Err(RuntimeError::Canceled);
                     }
                 }
 
@@ -352,12 +371,19 @@ impl ApiMethods {
                     }
                     Some("content_block_stop") => {
                         if in_thinking {
-                            // Flush thinking block with signature so it's echoed back in tool loops
-                            accumulated_content.push(json!({
-                                "type": "thinking",
-                                "thinking": current_thinking,
-                                "signature": current_thinking_signature
-                            }));
+                            // Flush thinking block with signature so it's echoed back in tool loops.
+                            // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
+                            // such blocks on the next turn with
+                            // `messages.N.content.M.thinking: each thinking block must contain thinking`.
+                            // Empty blocks happen when the stream produced only a signature delta
+                            // (or none at all) before the block_stop arrived.
+                            if !current_thinking.is_empty() {
+                                accumulated_content.push(json!({
+                                    "type": "thinking",
+                                    "thinking": current_thinking,
+                                    "signature": current_thinking_signature
+                                }));
+                            }
                             in_thinking = false;
                         } else if in_tool_use {
                             // Parse the accumulated JSON input
@@ -443,11 +469,13 @@ impl ApiMethods {
                 if let Ok(event) = serde_json::from_str::<Value>(data_part) {
                     if event["type"].as_str() == Some("content_block_stop") {
                         if in_thinking {
-                            accumulated_content.push(json!({
-                                "type": "thinking",
-                                "thinking": current_thinking,
-                                "signature": current_thinking_signature
-                            }));
+                            if !current_thinking.is_empty() {
+                                accumulated_content.push(json!({
+                                    "type": "thinking",
+                                    "thinking": current_thinking,
+                                    "signature": current_thinking_signature
+                                }));
+                            }
                         } else if in_tool_use {
                             let input = parse_tool_input(&current_tool_input_json);
                             accumulated_content.push(json!({
@@ -469,11 +497,13 @@ impl ApiMethods {
 
         // Return accumulated content in the expected format
         if in_thinking {
-            accumulated_content.push(json!({
-                "type": "thinking",
-                "thinking": current_thinking,
-                "signature": current_thinking_signature
-            }));
+            if !current_thinking.is_empty() {
+                accumulated_content.push(json!({
+                    "type": "thinking",
+                    "thinking": current_thinking,
+                    "signature": current_thinking_signature
+                }));
+            }
         } else if in_tool_use {
             let input = parse_tool_input(&current_tool_input_json);
             accumulated_content.push(json!({
@@ -511,7 +541,7 @@ impl ApiMethods {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, &tokio_util::sync::CancellationToken::new(),
+            None, None, thinking_budget, &tokio_util::sync::CancellationToken::new(),
         ).await {
             drop(tx);
             while rx.recv().await.is_some() {}
@@ -538,6 +568,9 @@ impl ApiMethods {
         
         // Avoid modifying past messages to maintain a 100% stable prefix for Anthropic caching.
         let mut cleaned_messages = messages.to_vec();
+        // Strip empty/invalid thinking blocks before they hit the API. See
+        // `sanitize_thinking_blocks` for the failure mode this guards against.
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
 
         let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
@@ -690,6 +723,30 @@ impl ApiMethods {
         messages: &[Value],
         max_retries: u32,
     ) -> Result<String> {
+        let tools_schema = Arc::new(Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let routed_system_prompt = Some(system_prompt.to_string());
+        if let Some(result) = crate::runtime::openai::try_route(
+            model,
+            client,
+            &tools_schema,
+            &routed_system_prompt,
+            messages,
+            &tx,
+            None,
+            None,
+            thinking_budget,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
+            drop(tx);
+            while rx.recv().await.is_some() {}
+            let response =
+                result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+            return Ok(Self::concat_response_text(&response));
+        }
+
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
         let mut body = json!({
@@ -819,5 +876,47 @@ impl ApiMethods {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod concat_response_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_text_from_single_block() {
+        let v = json!({"content": [{"type": "text", "text": "hello"}]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "hello");
+    }
+
+    #[test]
+    fn concatenates_multiple_text_blocks() {
+        let v = json!({"content": [
+            {"type": "text", "text": "alpha "},
+            {"type": "text", "text": "beta"},
+        ]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "alpha beta");
+    }
+
+    #[test]
+    fn skips_non_text_blocks() {
+        let v = json!({"content": [
+            {"type": "tool_use", "name": "bash"},
+            {"type": "text", "text": "result"},
+        ]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "result");
+    }
+
+    #[test]
+    fn returns_empty_for_missing_content() {
+        let v = json!({"role": "assistant"});
+        assert_eq!(ApiMethods::concat_response_text(&v), "");
+    }
+
+    #[test]
+    fn returns_empty_for_non_array_content() {
+        let v = json!({"content": "stringified"});
+        assert_eq!(ApiMethods::concat_response_text(&v), "");
     }
 }

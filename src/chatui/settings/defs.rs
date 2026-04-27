@@ -96,7 +96,7 @@ define_settings! {
         };
 
     subagent_timeout, "Subagent timeout", Agent, EditorKind::Text { numeric: true },
-        "Seconds before a dispatched subagent is cancelled.",
+        "Seconds before a dispatched subagent is canceled.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u64>() { runtime.set_subagent_timeout(n); }
         };

@@ -60,45 +60,45 @@ pub async fn start_callback_server(
     let expected = expected_state.clone();
     let tx_clone = tx.clone();
 
-    let app = axum::Router::new().route(
-        "/callback",
-        axum::routing::get(move |query: axum::extract::Query<std::collections::HashMap<String, String>>| {
-            let tx = tx_clone.clone();
-            let expected = expected.clone();
-            async move {
-                let code = query.get("code").cloned();
-                let state = query.get("state").cloned();
-                let error = query.get("error").cloned();
+    let handler = move |query: axum::extract::Query<std::collections::HashMap<String, String>>| {
+        let tx = tx_clone.clone();
+        let expected = expected.clone();
+        async move {
+            let code = query.get("code").cloned();
+            let state = query.get("state").cloned();
+            let error = query.get("error").cloned();
 
-                if let Some(err) = error {
-                    eprintln!("OAuth error from provider: {}", err);
-                    return axum::response::Html(ERROR_HTML.to_string());
-                }
-
-                let (code, state) = match (code, state) {
-                    (Some(c), Some(s)) => (c, s),
-                    _ => {
-                        return axum::response::Html(ERROR_HTML.to_string());
-                    }
-                };
-
-                if state != expected {
-                    eprintln!("State mismatch: expected {}, got {}", expected, state);
-                    return axum::response::Html(ERROR_HTML.to_string());
-                }
-
-                // Send the result
-                if let Some(sender) = tx.lock().await.take() {
-                    let _ = sender.send(CallbackResult {
-                        code,
-                        state,
-                    });
-                }
-
-                axum::response::Html(SUCCESS_HTML.to_string())
+            if let Some(err) = error {
+                eprintln!("OAuth error from provider: {}", err);
+                return axum::response::Html(ERROR_HTML.to_string());
             }
-        }),
-    );
+
+            let (code, state) = match (code, state) {
+                (Some(c), Some(s)) => (c, s),
+                _ => {
+                    return axum::response::Html(ERROR_HTML.to_string());
+                }
+            };
+
+            if state != expected {
+                eprintln!("State mismatch: expected {}, got {}", expected, state);
+                return axum::response::Html(ERROR_HTML.to_string());
+            }
+
+            if let Some(sender) = tx.lock().await.take() {
+                let _ = sender.send(CallbackResult {
+                    code,
+                    state,
+                });
+            }
+
+            axum::response::Html(SUCCESS_HTML.to_string())
+        }
+    };
+
+    let app = axum::Router::new()
+        .route("/callback", axum::routing::get(handler.clone()))
+        .route("/auth/callback", axum::routing::get(handler));
 
     let addr = format!("{}:{}", CALLBACK_HOST, port);
     let listener = tokio::net::TcpListener::bind(&addr)

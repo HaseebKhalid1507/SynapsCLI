@@ -545,7 +545,7 @@ impl Drop for SessionManager {
 ///
 /// The reaper runs every 30 seconds, checking for sessions whose last activity
 /// exceeds their configured idle timeout. Returns immediately — the task runs
-/// until the `CancellationToken` is cancelled (or the process exits).
+/// until the `CancellationToken` is canceled (or the process exits).
 pub fn start_reaper(
     manager: Arc<SessionManager>,
     cancel: tokio_util::sync::CancellationToken,

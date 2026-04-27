@@ -94,6 +94,8 @@ pub(crate) struct App {
     pub(crate) settings: Option<super::settings::SettingsState>,
     /// Active plugins modal state (Some while /plugins is open).
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
+    /// Active models router modal state (Some while /model or /models is open).
+    pub(crate) models: Option<super::models::ModelsModalState>,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -106,6 +108,9 @@ pub(crate) struct App {
     /// Channel for receiving async ping results.
     pub(crate) ping_tx: tokio::sync::mpsc::UnboundedSender<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     pub(crate) ping_rx: tokio::sync::mpsc::UnboundedReceiver<(String, synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// Channel for receiving expanded model-list API results.
+    pub(crate) model_list_tx: tokio::sync::mpsc::UnboundedSender<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
+    pub(crate) model_list_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
     /// Text selection state for the message area.
     /// Anchor is where the mouse was first pressed (col, row in terminal coords).
     /// End is the current drag position. Both are absolute terminal coordinates.
@@ -140,6 +145,7 @@ pub(crate) struct SubagentState {
 impl App {
     pub(crate) fn new(session: Session) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -181,6 +187,7 @@ impl App {
             gamba_child: None,
             settings: None,
             plugins: None,
+            models: None,
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
@@ -188,6 +195,8 @@ impl App {
             ping_pending: 0,
             ping_tx: ping_tx_init,
             ping_rx: ping_rx_init,
+            model_list_tx: model_list_tx_init,
+            model_list_rx: model_list_rx_init,
             selection_anchor: None,
             selection_end: None,
             msg_area_rect: None,

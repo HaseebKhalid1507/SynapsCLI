@@ -122,7 +122,7 @@ async fn reload_picks_up_new_skill() {
 
     let tools = Arc::new(RwLock::new(ToolRegistry::new()));
     let config = SynapsConfig::default();
-    let registry = register(&tools, &config).await;
+    let (registry, _keybinds) = register(&tools, &config).await;
 
     // No skill yet.
     assert!(matches!(registry.resolve("fresh"), synaps_cli::skills::registry::Resolution::Unknown));

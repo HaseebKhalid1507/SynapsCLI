@@ -234,7 +234,7 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
                 ct.cancel();
             }
             let _ = state.broadcast_tx.send(ServerMessage::System {
-                message: "cancelled".to_string(),
+                message: "canceled".to_string(),
             });
         }
         ClientMessage::Status => {
