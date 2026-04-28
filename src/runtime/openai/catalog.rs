@@ -595,7 +595,8 @@ pub fn merge_catalog_pages(pages: Vec<Vec<CatalogModel>>) -> Vec<CatalogModel> {
 pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
         ("gpt-5.5", "GPT-5.5"),
-        ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.4-mini", "GPT-5.4 Mini"),
     ]
     .into_iter()
     .filter_map(|(id, label)| {
@@ -1224,7 +1225,12 @@ mod tests {
         #[test]
         fn static_catalog_uses_fallback_source_and_prefixed_runtime_ids() {
             let models = codex_static_catalog_models();
-            assert!(models.iter().any(|m| m.id == "gpt-5.1-codex-mini"));
+            assert!(models.iter().any(|m| m.id == "gpt-5.5"));
+            assert!(models.iter().any(|m| m.id == "gpt-5.4"));
+            assert!(models.iter().any(|m| m.id == "gpt-5.4-mini"));
+            assert!(!models.iter().any(|m| m.id == "gpt-5.5-pro"));
+            assert!(!models.iter().any(|m| m.id == "gpt-5.4-nano"));
+            assert!(!models.iter().any(|m| m.id == "gpt-5.1-codex-mini"));
             assert!(models.iter().all(|m| m.source == CatalogSource::StaticFallback));
             assert!(models.iter().all(|m| m.runtime_id().starts_with("openai-codex/")));
         }
