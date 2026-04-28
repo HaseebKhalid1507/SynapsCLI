@@ -14,8 +14,8 @@ pub enum RuntimeError {
     Tool(String),
     #[error("Request timed out")]
     Timeout,
-    #[error("Operation cancelled")]
-    Cancelled,
+    #[error("Operation canceled")]
+    Canceled,
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
@@ -52,8 +52,8 @@ mod tests {
         );
 
         assert_eq!(
-            format!("{}", RuntimeError::Cancelled),
-            "Operation cancelled"
+            format!("{}", RuntimeError::Canceled),
+            "Operation canceled"
         );
     }
 
@@ -85,8 +85,8 @@ mod tests {
         );
 
         assert_eq!(
-            RuntimeError::Cancelled.to_string(),
-            "Operation cancelled"
+            RuntimeError::Canceled.to_string(),
+            "Operation canceled"
         );
     }
 }
