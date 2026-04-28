@@ -27,8 +27,8 @@ pub(crate) async fn call_oai_stream_inner(
     max_tokens: Option<u32>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let oai_messages = translate::messages_to_oai(messages, system_prompt);
-    let oai_tools = translate::tools_to_oai(tools_schema);
+    let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
+    let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
     let tools_opt = if oai_tools.is_empty() { None } else { Some(oai_tools) };
 
     // Google's OpenAI-compat endpoint rejects stream_options
@@ -103,7 +103,7 @@ pub(crate) async fn call_oai_stream_inner(
 
             sink.clear();
             decoder.push_line(line, &mut sink);
-            handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
+            handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
         }
     }
 
@@ -112,11 +112,11 @@ pub(crate) async fn call_oai_stream_inner(
         let line = std::str::from_utf8(&buf).unwrap_or("");
         sink.clear();
         decoder.push_line(line, &mut sink);
-        handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
+        handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
     }
     sink.clear();
     decoder.finish(&mut sink);
-    handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks);
+    handle_events(&sink, tx, &mut accumulated_text, &mut tool_use_blocks, &name_map);
 
     // Build Anthropic-shaped final response
     let mut content: Vec<Value> = Vec::new();
@@ -136,13 +136,14 @@ fn handle_events(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     text_acc: &mut String,
     tool_blocks: &mut Vec<Value>,
+    name_map: &translate::ToolNameMap,
 ) {
     for ev in events {
         if let OaiEvent::TextDelta(t) = ev {
             text_acc.push_str(t);
         }
         if let OaiEvent::ToolCallsComplete { calls, .. } = ev {
-            tool_blocks.extend(translate::tool_calls_to_content_blocks(calls));
+            tool_blocks.extend(translate::tool_calls_to_content_blocks(calls, name_map));
         }
         if let Some(se) = translate::oai_event_to_llm(ev) {
             let _ = tx.send(se);

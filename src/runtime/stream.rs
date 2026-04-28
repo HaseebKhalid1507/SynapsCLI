@@ -181,6 +181,7 @@ impl StreamMethods {
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
+                                let input = tools.read().await.translate_input_for_api_tool(&tool_name, input);
                                 let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 let tx_k = tx.clone();
                                 let t_id = tool_id.clone();
@@ -250,7 +251,10 @@ impl StreamMethods {
                             continue;
                         }
 
-                        let tool = tools.read().await.get(&tool_name).cloned();
+                        let tools_snapshot = tools.read().await;
+                        let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                        let tool = tools_snapshot.get(&tool_name).cloned();
+                        drop(tools_snapshot);
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
