@@ -49,8 +49,20 @@ impl Tool for SubagentTool {
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
-        let agent_name = params["agent"].as_str().map(|s| s.to_string());
-        let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
+        // Treat blank / whitespace / control-char strings as absent — see
+        // subagent_start.rs for full rationale. Models occasionally pass `agent: ""`
+        // (or "\u{0}", or " ") alongside a real `system_prompt`; without this filter
+        // we'd try to resolve an empty agent name and fail, instead of falling
+        // through to the inline prompt.
+        let is_blank = |s: &String| s.chars().all(|c| c.is_whitespace() || c.is_control());
+        let agent_name = params["agent"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
+        let inline_prompt = params["system_prompt"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
         let model_override = params["model"].as_str().map(|s| s.to_string());
         let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
