@@ -137,6 +137,10 @@ All notable changes to this project will be documented in this file.
   - Theme-aware highlight color
 
 ### Fixed
+- **Empty thinking/text blocks rejected by API** — fixed two related 400 errors that could permanently brick a session:
+  - `messages.N.content.M.thinking: each thinking block must contain thinking` — streaming accumulator (`runtime/api.rs`) was pushing thinking content blocks even when no `thinking_delta` arrived (only a signature, or stream cut off). Now skipped at all three accumulation sites (mid-stream, tail buffer, post-loop fallthrough).
+  - `messages: text content blocks must be non-empty` — defensive sanitizer (`runtime/helpers.rs::sanitize_thinking_blocks`) added; runs on every outbound API call from both `call_api_stream_inner` and `call_api`. Strips empty `thinking`, `redacted_thinking.data`, and `text` blocks; drops assistant messages whose entire content gets stripped; merges resulting consecutive same-role messages to preserve Anthropic's strict role-alternation rule. Auto-heals sessions persisted before the streaming fix landed.
+  - 9 unit tests covering the drop-and-merge cases.
 - **Config file permissions** — now 0600 (was 0644, world-readable with API keys)
 - **API key masking** — shows last 4 chars only (was showing first 8 + last 4)
 - **ProviderConfig Debug** — custom impl redacts `api_key` as `[REDACTED]` in logs
