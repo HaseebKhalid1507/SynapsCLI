@@ -3,13 +3,62 @@
 use super::types::{ChatMessage, FunctionCall, FunctionDefinition, OaiEvent, ToolCall, ToolDefinition};
 use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolNameMap {
+    original_to_oai: HashMap<String, String>,
+    oai_to_original: HashMap<String, String>,
+}
+
+impl ToolNameMap {
+    pub fn to_oai<'a>(&'a self, name: &'a str) -> &'a str {
+        self.original_to_oai.get(name).map(String::as_str).unwrap_or(name)
+    }
+
+    pub fn to_original<'a>(&'a self, name: &'a str) -> &'a str {
+        self.oai_to_original.get(name).map(String::as_str).unwrap_or(name)
+    }
+
+    fn insert(&mut self, original: &str, oai: &str) {
+        if original != oai {
+            self.original_to_oai.insert(original.to_string(), oai.to_string());
+            self.oai_to_original.insert(oai.to_string(), original.to_string());
+        }
+    }
+}
+
+/// OpenAI function names must match `^[a-zA-Z0-9_-]+$`. Synaps/MCP names may
+/// contain namespace separators like `:` or `.`, so sanitize only for the
+/// OpenAI wire format and map back before tool execution.
+fn sanitize_oai_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "tool".to_string()
+    } else {
+        if out.len() > 128 {
+            out.truncate(128);
+        }
+        out
+    }
+}
 
 /// Convert Anthropic tool schema entries to OpenAI ToolDefinitions.
 ///
 /// Anthropic shape: `{"name", "description", "input_schema", optional cache_control}`.
 /// OpenAI shape:    `{"type": "function", "function": {"name", "description", "parameters"}}`.
-pub fn tools_to_oai(schema: &[Value]) -> Vec<ToolDefinition> {
-    schema
+pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
+    let mut name_map = ToolNameMap::default();
+    let mut used_names: HashMap<String, String> = HashMap::new();
+
+    let tools = schema
         .iter()
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
@@ -17,6 +66,20 @@ pub fn tools_to_oai(schema: &[Value]) -> Vec<ToolDefinition> {
             if name.is_empty() || name == "respond" || name == "send_channel" || name == "watcher_exit" {
                 return None;
             }
+            let mut oai_name = sanitize_oai_tool_name(&name);
+            if let Some(existing) = used_names.get(&oai_name) {
+                if existing != &name {
+                    let base = oai_name.clone();
+                    let mut suffix = 2;
+                    while used_names.contains_key(&oai_name) {
+                        oai_name = format!("{base}_{suffix}");
+                        suffix += 1;
+                    }
+                }
+            }
+            used_names.insert(oai_name.clone(), name.clone());
+            name_map.insert(&name, &oai_name);
+
             let description = t
                 .get("description")
                 .and_then(|d| d.as_str())
@@ -28,13 +91,15 @@ pub fn tools_to_oai(schema: &[Value]) -> Vec<ToolDefinition> {
             Some(ToolDefinition {
                 kind: "function".to_string(),
                 function: FunctionDefinition {
-                    name,
+                    name: oai_name,
                     description,
                     parameters,
                 },
             })
         })
-        .collect()
+        .collect();
+
+    (tools, name_map)
 }
 
 /// Convert Anthropic-shaped message list + optional system prompt into
@@ -42,6 +107,7 @@ pub fn tools_to_oai(schema: &[Value]) -> Vec<ToolDefinition> {
 pub fn messages_to_oai(
     anthropic_messages: &[Value],
     system_prompt: &Option<String>,
+    name_map: &ToolNameMap,
 ) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
 
@@ -63,7 +129,7 @@ pub fn messages_to_oai(
                             block.get("id").and_then(|v| v.as_str()),
                             block.get("name").and_then(|v| v.as_str()),
                         ) {
-                            tool_name_map.insert(id.to_string(), name.to_string());
+                            tool_name_map.insert(id.to_string(), name_map.to_oai(name).to_string());
                         }
                     }
                 }
@@ -146,8 +212,8 @@ pub fn messages_to_oai(
                                 let name = block
                                     .get("name")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                    .map(|n| name_map.to_oai(n).to_string())
+                                    .unwrap_or_default();
                                 let arguments = block
                                     .get("input")
                                     .map(|v| v.to_string())
@@ -231,7 +297,7 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
 }
 
 /// Convert an OpenAI tool-call list into Anthropic-shaped `tool_use` content blocks.
-pub fn tool_calls_to_content_blocks(calls: &[ToolCall]) -> Vec<Value> {
+pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) -> Vec<Value> {
     calls
         .iter()
         .map(|c| {
@@ -239,7 +305,7 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall]) -> Vec<Value> {
             json!({
                 "type": "tool_use",
                 "id": c.id,
-                "name": c.function.name,
+                "name": name_map.to_original(&c.function.name),
                 "input": input,
             })
         })

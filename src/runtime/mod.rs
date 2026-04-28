@@ -339,6 +339,7 @@ impl Runtime {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
+                                let input = self.tools.read().await.translate_input_for_api_tool(tool_name, input.clone());
                                 let ctx = crate::ToolContext {
                                     channels: crate::tools::ToolChannels {
                                         tx_delta: None,
@@ -358,7 +359,7 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                match tool.execute(input.clone(), ctx).await {
+                                match tool.execute(input, ctx).await {
                                     Ok(output) => output,
                                     Err(e) => format!("Tool execution failed: {}", e),
                                 }
@@ -390,7 +391,10 @@ impl Runtime {
                             tool_use["id"].as_str().map(|s| s.to_string()),
                         ) {
                             let input = tool_use["input"].clone();
-                            let tool = self.tools.read().await.get(&tool_name).cloned();
+                            let tools_snapshot = self.tools.read().await;
+                            let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                            let tool = tools_snapshot.get(&tool_name).cloned();
+                            drop(tools_snapshot);
                             let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
                             let registry_inner = cfg_subagent_registry.clone();
