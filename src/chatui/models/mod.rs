@@ -363,7 +363,6 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
             .map(|model| {
                 let tier = match model.id.as_str() {
                     "gpt-5.5" => "S+",
-                    "gpt-5.1-codex-mini" => "A",
                     _ => "",
                 };
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
