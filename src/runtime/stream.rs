@@ -38,6 +38,7 @@ pub(super) struct StreamSession {
     pub(super) session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
+    pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
 }
 
 pub(super) struct StreamMethods;
@@ -96,6 +97,16 @@ impl StreamMethods {
             }
 
             let tools_snapshot = tools.read().await.clone();
+
+            // ═══ HOOK: before_message ═══
+            // Fire before sending messages to the LLM. Extensions can inject context.
+            if let Some(last_user_msg) = messages.last()
+                .and_then(|m| m["content"].as_str())
+            {
+                let hook_event = crate::extensions::hooks::events::HookEvent::before_message(last_user_msg);
+                let _ = session.hook_bus.emit(&hook_event).await;
+            }
+
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
                 &messages, tx.clone(), &cancel, api_retries, &options,

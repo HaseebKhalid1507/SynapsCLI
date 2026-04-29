@@ -553,6 +553,7 @@ impl Runtime {
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue,
+            hook_bus: self.hook_bus.clone(),
         };
 
         tokio::spawn(async move {

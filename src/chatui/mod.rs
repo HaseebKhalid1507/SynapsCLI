@@ -306,6 +306,12 @@ pub async fn run(
     }
 
 
+    // ═══ HOOK: on_session_start ═══
+    {
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);
+        let _ = runtime.hook_bus().emit(&hook_event).await;
+    }
+
     // ── Event loop ──
     loop {
         let elapsed = last_frame.elapsed();
@@ -1139,6 +1145,12 @@ pub async fn run(
 
     // Save session on exit
     app.save_session().await;
+
+    // ═══ HOOK: on_session_end ═══
+    {
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id);
+        let _ = runtime.hook_bus().emit(&hook_event).await;
+    }
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
