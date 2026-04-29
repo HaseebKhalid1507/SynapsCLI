@@ -1,6 +1,6 @@
 # Agent In Shell — Implementation Plan
 
-> **Status: ✅ COMPLETED** — All 10 tasks implemented. Code lives in `src/tools/shell/`. Checkboxes below were never updated but the implementation is complete and in production.
+> **Status: ✅ COMPLETED** — 9 of 10 tasks implemented. Code lives in `src/tools/shell/`. Integration tests at `tests/shell_pty.rs`. Task 10 (TUI streaming integration) was not implemented — shell output renders through standard tool result display. All other checkboxes below were never updated but the implementation is complete and in production.
 
 **Branch:** `agent_in_shell`
 **Spec:** `docs/specs/agent-in-shell.md`
