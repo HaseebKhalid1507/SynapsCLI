@@ -69,7 +69,13 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
             let mut oai_name = sanitize_oai_tool_name(&name);
             if let Some(existing) = used_names.get(&oai_name) {
                 if existing != &name {
-                    let base = oai_name.clone();
+                    // Truncate base to leave room for suffix (e.g. "_99" = 3 chars)
+                    let max_base = 128_usize.saturating_sub(4);
+                    let base = if oai_name.len() > max_base {
+                        oai_name[..max_base].to_string()
+                    } else {
+                        oai_name.clone()
+                    };
                     let mut suffix = 2;
                     while used_names.contains_key(&oai_name) {
                         oai_name = format!("{base}_{suffix}");

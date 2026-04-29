@@ -181,12 +181,14 @@ impl ReadinessDetector {
         }
 
         // Grab the tail to avoid scanning megabytes of scrollback.
-        // Walk forward to the next UTF-8 char boundary to avoid panicking
+        // Walk backward to the previous UTF-8 char boundary to avoid panicking
         // when multi-byte glyphs (●, ❯, box-drawing, emoji) straddle the cut.
+        // Walking backward (floor) instead of forward (ceil) ensures the tail
+        // is never empty when the cut lands inside the final multi-byte glyph.
         let tail = if output.len() > PROMPT_TAIL_LEN {
             let mut start = output.len() - PROMPT_TAIL_LEN;
-            while start < output.len() && !output.is_char_boundary(start) {
-                start += 1;
+            while start > 0 && !output.is_char_boundary(start) {
+                start -= 1;
             }
             &output[start..]
         } else {

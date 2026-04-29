@@ -21,6 +21,8 @@ pub struct ToolRegistry {
 struct SchemaNameMap {
     api_to_runtime: HashMap<String, String>,
     children: HashMap<String, SchemaNameMap>,
+    /// Name map for array `items` schemas (objects inside arrays).
+    items: Option<Box<SchemaNameMap>>,
 }
 
 impl Default for ToolRegistry {
@@ -158,9 +160,13 @@ impl ToolRegistry {
             }
         }
 
-        // Recurse into array item schemas too; no direct key mapping is needed at this level.
+        // Recurse into array item schemas; store the child map so
+        // translate_input_names can reverse-map property names inside array elements.
         if let Some(items) = obj.get_mut("items") {
-            let (sanitized_items, _) = Self::sanitize_schema(std::mem::take(items));
+            let (sanitized_items, items_map) = Self::sanitize_schema(std::mem::take(items));
+            if !items_map.api_to_runtime.is_empty() || !items_map.children.is_empty() || items_map.items.is_some() {
+                map.items = Some(Box::new(items_map));
+            }
             *items = sanitized_items;
         }
 
@@ -182,7 +188,14 @@ impl ToolRegistry {
                 }
                 Value::Object(out)
             }
-            Value::Array(arr) => Value::Array(arr.into_iter().map(|v| Self::translate_input_names(v, map)).collect()),
+            Value::Array(arr) => {
+                // If the schema had an items map, apply it to each array element.
+                if let Some(items_map) = &map.items {
+                    Value::Array(arr.into_iter().map(|v| Self::translate_input_names(v, items_map)).collect())
+                } else {
+                    Value::Array(arr)
+                }
+            }
             other => other,
         }
     }
@@ -193,7 +206,13 @@ impl ToolRegistry {
         let mut input_name_maps = HashMap::new();
         let mut schema = Vec::with_capacity(self.tools.len());
 
-        for tool in self.tools.values() {
+        // Sort by runtime name for deterministic API name assignment.
+        // HashMap iteration is random, so without sorting, collision suffixes
+        // (_2, _3) could change between rebuilds, breaking in-flight conversations.
+        let mut sorted_tools: Vec<_> = self.tools.values().collect();
+        sorted_tools.sort_by_key(|t| t.name().to_string());
+
+        for tool in sorted_tools {
             let runtime_name = tool.name();
             let api_name = Self::api_safe_name(runtime_name, &used);
             used.insert(api_name.clone());
