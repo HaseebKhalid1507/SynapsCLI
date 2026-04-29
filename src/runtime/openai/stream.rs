@@ -173,8 +173,8 @@ pub(crate) async fn call_codex_stream_inner(
         .or_else(|| crate::auth::extract_codex_account_id(&creds.access))
         .ok_or("Failed to extract ChatGPT account id from Codex token")?;
 
-    let oai_messages = translate::messages_to_oai(messages, system_prompt);
-    let oai_tools = translate::tools_to_oai(tools_schema);
+    let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
+    let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
     let tools: Vec<Value> = oai_tools
         .into_iter()
         .map(|tool| {
@@ -261,7 +261,7 @@ pub(crate) async fn call_codex_stream_inner(
     if !accumulated_text.is_empty() {
         content.push(json!({"type": "text", "text": accumulated_text}));
     }
-    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools));
+    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools, &name_map));
 
     Ok(json!({
         "role": "assistant",
@@ -294,11 +294,15 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
             continue;
         }
         if msg.role == "tool" {
-            out.push(json!({
-                "type": "function_call_output",
-                "call_id": msg.tool_call_id.unwrap_or_default(),
-                "output": msg.content.unwrap_or_default(),
-            }));
+            // Skip tool results with no call_id — sending an empty call_id
+            // to the Codex API would cause a 400 with a confusing error.
+            if let Some(call_id) = msg.tool_call_id {
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": msg.content.unwrap_or_default(),
+                }));
+            }
             continue;
         }
         out.push(json!({

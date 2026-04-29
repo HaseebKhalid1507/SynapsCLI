@@ -30,6 +30,12 @@ pub fn apply_openai_reasoning_params(
     model: &str,
     thinking_budget: u32,
 ) {
+    // Don't inject reasoning params when thinking is disabled.
+    // Without this guard, non-reasoning models (e.g. llama-3.3) get
+    // unsupported fields that cause request failures.
+    if thinking_budget == 0 {
+        return;
+    }
     let level = thinking_level_for_budget(thinking_budget);
     match provider {
         OpenAiReasoningProvider::OpenRouter => {
@@ -89,5 +95,15 @@ mod tests {
         assert!(body.is_empty());
         apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::Generic, "some/model", 4096);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_skips_all_reasoning_params() {
+        let mut body = Map::new();
+        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::OpenRouter, "deepseek/deepseek-r1", 0);
+        assert!(body.is_empty(), "OpenRouter should not inject reasoning when budget is 0");
+
+        apply_openai_reasoning_params(&mut body, OpenAiReasoningProvider::Groq, "openai/gpt-oss-120b", 0);
+        assert!(body.is_empty(), "Groq should not inject reasoning when budget is 0");
     }
 }

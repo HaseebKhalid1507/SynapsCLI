@@ -57,11 +57,26 @@ fn save_provider_auth_at(
     provider: &str,
     creds: &OAuthCredentials,
 ) -> std::result::Result<(), String> {
+    use fs4::fs_std::FileExt;
+
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
     }
+
+    // Hold an exclusive lock for the entire read-modify-write cycle.
+    // Without this, two concurrent `synaps login` processes can race:
+    // both read the same file, each adds their provider, second write
+    // silently drops the first's credential.
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|e| format!("Failed to lock {}: {}", lock_path.display(), e))?;
 
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)
@@ -79,6 +94,26 @@ fn save_provider_auth_at(
                     error = %e,
                     "auth.json could not be parsed as a JSON object; replacing with a fresh structure"
                 );
+                // Back up the corrupt file so credentials are potentially recoverable.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_extension(format!("json.corrupt.{}", ts));
+                match std::fs::copy(path, &backup) {
+                    Ok(_) => {
+                        eprintln!(
+                            "[warn] auth.json was corrupt and has been reset. Backup saved to: {}",
+                            backup.display()
+                        );
+                    }
+                    Err(copy_err) => {
+                        eprintln!(
+                            "[warn] auth.json was corrupt and has been reset, but backup failed: {}",
+                            copy_err
+                        );
+                    }
+                }
                 serde_json::Map::new()
             }
         }
@@ -94,17 +129,36 @@ fn save_provider_auth_at(
     let json = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;
 
-    std::fs::write(path, &json)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-    // Set file permissions to 600 (owner read/write only)
-    #[cfg(unix)]
+    // Atomic write: write to .tmp then rename. rename(2) is atomic on POSIX.
+    // This prevents a crash/kill between truncate and write from zeroing auth.json.
+    // Create with restrictive permissions from the start so credentials are never
+    // world-readable, even briefly.
+    let tmp_path = path.with_extension("json.tmp");
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create {}: {}", tmp_path.display(), e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            file.set_permissions(perms)
+                .map_err(|e| format!("Failed to set permissions on {}: {}", tmp_path.display(), e))?;
+        }
+
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to fsync {}: {}", tmp_path.display(), e))?;
     }
+
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to atomically replace {}: {}", path.display(), e))?;
 
     Ok(())
 }

@@ -158,19 +158,23 @@ pub async fn run(
     {
         let flag = interrupted.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ).expect("failed to register SIGTERM handler");
-            sigterm.recv().await;
-            flag.store(true, Ordering::Release);
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                    flag.store(true, Ordering::Release);
+                }
+                Err(e) => log(&format!("WARNING: failed to register SIGTERM handler: {e}")),
+            }
         });
         let flag = interrupted.clone();
         tokio::spawn(async move {
-            let mut sighup = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup(),
-            ).expect("failed to register SIGHUP handler");
-            sighup.recv().await;
-            flag.store(true, Ordering::Release);
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(mut sighup) => {
+                    sighup.recv().await;
+                    flag.store(true, Ordering::Release);
+                }
+                Err(e) => log(&format!("WARNING: failed to register SIGHUP handler: {e}")),
+            }
         });
     }
 
