@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::hooks::HookBus;
 use super::hooks::events::HookKind;
-use super::manifest::{ExtensionManifest, HookSubscription};
+use super::manifest::ExtensionManifest;
 use super::permissions::PermissionSet;
 use super::runtime::ExtensionHandler;
 use super::runtime::process::ProcessExtension;
