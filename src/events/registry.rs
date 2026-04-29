@@ -31,10 +31,13 @@ pub fn registry_dir() -> PathBuf {
 /// Rejects path separators, `..`, and non-printable characters.
 /// Returns the sanitized string (replaces unsafe chars with `_`).
 pub fn sanitize_session_id(raw: &str) -> String {
+    // Only allow alphanumeric, hyphens, and underscores. Dots are not needed
+    // in session IDs (format is {name}-{timestamp}-{pid}) and allowing them
+    // complicates path traversal prevention (single-pass ".." replace is
+    // incomplete for "..." inputs).
     raw.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect::<String>()
-        .replace("..", "_")
 }
 
 /// Returns the Unix domain socket path for a session.
