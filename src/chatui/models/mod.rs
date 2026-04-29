@@ -664,6 +664,11 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
     let theme = THEME.load();
     let width = area.width.saturating_sub(10).min(110);
     let height = area.height.saturating_sub(6).min(28);
+    // Guard against tiny terminals where popup dimensions collapse to
+    // zero or near-zero, which can panic in layout splits or produce garbage.
+    if width < 20 || height < 6 {
+        return;
+    }
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect { x, y, width, height };
