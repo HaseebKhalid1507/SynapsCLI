@@ -294,11 +294,15 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
             continue;
         }
         if msg.role == "tool" {
-            out.push(json!({
-                "type": "function_call_output",
-                "call_id": msg.tool_call_id.unwrap_or_default(),
-                "output": msg.content.unwrap_or_default(),
-            }));
+            // Skip tool results with no call_id — sending an empty call_id
+            // to the Codex API would cause a 400 with a confusing error.
+            if let Some(call_id) = msg.tool_call_id {
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": msg.content.unwrap_or_default(),
+                }));
+            }
             continue;
         }
         out.push(json!({
