@@ -79,6 +79,17 @@ fn save_provider_auth_at(
                     error = %e,
                     "auth.json could not be parsed as a JSON object; replacing with a fresh structure"
                 );
+                // Back up the corrupt file so credentials are potentially recoverable.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_extension(format!("json.corrupt.{}", ts));
+                let _ = std::fs::copy(path, &backup);
+                eprintln!(
+                    "[warn] auth.json was corrupt and has been reset. Backup saved to: {}",
+                    backup.display()
+                );
                 serde_json::Map::new()
             }
         }
