@@ -100,11 +100,20 @@ fn save_provider_auth_at(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let backup = path.with_extension(format!("json.corrupt.{}", ts));
-                let _ = std::fs::copy(path, &backup);
-                eprintln!(
-                    "[warn] auth.json was corrupt and has been reset. Backup saved to: {}",
-                    backup.display()
-                );
+                match std::fs::copy(path, &backup) {
+                    Ok(_) => {
+                        eprintln!(
+                            "[warn] auth.json was corrupt and has been reset. Backup saved to: {}",
+                            backup.display()
+                        );
+                    }
+                    Err(copy_err) => {
+                        eprintln!(
+                            "[warn] auth.json was corrupt and has been reset, but backup failed: {}",
+                            copy_err
+                        );
+                    }
+                }
                 serde_json::Map::new()
             }
         }
@@ -122,18 +131,30 @@ fn save_provider_auth_at(
 
     // Atomic write: write to .tmp then rename. rename(2) is atomic on POSIX.
     // This prevents a crash/kill between truncate and write from zeroing auth.json.
+    // Create with restrictive permissions from the start so credentials are never
+    // world-readable, even briefly.
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)
-        .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
-
-    // Set permissions on tmp file BEFORE rename so there's no window where
-    // the final file is world-readable.
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp_path, perms)
-            .map_err(|e| format!("Failed to set permissions on {}: {}", tmp_path.display(), e))?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create {}: {}", tmp_path.display(), e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            file.set_permissions(perms)
+                .map_err(|e| format!("Failed to set permissions on {}: {}", tmp_path.display(), e))?;
+        }
+
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to fsync {}: {}", tmp_path.display(), e))?;
     }
 
     std::fs::rename(&tmp_path, path)
