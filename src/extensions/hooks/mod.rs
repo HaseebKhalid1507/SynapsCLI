@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use super::events::{HookEvent, HookKind, HookResult};
+use self::events::{HookEvent, HookKind, HookResult};
 use crate::extensions::permissions::{Permission, PermissionSet};
 
 /// Default timeout for a single hook handler call.
@@ -23,7 +23,7 @@ const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct HandlerRegistration {
     /// The extension handler.
-    pub handler: Arc<dyn super::super::runtime::ExtensionHandler>,
+    pub handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
     /// Optional tool name filter (None = all tools).
     pub tool_filter: Option<String>,
     /// Permissions granted to this handler's extension.
@@ -53,7 +53,7 @@ impl HookBus {
     pub async fn subscribe(
         &self,
         kind: HookKind,
-        handler: Arc<dyn super::super::runtime::ExtensionHandler>,
+        handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
         tool_filter: Option<String>,
         permissions: PermissionSet,
     ) -> Result<(), String> {
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl super::super::super::runtime::ExtensionHandler for TestHandler {
+    impl super::crate::extensions::runtime::ExtensionHandler for TestHandler {
         fn id(&self) -> &str {
             &self.id
         }
