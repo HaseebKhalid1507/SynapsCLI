@@ -94,17 +94,24 @@ fn save_provider_auth_at(
     let json = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;
 
-    std::fs::write(path, &json)
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    // Atomic write: write to .tmp then rename. rename(2) is atomic on POSIX.
+    // This prevents a crash/kill between truncate and write from zeroing auth.json.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
 
-    // Set file permissions to 600 (owner read/write only)
+    // Set permissions on tmp file BEFORE rename so there's no window where
+    // the final file is world-readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+        std::fs::set_permissions(&tmp_path, perms)
+            .map_err(|e| format!("Failed to set permissions on {}: {}", tmp_path.display(), e))?;
     }
+
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to atomically replace {}: {}", path.display(), e))?;
 
     Ok(())
 }
