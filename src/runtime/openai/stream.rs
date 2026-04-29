@@ -173,8 +173,8 @@ pub(crate) async fn call_codex_stream_inner(
         .or_else(|| crate::auth::extract_codex_account_id(&creds.access))
         .ok_or("Failed to extract ChatGPT account id from Codex token")?;
 
-    let oai_messages = translate::messages_to_oai(messages, system_prompt);
-    let oai_tools = translate::tools_to_oai(tools_schema);
+    let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
+    let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
     let tools: Vec<Value> = oai_tools
         .into_iter()
         .map(|tool| {
@@ -261,7 +261,7 @@ pub(crate) async fn call_codex_stream_inner(
     if !accumulated_text.is_empty() {
         content.push(json!({"type": "text", "text": accumulated_text}));
     }
-    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools));
+    content.extend(translate::tool_calls_to_content_blocks(&parser.completed_tools, &name_map));
 
     Ok(json!({
         "role": "assistant",
