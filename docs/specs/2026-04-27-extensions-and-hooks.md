@@ -1,6 +1,6 @@
 # Spec: Extensions & Hooks
 
-> **Status: 📋 DRAFT — NOT IMPLEMENTED.** 5 blocking questions remain unanswered. No code exists. This spec cannot proceed until the questions are resolved.
+> **Status: 📋 UNBLOCKED — NOT YET IMPLEMENTED.** All 5 blocking questions resolved (S181, 2026-04-29). Ready for task breakdown and implementation. No code exists yet.
 
 **Status:** Draft (awaiting human review)
 **Date:** 2026-04-27
@@ -289,3 +289,17 @@ Coverage expectations:
 
 → Answer these before plan tasks are finalized; they affect 3–5 task
 boundaries.
+
+---
+
+## 9. Decisions (answered S181, 2026-04-29)
+
+| # | Question | Decision |
+|---|----------|----------|
+| 1 | Process protocol | JSON-RPC 2.0 over stdio with `Content-Length:` framing (LSP-style) |
+| 2 | Extension discovery | Reuse existing `plugins/` directory — extensions declared in `plugin.json` |
+| 3 | Trust model | Prompt-on-first-use (matches current plugin behavior) |
+| 4 | Provider refactor scope | OpenAI-compatible first, Anthropic migration as follow-on |
+| 5 | Benchmark tool | Yes — `criterion` as `[dev-dependencies]` |
+
+**Status: UNBLOCKED.** All blocking questions resolved. Ready for task breakdown and implementation.
