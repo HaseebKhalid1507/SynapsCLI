@@ -173,9 +173,11 @@ impl ToolRegistry {
                 let mut out = serde_json::Map::new();
                 for (api_name, value) in obj {
                     let runtime_name = map.api_to_runtime.get(&api_name).cloned().unwrap_or_else(|| api_name.clone());
-                    let value = map.children.get(&api_name)
-                        .map(|child| Self::translate_input_names(value.clone(), child))
-                        .unwrap_or(value);
+                    let value = if let Some(child) = map.children.get(&api_name) {
+                        Self::translate_input_names(value, child)
+                    } else {
+                        value
+                    };
                     out.insert(runtime_name, value);
                 }
                 Value::Object(out)
@@ -228,9 +230,11 @@ impl ToolRegistry {
     }
 
     pub fn translate_input_for_api_tool(&self, tool_name: &str, input: Value) -> Value {
-        self.input_name_maps.get(tool_name)
-            .map(|map| Self::translate_input_names(input.clone(), map))
-            .unwrap_or(input)
+        if let Some(map) = self.input_name_maps.get(tool_name) {
+            Self::translate_input_names(input, map)
+        } else {
+            input
+        }
     }
 
     pub fn tools_schema(&self) -> Arc<Vec<Value>> {
