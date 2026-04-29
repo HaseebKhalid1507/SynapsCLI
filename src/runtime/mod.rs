@@ -55,6 +55,8 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
+    /// Extension hook bus for dispatching events to extensions.
+    hook_bus: Arc<crate::extensions::hooks::HookBus>,
     // Held to keep the reaper task alive for the Runtime's lifetime; never read directly.
     #[allow(dead_code)]
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
@@ -105,6 +107,7 @@ impl Runtime {
             subagent_timeout: 300,
             api_retries: 3,
             session_manager,
+            hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             reaper_handle: Some(reaper_handle),
             reaper_cancel: Some(cancel),
         })
@@ -144,6 +147,11 @@ impl Runtime {
 
     pub fn event_queue(&self) -> &Arc<crate::events::EventQueue> {
         &self.event_queue
+    }
+
+    /// Get a shared reference to the extension hook bus.
+    pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
+        &self.hook_bus
     }
 
     /// Get a shared reference to the tool registry (for MCP lazy loading).
@@ -359,9 +367,24 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                match tool.execute(input, ctx).await {
-                                    Ok(output) => output,
-                                    Err(e) => format!("Tool execution failed: {}", e),
+                                // ═══ HOOK: before_tool_call ═══
+                                let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                    &tool_name, input.clone(),
+                                );
+                                let hook_result = self.hook_bus.emit(&hook_event).await;
+                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                    format!("Tool call blocked by extension: {}", reason)
+                                } else {
+                                    let output = match tool.execute(input, ctx).await {
+                                        Ok(output) => output,
+                                        Err(e) => format!("Tool execution failed: {}", e),
+                                    };
+                                    // ═══ HOOK: after_tool_call ═══
+                                    let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                        &tool_name, serde_json::json!({}), output.clone(),
+                                    );
+                                    let _ = self.hook_bus.emit(&hook_event).await;
+                                    output
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
@@ -563,6 +586,7 @@ impl Clone for Runtime {
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
             session_manager: self.session_manager.clone(),
+            hook_bus: self.hook_bus.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
             reaper_cancel: None,  // Cloned runtimes don't own the reaper
         }
