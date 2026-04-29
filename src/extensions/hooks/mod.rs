@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use self::events::{HookEvent, HookKind, HookResult};
-use crate::extensions::permissions::{Permission, PermissionSet};
+use crate::extensions::permissions::PermissionSet;
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -177,6 +177,7 @@ impl Default for HookBus {
 mod tests {
     use super::*;
     use crate::extensions::hooks::events::HookEvent;
+    use crate::extensions::permissions::Permission;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -202,7 +203,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl super::crate::extensions::runtime::ExtensionHandler for TestHandler {
+    impl crate::extensions::runtime::ExtensionHandler for TestHandler {
         fn id(&self) -> &str {
             &self.id
         }
