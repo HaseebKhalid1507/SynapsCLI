@@ -57,11 +57,26 @@ fn save_provider_auth_at(
     provider: &str,
     creds: &OAuthCredentials,
 ) -> std::result::Result<(), String> {
+    use fs4::fs_std::FileExt;
+
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
     }
+
+    // Hold an exclusive lock for the entire read-modify-write cycle.
+    // Without this, two concurrent `synaps login` processes can race:
+    // both read the same file, each adds their provider, second write
+    // silently drops the first's credential.
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|e| format!("Failed to lock {}: {}", lock_path.display(), e))?;
 
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path)
