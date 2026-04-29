@@ -181,8 +181,14 @@ impl ReadinessDetector {
         }
 
         // Grab the tail to avoid scanning megabytes of scrollback.
+        // Walk forward to the next UTF-8 char boundary to avoid panicking
+        // when multi-byte glyphs (●, ❯, box-drawing, emoji) straddle the cut.
         let tail = if output.len() > PROMPT_TAIL_LEN {
-            &output[output.len() - PROMPT_TAIL_LEN..]
+            let mut start = output.len() - PROMPT_TAIL_LEN;
+            while start < output.len() && !output.is_char_boundary(start) {
+                start += 1;
+            }
+            &output[start..]
         } else {
             output
         };
@@ -424,5 +430,39 @@ mod tests {
         assert!(!det.matches_prompt("user@host:~$ \nstill running..."));
         // Prompt at the end
         assert!(det.matches_prompt("still running...\nuser@host:~$ "));
+    }
+
+    // Regression: multi-byte UTF-8 glyphs at the tail boundary must not panic.
+    // See BUG_REPORT_synaps_ssh_crash.md — starship/powerline prompts with
+    // ●/❯/box-drawing glyphs caused SIGABRT when the byte-offset slice landed
+    // inside a multi-byte sequence.
+    #[test]
+    fn matches_prompt_handles_multibyte_glyph_at_tail_boundary() {
+        let det = hybrid_detector();
+
+        // Build output where a 3-byte char straddles the tail-window cut.
+        // prefix_len puts the start of '●' (3 bytes) exactly 1 byte before
+        // the PROMPT_TAIL_LEN boundary, so a naive slice would land inside it.
+        let prefix_len = PROMPT_TAIL_LEN - 1;
+        let mut output = "x".repeat(prefix_len);
+        output.push('●'); // 3-byte: E2 97 8F
+        output.push_str("\n~/repo on  main\nuser@host:~$ ");
+
+        // Must not panic, and should still detect the prompt.
+        assert!(det.matches_prompt(&output));
+    }
+
+    #[test]
+    fn matches_prompt_handles_4byte_emoji_at_tail_boundary() {
+        let det = hybrid_detector();
+
+        // 4-byte emoji right at the boundary edge
+        for offset in 0..4 {
+            let prefix_len = PROMPT_TAIL_LEN - offset;
+            let mut output = "a".repeat(prefix_len);
+            output.push('🔥'); // 4-byte: F0 9F 94 A5
+            output.push_str("\nuser@host:~$ ");
+            assert!(det.matches_prompt(&output), "panicked at offset {}", offset);
+        }
     }
 }
