@@ -76,9 +76,14 @@ impl ToolRegistry {
             api_to_runtime_names: HashMap::new(),
             input_name_maps: HashMap::new(),
         };
+        // Insert all tools first, then rebuild schema once.
+        // Calling register() in a loop would rebuild_schema() on every
+        // iteration, making initialization O(n²) with MCP tool counts.
         for tool in tool_list {
-            registry.register(tool);
+            let name = tool.name().to_string();
+            registry.tools.insert(name, tool);
         }
+        registry.rebuild_schema();
         registry
     }
 
