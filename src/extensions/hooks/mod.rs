@@ -131,6 +131,16 @@ impl HookBus {
                     // Continue to next handler with modified event
                 }
                 Ok(HookResult::Continue) => {}
+                Ok(HookResult::Inject { content }) => {
+                    tracing::debug!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        len = content.len(),
+                        "Extension injected context"
+                    );
+                    // Return the injection so the caller can use it
+                    return HookResult::Inject { content };
+                }
                 Err(_timeout) => {
                     tracing::warn!(
                         hook = %event.kind.as_str(),

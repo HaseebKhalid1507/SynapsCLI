@@ -100,15 +100,21 @@ impl StreamMethods {
 
             // ═══ HOOK: before_message ═══
             // Fire before sending messages to the LLM. Extensions can inject context.
+            let mut injected_system = system_prompt.clone();
             if let Some(last_user_msg) = messages.last()
                 .and_then(|m| m["content"].as_str())
             {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(last_user_msg);
-                let _ = hook_bus.emit(&hook_event).await;
+                if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
+                    // Prepend injected content to system prompt
+                    let base = injected_system.clone().unwrap_or_default();
+                    injected_system = Some(format!("{content}\n\n{base}"));
+                    tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                }
             }
 
             let response = match ApiMethods::call_api_stream_inner(
-                &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
+                &auth, &client, &model, &tools_snapshot, &injected_system, thinking_budget,
                 &messages, tx.clone(), &cancel, api_retries, &options,
             ).await {
                 Ok(r) => r,

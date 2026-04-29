@@ -197,6 +197,9 @@ pub enum HookResult {
     /// The handler mutated the event payload; the runtime should re-read
     /// the affected fields (e.g. `tool_input`, `message`) before continuing.
     Modify,
+    /// Inject context — the extension provides text to prepend to the
+    /// system prompt or conversation. Used by before_message hooks.
+    Inject { content: String },
 }
 
 impl Default for HookResult {
