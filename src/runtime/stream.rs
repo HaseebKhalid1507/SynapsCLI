@@ -54,7 +54,7 @@ impl StreamMethods {
             tx, cancel, mut steering_rx,
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
-            session_manager, subagent_registry, event_queue,
+            session_manager, subagent_registry, event_queue, hook_bus,
         } = session;
         let mut messages = initial_messages;
 
@@ -104,7 +104,7 @@ impl StreamMethods {
                 .and_then(|m| m["content"].as_str())
             {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(last_user_msg);
-                let _ = session.hook_bus.emit(&hook_event).await;
+                let _ = hook_bus.emit(&hook_event).await;
             }
 
             let response = match ApiMethods::call_api_stream_inner(
