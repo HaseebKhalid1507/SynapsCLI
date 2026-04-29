@@ -1,5 +1,7 @@
 # Spec: Extensions & Hooks
 
+> **Status: 📋 DRAFT — NOT IMPLEMENTED.** 5 blocking questions remain unanswered. No code exists. This spec cannot proceed until the questions are resolved.
+
 **Status:** Draft (awaiting human review)
 **Date:** 2026-04-27
 **Convergence mode:** holdout (per planning skill, fixed at plan time)

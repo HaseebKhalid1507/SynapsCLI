@@ -1,5 +1,7 @@
 # Agent In Shell — Implementation Plan
 
+> **Status: ✅ COMPLETED** — All 10 tasks implemented. Code lives in `src/tools/shell/`. Checkboxes below were never updated but the implementation is complete and in production.
+
 **Branch:** `agent_in_shell`
 **Spec:** `docs/specs/agent-in-shell.md`
 

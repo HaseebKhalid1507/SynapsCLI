@@ -1,5 +1,7 @@
 # Spec: Dynamic Model Catalog + Abstract Model Routing Handlers
 
+> **Status: ✅ IMPLEMENTED** — Shipped in PR #7 (`feat/login-enhancements`). `CatalogModel`, `ModelCatalogProvider` trait, and `ReasoningSupport` enum all exist in `src/runtime/openai/catalog.rs` (1,396 lines). Six provider implementations: OpenRouter, Groq, NVIDIA, Anthropic, Codex, Generic. Registry at `src/runtime/openai/registry.rs` (449 lines). Reasoning params at `src/runtime/openai/reasoning.rs` (109 lines).
+
 Status: Draft for review
 Branch target: `feat/login-enhancements` via a new implementation worktree
 Date: 2026-04-27

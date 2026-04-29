@@ -1,5 +1,7 @@
 # Agent In Shell — Technical Specification
 
+> **Status: ✅ IMPLEMENTED** — Fully shipped. 1,942 lines across 8 files in `src/tools/shell/`. Tools `shell_start`, `shell_send`, `shell_end` are live. PTY management, hybrid readiness detection, session manager, idle reaper — all operational.
+
 **Branch:** `agent_in_shell`
 **Status:** Draft
 **Author:** Jawz (S169)

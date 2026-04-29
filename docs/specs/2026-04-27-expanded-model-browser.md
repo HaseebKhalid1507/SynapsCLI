@@ -1,5 +1,7 @@
 # Models Router: Expanded Provider Model Browser
 
+> **Status: ✅ IMPLEMENTED** — Shipped in PR #7. Model browser TUI at `src/chatui/models/mod.rs` (947 lines) + `src/chatui/models/input.rs` (241 lines). Expanded provider browsing, fuzzy filter, favorites — all live.
+
 ## Assumptions
 1. The existing `/model` and `/models` modal remains the primary curated quick-switcher.
 2. The new "expand models" view is a secondary lightbox inside that modal, used when the curated list is not enough.

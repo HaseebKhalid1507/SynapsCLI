@@ -1,5 +1,7 @@
 # Event Bus Enhancements — Full-Scope Implementation Plan
 
+> **Status: 📋 PLANNED — NOT IMPLEMENTED.** Baseline event system exists (`src/events/`, ~1,262 lines) but none of the enhancements in this plan have been built. No typed EventKind, no durability, no shell hooks, no DLQ.
+
 **Branch home base:** `nightly`  
 **Filename rule:** this effort is called **enhancements**, not v2/v3.  
 **Status:** planning/specification only — no implementation in this checkout.  

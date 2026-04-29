@@ -1,5 +1,7 @@
 # Open Provider Issues
 
+> **Last audited: 2026-04-29 (S181).** Issues 1-4 confirmed still open. Issue 5 confirmed fixed.
+
 Tracked from S176 code review (8-agent review × 2 rounds). These require design decisions or significant implementation work.
 
 ---
