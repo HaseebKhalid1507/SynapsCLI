@@ -303,3 +303,61 @@ boundaries.
 | 5 | Benchmark tool | Yes — `criterion` as `[dev-dependencies]` |
 
 **Status: UNBLOCKED.** All blocking questions resolved. Ready for task breakdown and implementation.
+
+---
+
+## 10. Tool-Specific Hooks (added S181)
+
+Extensions can register hooks that fire only for specific tools, not all tool calls.
+
+### Syntax
+
+```
+before_tool_call           → fires for ALL tool calls
+before_tool_call:bash      → fires ONLY before bash
+after_tool_call:axel_search → fires ONLY after axel_search returns
+```
+
+### Registration (JSON-RPC)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "hooks.subscribe",
+  "params": {
+    "hook": "before_tool_call",
+    "tool": "bash"
+  }
+}
+```
+
+Omitting `"tool"` subscribes to all tool calls (general hook). Specifying `"tool"` filters to that tool name only.
+
+### Dispatch Logic
+
+```rust
+fn emit_before_tool_call(&self, tool_name: &str, input: &Value) {
+    for handler in &self.handlers["before_tool_call"] {
+        // General hooks (no filter) always fire
+        // Tool-specific hooks only fire when name matches
+        if handler.tool_filter.is_none() || handler.tool_filter.as_deref() == Some(tool_name) {
+            handler.call(input);
+        }
+    }
+}
+```
+
+### Priority Use Cases
+
+| Hook | Use Case |
+|------|----------|
+| `after_tool_call:bash` | Index command outputs into Axel brain |
+| `before_tool_call:bash` | Security: block dangerous commands |
+| `after_tool_call:axel_search` | Record search events for pattern detection |
+| `before_tool_call:write` | Enforce code style / linting before writes |
+| `after_tool_call:read` | Track which files the agent accesses |
+| `before_tool_call:subagent` | Inject context before agent delegation |
+
+### Performance
+
+Tool filter check is a single `Option<&str>` comparison — adds ~1ns per handler. No measurable overhead.
