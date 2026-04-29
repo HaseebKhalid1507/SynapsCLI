@@ -608,7 +608,7 @@ pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
         label: "Subagent timeout",
         category: Category::Agent,
         editor: EditorKind::Text { numeric: true },
-        help: "Seconds before a dispatched subagent is cancelled.",
+        help: "Seconds before a dispatched subagent is canceled.",
     },
     SettingDef {
         key: "max_tool_output",

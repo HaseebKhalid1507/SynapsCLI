@@ -49,7 +49,7 @@ pub struct LoadedSkill {
 /// Built-in command names. Keep in sync with the match in
 /// `src/chatui/commands.rs::handle_command`.
 pub const BUILTIN_COMMANDS: &[&str] = &[
-    "clear", "compact", "chain", "model", "system", "thinking", "sessions",
+    "clear", "compact", "chain", "model", "models", "system", "thinking", "sessions",
     "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
     "settings", "plugins", "status", "ping", "keybinds",
 ];

@@ -241,6 +241,7 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub provider: String,
 }
 
 impl std::fmt::Debug for ProviderConfig {

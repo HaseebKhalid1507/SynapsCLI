@@ -3,25 +3,31 @@ use super::types::Event;
 /// Strip any variation of </event> tags (case-insensitive, with whitespace)
 fn regex_strip_event_close(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let lower = s.to_lowercase();
-    let bytes = s.as_bytes();
+    let chars: Vec<char> = s.chars().collect();
+    let lower_chars: Vec<char> = s.to_lowercase().chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
+    while i < chars.len() {
         // Check for </ event > pattern at current position
-        if i + 7 < bytes.len() && &lower[i..i+2] == "</" {
+        if i + 7 < chars.len() && lower_chars[i] == '<' && lower_chars[i + 1] == '/' {
             // Scan for "event" after optional whitespace
             let mut j = i + 2;
-            while j < bytes.len() && lower.as_bytes()[j] == b' ' { j += 1; }
-            if j + 5 <= bytes.len() && &lower[j..j+5] == "event" {
+            while j < chars.len() && lower_chars[j] == ' ' { j += 1; }
+            if j + 5 <= chars.len()
+                && lower_chars[j] == 'e'
+                && lower_chars[j + 1] == 'v'
+                && lower_chars[j + 2] == 'e'
+                && lower_chars[j + 3] == 'n'
+                && lower_chars[j + 4] == 't'
+            {
                 let mut k = j + 5;
-                while k < bytes.len() && lower.as_bytes()[k] == b' ' { k += 1; }
-                if k < bytes.len() && bytes[k] == b'>' {
+                while k < chars.len() && lower_chars[k] == ' ' { k += 1; }
+                if k < chars.len() && chars[k] == '>' {
                     i = k + 1; // skip the entire closing tag
                     continue;
                 }
             }
         }
-        result.push(s.as_bytes()[i] as char);
+        result.push(chars[i]);
         i += 1;
     }
     result

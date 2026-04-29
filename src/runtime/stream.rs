@@ -144,24 +144,24 @@ impl StreamMethods {
 
                 // Channel for dynamic tool registration (MCP connect uses this)
                 let (tool_reg_tx, mut tool_reg_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
-                // blocks". On cancellation we synthesize a "Cancelled by user" result for any
+                // blocks". On cancellation we synthesize a "Canceled by user" result for any
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
-                let mut cancelled = false;
+                let mut canceled = false;
 
                 if cancel.is_cancelled() {
-                    // Already cancelled before tool execution — fill all with cancel results
+                    // Already canceled before tool execution — fill all with cancel results
                     for tool_use in &tool_uses {
                         let tool_id = tool_use["id"].as_str().unwrap_or("").to_string();
                         if !tool_id.is_empty() {
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
-                                "content": "Cancelled by user"
+                                "content": "Canceled by user"
                             }));
                         }
                     }
-                    cancelled = true;
+                    canceled = true;
                 } else if tool_uses.len() == 1 {
                     // Single tool — run inline with delta streaming + cancellation
                     let tool_use = &tool_uses[0];
@@ -181,6 +181,7 @@ impl StreamMethods {
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
+                                let input = tools.read().await.translate_input_for_api_tool(&tool_name, input);
                                 let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 let tx_k = tx.clone();
                                 let t_id = tool_id.clone();
@@ -205,8 +206,8 @@ impl StreamMethods {
                                         }
                                     }
                                     _ = cancel.cancelled() => {
-                                        cancelled = true;
-                                        "Cancelled by user".to_string()
+                                        canceled = true;
+                                        "Canceled by user".to_string()
                                     }
                                 }
                             }
@@ -250,7 +251,10 @@ impl StreamMethods {
                             continue;
                         }
 
-                        let tool = tools.read().await.get(&tool_name).cloned();
+                        let tools_snapshot = tools.read().await;
+                        let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                        let tool = tools_snapshot.get(&tool_name).cloned();
+                        drop(tools_snapshot);
                         let tx_stream = tx.clone();
                         let cancel_token = cancel.clone();
                         let exit_path = watcher_exit_path.clone();
@@ -286,7 +290,7 @@ impl StreamMethods {
                                             }
                                         }
                                         _ = cancel_token.cancelled() => {
-                                            (true, "Cancelled by user".to_string())
+                                            (true, "Canceled by user".to_string())
                                         }
                                     }
                                 }
@@ -306,8 +310,8 @@ impl StreamMethods {
                     let mut results_map = std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
                         match res {
-                            Ok((tool_id, was_cancelled, result)) => {
-                                if was_cancelled { cancelled = true; }
+                            Ok((tool_id, was_canceled, result)) => {
+                                if was_canceled { canceled = true; }
                                 results_map.insert(tool_id, result);
                             }
                             Err(e) => {
@@ -320,7 +324,7 @@ impl StreamMethods {
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
                             let result = results_map.remove(tool_id)
-                                .unwrap_or_else(|| "Cancelled by user".to_string());
+                                .unwrap_or_else(|| "Canceled by user".to_string());
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -346,7 +350,7 @@ impl StreamMethods {
                     "content": tool_results
                 }));
 
-                if cancelled {
+                if canceled {
                     // Send final history on cancellation so session can be saved
                     let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                     return Ok(());

@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 pub mod types;
 pub mod wire;
 pub mod registry;
+pub mod catalog;
+pub mod reasoning;
 pub mod translate;
 pub mod stream;
 pub mod ping;
@@ -26,6 +28,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI-compatible provider with a resolved config.
     OpenAi(ProviderConfig),
+    /// ChatGPT subscription-backed Codex responses endpoint.
+    Codex(ProviderConfig),
     /// Known provider prefix but no API key configured.
     MissingKey(String),
 }
@@ -37,6 +41,12 @@ pub enum Provider {
 /// - anything else → `Anthropic` (backward compat)
 pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> Provider {
     if let Some((prefix, _rest)) = model.split_once('/') {
+        if prefix == "openai-codex" {
+            if let Some(cfg) = registry::resolve_codex_shorthand(model) {
+                return Provider::Codex(cfg);
+            }
+            return Provider::MissingKey(prefix.to_string());
+        }
         if prefix == "local" || registry::providers().iter().any(|s| s.key == prefix) {
             if let Some(cfg) = registry::resolve_shorthand(model, provider_keys) {
                 return Provider::OpenAi(cfg);
@@ -65,12 +75,20 @@ pub async fn try_route(
     tx: &tokio::sync::mpsc::UnboundedSender<crate::runtime::types::StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     let provider_keys = crate::core::config::get_provider_keys();
     match resolve_route(model, &provider_keys) {
         Provider::OpenAi(cfg) => {
             let result = stream::call_oai_stream_inner(
+                &cfg, client, tools_schema, system_prompt, messages, tx,
+                temperature, max_tokens, thinking_budget, cancel,
+            ).await;
+            Some(result)
+        }
+        Provider::Codex(cfg) => {
+            let result = stream::call_codex_stream_inner(
                 &cfg, client, tools_schema, system_prompt, messages, tx,
                 temperature, max_tokens, cancel,
             ).await;
@@ -82,6 +100,24 @@ pub async fn try_route(
                 "No API key for '{}'. Set provider.{} in ~/.synaps-cli/config or the corresponding env var.",
                 provider, provider
             ).into()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_openai_codex_without_requiring_eager_credentials() {
+        std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
+        match resolve_route("openai-codex/gpt-5.1-codex-mini", &BTreeMap::new()) {
+            Provider::Codex(cfg) => {
+                assert_eq!(cfg.provider, "openai-codex");
+                assert_eq!(cfg.model, "gpt-5.1-codex-mini");
+                assert!(cfg.base_url.contains("chatgpt.com/backend-api"));
+            }
+            other => panic!("expected Codex route, got {other:?}"),
         }
     }
 }

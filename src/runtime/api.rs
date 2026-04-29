@@ -32,6 +32,22 @@ pub struct ApiOptions {
 pub(super) struct ApiMethods;
 
 impl ApiMethods {
+    /// Concatenate the `text` fields of every block in an Anthropic-shaped
+    /// response `content` array. Returns the empty string if the value is
+    /// not an array or contains no text blocks.
+    fn concat_response_text(response: &Value) -> String {
+        response["content"]
+            .as_array()
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    }
+
     /// Build the auth header for Anthropic requests.
     /// Returns `(header_name, header_value, auth_type)`.
     async fn build_auth_header(auth: &Arc<RwLock<AuthState>>) -> (String, String, String) {
@@ -101,7 +117,7 @@ impl ApiMethods {
         let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, cancel,
+            None, None, thinking_budget, cancel,
         ).await {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
@@ -200,7 +216,7 @@ impl ApiMethods {
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
-                        return Err(RuntimeError::Cancelled);
+                        return Err(RuntimeError::Canceled);
                     }
                 }
 
@@ -525,7 +541,7 @@ impl ApiMethods {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, &tokio_util::sync::CancellationToken::new(),
+            None, None, thinking_budget, &tokio_util::sync::CancellationToken::new(),
         ).await {
             drop(tx);
             while rx.recv().await.is_some() {}
@@ -707,6 +723,30 @@ impl ApiMethods {
         messages: &[Value],
         max_retries: u32,
     ) -> Result<String> {
+        let tools_schema = Arc::new(Vec::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let routed_system_prompt = Some(system_prompt.to_string());
+        if let Some(result) = crate::runtime::openai::try_route(
+            model,
+            client,
+            &tools_schema,
+            &routed_system_prompt,
+            messages,
+            &tx,
+            None,
+            None,
+            thinking_budget,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
+            drop(tx);
+            while rx.recv().await.is_some() {}
+            let response =
+                result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
+            return Ok(Self::concat_response_text(&response));
+        }
+
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
         let mut body = json!({
@@ -836,5 +876,47 @@ impl ApiMethods {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod concat_response_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_text_from_single_block() {
+        let v = json!({"content": [{"type": "text", "text": "hello"}]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "hello");
+    }
+
+    #[test]
+    fn concatenates_multiple_text_blocks() {
+        let v = json!({"content": [
+            {"type": "text", "text": "alpha "},
+            {"type": "text", "text": "beta"},
+        ]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "alpha beta");
+    }
+
+    #[test]
+    fn skips_non_text_blocks() {
+        let v = json!({"content": [
+            {"type": "tool_use", "name": "bash"},
+            {"type": "text", "text": "result"},
+        ]});
+        assert_eq!(ApiMethods::concat_response_text(&v), "result");
+    }
+
+    #[test]
+    fn returns_empty_for_missing_content() {
+        let v = json!({"role": "assistant"});
+        assert_eq!(ApiMethods::concat_response_text(&v), "");
+    }
+
+    #[test]
+    fn returns_empty_for_non_array_content() {
+        let v = json!({"content": "stringified"});
+        assert_eq!(ApiMethods::concat_response_text(&v), "");
     }
 }

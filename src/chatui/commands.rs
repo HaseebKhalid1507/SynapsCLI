@@ -37,6 +37,8 @@ pub(super) enum CommandAction {
     Quit,
     /// Launch the casino (requires dropping/recreating EventStream).
     LaunchGamba,
+    /// Open the /model(s) router modal.
+    OpenModels,
     /// Open the /settings modal.
     OpenSettings,
     /// Open the /plugins modal.
@@ -165,15 +167,13 @@ pub(super) async fn handle_command(
             app.session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
-        "model" => {
+        "model" | "models" => {
             if arg.is_empty() {
-                app.push_msg(ChatMessage::System(
-                    format!("current model: {}", runtime.model())
-                ));
+                return CommandAction::OpenModels;
             } else {
                 runtime.set_model(arg.to_string());
                 app.push_msg(ChatMessage::System(
-                    format!("model set to: {}", arg)
+                    format!("model set to: {}", runtime.model())
                 ));
             }
         }
@@ -314,7 +314,7 @@ pub(super) async fn handle_command(
                 "/chain name <name> — bookmark current session as <name> (auto-advances on compaction)",
                 "/chain unname <name> — delete a named chain",
                 "/saveas [name] — name the current session, or clear if empty",
-                "/model [name] — show or set model (e.g. groq/llama-3.3-70b-versatile)",
+                "/model, /models — open model router; /model <name> still sets directly",
                 "/system <prompt|show|save> — system prompt",
                 "/thinking [low|medium|high|xhigh] — thinking budget",
                 "/sessions — list saved sessions",
@@ -498,7 +498,7 @@ mod tests {
     fn commands() -> Vec<String> {
         vec![
             "clear".into(), "compact".into(), "chain".into(), "model".into(),
-            "system".into(), "thinking".into(), "sessions".into(), "resume".into(),
+            "models".into(), "system".into(), "thinking".into(), "sessions".into(), "resume".into(),
             "saveas".into(), "theme".into(), "gamba".into(), "help".into(),
             "quit".into(), "exit".into(), "settings".into(), "plugins".into(),
             "status".into(),

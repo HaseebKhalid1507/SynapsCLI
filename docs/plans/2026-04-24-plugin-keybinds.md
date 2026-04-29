@@ -1,5 +1,7 @@
 # Plugin Keybinds — Design Spec
 
+> **Status: ✅ IMPLEMENTED** — Keybind registry at `src/skills/keybinds.rs` (575 lines). Fully wired into `src/chatui/input.rs` — `keybind_registry` is passed to `handle_event()` and `match_key()` runs before core binds. Plugin keybinds from `plugin.json` are registered and active.
+
 **Goal:** Let plugins register custom keyboard shortcuts in the TUI. Users see keybinds in settings, plugins get a clean declaration surface, core binds are never overridable.
 
 **Branch:** `feat/plugin-keybinds`

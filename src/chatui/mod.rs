@@ -12,6 +12,7 @@ mod input;
 mod stream_handler;
 mod settings;
 mod plugins;
+mod models;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -285,6 +286,25 @@ pub async fn run(
         })
     };
 
+    // Start per-session Unix socket listener + register in session registry
+    let socket_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session_socket_path = synaps_cli::events::registry::socket_path_for_session(&app.session.id);
+    let socket_task = synaps_cli::events::socket::listen_session_socket(
+        session_socket_path.clone(),
+        runtime.event_queue().clone(),
+        socket_shutdown.clone(),
+    );
+    let session_registration = synaps_cli::events::registry::SessionRegistration {
+        session_id: app.session.id.clone(),
+        name: app.session.name.clone(),
+        socket_path: session_socket_path.clone(),
+        pid: std::process::id(),
+        started_at: chrono::Utc::now(),
+    };
+    if let Err(e) = synaps_cli::events::registry::register_session(&session_registration) {
+        tracing::warn!("Failed to register session: {}", e);
+    }
+
 
     // ── Event loop ──
     loop {
@@ -321,6 +341,15 @@ pub async fn run(
                     None => {
                         // All ping tasks done (tx dropped) — stop printing
                         app.ping_print = false;
+                    }
+                }
+            }
+
+            // ── Expanded model-list results ──
+            result = app.model_list_rx.recv() => {
+                if let Some((provider_key, models_result)) = result {
+                    if let Some(state) = app.models.as_mut() {
+                        models::set_expanded_models(state, &provider_key, models_result);
                     }
                 }
             }
@@ -532,6 +561,9 @@ pub async fn run(
                                             }
                                         }
                                         event_reader = EventStream::new();
+                                    }
+                                    CommandAction::OpenModels => {
+                                        app.models = Some(models::ModelsModalState::new());
                                     }
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
@@ -860,6 +892,7 @@ pub async fn run(
                                             event_reader = EventStream::new();
                                         }
                                         CommandAction::StartStream => {}
+                                        CommandAction::OpenModels => {}
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
                                         CommandAction::ReloadPlugins => {}
@@ -885,6 +918,50 @@ pub async fn run(
                                     }
                                     app.queued_message = Some(input);
                                 }
+                            }
+                            InputAction::ModelsApply(model) => {
+                                runtime.set_model(model.clone());
+                                let applied = runtime.model().to_string();
+                                let _ = synaps_cli::config::write_config_value("model", &applied);
+                                app.session.model = applied.clone();
+                                app.push_msg(ChatMessage::System(format!("model set to: {}", applied)));
+                            }
+                            InputAction::ModelsExpandProvider(provider_key) => {
+                                let client = runtime.http_client().clone();
+                                let provider_keys = synaps_cli::config::get_provider_keys();
+                                let tx = app.model_list_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = synaps_cli::runtime::openai::catalog::fetch_catalog_models(
+                                        &client,
+                                        &provider_key,
+                                        &provider_keys,
+                                    ).await.map(|models| {
+                                        models.into_iter().map(|model| {
+                                            let full_id = model.runtime_id();
+                                            let label = model.display_label().to_string();
+                                            let mut metadata = Vec::new();
+                                            if let Some(context) = model.context_tokens {
+                                                metadata.push(if context >= 1_000_000 {
+                                                    format!("{}M ctx", context / 1_000_000)
+                                                } else if context >= 1_000 {
+                                                    format!("{}K ctx", context / 1_000)
+                                                } else {
+                                                    format!("{context} ctx")
+                                                });
+                                            }
+                                            match model.reasoning {
+                                                synaps_cli::runtime::openai::catalog::ReasoningSupport::None => {}
+                                                synaps_cli::runtime::openai::catalog::ReasoningSupport::Unknown => {}
+                                                _ => metadata.push("thinking".to_string()),
+                                            }
+                                            if model.pricing.has_internal_reasoning_cost() {
+                                                metadata.push("reasoning $".to_string());
+                                            }
+                                            models::ExpandedModelEntry::with_metadata(full_id, label, false, metadata)
+                                        }).collect()
+                                    });
+                                    let _ = tx.send((provider_key, result));
+                                });
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
@@ -1066,6 +1143,11 @@ pub async fn run(
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher_task.abort();
+
+    // Shut down per-session socket + unregister from registry
+    socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    socket_task.abort();
+    synaps_cli::events::registry::unregister_session(&app.session.id);
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();
