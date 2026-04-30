@@ -1,8 +1,8 @@
 # Spec: Extensions & Hooks
 
-> **Status: 📋 UNBLOCKED — NOT YET IMPLEMENTED.** All 5 blocking questions resolved (S181, 2026-04-29). Ready for task breakdown and implementation. No code exists yet.
+> **Status: ✅ IMPLEMENTED (Phase 1).** Core extension system shipped in S181. Process-based JSON-RPC hooks, permission model, HookBus dispatch, and TUI integration are live on dev.
 
-**Status:** Draft (awaiting human review)
+**Status:** Implemented (Phase 1)
 **Date:** 2026-04-27
 **Convergence mode:** holdout (per planning skill, fixed at plan time)
 
