@@ -54,5 +54,9 @@
     "tools.override",
     "tools.register",
     "providers.register"
-  ]
+  ],
+  "matchers": {
+    "input_contains": "substring match against JSON-stringified tool_input",
+    "input_equals": "exact JSON equality against tool_input"
+  }
 }

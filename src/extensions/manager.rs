@@ -105,9 +105,9 @@ impl ExtensionManager {
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
 
         // Register hook subscriptions
-        for (kind, tool_filter) in subscriptions {
+        for (kind, tool_filter, matcher) in subscriptions {
             self.hook_bus
-                .subscribe(kind, handler.clone(), tool_filter, permissions.clone())
+                .subscribe(kind, handler.clone(), tool_filter, matcher, permissions.clone())
                 .await?;
         }
 
@@ -360,6 +360,7 @@ mod tests {
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
+                matcher: None,
             }],
         };
 

@@ -153,6 +153,7 @@ async fn manager_rejects_bad_manifest_before_spawning_process() {
         hooks: vec![HookSubscription {
             hook: "before_tool_call".to_string(),
             tool: Some("bash".to_string()),
+            matcher: None,
         }],
     };
 

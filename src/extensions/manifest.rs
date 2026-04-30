@@ -37,7 +37,7 @@ pub struct ExtensionManifest {
 #[derive(Debug, Clone)]
 pub struct ValidatedExtensionManifest {
     pub permissions: PermissionSet,
-    pub subscriptions: Vec<(HookKind, Option<String>)>,
+    pub subscriptions: Vec<(HookKind, Option<String>, Option<HookMatcher>)>,
 }
 
 impl ExtensionManifest {
@@ -79,7 +79,7 @@ impl ExtensionManifest {
                     kind.as_str(),
                 ));
             }
-            subscriptions.push((kind, sub.tool.clone()));
+            subscriptions.push((kind, sub.tool.clone(), sub.matcher.clone()));
         }
 
         Ok(ValidatedExtensionManifest {
@@ -104,6 +104,18 @@ pub struct HookSubscription {
     /// Optional tool filter (e.g. "bash" for tool-specific hooks)
     #[serde(default)]
     pub tool: Option<String>,
+    /// Optional simple matcher conditions.
+    #[serde(default, rename = "match")]
+    pub matcher: Option<HookMatcher>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HookMatcher {
+    #[serde(default)]
+    pub input_contains: Option<String>,
+    #[serde(default)]
+    pub input_equals: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -215,6 +227,7 @@ mod tests {
             hooks: vec![HookSubscription {
                 hook: "before_tool_call".to_string(),
                 tool: None,
+                matcher: None,
             }],
         };
 
@@ -233,6 +246,7 @@ mod tests {
             hooks: vec![HookSubscription {
                 hook: "on_session_start".to_string(),
                 tool: Some("bash".to_string()),
+                matcher: None,
             }],
         };
 
@@ -253,6 +267,7 @@ mod tests {
             hooks: vec![HookSubscription {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
+                matcher: None,
             }],
         };
 
@@ -275,5 +290,24 @@ mod tests {
         let rt = ExtensionRuntime::Process;
         let json = serde_json::to_string(&rt).unwrap();
         assert_eq!(json, r#""process""#);
+    }
+}
+
+
+impl HookMatcher {
+    pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
+        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
+        if let Some(expected) = &self.input_equals {
+            if input != expected {
+                return false;
+            }
+        }
+        if let Some(needle) = &self.input_contains {
+            let haystack = serde_json::to_string(input).unwrap_or_default();
+            if !haystack.contains(needle) {
+                return false;
+            }
+        }
+        true
     }
 }
