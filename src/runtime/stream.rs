@@ -219,6 +219,7 @@ impl StreamMethods {
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                let input_for_hook = input.clone();
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
                                         channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
@@ -231,7 +232,7 @@ impl StreamMethods {
                                         };
                                         // ═══ HOOK: after_tool_call (stream single) ═══
                                         let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                            &tool_name, serde_json::json!({}), output.clone(),
+                                            &tool_name, input_for_hook, output.clone(),
                                         );
                                         let _ = hook_bus.emit(&hook_event).await;
                                         output
@@ -308,6 +309,7 @@ impl StreamMethods {
                                     if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                         (false, format!("Tool call blocked by extension: {}", reason))
                                     } else {
+                                    let input_for_hook = input.clone();
                                     let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     let tx_k = tx_stream.clone();
                                     let t_id = tool_id.clone();
@@ -332,7 +334,7 @@ impl StreamMethods {
                                             };
                                             // ═══ HOOK: after_tool_call (stream parallel) ═══
                                             let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                                &tool_name_for_hook, serde_json::json!({}), output.clone(),
+                                                &tool_name_for_hook, input_for_hook, output.clone(),
                                             );
                                             let _ = hook_bus_inner.emit(&hook_event).await;
                                             (false, output)

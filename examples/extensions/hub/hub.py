@@ -172,7 +172,11 @@ def handle_hook(params):
         else:
             agent_name = ""
 
-        if agent_name and agent_name in state.agents:
+        # For inline subagents (no agent name), use "unknown"
+        if not agent_name:
+            agent_name = "unknown"
+
+        if agent_name in state.agents:
             # Complete the oldest active task for this agent
             agent = state.agents[agent_name]
             active = [t for t in agent.tasks.values() if t.status == "working"]
