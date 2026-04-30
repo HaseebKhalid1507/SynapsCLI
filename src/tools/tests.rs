@@ -463,6 +463,54 @@ fn test_resolve_agent_prompt_path_not_found() {
     assert!(error.contains("Failed to read agent file"));
 }
 
+#[test]
+fn test_resolve_agent_prompt_blank_rejected_without_agent_lookup() {
+    let result = resolve_agent_prompt("");
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.contains("Empty 'agent' parameter"));
+    assert!(!error.contains("agents/.md"));
+}
+
+#[tokio::test]
+async fn test_subagent_start_blank_agent_uses_system_prompt() {
+    use std::sync::{Arc, Mutex};
+
+    let tool = SubagentStartTool;
+    let mut ctx = create_tool_context();
+    ctx.capabilities.subagent_registry = Some(Arc::new(Mutex::new(SubagentRegistry::new())));
+
+    let params = json!({
+        "agent": "",
+        "system_prompt": "You are a concise test subagent. Reply with only: ok",
+        "task": "Say ok",
+        "model": "claude-sonnet-4-6",
+        "timeout": 1
+    });
+
+    let result = tool.execute(params, ctx).await;
+    assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+    let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+    assert_eq!(body["agent_name"], "inline");
+    assert!(body["handle_id"].as_str().unwrap_or_default().starts_with("sa_"));
+}
+
+#[tokio::test]
+async fn test_subagent_blank_agent_uses_system_prompt() {
+    let tool = SubagentTool;
+    let ctx = create_tool_context();
+    let params = json!({
+        "agent": "",
+        "system_prompt": "You are a concise test subagent. Reply with only: ok",
+        "task": "Say ok",
+        "model": "claude-sonnet-4-6",
+        "timeout": 1
+    });
+
+    let result = tool.execute(params, ctx).await;
+    assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+}
+
 #[tokio::test]
 async fn test_grep_tool_execution() {
     let temp_dir = std::env::temp_dir();
