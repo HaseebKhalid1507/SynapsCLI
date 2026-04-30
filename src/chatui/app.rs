@@ -342,6 +342,15 @@ impl App {
         self.line_cache = None;
     }
 
+    /// Returns true when the chat message at `idx` is the tool result currently
+    /// being streamed/executed. Completed historical tool results must render as
+    /// done even while a later tool call is active.
+    pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
+        self.tool_start_time.is_some()
+            && idx == self.messages.len().saturating_sub(1)
+            && matches!(self.messages.get(idx).map(|m| &m.msg), Some(ChatMessage::ToolResult { elapsed_ms: None, .. }))
+    }
+
     /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
     pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
         // Walk backwards from idx to find the preceding ToolUse
@@ -638,4 +647,54 @@ impl App {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(Session::new("test-model", "low", None))
+    }
+
+    #[test]
+    fn active_tool_result_is_only_latest_incomplete_result() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "first output".to_string(),
+            elapsed_ms: None,
+        });
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "second output".to_string(),
+            elapsed_ms: None,
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+
+        assert!(!app.is_active_tool_result(1), "completed historical result must render done while later tool runs");
+        assert!(app.is_active_tool_result(3), "latest incomplete result is the actively running tool result");
+    }
+
+    #[test]
+    fn completed_latest_tool_result_is_not_active() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "done".to_string(),
+            elapsed_ms: Some(25),
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+
+        assert!(!app.is_active_tool_result(1));
+    }
 }
