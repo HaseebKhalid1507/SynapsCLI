@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::skills::LoadedSkill;
+use crate::skills::{LoadedSkill, Plugin};
 
 #[derive(Debug, Clone)]
 pub struct PluginSummary {
@@ -11,12 +11,23 @@ pub struct PluginSummary {
 }
 
 /// Resolution outcome for a typed slash command.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct RegisteredPluginCommand {
+    pub plugin: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub plugin_root: std::path::PathBuf,
+}
+
 pub enum Resolution {
     /// A built-in command (dispatched via existing handle_command).
     Builtin,
     /// A single unambiguous skill.
     Skill(Arc<LoadedSkill>),
+    /// A plugin command from plugin.json `commands`.
+    PluginCommand(Arc<RegisteredPluginCommand>),
     /// Multiple skills share this unqualified name; user must qualify.
     Ambiguous(Vec<String>), // list of plugin-qualified names
     /// No such command.
@@ -26,6 +37,7 @@ pub enum Resolution {
 struct Inner {
     skills: HashMap<String, Vec<Arc<LoadedSkill>>>, // unqualified name -> all matches
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
+    plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>>, // "plugin:cmd" -> single
 }
 
 pub struct CommandRegistry {
@@ -35,23 +47,49 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn new(builtins: &[&'static str], skills: Vec<LoadedSkill>) -> Self {
+        Self::new_with_plugins(builtins, skills, vec![])
+    }
+
+    pub fn new_with_plugins(builtins: &[&'static str], skills: Vec<LoadedSkill>, plugins: Vec<Plugin>) -> Self {
         let r = CommandRegistry {
             builtins: builtins.to_vec(),
             inner: RwLock::new(Inner {
                 skills: HashMap::new(),
                 qualified: HashMap::new(),
+                plugin_commands: HashMap::new(),
             }),
         };
-        r.rebuild_with(skills);
+        r.rebuild_with_plugins(skills, plugins);
         r
     }
 
     /// Atomically replace the skill set. Built-ins are unchanged.
     pub fn rebuild_with(&self, skills: Vec<LoadedSkill>) {
+        self.rebuild_with_plugins(skills, vec![]);
+    }
+
+    /// Atomically replace the skill and plugin-command set. Built-ins are unchanged.
+    pub fn rebuild_with_plugins(&self, skills: Vec<LoadedSkill>, plugins: Vec<Plugin>) {
         let builtins_set: std::collections::HashSet<&str> =
             self.builtins.iter().copied().collect();
         let mut new_skills: HashMap<String, Vec<Arc<LoadedSkill>>> = HashMap::new();
         let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
+        let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
+        for plugin in plugins {
+            if let Some(manifest) = plugin.manifest {
+                for cmd in manifest.commands {
+                    let q = format!("{}:{}", manifest.name, cmd.name);
+                    new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
+                        plugin: manifest.name.clone(),
+                        name: cmd.name,
+                        description: cmd.description,
+                        command: cmd.command,
+                        args: cmd.args,
+                        plugin_root: plugin.root.clone(),
+                    }));
+                }
+            }
+        }
         for s in skills {
             let arc = Arc::new(s);
             // Unqualified entry
@@ -74,11 +112,15 @@ impl CommandRegistry {
         let mut w = self.inner.write().unwrap();
         w.skills = new_skills;
         w.qualified = new_qualified;
+        w.plugin_commands = new_plugin_commands;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
         let r = self.inner.read().unwrap();
         if cmd.contains(':') {
+            if let Some(c) = r.plugin_commands.get(cmd) {
+                return Resolution::PluginCommand(c.clone());
+            }
             return match r.qualified.get(cmd) {
                 Some(s) => Resolution::Skill(s.clone()),
                 None => Resolution::Unknown,
@@ -103,6 +145,7 @@ impl CommandRegistry {
         let r = self.inner.read().unwrap();
         let mut v: Vec<String> = self.builtins.iter().map(|s| s.to_string()).collect();
         v.extend(r.skills.keys().cloned());
+        v.extend(r.plugin_commands.keys().cloned());
         v.sort();
         v.dedup();
         v
@@ -112,6 +155,12 @@ impl CommandRegistry {
         let r = self.inner.read().unwrap();
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for c in r.plugin_commands.values() {
+            let key = (c.plugin.clone(), c.name.clone());
+            if seen.insert(key) {
+                *counts.entry(c.plugin.clone()).or_insert(0) += 0;
+            }
+        }
         for s in r.qualified.values() {
             if let Some(ref p) = s.plugin {
                 let key = (p.clone(), s.name.clone());
@@ -148,6 +197,29 @@ impl CommandRegistry {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use crate::skills::manifest::ManifestCommand;
+
+    fn mk_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
+        Plugin {
+            name: plugin.to_string(),
+            root,
+            marketplace: None,
+            version: None,
+            description: None,
+            manifest: Some(crate::skills::manifest::PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                commands: vec![ManifestCommand {
+                    name: name.to_string(),
+                    description: Some("desc".to_string()),
+                    command: "printf".to_string(),
+                    args: vec!["hi".to_string()],
+                }],
+            }),
+        }
+    }
 
     fn mk(name: &str, plugin: Option<&str>) -> LoadedSkill {
         LoadedSkill {
@@ -273,6 +345,28 @@ mod tests {
         r.rebuild_with(vec![mk("b", None)]);
         assert!(matches!(r2.resolve("b"), Resolution::Skill(_)));
         assert!(matches!(r2.resolve("a"), Resolution::Unknown));
+    }
+
+    #[test]
+    fn resolve_qualified_plugin_command() {
+        let r = CommandRegistry::new_with_plugins(&[], vec![], vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))]);
+        match r.resolve("p:hello") {
+            Resolution::PluginCommand(cmd) => {
+                assert_eq!(cmd.plugin, "p");
+                assert_eq!(cmd.name, "hello");
+                assert_eq!(cmd.command, "printf");
+                assert_eq!(cmd.plugin_root, PathBuf::from("/tmp/p"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn all_commands_includes_qualified_plugin_commands() {
+        let r = CommandRegistry::new_with_plugins(&["help"], vec![], vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))]);
+        let cmds = r.all_commands();
+        assert!(cmds.contains(&"help".to_string()));
+        assert!(cmds.contains(&"p:hello".to_string()));
     }
 
     #[test]

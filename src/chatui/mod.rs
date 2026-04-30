@@ -75,6 +75,7 @@ fn command_action_name(action: &CommandAction) -> &'static str {
         CommandAction::OpenPlugins => "plugins",
         CommandAction::ReloadPlugins => "plugins-reload",
         CommandAction::LoadSkill { .. } => "load-skill",
+        CommandAction::PluginCommand { .. } => "plugin-command",
         CommandAction::Compact { .. } => "compact",
         CommandAction::Ping => "ping",
         CommandAction::Chain => "chain",
@@ -840,6 +841,26 @@ pub async fn run(
                                         cancel_token = Some(ct);
                                         steer_tx = Some(s_tx);
                                     }
+                                    CommandAction::PluginCommand { command, arg } => {
+                                        match synaps_cli::skills::commands::execute_plugin_command(&command, &arg).await {
+                                            Ok(output) => {
+                                                let mut lines = vec![format!(
+                                                    "plugin command /{}:{} exited with {}",
+                                                    command.plugin,
+                                                    command.name,
+                                                    output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                                                )];
+                                                if !output.stdout.trim().is_empty() {
+                                                    lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
+                                                }
+                                                if !output.stderr.trim().is_empty() {
+                                                    lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
+                                                }
+                                                app.push_msg(ChatMessage::System(lines.join("\n")));
+                                            }
+                                            Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
+                                        }
+                                    }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).
                                         if app.api_messages.len() < 4 {
@@ -1162,8 +1183,9 @@ let display_text = app.user_display_text_for_submission(&input);
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
                                         CommandAction::ReloadPlugins => {}
-                                        // handle_streaming_command never returns LoadSkill or Compact.
+                                        // handle_streaming_command never returns LoadSkill, PluginCommand, or Compact.
                                         CommandAction::LoadSkill { .. } => {}
+                                        CommandAction::PluginCommand { .. } => {}
                                         CommandAction::Compact { .. } => {}
                                         CommandAction::Chain => {}
                                         CommandAction::ChainList => {}

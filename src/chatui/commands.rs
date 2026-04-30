@@ -50,6 +50,11 @@ pub(super) enum CommandAction {
         skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
         arg: String,
     },
+    /// Execute a plugin manifest command.
+    PluginCommand {
+        command: std::sync::Arc<synaps_cli::skills::registry::RegisteredPluginCommand>,
+        arg: String,
+    },
     /// Compact the conversation history into a summary.
     Compact {
         custom_instructions: Option<String>,
@@ -467,6 +472,9 @@ pub(super) async fn handle_command(
                 Resolution::Skill(skill) => {
                     return CommandAction::LoadSkill { skill, arg: arg.to_string() };
                 }
+                Resolution::PluginCommand(command) => {
+                    return CommandAction::PluginCommand { command, arg: arg.to_string() };
+                }
                 Resolution::Ambiguous(opts) => {
                     app.push_msg(ChatMessage::Error(format!(
                         "ambiguous command /{}; try one of: {}",
@@ -514,6 +522,12 @@ mod tests {
     #[test]
     fn extensions_is_in_all_commands() {
         assert!(ALL_COMMANDS.contains(&"extensions"));
+    }
+
+    #[test]
+    fn resolve_prefix_keeps_exact_plugin_command_name() {
+        let cmds = vec!["help".to_string(), "my-plugin:hello".to_string()];
+        assert_eq!(resolve_prefix("my-plugin:hello", &cmds), "my-plugin:hello");
     }
 
     // -- edit_distance tests --

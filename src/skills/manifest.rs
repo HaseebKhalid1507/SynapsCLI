@@ -4,6 +4,16 @@ use serde::Deserialize;
 
 use super::keybinds::ManifestKeybind;
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -13,6 +23,8 @@ pub struct PluginManifest {
     pub description: Option<String>,
     #[serde(default)]
     pub keybinds: Vec<ManifestKeybind>,
+    #[serde(default)]
+    pub commands: Vec<ManifestCommand>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +58,7 @@ mod tests {
         assert_eq!(m.name, "web-tools");
         assert_eq!(m.version, None);
         assert_eq!(m.description, None);
+        assert!(m.commands.is_empty());
     }
 
     #[test]
@@ -63,6 +76,34 @@ mod tests {
         assert_eq!(m.name, "web-tools");
         assert_eq!(m.version.as_deref(), Some("1.0.0"));
         assert_eq!(m.description.as_deref(), Some("Web tools"));
+    }
+
+    #[test]
+    fn plugin_manifest_parses_commands() {
+        let json = r#"{
+            "name": "dev-tools",
+            "commands": [
+                {
+                    "name": "lint",
+                    "description": "Run lint",
+                    "command": "bash",
+                    "args": ["scripts/lint.sh"]
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.commands.len(), 1);
+        assert_eq!(m.commands[0].name, "lint");
+        assert_eq!(m.commands[0].description.as_deref(), Some("Run lint"));
+        assert_eq!(m.commands[0].command, "bash");
+        assert_eq!(m.commands[0].args, vec!["scripts/lint.sh"]);
+    }
+
+    #[test]
+    fn plugin_manifest_command_missing_command_fails() {
+        let json = r#"{"name":"p","commands":[{"name":"x"}]}"#;
+        let result: Result<PluginManifest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     #[test]

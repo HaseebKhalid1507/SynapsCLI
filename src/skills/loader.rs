@@ -400,8 +400,34 @@ mod tests {
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "my-plugin");
+        assert!(plugins[0].manifest.as_ref().unwrap().commands.is_empty());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].plugin.as_deref(), Some("my-plugin"));
+    }
+
+    #[test]
+    fn load_all_plugin_commands_are_carried_in_manifest() {
+        let tmp = tempdir();
+        let plugin_dir = tmp.join("cmd-plugin");
+        fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{
+                "name": "cmd-plugin",
+                "commands": [
+                    {"name":"hello","description":"Say hello","command":"printf","args":["hello"]}
+                ]
+            }"#,
+        ).unwrap();
+
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
+
+        assert_eq!(plugins.len(), 1);
+        assert!(skills.is_empty());
+        let commands = &plugins[0].manifest.as_ref().unwrap().commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "hello");
+        assert_eq!(commands[0].command, "printf");
     }
 
     #[test]

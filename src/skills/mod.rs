@@ -17,6 +17,7 @@ pub mod state;
 pub mod marketplace;
 pub mod install;
 pub mod keybinds;
+pub mod commands;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -90,7 +91,7 @@ pub async fn register(
         kb_registry.register_user(&config.keybinds);
     }
 
-    let registry = Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, skills));
+    let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
     (registry, Arc::new(kb_registry))
@@ -99,8 +100,8 @@ pub async fn register(
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
-    let (_plugins, mut skills) = loader::load_all(&loader::default_roots());
+    let (plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
     tracing::info!(skills = skills.len(), "reloaded skills");
-    registry.rebuild_with(skills);
+    registry.rebuild_with_plugins(skills, plugins);
 }
