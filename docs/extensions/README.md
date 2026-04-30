@@ -13,11 +13,12 @@ An extension is an independent process that SynapsCLI spawns alongside the main 
 Extensions can:
 
 - **Observe** — log, audit, or monitor tool calls and messages
-- **Block** — prevent a tool call or message from proceeding
+- **Block** — prevent a `before_tool_call` event from proceeding
 - **Inject** — prepend context into the system prompt before a request reaches the LLM
-- **Register** — expose new tools or providers into the runtime
 
-SynapsCLI spawns each extension as a subprocess on session start and tears it down on session end. If an extension crashes or times out, the runtime fails open — the event proceeds as if the extension wasn't there.
+Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
+
+SynapsCLI spawns each extension as a subprocess on session start and tears it down on session end. Extensions run with the plugin root as their current working directory. If an extension crashes or times out, the runtime fails open — the event proceeds as if the extension wasn't there. Transport failures trigger up to three restart attempts before the extension is marked failed.
 
 ---
 
@@ -58,6 +59,7 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
   "description": "Logs all tool calls to a local audit file.",
   "author": "Your Name",
   "extension": {
+    "protocol_version": 1,
     "runtime": "process",
     "command": "python3",
     "args": ["main.py"],
@@ -72,13 +74,14 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
 
 The `extension` field is what distinguishes a plugin that provides an extension from one that only declares tools or themes. Its fields:
 
-| Field         | Type            | Description                                              |
-|---------------|-----------------|----------------------------------------------------------|
-| `runtime`     | string          | Runtime type; phase 1 supports `process` only            |
-| `command`     | string          | Executable or plugin-relative script path to launch      |
-| `args`        | array           | Arguments passed to `command`; local files resolve from the plugin dir when safe |
-| `permissions` | array of string | Permissions the extension requires to function correctly |
-| `hooks`       | array           | List of hook subscriptions (see below)                   |
+| Field              | Type            | Description                                              |
+|--------------------|-----------------|----------------------------------------------------------|
+| `protocol_version` | integer         | Extension protocol version; phase 1 uses `1`             |
+| `runtime`          | string          | Runtime type; phase 1 supports `process` only            |
+| `command`          | string          | Executable or plugin-relative script path to launch      |
+| `args`             | array           | Arguments passed to `command`; local files resolve from the plugin dir when safe |
+| `permissions`      | array of string | Permissions the extension requires to function correctly |
+| `hooks`            | array           | List of hook subscriptions (see below)                   |
 
 ---
 
@@ -125,12 +128,11 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 
 | Permission           | What it grants                                                                 |
 |----------------------|--------------------------------------------------------------------------------|
-| `tools.intercept`    | Ability to block tool calls via `before_tool_call`                             |
-| `privacy.llm_content`| Access to the full content of messages and tool outputs sent to/from the LLM  |
+| `tools.intercept`    | Ability to receive `before_tool_call` / `after_tool_call` events               |
+| `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
-| `tools.register`     | Ability to expose new tools into the runtime for the LLM to call               |
-| `providers.register` | Ability to register a new LLM provider                                         |
-| `tools.override`     | Ability to replace the implementation of an existing built-in tool             |
+
+Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override`, `tools.register`, and `providers.register`.
 
 Permissions are checked before events are delivered. An extension that lacks a hook's required permission is not subscribed to that hook.
 

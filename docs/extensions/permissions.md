@@ -1,19 +1,33 @@
 # Extension permissions
 
 Permissions are declared in the plugin manifest under `extension.permissions`.
-They are checked before hook subscriptions are installed. Unknown permission
-strings are rejected so typos fail loudly.
+SynapsCLI validates them before spawning the extension process or installing hook
+subscriptions. Unknown permissions fail loudly; reserved permissions are known to
+the contract but are rejected until their runtime support exists.
 
-## Permission flags
+## Active permissions
+
+These are the only permissions currently accepted in `extension.permissions`:
 
 | Permission | Allows |
 |---|---|
 | `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` |
-| `tools.override` | Reserved for overriding built-in tools |
-| `privacy.llm_content` | Subscribe to LLM/user-message content hooks |
+| `privacy.llm_content` | Subscribe to `before_message` and receive message content |
 | `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
-| `tools.register` | Reserved for registering extension-provided tools |
-| `providers.register` | Reserved for registering extension-provided model providers |
+
+## Reserved permissions
+
+These names are reserved for future protocol phases and must not be declared by
+plugins today:
+
+| Permission | Reserved for |
+|---|---|
+| `tools.override` | Replacing or wrapping built-in tool implementations |
+| `tools.register` | Registering extension-provided tools |
+| `providers.register` | Registering extension-provided model providers |
+
+If a manifest includes a reserved permission, SynapsCLI rejects the extension
+with a validation error instead of silently granting future power.
 
 ## Principle
 

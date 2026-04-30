@@ -12,7 +12,9 @@ Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime sp
 
 - **stdin** — receives messages from the runtime
 - **stdout** — used to send responses back to the runtime
-- **stderr** — currently discarded by the phase-1 runtime; prefer explicit logging files while developing
+- **stderr** — captured by SynapsCLI and emitted to debug tracing with the extension id
+
+The process is started with the plugin root as its current working directory. Relative file access from your extension should therefore be written relative to the plugin directory.
 
 The protocol is **JSON-RPC 2.0** over a length-prefixed binary framing, identical in structure to the Language Server Protocol (LSP) transport. This is a deliberate choice — tooling that works with LSP servers works here too.
 
@@ -290,6 +292,7 @@ Full `plugin.json` with all supported extension fields:
   "author": "Your Name <you@example.com>",
   "license": "MIT",
   "extension": {
+    "protocol_version": 1,
     "runtime": "process",
     "command": "python3",
     "args": ["main.py"],
@@ -304,15 +307,16 @@ Full `plugin.json` with all supported extension fields:
 }
 ```
 
-| Field                    | Type            | Required | Description                                                           |
-|--------------------------|-----------------|----------|-----------------------------------------------------------------------|
-| `extension.runtime`      | string          | yes      | Runtime type; phase 1 supports `process` only                         |
-| `extension.command`      | string          | yes      | Executable or plugin-relative script path to launch                   |
-| `extension.args`         | array           | no       | Arguments passed to `command`                                         |
-| `extension.hooks`        | array           | yes      | One or more hook registrations                                        |
-| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                 |
-| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                      |
-| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only) |
+| Field                         | Type            | Required | Description                                                           |
+|-------------------------------|-----------------|----------|-----------------------------------------------------------------------|
+| `extension.protocol_version`  | integer         | no       | Protocol version; defaults to `1`, future versions are rejected       |
+| `extension.runtime`           | string          | yes      | Runtime type; phase 1 supports `process` only                         |
+| `extension.command`           | string          | yes      | Executable or plugin-relative script path to launch                   |
+| `extension.args`              | array           | no       | Arguments passed to `command`                                         |
+| `extension.hooks`             | array           | yes      | One or more hook registrations                                        |
+| `extension.hooks[].hook`      | string          | yes      | Hook name (see Available Hooks table)                                 |
+| `extension.hooks[].tool`      | string          | no       | If set, narrows the hook to a specific tool name                      |
+| `extension.permissions`       | array of string | no       | Active permissions the extension declares it requires                 |
 
 Relative command paths and local argument paths are resolved from the plugin directory when safe. Bare commands such as `python3` and `node` are resolved through `PATH`.
 
@@ -325,11 +329,10 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
-| `tools.register`     | Allows the extension to declare new tools the LLM can call (separate registration flow).   |
-| `providers.register` | Allows the extension to register a new LLM backend provider.                               |
-| `tools.override`     | Allows replacing a built-in tool's implementation with the extension's own handler.        |
 
-Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
+Reserved future permissions are rejected if declared today: `tools.register`, `providers.register`, and `tools.override`.
+
+Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 
 ---
 
@@ -339,33 +342,35 @@ Permissions are enforced before hook subscriptions are installed. Unknown permis
 
 SynapsCLI is designed to degrade gracefully when extensions misbehave. If your extension:
 
-- **Does not respond within 5 seconds** — the event proceeds as `continue`. Your extension is not killed; the next event will still be sent.
+- **Does not respond within 5 seconds** — the event proceeds as `continue`.
 - **Sends a malformed response** — treated as `continue`. The error is logged through SynapsCLI tracing.
-- **Crashes or closes stdout** — hook delivery fails open for that call. The session continues normally.
+- **Crashes or closes stdout** — the runtime restarts the process and retries the request. If retry also fails, hook delivery fails open for that call.
 - **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
+
+After three restart attempts, the extension health becomes `Failed`; subsequent hook calls continue fail-open.
 
 ### Timeouts
 
-| Scenario                      | Timeout | Behavior on expiry                       |
-|-------------------------------|---------|------------------------------------------|
-| `hook.handle` response        | 5s      | Treat as `continue`, log warning         |
-| Extension startup (first msg) | 10s     | Extension marked failed, not retried     |
-| `shutdown` grace period       | 2s      | `SIGKILL` sent to extension process      |
+| Scenario               | Timeout | Behavior on expiry                       |
+|------------------------|---------|------------------------------------------|
+| `hook.handle` response | 5s      | Treat as `continue`, log warning         |
+| `shutdown` grace period| 500ms request timeout, then kill after a short grace period | Best-effort shutdown, then child kill |
 
 ### On Crash
 
 When an extension process exits without receiving `shutdown`:
 
 1. The runtime logs the transport error through tracing
-2. The event that triggered the failure proceeds as `continue`
-3. Shutdown later attempts to terminate the child process
-4. Other extensions continue operating normally
+2. The runtime respawns the process and retries the in-flight request
+3. If retry fails, the triggering event proceeds as `continue`
+4. After three restart attempts, the extension is marked `Failed`
+5. Other extensions continue operating normally
 
 Design your extension to be stateless where possible. If you maintain state, write it to disk promptly — do not rely on an orderly `shutdown` call.
 
 ### Stderr Logging
 
-Phase-1 currently discards child stderr. Future runtimes should capture it and forward it to tracing. Until then, write extension debug logs to a file under your plugin directory when needed:
+Child stderr is captured and forwarded to SynapsCLI debug tracing with the extension id. Use stderr for human/debug diagnostics only; stdout is reserved for framed JSON-RPC responses.
 
 ```
 [rm-rf-guard] Checked command: "ls -la" — allowed
