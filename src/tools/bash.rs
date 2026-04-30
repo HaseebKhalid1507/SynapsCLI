@@ -9,7 +9,7 @@ impl Tool for BashTool {
     fn name(&self) -> &str { "bash" }
 
     fn description(&self) -> &str {
-        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds."
+        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed."
     }
 
     fn parameters(&self) -> Value {
@@ -22,7 +22,7 @@ impl Tool for BashTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 30, max: 300)"
+                    "description": "Timeout in seconds (default: 30). Use a larger value for long-running commands."
                 }
             },
             "required": ["command"]
@@ -33,7 +33,7 @@ impl Tool for BashTool {
         let command = params["command"].as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.bash_timeout).min(ctx.limits.bash_max_timeout);
+        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.bash_timeout);
         let max_output = ctx.limits.max_tool_output;
 
         let mut child = tokio::process::Command::new("bash")

@@ -372,6 +372,22 @@ async fn test_bash_tool_execution() {
     assert!(result.unwrap_err().to_string().contains("timed out"));
 }
 
+#[tokio::test]
+async fn test_bash_tool_requested_timeout_is_not_clamped_by_max_timeout() {
+    let tool = BashTool;
+    let mut ctx = create_tool_context();
+    ctx.limits.bash_max_timeout = 1;
+
+    let params = json!({
+        "command": "sleep 2; echo done",
+        "timeout": 3
+    });
+
+    let result = tool.execute(params, ctx).await;
+    assert!(result.is_ok(), "requested timeout should not be clamped by bash_max_timeout: {result:?}");
+    assert!(result.unwrap().contains("done"));
+}
+
 // ── New Tests ────────────────────────────────────────────────────────────
 
 #[test]
