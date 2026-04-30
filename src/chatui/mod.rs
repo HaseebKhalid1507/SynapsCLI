@@ -180,6 +180,7 @@ pub async fn run(
     continue_session: Option<Option<String>>,
     system: Option<String>,
     profile: Option<String>,
+    no_extensions: bool,
 ) -> Result<()> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
@@ -311,13 +312,18 @@ pub async fn run(
     let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
         std::sync::Arc::clone(runtime.hook_bus()),
     );
-    {
-        let loaded = ext_mgr.discover_and_load().await;
+    if !no_extensions {
+        let (loaded, failed) = ext_mgr.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
         tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
         if !loaded.is_empty() {
             app.push_msg(ChatMessage::System(format!(
                 "Extensions loaded: {} ({} hooks)", loaded.join(", "), handler_count
+            )));
+        }
+        for (name, error) in &failed {
+            app.push_msg(ChatMessage::System(format!(
+                "⚠ Extension '{}' failed: {}", name, error
             )));
         }
     }

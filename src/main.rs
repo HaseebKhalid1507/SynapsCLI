@@ -18,6 +18,10 @@ struct Cli {
     #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
     system: Option<String>,
 
+    /// Disable all extensions for this session.
+    #[arg(long)]
+    no_extensions: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -119,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            chatui::run(cli.continue_session, cli.system, cli.profile).await?;
+            chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
         }
         Some(Command::Run { prompt, agent, system }) => {
             cmd::run::run(prompt, agent, system).await?;

@@ -290,10 +290,15 @@ async def start_server():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 3456)
+    port = int(os.environ.get("HUB_PORT", "3456"))
+    try:
+        site = web.TCPSite(runner, "127.0.0.1", port)
+    except Exception:
+        port += 1
+        site = web.TCPSite(runner, "127.0.0.1", port)
     await site.start()
 
-    sys.stderr.write("[hub] Dashboard running at http://localhost:3456\n")
+    sys.stderr.write(f"[hub] Dashboard running at http://localhost:{port}\n")
     sys.stderr.flush()
 
     # Start tick loop for elapsed time updates

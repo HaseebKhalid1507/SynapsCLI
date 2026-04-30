@@ -93,6 +93,9 @@ impl HookBus {
             _ => return HookResult::Continue, // fast path: no handlers
         };
 
+        // Collect injections from all handlers rather than returning on first
+        let mut injections: Vec<String> = Vec::new();
+
         for reg in registrations {
             // Tool-specific filter: skip handlers that don't match
             if let Some(ref filter) = reg.tool_filter {
@@ -130,8 +133,8 @@ impl HookBus {
                         len = content.len(),
                         "Extension injected context"
                     );
-                    // Return the injection so the caller can use it
-                    return HookResult::Inject { content };
+                    // Accumulate — don't early-return. Multiple extensions can inject.
+                    injections.push(content);
                 }
                 Err(_timeout) => {
                     tracing::warn!(
@@ -145,7 +148,14 @@ impl HookBus {
             }
         }
 
-        HookResult::Continue
+        // Merge accumulated injections from all handlers
+        if !injections.is_empty() {
+            HookResult::Inject {
+                content: injections.join("\n\n"),
+            }
+        } else {
+            HookResult::Continue
+        }
     }
 
     /// Remove all handlers for a given extension ID.

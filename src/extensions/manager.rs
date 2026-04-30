@@ -101,19 +101,20 @@ impl ExtensionManager {
     ///
     /// Scans `~/.synaps-cli/plugins/*/plugin.json` for manifests that
     /// contain an `extension` field. Loads each one via `self.load()`.
-    pub async fn discover_and_load(&mut self) -> Vec<String> {
+    pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<(String, String)>) {
         let plugins_dir = crate::config::base_dir().join("plugins");
         let mut loaded = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
 
         if !plugins_dir.exists() {
-            return loaded;
+            return (loaded, failed);
         }
 
         let entries = match std::fs::read_dir(&plugins_dir) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to read plugins directory");
-                return loaded;
+                return (loaded, failed);
             }
         };
 
@@ -198,11 +199,12 @@ impl ExtensionManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, error = %e, "Failed to load extension");
+                    failed.push((plugin_name, e));
                 }
             }
         }
 
-        loaded
+        (loaded, failed)
     }
 }
 
