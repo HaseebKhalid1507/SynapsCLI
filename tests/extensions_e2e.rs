@@ -66,7 +66,7 @@ async fn time_extension_injects_timestamp() {
     let mut perms = PermissionSet::new();
     perms.grant(Permission::LlmContent);
 
-    bus.subscribe(HookKind::BeforeMessage, handler.clone(), None, perms)
+    bus.subscribe(HookKind::BeforeMessage, handler.clone(), None, None, perms)
         .await
         .expect("Failed to subscribe");
 
