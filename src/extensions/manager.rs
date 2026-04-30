@@ -38,35 +38,36 @@ impl ExtensionManager {
             return Err(format!("Extension '{}' is already loaded", id));
         }
 
-        // Spawn the extension process
+        // Validate permissions and hook subscriptions before spawning the
+        // extension process. This keeps malformed manifests from leaking child
+        // processes when a later subscription step fails.
+        let permissions = PermissionSet::try_from_strings(&manifest.permissions)?;
+        let mut subscriptions = Vec::with_capacity(manifest.hooks.len());
+        for sub in &manifest.hooks {
+            let kind = HookKind::from_str(&sub.hook).ok_or_else(|| {
+                format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id)
+            })?;
+            if !permissions.allows_hook(kind) {
+                return Err(format!(
+                    "Extension '{}' lacks permission '{}' required for hook '{}'",
+                    id,
+                    kind.required_permission().as_str(),
+                    kind.as_str(),
+                ));
+            }
+            subscriptions.push((kind, sub.tool.clone()));
+        }
+
+        // Spawn the extension process only after the manifest is known-good.
         let handler: Arc<dyn ExtensionHandler> = Arc::new(
-            ProcessExtension::spawn(id, &manifest.command, &manifest.args).await?
+            ProcessExtension::spawn(id, &manifest.command, &manifest.args).await?,
         );
 
-        // Parse permissions
-        let permissions = PermissionSet::from_strings(&manifest.permissions);
-
         // Register hook subscriptions
-        for sub in &manifest.hooks {
-            let kind = match HookKind::from_str(&sub.hook) {
-                Some(k) => k,
-                None => {
-                    // Rollback: unsubscribe any registered hooks and shutdown process
-                    self.hook_bus.unsubscribe_all(id).await;
-                    handler.shutdown().await;
-                    return Err(format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id));
-                }
-            };
-
-            if let Err(e) = self.hook_bus
-                .subscribe(kind, handler.clone(), sub.tool.clone(), permissions.clone())
-                .await
-            {
-                // Rollback: unsubscribe any registered hooks and shutdown process
-                self.hook_bus.unsubscribe_all(id).await;
-                handler.shutdown().await;
-                return Err(e);
-            }
+        for (kind, tool_filter) in subscriptions {
+            self.hook_bus
+                .subscribe(kind, handler.clone(), tool_filter, permissions.clone())
+                .await?;
         }
 
         self.extensions.insert(id.to_string(), handler);
@@ -76,7 +77,9 @@ impl ExtensionManager {
 
     /// Unload an extension — unsubscribe hooks and shut down the process.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
-        let handler = self.extensions.remove(id)
+        let handler = self
+            .extensions
+            .remove(id)
             .ok_or_else(|| format!("Extension '{}' not found", id))?;
 
         self.hook_bus.unsubscribe_all(id).await;
@@ -111,8 +114,9 @@ impl ExtensionManager {
 
     /// Discover and load all extensions from the plugins directory.
     ///
-    /// Scans `~/.synaps-cli/plugins/*/plugin.json` for manifests that
-    /// contain an `extension` field. Loads each one via `self.load()`.
+    /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` for
+    /// manifests that contain an `extension` field. Loads each one via
+    /// `self.load()`.
     pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<(String, String)>) {
         let plugins_dir = crate::config::base_dir().join("plugins");
         let mut loaded = Vec::new();
@@ -176,27 +180,8 @@ impl ExtensionManager {
                 // Resolve via PATH, don't join with plugin directory
                 ext_manifest.command.clone()
             } else {
-                // Relative path — resolve and confine to plugin directory
-                let resolved = plugin_dir.join(&ext_manifest.command);
-                match resolved.canonicalize() {
-                    Ok(canonical) if canonical.starts_with(&plugin_dir) => {
-                        canonical.to_string_lossy().to_string()
-                    }
-                    Ok(canonical) => {
-                        tracing::warn!(
-                            "Extension '{}' command escapes plugin directory: {} → {}",
-                            plugin_name, ext_manifest.command, canonical.display()
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "Extension '{}' command not found: {}",
-                            plugin_name, ext_manifest.command
-                        );
-                        continue;
-                    }
-                }
+                plugin_dir.join(&ext_manifest.command)
+                    .to_string_lossy().to_string()
             };
 
             // Resolve args relative to plugin directory

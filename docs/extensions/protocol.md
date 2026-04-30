@@ -8,11 +8,11 @@ For a user-facing guide on installing and configuring extensions, see [README.md
 
 ## Transport
 
-Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess by directly executing the `command` declared in `plugin.json` with the supplied `args` (no shell is involved — there is no shell-string parsing, globbing, or quoting). Your process's:
+Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess using the `extension.command` and `extension.args` fields declared in `.synaps-plugin/plugin.json`. Your process's:
 
 - **stdin** — receives messages from the runtime
 - **stdout** — used to send responses back to the runtime
-- **stderr** — discarded (the runtime attaches `Stdio::null()`). Anything you write to stderr is dropped on the floor.
+- **stderr** — currently discarded by the phase-1 runtime; prefer explicit logging files while developing
 
 The protocol is **JSON-RPC 2.0** over a length-prefixed binary framing, identical in structure to the Language Server Protocol (LSP) transport. This is a deliberate choice — tooling that works with LSP servers works here too.
 
@@ -36,17 +36,17 @@ Content-Length: <byte-length-of-body>\r\n
 **Example frame (runtime → extension):**
 
 ```
-Content-Length: 175\r\n
+Content-Length: 187\r\n
 \r\n
-{"jsonrpc":"2.0","id":1,"method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","session_id":"sess-abc","tool_input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
+{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"hook":"before_tool_call","tool":"bash","session_id":"sess-abc","input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
 ```
 
 **Example frame (extension → runtime):**
 
 ```
-Content-Length: 46\r\n
+Content-Length: 22\r\n
 \r\n
-{"jsonrpc":"2.0","id":1,"result":{"action":"continue"}}
+{"jsonrpc":"2.0","id":"evt-001","result":{"action":"continue"}}
 ```
 
 Both directions use the same framing. Your extension must:
@@ -115,14 +115,15 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 
 ```json
 {
-  "kind": "before_tool_call",
-  "tool_name": "bash",
+  "hook": "before_tool_call",
+  "tool": "bash",
   "session_id": "sess-abc123",
-  "tool_input": {
+  "input": {
     "command": "rm -rf /tmp/scratch"
   },
-  "tool_output": null,
+  "output": null,
   "message": null,
+  "role": null,
   "timestamp": "2024-11-14T10:23:01Z",
   "metadata": {
     "model": "claude-opus-4-5",
@@ -131,16 +132,17 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 }
 ```
 
-| Field         | Type               | Present on hooks                              | Description                                               |
-|---------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
-| `kind`        | string             | all                                           | The hook name that fired                                  |
-| `tool_name`   | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
-| `session_id`  | string \| null     | `on_session_start`, `on_session_end`          | Stable identifier for the current session                 |
-| `tool_input`  | object \| null     | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                |
-| `tool_output` | string \| null     | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)      |
-| `message`     | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
-| `timestamp`   | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
-| `metadata`    | object             | all                                           | Runtime context: active model, turn count, etc.           |
+| Field        | Type               | Present on hooks                              | Description                                               |
+|--------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
+| `hook`       | string             | all                                           | The hook name that fired                                  |
+| `tool`       | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
+| `session_id` | string             | all                                           | Stable identifier for the current session                 |
+| `input`      | object \| null     | `before_tool_call`                            | The raw input arguments passed to the tool                |
+| `output`     | object \| null     | `after_tool_call`                             | The result returned by the tool                           |
+| `message`    | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
+| `role`       | string \| null     | `before_message`                              | `"user"` or `"assistant"`                                 |
+| `timestamp`  | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
+| `metadata`   | object             | all                                           | Runtime context: active model, turn count, etc.           |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -288,31 +290,31 @@ Full `plugin.json` with all supported extension fields:
   "author": "Your Name <you@example.com>",
   "license": "MIT",
   "extension": {
+    "runtime": "process",
     "command": "python3",
     "args": ["main.py"],
+    "permissions": ["tools.intercept"],
     "hooks": [
       {
         "hook": "before_tool_call",
         "tool": "bash"
       }
-    ],
-    "permissions": [
-      "tools.intercept"
     ]
   }
 }
 ```
 
-| Field                    | Type            | Required | Description                                                                                                |
-|--------------------------|-----------------|----------|------------------------------------------------------------------------------------------------------------|
-| `extension.command`      | string          | yes      | Executable to launch (resolved against `PATH` if bare, otherwise relative to the plugin directory). No shell. |
-| `extension.args`         | array of string | no       | Arguments passed to `command`. Defaults to `[]`. Each element is a single argv entry — no shell splitting. |
-| `extension.hooks`        | array           | yes      | One or more hook registrations                                                                             |
-| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                                                      |
-| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                                                           |
-| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only)                                      |
+| Field                    | Type            | Required | Description                                                           |
+|--------------------------|-----------------|----------|-----------------------------------------------------------------------|
+| `extension.runtime`      | string          | yes      | Runtime type; phase 1 supports `process` only                         |
+| `extension.command`      | string          | yes      | Executable or plugin-relative script path to launch                   |
+| `extension.args`         | array           | no       | Arguments passed to `command`                                         |
+| `extension.hooks`        | array           | yes      | One or more hook registrations                                        |
+| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                 |
+| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                      |
+| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only) |
 
-The `command` is executed with the plugin directory as the working directory. Relative paths in `command` resolve from there. Because there is no shell, you cannot use shell features (pipes, `&&`, env-var expansion, glob patterns) inside `command` or `args` — invoke an interpreter explicitly (e.g. `"command": "python3", "args": ["main.py"]`).
+Relative command paths and local argument paths are resolved from the plugin directory when safe. Bare commands such as `python3` and `node` are resolved through `PATH`.
 
 ---
 
@@ -320,14 +322,14 @@ The `command` is executed with the plugin directory as the working directory. Re
 
 | Permission           | What it unlocks                                                                            |
 |----------------------|--------------------------------------------------------------------------------------------|
-| `tools.intercept`    | Enables `block` results on `before_tool_call`. Without this, block is silently ignored.    |
-| `privacy.llm_content`| Populates `message` and `output` fields. Without this, those fields are always `null`.     |
+| `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
+| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
 | `tools.register`     | Allows the extension to declare new tools the LLM can call (separate registration flow).   |
 | `providers.register` | Allows the extension to register a new LLM backend provider.                               |
 | `tools.override`     | Allows replacing a built-in tool's implementation with the extension's own handler.        |
 
-Permissions are declared but not enforced cryptographically — they serve as an explicit contract between the extension author and the user installing it. SynapsCLI will display the requested permissions at install time and warn if an extension is attempting to use capabilities it hasn't declared.
+Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 
 ---
 
@@ -338,9 +340,9 @@ Permissions are declared but not enforced cryptographically — they serve as an
 SynapsCLI is designed to degrade gracefully when extensions misbehave. If your extension:
 
 - **Does not respond within 5 seconds** — the event proceeds as `continue`. Your extension is not killed; the next event will still be sent.
-- **Sends a malformed response** — treated as `continue`. The error is dropped (stderr is not captured; see below).
-- **Crashes (exits unexpectedly)** — the runtime marks your extension as failed for this session. All subsequent hook events for your registered hooks are skipped. The session continues normally.
-- **Sends an error object** instead of a result — treated as `continue`. The error message is discarded.
+- **Sends a malformed response** — treated as `continue`. The error is logged through SynapsCLI tracing.
+- **Crashes or closes stdout** — hook delivery fails open for that call. The session continues normally.
+- **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
 
 ### Timeouts
 
@@ -354,15 +356,20 @@ SynapsCLI is designed to degrade gracefully when extensions misbehave. If your e
 
 When an extension process exits without receiving `shutdown`:
 
-1. The runtime logs the exit code
-2. The extension is marked inactive for the session
-3. No attempt is made to restart it
+1. The runtime logs the transport error through tracing
+2. The event that triggered the failure proceeds as `continue`
+3. Shutdown later attempts to terminate the child process
 4. Other extensions continue operating normally
 
 Design your extension to be stateless where possible. If you maintain state, write it to disk promptly — do not rely on an orderly `shutdown` call.
 
-### Stderr Handling
+### Stderr Logging
 
-The runtime currently attaches `Stdio::null()` to extension stderr — anything you write there is **discarded**, not captured or surfaced. Do not rely on stderr for diagnostics that you need to see.
+Phase-1 currently discards child stderr. Future runtimes should capture it and forward it to tracing. Until then, write extension debug logs to a file under your plugin directory when needed:
 
-For debugging, write to a file inside your plugin directory (or a temp path) and tail it externally. A future runtime version may capture stderr into the SynapsCLI debug log, but that is **not yet implemented**.
+```
+[rm-rf-guard] Checked command: "ls -la" — allowed
+[rm-rf-guard] Checked command: "rm -rf /home/user/docs" — blocked
+```
+
+Do not write protocol data to stderr; stdout is reserved for framed JSON-RPC responses.

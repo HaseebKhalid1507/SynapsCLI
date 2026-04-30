@@ -143,12 +143,17 @@ impl HookEvent {
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
         const MAX_HOOK_OUTPUT: usize = 32 * 1024; // 32 KB
         let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
-            // Find the last valid UTF-8 char boundary at or before MAX_HOOK_OUTPUT
-            let mut end = MAX_HOOK_OUTPUT;
-            while end > 0 && !output.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…[truncated, {} total bytes]", &output[..end], output.len())
+            let boundary = output
+                .char_indices()
+                .map(|(idx, _)| idx)
+                .take_while(|idx| *idx <= MAX_HOOK_OUTPUT)
+                .last()
+                .unwrap_or(0);
+            format!(
+                "{}…[truncated, {} total bytes]",
+                &output[..boundary],
+                output.len()
+            )
         } else {
             output
         };

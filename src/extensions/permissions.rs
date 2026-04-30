@@ -66,9 +66,24 @@ impl PermissionSet {
     }
 
     /// Parse permission strings (from manifest) into a set.
+    ///
+    /// This lenient parser is kept for tests and internal callers that have
+    /// already validated manifests. Extension manifests should use
+    /// [`try_from_strings`](Self::try_from_strings) so typos fail loudly.
     pub fn from_strings(perms: &[String]) -> Self {
         let permissions = perms.iter().filter_map(|s| Permission::parse(s)).collect();
         Self { permissions }
+    }
+
+    /// Parse permission strings and reject unknown values.
+    pub fn try_from_strings(perms: &[String]) -> Result<Self, String> {
+        let mut permissions = HashSet::new();
+        for perm in perms {
+            let parsed = Permission::parse(perm)
+                .ok_or_else(|| format!("Unknown extension permission: {perm}"))?;
+            permissions.insert(parsed);
+        }
+        Ok(Self { permissions })
     }
 
     /// Check if a permission is granted.

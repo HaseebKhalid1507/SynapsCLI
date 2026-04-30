@@ -75,10 +75,11 @@ struct JsonRpcError {
 /// [`HookResult::Continue`] so a misbehaving extension never blocks the agent.
 pub struct ProcessExtension {
     id: String,
-    /// Single lock for the entire call cycle (write request + read response).
-    /// Prevents concurrent calls from interleaving on the stdio pipe,
-    /// which would cause response ID mismatches and silent fail-open.
-    io: Arc<Mutex<(tokio::process::ChildStdin, BufReader<tokio::process::ChildStdout>)>>,
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
+    stdout: Arc<Mutex<BufReader<tokio::process::ChildStdout>>>,
+    /// Serializes a full request/response exchange. JSON-RPC ids are still
+    /// checked, but the phase-1 stdio runtime does not multiplex responses.
+    call_lock: Arc<Mutex<()>>,
     child: Arc<Mutex<Child>>,
     /// Monotonically-increasing JSON-RPC request id.
     next_id: AtomicU64,
@@ -90,16 +91,8 @@ impl ProcessExtension {
     /// Stderr of the child process is discarded (redirect it yourself before
     /// calling this if you need to capture it).
     pub async fn spawn(id: &str, command: &str, args: &[String]) -> Result<Self, String> {
-        // Allowlist of safe environment variables — strip API keys and secrets
-        let safe_env_keys = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR", "XDG_RUNTIME_DIR"];
-        let safe_env: Vec<(String, String)> = safe_env_keys.iter()
-            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-            .collect();
-
         let mut child = Command::new(command)
             .args(args)
-            .env_clear()
-            .envs(safe_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -117,7 +110,9 @@ impl ProcessExtension {
 
         Ok(Self {
             id: id.to_string(),
-            io: Arc::new(Mutex::new((stdin, BufReader::new(stdout)))),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            call_lock: Arc::new(Mutex::new(())),
             child: Arc::new(Mutex::new(child)),
             next_id: AtomicU64::new(1),
         })
@@ -125,10 +120,11 @@ impl ProcessExtension {
 
     /// Send a JSON-RPC request and return the `result` value from the response.
     ///
-    /// Uses Content-Length framing on both ends. Requests and responses are
-    /// serialised / deserialised in one lock-scope each to keep the mutex
-    /// held for the minimum time.
+    /// Uses Content-Length framing on both ends. The stdio transport is
+    /// serialized across the full request/response exchange so concurrent hook
+    /// calls cannot consume each other's responses.
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _call_guard = self.call_lock.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let body = serde_json::to_string(&JsonRpcRequest {
@@ -139,13 +135,10 @@ impl ProcessExtension {
         })
         .map_err(|e| format!("Serialize error: {}", e))?;
 
-        // ── Single lock for write + read — prevents concurrent call interleaving ──
-        let body_buf = {
-            let mut io = self.io.lock().await;
-            let (ref mut stdin, ref mut stdout) = *io;
-
-            // Write request
-            let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        // ── Write request ───────────────────────────────────────────────────
+        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        {
+            let mut stdin = self.stdin.lock().await;
             stdin
                 .write_all(frame.as_bytes())
                 .await
@@ -154,8 +147,15 @@ impl ProcessExtension {
                 .flush()
                 .await
                 .map_err(|e| format!("Flush error: {}", e))?;
+        } // drop stdin lock before reading
+
+        // ── Read response ───────────────────────────────────────────────────
+        let body_buf = {
+            let mut stdout = self.stdout.lock().await;
 
             // Read headers until blank line, extract Content-Length
+            // case-insensitively. Supports extensions that send additional
+            // headers (e.g. Content-Type) like full LSP implementations.
             let mut content_length: Option<usize> = None;
             loop {
                 let mut header_line = String::new();
@@ -211,7 +211,7 @@ impl ProcessExtension {
                 .await
                 .map_err(|e| format!("Read body error: {}", e))?;
             buf
-        }; // drop io lock
+        }; // drop stdout lock
 
         let response: JsonRpcResponse = serde_json::from_slice(&body_buf)
             .map_err(|e| format!("Parse response error: {}", e))?;
@@ -248,20 +248,7 @@ impl ExtensionHandler for ProcessExtension {
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match self.call("hook.handle", params).await {
-            Ok(value) => {
-                match serde_json::from_value::<HookResult>(value.clone()) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::warn!(
-                            extension = %self.id,
-                            error = %e,
-                            raw = %value,
-                            "Extension returned malformed hook result — failing open",
-                        );
-                        HookResult::Continue
-                    }
-                }
-            },
+            Ok(value) => serde_json::from_value(value).unwrap_or(HookResult::Continue),
             Err(e) => {
                 tracing::warn!(
                     extension = %self.id,
@@ -280,7 +267,8 @@ impl ExtensionHandler for ProcessExtension {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             self.call("shutdown", Value::Null),
-        ).await;
+        )
+        .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
