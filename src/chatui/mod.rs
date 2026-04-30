@@ -1170,7 +1170,8 @@ pub async fn run(
 
     // ═══ HOOK: on_session_end ═══
     {
-        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id);
+        let transcript = Some(app.api_messages.clone());
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id, transcript);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 

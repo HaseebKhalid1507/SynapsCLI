@@ -98,7 +98,12 @@ pub struct HookEvent {
     /// Which hook fired.
     pub kind: HookKind,
     /// Tool name for tool-specific hooks; `None` for general hooks.
+    /// This is the API-safe name (sanitized for the LLM).
     pub tool_name: Option<String>,
+    /// Original runtime name of the tool (before API sanitization).
+    /// Extension authors typically write runtime names in their manifests.
+    #[serde(default)]
+    pub tool_runtime_name: Option<String>,
     /// Tool input arguments for `before_tool_call` and `after_tool_call`.
     pub tool_input: Option<Value>,
     /// Tool output for `after_tool_call`.
@@ -107,6 +112,11 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Session identifier for session lifecycle hooks.
     pub session_id: Option<String>,
+    /// Session message history for `on_session_end`.
+    /// Contains the conversation transcript so extensions (like Stelline)
+    /// can extract memories without reaching into runtime internals.
+    #[serde(default)]
+    pub transcript: Option<Vec<Value>>,
     /// Arbitrary extension-defined data, passed through without inspection.
     pub data: Value,
 }
@@ -121,19 +131,31 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: None,
+            tool_runtime_name: None,
+            transcript: None,
             data: Value::Null,
         }
     }
 
     /// Construct an `after_tool_call` event carrying both input and output.
+    /// Output is truncated to MAX_HOOK_OUTPUT_SIZE to prevent sending
+    /// megabytes of bash output over the JSON-RPC pipe.
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
+        const MAX_HOOK_OUTPUT: usize = 32 * 1024; // 32 KB
+        let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
+            format!("{}…[truncated, {} total bytes]", &output[..MAX_HOOK_OUTPUT], output.len())
+        } else {
+            output
+        };
         Self {
             kind: HookKind::AfterToolCall,
             tool_name: Some(tool_name.to_string()),
             tool_input: Some(input),
-            tool_output: Some(output),
+            tool_output: Some(truncated_output),
             message: None,
             session_id: None,
+            tool_runtime_name: None,
+            transcript: None,
             data: Value::Null,
         }
     }
@@ -147,6 +169,8 @@ impl HookEvent {
             tool_output: None,
             message: Some(message.to_string()),
             session_id: None,
+            tool_runtime_name: None,
+            transcript: None,
             data: Value::Null,
         }
     }
@@ -160,12 +184,14 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            tool_runtime_name: None,
+            transcript: None,
             data: Value::Null,
         }
     }
 
     /// Construct an `on_session_end` event.
-    pub fn on_session_end(session_id: &str) -> Self {
+    pub fn on_session_end(session_id: &str, transcript: Option<Vec<Value>>) -> Self {
         Self {
             kind: HookKind::OnSessionEnd,
             tool_name: None,
@@ -173,6 +199,8 @@ impl HookEvent {
             tool_output: None,
             message: None,
             session_id: Some(session_id.to_string()),
+            tool_runtime_name: None,
+            transcript,
             data: Value::Null,
         }
     }
@@ -334,7 +362,7 @@ mod tests {
 
     #[test]
     fn hook_event_on_session_end() {
-        let ev = HookEvent::on_session_end("sess-abc-123");
+        let ev = HookEvent::on_session_end("sess-abc-123", None);
 
         assert_eq!(ev.kind, HookKind::OnSessionEnd);
         assert_eq!(ev.session_id.as_deref(), Some("sess-abc-123"));
@@ -382,5 +410,13 @@ mod tests {
     fn hook_result_continue_serde() {
         let json = serde_json::to_string(&HookResult::Continue).unwrap();
         assert_eq!(json, r#"{"action":"continue"}"#);
+    }
+}
+
+impl HookEvent {
+    /// Set the runtime name for tool-related events.
+    pub fn with_runtime_name(mut self, name: &str) -> Self {
+        self.tool_runtime_name = Some(name.to_string());
+        self
     }
 }

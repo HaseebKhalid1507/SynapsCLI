@@ -212,9 +212,11 @@ impl StreamMethods {
                                 });
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
-                                let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
+                                let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
                                     &tool_name, input.clone(),
                                 );
+                                hook_event.tool_runtime_name = Some(runtime_name.clone());
                                 let hook_result = hook_bus.emit(&hook_event).await;
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)

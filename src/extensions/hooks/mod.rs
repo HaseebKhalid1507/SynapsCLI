@@ -97,12 +97,18 @@ impl HookBus {
         let mut injections: Vec<String> = Vec::new();
 
         for reg in registrations {
-            // Tool-specific filter: skip handlers that don't match
+            // Tool-specific filter: skip handlers that don't match.
+            // Check both API name and runtime name so MCP tools with
+            // sanitized names (slashes→underscores) still match.
             if let Some(ref filter) = reg.tool_filter {
-                match &event.tool_name {
-                    Some(tool) if tool != filter => continue,
-                    None => continue, // tool-specific handler, but event has no tool
-                    _ => {} // matches
+                let matches = match (&event.tool_name, &event.tool_runtime_name) {
+                    (Some(api), Some(runtime)) => filter == api || filter == runtime,
+                    (Some(api), None) => filter == api,
+                    (None, Some(runtime)) => filter == runtime,
+                    (None, None) => false,
+                };
+                if !matches {
+                    continue;
                 }
             }
 

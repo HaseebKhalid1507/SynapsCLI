@@ -74,6 +74,7 @@ class HubState:
         self.agents: Dict[str, AgentState] = {}
         self.total_dispatched = 0
         self.total_completed = 0
+        self.next_task_id = 0
         self.session_start = time.time()
         self.websockets: List[web.WebSocketResponse] = []
         self._lock = threading.Lock()
@@ -83,12 +84,24 @@ class HubState:
             self.agents[name] = AgentState(name)
         return self.agents[name]
 
-    def dispatch(self, agent_name: str, task_id: str, description: str):
+    def dispatch(self, agent_name: str, description: str) -> str:
         with self._lock:
+            self.next_task_id += 1
+            task_id = f"task_{self.next_task_id}"
             agent = self.get_or_create(agent_name)
             agent.tasks[task_id] = AgentTask(task_id, description)
             agent.last_active = time.time()
             self.total_dispatched += 1
+            return task_id
+
+    def prune_idle(self):
+        with self._lock:
+            cutoff = time.time() - 300  # 5 minutes
+            to_remove = [name for name, agent in self.agents.items()
+                         if agent.status == "idle" and agent.last_active
+                         and agent.last_active < cutoff]
+            for name in to_remove:
+                del self.agents[name]
 
     def complete(self, agent_name: str, task_id: str):
         with self._lock:
@@ -144,11 +157,8 @@ def write_jsonrpc(msg):
     sys.stdout.buffer.write(body_bytes)
     sys.stdout.buffer.flush()
 
-_task_counter = 0
-
 def handle_hook(params):
     """Handle a hook event from SynapsCLI."""
-    global _task_counter
     kind = params.get("kind", "")
     tool_name = params.get("tool_name", "")
     tool_input = params.get("tool_input", {})
@@ -163,9 +173,12 @@ def handle_hook(params):
             agent_name = "unknown"
             task_desc = str(tool_input)[:120]
 
-        _task_counter += 1
-        task_id = f"task_{_task_counter}"
-        state.dispatch(agent_name, task_id, task_desc)
+        if not agent_name or agent_name == "unknown":
+            # Use first few words of task description
+            words = task_desc.strip().split()[:3]
+            agent_name = " ".join(words).lower() if words else "inline"
+
+        task_id = state.dispatch(agent_name, task_desc)
         broadcast_state()
         return {"action": "continue"}
 
@@ -273,15 +286,19 @@ async def handle_api(request):
 
 async def tick_loop():
     """Periodic state broadcast for elapsed time updates."""
+    ticks = 0
     while True:
         await asyncio.sleep(1)
+        ticks += 1
         if state.websockets:
             msg = json.dumps(state.snapshot())
             await _broadcast(msg)
+        if ticks % 60 == 0:
+            state.prune_idle()
 
 async def start_server():
     global _loop
-    _loop = asyncio.get_event_loop()
+    _loop = asyncio.get_running_loop()
 
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -466,7 +483,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-const ws = new WebSocket(`ws://${location.host}/ws`);
 const grid = document.getElementById('grid');
 const empty = document.getElementById('empty');
 
@@ -526,11 +542,13 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
-ws.onmessage = (e) => render(JSON.parse(e.data));
-ws.onclose = () => {
-  empty.innerHTML = 'Connection lost. Refresh to reconnect.';
-  empty.style.display = 'block';
-};
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = (e) => render(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onerror = () => ws.close();
+}
+connect();
 </script>
 </body>
 </html>
