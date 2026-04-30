@@ -14,6 +14,8 @@ use std::pin::Pin;
 mod types;
 mod auth;
 mod api;
+mod api_sync;
+mod request;
 mod stream;
 mod helpers;
 pub mod subagent;
