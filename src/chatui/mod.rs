@@ -269,6 +269,10 @@ pub async fn run(
         .map_err(|e| synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e)))?;
     let mut event_reader = EventStream::new();
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
+    let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
+    let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
+    let mut secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
     let mut cancel_token: Option<CancellationToken> = None;
     let mut steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
     let mut boot_fx: Option<Effect> = Some(boot_effect());
@@ -310,7 +314,7 @@ pub async fn run(
     loop {
         let elapsed = last_frame.elapsed();
         last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
 
         tokio::select! {
 
@@ -336,7 +340,7 @@ pub async fn run(
                         app.model_health.insert(key, (status, ms));
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                     }
                     None => {
                         // All ping tasks done (tx dropped) — stop printing
@@ -390,7 +394,7 @@ pub async fn run(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
@@ -400,10 +404,14 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() => {
-                if let Ok(size) = terminal.size() {
-                    if size.width > 0 && size.height > 0 {
-                        terminal.clear().ok();
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() => {
+                secret_prompts.poll_requests(&secret_prompt_rx);
+                let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
+                if message_animation_needs_clear {
+                    if let Ok(size) = terminal.size() {
+                        if size.width > 0 && size.height > 0 {
+                            terminal.clear().ok();
+                        }
                     }
                 }
                 if let Some(ref mut t) = app.logo_build_t {
@@ -414,11 +422,8 @@ pub async fn run(
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
                 }
-                if !app.subagents.is_empty() || app.streaming || app.compact_task.is_some() {
-                    app.spinner_frame = app.spinner_frame.wrapping_add(1);
-                    if app.spinner_frame % 3 == 0 {
-                        app.invalidate();
-                    }
+                if app.advance_animations() {
+                    app.invalidate();
                 }
                 if let Some(msg) = app.check_gamba_exited() {
                     terminal.clear().ok();
@@ -426,7 +431,7 @@ pub async fn run(
                     app.invalidate();
                     let elapsed = last_frame.elapsed();
                     last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                 }
                 // Poll background compaction task
                 if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
@@ -514,6 +519,24 @@ pub async fn run(
             maybe_event = event_reader.next(), if app.gamba_child.is_none() => {
                 match maybe_event {
                     Some(Ok(event)) => {
+                        if secret_prompts.is_active() {
+                            match event {
+                                crossterm::event::Event::Key(key) => match key.code {
+                                    crossterm::event::KeyCode::Enter => secret_prompts.submit(),
+                                    crossterm::event::KeyCode::Esc => secret_prompts.cancel(),
+                                    crossterm::event::KeyCode::Backspace => secret_prompts.backspace(),
+                                    crossterm::event::KeyCode::Char(c) => secret_prompts.push_char(c),
+                                    _ => {}
+                                },
+                                crossterm::event::Event::Paste(text) => {
+                                    for ch in text.chars() {
+                                        secret_prompts.push_char(ch);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         let is_streaming = app.streaming;
                         let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
                         match action {
@@ -631,8 +654,8 @@ pub async fn run(
                                         app.spinner_frame = 0;
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
-                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
-                                        stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                                        stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
                                         cancel_token = Some(ct);
@@ -825,8 +848,8 @@ pub async fn run(
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
-                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
                                 cancel_token = Some(ct);
@@ -1054,7 +1077,7 @@ pub async fn run(
                                     app.invalidate();
                                     let elapsed = last_frame.elapsed();
                                     last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                                 }
                             }
                         }
@@ -1070,7 +1093,7 @@ pub async fn run(
                                 app.invalidate();
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
@@ -1091,8 +1114,8 @@ pub async fn run(
                             app.spinner_frame = 0;
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
@@ -1106,7 +1129,7 @@ pub async fn run(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx)).await);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
@@ -1116,7 +1139,7 @@ pub async fn run(
                     if do_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry);
+                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                     }
                 }
             }

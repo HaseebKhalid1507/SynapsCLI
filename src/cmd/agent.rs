@@ -324,6 +324,7 @@ pub async fn run(config_path: String, trigger_context: String) {
             messages.clone(),
             cancel,
             None, // no steering for autonomous agents
+            None,
         ).await;
 
         let mut turn_done = false;
@@ -444,7 +445,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         }));
 
         let cancel = CancellationToken::new();
-        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None).await;
+        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None, None).await;
         
         // Give it 60 seconds to write handoff
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);

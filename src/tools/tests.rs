@@ -162,6 +162,7 @@ fn create_tool_context() -> ToolContext {
             session_manager: None,
             subagent_registry: None,
             event_queue: None,
+            secret_prompt: None,
         },
         limits: crate::tools::ToolLimits {
             max_tool_output: 30000,
@@ -386,6 +387,205 @@ async fn test_bash_tool_requested_timeout_is_not_clamped_by_max_timeout() {
     let result = tool.execute(params, ctx).await;
     assert!(result.is_ok(), "requested timeout should not be clamped by bash_max_timeout: {result:?}");
     assert!(result.unwrap().contains("done"));
+}
+
+
+#[tokio::test]
+async fn test_bash_fake_sudo_prompt_uses_secret_prompt_and_redacts_password() {
+    let tool = BashTool;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let responder = tokio::spawn(async move {
+        let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+        assert!(req.prompt.to_ascii_lowercase().contains("password"), "prompt was {:?}", req.prompt);
+        req.response_tx.send(Some("swordfish".to_string())).unwrap();
+    });
+
+    let mut ctx = create_tool_context();
+    ctx.capabilities.secret_prompt = Some(prompt_handle);
+    ctx.channels.tx_delta = Some(delta_tx);
+    let params = json!({
+        "command": "printf '[sudo] password for testuser: ' >&2; read -r pw; if [ \"$pw\" = swordfish ]; then echo AUTH_OK; else echo AUTH_FAIL; fi",
+        "timeout": 5
+    });
+
+    let result = tool.execute(params, ctx).await.unwrap();
+    responder.await.unwrap();
+    let mut streamed = String::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        streamed.push_str(&delta);
+    }
+
+    assert!(result.contains("AUTH_OK"));
+    assert!(!result.contains("swordfish"));
+    assert!(!result.contains("[sudo] password"));
+    assert!(!streamed.contains("[sudo] password"));
+}
+
+#[test]
+fn test_bash_wraps_sudo_to_force_stdin_prompt() {
+    let script = crate::tools::bash::bash_script_with_secure_sudo("sudo id");
+
+    assert!(script.contains("sudo()"));
+    assert!(script.contains("command sudo -S -p '[sudo] password required: '"));
+    assert!(script.ends_with("sudo id"));
+}
+
+#[tokio::test]
+async fn test_bash_sudo_function_prompt_is_intercepted_before_streaming() {
+    let tool = BashTool;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let responder = tokio::spawn(async move {
+        let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+        assert!(req.prompt.contains("[sudo] password required"), "prompt was {:?}", req.prompt);
+        req.response_tx.send(Some("wrong-password-for-test".to_string())).unwrap();
+    });
+
+    let mut ctx = create_tool_context();
+    ctx.capabilities.secret_prompt = Some(prompt_handle);
+    ctx.channels.tx_delta = Some(delta_tx);
+    let params = json!({
+        "command": "sudo -k; sudo -v",
+        "timeout": 5
+    });
+
+    let _ = tool.execute(params, ctx).await;
+    responder.await.unwrap();
+    let mut streamed = String::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        streamed.push_str(&delta);
+    }
+
+    assert!(!streamed.contains("[sudo] password required"), "sudo password prompt leaked into deltas: {streamed:?}");
+}
+
+#[tokio::test]
+async fn test_bash_control_char_output_is_sanitized_and_bounded_in_deltas() {
+    let tool = BashTool;
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut ctx = create_tool_context();
+    ctx.channels.tx_delta = Some(delta_tx);
+    ctx.limits.max_tool_output = 256;
+
+    let params = json!({
+        "command": "python3 -c \"import sys; sys.stdout.buffer.write(b'clean\\x1b[2J\\x00' + b'A' * 2000); sys.stdout.flush()\"",
+        "timeout": 5
+    });
+
+    let result = tool.execute(params, ctx).await.unwrap();
+    let mut streamed = String::new();
+    while let Ok(delta) = delta_rx.try_recv() {
+        streamed.push_str(&delta);
+    }
+
+    assert!(result.contains("[output truncated at 256]"));
+    assert!(!result.contains('\u{1b}'));
+    assert!(!result.contains('\0'));
+    assert!(!streamed.contains('\u{1b}'));
+    assert!(!streamed.contains('\0'));
+    assert!(streamed.len() <= 2048, "streamed deltas must be bounded, got {} bytes", streamed.len());
+}
+
+
+#[tokio::test]
+async fn test_bash_echoed_secret_is_redacted_from_output() {
+    let tool = BashTool;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
+
+    let responder = tokio::spawn(async move {
+        let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+        req.response_tx.send(Some("swordfish".to_string())).unwrap();
+    });
+
+    let mut ctx = create_tool_context();
+    ctx.capabilities.secret_prompt = Some(prompt_handle);
+    let params = json!({
+        "command": "printf 'Password: ' >&2; read -r pw; echo seen:$pw",
+        "timeout": 5
+    });
+
+    let result = tool.execute(params, ctx).await.unwrap();
+    responder.await.unwrap();
+
+    assert!(result.contains("seen:[redacted]"));
+    assert!(!result.contains("swordfish"));
+}
+
+
+#[tokio::test]
+async fn test_bash_sequential_password_prompts_are_each_handled() {
+    let tool = BashTool;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
+
+    let responder = tokio::spawn(async move {
+        for value in ["first", "second"] {
+            let req = prompt_rx.recv().await.expect("bash should request each secret prompt");
+            assert!(req.prompt.to_ascii_lowercase().contains("password"));
+            req.response_tx.send(Some(value.to_string())).unwrap();
+        }
+    });
+
+    let mut ctx = create_tool_context();
+    ctx.capabilities.secret_prompt = Some(prompt_handle);
+    let params = json!({
+        "command": "printf 'Password: ' >&2; read -r one; printf 'Password: ' >&2; read -r two; echo done:$one:$two",
+        "timeout": 5
+    });
+
+    let result = tool.execute(params, ctx).await.unwrap();
+    responder.await.unwrap();
+
+    assert!(result.contains("done:[redacted]:[redacted]"));
+    assert!(!result.contains("first"));
+    assert!(!result.contains("second"));
+}
+
+#[tokio::test]
+async fn test_bash_password_prompt_cancel_kills_command_without_leaking_partial_secret() {
+    let tool = BashTool;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
+
+    let responder = tokio::spawn(async move {
+        let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+        req.response_tx.send(None).unwrap();
+    });
+
+    let mut ctx = create_tool_context();
+    ctx.capabilities.secret_prompt = Some(prompt_handle);
+    let params = json!({
+        "command": "printf 'Password: ' >&2; read -r pw; echo should-not-run:$pw",
+        "timeout": 5
+    });
+
+    let err = tool.execute(params, ctx).await.unwrap_err().to_string();
+    responder.await.unwrap();
+
+    assert!(err.contains("waiting for password"));
+    assert!(!err.contains("should-not-run"));
+}
+
+#[tokio::test]
+async fn test_bash_binary_output_is_sanitized() {
+    let tool = BashTool;
+    let ctx = create_tool_context();
+    let params = json!({
+        "command": "python3 -c \"import sys; sys.stdout.buffer.write(bytes(range(32)) + b'visible')\"",
+        "timeout": 5
+    });
+
+    let result = tool.execute(params, ctx).await.unwrap();
+
+    assert!(result.contains("visible"));
+    assert!(!result.contains('\0'));
+    assert!(!result.contains('\u{1b}'));
 }
 
 // ── New Tests ────────────────────────────────────────────────────────────

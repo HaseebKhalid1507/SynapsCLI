@@ -393,6 +393,44 @@ impl App {
         self.line_cache = None;
     }
 
+    /// Advance spinner/animation state.
+    ///
+    /// Returns true only when text generated from `render_lines` may have changed
+    /// and the cached message lines must be rebuilt. Full-screen overlays and
+    /// header/panel spinners are redrawn from current state without touching the
+    /// message cache, avoiding unnecessary whole-terminal clears on every frame.
+    pub(crate) fn advance_animations(&mut self) -> bool {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        if self.spinner_frame % 3 != 0 {
+            return false;
+        }
+
+        self.render_lines_uses_spinner()
+    }
+
+    fn render_lines_uses_spinner(&self) -> bool {
+        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
+            ChatMessage::Thinking(text) => text == "…",
+            ChatMessage::ToolUseStart(_, _) => true,
+            ChatMessage::ToolUse { .. } => {
+                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+            }
+            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
+            _ => false,
+        })
+    }
+
+    /// True when a full terminal clear is needed before an animated redraw.
+    ///
+    /// The message pane is already cleared locally in `draw()` before rendering
+    /// the transcript, and rendered lines are clamped to terminal display width.
+    /// Calling `terminal.clear()` on streaming animation frames repaints the
+    /// whole alternate screen and causes visible flicker, so animation ticks
+    /// should not request a full-screen clear.
+    pub(crate) fn needs_clear_for_animation_redraw(&self) -> bool {
+        false
+    }
+
     /// Returns true when the chat message at `idx` is the tool result currently
     /// being streamed/executed. Completed historical tool results must render as
     /// done even while a later tool call is active.
@@ -747,6 +785,49 @@ mod tests {
         app.tool_start_time = Some(std::time::Instant::now());
 
         assert!(!app.is_active_tool_result(1));
+    }
+
+    #[test]
+    fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("stable transcript".to_string()));
+        app.line_cache = Some((80, app.render_lines(80)));
+        app.subagents.push(SubagentState {
+            id: 1,
+            name: "tester".to_string(),
+            status: "running".to_string(),
+            start_time: std::time::Instant::now(),
+            done: false,
+            duration_secs: None,
+        });
+        app.spinner_frame = 2;
+
+        let invalidate_messages = app.advance_animations();
+
+        assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
+        assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
+        assert!(app.line_cache.is_some(), "message cache should remain valid for panel-only animation");
+    }
+
+    #[test]
+    fn animation_tick_for_active_bash_result_invalidates_message_cache() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: String::new(),
+            elapsed_ms: None,
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+        app.line_cache = Some((80, app.render_lines(80)));
+        app.spinner_frame = 2;
+
+        let invalidate_messages = app.advance_animations();
+
+        assert!(invalidate_messages, "active message-area bash animation must rebuild message cache");
+        assert!(!app.needs_clear_for_animation_redraw(), "streaming animation must not force whole-terminal clear flicker");
     }
 
     #[test]

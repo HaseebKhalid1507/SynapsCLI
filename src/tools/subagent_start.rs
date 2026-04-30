@@ -168,7 +168,7 @@ impl Tool for SubagentStartTool {
                         cancel_inner.cancel();
                     });
 
-                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx)).await;
+                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx), None).await;
 
                     let mut tool_count = 0u32;
                     let mut total_input_tokens = 0u64;
