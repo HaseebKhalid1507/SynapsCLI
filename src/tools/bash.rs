@@ -265,12 +265,12 @@ impl Tool for BashTool {
                 }
             }
             let status = child.wait().await.map_err(|e| RuntimeError::Tool(e.to_string()))?;
-            Ok::<_, RuntimeError>((status, full_output))
+            Ok::<_, RuntimeError>((status, full_output, truncated))
         }).await;
 
         match result {
-            Ok(Ok((status, output))) => {
-                if status.success() || output.contains("[output truncated at") {
+            Ok(Ok((status, output, was_truncated))) => {
+                if status.success() || was_truncated {
                     Ok(output)
                 } else {
                     Err(RuntimeError::Tool(format!(
