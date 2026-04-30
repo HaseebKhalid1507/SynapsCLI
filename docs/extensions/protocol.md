@@ -105,6 +105,73 @@ Sent once immediately after the process starts, before any hooks are delivered. 
 
 If the response protocol version is unsupported, Synaps refuses to load the extension and reports the load failure.
 
+Extensions that request `tools.register` may declare extension-provided tools in
+`capabilities.tools`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocol_version": 1,
+    "capabilities": {
+      "tools": [
+        {
+          "name": "echo",
+          "description": "Echo text back to the model",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" }
+            },
+            "required": ["text"]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Registered tool runtime names are namespaced as `plugin-id:tool-name` to avoid
+collisions. API-facing tool names are sanitized by the normal tool registry, for
+example `policy-bundle:echo` becomes `policy-bundle_echo`.
+
+---
+
+### `tool.call`
+
+Called when the model invokes an extension-provided tool declared during
+`initialize`.
+
+**Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tool.call",
+  "params": {
+    "name": "echo",
+    "input": { "text": "hello" }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": { "content": "echo: hello" }
+}
+```
+
+If `result` is a string, Synaps uses it as the tool output. If `result.content`
+is a string, Synaps uses that. Otherwise Synaps serializes the JSON result as the
+tool output. JSON-RPC errors are surfaced as normal tool execution failures.
+
 ---
 
 ### `hook.handle`
@@ -210,7 +277,7 @@ Fields that are not applicable to the current hook are always `null`, never omit
 
 ## HookResult Variants
 
-Your response's `result` field must be one of four variants, identified by the `action` field.
+Your response's `result` field must be one of these variants, identified by the `action` field.
 
 ### `continue`
 
