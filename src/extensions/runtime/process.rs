@@ -53,7 +53,6 @@ struct JsonRpcResponse {
     jsonrpc: String,
     result: Option<Value>,
     error: Option<JsonRpcError>,
-    #[allow(dead_code)]
     id: u64,
 }
 
@@ -149,20 +148,48 @@ impl ProcessExtension {
         let body_buf = {
             let mut stdout = self.stdout.lock().await;
 
-            // Header: "Content-Length: <n>\r\n"
-            let mut header_line = String::new();
-            stdout
-                .read_line(&mut header_line)
-                .await
-                .map_err(|e| format!("Read header error: {}", e))?;
+            // Read headers until blank line, extract Content-Length
+            // case-insensitively. Supports extensions that send additional
+            // headers (e.g. Content-Type) like full LSP implementations.
+            let mut content_length: Option<usize> = None;
+            loop {
+                let mut header_line = String::new();
+                stdout
+                    .read_line(&mut header_line)
+                    .await
+                    .map_err(|e| format!("Read header error: {}", e))?;
 
-            let content_length: usize = header_line
-                .trim()
-                .strip_prefix("Content-Length: ")
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| {
-                    format!("Invalid Content-Length header: {:?}", header_line)
-                })?;
+                if header_line.is_empty() {
+                    return Err("Unexpected EOF while reading response headers".into());
+                }
+
+                // Cap header line size to prevent unbounded buffering
+                if header_line.len() > 1024 {
+                    return Err(format!(
+                        "Extension '{}' header line too long ({} bytes)",
+                        self.id, header_line.len()
+                    ));
+                }
+
+                let trimmed = header_line.trim();
+                if trimmed.is_empty() {
+                    break; // blank line = end of headers
+                }
+
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("Content-Length") {
+                        content_length = Some(
+                            value.trim().parse().map_err(|_| {
+                                format!("Invalid Content-Length value: {:?}", value.trim())
+                            })?
+                        );
+                    }
+                }
+            }
+
+            let content_length = content_length.ok_or_else(|| {
+                format!("Extension '{}' response missing Content-Length header", self.id)
+            })?;
 
             // Guard against OOM from malicious/buggy Content-Length
             const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024; // 4 MB
@@ -172,13 +199,6 @@ impl ProcessExtension {
                     self.id, content_length, MAX_RESPONSE_SIZE
                 ));
             }
-
-            // Blank separator line "\r\n"
-            let mut blank = String::new();
-            stdout
-                .read_line(&mut blank)
-                .await
-                .map_err(|e| format!("Read separator error: {}", e))?;
 
             // Body
             let mut buf = vec![0u8; content_length];
@@ -190,6 +210,15 @@ impl ProcessExtension {
 
         let response: JsonRpcResponse = serde_json::from_slice(&body_buf)
             .map_err(|e| format!("Parse response error: {}", e))?;
+
+        // Validate response ID matches request — detects protocol desync
+        // from concurrent calls or extension bugs.
+        if response.id != id {
+            return Err(format!(
+                "Extension '{}' response ID mismatch: expected {}, got {} (protocol desync)",
+                self.id, id, response.id
+            ));
+        }
 
         if let Some(err) = response.error {
             return Err(format!("Extension error: {}", err.message));

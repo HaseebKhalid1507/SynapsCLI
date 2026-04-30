@@ -86,17 +86,22 @@ impl HookBus {
     /// If no handlers are registered for this hook, returns immediately
     /// (the no-extensions fast path).
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
-        let handlers = self.handlers.read().await;
-
-        let registrations = match handlers.get(&event.kind) {
-            Some(regs) if !regs.is_empty() => regs,
-            _ => return HookResult::Continue, // fast path: no handlers
-        };
+        // Snapshot the handler list and drop the lock immediately.
+        // This prevents holding the RwLock across async handler calls
+        // (which could block subscribe/unsubscribe for the entire
+        // duration of IPC round-trips to extension processes).
+        let registrations = {
+            let handlers = self.handlers.read().await;
+            match handlers.get(&event.kind) {
+                Some(regs) if !regs.is_empty() => regs.clone(),
+                _ => return HookResult::Continue, // fast path: no handlers
+            }
+        }; // lock dropped here
 
         // Collect injections from all handlers rather than returning on first
         let mut injections: Vec<String> = Vec::new();
 
-        for reg in registrations {
+        for reg in &registrations {
             // Tool-specific filter: skip handlers that don't match.
             // Check both API name and runtime name so MCP tools with
             // sanitized names (slashes→underscores) still match.

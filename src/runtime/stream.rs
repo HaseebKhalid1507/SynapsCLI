@@ -100,11 +100,27 @@ impl StreamMethods {
 
             // ═══ HOOK: before_message ═══
             // Fire before sending messages to the LLM. Extensions can inject context.
+            // Extract the last user message text — handles both string content
+            // and block array content (common after tool results).
             let mut injected_system = system_prompt.clone();
-            if let Some(last_user_msg) = messages.last()
-                .and_then(|m| m["content"].as_str())
-            {
-                let hook_event = crate::extensions::hooks::events::HookEvent::before_message(last_user_msg);
+            let last_user_msg: Option<String> = messages.iter().rev()
+                .find(|m| m["role"].as_str() == Some("user"))
+                .and_then(|m| {
+                    // Try string content first
+                    if let Some(s) = m["content"].as_str() {
+                        return Some(s.to_string());
+                    }
+                    // Try block array content
+                    if let Some(arr) = m["content"].as_array() {
+                        return arr.iter()
+                            .find(|b| b["type"].as_str() == Some("text"))
+                            .and_then(|b| b["text"].as_str())
+                            .map(String::from);
+                    }
+                    None
+                });
+            if let Some(ref msg_text) = last_user_msg {
+                let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
                 if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
                     // Prepend injected content to system prompt
                     let base = injected_system.clone().unwrap_or_default();
