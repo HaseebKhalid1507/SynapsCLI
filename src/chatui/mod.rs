@@ -453,8 +453,9 @@ pub async fn run(
 
     // ═══ Extension Discovery ═══
     // Scan ~/.synaps-cli/plugins/ for extensions and load them
-    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
+    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new_with_tools(
         std::sync::Arc::clone(runtime.hook_bus()),
+        runtime.tools_shared(),
     );
     if !no_extensions {
         let (loaded, failed) = ext_mgr.discover_and_load().await;

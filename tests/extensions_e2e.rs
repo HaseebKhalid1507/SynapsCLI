@@ -220,6 +220,37 @@ async fn malformed_modify_result_blocks_instead_of_failing_open() {
 }
 
 #[tokio::test]
+async fn extension_tools_are_registered_in_tool_registry() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let hook_bus = Arc::new(HookBus::new());
+    let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
+    let mut manager = ExtensionManager::new_with_tools(hook_bus, tools.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["tools.register".to_string()],
+        hooks: vec![],
+    };
+
+    manager.load("register-tool-test", &manifest).await.unwrap();
+
+    let registry = tools.read().await;
+    assert!(registry.get("register-tool-test:echo").is_some());
+    let schema = registry.tools_schema();
+    let registered = schema.iter().find(|tool| tool["name"] == "register-tool-test_echo");
+    assert!(registered.is_some(), "extension tool should appear in API schema: {schema:?}");
+    drop(registry);
+
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn extension_registering_tools_requires_tools_register_permission() {
     let fixture = std::env::current_dir()
         .unwrap()

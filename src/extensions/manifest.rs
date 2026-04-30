@@ -54,8 +54,8 @@ impl ExtensionManifest {
             return Err(format!("Extension '{}' has empty command", id));
         }
 
-        if self.hooks.is_empty() {
-            return Err(format!("Extension '{}' must subscribe to at least one hook", id));
+        if self.hooks.is_empty() && !self.permissions.iter().any(|permission| permission == "tools.register") {
+            return Err(format!("Extension '{}' must subscribe to at least one hook or request tools.register", id));
         }
 
         let permissions = PermissionSet::try_from_strings(&self.permissions)?;

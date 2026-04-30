@@ -58,6 +58,8 @@ pub struct ExtensionStatus {
 pub struct ExtensionManager {
     /// The shared hook bus.
     hook_bus: Arc<HookBus>,
+    /// Optional shared tool registry for extension-provided tools.
+    tools: Option<Arc<tokio::sync::RwLock<crate::ToolRegistry>>>,
     /// Running extensions keyed by ID.
     extensions: HashMap<String, Arc<dyn ExtensionHandler>>,
 }
@@ -67,6 +69,19 @@ impl ExtensionManager {
     pub fn new(hook_bus: Arc<HookBus>) -> Self {
         Self {
             hook_bus,
+            tools: None,
+            extensions: HashMap::new(),
+        }
+    }
+
+    /// Create a new manager with shared hook bus and tool registry.
+    pub fn new_with_tools(
+        hook_bus: Arc<HookBus>,
+        tools: Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    ) -> Self {
+        Self {
+            hook_bus,
+            tools: Some(tools),
             extensions: HashMap::new(),
         }
     }
@@ -109,6 +124,19 @@ impl ExtensionManager {
             ));
         }
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
+
+        if !registered_tools.is_empty() {
+            let Some(tools) = &self.tools else {
+                return Err(format!(
+                    "Extension '{}' registered tools but no tool registry is available",
+                    id
+                ));
+            };
+            let mut registry = tools.write().await;
+            for spec in registered_tools {
+                registry.register(Arc::new(crate::tools::ExtensionTool::new(id, spec, handler.clone())));
+            }
+        }
 
         // Register hook subscriptions
         for (kind, tool_filter, matcher) in subscriptions {
