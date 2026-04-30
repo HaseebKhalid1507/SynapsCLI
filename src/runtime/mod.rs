@@ -407,6 +407,7 @@ impl Runtime {
                     let session_mgr = self.session_manager.clone();
                     let cfg_subagent_registry = self.subagent_registry.clone();
                     let cfg_event_queue = self.event_queue.clone();
+                    let cfg_hook_bus = self.hook_bus.clone();
                     
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
@@ -422,10 +423,20 @@ impl Runtime {
                             let session_mgr_inner = session_mgr.clone();
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
+                            let hook_bus_inner = cfg_hook_bus.clone();
+                            let tool_name_for_hook = tool_name.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
+                                        // ═══ HOOK: before_tool_call (parallel) ═══
+                                        let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                            &tool_name_for_hook, input.clone(),
+                                        );
+                                        let hook_result = hook_bus_inner.emit(&hook_event).await;
+                                        if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                            format!("Tool call blocked by extension: {}", reason)
+                                        } else {
                                         let ctx = crate::ToolContext {
                                             channels: crate::tools::ToolChannels {
                                                 tx_delta: None,
@@ -445,9 +456,16 @@ impl Runtime {
                                                 subagent_timeout: cfg_subagent_timeout,
                                             },
                                         };
-                                        match t.execute(input, ctx).await {
+                                        let output = match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
+                                        };
+                                        // ═══ HOOK: after_tool_call (parallel) ═══
+                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                            &tool_name_for_hook, serde_json::json!({}), output.clone(),
+                                        );
+                                        let _ = hook_bus_inner.emit(&hook_event).await;
+                                        output
                                         }
                                     }
                                     None => format!("Unknown tool: {}", tool_name),
