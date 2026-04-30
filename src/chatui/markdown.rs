@@ -124,7 +124,11 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         }
     }
 
-    // Shrink columns if total table width exceeds terminal width
+    // Shrink columns if total table width exceeds terminal width.
+    // Strategy: lock narrow columns at their natural width (they're already
+    // compact), then distribute the remaining budget among the wide columns.
+    // This prevents short fields like "✅" or "5.0s" from being crushed to
+    // "…" while giving long-text columns as much room as possible.
     let prefix_overhead = UnicodeWidthStr::width(prefix) + 2; // prefix + "  "
     let per_col_overhead = 3; // " " + cell + " " + gap
     let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
@@ -133,9 +137,41 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         if available > 0 && num_cols > 0 {
             let total_content: usize = col_widths.iter().sum();
             if total_content > available {
-                let mut new_widths: Vec<usize> = col_widths.iter()
-                    .map(|&w| (w * available / total_content).max(3))
-                    .collect();
+                // Phase 1: columns that fit in ≤ 12 chars keep their natural
+                // width — they're already tight and truncating them destroys
+                // readability. Everything else is "shrinkable".
+                let narrow_threshold = 12;
+                let mut new_widths = col_widths.clone();
+                let mut locked_total: usize = 0;
+                let mut shrinkable_total: usize = 0;
+                let mut shrinkable_indices: Vec<usize> = Vec::new();
+
+                for (i, &w) in col_widths.iter().enumerate() {
+                    if w <= narrow_threshold {
+                        locked_total += w;
+                    } else {
+                        shrinkable_indices.push(i);
+                        shrinkable_total += w;
+                    }
+                }
+
+                let budget_for_shrinkable = available.saturating_sub(locked_total);
+
+                if shrinkable_indices.is_empty() || budget_for_shrinkable == 0 {
+                    // All columns are narrow or no budget left — fall back to
+                    // proportional shrink across everything.
+                    new_widths = col_widths.iter()
+                        .map(|&w| (w * available / total_content).max(3))
+                        .collect();
+                } else {
+                    // Distribute budget proportionally among shrinkable columns
+                    for &idx in &shrinkable_indices {
+                        let share = (col_widths[idx] * budget_for_shrinkable / shrinkable_total).max(6);
+                        new_widths[idx] = share;
+                    }
+                }
+
+                // Distribute any leftover chars to the widest columns first
                 let used: usize = new_widths.iter().sum();
                 if used < available {
                     let mut remainder = available - used;
@@ -542,4 +578,79 @@ pub(crate) fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
     else if n >= 1_000 { format!("{:.1}k", n as f64 / 1_000.0) }
     else { format!("{}", n) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract all text content from rendered lines
+    fn rendered_text(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| {
+            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        }).collect()
+    }
+
+    #[test]
+    fn table_narrow_cols_preserved_when_shrinking() {
+        // Table with mixed column widths: short status + long description
+        // On a narrow terminal, the short columns should keep their size
+        let table_lines = vec![
+            "| Status | Name | Description |".to_string(),
+            "|--------|------|-------------|".to_string(),
+            "| ✅ | Spike | The executor workhorse agent that handles grunt work |".to_string(),
+            "| ❌ | Chrollo | Deep analyst for recon and complex reasoning tasks |".to_string(),
+        ];
+
+        // Render at width=60 — tight squeeze
+        let result = render_table(&table_lines, "  ", 60);
+        let texts = rendered_text(&result);
+
+        // Status column (✅/❌) should NOT be truncated to "…"
+        let has_checkmark = texts.iter().any(|t| t.contains('✅'));
+        let has_cross = texts.iter().any(|t| t.contains('❌'));
+        assert!(has_checkmark, "Status ✅ was truncated away");
+        assert!(has_cross, "Status ❌ was truncated away");
+
+        // Names should survive too (short columns)
+        let has_spike = texts.iter().any(|t| t.contains("Spike"));
+        let has_chrollo = texts.iter().any(|t| t.contains("Chrollo"));
+        assert!(has_spike, "Name 'Spike' was truncated");
+        assert!(has_chrollo, "Name 'Chrollo' was truncated");
+    }
+
+    #[test]
+    fn table_six_columns_dont_all_become_ellipsis() {
+        // The exact scenario from S182: wide table with 6 columns
+        let table_lines = vec![
+            "| # | Test | Status | Quality | Speed | Notes |".to_string(),
+            "|---|------|--------|---------|-------|-------|".to_string(),
+            "| 1 | example.com | ✅ Yes | Good | 0.13s | Perfect output |".to_string(),
+            "| 2 | HN | ✅ Yes | Meh | 0.41s | Table-noisy but works |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "  ", 80);
+        let texts = rendered_text(&result);
+
+        // Short columns (#, Status, Speed) must survive intact
+        let row1 = texts.iter().find(|t| t.contains("example")).unwrap();
+        assert!(row1.contains("0.13s"), "Speed column was truncated in: {}", row1);
+        assert!(row1.contains("✅"), "Status was truncated in: {}", row1);
+    }
+
+    #[test]
+    fn table_fits_width_no_truncation() {
+        // Table that fits — nothing should be truncated
+        let table_lines = vec![
+            "| A | B |".to_string(),
+            "|---|---|".to_string(),
+            "| x | y |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+        // No ellipsis anywhere
+        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
+            "Small table was unnecessarily truncated");
+    }
 }
