@@ -9,6 +9,7 @@ Usage: spawned by SynapsCLI extension system, serves on :3456
 """
 
 import asyncio
+import os
 import json
 import sys
 import threading
@@ -214,9 +215,10 @@ def stdin_loop():
             sys.stderr.flush()
             break
 
-    # Shutdown the web server
-    sys.stderr.write("[hub] stdin loop ended, shutting down\n")
+    # Parent process (synaps) exited — kill the whole process
+    sys.stderr.write("[hub] stdin closed, exiting\n")
     sys.stderr.flush()
+    os._exit(0)
 
 # ── WebSocket broadcast ───────────────────────────────────────────────
 
