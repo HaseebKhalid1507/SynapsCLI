@@ -101,7 +101,13 @@ impl ExtensionManager {
 
         // Spawn the extension process only after the manifest is known-good.
         let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
-        process.initialize(cwd.clone()).await?;
+        let registered_tools = process.initialize(cwd.clone()).await?;
+        if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
+            return Err(format!(
+                "Extension '{}' registered tools but lacks permission 'tools.register'",
+                id
+            ));
+        }
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
 
         // Register hook subscriptions

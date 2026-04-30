@@ -55,12 +55,24 @@ struct InitializeParams {
     config: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RegisteredExtensionToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
 #[derive(Deserialize)]
 struct InitializeResult {
     protocol_version: u32,
-    #[allow(dead_code)]
     #[serde(default)]
-    capabilities: Value,
+    capabilities: InitializeCapabilities,
+}
+
+#[derive(Default, Deserialize)]
+struct InitializeCapabilities {
+    #[serde(default)]
+    tools: Vec<RegisteredExtensionToolSpec>,
 }
 
 struct ProcessState {
@@ -171,7 +183,7 @@ impl ProcessExtension {
         self.restart_count.load(Ordering::Relaxed)
     }
 
-    pub async fn initialize(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
+    pub async fn initialize(&self, plugin_root: Option<PathBuf>) -> Result<Vec<RegisteredExtensionToolSpec>, String> {
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
@@ -182,20 +194,24 @@ impl ProcessExtension {
             config: Value::Object(Default::default()),
         };
         let value = self.call_no_restart("initialize", serde_json::to_value(params).map_err(|e| e.to_string())?).await?;
+        Self::parse_initialize_result(&self.id, value)
+    }
+
+    fn parse_initialize_result(id: &str, value: Value) -> Result<Vec<RegisteredExtensionToolSpec>, String> {
         let result: InitializeResult = serde_json::from_value(value)
-            .map_err(|e| format!("Invalid initialize response from extension '{}': {}", self.id, e))?;
+            .map_err(|e| format!("Invalid initialize response from extension '{}': {}", id, e))?;
         if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
             return Err(format!(
                 "Extension '{}' initialize returned unsupported protocol_version {} (supported: {})",
-                self.id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
+                id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
             ));
         }
-        Ok(())
+        Ok(result.capabilities.tools)
     }
 
     #[doc(hidden)]
     pub async fn initialize_for_test(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
-        self.initialize(plugin_root).await
+        self.initialize(plugin_root).await.map(|_| ())
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
@@ -246,15 +262,7 @@ impl ProcessExtension {
             serde_json::to_value(params).map_err(|e| e.to_string())?,
             id,
         ).await?;
-        let result: InitializeResult = serde_json::from_value(value)
-            .map_err(|e| format!("Invalid initialize response from extension '{}': {}", self.id, e))?;
-        if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
-            return Err(format!(
-                "Extension '{}' initialize returned unsupported protocol_version {} (supported: {})",
-                self.id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
-            ));
-        }
-        Ok(())
+        Self::parse_initialize_result(&self.id, value).map(|_| ())
     }
 
     async fn call_once_locked(

@@ -219,6 +219,32 @@ async fn malformed_modify_result_blocks_instead_of_failing_open() {
     handler.shutdown().await;
 }
 
+#[tokio::test]
+async fn extension_registering_tools_requires_tools_register_permission() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["tools.intercept".to_string()],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+            hook: "before_tool_call".to_string(),
+            tool: Some("bash".to_string()),
+            matcher: None,
+        }],
+    };
+
+    let error = manager.load("register-tool-test", &manifest).await.unwrap_err();
+    assert!(error.contains("tools.register"), "{error}");
+    manager.shutdown_all().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
