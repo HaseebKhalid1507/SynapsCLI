@@ -1,0 +1,39 @@
+{
+  "manifest_version": 1,
+  "runtimes": ["process"],
+  "hooks": {
+    "before_tool_call": {
+      "permission": "tools.intercept",
+      "tool_filter": true,
+      "actions": ["continue", "block"]
+    },
+    "after_tool_call": {
+      "permission": "tools.intercept",
+      "tool_filter": true,
+      "actions": ["continue"]
+    },
+    "before_message": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": ["continue", "inject"]
+    },
+    "on_session_start": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": ["continue"]
+    },
+    "on_session_end": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": ["continue"]
+    }
+  },
+  "permissions": [
+    "tools.intercept",
+    "tools.override",
+    "privacy.llm_content",
+    "session.lifecycle",
+    "tools.register",
+    "providers.register"
+  ]
+}
