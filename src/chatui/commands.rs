@@ -67,6 +67,8 @@ pub(super) enum CommandAction {
     /// Assign (or clear, if empty) a name to the current session. Persists via save.
     /// Show account usage and reset times.
     Status,
+    /// Show loaded extension health snapshots.
+    ExtensionsStatus,
     /// Control local voice capture: /voice on|off|status.
     Voice { subcommand: String },
 }
@@ -325,6 +327,7 @@ pub(super) async fn handle_command(
                 "/theme — list available themes",
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
+                "/extensions status — show loaded extension health",
                 "/status — show account usage and reset times",
                 "/voice — toggle local voice dictation controls",
                 "/voice on|off|status — explicit voice control",
@@ -395,6 +398,18 @@ pub(super) async fn handle_command(
                 }
                 _ => {
                     app.push_msg(ChatMessage::Error(format!("unknown /chain subcommand: {}", sub)));
+                }
+            }
+        }
+        "extensions" => {
+            match arg.trim() {
+                "status" | "" => return CommandAction::ExtensionsStatus,
+                other => {
+                    app.push_msg(ChatMessage::System(format!(
+                        "usage: /extensions status (unknown: {})",
+                        other
+                    )));
+                    return CommandAction::None;
                 }
             }
         }
@@ -494,6 +509,11 @@ mod tests {
     #[test]
     fn plugins_is_in_all_commands() {
         assert!(ALL_COMMANDS.contains(&"plugins"));
+    }
+
+    #[test]
+    fn extensions_is_in_all_commands() {
+        assert!(ALL_COMMANDS.contains(&"extensions"));
     }
 
     // -- edit_distance tests --

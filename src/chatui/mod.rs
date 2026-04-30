@@ -82,6 +82,7 @@ fn command_action_name(action: &CommandAction) -> &'static str {
         CommandAction::ChainName { .. } => "chain-name",
         CommandAction::ChainUnname { .. } => "chain-unname",
         CommandAction::Status => "status",
+        CommandAction::ExtensionsStatus => "extensions-status",
         CommandAction::Voice { .. } => "voice",
     }
 }
@@ -979,6 +980,22 @@ pub async fn run(
                                             }
                                         }
                                     }
+                                    CommandAction::ExtensionsStatus => {
+                                        let statuses = ext_mgr.statuses().await;
+                                        if statuses.is_empty() {
+                                            app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
+                                        } else {
+                                            app.push_msg(ChatMessage::System(format!("Extensions ({}):", statuses.len())));
+                                            for status in statuses {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  {} — {} (restarts: {})",
+                                                    status.id,
+                                                    status.health.as_str(),
+                                                    status.restart_count
+                                                )));
+                                            }
+                                        }
+                                    }
                                     CommandAction::Voice { subcommand } => {
                                         if subcommand == "mode conversation" {
                                             app.voice.mode = app::VoiceUiMode::Conversation;
@@ -1153,6 +1170,7 @@ let display_text = app.user_display_text_for_submission(&input);
                                         CommandAction::ChainName { .. } => {}
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
+                                        CommandAction::ExtensionsStatus => {}
                                         CommandAction::Voice { .. } => {}
                                         CommandAction::Ping => {}
                                     }
