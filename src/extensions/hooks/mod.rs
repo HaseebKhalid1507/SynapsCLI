@@ -33,6 +33,7 @@ fn hook_result_action(result: &HookResult) -> &'static str {
         HookResult::Continue => "continue",
         HookResult::Block { .. } => "block",
         HookResult::Inject { .. } => "inject",
+        HookResult::Confirm { .. } => "confirm",
     }
 }
 
@@ -221,6 +222,23 @@ impl HookBus {
                     // Accumulate — don't early-return. Multiple extensions can inject.
                     injections.push(content);
                 }
+                Ok(HookResult::Confirm { message }) => {
+                    if !event.kind.allows_result(&HookResult::Confirm { message: message.clone() }) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "confirm",
+                            "Extension returned action not allowed for hook — ignoring"
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Hook requested confirmation by extension"
+                    );
+                    return HookResult::Confirm { message };
+                }
                 Err(_timeout) => {
                     tracing::warn!(
                         hook = %event.kind.as_str(),
@@ -350,6 +368,12 @@ mod tests {
             }),
             "inject"
         );
+        assert_eq!(
+            hook_result_action(&HookResult::Confirm {
+                message: "Proceed?".into(),
+            }),
+            "confirm"
+        );
     }
 
     #[tokio::test]
@@ -374,6 +398,49 @@ mod tests {
         bus.emit(&event).await;
 
         assert_eq!(handler.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_stops_chain_for_before_tool_call() {
+        let bus = HookBus::new();
+        let confirmer = TestHandler::new("confirmer", HookResult::Confirm {
+            message: "Run this command?".into(),
+        });
+        let after = TestHandler::new("after", HookResult::Continue);
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, confirmer.clone(), None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Confirm { .. }));
+        assert_eq!(confirmer.calls(), 1);
+        assert_eq!(after.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn confirm_is_ignored_for_non_tool_hooks() {
+        let bus = HookBus::new();
+        let confirmer = TestHandler::new("confirmer", HookResult::Confirm {
+            message: "Not allowed here".into(),
+        });
+        let perms = perms_with(&[Permission::LlmContent]);
+
+        bus.subscribe(HookKind::BeforeMessage, confirmer.clone(), None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_message("hello");
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Continue));
+        assert_eq!(confirmer.calls(), 1);
     }
 
     #[tokio::test]

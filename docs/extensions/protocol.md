@@ -154,7 +154,7 @@ Fields that are not applicable to the current hook are always `null`, never omit
 
 ## HookResult Variants
 
-Your response's `result` field must be one of three variants, identified by the `action` field.
+Your response's `result` field must be one of four variants, identified by the `action` field.
 
 ### `continue`
 
@@ -180,6 +180,21 @@ Prevent the event from proceeding. Only valid on hooks marked **Can block?** in 
 | `reason` | string | yes      | Human-readable explanation surfaced to the user/logs  |
 
 When a tool call is blocked, the LLM receives a synthetic tool result indicating the tool was not executed, along with the reason.
+
+### `confirm`
+
+Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on `before_tool_call`; on other hooks, `confirm` is treated as `continue` and logged as an unsupported action. Call sites must explicitly handle this distinct result before executing the tool.
+
+```json
+{
+  "action": "confirm",
+  "message": "Run `deploy-prod` now?"
+}
+```
+
+| Field     | Type   | Required | Description                                      |
+|-----------|--------|----------|--------------------------------------------------|
+| `message` | string | yes      | Human-readable confirmation prompt for the user  |
 
 ### `inject`
 

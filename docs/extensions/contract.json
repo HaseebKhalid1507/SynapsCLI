@@ -6,7 +6,7 @@
     "before_tool_call": {
       "permission": "tools.intercept",
       "tool_filter": true,
-      "actions": ["continue", "block"]
+      "actions": ["continue", "block", "confirm"]
     },
     "after_tool_call": {
       "permission": "tools.intercept",

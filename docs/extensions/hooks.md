@@ -25,7 +25,7 @@ name.
 
 | Hook | Required permission | Tool filter? | Allowed result actions | Purpose |
 |---|---|---:|---|---|
-| `before_tool_call` | `tools.intercept` | yes | `continue`, `block` | Inspect/block a tool call before execution |
+| `before_tool_call` | `tools.intercept` | yes | `continue`, `block`, `confirm` | Inspect/block/confirm a tool call before execution |
 | `after_tool_call` | `tools.intercept` | yes | `continue` | Observe tool input/output after execution |
 | `before_message` | `privacy.llm_content` | no | `continue`, `inject` | Inspect the user message and optionally inject context |
 | `on_session_start` | `session.lifecycle` | no | `continue` | Observe session creation |
@@ -38,6 +38,9 @@ Unsupported result actions are ignored fail-open and logged as warnings.
 - `continue` lets SynapsCLI proceed.
 - `block` prevents the hooked operation and surfaces the reason. It is accepted
   only on `before_tool_call`.
+- `confirm` asks the runtime to get explicit user confirmation before proceeding.
+  It is accepted only on `before_tool_call`; until a UI confirmation flow is wired
+  into a call site, it is surfaced as a distinct result for the caller to handle.
 - `inject` accumulates text from all matching handlers and injects it into the
   model context. It is accepted only on `before_message`.
 

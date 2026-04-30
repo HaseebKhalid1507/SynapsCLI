@@ -88,17 +88,18 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 
 ## Available Hooks
 
-| Hook                | Fires when…                                              | Can block? | Can inject? |
-|---------------------|----------------------------------------------------------|------------|-------------|
-| `before_tool_call`  | A tool is about to be executed                           | ✅          | ❌           |
-| `after_tool_call`   | A tool has finished executing                            | ❌          | ❌           |
-| `before_message`    | A user message is about to be sent to the model          | ❌          | ✅           |
-| `on_session_start`  | A new session has been initialized                       | ❌          | ❌           |
-| `on_session_end`    | A session is being torn down                             | ❌          | ❌           |
+| Hook                | Fires when…                                              | Can block? | Can confirm? | Can inject? |
+|---------------------|----------------------------------------------------------|------------|--------------|-------------|
+| `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅            | ❌           |
+| `after_tool_call`   | A tool has finished executing                            | ❌          | ❌            | ❌           |
+| `before_message`    | A user message is about to be sent to the model          | ❌          | ❌            | ✅           |
+| `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ❌           |
+| `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
 
 **Notes:**
 
 - `before_tool_call` supports `block`; if any extension blocks, the tool is not executed and later handlers are skipped.
+- `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Call sites that have not yet wired a confirmation UI must handle this distinct result explicitly.
 - `before_message` supports `inject`; injected content from matching extensions is accumulated.
 - Other hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 
