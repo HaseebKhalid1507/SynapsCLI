@@ -65,6 +65,79 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
+/// Word-wrap a table cell's content to fit within `max_width` display columns.
+/// Breaks on word boundaries where possible; forces a break mid-word if a single
+/// word exceeds the column width. Returns one String per visual line.
+fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let display_w = UnicodeWidthStr::width(text);
+    if display_w <= max_width {
+        return vec![text.to_string()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w: usize = 0;
+
+    for word in text.split_whitespace() {
+        let word_w = UnicodeWidthStr::width(word);
+        if current.is_empty() {
+            // First word on this line
+            if word_w <= max_width {
+                current.push_str(word);
+                current_w = word_w;
+            } else {
+                // Word is wider than column — force-break it char by char
+                for ch in word.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_w + ch_w > max_width && !current.is_empty() {
+                        lines.push(current);
+                        current = String::new();
+                        current_w = 0;
+                    }
+                    current.push(ch);
+                    current_w += ch_w;
+                }
+            }
+        } else if current_w + 1 + word_w <= max_width {
+            // Fits on current line with a space
+            current.push(' ');
+            current.push_str(word);
+            current_w += 1 + word_w;
+        } else {
+            // Doesn't fit — start a new line
+            lines.push(current);
+            current = String::new();
+            current_w = 0;
+            if word_w <= max_width {
+                current.push_str(word);
+                current_w = word_w;
+            } else {
+                // Force-break long word
+                for ch in word.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_w + ch_w > max_width && !current.is_empty() {
+                        lines.push(current);
+                        current = String::new();
+                        current_w = 0;
+                    }
+                    current.push(ch);
+                    current_w += ch_w;
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Render a markdown table into styled Lines.
 ///
 /// No outer border — clean, breathable layout. Header row is bold with a
@@ -199,38 +272,44 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     let body_count = rows.len().saturating_sub(body_start);
 
     for (i, row) in rows.iter().enumerate() {
-        // Data row: padded cells separated by spaces (no vertical borders)
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(format!("{}  ", prefix), Style::default()));
+        let style = if has_header && i == 0 { header_style } else { cell_style };
 
+        // Wrap each cell into multiple visual lines
+        let mut wrapped_cols: Vec<Vec<String>> = Vec::new();
         for (j, cell) in row.iter().enumerate() {
             let w = col_widths[j];
-            let display_w = UnicodeWidthStr::width(cell.as_str());
-            let display_cell = if display_w > w {
-                let mut truncated = String::new();
-                let mut tw = 0;
-                for ch in cell.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if tw + cw > w.saturating_sub(1) { break; }
-                    truncated.push(ch);
-                    tw += cw;
-                }
-                truncated.push('\u{2026}');
-                truncated
-            } else {
-                cell.clone()
-            };
-            let truncated_w = UnicodeWidthStr::width(display_cell.as_str());
-            let padding = w.saturating_sub(truncated_w);
-            let padded = format!(" {}{} ", display_cell, " ".repeat(padding));
-            let style = if has_header && i == 0 { header_style } else { cell_style };
-            spans.push(Span::styled(padded, style));
-            // Light separator between columns (not after last)
-            if j < num_cols - 1 {
-                spans.push(Span::styled(" ", Style::default()));
-            }
+            wrapped_cols.push(wrap_cell(cell, w));
         }
-        result.push(Line::from(spans));
+        let max_lines = wrapped_cols.iter().map(|c| c.len()).max().unwrap_or(1);
+
+        for line_idx in 0..max_lines {
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(format!("{}  ", prefix), Style::default()));
+
+            for (j, col_lines) in wrapped_cols.iter().enumerate() {
+                let w = col_widths[j];
+                let cell_text = col_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
+                let display_w = UnicodeWidthStr::width(cell_text);
+                let padding = w.saturating_sub(display_w);
+                let padded = format!(" {}{} ", cell_text, " ".repeat(padding));
+                spans.push(Span::styled(padded, style));
+                if j < num_cols - 1 {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+            }
+            result.push(Line::from(spans));
+        }
+
+        // Add a faint separator after multi-line wrapped body rows
+        // so adjacent rows don't blur together
+        if max_lines > 1 && i >= body_start && i < rows.len() - 1 {
+            let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
+            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+            result.push(Line::from(Span::styled(
+                sep,
+                Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
+            )));
+        }
 
         // After header row, draw a single ─ rule
         if has_header && i == 0 {
@@ -640,7 +719,7 @@ mod tests {
 
     #[test]
     fn table_fits_width_no_truncation() {
-        // Table that fits — nothing should be truncated
+        // Table that fits — nothing should be truncated or wrapped
         let table_lines = vec![
             "| A | B |".to_string(),
             "|---|---|".to_string(),
@@ -652,5 +731,43 @@ mod tests {
         // No ellipsis anywhere
         assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
             "Small table was unnecessarily truncated");
+    }
+
+    #[test]
+    fn wrap_cell_fits_returns_single_line() {
+        let result = wrap_cell("hello world", 20);
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_cell_breaks_on_word_boundary() {
+        let result = wrap_cell("hello world foo", 11);
+        assert_eq!(result, vec!["hello world", "foo"]);
+    }
+
+    #[test]
+    fn wrap_cell_force_breaks_long_word() {
+        let result = wrap_cell("abcdefghij", 5);
+        assert_eq!(result, vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn table_wraps_instead_of_truncating() {
+        let table_lines = vec![
+            "| Name | Description |".to_string(),
+            "|------|-------------|".to_string(),
+            "| Spike | The executor workhorse agent that handles all grunt work |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 40);
+        let texts = rendered_text(&result);
+
+        // Full description text should be present across wrapped lines
+        let all_text: String = texts.join(" ");
+        assert!(all_text.contains("grunt work"),
+            "Wrapped table lost content: {}", all_text);
+        // No ellipsis — we wrap, not truncate
+        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
+            "Table used truncation instead of wrapping");
     }
 }
