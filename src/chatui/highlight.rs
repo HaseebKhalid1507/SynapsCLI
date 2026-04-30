@@ -9,6 +9,7 @@ use syntect::util::LinesWithEndings;
 use std::sync::LazyLock;
 
 use super::theme::THEME;
+use unicode_width::UnicodeWidthStr;
 
 /// Clamp a `Line` to fit within `width` terminal columns.
 /// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
@@ -20,16 +21,27 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     let mut remaining = width;
     let mut clamped: Vec<Span<'static>> = Vec::new();
     for span in line.spans {
-        let span_len = span.content.chars().count();
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
         if remaining == 0 {
             break;
         }
-        if span_len <= remaining {
-            remaining -= span_len;
+        if span_width <= remaining {
+            remaining -= span_width;
             clamped.push(span);
         } else {
-            // Truncate this span to fit
-            let truncated: String = span.content.chars().take(remaining).collect();
+            // Truncate this span by display width. Multi-column chars must be
+            // counted by terminal cells, not scalar values, or a supposedly
+            // clamped line can still overrun the viewport and leave artifacts.
+            let mut used = 0;
+            let mut truncated = String::new();
+            for ch in span.content.chars() {
+                let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + ch_width > remaining {
+                    break;
+                }
+                used += ch_width;
+                truncated.push(ch);
+            }
             clamped.push(Span::styled(truncated, span.style));
             remaining = 0;
         }
