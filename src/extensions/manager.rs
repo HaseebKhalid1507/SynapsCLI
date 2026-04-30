@@ -1,14 +1,50 @@
 //! Extension manager — discovers, starts, and manages extension lifecycles.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::hooks::HookBus;
-use super::hooks::events::HookKind;
 use super::manifest::ExtensionManifest;
-use super::permissions::PermissionSet;
 use super::runtime::ExtensionHandler;
 use super::runtime::process::ProcessExtension;
+
+/// Actionable discovery/load failure for an installed plugin extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionLoadFailure {
+    pub plugin: String,
+    pub manifest_path: Option<PathBuf>,
+    pub reason: String,
+    pub hint: String,
+}
+
+impl ExtensionLoadFailure {
+    fn new(
+        plugin: impl Into<String>,
+        manifest_path: Option<PathBuf>,
+        reason: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            plugin: plugin.into(),
+            manifest_path,
+            reason: reason.into(),
+            hint: hint.into(),
+        }
+    }
+
+    pub fn concise_message(&self) -> String {
+        match &self.manifest_path {
+            Some(path) => format!(
+                "{} (manifest: {}; hint: {})",
+                self.reason,
+                path.display(),
+                self.hint
+            ),
+            None => format!("{} (hint: {})", self.reason, self.hint),
+        }
+    }
+}
 
 /// Manages the lifecycle of all loaded extensions.
 pub struct ExtensionManager {
@@ -33,6 +69,16 @@ impl ExtensionManager {
         id: &str,
         manifest: &ExtensionManifest,
     ) -> Result<(), String> {
+        self.load_with_cwd(id, manifest, None).await
+    }
+
+    /// Load and start an extension from its manifest with a process cwd.
+    pub async fn load_with_cwd(
+        &mut self,
+        id: &str,
+        manifest: &ExtensionManifest,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<(), String> {
         // Don't load duplicates
         if self.extensions.contains_key(id) {
             return Err(format!("Extension '{}' is already loaded", id));
@@ -41,26 +87,13 @@ impl ExtensionManager {
         // Validate permissions and hook subscriptions before spawning the
         // extension process. This keeps malformed manifests from leaking child
         // processes when a later subscription step fails.
-        let permissions = PermissionSet::try_from_strings(&manifest.permissions)?;
-        let mut subscriptions = Vec::with_capacity(manifest.hooks.len());
-        for sub in &manifest.hooks {
-            let kind = HookKind::from_str(&sub.hook).ok_or_else(|| {
-                format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id)
-            })?;
-            if !permissions.allows_hook(kind) {
-                return Err(format!(
-                    "Extension '{}' lacks permission '{}' required for hook '{}'",
-                    id,
-                    kind.required_permission().as_str(),
-                    kind.as_str(),
-                ));
-            }
-            subscriptions.push((kind, sub.tool.clone()));
-        }
+        let validated = manifest.validate(id)?;
+        let permissions = validated.permissions;
+        let subscriptions = validated.subscriptions;
 
         // Spawn the extension process only after the manifest is known-good.
         let handler: Arc<dyn ExtensionHandler> = Arc::new(
-            ProcessExtension::spawn(id, &manifest.command, &manifest.args).await?,
+            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd).await?,
         );
 
         // Register hook subscriptions
@@ -117,10 +150,10 @@ impl ExtensionManager {
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` for
     /// manifests that contain an `extension` field. Loads each one via
     /// `self.load()`.
-    pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<(String, String)>) {
+    pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<ExtensionLoadFailure>) {
         let plugins_dir = crate::config::base_dir().join("plugins");
         let mut loaded = Vec::new();
-        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
 
         if !plugins_dir.exists() {
             return (loaded, failed);
@@ -129,29 +162,55 @@ impl ExtensionManager {
         let entries = match std::fs::read_dir(&plugins_dir) {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to read plugins directory");
+                tracing::warn!(path = %plugins_dir.display(), error = %e, "Failed to read plugins directory");
+                failed.push(ExtensionLoadFailure::new(
+                    "plugins",
+                    Some(plugins_dir.clone()),
+                    format!("Failed to read plugins directory: {e}"),
+                    "Check directory permissions and retry",
+                ));
                 return (loaded, failed);
             }
         };
 
         for entry in entries.flatten() {
-            let manifest_path = entry.path().join(".synaps-plugin").join("plugin.json");
+            let plugin_name = entry.file_name().to_string_lossy().to_string();
+            let plugin_dir = entry.path();
+            let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
             if !manifest_path.exists() {
                 continue;
             }
 
             let content = match std::fs::read_to_string(&manifest_path) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(e) => {
+                    let reason = format!("Failed to read plugin manifest: {e}");
+                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to read plugin manifest");
+                    failed.push(ExtensionLoadFailure::new(
+                        plugin_name,
+                        Some(manifest_path),
+                        reason,
+                        "Check manifest file permissions, then run `plugin validate <plugin-dir>`",
+                    ));
+                    continue;
+                }
             };
 
-            // Parse the full manifest to check for extension field
             let json: serde_json::Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    let reason = format!("Invalid plugin manifest JSON: {e}");
+                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Invalid plugin manifest JSON");
+                    failed.push(ExtensionLoadFailure::new(
+                        plugin_name,
+                        Some(manifest_path),
+                        reason,
+                        "Fix JSON syntax, then run `plugin validate <plugin-dir>`",
+                    ));
+                    continue;
+                }
             };
 
-            // Only load plugins that have an "extension" field
             let ext_value = match json.get("extension") {
                 Some(v) => v.clone(),
                 None => continue,
@@ -160,35 +219,29 @@ impl ExtensionManager {
             let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!(
-                        plugin = %entry.path().display(),
-                        error = %e,
-                        "Failed to parse extension manifest"
-                    );
+                    let reason = format!("Failed to parse extension manifest: {e}");
+                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to parse extension manifest");
+                    failed.push(ExtensionLoadFailure::new(
+                        plugin_name,
+                        Some(manifest_path),
+                        reason,
+                        "Check the `extension` block shape against docs/extensions/contract.json, then run `plugin validate <plugin-dir>`",
+                    ));
                     continue;
                 }
             };
 
-            let plugin_name = entry.file_name().to_string_lossy().to_string();
-            let plugin_dir = entry.path();
-
-            // Resolve command relative to plugin directory
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
             } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR) && !ext_manifest.command.contains('/') {
-                // No path separator = bare executable name (interpreter like python3, node, ruby)
-                // Resolve via PATH, don't join with plugin directory
                 ext_manifest.command.clone()
             } else {
                 plugin_dir.join(&ext_manifest.command)
                     .to_string_lossy().to_string()
             };
 
-            // Resolve args relative to plugin directory
             let args: Vec<String> = ext_manifest.args.iter().map(|arg| {
                 let arg_path = plugin_dir.join(arg);
-                // Only resolve if path exists AND stays within the plugin directory
-                // (prevents path traversal via ../../etc/passwd)
                 if arg_path.exists() {
                     if let (Ok(canonical), Ok(plugin_canonical)) = (
                         arg_path.canonicalize(),
@@ -208,14 +261,19 @@ impl ExtensionManager {
                 ..ext_manifest
             };
 
-            match self.load(&plugin_name, &resolved).await {
+            match self.load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone())).await {
                 Ok(()) => {
                     tracing::info!(plugin = %plugin_name, "Extension loaded from plugins/");
                     loaded.push(plugin_name);
                 }
                 Err(e) => {
-                    tracing::warn!(plugin = %plugin_name, error = %e, "Failed to load extension");
-                    failed.push((plugin_name, e));
+                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
+                    failed.push(ExtensionLoadFailure::new(
+                        plugin_name,
+                        Some(manifest_path),
+                        e,
+                        "Run `plugin validate <plugin-dir>` and confirm the extension command is installed",
+                    ));
                 }
             }
         }

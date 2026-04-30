@@ -58,7 +58,6 @@ impl Default for VoiceConfig {
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
-static BASE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.
 /// Empty if `load_config()` hasn't been called. The registry falls back to
@@ -81,8 +80,8 @@ pub fn set_profile(name: Option<String>) {
 }
 
 pub fn base_dir() -> PathBuf {
-    if let Some(path) = BASE_DIR_OVERRIDE.get() {
-        return path.clone();
+    if let Ok(path) = std::env::var("SYNAPS_BASE_DIR") {
+        return PathBuf::from(path);
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -93,7 +92,7 @@ pub fn base_dir() -> PathBuf {
 /// Overrides the Synaps base directory. Intended for tests and embedded harnesses.
 #[doc(hidden)]
 pub fn set_base_dir_for_tests(path: PathBuf) {
-    let _ = BASE_DIR_OVERRIDE.set(path);
+    std::env::set_var("SYNAPS_BASE_DIR", path);
 }
 
 /// Resolves a path for reading. Checks the profile folder first, then falls back to the default folder.
