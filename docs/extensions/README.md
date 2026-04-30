@@ -14,6 +14,8 @@ Extensions can:
 
 - **Observe** — log, audit, or monitor tool calls and messages
 - **Block** — prevent a `before_tool_call` event from proceeding
+- **Confirm** — ask for explicit user approval before a tool call proceeds
+- **Modify** — replace `before_tool_call` input before execution
 - **Inject** — prepend context into the system prompt before a request reaches the LLM
 
 Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
@@ -90,7 +92,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 
 | Hook                | Fires when…                                              | Can block? | Can confirm? | Can inject? |
 |---------------------|----------------------------------------------------------|------------|--------------|-------------|
-| `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅            | ❌           |
+| `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅            | ✅ modify    |
 | `after_tool_call`   | A tool has finished executing                            | ❌          | ❌            | ❌           |
 | `before_message`    | A user message is about to be sent to the model          | ❌          | ❌            | ✅           |
 | `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ❌           |
@@ -100,6 +102,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 
 - `before_tool_call` supports `block`; if any extension blocks, the tool is not executed and later handlers are skipped.
 - `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
+- `before_tool_call` supports `modify`, which replaces the tool input before execution. Trace logs record that modification occurred without logging the modified input.
 - `before_message` supports `inject`; injected content from matching extensions is accumulated.
 - Other hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 
@@ -121,6 +124,29 @@ Your extension will only receive `before_tool_call` events for the named tools. 
 This is the recommended approach when your extension only cares about specific tools. It reduces noise and avoids unnecessary inter-process communication.
 
 Omitting the `"tool"` field registers a wildcard — your extension receives that hook for every tool.
+
+---
+
+## Hook Matchers
+
+Hook subscriptions may include a small `match` object to avoid invoking an extension unless the event payload is relevant:
+
+```json
+"hooks": [
+  {
+    "hook": "before_tool_call",
+    "tool": "bash",
+    "match": { "input_contains": "rm -rf" }
+  }
+]
+```
+
+Current matchers are contract-defined:
+
+- `input_contains` — substring search against JSON-stringified `tool_input`
+- `input_equals` — exact JSON equality against `tool_input`
+
+No policy language is embedded in manifests; complex logic belongs in the extension process.
 
 ---
 

@@ -151,6 +151,24 @@ After receiving `shutdown`, your process should exit within 2 seconds. The runti
 
 ---
 
+## Hook Matchers
+
+Manifest hook subscriptions may include simple matcher conditions:
+
+```json
+{
+  "hook": "before_tool_call",
+  "tool": "bash",
+  "match": {
+    "input_contains": "rm -rf"
+  }
+}
+```
+
+Supported matcher keys are listed in `docs/extensions/contract.json` under `matchers`. Phase G supports `input_contains` and `input_equals` against `tool_input`. All specified matcher keys must match for the handler to be invoked.
+
+---
+
 ## HookEvent Schema
 
 The `params` field of a `hook.handle` request is a `HookEvent` object.
@@ -233,6 +251,21 @@ Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on
 | Field     | Type   | Required | Description                                      |
 |-----------|--------|----------|--------------------------------------------------|
 | `message` | string | yes      | Human-readable confirmation prompt for the user  |
+
+### `modify`
+
+Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.
+
+```json
+{
+  "action": "modify",
+  "input": { "command": "echo safe" }
+}
+```
+
+| Field   | Type   | Required | Description                       |
+|---------|--------|----------|-----------------------------------|
+| `input` | object | yes      | Replacement tool input JSON value |
 
 ### `inject`
 
