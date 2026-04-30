@@ -445,6 +445,7 @@ impl Runtime {
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
                                 let input = self.tools.read().await.translate_input_for_api_tool(tool_name, input.clone());
+                                let runtime_name = self.tools.read().await.runtime_name_for_api(tool_name).to_string();
                                 let ctx = crate::ToolContext {
                                     channels: crate::tools::ToolChannels {
                                         tx_delta: None,
@@ -470,7 +471,7 @@ impl Runtime {
                                     emit_before_tool_call(
                                         &self.hook_bus,
                                         &tool_name,
-                                        None,
+                                        Some(&runtime_name),
                                         input.clone(),
                                     ).await,
                                     None,
@@ -487,7 +488,7 @@ impl Runtime {
                                     let _ = emit_after_tool_call(
                                         &self.hook_bus,
                                         &tool_name,
-                                        None,
+                                        Some(&runtime_name),
                                         input_for_hook,
                                         output.clone(),
                                     ).await;
@@ -524,6 +525,7 @@ impl Runtime {
                             let input = tool_use["input"].clone();
                             let tools_snapshot = self.tools.read().await;
                             let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                            let runtime_name = tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                             let tool = tools_snapshot.get(&tool_name).cloned();
                             drop(tools_snapshot);
                             let exit_path = self.watcher_exit_path.clone();
@@ -532,6 +534,7 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let tool_name_for_hook = tool_name.clone();
+                            let runtime_name_for_hook = runtime_name.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
@@ -541,7 +544,7 @@ impl Runtime {
                                             crate::runtime::emit_before_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
-                                                None,
+                                                Some(&runtime_name_for_hook),
                                                 input.clone(),
                                             ).await,
                                             None,
@@ -578,7 +581,7 @@ impl Runtime {
                                         let _ = crate::runtime::emit_after_tool_call(
                                             &hook_bus_inner,
                                             &tool_name_for_hook,
-                                            None,
+                                            Some(&runtime_name_for_hook),
                                             input_for_hook,
                                             output.clone(),
                                         ).await;

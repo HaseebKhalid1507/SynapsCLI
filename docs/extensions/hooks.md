@@ -25,7 +25,7 @@ name.
 
 | Hook | Required permission | Tool filter? | Allowed result actions | Purpose |
 |---|---|---:|---|---|
-| `before_tool_call` | `tools.intercept` | yes | `continue`, `block`, `confirm` | Inspect/block/confirm a tool call before execution |
+| `before_tool_call` | `tools.intercept` | yes | `continue`, `block`, `confirm`, `modify` | Inspect/block/confirm/modify a tool call before execution |
 | `after_tool_call` | `tools.intercept` | yes | `continue` | Observe tool input/output after execution |
 | `before_message` | `privacy.llm_content` | no | `continue`, `inject` | Inspect the user message and optionally inject context |
 | `on_session_start` | `session.lifecycle` | no | `continue` | Observe session creation |
@@ -43,7 +43,10 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `inject` accumulates text from all matching handlers and injects it into the
   model context. It is accepted only on `before_message`.
+- `modify` replaces the tool input before execution. It is accepted only on
+  `before_tool_call`; the first modifier stops the handler chain.
 
-Process extensions cannot mutate event payloads in place. If mutation support is
-added later it should use an explicit patch/result object rather than relying on
-serialized event mutation.
+`block`, `confirm`, and `modify` all stop the `before_tool_call` handler chain in
+registration order. Put high-priority security policy extensions earlier in plugin
+load order, and avoid granting trust to plugins that can modify tool inputs unless
+you accept this ordering behavior.

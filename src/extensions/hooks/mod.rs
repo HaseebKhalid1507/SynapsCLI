@@ -196,16 +196,16 @@ impl HookBus {
             }
 
             match result {
+                Ok(result) if !event.kind.allows_result(&result) => {
+                    tracing::warn!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        action = hook_result_action(&result),
+                        "Extension returned action not allowed for hook — ignoring"
+                    );
+                    continue;
+                }
                 Ok(HookResult::Block { reason }) => {
-                    if !event.kind.allows_result(&HookResult::Block { reason: reason.clone() }) {
-                        tracing::warn!(
-                            hook = %event.kind.as_str(),
-                            extension = %reg.handler.id(),
-                            action = "block",
-                            "Extension returned action not allowed for hook — ignoring"
-                        );
-                        continue;
-                    }
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -216,15 +216,6 @@ impl HookBus {
                 }
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Inject { content }) => {
-                    if !event.kind.allows_result(&HookResult::Inject { content: content.clone() }) {
-                        tracing::warn!(
-                            hook = %event.kind.as_str(),
-                            extension = %reg.handler.id(),
-                            action = "inject",
-                            "Extension returned action not allowed for hook — ignoring"
-                        );
-                        continue;
-                    }
                     tracing::debug!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -235,15 +226,6 @@ impl HookBus {
                     injections.push(content);
                 }
                 Ok(HookResult::Modify { input }) => {
-                    if !event.kind.allows_result(&HookResult::Modify { input: input.clone() }) {
-                        tracing::warn!(
-                            hook = %event.kind.as_str(),
-                            extension = %reg.handler.id(),
-                            action = "modify",
-                            "Extension returned action not allowed for hook — ignoring"
-                        );
-                        continue;
-                    }
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -252,15 +234,6 @@ impl HookBus {
                     return HookResult::Modify { input };
                 }
                 Ok(HookResult::Confirm { message }) => {
-                    if !event.kind.allows_result(&HookResult::Confirm { message: message.clone() }) {
-                        tracing::warn!(
-                            hook = %event.kind.as_str(),
-                            extension = %reg.handler.id(),
-                            action = "confirm",
-                            "Extension returned action not allowed for hook — ignoring"
-                        );
-                        continue;
-                    }
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -427,6 +400,12 @@ mod tests {
             }),
             "confirm"
         );
+        assert_eq!(
+            hook_result_action(&HookResult::Modify {
+                input: serde_json::json!({"command": "echo safe"}),
+            }),
+            "modify"
+        );
     }
 
     #[tokio::test]
@@ -517,6 +496,32 @@ mod tests {
 
         assert!(matches!(result, HookResult::Block { .. }));
         assert_eq!(blocker.calls(), 1);
+        assert_eq!(after.calls(), 0); // never reached
+    }
+
+    #[tokio::test]
+    async fn modify_stops_chain() {
+        let bus = HookBus::new();
+        let modifier = TestHandler::new("modifier", HookResult::Modify {
+            input: serde_json::json!({"command": "echo safe"}),
+        });
+        let after = TestHandler::new("after", HookResult::Block {
+            reason: "should not run".into(),
+        });
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, modifier.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "rm -rf /"}));
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Modify { input } if input == serde_json::json!({"command": "echo safe"})));
+        assert_eq!(modifier.calls(), 1);
         assert_eq!(after.calls(), 0); // never reached
     }
 

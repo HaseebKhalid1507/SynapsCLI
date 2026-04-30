@@ -10,6 +10,7 @@ use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::ExtensionHandler;
+use synaps_cli::Tool;
 
 fn installed_fixture_script() -> String {
     std::env::current_dir()
@@ -109,6 +110,91 @@ async fn time_extension_continues_for_non_message_hooks() {
 }
 
 static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[tokio::test(flavor = "current_thread")]
+async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/modify_extension.py")
+        .to_string_lossy()
+        .to_string();
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["tools.intercept".to_string()],
+        hooks: vec![
+            synaps_cli::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            },
+            synaps_cli::extensions::manifest::HookSubscription {
+                hook: "after_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            },
+        ],
+    };
+    manager.load("modify-test", &manifest).await.unwrap();
+
+    let before = synaps_cli::runtime::emit_before_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        serde_json::json!({"command": "rm -rf /tmp/nope"}),
+    ).await;
+    let decision = synaps_cli::runtime::resolve_before_tool_call_decision(
+        serde_json::json!({"command": "rm -rf /tmp/nope"}),
+        before,
+        None,
+    ).await;
+    let input = match decision {
+        synaps_cli::runtime::BeforeToolCallDecision::Continue { input } => input,
+        synaps_cli::runtime::BeforeToolCallDecision::Block { reason } => panic!("unexpected block: {reason}"),
+    };
+    assert_eq!(input, serde_json::json!({"command": "printf modified"}));
+
+    let output = synaps_cli::tools::BashTool
+        .execute(
+            input.clone(),
+            synaps_cli::ToolContext {
+                channels: synaps_cli::tools::ToolChannels { tx_delta: None, tx_events: None },
+                capabilities: synaps_cli::tools::ToolCapabilities {
+                    watcher_exit_path: None,
+                    tool_register_tx: None,
+                    session_manager: None,
+                    subagent_registry: None,
+                    event_queue: None,
+                    secret_prompt: None,
+                },
+                limits: synaps_cli::tools::ToolLimits {
+                    max_tool_output: 30_000,
+                    bash_timeout: 30,
+                    bash_max_timeout: 300,
+                    subagent_timeout: 300,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(output, "modified");
+
+    let after = synaps_cli::runtime::emit_after_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        input,
+        output,
+    ).await;
+    assert!(matches!(after, HookResult::Continue));
+
+    manager.shutdown_all().await;
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {

@@ -118,6 +118,26 @@ pub struct HookMatcher {
     pub input_equals: Option<serde_json::Value>,
 }
 
+impl HookMatcher {
+    pub const SUPPORTED_KEYS: &'static [&'static str] = &["input_contains", "input_equals"];
+
+    pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
+        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
+        if let Some(expected) = &self.input_equals {
+            if input != expected {
+                return false;
+            }
+        }
+        if let Some(needle) = &self.input_contains {
+            let haystack = serde_json::to_string(input).unwrap_or_default();
+            if !haystack.contains(needle) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,28 +306,49 @@ mod tests {
     // ── Runtime serialises as lowercase string ──────────────────────────────
 
     #[test]
+    fn matcher_input_equals_requires_exact_tool_input() {
+        let matcher = HookMatcher {
+            input_contains: None,
+            input_equals: Some(serde_json::json!({"command": "echo safe"})),
+        };
+
+        let matching = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe"}),
+        );
+        let different = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe", "extra": true}),
+        );
+
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&different));
+    }
+
+    #[test]
+    fn matcher_conditions_are_combined_with_and() {
+        let matcher = HookMatcher {
+            input_contains: Some("safe".to_string()),
+            input_equals: Some(serde_json::json!({"command": "echo safe"})),
+        };
+
+        let matching = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe"}),
+        );
+        let equals_but_missing_contains = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo ok"}),
+        );
+
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&equals_but_missing_contains));
+    }
+
+    #[test]
     fn runtime_serializes_as_lowercase() {
         let rt = ExtensionRuntime::Process;
         let json = serde_json::to_string(&rt).unwrap();
         assert_eq!(json, r#""process""#);
-    }
-}
-
-
-impl HookMatcher {
-    pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
-        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
-        if let Some(expected) = &self.input_equals {
-            if input != expected {
-                return false;
-            }
-        }
-        if let Some(needle) = &self.input_contains {
-            let haystack = serde_json::to_string(input).unwrap_or_default();
-            if !haystack.contains(needle) {
-                return false;
-            }
-        }
-        true
     }
 }

@@ -248,8 +248,8 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - Any `Block` from any handler prevents the operation.
-///   and the runtime should re-read them before proceeding.
+/// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
+/// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]

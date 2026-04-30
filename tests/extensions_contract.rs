@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use serde_json::Value;
 use synaps_cli::extensions::hooks::events::{HookEvent, HookKind};
 use synaps_cli::extensions::manager::ExtensionManager;
+use synaps_cli::extensions::manifest::HookMatcher;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 
 const ALL_HOOK_KINDS: [HookKind; 5] = [
@@ -107,6 +108,14 @@ fn contract_json_matches_rust_hook_and_permission_catalogs() {
         .map(|permission| permission.as_str().expect("permission should be a string"))
         .collect();
     assert_eq!(contract_reserved_permissions, rust_reserved_permissions);
+
+    let matchers = contract
+        .get("matchers")
+        .and_then(Value::as_object)
+        .expect("contract should define matchers object");
+    let contract_matchers: HashSet<&str> = matchers.keys().map(String::as_str).collect();
+    let rust_matchers: HashSet<&'static str> = HookMatcher::SUPPORTED_KEYS.iter().copied().collect();
+    assert_eq!(contract_matchers, rust_matchers);
 }
 
 #[test]
