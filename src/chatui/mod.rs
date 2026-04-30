@@ -800,26 +800,7 @@ pub async fn run(
                                     app.queued_message = Some(input);
                                     continue;
                                 }
-                                // Build display text with paste info
-                                let display_text = if app.pasted_char_count > 0 {
-                                    let typed = app.input_before_paste.as_deref().unwrap_or("");
-                                    let typed_char_count = typed.chars().count();
-                                    let paste_byte_start = input.char_indices()
-                                        .nth(typed_char_count)
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(input.len());
-                                    let paste_content = &input[paste_byte_start..];
-                                    let line_count = paste_content.lines().count();
-                                    let pasted_char_count = input.chars().count().saturating_sub(typed_char_count);
-                                    let paste_label = if line_count > 1 {
-                                        format!("[Pasted {} lines]", line_count)
-                                    } else {
-                                        format!("[Pasted {} chars]", pasted_char_count)
-                                    };
-                                    if typed.is_empty() { paste_label } else { format!("{} {}", typed.trim(), paste_label) }
-                                } else {
-                                    input.clone()
-                                };
+                                let display_text = app.user_display_text_for_submission(&input);
                                 app.push_msg(ChatMessage::User(display_text));
                                 app.input_before_paste = None;
                                 app.pasted_char_count = 0;

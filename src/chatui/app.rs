@@ -204,6 +204,57 @@ impl App {
             suppress_paste_until: None,
         }
     }
+    /// Build the text shown in the chat transcript for a submitted user message.
+    /// Large pasted payloads are collapsed to a label, while any text typed before
+    /// or after the pasted range remains visible.
+    pub(crate) fn user_display_text_for_submission(&self, input: &str) -> String {
+        if self.pasted_char_count == 0 {
+            return input.to_string();
+        }
+
+        let before_paste = self.input_before_paste.as_deref().unwrap_or("");
+        let before_chars = before_paste.chars().count();
+        let total_chars = input.chars().count();
+        let paste_chars = self.pasted_char_count.min(total_chars.saturating_sub(before_chars));
+        let after_chars = total_chars.saturating_sub(before_chars + paste_chars);
+
+        let paste_byte_start = input
+            .char_indices()
+            .nth(before_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(input.len());
+        let paste_byte_end = input
+            .char_indices()
+            .nth(before_chars + paste_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(input.len());
+
+        let pasted = &input[paste_byte_start..paste_byte_end];
+        let after_paste = if after_chars == 0 {
+            ""
+        } else {
+            &input[paste_byte_end..]
+        };
+
+        let line_count = pasted.lines().count();
+        let paste_label = if line_count > 1 {
+            format!("[Pasted {} lines]", line_count)
+        } else {
+            format!("[Pasted {} chars]", paste_chars)
+        };
+
+        match (before_paste.is_empty(), after_paste.is_empty()) {
+            (true, true) => paste_label,
+            (false, true) => format!("{} {}", before_paste.trim(), paste_label),
+            (true, false) => format!("{} {}", paste_label, after_paste.trim()),
+            (false, false) => format!(
+                "{} {} {}",
+                before_paste.trim(),
+                paste_label,
+                after_paste.trim()
+            ),
+        }
+    }
 
     /// Restore SynapsCLI's TUI after casino (or failed spawn).
     /// Convert char-based cursor_pos to byte offset in self.input.
@@ -696,5 +747,16 @@ mod tests {
         app.tool_start_time = Some(std::time::Instant::now());
 
         assert!(!app.is_active_tool_result(1));
+    }
+
+    #[test]
+    fn pasted_message_display_preserves_text_typed_after_paste() {
+        let mut app = test_app();
+        app.input_before_paste = Some("before".to_string());
+        app.pasted_char_count = "PASTED".chars().count();
+
+        let display = app.user_display_text_for_submission("beforePASTED after");
+
+        assert_eq!(display, "before [Pasted 6 chars] after");
     }
 }
