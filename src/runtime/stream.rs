@@ -122,11 +122,18 @@ impl StreamMethods {
                 });
             if let Some(ref msg_text) = last_user_msg {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
-                if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
-                    // Prepend injected content to system prompt
-                    let base = injected_system.clone().unwrap_or_default();
-                    injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
-                    tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                match hook_bus.emit(&hook_event).await {
+                    crate::extensions::hooks::events::HookResult::Inject { content } => {
+                        // Prepend injected content to system prompt
+                        let base = injected_system.clone().unwrap_or_default();
+                        injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
+                        tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                    }
+                    crate::extensions::hooks::events::HookResult::Block { reason } => {
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        return Err(RuntimeError::Config(format!("Message blocked by extension: {}", reason)));
+                    }
+                    _ => {}
                 }
             }
 
