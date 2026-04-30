@@ -67,7 +67,7 @@ impl HookKind {
     ///
     /// Called by the permission gate before delivering any event; if the
     /// extension's [`PermissionSet`][crate::extensions::permissions::PermissionSet]
-    /// does not include this permission the subscription is silently dropped.
+    /// does not include this permission, `HookBus::subscribe()` returns an error.
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,

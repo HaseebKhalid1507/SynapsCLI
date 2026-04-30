@@ -375,13 +375,14 @@ impl Runtime {
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                    let input_for_hook = input.clone();
                                     let output = match tool.execute(input, ctx).await {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
                                     };
                                     // ═══ HOOK: after_tool_call ═══
                                     let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                        &tool_name, serde_json::json!({}), output.clone(),
+                                        &tool_name, input_for_hook, output.clone(),
                                     );
                                     let _ = self.hook_bus.emit(&hook_event).await;
                                     output
@@ -458,13 +459,14 @@ impl Runtime {
                                                 subagent_timeout: cfg_subagent_timeout,
                                             },
                                         };
+                                        let input_for_hook = input.clone();
                                         let output = match t.execute(input, ctx).await {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
                                         // ═══ HOOK: after_tool_call (parallel) ═══
                                         let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                            &tool_name_for_hook, serde_json::json!({}), output.clone(),
+                                            &tool_name_for_hook, input_for_hook, output.clone(),
                                         );
                                         let _ = hook_bus_inner.emit(&hook_event).await;
                                         output

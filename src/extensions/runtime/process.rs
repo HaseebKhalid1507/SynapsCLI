@@ -228,13 +228,16 @@ impl ExtensionHandler for ProcessExtension {
 
     /// Send a `shutdown` notification then SIGKILL after 500 ms.
     async fn shutdown(&self) {
-        // Best-effort — ignore errors, the kill below is the real cleanup.
-        let _ = self.call("shutdown", Value::Null).await;
+        // Best-effort shutdown request — bound the wait in case the
+        // extension never replies; the kill below is the real cleanup.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.call("shutdown", Value::Null),
+        ).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.kill().await;
-        }
+        let mut child = self.child.lock().await;
+        let _ = child.kill().await;
     }
 }
