@@ -51,6 +51,13 @@ impl Permission {
             _ => None,
         }
     }
+    /// Whether this permission is reserved for a future implementation.
+    pub fn is_reserved(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolsOverride | Self::ToolsRegister | Self::ProvidersRegister
+        )
+    }
 }
 
 /// A set of permissions granted to an extension.
@@ -81,6 +88,11 @@ impl PermissionSet {
         for perm in perms {
             let parsed = Permission::parse(perm)
                 .ok_or_else(|| format!("Unknown extension permission: {perm}"))?;
+            if parsed.is_reserved() {
+                return Err(format!(
+                    "Reserved extension permission is not implemented yet: {perm}"
+                ));
+            }
             permissions.insert(parsed);
         }
         Ok(Self { permissions })

@@ -63,6 +63,31 @@ impl HookKind {
         }
     }
 
+    /// Supported action names for this hook in the extension contract.
+    pub fn allowed_action_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::BeforeToolCall => &["continue", "block"],
+            Self::AfterToolCall => &["continue"],
+            Self::BeforeMessage => &["continue", "inject"],
+            Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
+        }
+    }
+
+    /// Whether this hook can be filtered by tool name in a manifest.
+    pub fn allows_tool_filter(&self) -> bool {
+        matches!(self, Self::BeforeToolCall | Self::AfterToolCall)
+    }
+
+    /// Whether this hook accepts a handler result action.
+    pub fn allows_result(&self, result: &HookResult) -> bool {
+        match (self, result) {
+            (_, HookResult::Continue) => true,
+            (Self::BeforeToolCall, HookResult::Block { .. }) => true,
+            (Self::BeforeMessage, HookResult::Inject { .. }) => true,
+            _ => false,
+        }
+    }
+
     /// The [`Permission`] an extension must hold to subscribe to this hook.
     ///
     /// Called by the permission gate before delivering any event; if the

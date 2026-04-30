@@ -14,8 +14,6 @@ use std::pin::Pin;
 mod types;
 mod auth;
 mod api;
-mod api_sync;
-mod request;
 mod stream;
 mod helpers;
 pub mod subagent;
@@ -27,6 +25,41 @@ use auth::AuthMethods;
 use api::ApiMethods;
 use stream::StreamMethods;
 use helpers::HelperMethods;
+
+/// Emit a `before_tool_call` event and include the runtime tool name when it
+/// differs from the API-safe name.
+pub async fn emit_before_tool_call(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+) -> crate::extensions::hooks::events::HookResult {
+    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input);
+    if let Some(runtime_tool_name) = runtime_tool_name {
+        event.tool_runtime_name = Some(runtime_tool_name.to_string());
+    }
+    hook_bus.emit(&event).await
+}
+
+/// Emit an `after_tool_call` event and include the runtime tool name when it
+/// differs from the API-safe name.
+pub async fn emit_after_tool_call(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+) -> crate::extensions::hooks::events::HookResult {
+    let mut event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+        tool_name,
+        input,
+        output,
+    );
+    if let Some(runtime_tool_name) = runtime_tool_name {
+        event.tool_runtime_name = Some(runtime_tool_name.to_string());
+    }
+    hook_bus.emit(&event).await
+}
 
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
@@ -370,12 +403,12 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                // ═══ HOOK: before_tool_call ═══
-                                let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                    &tool_name, input.clone(),
-                                );
-                                hook_event.tool_runtime_name = Some(tool_name.to_string());
-                                let hook_result = self.hook_bus.emit(&hook_event).await;
+                                let hook_result = emit_before_tool_call(
+                                    &self.hook_bus,
+                                    &tool_name,
+                                    None,
+                                    input.clone(),
+                                ).await;
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
@@ -384,11 +417,13 @@ impl Runtime {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
                                     };
-                                    // ═══ HOOK: after_tool_call ═══
-                                    let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                        &tool_name, input_for_hook, output.clone(),
-                                    );
-                                    let _ = self.hook_bus.emit(&hook_event).await;
+                                    let _ = emit_after_tool_call(
+                                        &self.hook_bus,
+                                        &tool_name,
+                                        None,
+                                        input_for_hook,
+                                        output.clone(),
+                                    ).await;
                                     output
                                 }
                             }
@@ -434,13 +469,12 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        // ═══ HOOK: before_tool_call (parallel) ═══
-                                        let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                            &tool_name_for_hook, input.clone(),
-                                        );
-                                        hook_event.tool_runtime_name = Some(tool_name_for_hook.clone());
-                                        tracing::debug!(tool = %tool_name_for_hook, "before_tool_call hook firing (parallel)");
-                                        let hook_result = hook_bus_inner.emit(&hook_event).await;
+                                        let hook_result = crate::runtime::emit_before_tool_call(
+                                            &hook_bus_inner,
+                                            &tool_name_for_hook,
+                                            None,
+                                            input.clone(),
+                                        ).await;
                                         tracing::debug!(?hook_result, "before_tool_call hook result (parallel)");
                                         if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                             format!("Tool call blocked by extension: {}", reason)
@@ -470,11 +504,13 @@ impl Runtime {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        // ═══ HOOK: after_tool_call (parallel) ═══
-                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                            &tool_name_for_hook, input_for_hook, output.clone(),
-                                        );
-                                        let _ = hook_bus_inner.emit(&hook_event).await;
+                                        let _ = crate::runtime::emit_after_tool_call(
+                                            &hook_bus_inner,
+                                            &tool_name_for_hook,
+                                            None,
+                                            input_for_hook,
+                                            output.clone(),
+                                        ).await;
                                         output
                                         }
                                     }

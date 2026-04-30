@@ -1,5 +1,6 @@
 {
   "manifest_version": 1,
+  "extension_protocol_version": 1,
   "runtimes": ["process"],
   "hooks": {
     "before_tool_call": {
@@ -30,9 +31,11 @@
   },
   "permissions": [
     "tools.intercept",
-    "tools.override",
     "privacy.llm_content",
-    "session.lifecycle",
+    "session.lifecycle"
+  ],
+  "reserved_permissions": [
+    "tools.override",
     "tools.register",
     "providers.register"
   ]

@@ -128,6 +128,15 @@ impl HookBus {
 
             match result {
                 Ok(HookResult::Block { reason }) => {
+                    if !event.kind.allows_result(&HookResult::Block { reason: reason.clone() }) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "block",
+                            "Extension returned action not allowed for hook — ignoring"
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
@@ -138,6 +147,15 @@ impl HookBus {
                 }
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Inject { content }) => {
+                    if !event.kind.allows_result(&HookResult::Inject { content: content.clone() }) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "inject",
+                            "Extension returned action not allowed for hook — ignoring"
+                        );
+                        continue;
+                    }
                     tracing::debug!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),

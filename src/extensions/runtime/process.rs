@@ -2,29 +2,10 @@
 //!
 //! Spawns the extension as a child process. Communication uses
 //! Content-Length framing (LSP-style) over stdin/stdout.
-//!
-//! # Wire format
-//!
-//! Every message is prefixed by a single header line followed by a blank line:
-//!
-//! ```text
-//! Content-Length: <byte-count>\r\n
-//! \r\n
-//! <json-body>
-//! ```
-//!
-//! This matches the Language Server Protocol framing so extensions can
-//! be written with any LSP-aware JSON-RPC library.
-//!
-//! # Required dependency
-//!
-//! ```toml
-//! # Cargo.toml
-//! async-trait = "0.1"
-//! ```
 
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,10 +15,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use super::{ExtensionHandler, ExtensionHealth};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
-use super::ExtensionHandler;
 
-// ── Wire types ────────────────────────────────────────────────────────────────
+const MAX_RESTARTS: usize = 3;
 
 #[derive(Serialize)]
 struct JsonRpcRequest {
@@ -63,39 +44,69 @@ struct JsonRpcError {
     message: String,
 }
 
-// ── ProcessExtension ──────────────────────────────────────────────────────────
+struct ProcessState {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+}
 
 /// A running extension process communicating via JSON-RPC 2.0 over stdio.
-///
-/// Each [`handle`](ExtensionHandler::handle) call serialises the [`HookEvent`]
-/// as the `params` of a `hook.handle` request and deserialises the response
-/// body back into a [`HookResult`].
-///
-/// On error the handler fails-open — it logs a warning and returns
-/// [`HookResult::Continue`] so a misbehaving extension never blocks the agent.
 pub struct ProcessExtension {
     id: String,
-    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<tokio::process::ChildStdout>>>,
-    /// Serializes a full request/response exchange. JSON-RPC ids are still
-    /// checked, but the phase-1 stdio runtime does not multiplex responses.
+    command: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    state: Arc<Mutex<Option<ProcessState>>>,
+    /// Serializes a full request/response exchange and restart attempts.
     call_lock: Arc<Mutex<()>>,
-    child: Arc<Mutex<Child>>,
-    /// Monotonically-increasing JSON-RPC request id.
     next_id: AtomicU64,
+    restart_count: AtomicUsize,
 }
 
 impl ProcessExtension {
-    /// Spawn `command` with `args` and return a ready [`ProcessExtension`].
-    ///
-    /// Stderr of the child process is discarded (redirect it yourself before
-    /// calling this if you need to capture it).
     pub async fn spawn(id: &str, command: &str, args: &[String]) -> Result<Self, String> {
-        let mut child = Command::new(command)
-            .args(args)
+        Self::spawn_with_cwd(id, command, args, None).await
+    }
+
+    /// Spawn `command` with `args` and optional working directory.
+    ///
+    /// Child stderr is captured and forwarded to debug tracing with the extension
+    /// id so extension authors can inspect diagnostics without corrupting stdout.
+    pub async fn spawn_with_cwd(
+        id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let state = Self::spawn_state(id, command, args, cwd.as_ref()).await?;
+        Ok(Self {
+            id: id.to_string(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            cwd,
+            state: Arc::new(Mutex::new(Some(state))),
+            call_lock: Arc::new(Mutex::new(())),
+            next_id: AtomicU64::new(1),
+            restart_count: AtomicUsize::new(0),
+        })
+    }
+
+    async fn spawn_state(
+        id: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&PathBuf>,
+    ) -> Result<ProcessState, String> {
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn extension '{}': {}", id, e))?;
 
@@ -107,26 +118,72 @@ impl ProcessExtension {
             .stdout
             .take()
             .ok_or_else(|| format!("No stdout for extension '{}'", id))?;
+        if let Some(stderr) = child.stderr.take() {
+            let extension_id = id.to_string();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            tracing::debug!(extension = %extension_id, stderr = %line);
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(
+                                extension = %extension_id,
+                                error = %error,
+                                "Failed to read extension stderr",
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
-        Ok(Self {
-            id: id.to_string(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
-            call_lock: Arc::new(Mutex::new(())),
-            child: Arc::new(Mutex::new(child)),
-            next_id: AtomicU64::new(1),
+        Ok(ProcessState {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
         })
     }
 
-    /// Send a JSON-RPC request and return the `result` value from the response.
-    ///
-    /// Uses Content-Length framing on both ends. The stdio transport is
-    /// serialized across the full request/response exchange so concurrent hook
-    /// calls cannot consume each other's responses.
-    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let _call_guard = self.call_lock.lock().await;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempted > MAX_RESTARTS {
+            *state = None;
+            return Err(format!(
+                "Extension '{}' exceeded restart limit ({})",
+                self.id, MAX_RESTARTS,
+            ));
+        }
 
+        if let Some(mut old) = state.take() {
+            let _ = old.child.kill().await;
+        }
+
+        tracing::warn!(
+            extension = %self.id,
+            attempt = attempted,
+            max_attempts = MAX_RESTARTS,
+            "Restarting extension process after transport failure",
+        );
+        *state = Some(Self::spawn_state(
+            &self.id,
+            &self.command,
+            &self.args,
+            self.cwd.as_ref(),
+        ).await?);
+        Ok(())
+    }
+
+    async fn call_once_locked(
+        &self,
+        state: &mut ProcessState,
+        method: &str,
+        params: Value,
+        id: u64,
+    ) -> Result<Value, String> {
         let body = serde_json::to_string(&JsonRpcRequest {
             jsonrpc: "2.0",
             method: method.to_string(),
@@ -135,105 +192,118 @@ impl ProcessExtension {
         })
         .map_err(|e| format!("Serialize error: {}", e))?;
 
-        // ── Write request ───────────────────────────────────────────────────
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(frame.as_bytes())
+        state
+            .stdin
+            .write_all(frame.as_bytes())
+            .await
+            .map_err(|e| format!("Write error: {}", e))?;
+        state
+            .stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Flush error: {}", e))?;
+
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut header_line = String::new();
+            state
+                .stdout
+                .read_line(&mut header_line)
                 .await
-                .map_err(|e| format!("Write error: {}", e))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| format!("Flush error: {}", e))?;
-        } // drop stdin lock before reading
+                .map_err(|e| format!("Read header error: {}", e))?;
 
-        // ── Read response ───────────────────────────────────────────────────
-        let body_buf = {
-            let mut stdout = self.stdout.lock().await;
-
-            // Read headers until blank line, extract Content-Length
-            // case-insensitively. Supports extensions that send additional
-            // headers (e.g. Content-Type) like full LSP implementations.
-            let mut content_length: Option<usize> = None;
-            loop {
-                let mut header_line = String::new();
-                stdout
-                    .read_line(&mut header_line)
-                    .await
-                    .map_err(|e| format!("Read header error: {}", e))?;
-
-                if header_line.is_empty() {
-                    return Err("Unexpected EOF while reading response headers".into());
-                }
-
-                // Cap header line size to prevent unbounded buffering
-                if header_line.len() > 1024 {
-                    return Err(format!(
-                        "Extension '{}' header line too long ({} bytes)",
-                        self.id, header_line.len()
-                    ));
-                }
-
-                let trimmed = header_line.trim();
-                if trimmed.is_empty() {
-                    break; // blank line = end of headers
-                }
-
-                if let Some((name, value)) = trimmed.split_once(':') {
-                    if name.trim().eq_ignore_ascii_case("Content-Length") {
-                        content_length = Some(
-                            value.trim().parse().map_err(|_| {
-                                format!("Invalid Content-Length value: {:?}", value.trim())
-                            })?
-                        );
-                    }
-                }
+            if header_line.is_empty() {
+                return Err("Unexpected EOF while reading response headers".into());
             }
-
-            let content_length = content_length.ok_or_else(|| {
-                format!("Extension '{}' response missing Content-Length header", self.id)
-            })?;
-
-            // Guard against OOM from malicious/buggy Content-Length
-            const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024; // 4 MB
-            if content_length > MAX_RESPONSE_SIZE {
+            if header_line.len() > 1024 {
                 return Err(format!(
-                    "Extension '{}' response too large: {} bytes (max {})",
-                    self.id, content_length, MAX_RESPONSE_SIZE
+                    "Extension '{}' header line too long ({} bytes)",
+                    self.id, header_line.len()
                 ));
             }
 
-            // Body
-            let mut buf = vec![0u8; content_length];
-            tokio::io::AsyncReadExt::read_exact(&mut *stdout, &mut buf)
-                .await
-                .map_err(|e| format!("Read body error: {}", e))?;
-            buf
-        }; // drop stdout lock
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    content_length = Some(
+                        value.trim().parse().map_err(|_| {
+                            format!("Invalid Content-Length value: {:?}", value.trim())
+                        })?
+                    );
+                }
+            }
+        }
 
-        let response: JsonRpcResponse = serde_json::from_slice(&body_buf)
+        let content_length = content_length.ok_or_else(|| {
+            format!("Extension '{}' response missing Content-Length header", self.id)
+        })?;
+        const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024;
+        if content_length > MAX_RESPONSE_SIZE {
+            return Err(format!(
+                "Extension '{}' response too large: {} bytes (max {})",
+                self.id, content_length, MAX_RESPONSE_SIZE
+            ));
+        }
+
+        let mut buf = vec![0u8; content_length];
+        tokio::io::AsyncReadExt::read_exact(&mut state.stdout, &mut buf)
+            .await
+            .map_err(|e| format!("Read body error: {}", e))?;
+
+        let response: JsonRpcResponse = serde_json::from_slice(&buf)
             .map_err(|e| format!("Parse response error: {}", e))?;
-
-        // Validate response ID matches request — detects protocol desync
-        // from concurrent calls or extension bugs.
         if response.id != id {
             return Err(format!(
                 "Extension '{}' response ID mismatch: expected {}, got {} (protocol desync)",
                 self.id, id, response.id
             ));
         }
-
         if let Some(err) = response.error {
             return Err(format!("Extension error: {}", err.message));
         }
-
         Ok(response.result.unwrap_or(Value::Null))
     }
-}
 
-// ── ExtensionHandler impl ─────────────────────────────────────────────────────
+    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _call_guard = self.call_lock.lock().await;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut state_guard = self.state.lock().await;
+        if state_guard.is_none() {
+            self.restart_locked(&mut state_guard).await?;
+        }
+
+        let result = self
+            .call_once_locked(
+                state_guard.as_mut().expect("state should exist after restart"),
+                method,
+                params.clone(),
+                id,
+            )
+            .await;
+
+        match result {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                self.restart_locked(&mut state_guard).await?;
+                let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                self.call_once_locked(
+                    state_guard.as_mut().expect("state should exist after restart"),
+                    method,
+                    params,
+                    retry_id,
+                )
+                .await
+                .map_err(|retry_error| {
+                    format!("{}; retry after restart failed: {}", first_error, retry_error)
+                })
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl ExtensionHandler for ProcessExtension {
@@ -241,15 +311,11 @@ impl ExtensionHandler for ProcessExtension {
         &self.id
     }
 
-    /// Dispatch a hook event to the extension process.
-    ///
-    /// Fails-open: on any transport or extension-reported error the result is
-    /// [`HookResult::Continue`] so a broken extension never stalls the agent.
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
-        match self.call("hook.handle", params).await {
-            Ok(value) => serde_json::from_value(value).unwrap_or(HookResult::Continue),
-            Err(e) => {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {
+            Ok(Ok(value)) => serde_json::from_value(value).unwrap_or(HookResult::Continue),
+            Ok(Err(e)) => {
                 tracing::warn!(
                     extension = %self.id,
                     error = %e,
@@ -257,13 +323,18 @@ impl ExtensionHandler for ProcessExtension {
                 );
                 HookResult::Continue
             }
+            Err(_) => {
+                tracing::warn!(
+                    extension = %self.id,
+                    timeout_secs = 5,
+                    "Extension hook handler timed out — continuing",
+                );
+                HookResult::Continue
+            }
         }
     }
 
-    /// Send a `shutdown` notification then SIGKILL after 500 ms.
     async fn shutdown(&self) {
-        // Best-effort shutdown request — bound the wait in case the
-        // extension never replies; the kill below is the real cleanup.
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             self.call("shutdown", Value::Null),
@@ -271,8 +342,19 @@ impl ExtensionHandler for ProcessExtension {
         .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut state_guard = self.state.lock().await;
+        if let Some(mut state) = state_guard.take() {
+            let _ = state.child.kill().await;
+        }
+    }
 
-        let mut child = self.child.lock().await;
-        let _ = child.kill().await;
+    async fn health(&self) -> ExtensionHealth {
+        if self.restart_count.load(Ordering::Relaxed) > MAX_RESTARTS {
+            ExtensionHealth::Failed
+        } else if self.restart_count.load(Ordering::Relaxed) > 0 {
+            ExtensionHealth::Restarting
+        } else {
+            ExtensionHealth::Healthy
+        }
     }
 }
