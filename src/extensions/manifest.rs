@@ -49,7 +49,7 @@ mod tests {
             "runtime": "process",
             "command": "/usr/bin/my-ext",
             "args": ["--port", "0"],
-            "permissions": ["read_context", "write_output"],
+            "permissions": ["tools.intercept", "session.lifecycle"],
             "hooks": [
                 {"hook": "before_tool_call", "tool": "bash"},
                 {"hook": "on_session_start"}
@@ -60,7 +60,7 @@ mod tests {
         assert_eq!(m.runtime, ExtensionRuntime::Process);
         assert_eq!(m.command, "/usr/bin/my-ext");
         assert_eq!(m.args, vec!["--port", "0"]);
-        assert_eq!(m.permissions, vec!["read_context", "write_output"]);
+        assert_eq!(m.permissions, vec!["tools.intercept", "session.lifecycle"]);
         assert_eq!(m.hooks.len(), 2);
         assert_eq!(m.hooks[0].hook, "before_tool_call");
         assert_eq!(m.hooks[0].tool.as_deref(), Some("bash"));

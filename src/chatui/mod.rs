@@ -308,20 +308,18 @@ pub async fn run(
 
     // ═══ Extension Discovery ═══
     // Scan ~/.synaps-cli/plugins/ for extensions and load them
+    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
+        std::sync::Arc::clone(runtime.hook_bus()),
+    );
     {
-        let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
-            std::sync::Arc::clone(runtime.hook_bus()),
-        );
         let loaded = ext_mgr.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
-        eprintln!("[ext-debug] discovered {} extensions, {} handlers registered", loaded.len(), handler_count);
+        tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
         if !loaded.is_empty() {
             app.push_msg(ChatMessage::System(format!(
                 "Extensions loaded: {} ({} hooks)", loaded.join(", "), handler_count
             )));
         }
-        // Leak the manager so extensions stay alive for the session
-        std::mem::forget(ext_mgr);
     }
 
     // ═══ HOOK: on_session_start ═══
@@ -1169,6 +1167,9 @@ pub async fn run(
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
+
+    // Gracefully shut down all extensions
+    ext_mgr.shutdown_all().await;
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

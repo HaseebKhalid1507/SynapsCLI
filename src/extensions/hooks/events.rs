@@ -184,7 +184,6 @@ impl HookEvent {
 ///
 /// The runtime resolves multiple handlers by precedence:
 /// - Any `Block` from any handler prevents the operation.
-/// - `Modify` signals that the handler mutated the event's fields in-place
 ///   and the runtime should re-read them before proceeding.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,12 +193,13 @@ pub enum HookResult {
     Continue,
     /// Prevent the hooked operation. The `reason` is surfaced to the user.
     Block { reason: String },
-    /// The handler mutated the event payload; the runtime should re-read
-    /// the affected fields (e.g. `tool_input`, `message`) before continuing.
-    Modify,
     /// Inject context — the extension provides text to prepend to the
     /// system prompt or conversation. Used by before_message hooks.
     Inject { content: String },
+    // NOTE: `Modify` was removed in the review pass. Process-based extensions
+    // can't mutate events in-place (they get a serialized copy). If mutation
+    // support is needed, add a `ModifyWith { fields: Value }` variant that
+    // carries the modified data back.
 }
 
 impl Default for HookResult {
@@ -382,12 +382,5 @@ mod tests {
     fn hook_result_continue_serde() {
         let json = serde_json::to_string(&HookResult::Continue).unwrap();
         assert_eq!(json, r#"{"action":"continue"}"#);
-    }
-
-    /// Modify serialises as {"action":"modify"}.
-    #[test]
-    fn hook_result_modify_serde() {
-        let json = serde_json::to_string(&HookResult::Modify).unwrap();
-        assert_eq!(json, r#"{"action":"modify"}"#);
     }
 }

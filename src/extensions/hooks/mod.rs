@@ -122,14 +122,6 @@ impl HookBus {
                     );
                     return HookResult::Block { reason };
                 }
-                Ok(HookResult::Modify) => {
-                    tracing::debug!(
-                        hook = %event.kind.as_str(),
-                        extension = %reg.handler.id(),
-                        "Hook event modified by extension"
-                    );
-                    // Continue to next handler with modified event
-                }
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Inject { content }) => {
                     tracing::debug!(

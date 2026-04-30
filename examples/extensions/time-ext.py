@@ -13,25 +13,24 @@ from datetime import datetime
 
 def read_message():
     """Read a Content-Length framed JSON-RPC message from stdin."""
-    header = sys.stdin.readline()
+    header = sys.stdin.buffer.readline().decode('utf-8')
     if not header:
         return None
-    
-    # Parse Content-Length
     if not header.startswith("Content-Length:"):
         return None
-    
     length = int(header.split(":")[1].strip())
-    sys.stdin.readline()  # blank line separator
-    body = sys.stdin.read(length)
+    sys.stdin.buffer.readline()  # blank line
+    body = sys.stdin.buffer.read(length)
     return json.loads(body)
 
 def write_message(msg):
     """Write a Content-Length framed JSON-RPC message to stdout."""
     body = json.dumps(msg)
-    frame = f"Content-Length: {len(body)}\r\n\r\n{body}"
-    sys.stdout.write(frame)
-    sys.stdout.flush()
+    body_bytes = body.encode('utf-8')
+    header = f"Content-Length: {len(body_bytes)}\r\n\r\n"
+    sys.stdout.buffer.write(header.encode('utf-8'))
+    sys.stdout.buffer.write(body_bytes)
+    sys.stdout.buffer.flush()
 
 def handle_hook(request):
     """Handle a hook.handle call."""

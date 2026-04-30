@@ -164,6 +164,15 @@ impl ProcessExtension {
                     format!("Invalid Content-Length header: {:?}", header_line)
                 })?;
 
+            // Guard against OOM from malicious/buggy Content-Length
+            const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+            if content_length > MAX_RESPONSE_SIZE {
+                return Err(format!(
+                    "Extension '{}' response too large: {} bytes (max {})",
+                    self.id, content_length, MAX_RESPONSE_SIZE
+                ));
+            }
+
             // Blank separator line "\r\n"
             let mut blank = String::new();
             stdout

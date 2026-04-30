@@ -158,8 +158,9 @@ impl ExtensionManager {
             // Resolve command relative to plugin directory
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
-            } else if ext_manifest.command == "python3" || ext_manifest.command == "python" || ext_manifest.command == "node" {
-                // Interpreter commands stay as-is, but resolve args
+            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR) && !ext_manifest.command.contains('/') {
+                // No path separator = bare executable name (interpreter like python3, node, ruby)
+                // Resolve via PATH, don't join with plugin directory
                 ext_manifest.command.clone()
             } else {
                 plugin_dir.join(&ext_manifest.command)
@@ -169,11 +170,19 @@ impl ExtensionManager {
             // Resolve args relative to plugin directory
             let args: Vec<String> = ext_manifest.args.iter().map(|arg| {
                 let arg_path = plugin_dir.join(arg);
+                // Only resolve if path exists AND stays within the plugin directory
+                // (prevents path traversal via ../../etc/passwd)
                 if arg_path.exists() {
-                    arg_path.to_string_lossy().to_string()
-                } else {
-                    arg.clone()
+                    if let (Ok(canonical), Ok(plugin_canonical)) = (
+                        arg_path.canonicalize(),
+                        plugin_dir.canonicalize(),
+                    ) {
+                        if canonical.starts_with(&plugin_canonical) {
+                            return canonical.to_string_lossy().to_string();
+                        }
+                    }
                 }
+                arg.clone()
             }).collect();
 
             let resolved = ExtensionManifest {

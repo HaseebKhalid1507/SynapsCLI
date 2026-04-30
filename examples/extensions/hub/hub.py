@@ -125,21 +125,24 @@ state = HubState()
 
 def read_jsonrpc():
     """Read Content-Length framed JSON-RPC from stdin (blocking)."""
-    header = sys.stdin.readline()
+    header = sys.stdin.buffer.readline().decode('utf-8')
     if not header:
         return None
     if not header.startswith("Content-Length:"):
         return None
     length = int(header.split(":")[1].strip())
-    sys.stdin.readline()  # blank separator
-    body = sys.stdin.read(length)
+    sys.stdin.buffer.readline()  # blank line
+    body = sys.stdin.buffer.read(length)
     return json.loads(body)
 
 def write_jsonrpc(msg):
     """Write Content-Length framed JSON-RPC to stdout."""
     body = json.dumps(msg)
-    sys.stdout.write(f"Content-Length: {len(body)}\r\n\r\n{body}")
-    sys.stdout.flush()
+    body_bytes = body.encode('utf-8')
+    header = f"Content-Length: {len(body_bytes)}\r\n\r\n"
+    sys.stdout.buffer.write(header.encode('utf-8'))
+    sys.stdout.buffer.write(body_bytes)
+    sys.stdout.buffer.flush()
 
 _task_counter = 0
 
