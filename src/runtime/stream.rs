@@ -7,7 +7,7 @@ use reqwest::Client;
 use crate::{Result, RuntimeError, ToolRegistry};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
-use super::{emit_after_tool_call, emit_before_tool_call};
+use super::{emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_result};
 use super::api::ApiMethods;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
@@ -231,11 +231,14 @@ impl StreamMethods {
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
-                                let hook_result = emit_before_tool_call(
-                                    &hook_bus,
-                                    &tool_name,
-                                    Some(&runtime_name),
-                                    input.clone(),
+                                let hook_result = resolve_before_tool_call_result(
+                                    emit_before_tool_call(
+                                        &hook_bus,
+                                        &tool_name,
+                                        Some(&runtime_name),
+                                        input.clone(),
+                                    ).await,
+                                    secret_prompt.as_ref(),
                                 ).await;
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
@@ -327,11 +330,14 @@ impl StreamMethods {
                         join_set.spawn(async move {
                             let result = match tool {
                                 Some(t) => {
-                                    let hook_result = emit_before_tool_call(
-                                        &hook_bus_inner,
-                                        &tool_name_for_hook,
-                                        Some(&runtime_name_for_hook),
-                                        input.clone(),
+                                    let hook_result = resolve_before_tool_call_result(
+                                        emit_before_tool_call(
+                                            &hook_bus_inner,
+                                            &tool_name_for_hook,
+                                            Some(&runtime_name_for_hook),
+                                            input.clone(),
+                                        ).await,
+                                        prompt_inner.as_ref(),
                                     ).await;
                                     if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                         (false, format!("Tool call blocked by extension: {}", reason))

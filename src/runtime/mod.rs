@@ -41,6 +41,45 @@ pub async fn emit_before_tool_call(
     hook_bus.emit(&event).await
 }
 
+
+/// Resolve a before_tool_call result that may request user confirmation.
+///
+/// Headless/non-interactive callers fail closed for `confirm` by returning `Block`.
+pub async fn resolve_before_tool_call_result(
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+) -> crate::extensions::hooks::events::HookResult {
+    match hook_result {
+        crate::extensions::hooks::events::HookResult::Confirm { message } => {
+            let Some(prompt) = secret_prompt else {
+                return crate::extensions::hooks::events::HookResult::Block {
+                    reason: format!(
+                        "Tool call requires confirmation but no interactive prompt is available: {}",
+                        message
+                    ),
+                };
+            };
+
+            let response = prompt
+                .prompt(
+                    "Confirm tool call".to_string(),
+                    format!("{}\n\nType 'yes' or 'y' to allow.", message),
+                )
+                .await;
+
+            match response.as_deref().map(str::trim) {
+                Some(answer) if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") => {
+                    crate::extensions::hooks::events::HookResult::Continue
+                }
+                _ => crate::extensions::hooks::events::HookResult::Block {
+                    reason: format!("Tool call confirmation denied: {}", message),
+                },
+            }
+        }
+        other => other,
+    }
+}
+
 /// Emit an `after_tool_call` event and include the runtime tool name when it
 /// differs from the API-safe name.
 pub async fn emit_after_tool_call(
@@ -403,11 +442,14 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                let hook_result = emit_before_tool_call(
-                                    &self.hook_bus,
-                                    &tool_name,
+                                let hook_result = resolve_before_tool_call_result(
+                                    emit_before_tool_call(
+                                        &self.hook_bus,
+                                        &tool_name,
+                                        None,
+                                        input.clone(),
+                                    ).await,
                                     None,
-                                    input.clone(),
                                 ).await;
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
@@ -469,11 +511,14 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let hook_result = crate::runtime::emit_before_tool_call(
-                                            &hook_bus_inner,
-                                            &tool_name_for_hook,
+                                        let hook_result = crate::runtime::resolve_before_tool_call_result(
+                                            crate::runtime::emit_before_tool_call(
+                                                &hook_bus_inner,
+                                                &tool_name_for_hook,
+                                                None,
+                                                input.clone(),
+                                            ).await,
                                             None,
-                                            input.clone(),
                                         ).await;
                                         tracing::debug!(?hook_result, "before_tool_call hook result (parallel)");
                                         if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
@@ -662,6 +707,76 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirm_without_prompt_fails_closed() {
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Block { reason }
+                if reason.contains("requires confirmation") && reason.contains("Run deploy?")
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_prompt_yes_continues() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            assert_eq!(request.title, "Confirm tool call");
+            assert!(request.prompt.contains("Run deploy?"));
+            let _ = request.response_tx.send(Some("yes".to_string()));
+        });
+
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            Some(&handle),
+        )
+        .await;
+
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_prompt_non_yes_blocks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            let _ = request.response_tx.send(Some("no".to_string()));
+        });
+
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            Some(&handle),
+        )
+        .await;
+
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Block { reason }
+                if reason.contains("confirmation denied")
+        ));
+    }
 
     #[test]
     fn test_max_tokens_for_model() {

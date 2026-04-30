@@ -99,7 +99,7 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 **Notes:**
 
 - `before_tool_call` supports `block`; if any extension blocks, the tool is not executed and later handlers are skipped.
-- `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Call sites that have not yet wired a confirmation UI must handle this distinct result explicitly.
+- `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `before_message` supports `inject`; injected content from matching extensions is accumulated.
 - Other hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 

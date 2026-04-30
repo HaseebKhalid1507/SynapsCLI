@@ -183,7 +183,7 @@ When a tool call is blocked, the LLM receives a synthetic tool result indicating
 
 ### `confirm`
 
-Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on `before_tool_call`; on other hooks, `confirm` is treated as `continue` and logged as an unsupported action. Call sites must explicitly handle this distinct result before executing the tool.
+Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on `before_tool_call`; on other hooks, `confirm` is treated as `continue` and logged as an unsupported action. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
 
 ```json
 {

@@ -39,8 +39,8 @@ Unsupported result actions are ignored fail-open and logged as warnings.
 - `block` prevents the hooked operation and surfaces the reason. It is accepted
   only on `before_tool_call`.
 - `confirm` asks the runtime to get explicit user confirmation before proceeding.
-  It is accepted only on `before_tool_call`; until a UI confirmation flow is wired
-  into a call site, it is surfaced as a distinct result for the caller to handle.
+  It is accepted only on `before_tool_call`. Interactive TUI streams prompt the
+  user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `inject` accumulates text from all matching handlers and injects it into the
   model context. It is accepted only on `before_message`.
 
