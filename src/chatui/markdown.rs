@@ -65,14 +65,58 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
+/// Strip inline markdown markers (`**`, `*`, `` ` ``) from text for width calculation.
+/// Returns the visible text without formatting markers.
+fn strip_inline_md(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                // Skip backtick, consume until closing backtick
+                while let Some(&c) = chars.peek() {
+                    if c == '`' { chars.next(); break; }
+                    result.push(c);
+                    chars.next();
+                }
+            }
+            '*' => {
+                let is_bold = chars.peek() == Some(&'*');
+                if is_bold { chars.next(); } // skip second *
+                // Consume content until closing delimiter
+                let mut found_end = false;
+                while let Some(c) = chars.next() {
+                    if c == '*' {
+                        if is_bold {
+                            if chars.peek() == Some(&'*') { chars.next(); found_end = true; break; }
+                            result.push(c);
+                        } else {
+                            found_end = true;
+                            break;
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                let _ = found_end;
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
 /// Word-wrap a table cell's content to fit within `max_width` display columns.
 /// Breaks on word boundaries where possible; forces a break mid-word if a single
 /// word exceeds the column width. Returns one String per visual line.
+/// Width calculations strip inline markdown markers so `**bold**` counts as
+/// the width of `bold`, not `**bold**`.
 fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![String::new()];
     }
-    let display_w = UnicodeWidthStr::width(text);
+    let stripped = strip_inline_md(text);
+    let display_w = UnicodeWidthStr::width(stripped.as_str());
     if display_w <= max_width {
         return vec![text.to_string()];
     }
@@ -187,12 +231,14 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         }
     }
 
-    // Calculate column widths using display width
+    // Calculate column widths using display width of stripped content
+    // (markdown formatting like **bold** shouldn't count toward column width)
     let mut col_widths: Vec<usize> = vec![3; num_cols];
     for row in &rows {
         for (j, cell) in row.iter().enumerate() {
             if j < num_cols {
-                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(cell.as_str()));
+                let stripped = strip_inline_md(cell);
+                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(stripped.as_str()));
             }
         }
     }
@@ -289,10 +335,17 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             for (j, col_lines) in wrapped_cols.iter().enumerate() {
                 let w = col_widths[j];
                 let cell_text = col_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
-                let display_w = UnicodeWidthStr::width(cell_text);
+                let stripped_text = strip_inline_md(cell_text);
+                let display_w = UnicodeWidthStr::width(stripped_text.as_str());
                 let padding = w.saturating_sub(display_w);
-                let padded = format!(" {}{} ", cell_text, " ".repeat(padding));
-                spans.push(Span::styled(padded, style));
+
+                // Leading space
+                spans.push(Span::styled(" ".to_string(), style));
+                // Parse inline markdown (bold, italic, code) within cell
+                spans.extend(parse_inline_md(cell_text, style));
+                // Trailing padding + space
+                spans.push(Span::styled(format!("{} ", " ".repeat(padding)), style));
+
                 if j < num_cols - 1 {
                     spans.push(Span::styled(" ", Style::default()));
                 }
@@ -769,5 +822,58 @@ mod tests {
         // No ellipsis — we wrap, not truncate
         assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
             "Table used truncation instead of wrapping");
+    }
+
+    #[test]
+    fn table_renders_bold_markdown_in_cells() {
+        let table_lines = vec![
+            "| Category | Value |".to_string(),
+            "|----------|-------|".to_string(),
+            "| **Era** | 130 million years |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+
+        // The ** markers should NOT appear in rendered text
+        let all_text: String = texts.join(" ");
+        assert!(!all_text.contains("**"), "Bold markers ** still visible in: {}", all_text);
+        assert!(all_text.contains("Era"), "Bold content 'Era' missing from: {}", all_text);
+
+        // Check that the Era span actually has BOLD modifier
+        let era_line = result.iter().find(|l| {
+            l.spans.iter().any(|s| s.content.contains("Era"))
+        }).expect("No line contains 'Era'");
+        let era_span = era_line.spans.iter().find(|s| s.content.contains("Era")).unwrap();
+        assert!(era_span.style.add_modifier == Modifier::BOLD,
+            "Era span is not bold: {:?}", era_span.style);
+    }
+
+    #[test]
+    fn strip_inline_md_removes_bold_markers() {
+        assert_eq!(strip_inline_md("**hello**"), "hello");
+        assert_eq!(strip_inline_md("**a** and **b**"), "a and b");
+        assert_eq!(strip_inline_md("plain text"), "plain text");
+        assert_eq!(strip_inline_md("*italic*"), "italic");
+        assert_eq!(strip_inline_md("`code`"), "code");
+    }
+
+    #[test]
+    fn table_bold_cells_dont_waste_width_on_markers() {
+        // **Signature Move** is 20 chars raw but only 14 stripped
+        // Width calc should use 14, giving the column more room
+        let table_lines = vec![
+            "| Label | Data |".to_string(),
+            "|-------|------|".to_string(),
+            "| **Signature Move** | some data |".to_string(),
+            "| **Era** | more data |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+        let all_text: String = texts.join(" ");
+        // Full label should be visible, not truncated
+        assert!(all_text.contains("Signature Move"),
+            "Label was truncated: {}", all_text);
     }
 }
