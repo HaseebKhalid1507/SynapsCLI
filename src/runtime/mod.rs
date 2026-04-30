@@ -371,7 +371,9 @@ impl Runtime {
                                 let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
                                     &tool_name, input.clone(),
                                 );
+                                tracing::info!(tool = %tool_name, handlers = self.hook_bus.handler_count().await, "firing before_tool_call hook");
                                 let hook_result = self.hook_bus.emit(&hook_event).await;
+                                tracing::info!(tool = %tool_name, result = ?hook_result, "before_tool_call result");
                                 if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
@@ -433,7 +435,9 @@ impl Runtime {
                                         let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
                                             &tool_name_for_hook, input.clone(),
                                         );
+                                        eprintln!("[hook-debug] parallel before_tool_call: tool={}, handlers exist", tool_name_for_hook);
                                         let hook_result = hook_bus_inner.emit(&hook_event).await;
+                                        eprintln!("[hook-debug] parallel before_tool_call result: {:?}", hook_result);
                                         if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
                                             format!("Tool call blocked by extension: {}", reason)
                                         } else {

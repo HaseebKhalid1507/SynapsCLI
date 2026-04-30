@@ -313,13 +313,14 @@ pub async fn run(
             std::sync::Arc::clone(runtime.hook_bus()),
         );
         let loaded = ext_mgr.discover_and_load().await;
+        let handler_count = runtime.hook_bus().handler_count().await;
+        eprintln!("[ext-debug] discovered {} extensions, {} handlers registered", loaded.len(), handler_count);
         if !loaded.is_empty() {
             app.push_msg(ChatMessage::System(format!(
-                "Extensions loaded: {}", loaded.join(", ")
+                "Extensions loaded: {} ({} hooks)", loaded.join(", "), handler_count
             )));
         }
         // Leak the manager so extensions stay alive for the session
-        // (proper ownership will come with the extension lifecycle refactor)
         std::mem::forget(ext_mgr);
     }
 
