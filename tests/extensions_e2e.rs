@@ -196,6 +196,29 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
     manager.shutdown_all().await;
 }
 
+#[tokio::test]
+async fn malformed_modify_result_blocks_instead_of_failing_open() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/malformed_modify_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let handler = ProcessExtension::spawn("malformed-modify", "python3", &[fixture])
+        .await
+        .expect("Failed to spawn malformed modify extension");
+    handler.initialize_for_test(None).await.unwrap();
+
+    let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "rm -rf /"}));
+    let result = handler.handle(&event).await;
+
+    match result {
+        HookResult::Block { reason } => assert!(reason.contains("malformed modify"), "{reason}"),
+        other => panic!("expected malformed modify to block, got {other:?}"),
+    }
+
+    handler.shutdown().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();

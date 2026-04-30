@@ -414,7 +414,24 @@ impl ExtensionHandler for ProcessExtension {
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {
-            Ok(Ok(value)) => serde_json::from_value(value).unwrap_or(HookResult::Continue),
+            Ok(Ok(value)) => match serde_json::from_value(value.clone()) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %self.id,
+                        error = %error,
+                        response = %value,
+                        "Extension hook handler returned invalid result",
+                    );
+                    if value.get("action").and_then(Value::as_str) == Some("modify") {
+                        HookResult::Block {
+                            reason: "Extension returned malformed modify result".to_string(),
+                        }
+                    } else {
+                        HookResult::Continue
+                    }
+                }
+            },
             Ok(Err(e)) => {
                 tracing::warn!(
                     extension = %self.id,
