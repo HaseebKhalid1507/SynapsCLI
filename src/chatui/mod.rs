@@ -306,6 +306,23 @@ pub async fn run(
     }
 
 
+    // ═══ Extension Discovery ═══
+    // Scan ~/.synaps-cli/plugins/ for extensions and load them
+    {
+        let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
+            std::sync::Arc::clone(runtime.hook_bus()),
+        );
+        let loaded = ext_mgr.discover_and_load().await;
+        if !loaded.is_empty() {
+            app.push_msg(ChatMessage::System(format!(
+                "Extensions loaded: {}", loaded.join(", ")
+            )));
+        }
+        // Leak the manager so extensions stay alive for the session
+        // (proper ownership will come with the extension lifecycle refactor)
+        std::mem::forget(ext_mgr);
+    }
+
     // ═══ HOOK: on_session_start ═══
     {
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);

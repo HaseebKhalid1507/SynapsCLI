@@ -96,6 +96,90 @@ impl ExtensionManager {
     pub fn hook_bus(&self) -> &Arc<HookBus> {
         &self.hook_bus
     }
+
+    /// Discover and load all extensions from the plugins directory.
+    ///
+    /// Scans `~/.synaps-cli/plugins/*/plugin.json` for manifests that
+    /// contain an `extension` field. Loads each one via `self.load()`.
+    pub async fn discover_and_load(&mut self) -> Vec<String> {
+        let plugins_dir = crate::config::base_dir().join("plugins");
+        let mut loaded = Vec::new();
+
+        if !plugins_dir.exists() {
+            return loaded;
+        }
+
+        let entries = match std::fs::read_dir(&plugins_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read plugins directory");
+                return loaded;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let manifest_path = entry.path().join(".synaps-plugin").join("plugin.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&manifest_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Parse the full manifest to check for extension field
+            let json: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Only load plugins that have an "extension" field
+            let ext_value = match json.get("extension") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+
+            let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %entry.path().display(),
+                        error = %e,
+                        "Failed to parse extension manifest"
+                    );
+                    continue;
+                }
+            };
+
+            let plugin_name = entry.file_name().to_string_lossy().to_string();
+
+            // Resolve command relative to plugin directory
+            let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
+                ext_manifest.command.clone()
+            } else {
+                entry.path().join(&ext_manifest.command)
+                    .to_string_lossy().to_string()
+            };
+
+            let resolved = ExtensionManifest {
+                command,
+                ..ext_manifest
+            };
+
+            match self.load(&plugin_name, &resolved).await {
+                Ok(()) => {
+                    tracing::info!(plugin = %plugin_name, "Extension loaded from plugins/");
+                    loaded.push(plugin_name);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %plugin_name, error = %e, "Failed to load extension");
+                }
+            }
+        }
+
+        loaded
+    }
 }
 
 #[cfg(test)]
