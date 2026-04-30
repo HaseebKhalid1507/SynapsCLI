@@ -114,7 +114,7 @@ define_settings! {
         };
 
     bash_max_timeout, "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
-        "Upper bound on requested bash timeouts.",
+        "Legacy setting retained for config compatibility; requested bash timeouts are no longer clamped.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u64>() { runtime.set_bash_max_timeout(n); }
         };
