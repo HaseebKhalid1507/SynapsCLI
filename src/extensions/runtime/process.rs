@@ -419,6 +419,13 @@ impl ExtensionHandler for ProcessExtension {
         &self.id
     }
 
+    async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
+        self.call("tool.call", serde_json::json!({
+            "name": name,
+            "input": input,
+        })).await
+    }
+
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{Result, RuntimeError, ToolContext};
 use crate::extensions::runtime::ExtensionHandler;
@@ -41,23 +41,17 @@ impl crate::tools::Tool for ExtensionTool {
     }
 
     async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
-        let request = crate::extensions::hooks::events::HookEvent {
-            kind: crate::extensions::hooks::events::HookKind::BeforeToolCall,
-            tool_name: Some(self.tool_name.clone()),
-            tool_runtime_name: Some(self.runtime_name.clone()),
-            tool_input: Some(json!({
-                "name": self.tool_name,
-                "input": params,
-            })),
-            tool_output: None,
-            message: None,
-            session_id: None,
-            transcript: None,
-            data: json!({"method": "tool.call"}),
-        };
-        let _ = self.handler.handle(&request).await;
-        Err(RuntimeError::Tool(
-            "extension tool execution is not wired yet".to_string(),
-        ))
+        let value = self
+            .handler
+            .call_tool(&self.tool_name, params)
+            .await
+            .map_err(RuntimeError::Tool)?;
+        if let Some(text) = value.as_str() {
+            Ok(text.to_string())
+        } else if let Some(text) = value.get("content").and_then(Value::as_str) {
+            Ok(text.to_string())
+        } else {
+            Ok(value.to_string())
+        }
     }
 }

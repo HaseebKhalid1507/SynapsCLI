@@ -3,6 +3,7 @@
 pub mod process;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 
 /// Health state for an extension handler.
@@ -31,6 +32,11 @@ pub trait ExtensionHandler: Send + Sync {
 
     /// Handle a hook event. Returns the handler's decision.
     async fn handle(&self, event: &HookEvent) -> HookResult;
+
+    /// Call an extension-provided tool.
+    async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
+        Err("extension runtime does not support tool.call".to_string())
+    }
 
     /// Gracefully shut down the extension.
     async fn shutdown(&self);

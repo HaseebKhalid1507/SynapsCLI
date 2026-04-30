@@ -50,6 +50,12 @@ while True:
                 }]
             }
         })
+    elif method == "tool.call":
+        params = request.get("params") or {}
+        if params.get("name") == "echo":
+            write_message(request, {"content": f"echo: {params.get('input', {}).get('text', '')}"})
+        else:
+            write_message(request, error={"code": -32602, "message": "unknown tool"})
     elif method == "hook.handle":
         write_message(request, {"action": "continue"})
     elif method == "shutdown":

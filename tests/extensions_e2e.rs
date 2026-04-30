@@ -242,6 +242,32 @@ async fn extension_tools_are_registered_in_tool_registry() {
 
     let registry = tools.read().await;
     assert!(registry.get("register-tool-test:echo").is_some());
+    let output = registry
+        .get("register-tool-test:echo")
+        .unwrap()
+        .execute(
+            serde_json::json!({"text": "hello"}),
+            synaps_cli::ToolContext {
+                channels: synaps_cli::tools::ToolChannels { tx_delta: None, tx_events: None },
+                capabilities: synaps_cli::tools::ToolCapabilities {
+                    watcher_exit_path: None,
+                    tool_register_tx: None,
+                    session_manager: None,
+                    subagent_registry: None,
+                    event_queue: None,
+                    secret_prompt: None,
+                },
+                limits: synaps_cli::tools::ToolLimits {
+                    max_tool_output: 30_000,
+                    bash_timeout: 30,
+                    bash_max_timeout: 300,
+                    subagent_timeout: 300,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(output, "echo: hello");
     let schema = registry.tools_schema();
     let registered = schema.iter().find(|tool| tool["name"] == "register-tool-test_echo");
     assert!(registered.is_some(), "extension tool should appear in API schema: {schema:?}");
