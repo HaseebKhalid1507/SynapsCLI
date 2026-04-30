@@ -166,7 +166,10 @@ def handle_hook(params):
         broadcast_state()
         return {"action": "continue"}
 
-    elif kind == "after_tool_call" and tool_name in ("subagent", "subagent_start", "subagent_collect"):
+    elif kind == "after_tool_call" and tool_name in ("subagent", "subagent_collect"):
+        # subagent = blocking (done when it returns)
+        # subagent_collect = reactive (done when collected)
+        # subagent_start = NOT here — it returns immediately, agent still running
         # Try to figure out which agent completed
         if isinstance(tool_input, dict):
             agent_name = tool_input.get("agent", tool_input.get("agent_name", ""))
