@@ -38,6 +38,7 @@ pub(super) struct StreamSession {
     pub(super) session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     pub(super) subagent_registry: Arc<Mutex<crate::runtime::subagent::SubagentRegistry>>,
     pub(super) event_queue: Arc<crate::events::EventQueue>,
+    pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
 }
 
 pub(super) struct StreamMethods;
@@ -53,7 +54,7 @@ impl StreamMethods {
             tx, cancel, mut steering_rx,
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
-            session_manager, subagent_registry, event_queue,
+            session_manager, subagent_registry, event_queue, hook_bus,
         } = session;
         let mut messages = initial_messages;
 
@@ -96,8 +97,40 @@ impl StreamMethods {
             }
 
             let tools_snapshot = tools.read().await.clone();
+
+            // ═══ HOOK: before_message ═══
+            // Fire before sending messages to the LLM. Extensions can inject context.
+            // Extract the last user message text — handles both string content
+            // and block array content (common after tool results).
+            let mut injected_system = system_prompt.clone();
+            let last_user_msg: Option<String> = messages.iter().rev()
+                .find(|m| m["role"].as_str() == Some("user"))
+                .and_then(|m| {
+                    // Try string content first
+                    if let Some(s) = m["content"].as_str() {
+                        return Some(s.to_string());
+                    }
+                    // Try block array content
+                    if let Some(arr) = m["content"].as_array() {
+                        return arr.iter()
+                            .find(|b| b["type"].as_str() == Some("text"))
+                            .and_then(|b| b["text"].as_str())
+                            .map(String::from);
+                    }
+                    None
+                });
+            if let Some(ref msg_text) = last_user_msg {
+                let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
+                if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
+                    // Prepend injected content to system prompt
+                    let base = injected_system.clone().unwrap_or_default();
+                    injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
+                    tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                }
+            }
+
             let response = match ApiMethods::call_api_stream_inner(
-                &auth, &client, &model, &tools_snapshot, &system_prompt, thinking_budget,
+                &auth, &client, &model, &tools_snapshot, &injected_system, thinking_budget,
                 &messages, tx.clone(), &cancel, api_retries, &options,
             ).await {
                 Ok(r) => r,
@@ -194,21 +227,39 @@ impl StreamMethods {
                                     }
                                 });
 
+                                // ═══ HOOK: before_tool_call (stream single) ═══
+                                let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
+                                let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                    &tool_name, input.clone(),
+                                );
+                                hook_event.tool_runtime_name = Some(runtime_name.clone());
+                                let hook_result = hook_bus.emit(&hook_event).await;
+                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                    format!("Tool call blocked by extension: {}", reason)
+                                } else {
+                                let input_for_hook = input.clone();
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
                                         channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                         capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()) },
                                         limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                     }) => {
-                                        match res {
+                                        let output = match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
-                                        }
+                                        };
+                                        // ═══ HOOK: after_tool_call (stream single) ═══
+                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                            &tool_name, input_for_hook, output.clone(),
+                                        );
+                                        let _ = hook_bus.emit(&hook_event).await;
+                                        output
                                     }
                                     _ = cancel.cancelled() => {
                                         canceled = true;
                                         "Canceled by user".to_string()
                                     }
+                                }
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
@@ -262,10 +313,21 @@ impl StreamMethods {
                         let session_mgr = session_manager.clone();
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
+                        let hook_bus_inner = hook_bus.clone();
+                        let tool_name_for_hook = tool_name.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
                                 Some(t) => {
+                                    // ═══ HOOK: before_tool_call (stream parallel) ═══
+                                    let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                        &tool_name_for_hook, input.clone(),
+                                    );
+                                    let hook_result = hook_bus_inner.emit(&hook_event).await;
+                                    if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                        (false, format!("Tool call blocked by extension: {}", reason))
+                                    } else {
+                                    let input_for_hook = input.clone();
                                     let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     let tx_k = tx_stream.clone();
                                     let t_id = tool_id.clone();
@@ -284,15 +346,22 @@ impl StreamMethods {
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()) },
                                             limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
-                                            match res {
-                                                Ok(output) => (false, output),
-                                                Err(e) => (false, format!("Tool execution failed: {}", e)),
-                                            }
+                                            let output = match res {
+                                                Ok(output) => output,
+                                                Err(e) => format!("Tool execution failed: {}", e),
+                                            };
+                                            // ═══ HOOK: after_tool_call (stream parallel) ═══
+                                            let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                                &tool_name_for_hook, input_for_hook, output.clone(),
+                                            );
+                                            let _ = hook_bus_inner.emit(&hook_event).await;
+                                            (false, output)
                                         }
                                         _ = cancel_token.cancelled() => {
                                             (true, "Canceled by user".to_string())
                                         }
                                     }
+                                    } // close else from Block check
                                 }
                                 None => (false, format!("Unknown tool: {}", tool_name)),
                             };

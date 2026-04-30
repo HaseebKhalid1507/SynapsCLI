@@ -180,6 +180,7 @@ pub async fn run(
     continue_session: Option<Option<String>>,
     system: Option<String>,
     profile: Option<String>,
+    no_extensions: bool,
 ) -> Result<()> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
@@ -305,6 +306,33 @@ pub async fn run(
         tracing::warn!("Failed to register session: {}", e);
     }
 
+
+    // ═══ Extension Discovery ═══
+    // Scan ~/.synaps-cli/plugins/ for extensions and load them
+    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
+        std::sync::Arc::clone(runtime.hook_bus()),
+    );
+    if !no_extensions {
+        let (loaded, failed) = ext_mgr.discover_and_load().await;
+        let handler_count = runtime.hook_bus().handler_count().await;
+        tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
+        if !loaded.is_empty() {
+            app.push_msg(ChatMessage::System(format!(
+                "Extensions loaded: {} ({} hooks)", loaded.join(", "), handler_count
+            )));
+        }
+        for (name, error) in &failed {
+            app.push_msg(ChatMessage::System(format!(
+                "⚠ Extension '{}' failed: {}", name, error
+            )));
+        }
+    }
+
+    // ═══ HOOK: on_session_start ═══
+    {
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);
+        let _ = runtime.hook_bus().emit(&hook_event).await;
+    }
 
     // ── Event loop ──
     loop {
@@ -1139,6 +1167,16 @@ pub async fn run(
 
     // Save session on exit
     app.save_session().await;
+
+    // ═══ HOOK: on_session_end ═══
+    {
+        let transcript = Some(app.api_messages.clone());
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id, transcript);
+        let _ = runtime.hook_bus().emit(&hook_event).await;
+    }
+
+    // Gracefully shut down all extensions
+    ext_mgr.shutdown_all().await;
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
