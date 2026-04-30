@@ -184,3 +184,73 @@ async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
     assert!(failure.reason.contains("Invalid plugin manifest JSON"), "{failure:?}");
     assert!(failure.hint.contains("plugin validate"), "{failure:?}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn project_local_plugins_override_user_plugins_with_same_name() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let fixture = installed_fixture_script();
+    let previous_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let user_plugin_dir = home.path().join("plugins/layered-test");
+    fs::create_dir_all(user_plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(user_plugin_dir.join("extensions")).unwrap();
+    fs::copy(&fixture, user_plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::write(
+        user_plugin_dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "layered-test",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/installed_extension.py"],
+    "permissions": ["tools.intercept"],
+    "hooks": [{"hook": "before_tool_call", "tool": "bash"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let project_plugin_dir = project.path().join(".synaps/plugins/layered-test");
+    fs::create_dir_all(project_plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(project_plugin_dir.join("extensions")).unwrap();
+    fs::copy(&fixture, project_plugin_dir.join("extensions/installed_extension.py")).unwrap();
+    fs::write(
+        project_plugin_dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "layered-test",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/installed_extension.py"],
+    "permissions": ["tools.intercept"],
+    "hooks": [{"hook": "before_tool_call", "tool": "bash"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+
+    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+    assert_eq!(loaded, vec!["layered-test".to_string()]);
+
+    let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo local"}));
+    assert!(matches!(hook_bus.emit(&event).await, HookResult::Block { .. }));
+    assert!(project_plugin_dir.join("hook-seen.json").exists());
+    assert!(!user_plugin_dir.join("hook-seen.json").exists());
+
+    manager.shutdown_all().await;
+    std::env::set_current_dir(previous_cwd).unwrap();
+}

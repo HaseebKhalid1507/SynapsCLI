@@ -24,7 +24,7 @@ SynapsCLI spawns each extension as a subprocess on session start and tears it do
 
 ## Installing Extensions
 
-Extensions live under `~/.synaps-cli/plugins/`. Each plugin gets its own directory named after the extension:
+Extensions live under the user plugin directory (`~/.synaps-cli/plugins/`) and may also live under a project-local directory (`./.synaps/plugins/`). Each plugin gets its own directory named after the extension:
 
 ```
 ~/.synaps-cli/plugins/
@@ -32,7 +32,8 @@ Extensions live under `~/.synaps-cli/plugins/`. Each plugin gets its own directo
     .synaps-plugin/
       plugin.json
     main.py
-  another-extension/
+./.synaps/plugins/
+  project-auditor/
     .synaps-plugin/
       plugin.json
     index.js
@@ -44,7 +45,7 @@ To install an extension from a git repository:
 git clone https://github.com/example/my-auditor ~/.synaps-cli/plugins/my-auditor
 ```
 
-SynapsCLI scans this directory on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically.
+SynapsCLI scans both locations on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically. If the same plugin directory name exists in both locations, the project-local plugin in `./.synaps/plugins/` overrides the user plugin for that project.
 
 ---
 

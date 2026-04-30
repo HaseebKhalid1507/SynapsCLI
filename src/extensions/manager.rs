@@ -173,37 +173,54 @@ impl ExtensionManager {
         &self.hook_bus
     }
 
-    /// Discover and load all extensions from the plugins directory.
+    /// Discover and load all extensions from the user and project plugin directories.
     ///
-    /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` for
-    /// manifests that contain an `extension` field. Loads each one via
-    /// `self.load()`.
+    /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and
+    /// `./.synaps/plugins/*/.synaps-plugin/plugin.json` for manifests that contain
+    /// an `extension` field. Project-local plugins override user plugins with the
+    /// same directory name.
     pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<ExtensionLoadFailure>) {
-        let plugins_dir = crate::config::base_dir().join("plugins");
-        let mut loaded = Vec::new();
-        let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
-
-        if !plugins_dir.exists() {
-            return (loaded, failed);
+        let mut plugin_roots = vec![crate::config::base_dir().join("plugins")];
+        if let Ok(cwd) = std::env::current_dir() {
+            let project_plugins = cwd.join(".synaps").join("plugins");
+            if project_plugins != plugin_roots[0] {
+                plugin_roots.push(project_plugins);
+            }
         }
 
-        let entries = match std::fs::read_dir(&plugins_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(path = %plugins_dir.display(), error = %e, "Failed to read plugins directory");
-                failed.push(ExtensionLoadFailure::new(
-                    "plugins",
-                    Some(plugins_dir.clone()),
-                    format!("Failed to read plugins directory: {e}"),
-                    "Check directory permissions and retry",
-                ));
-                return (loaded, failed);
-            }
-        };
+        let mut plugin_dirs: HashMap<String, PathBuf> = HashMap::new();
+        let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
 
-        for entry in entries.flatten() {
-            let plugin_name = entry.file_name().to_string_lossy().to_string();
-            let plugin_dir = entry.path();
+        for plugins_dir in plugin_roots {
+            if !plugins_dir.exists() {
+                continue;
+            }
+
+            let entries = match std::fs::read_dir(&plugins_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(path = %plugins_dir.display(), error = %e, "Failed to read plugins directory");
+                    failed.push(ExtensionLoadFailure::new(
+                        "plugins",
+                        Some(plugins_dir.clone()),
+                        format!("Failed to read plugins directory: {e}"),
+                        "Check directory permissions and retry",
+                    ));
+                    continue;
+                }
+            };
+
+            for entry in entries.flatten() {
+                let plugin_name = entry.file_name().to_string_lossy().to_string();
+                plugin_dirs.insert(plugin_name, entry.path());
+            }
+        }
+
+        let mut plugin_dirs: Vec<(String, PathBuf)> = plugin_dirs.into_iter().collect();
+        plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut loaded = Vec::new();
+        for (plugin_name, plugin_dir) in plugin_dirs {
             let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
             if !manifest_path.exists() {
                 continue;
@@ -291,7 +308,7 @@ impl ExtensionManager {
 
             match self.load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone())).await {
                 Ok(()) => {
-                    tracing::info!(plugin = %plugin_name, "Extension loaded from plugins/");
+                    tracing::info!(plugin = %plugin_name, path = %plugin_dir.display(), "Extension loaded from plugins/");
                     loaded.push(plugin_name);
                 }
                 Err(e) => {
