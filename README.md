@@ -209,7 +209,7 @@ See [AGENTS.md](AGENTS.md) for parameters and behavior.
 SynapsCLI has a first-class extension system. Extensions are external processes that hook into the agent loop via JSON-RPC 2.0 over stdio.
 
 - **5 hooks:** `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`
-- **Tool-specific filtering:** `before_tool_call:bash` fires only for bash calls
+- **Tool-specific filtering:** narrow a hook to a single tool by adding `"tool"` to the registration, e.g. `{ "hook": "before_tool_call", "tool": "bash" }` fires only for bash calls
 - **Context injection:** Extensions inject context into the system prompt via `HookResult::Inject`
 - **Permission-gated:** 6 permissions control what extensions can access
 - **Drop-in plugins:** Clone into `~/.synaps-cli/plugins/<name>/` and restart

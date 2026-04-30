@@ -58,7 +58,8 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
   "description": "Logs all tool calls to a local audit file.",
   "author": "Your Name",
   "extension": {
-    "entry": "python3 main.py",
+    "command": "python3",
+    "args": ["main.py"],
     "hooks": [
       { "hook": "before_tool_call" },
       { "hook": "after_tool_call" }
@@ -72,11 +73,12 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
 
 The `extension` field is what distinguishes a plugin that provides an extension from one that only declares tools or themes. Its fields:
 
-| Field         | Type            | Description                                              |
-|---------------|-----------------|----------------------------------------------------------|
-| `entry`       | string          | Shell command used to launch the extension process       |
-| `hooks`       | array           | List of hook registrations (see below)                   |
-| `permissions` | array of string | Permissions the extension requires to function correctly |
+| Field         | Type            | Description                                                                                          |
+|---------------|-----------------|------------------------------------------------------------------------------------------------------|
+| `command`     | string          | Executable used to launch the extension process. Run directly — no shell, no glob/quoting expansion. |
+| `args`        | array of string | Arguments passed to `command` (each element is a single argv entry). Defaults to `[]`.               |
+| `hooks`       | array           | List of hook registrations (see below)                                                               |
+| `permissions` | array of string | Permissions the extension requires to function correctly                                             |
 
 ---
 
@@ -130,7 +132,7 @@ Extensions must declare the permissions they require. SynapsCLI will warn (and o
 | `providers.register` | Ability to register a new LLM provider                                         |
 | `tools.override`     | Ability to replace the implementation of an existing built-in tool             |
 
-Extensions that do not declare a required permission will receive events but with sensitive fields redacted. For example, an extension without `privacy.llm_content` that registers `before_message` will see the event fired but the `content` field will be `null`.
+Extensions that do not declare a required permission **cannot subscribe to the corresponding hook at all**. The runtime rejects the subscription at load time with an error like `Extension '<name>' lacks permission '<perm>' required for hook '<hook>'`, and the extension simply does not receive any of those events. There is no per-field redaction or partial delivery — it is all-or-nothing per hook.
 
 ---
 
@@ -140,7 +142,7 @@ When an extension returns a `HookResult::Inject` from a supported hook, the prov
 
 ```json
 {
-  "type": "inject",
+  "action": "inject",
   "content": "The current user is in UTC+5:30. Prefer IST when discussing times."
 }
 ```

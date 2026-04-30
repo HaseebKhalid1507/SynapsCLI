@@ -8,11 +8,11 @@ For a user-facing guide on installing and configuring extensions, see [README.md
 
 ## Transport
 
-Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess using the `entry` command declared in `plugin.json`. Your process's:
+Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess by directly executing the `command` declared in `plugin.json` with the supplied `args` (no shell is involved — there is no shell-string parsing, globbing, or quoting). Your process's:
 
 - **stdin** — receives messages from the runtime
 - **stdout** — used to send responses back to the runtime
-- **stderr** — captured and written to SynapsCLI's debug log (visible with `AXEL_BRAIN=1`)
+- **stderr** — discarded (the runtime attaches `Stdio::null()`). Anything you write to stderr is dropped on the floor.
 
 The protocol is **JSON-RPC 2.0** over a length-prefixed binary framing, identical in structure to the Language Server Protocol (LSP) transport. This is a deliberate choice — tooling that works with LSP servers works here too.
 
@@ -36,17 +36,17 @@ Content-Length: <byte-length-of-body>\r\n
 **Example frame (runtime → extension):**
 
 ```
-Content-Length: 187\r\n
+Content-Length: 175\r\n
 \r\n
-{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"hook":"before_tool_call","tool":"bash","session_id":"sess-abc","input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
+{"jsonrpc":"2.0","id":1,"method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","session_id":"sess-abc","tool_input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
 ```
 
 **Example frame (extension → runtime):**
 
 ```
-Content-Length: 22\r\n
+Content-Length: 46\r\n
 \r\n
-{"jsonrpc":"2.0","id":"evt-001","result":{"type":"continue"}}
+{"jsonrpc":"2.0","id":1,"result":{"action":"continue"}}
 ```
 
 Both directions use the same framing. Your extension must:
@@ -115,15 +115,14 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 
 ```json
 {
-  "hook": "before_tool_call",
-  "tool": "bash",
+  "kind": "before_tool_call",
+  "tool_name": "bash",
   "session_id": "sess-abc123",
-  "input": {
+  "tool_input": {
     "command": "rm -rf /tmp/scratch"
   },
-  "output": null,
+  "tool_output": null,
   "message": null,
-  "role": null,
   "timestamp": "2024-11-14T10:23:01Z",
   "metadata": {
     "model": "claude-opus-4-5",
@@ -132,17 +131,16 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 }
 ```
 
-| Field        | Type               | Present on hooks                              | Description                                               |
-|--------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
-| `hook`       | string             | all                                           | The hook name that fired                                  |
-| `tool`       | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
-| `session_id` | string             | all                                           | Stable identifier for the current session                 |
-| `input`      | object \| null     | `before_tool_call`                            | The raw input arguments passed to the tool                |
-| `output`     | object \| null     | `after_tool_call`                             | The result returned by the tool                           |
-| `message`    | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
-| `role`       | string \| null     | `before_message`                              | `"user"` or `"assistant"`                                 |
-| `timestamp`  | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
-| `metadata`   | object             | all                                           | Runtime context: active model, turn count, etc.           |
+| Field         | Type               | Present on hooks                              | Description                                               |
+|---------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
+| `kind`        | string             | all                                           | The hook name that fired                                  |
+| `tool_name`   | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
+| `session_id`  | string \| null     | `on_session_start`, `on_session_end`          | Stable identifier for the current session                 |
+| `tool_input`  | object \| null     | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                |
+| `tool_output` | string \| null     | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)      |
+| `message`     | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
+| `timestamp`   | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
+| `metadata`    | object             | all                                           | Runtime context: active model, turn count, etc.           |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -150,14 +148,14 @@ Fields that are not applicable to the current hook are always `null`, never omit
 
 ## HookResult Variants
 
-Your response's `result` field must be one of three variants, identified by the `type` field.
+Your response's `result` field must be one of three variants, identified by the `action` field.
 
 ### `continue`
 
 Allow the event to proceed normally. Use this when your extension has no objection.
 
 ```json
-{ "type": "continue" }
+{ "action": "continue" }
 ```
 
 ### `block`
@@ -166,7 +164,7 @@ Prevent the event from proceeding. Only valid on hooks marked **Can block?** in 
 
 ```json
 {
-  "type": "block",
+  "action": "block",
   "reason": "Command contains a destructive pattern (rm -rf on non-/tmp path)."
 }
 ```
@@ -183,7 +181,7 @@ Prepend content to the system prompt for the current request. Only valid on hook
 
 ```json
 {
-  "type": "inject",
+  "action": "inject",
   "content": "Policy: Never execute commands that modify files outside /tmp without explicit confirmation."
 }
 ```
@@ -233,16 +231,16 @@ def write_message(payload: dict):
 
 
 def handle_hook(event: dict) -> dict:
-    tool_input = event.get("input") or {}
+    tool_input = event.get("tool_input") or {}
     command = tool_input.get("command", "")
 
     if "rm -rf" in command and "/tmp" not in command:
         return {
-            "type": "block",
+            "action": "block",
             "reason": f"Blocked destructive command outside /tmp: {command!r}"
         }
 
-    return {"type": "continue"}
+    return {"action": "continue"}
 
 
 def main():
@@ -290,7 +288,8 @@ Full `plugin.json` with all supported extension fields:
   "author": "Your Name <you@example.com>",
   "license": "MIT",
   "extension": {
-    "entry": "python3 main.py",
+    "command": "python3",
+    "args": ["main.py"],
     "hooks": [
       {
         "hook": "before_tool_call",
@@ -304,15 +303,16 @@ Full `plugin.json` with all supported extension fields:
 }
 ```
 
-| Field                    | Type            | Required | Description                                                           |
-|--------------------------|-----------------|----------|-----------------------------------------------------------------------|
-| `extension.entry`        | string          | yes      | Shell command to launch the extension process                         |
-| `extension.hooks`        | array           | yes      | One or more hook registrations                                        |
-| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                 |
-| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                      |
-| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only) |
+| Field                    | Type            | Required | Description                                                                                                |
+|--------------------------|-----------------|----------|------------------------------------------------------------------------------------------------------------|
+| `extension.command`      | string          | yes      | Executable to launch (resolved against `PATH` if bare, otherwise relative to the plugin directory). No shell. |
+| `extension.args`         | array of string | no       | Arguments passed to `command`. Defaults to `[]`. Each element is a single argv entry — no shell splitting. |
+| `extension.hooks`        | array           | yes      | One or more hook registrations                                                                             |
+| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                                                      |
+| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                                                           |
+| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only)                                      |
 
-The `entry` command is executed with the plugin directory as the working directory. Relative paths in `entry` resolve from there.
+The `command` is executed with the plugin directory as the working directory. Relative paths in `command` resolve from there. Because there is no shell, you cannot use shell features (pipes, `&&`, env-var expansion, glob patterns) inside `command` or `args` — invoke an interpreter explicitly (e.g. `"command": "python3", "args": ["main.py"]`).
 
 ---
 
@@ -338,9 +338,9 @@ Permissions are declared but not enforced cryptographically — they serve as an
 SynapsCLI is designed to degrade gracefully when extensions misbehave. If your extension:
 
 - **Does not respond within 5 seconds** — the event proceeds as `continue`. Your extension is not killed; the next event will still be sent.
-- **Sends a malformed response** — treated as `continue`. The error is logged to stderr capture.
+- **Sends a malformed response** — treated as `continue`. The error is dropped (stderr is not captured; see below).
 - **Crashes (exits unexpectedly)** — the runtime marks your extension as failed for this session. All subsequent hook events for your registered hooks are skipped. The session continues normally.
-- **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
+- **Sends an error object** instead of a result — treated as `continue`. The error message is discarded.
 
 ### Timeouts
 
@@ -354,20 +354,15 @@ SynapsCLI is designed to degrade gracefully when extensions misbehave. If your e
 
 When an extension process exits without receiving `shutdown`:
 
-1. The runtime logs the exit code and any buffered stderr output
+1. The runtime logs the exit code
 2. The extension is marked inactive for the session
 3. No attempt is made to restart it
 4. Other extensions continue operating normally
 
 Design your extension to be stateless where possible. If you maintain state, write it to disk promptly — do not rely on an orderly `shutdown` call.
 
-### Stderr Logging
+### Stderr Handling
 
-Anything your extension writes to stderr is captured by the runtime and written to its internal debug log. With `AXEL_BRAIN=1`, this output appears in the terminal prefixed with the extension name:
+The runtime currently attaches `Stdio::null()` to extension stderr — anything you write there is **discarded**, not captured or surfaced. Do not rely on stderr for diagnostics that you need to see.
 
-```
-[rm-rf-guard] Checked command: "ls -la" — allowed
-[rm-rf-guard] Checked command: "rm -rf /home/user/docs" — blocked
-```
-
-Use stderr liberally for debug output. It never reaches the user by default.
+For debugging, write to a file inside your plugin directory (or a temp path) and tail it externally. A future runtime version may capture stderr into the SynapsCLI debug log, but that is **not yet implemented**.
