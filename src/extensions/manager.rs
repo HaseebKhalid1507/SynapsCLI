@@ -153,17 +153,33 @@ impl ExtensionManager {
             };
 
             let plugin_name = entry.file_name().to_string_lossy().to_string();
+            let plugin_dir = entry.path();
 
             // Resolve command relative to plugin directory
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
+            } else if ext_manifest.command == "python3" || ext_manifest.command == "python" || ext_manifest.command == "node" {
+                // Interpreter commands stay as-is, but resolve args
+                ext_manifest.command.clone()
             } else {
-                entry.path().join(&ext_manifest.command)
+                plugin_dir.join(&ext_manifest.command)
                     .to_string_lossy().to_string()
+            };
+
+            // Resolve args relative to plugin directory
+            let args: Vec<String> = ext_manifest.args.iter().map(|arg| {
+                let arg_path = plugin_dir.join(arg);
+                if arg_path.exists() {
+                    arg_path.to_string_lossy().to_string()
+                } else {
+                    arg.clone()
+                }
+            }).collect();
             };
 
             let resolved = ExtensionManifest {
                 command,
+                args,
                 ..ext_manifest
             };
 
