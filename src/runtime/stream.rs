@@ -211,21 +211,36 @@ impl StreamMethods {
                                     }
                                 });
 
+                                // ═══ HOOK: before_tool_call (stream single) ═══
+                                let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                    &tool_name, input.clone(),
+                                );
+                                let hook_result = hook_bus.emit(&hook_event).await;
+                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                    format!("Tool call blocked by extension: {}", reason)
+                                } else {
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
                                         channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                         capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()) },
                                         limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                     }) => {
-                                        match res {
+                                        let output = match res {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
-                                        }
+                                        };
+                                        // ═══ HOOK: after_tool_call (stream single) ═══
+                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                            &tool_name, serde_json::json!({}), output.clone(),
+                                        );
+                                        let _ = hook_bus.emit(&hook_event).await;
+                                        output
                                     }
                                     _ = cancel.cancelled() => {
                                         canceled = true;
                                         "Canceled by user".to_string()
                                     }
+                                }
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
@@ -279,10 +294,20 @@ impl StreamMethods {
                         let session_mgr = session_manager.clone();
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
+                        let hook_bus_inner = hook_bus.clone();
+                        let tool_name_for_hook = tool_name.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
                                 Some(t) => {
+                                    // ═══ HOOK: before_tool_call (stream parallel) ═══
+                                    let hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
+                                        &tool_name_for_hook, input.clone(),
+                                    );
+                                    let hook_result = hook_bus_inner.emit(&hook_event).await;
+                                    if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                        (false, format!("Tool call blocked by extension: {}", reason))
+                                    } else {
                                     let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     let tx_k = tx_stream.clone();
                                     let t_id = tool_id.clone();
@@ -301,15 +326,22 @@ impl StreamMethods {
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()) },
                                             limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
-                                            match res {
-                                                Ok(output) => (false, output),
-                                                Err(e) => (false, format!("Tool execution failed: {}", e)),
-                                            }
+                                            let output = match res {
+                                                Ok(output) => output,
+                                                Err(e) => format!("Tool execution failed: {}", e),
+                                            };
+                                            // ═══ HOOK: after_tool_call (stream parallel) ═══
+                                            let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+                                                &tool_name_for_hook, serde_json::json!({}), output.clone(),
+                                            );
+                                            let _ = hook_bus_inner.emit(&hook_event).await;
+                                            (false, output)
                                         }
                                         _ = cancel_token.cancelled() => {
                                             (true, "Canceled by user".to_string())
                                         }
                                     }
+                                    } // close else from Block check
                                 }
                                 None => (false, format!("Unknown tool: {}", tool_name)),
                             };
