@@ -26,6 +26,12 @@ use api::ApiMethods;
 use stream::StreamMethods;
 use helpers::HelperMethods;
 
+/// Result of resolving before_tool_call extension policy.
+pub enum BeforeToolCallDecision {
+    Continue { input: Value },
+    Block { reason: String },
+}
+
 /// Emit a `before_tool_call` event and include the runtime tool name when it
 /// differs from the API-safe name.
 pub async fn emit_before_tool_call(
@@ -77,6 +83,23 @@ pub async fn resolve_before_tool_call_result(
             }
         }
         other => other,
+    }
+}
+
+/// Resolve before_tool_call policy into executable input or a block reason.
+pub async fn resolve_before_tool_call_decision(
+    original_input: Value,
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+) -> BeforeToolCallDecision {
+    match resolve_before_tool_call_result(hook_result, secret_prompt).await {
+        crate::extensions::hooks::events::HookResult::Block { reason } => {
+            BeforeToolCallDecision::Block { reason }
+        }
+        crate::extensions::hooks::events::HookResult::Modify { input } => {
+            BeforeToolCallDecision::Continue { input }
+        }
+        _ => BeforeToolCallDecision::Continue { input: original_input },
     }
 }
 
@@ -442,7 +465,8 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                let hook_result = resolve_before_tool_call_result(
+                                let decision = resolve_before_tool_call_decision(
+                                    input.clone(),
                                     emit_before_tool_call(
                                         &self.hook_bus,
                                         &tool_name,
@@ -451,9 +475,10 @@ impl Runtime {
                                     ).await,
                                     None,
                                 ).await;
-                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     let output = match tool.execute(input, ctx).await {
                                         Ok(output) => output,
@@ -511,7 +536,8 @@ impl Runtime {
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let hook_result = crate::runtime::resolve_before_tool_call_result(
+                                        let decision = crate::runtime::resolve_before_tool_call_decision(
+                                            input.clone(),
                                             crate::runtime::emit_before_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
@@ -520,10 +546,10 @@ impl Runtime {
                                             ).await,
                                             None,
                                         ).await;
-                                        tracing::debug!(?hook_result, "before_tool_call hook result (parallel)");
-                                        if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                        if let crate::runtime::BeforeToolCallDecision::Block { reason } = decision {
                                             format!("Tool call blocked by extension: {}", reason)
                                         } else {
+                                        let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                         let ctx = crate::ToolContext {
                                             channels: crate::tools::ToolChannels {
                                                 tx_delta: None,
@@ -723,6 +749,24 @@ mod tests {
             crate::extensions::hooks::events::HookResult::Block { reason }
                 if reason.contains("requires confirmation") && reason.contains("Run deploy?")
         ));
+    }
+
+    #[tokio::test]
+    async fn modify_result_replaces_tool_input() {
+        let result = resolve_before_tool_call_decision(
+            serde_json::json!({"command":"rm -rf /"}),
+            crate::extensions::hooks::events::HookResult::Modify {
+                input: serde_json::json!({"command":"echo safe"}),
+            },
+            None,
+        ).await;
+
+        match result {
+            BeforeToolCallDecision::Continue { input } => {
+                assert_eq!(input, serde_json::json!({"command":"echo safe"}));
+            }
+            BeforeToolCallDecision::Block { reason } => panic!("unexpected block: {reason}"),
+        }
     }
 
     #[tokio::test]

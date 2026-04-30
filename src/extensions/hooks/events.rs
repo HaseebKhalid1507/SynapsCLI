@@ -66,7 +66,7 @@ impl HookKind {
     /// Supported action names for this hook in the extension contract.
     pub fn allowed_action_names(&self) -> &'static [&'static str] {
         match self {
-            Self::BeforeToolCall => &["continue", "block", "confirm"],
+            Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue"],
             Self::BeforeMessage => &["continue", "inject"],
             Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
@@ -84,6 +84,7 @@ impl HookKind {
             (_, HookResult::Continue) => true,
             (Self::BeforeToolCall, HookResult::Block { .. }) => true,
             (Self::BeforeToolCall, HookResult::Confirm { .. }) => true,
+            (Self::BeforeToolCall, HookResult::Modify { .. }) => true,
             (Self::BeforeMessage, HookResult::Inject { .. }) => true,
             _ => false,
         }
@@ -263,10 +264,8 @@ pub enum HookResult {
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
     Confirm { message: String },
-    // NOTE: `Modify` was removed in the review pass. Process-based extensions
-    // can't mutate events in-place (they get a serialized copy). If mutation
-    // support is needed, add a `ModifyWith { fields: Value }` variant that
-    // carries the modified data back.
+    /// Replace the tool input before execution. Only valid on before_tool_call hooks.
+    Modify { input: Value },
 }
 
 impl Default for HookResult {
@@ -455,6 +454,17 @@ mod tests {
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
+    }
+
+    /// Modify carries replacement input through serialization.
+    #[test]
+    fn hook_result_modify_serde() {
+        let r = HookResult::Modify { input: json!({"command": "echo safe"}) };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"action":"modify","input":{"command":"echo safe"}}"#);
+
+        let back: HookResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, HookResult::Modify { input } if input == json!({"command": "echo safe"})));
     }
 
     /// Continue serialises as {"action":"continue"}.

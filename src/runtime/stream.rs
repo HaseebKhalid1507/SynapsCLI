@@ -7,7 +7,7 @@ use reqwest::Client;
 use crate::{Result, RuntimeError, ToolRegistry};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
-use super::{emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_result};
+use super::{BeforeToolCallDecision, emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision};
 use super::api::ApiMethods;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
@@ -231,7 +231,8 @@ impl StreamMethods {
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
-                                let hook_result = resolve_before_tool_call_result(
+                                let decision = resolve_before_tool_call_decision(
+                                    input.clone(),
                                     emit_before_tool_call(
                                         &hook_bus,
                                         &tool_name,
@@ -240,9 +241,10 @@ impl StreamMethods {
                                     ).await,
                                     secret_prompt.as_ref(),
                                 ).await;
-                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                 let input_for_hook = input.clone();
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
@@ -330,7 +332,8 @@ impl StreamMethods {
                         join_set.spawn(async move {
                             let result = match tool {
                                 Some(t) => {
-                                    let hook_result = resolve_before_tool_call_result(
+                                    let decision = resolve_before_tool_call_decision(
+                                        input.clone(),
                                         emit_before_tool_call(
                                             &hook_bus_inner,
                                             &tool_name_for_hook,
@@ -339,9 +342,10 @@ impl StreamMethods {
                                         ).await,
                                         prompt_inner.as_ref(),
                                     ).await;
-                                    if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                    if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, format!("Tool call blocked by extension: {}", reason))
                                     } else {
+                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     let tx_k = tx_stream.clone();

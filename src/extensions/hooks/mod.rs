@@ -34,6 +34,7 @@ fn hook_result_action(result: &HookResult) -> &'static str {
         HookResult::Block { .. } => "block",
         HookResult::Inject { .. } => "inject",
         HookResult::Confirm { .. } => "confirm",
+        HookResult::Modify { .. } => "modify",
     }
 }
 
@@ -221,6 +222,23 @@ impl HookBus {
                     );
                     // Accumulate — don't early-return. Multiple extensions can inject.
                     injections.push(content);
+                }
+                Ok(HookResult::Modify { input }) => {
+                    if !event.kind.allows_result(&HookResult::Modify { input: input.clone() }) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "modify",
+                            "Extension returned action not allowed for hook — ignoring"
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Hook modified tool input by extension"
+                    );
+                    return HookResult::Modify { input };
                 }
                 Ok(HookResult::Confirm { message }) => {
                     if !event.kind.allows_result(&HookResult::Confirm { message: message.clone() }) {

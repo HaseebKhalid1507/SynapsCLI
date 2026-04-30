@@ -1,32 +1,48 @@
 {
   "manifest_version": 1,
   "extension_protocol_version": 1,
-  "runtimes": ["process"],
+  "runtimes": [
+    "process"
+  ],
   "hooks": {
     "before_tool_call": {
       "permission": "tools.intercept",
       "tool_filter": true,
-      "actions": ["continue", "block", "confirm"]
+      "actions": [
+        "continue",
+        "block",
+        "confirm",
+        "modify"
+      ]
     },
     "after_tool_call": {
       "permission": "tools.intercept",
       "tool_filter": true,
-      "actions": ["continue"]
+      "actions": [
+        "continue"
+      ]
     },
     "before_message": {
       "permission": "privacy.llm_content",
       "tool_filter": false,
-      "actions": ["continue", "inject"]
+      "actions": [
+        "continue",
+        "inject"
+      ]
     },
     "on_session_start": {
       "permission": "session.lifecycle",
       "tool_filter": false,
-      "actions": ["continue"]
+      "actions": [
+        "continue"
+      ]
     },
     "on_session_end": {
       "permission": "session.lifecycle",
       "tool_filter": false,
-      "actions": ["continue"]
+      "actions": [
+        "continue"
+      ]
     }
   },
   "permissions": [
