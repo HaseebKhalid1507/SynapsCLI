@@ -55,7 +55,7 @@ impl Permission {
     pub fn is_reserved(&self) -> bool {
         matches!(
             self,
-            Self::ToolsOverride | Self::ToolsRegister | Self::ProvidersRegister
+            Self::ToolsOverride | Self::ProvidersRegister
         )
     }
 }

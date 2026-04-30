@@ -17,15 +17,15 @@ const ALL_HOOK_KINDS: [HookKind; 5] = [
     HookKind::OnSessionEnd,
 ];
 
-const ALL_PERMISSIONS: [Permission; 3] = [
+const ALL_PERMISSIONS: [Permission; 4] = [
     Permission::ToolsIntercept,
     Permission::LlmContent,
     Permission::SessionLifecycle,
+    Permission::ToolsRegister,
 ];
 
-const RESERVED_PERMISSIONS: [Permission; 3] = [
+const RESERVED_PERMISSIONS: [Permission; 2] = [
     Permission::ToolsOverride,
-    Permission::ToolsRegister,
     Permission::ProvidersRegister,
 ];
 

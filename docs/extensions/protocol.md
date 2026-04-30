@@ -425,8 +425,9 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
+| `tools.register`    | Register extension-provided tools during initialization.                                    |
 
-Reserved future permissions are rejected if declared today: `tools.register`, `providers.register`, and `tools.override`.
+Reserved future permissions are rejected if declared today: `providers.register` and `tools.override`.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 

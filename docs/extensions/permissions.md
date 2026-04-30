@@ -14,6 +14,7 @@ These are the only permissions currently accepted in `extension.permissions`:
 | `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` |
 | `privacy.llm_content` | Subscribe to `before_message` and receive message content |
 | `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
+| `tools.register` | Register extension-provided tools during initialization |
 
 ## Reserved permissions
 
@@ -23,7 +24,6 @@ plugins today:
 | Permission | Reserved for |
 |---|---|
 | `tools.override` | Replacing or wrapping built-in tool implementations |
-| `tools.register` | Registering extension-provided tools |
 | `providers.register` | Registering extension-provided model providers |
 
 If a manifest includes a reserved permission, SynapsCLI rejects the extension

@@ -159,8 +159,9 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 | `tools.intercept`    | Ability to receive `before_tool_call` / `after_tool_call` events               |
 | `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
+| `tools.register`    | Register extension-provided tools during initialization                         |
 
-Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override`, `tools.register`, and `providers.register`.
+Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override` and `providers.register`.
 
 Permissions are checked before events are delivered. An extension that lacks a hook's required permission is not subscribed to that hook.
 

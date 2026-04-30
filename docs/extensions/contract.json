@@ -48,11 +48,11 @@
   "permissions": [
     "tools.intercept",
     "privacy.llm_content",
-    "session.lifecycle"
+    "session.lifecycle",
+    "tools.register"
   ],
   "reserved_permissions": [
     "tools.override",
-    "tools.register",
     "providers.register"
   ],
   "matchers": {
