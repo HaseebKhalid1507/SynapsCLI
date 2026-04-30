@@ -168,7 +168,9 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                     if slash_pos > 0 {
                         let before = &remaining[..slash_pos];
                         // Find the start of the path (walk back to whitespace)
-                        let path_start = before.rfind(|c: char| c.is_whitespace()).map(|p| p + 1).unwrap_or(0);
+                        let path_start = before.rfind(|c: char| c.is_whitespace())
+                            .map(|p| p + before[p..].chars().next().unwrap().len_utf8())
+                            .unwrap_or(0);
                         if path_start > 0 {
                             spans.push(Span::styled(
                                 remaining[..path_start].to_string(),
@@ -181,11 +183,12 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                             .unwrap_or(after_slash.len());
                         // Guard: if path_end is 0, we'd loop forever — consume at least 1 char
                         if path_end == 0 {
+                            let first_char_len = after_slash.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                             spans.push(Span::styled(
-                                after_slash[..1].to_string(),
+                                after_slash[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
                             ));
-                            remaining = &after_slash[1..];
+                            remaining = &after_slash[first_char_len..];
                         } else {
                             spans.push(Span::styled(
                                 after_slash[..path_end].to_string(),
@@ -198,11 +201,12 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                             .unwrap_or(remaining.len());
                         // Guard: if path_end is 0, consume at least 1 char to avoid infinite loop
                         if path_end == 0 {
+                            let first_char_len = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                             spans.push(Span::styled(
-                                remaining[..1].to_string(),
+                                remaining[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
                             ));
-                            remaining = &remaining[1..];
+                            remaining = &remaining[first_char_len..];
                         } else {
                             spans.push(Span::styled(
                                 remaining[..path_end].to_string(),
@@ -383,5 +387,33 @@ mod tests {
 
         assert_eq!(rendered, "ab漢");
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_nbsp_in_path_context() {
+        // Regression: \u{a0} (NBSP) is whitespace but 2 bytes in UTF-8.
+        // rfind(whitespace) + 1 landed mid-char → panic on slice.
+        // This is the exact crash string from S182.
+        let lines = vec![") \\| [395 comments](https://news.ycombinator.com/item?id=47961319) |"];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_nbsp_before_slash() {
+        // NBSP (\u{00a0}) right before a slash — rfind finds NBSP as whitespace,
+        // +1 byte would land inside the 2-byte char. Must use char boundary.
+        let line_with_nbsp = "text\u{00a0}/some/path here";
+        let lines = vec![line_with_nbsp];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_multibyte_at_path_boundary() {
+        // Multi-byte char (é = 2 bytes) near a slash
+        let lines = vec!["café/menu"];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
     }
 }
