@@ -140,6 +140,10 @@ pub(crate) fn draw(
                 format!(" {} {} agent{} ({} done) ", spinner, active, if active != 1 { "s" } else { "" }, done),
                 Style::default().fg(THEME.load().subagent_name),
             )
+        } else if app.voice.enabled && app.voice.listening {
+            Span::styled(" 🎙 voice ", Style::default().fg(THEME.load().status_streaming))
+        } else if app.voice.enabled {
+            Span::styled(" ◌ voice ready ", Style::default().fg(THEME.load().status_ready))
         } else if app.streaming {
             let pulse = ((app.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
             let (sr, sg, sb) = match THEME.load().status_streaming { Color::Rgb(r, g, b) => (r, g, b), _ => (128, 128, 128) };

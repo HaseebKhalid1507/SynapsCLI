@@ -261,6 +261,18 @@ pub(crate) fn handle_event(
     }
 }
 
+pub(crate) fn insert_voice_text(state: &mut SettingsState, text: &str) -> bool {
+    match state.edit_mode.as_mut() {
+        Some(ActiveEditor::Text { buffer, .. })
+        | Some(ActiveEditor::CustomModel { buffer, .. })
+        | Some(ActiveEditor::ApiKey { buffer, .. }) => {
+            buffer.push_str(text);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
     let editor = state.edit_mode.as_mut().expect("caller checks");
     match editor {
@@ -491,6 +503,43 @@ mod tests {
                 assert!(enabled);
             }
             _ => panic!("expected TogglePlugin"),
+        }
+    }
+
+    #[test]
+    fn voice_text_inserts_into_text_editor_buffer() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Text {
+            buffer: "abc".into(),
+            setting_key: "model",
+            numeric: false,
+            error: Some("bad".into()),
+        });
+
+        assert!(insert_voice_text(&mut state, " def"));
+
+        match state.edit_mode {
+            Some(ActiveEditor::Text { buffer, error, .. }) => {
+                assert_eq!(buffer, "abc def");
+                assert!(error.is_some());
+            }
+            _ => panic!("expected text editor"),
+        }
+    }
+
+    #[test]
+    fn voice_text_inserts_into_api_key_editor_buffer() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::ApiKey {
+            provider_id: "local.url".into(),
+            buffer: "http://".into(),
+        });
+
+        assert!(insert_voice_text(&mut state, "localhost"));
+
+        match state.edit_mode {
+            Some(ActiveEditor::ApiKey { buffer, .. }) => assert_eq!(buffer, "http://localhost"),
+            _ => panic!("expected api key editor"),
         }
     }
 }

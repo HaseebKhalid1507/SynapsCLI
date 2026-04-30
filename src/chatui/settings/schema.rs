@@ -78,4 +78,5 @@ mod tests {
     fn plugins_category_label() {
         assert_eq!(Category::Plugins.label(), "Plugins");
     }
+
 }

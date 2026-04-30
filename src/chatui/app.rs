@@ -127,6 +127,49 @@ pub(crate) struct App {
     /// immediately after MouseDown(Right). We suppress only within a short TTL
     /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
     pub(crate) suppress_paste_until: Option<std::time::Instant>,
+    /// User-facing local voice capture state for header/status rendering.
+    pub(crate) voice: VoiceUiState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceUiMode {
+    PushToTalk,
+    Toggle,
+    Conversation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VoiceUiState {
+    pub(crate) enabled: bool,
+    pub(crate) listening: bool,
+    pub(crate) mode: VoiceUiMode,
+    pub(crate) last_error: Option<String>,
+}
+
+impl Default for VoiceUiState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listening: false,
+            mode: VoiceUiMode::PushToTalk,
+            last_error: None,
+        }
+    }
+}
+
+impl VoiceUiState {
+    pub(crate) fn from_config(config: &synaps_cli::VoiceConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            listening: false,
+            mode: match config.mode.as_str() {
+                "toggle" => VoiceUiMode::Toggle,
+                "conversation" => VoiceUiMode::Conversation,
+                _ => VoiceUiMode::PushToTalk,
+            },
+            last_error: None,
+        }
+    }
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -202,6 +245,7 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
+            voice: VoiceUiState::default(),
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
