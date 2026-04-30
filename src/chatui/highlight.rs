@@ -344,3 +344,44 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
     Some(result)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{style::Style, text::{Line, Span}};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clamp_line_truncates_by_display_width_not_char_count() {
+        let line = Line::from(vec![Span::styled("ab漢字c", Style::default())]);
+
+        let clamped = clamp_line(line, 5);
+        let rendered: String = clamped
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered, "ab漢");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+
+    #[test]
+    fn clamp_line_preserves_spans_within_display_width_budget() {
+        let line = Line::from(vec![
+            Span::styled("ab", Style::default()),
+            Span::styled("漢", Style::default()),
+            Span::styled("cd", Style::default()),
+        ]);
+
+        let clamped = clamp_line(line, 4);
+        let rendered: String = clamped
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered, "ab漢");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+}
