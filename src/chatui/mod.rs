@@ -320,11 +320,7 @@ pub async fn run(
         let (loaded, failed) = ext_mgr.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
         tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
-        if !loaded.is_empty() {
-            app.push_msg(ChatMessage::System(format!(
-                "Extensions loaded: {} ({} hooks)", loaded.join(", "), handler_count
-            )));
-        }
+        // Extensions load silently — only surface failures
         for (name, error) in &failed {
             app.push_msg(ChatMessage::System(format!(
                 "⚠ Extension '{}' failed: {}", name, error
