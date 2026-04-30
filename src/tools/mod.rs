@@ -17,6 +17,7 @@ mod grep;
 mod find;
 mod ls;
 mod subagent;
+mod secret_prompt;
 
 pub mod watcher_exit;
 pub(crate) mod util;
@@ -53,6 +54,8 @@ pub use subagent_collect::SubagentCollectTool;
 pub use subagent_resume::SubagentResumeTool;
 pub use respond::RespondTool;
 pub use send_channel::SendChannelTool;
+pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::SecretPromptQueue;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -72,6 +75,7 @@ pub struct ToolCapabilities {
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
+    pub secret_prompt: Option<SecretPromptHandle>,
 }
 
 /// Configuration limits and timeouts.

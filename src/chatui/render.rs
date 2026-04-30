@@ -413,8 +413,8 @@ impl App {
                                     Style::default().fg(THEME.load().subagent_time),
                                 ),
                             ]));
-                        } else if elapsed_ms.is_none() && self.tool_start_time.is_some() {
-                            // Tool still executing — show animation
+                        } else if self.is_active_tool_result(i) {
+                            // Tool still executing — show animation only for the active result.
                             let preceding_tool_name = self.find_preceding_tool_name(i);
                             let elapsed_str = if let Some(start) = self.tool_start_time {
                                 let secs = start.elapsed().as_secs_f64();

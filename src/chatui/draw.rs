@@ -89,6 +89,7 @@ pub(crate) fn draw(
     exit_effect: &mut Option<Effect>,
     elapsed: std::time::Duration,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    secret_prompts: &synaps_cli::tools::SecretPromptQueue,
 ) -> io::Result<()> {
     let model = runtime.model();
     let thinking = runtime.thinking_level();
@@ -206,9 +207,18 @@ pub(crate) fn draw(
             .padding(Padding::horizontal(1));
         // Compute inner rect before block is consumed by Paragraph
         let msg_inner = msg_block.inner(msg_area);
-        let messages_widget = Paragraph::new(visible.clone()).block(msg_block);
+        let messages_widget = Paragraph::new(visible.clone()).block(msg_block.clone());
+        // Clear the message pane locally each frame. When a secure prompt is
+        // active, do not paint the live transcript underneath it; raw sudo
+        // prompts can otherwise appear in the chat/input area for one frame and
+        // long prompt lines can reintroduce edge overflow artifacts.
         frame.render_widget(Clear, msg_area);
-        frame.render_widget(messages_widget, msg_area);
+        if secret_prompts.is_active() {
+            let blank_messages = Paragraph::new(Vec::<Line>::new()).block(msg_block);
+            frame.render_widget(blank_messages, msg_area);
+        } else {
+            frame.render_widget(messages_widget, msg_area);
+        }
 
         // Save inner content rect (after borders + padding) so input.rs can
         // map mouse coordinates without hardcoded offsets.
@@ -699,6 +709,36 @@ pub(crate) fn draw(
         if let Some(ref mut fx) = exit_effect {
             let area = frame.area();
             fx.process(elapsed.into(), frame.buffer_mut(), area);
+        }
+
+        if let Some(prompt) = secret_prompts.active() {
+            let area = frame.area();
+            let width = area.width.min(62).max(30);
+            let height = 7u16;
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            let y = area.y + area.height.saturating_sub(height) / 2;
+            let modal_area = ratatui::layout::Rect { x, y, width, height };
+            frame.render_widget(Clear, modal_area);
+            let block = Block::default()
+                .title(Span::styled(
+                    format!(" {} ", prompt.title),
+                    Style::default().fg(THEME.load().warning_color).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(THEME.load().warning_color))
+                .style(Style::default().bg(THEME.load().bg));
+            let masked = "•".repeat(prompt.buffer.chars().count());
+            let text = vec![
+                Line::from(Span::styled(prompt.prompt.clone(), Style::default().fg(THEME.load().help_fg))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("password: ", Style::default().fg(THEME.load().muted)),
+                    Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
+                ]),
+                Line::from(Span::styled("Enter submit · Esc cancel", Style::default().fg(THEME.load().muted))),
+            ];
+            frame.render_widget(Paragraph::new(text).block(block).alignment(Alignment::Left), modal_area);
         }
 
         if let Some(ref state) = app.settings {

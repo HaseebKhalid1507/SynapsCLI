@@ -178,6 +178,7 @@ impl Tool for SubagentResumeTool {
                         vec![serde_json::json!({"role": "user", "content": task_for_stream})],
                         cancel,
                         Some(steer_rx),
+                        None,
                     ).await;
 
                     let mut tool_count = 0u32;

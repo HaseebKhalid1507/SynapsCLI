@@ -359,6 +359,7 @@ impl Runtime {
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
                                         event_queue: Some(self.event_queue.clone()),
+                                        secret_prompt: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -451,6 +452,7 @@ impl Runtime {
                                                 session_manager: Some(session_mgr_inner),
                                                 subagent_registry: Some(registry_inner),
                                                 event_queue: Some(event_queue_inner),
+                                                secret_prompt: None,
                                             },
                                             limits: crate::tools::ToolLimits {
                                                 max_tool_output: cfg_max_tool_output,
@@ -523,7 +525,7 @@ impl Runtime {
     /// Run a prompt as a cancellable stream of [`StreamEvent`]s. Convenience wrapper
     /// around [`run_stream_with_messages`] for single-turn usage.
     pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None).await
+        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None, None).await
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -534,6 +536,7 @@ impl Runtime {
         messages: Vec<Value>,
         cancel: CancellationToken,
         steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -574,7 +577,7 @@ impl Runtime {
             tx: tx.clone(), cancel, steering_rx,
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
-            session_manager, subagent_registry, event_queue,
+            session_manager, subagent_registry, event_queue, secret_prompt,
             hook_bus: self.hook_bus.clone(),
         };
 
