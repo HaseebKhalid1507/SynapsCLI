@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
+use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
 pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;

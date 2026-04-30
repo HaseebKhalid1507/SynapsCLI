@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
+use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
 pub struct SubagentResumeTool;
