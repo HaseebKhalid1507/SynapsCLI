@@ -175,7 +175,6 @@ impl ExtensionManager {
                     arg.clone()
                 }
             }).collect();
-            };
 
             let resolved = ExtensionManifest {
                 command,
