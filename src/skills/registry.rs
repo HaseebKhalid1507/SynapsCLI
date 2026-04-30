@@ -211,6 +211,7 @@ mod tests {
                 version: None,
                 description: None,
                 keybinds: vec![],
+                compatibility: None,
                 commands: vec![ManifestCommand {
                     name: name.to_string(),
                     description: Some("desc".to_string()),

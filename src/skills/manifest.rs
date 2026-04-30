@@ -5,6 +5,14 @@ use serde::Deserialize;
 use super::keybinds::ManifestKeybind;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PluginCompatibility {
+    #[serde(default)]
+    pub synaps: Option<String>,
+    #[serde(default)]
+    pub extension_protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ManifestCommand {
     pub name: String,
     #[serde(default)]
@@ -23,6 +31,8 @@ pub struct PluginManifest {
     pub description: Option<String>,
     #[serde(default)]
     pub keybinds: Vec<ManifestKeybind>,
+    #[serde(default)]
+    pub compatibility: Option<PluginCompatibility>,
     #[serde(default)]
     pub commands: Vec<ManifestCommand>,
 }
@@ -59,6 +69,7 @@ mod tests {
         assert_eq!(m.version, None);
         assert_eq!(m.description, None);
         assert!(m.commands.is_empty());
+        assert!(m.compatibility.is_none());
     }
 
     #[test]
@@ -70,12 +81,18 @@ mod tests {
             "author": {"name": "x"},
             "repository": "https://...",
             "license": "MIT",
+            "compatibility": {
+                "synaps": ">=0.1.0",
+                "extension_protocol": "1"
+            },
             "unknown_field": 42
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.name, "web-tools");
         assert_eq!(m.version.as_deref(), Some("1.0.0"));
         assert_eq!(m.description.as_deref(), Some("Web tools"));
+        assert_eq!(m.compatibility.as_ref().unwrap().synaps.as_deref(), Some(">=0.1.0"));
+        assert_eq!(m.compatibility.as_ref().unwrap().extension_protocol.as_deref(), Some("1"));
     }
 
     #[test]
