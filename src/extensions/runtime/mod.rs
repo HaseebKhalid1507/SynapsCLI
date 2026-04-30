@@ -13,6 +13,16 @@ pub enum ExtensionHealth {
     Failed,
 }
 
+impl ExtensionHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Restarting => "restarting",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Trait for extension runtimes that can handle hook events.
 #[async_trait]
 pub trait ExtensionHandler: Send + Sync {
@@ -28,5 +38,10 @@ pub trait ExtensionHandler: Send + Sync {
     /// Current health state of this handler.
     async fn health(&self) -> ExtensionHealth {
         ExtensionHealth::Healthy
+    }
+
+    /// Number of transport restarts observed by this handler.
+    async fn restart_count(&self) -> usize {
+        0
     }
 }

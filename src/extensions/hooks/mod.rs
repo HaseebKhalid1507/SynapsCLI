@@ -9,7 +9,7 @@ pub mod events;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
@@ -18,6 +18,23 @@ use crate::extensions::permissions::PermissionSet;
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn extensions_trace_enabled() -> bool {
+    std::env::var("SYNAPS_EXTENSIONS_TRACE")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn hook_result_action(result: &HookResult) -> &'static str {
+    match result {
+        HookResult::Continue => "continue",
+        HookResult::Block { .. } => "block",
+        HookResult::Inject { .. } => "inject",
+    }
+}
 
 /// A registered hook handler with its metadata.
 #[derive(Clone)]
@@ -120,11 +137,50 @@ impl HookBus {
             // Call handler with timeout
             let handler = reg.handler.clone();
             let event_clone = event.clone();
+            let trace_enabled = extensions_trace_enabled();
+            let started_at = trace_enabled.then(Instant::now);
             let result = tokio::time::timeout(
                 HANDLER_TIMEOUT,
                 handler.handle(&event_clone),
             )
             .await;
+
+            if trace_enabled {
+                let health = reg.handler.health().await;
+                let health = health.as_str();
+                let restart_count = reg.handler.restart_count().await;
+                let duration_ms = started_at
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                match &result {
+                    Ok(hook_result) => {
+                        let action = hook_result_action(hook_result);
+                        tracing::info!(
+                            extension_trace = true,
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = action,
+                            duration_ms = duration_ms,
+                            health = health,
+                            restart_count = restart_count,
+                            "Extension hook trace"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            extension_trace = true,
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "timeout",
+                            duration_ms = duration_ms,
+                            timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                            health = health,
+                            restart_count = restart_count,
+                            "Extension hook trace"
+                        );
+                    }
+                }
+            }
 
             match result {
                 Ok(HookResult::Block { reason }) => {
@@ -263,6 +319,37 @@ mod tests {
             set.grant(*p);
         }
         set
+    }
+
+    #[test]
+    fn trace_env_value_parser_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("SYNAPS_EXTENSIONS_TRACE", value);
+            assert!(extensions_trace_enabled(), "{value} should enable trace mode");
+        }
+
+        for value in ["", "0", "false", "off", "no"] {
+            std::env::set_var("SYNAPS_EXTENSIONS_TRACE", value);
+            assert!(!extensions_trace_enabled(), "{value:?} should not enable trace mode");
+        }
+        std::env::remove_var("SYNAPS_EXTENSIONS_TRACE");
+    }
+
+    #[test]
+    fn hook_result_action_names_are_stable_for_trace_logs() {
+        assert_eq!(hook_result_action(&HookResult::Continue), "continue");
+        assert_eq!(
+            hook_result_action(&HookResult::Block {
+                reason: "stop".into(),
+            }),
+            "block"
+        );
+        assert_eq!(
+            hook_result_action(&HookResult::Inject {
+                content: "context".into(),
+            }),
+            "inject"
+        );
     }
 
     #[tokio::test]

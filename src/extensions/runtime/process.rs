@@ -148,6 +148,10 @@ impl ProcessExtension {
         })
     }
 
+    pub fn restart_count(&self) -> usize {
+        self.restart_count.load(Ordering::Relaxed)
+    }
+
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
         if attempted > MAX_RESTARTS {
@@ -346,6 +350,10 @@ impl ExtensionHandler for ProcessExtension {
         if let Some(mut state) = state_guard.take() {
             let _ = state.child.kill().await;
         }
+    }
+
+    async fn restart_count(&self) -> usize {
+        self.restart_count()
     }
 
     async fn health(&self) -> ExtensionHealth {

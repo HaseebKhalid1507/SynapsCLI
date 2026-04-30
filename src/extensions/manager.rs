@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::hooks::HookBus;
 use super::manifest::ExtensionManifest;
-use super::runtime::ExtensionHandler;
+use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
 
 /// Actionable discovery/load failure for an installed plugin extension.
@@ -44,6 +44,14 @@ impl ExtensionLoadFailure {
             None => format!("{} (hint: {})", self.reason, self.hint),
         }
     }
+}
+
+/// Snapshot of a loaded extension's runtime status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStatus {
+    pub id: String,
+    pub health: ExtensionHealth,
+    pub restart_count: usize,
 }
 
 /// Manages the lifecycle of all loaded extensions.
@@ -138,6 +146,26 @@ impl ExtensionManager {
     /// Number of running extensions.
     pub fn count(&self) -> usize {
         self.extensions.len()
+    }
+
+    /// Return health snapshots for all loaded extensions, sorted by ID.
+    pub async fn statuses(&self) -> Vec<ExtensionStatus> {
+        let mut handlers: Vec<(String, Arc<dyn ExtensionHandler>)> = self
+            .extensions
+            .iter()
+            .map(|(id, handler)| (id.clone(), handler.clone()))
+            .collect();
+        handlers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut statuses = Vec::with_capacity(handlers.len());
+        for (id, handler) in handlers {
+            statuses.push(ExtensionStatus {
+                id,
+                health: handler.health().await,
+                restart_count: handler.restart_count().await,
+            });
+        }
+        statuses
     }
 
     /// Get the shared hook bus.
@@ -300,5 +328,35 @@ mod tests {
         let mut mgr = ExtensionManager::new(bus);
         let result = mgr.unload("nope").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn statuses_report_loaded_extension_health() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus);
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: crate::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string()],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![crate::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+            }],
+        };
+
+        mgr.load("status-test", &manifest).await.unwrap();
+
+        assert_eq!(
+            mgr.statuses().await,
+            vec![ExtensionStatus {
+                id: "status-test".to_string(),
+                health: ExtensionHealth::Healthy,
+                restart_count: 0,
+            }]
+        );
+
+        mgr.shutdown_all().await;
     }
 }

@@ -14,6 +14,8 @@ Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime sp
 - **stdout** — used to send responses back to the runtime
 - **stderr** — captured by SynapsCLI and emitted to debug tracing with the extension id
 
+Set `SYNAPS_EXTENSIONS_TRACE=1` (also accepts `true`, `yes`, or `on`) to emit one structured trace log for each extension hook call. Trace records include hook kind, extension id, action, duration, timeout state, health, and restart count. Trace mode intentionally does **not** log full hook params, tool inputs, or tool outputs by default.
+
 The process is started with the plugin root as its current working directory. Relative file access from your extension should therefore be written relative to the plugin directory.
 
 The protocol is **JSON-RPC 2.0** over a length-prefixed binary framing, identical in structure to the Language Server Protocol (LSP) transport. This is a deliberate choice — tooling that works with LSP servers works here too.

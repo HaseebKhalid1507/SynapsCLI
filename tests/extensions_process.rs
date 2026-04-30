@@ -67,6 +67,20 @@ async fn restart_exhaustion_marks_failed_and_fails_open() {
     }
 
     assert_eq!(process.extension.health().await, ExtensionHealth::Failed);
+    assert_eq!(process.extension.restart_count(), 4);
     assert!(matches!(process.extension.handle(&event).await, HookResult::Continue));
+    process.extension.shutdown().await;
+}
+
+#[tokio::test]
+async fn restart_count_reports_transport_restarts() {
+    let process = spawn_fixture("restart-count", "exit_before_response").await;
+
+    assert_eq!(process.extension.restart_count(), 0);
+    let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
+    let result = process.extension.handle(&event).await;
+
+    assert!(matches!(result, HookResult::Block { .. }));
+    assert_eq!(process.extension.restart_count(), 1);
     process.extension.shutdown().await;
 }
