@@ -68,3 +68,65 @@ impl Tool for WriteTool {
         Ok(format!("Wrote {} lines ({} bytes) to {}", line_count, content.len(), path.display()))
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_write_tool_schema() {
+        let tool = WriteTool;
+        assert_eq!(tool.name(), "write");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("write_tool_test.txt");
+
+        let tool = WriteTool;
+        let ctx = create_tool_context();
+
+        let content = "Hello, world!\nThis is a test file.";
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "content": content
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        // Verify success message
+        assert!(result.contains("Wrote 2 lines"));
+        assert!(result.contains("bytes"));
+
+        // Verify file was created with correct content
+        let written_content = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(written_content, content);
+
+        // Test parent directory creation
+        let nested_file = temp_dir.join("nested").join("dir").join("test.txt");
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": nested_file.to_string_lossy(),
+            "content": "nested content"
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+        assert!(result.contains("Wrote"));
+
+        let nested_content = std::fs::read_to_string(&nested_file).unwrap();
+        assert_eq!(nested_content, "nested content");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+        let _ = std::fs::remove_dir_all(temp_dir.join("nested"));
+    }
+}

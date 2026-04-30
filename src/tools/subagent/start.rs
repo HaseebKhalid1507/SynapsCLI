@@ -388,3 +388,33 @@ impl Tool for SubagentStartTool {
         }).to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::{SubagentRegistry, Tool};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn test_subagent_start_blank_agent_uses_system_prompt() {
+        let tool = SubagentStartTool;
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(Arc::new(Mutex::new(SubagentRegistry::new())));
+
+        let params = json!({
+            "agent": "",
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "claude-sonnet-4-6",
+            "timeout": 1
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+        let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(body["agent_name"], "inline");
+        assert!(body["handle_id"].as_str().unwrap_or_default().starts_with("sa_"));
+    }
+}

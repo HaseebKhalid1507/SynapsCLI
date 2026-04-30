@@ -383,3 +383,39 @@ impl Tool for SubagentTool {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_subagent_tool_schema() {
+        let tool = SubagentTool;
+        assert_eq!(tool.name(), "subagent");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_blank_agent_uses_system_prompt() {
+        let tool = SubagentTool;
+        let ctx = create_tool_context();
+        let params = json!({
+            "agent": "",
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "claude-sonnet-4-6",
+            "timeout": 1
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+    }
+}

@@ -83,3 +83,51 @@ impl Tool for GrepTool {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_grep_tool_schema() {
+        let tool = GrepTool;
+        assert_eq!(tool.name(), "grep");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_grep_tool_execution.txt");
+
+        // Write test content
+        let content = "hello world\nfoo bar\nhello again";
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = GrepTool;
+        let ctx = create_tool_context();
+
+        let params = json!({
+            "pattern": "hello",
+            "path": test_file.to_string_lossy()
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        // Should contain both matching lines with line numbers
+        assert!(result.contains("hello world"));
+        assert!(result.contains("hello again"));
+        assert!(result.contains("1:") || result.contains("hello world"));
+        assert!(result.contains("3:") || result.contains("hello again"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+}

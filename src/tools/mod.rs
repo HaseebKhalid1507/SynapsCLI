@@ -100,4 +100,4 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests;
+mod test_helpers;

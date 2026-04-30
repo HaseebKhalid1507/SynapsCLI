@@ -270,4 +270,50 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_strip_frontmatter_removes_frontmatter() {
+        let content = "---\ntitle: test\ndate: 2023-01-01\n---\nThis is the content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, "This is the content.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_without_frontmatter() {
+        let content = "This is just plain content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_only_opening_delimiter() {
+        let content = "---\ntitle: test\nno closing delimiter";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_nonexistent() {
+        let result = resolve_agent_prompt("definitely_does_not_exist_12345");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Agent 'definitely_does_not_exist_12345' not found"));
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_path_not_found() {
+        let result = resolve_agent_prompt("/nonexistent/path/agent.md");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to read agent file"));
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_blank_rejected_without_agent_lookup() {
+        let result = resolve_agent_prompt("");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Empty 'agent' parameter"));
+        assert!(!error.contains("agents/.md"));
+    }
 }
