@@ -38,6 +38,14 @@ if request is None:
 with open(state_path, "a", encoding="utf-8") as state:
     state.write(f"request:{request['method']}\n")
 
+if request.get("method") == "initialize":
+    write_response(request, {"protocol_version": 1, "capabilities": {}})
+    request = read_request()
+    if request is None:
+        sys.exit(0)
+    with open(state_path, "a", encoding="utf-8") as state:
+        state.write(f"request:{request['method']}\n")
+
 if request.get("method") == "shutdown":
     write_response(request, {"action": "continue"})
     sys.exit(0)

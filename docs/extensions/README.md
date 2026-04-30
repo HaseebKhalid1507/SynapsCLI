@@ -51,7 +51,7 @@ SynapsCLI scans both locations on startup. Any subdirectory containing a `.synap
 
 ## Plugin Structure
 
-Every extension must include a manifest at `.synaps-plugin/plugin.json`. The manifest declares metadata, the process command, requested permissions, and which hooks to subscribe to.
+Every extension must include a manifest at `.synaps-plugin/plugin.json`. The manifest declares metadata, optional compatibility metadata, the process command, requested permissions, and which hooks to subscribe to.
 
 ```json
 {

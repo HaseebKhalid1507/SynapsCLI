@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 
 use super::{ExtensionHandler, ExtensionHealth};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
 
 const MAX_RESTARTS: usize = 3;
 
@@ -42,6 +43,24 @@ struct JsonRpcError {
     #[allow(dead_code)]
     code: i64,
     message: String,
+}
+
+
+#[derive(Serialize)]
+struct InitializeParams {
+    synaps_version: &'static str,
+    extension_protocol_version: u32,
+    plugin_id: String,
+    plugin_root: Option<String>,
+    config: Value,
+}
+
+#[derive(Deserialize)]
+struct InitializeResult {
+    protocol_version: u32,
+    #[allow(dead_code)]
+    #[serde(default)]
+    capabilities: Value,
 }
 
 struct ProcessState {
@@ -152,6 +171,33 @@ impl ProcessExtension {
         self.restart_count.load(Ordering::Relaxed)
     }
 
+    pub async fn initialize(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
+        let params = InitializeParams {
+            synaps_version: env!("CARGO_PKG_VERSION"),
+            extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
+            plugin_id: self.id.clone(),
+            plugin_root: plugin_root
+                .or_else(|| self.cwd.clone())
+                .map(|path| path.to_string_lossy().to_string()),
+            config: Value::Object(Default::default()),
+        };
+        let value = self.call_no_restart("initialize", serde_json::to_value(params).map_err(|e| e.to_string())?).await?;
+        let result: InitializeResult = serde_json::from_value(value)
+            .map_err(|e| format!("Invalid initialize response from extension '{}': {}", self.id, e))?;
+        if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
+            return Err(format!(
+                "Extension '{}' initialize returned unsupported protocol_version {} (supported: {})",
+                self.id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
+            ));
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn initialize_for_test(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
+        self.initialize(plugin_root).await
+    }
+
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
         if attempted > MAX_RESTARTS {
@@ -178,6 +224,36 @@ impl ProcessExtension {
             &self.args,
             self.cwd.as_ref(),
         ).await?);
+        self.initialize_locked(state).await?;
+        Ok(())
+    }
+
+
+    async fn initialize_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        let params = InitializeParams {
+            synaps_version: env!("CARGO_PKG_VERSION"),
+            extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
+            plugin_id: self.id.clone(),
+            plugin_root: self.cwd
+                .clone()
+                .map(|path| path.to_string_lossy().to_string()),
+            config: Value::Object(Default::default()),
+        };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let value = self.call_once_locked(
+            state.as_mut().expect("state should exist for initialize"),
+            "initialize",
+            serde_json::to_value(params).map_err(|e| e.to_string())?,
+            id,
+        ).await?;
+        let result: InitializeResult = serde_json::from_value(value)
+            .map_err(|e| format!("Invalid initialize response from extension '{}': {}", self.id, e))?;
+        if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
+            return Err(format!(
+                "Extension '{}' initialize returned unsupported protocol_version {} (supported: {})",
+                self.id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
+            ));
+        }
         Ok(())
     }
 
@@ -270,6 +346,26 @@ impl ProcessExtension {
             return Err(format!("Extension error: {}", err.message));
         }
         Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    async fn call_no_restart(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _call_guard = self.call_lock.lock().await;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut state_guard = self.state.lock().await;
+        if state_guard.is_none() {
+            *state_guard = Some(Self::spawn_state(
+                &self.id,
+                &self.command,
+                &self.args,
+                self.cwd.as_ref(),
+            ).await?);
+        }
+        self.call_once_locked(
+            state_guard.as_mut().expect("state should exist"),
+            method,
+            params,
+            id,
+        ).await
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {

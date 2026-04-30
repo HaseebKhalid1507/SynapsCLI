@@ -31,7 +31,9 @@ while True:
     request = read_request()
     if request is None:
         break
-    if request.get("method") == "hook.handle":
+    if request.get("method") == "initialize":
+        write_response(request, {"protocol_version": 1, "capabilities": {}})
+    elif request.get("method") == "hook.handle":
         with open(seen_path, "w", encoding="utf-8") as seen:
             json.dump(request.get("params"), seen)
         write_response(request, {"action": "block", "reason": "installed hook fired"})

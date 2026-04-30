@@ -69,6 +69,44 @@ Both directions use the same framing. Your extension must:
 
 The runtime calls methods on your extension. Your extension does not initiate calls — it only responds.
 
+### `initialize`
+
+Sent once immediately after the process starts, before any hooks are delivered. Extensions must respond with the protocol version they support.
+
+**Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "synaps_version": "0.1.0",
+    "extension_protocol_version": 1,
+    "plugin_id": "my-plugin",
+    "plugin_root": "/path/to/my-plugin",
+    "config": {}
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocol_version": 1,
+    "capabilities": {}
+  }
+}
+```
+
+If the response protocol version is unsupported, Synaps refuses to load the extension and reports the load failure.
+
+---
+
 ### `hook.handle`
 
 Called when a registered hook fires.
@@ -272,7 +310,14 @@ def main():
 
         method = message.get("method")
 
-        if method == "hook.handle":
+        if method == "initialize":
+            write_message({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {"protocol_version": 1, "capabilities": {}}
+            })
+
+        elif method == "hook.handle":
             result = handle_hook(message["params"])
             write_message({
                 "jsonrpc": "2.0",
@@ -292,6 +337,7 @@ if __name__ == "__main__":
 
 - Reading is byte-exact based on `Content-Length`. Do not use `readline()` alone.
 - Writing uses `sys.stdout.buffer` (raw bytes), not `print()`.
+- `initialize` is handled before hooks and returns the supported protocol version.
 - `shutdown` is handled gracefully — the loop exits and the process terminates naturally.
 - No threads, no async — a simple synchronous loop is sufficient for most extensions.
 

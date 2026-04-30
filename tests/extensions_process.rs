@@ -2,6 +2,14 @@ use synaps_cli::extensions::hooks::events::{HookEvent, HookResult};
 use synaps_cli::extensions::runtime::{ExtensionHandler, ExtensionHealth};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 
+fn temp_state_path(label: &str) -> std::path::PathBuf {
+    tempfile::TempDir::keep(tempfile::tempdir().unwrap()).join(format!("{label}.log"))
+}
+
+fn before_tool_event() -> HookEvent {
+    HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}))
+}
+
 fn fixture_script() -> String {
     std::env::current_dir()
         .unwrap()
@@ -83,4 +91,53 @@ async fn restart_count_reports_transport_restarts() {
     assert!(matches!(result, HookResult::Block { .. }));
     assert_eq!(process.extension.restart_count(), 1);
     process.extension.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_extension_initializes_before_hooks() {
+    let state = temp_state_path("initialize-before-hooks");
+    let ext = ProcessExtension::spawn_with_cwd(
+        "init-test",
+        "python3",
+        &[
+            "tests/fixtures/initialize_extension.py".to_string(),
+            "ok".to_string(),
+            state.to_string_lossy().to_string(),
+        ],
+        Some(std::env::current_dir().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    ext.initialize_for_test(Some(std::env::current_dir().unwrap())).await.unwrap();
+    let result = ext.handle(&before_tool_event()).await;
+    assert!(matches!(result, HookResult::Continue));
+    ext.shutdown().await;
+
+    let log = std::fs::read_to_string(&state).unwrap();
+    assert!(log.starts_with("initialize\n"), "log was {log:?}");
+    assert!(log.contains("plugin_id=init-test"));
+    assert!(log.contains("protocol=1"));
+    assert!(log.contains("hook.handle"));
+}
+
+#[tokio::test]
+async fn process_extension_rejects_unsupported_initialize_protocol() {
+    let state = temp_state_path("initialize-bad-protocol");
+    let ext = ProcessExtension::spawn_with_cwd(
+        "bad-init",
+        "python3",
+        &[
+            "tests/fixtures/initialize_extension.py".to_string(),
+            "bad_protocol".to_string(),
+            state.to_string_lossy().to_string(),
+        ],
+        Some(std::env::current_dir().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let err = ext.initialize_for_test(Some(std::env::current_dir().unwrap())).await.unwrap_err();
+    assert!(err.contains("unsupported protocol_version 999"));
+    ext.shutdown().await;
 }

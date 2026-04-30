@@ -100,9 +100,9 @@ impl ExtensionManager {
         let subscriptions = validated.subscriptions;
 
         // Spawn the extension process only after the manifest is known-good.
-        let handler: Arc<dyn ExtensionHandler> = Arc::new(
-            ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd).await?,
-        );
+        let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
+        process.initialize(cwd.clone()).await?;
+        let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
 
         // Register hook subscriptions
         for (kind, tool_filter) in subscriptions {
@@ -355,7 +355,7 @@ mod tests {
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
-            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string()],
+            args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-status-test.log".to_string()],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
                 hook: "before_tool_call".to_string(),
