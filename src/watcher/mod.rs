@@ -247,15 +247,23 @@ pub async fn run(command: String, args: Vec<String>) {
                     Err(_) => {
                         log(&format!("[{}] agent didn't exit within 30s, killing", name));
                         let _ = child.kill().await;
-                        0 // Assume clean if it ran the full session
+                        // Reap the killed process to avoid zombie
+                        let reap_status = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            child.wait()
+                        ).await;
+                        match reap_status {
+                            Ok(Ok(s)) => s.code().unwrap_or(137), // killed
+                            _ => 137 // SIGKILL exit code
+                        }
                     }
                 };
 
                 let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
                 log(&format!("[{}] exited with code {}", name, code));
-                if code == 0 && agent.config.hooks.notify_inbox {
+                if agent.config.hooks.notify_inbox {
                     log(&format!("[{}] notify_inbox hook firing", name));
-                    supervisor::notify_inbox_completion(name, 1, elapsed, code);
+                    supervisor::notify_inbox_completion(name, agent.session_count, elapsed, code);
                 }
                 std::process::exit(code);
             }
