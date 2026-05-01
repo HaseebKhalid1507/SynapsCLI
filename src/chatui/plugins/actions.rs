@@ -15,6 +15,7 @@ use synaps_cli::skills::{
         derive_git_clone_url, fetch_manifest, fetch_marketplace, is_safe_plugin_name, is_trusted,
         trust_host_for_source,
     },
+    plugin_index::PluginIndexEntry,
     reload_registry,
     registry::CommandRegistry,
     state::{InstalledPlugin, Marketplace, PluginsState},
@@ -180,6 +181,57 @@ pub(crate) async fn apply_install(
     run_install_flow(
         state, plugin_name, effective_source, subdir, Some(marketplace_name),
         registry, config,
+    ).await;
+}
+
+pub(crate) async fn apply_install_from_index_entry(
+    state: &mut PluginsModalState,
+    marketplace_name: String,
+    entry: PluginIndexEntry,
+    registry: &Arc<CommandRegistry>,
+    config: &synaps_cli::SynapsConfig,
+) {
+    let summary = vec![
+        format!("index plugin: {} {}", entry.id, entry.version),
+        format!("repository: {}", entry.repository),
+        format!("checksum: {}:{}", entry.checksum.algorithm, entry.checksum.value),
+        format!("executable extension: {}", if entry.capabilities.has_extension { "yes" } else { "no" }),
+        format!("permissions: {}", if entry.capabilities.permissions.is_empty() { "none".to_string() } else { entry.capabilities.permissions.join(", ") }),
+        format!("hooks: {}", if entry.capabilities.hooks.is_empty() { "none".to_string() } else { entry.capabilities.hooks.join(", ") }),
+        "fetched plugin manifest will be re-inspected before final install".to_string(),
+    ];
+    let host = match trust_host_for_source(&entry.repository) {
+        Ok(h) => h,
+        Err(e) => {
+            state.row_error = Some(e);
+            return;
+        }
+    };
+    if !is_trusted(&entry.repository, &state.file.trusted_hosts) {
+        state.mode = RightMode::TrustPrompt {
+            plugin_name: entry.id,
+            host,
+            pending_source: entry.repository,
+            summary,
+        };
+        return;
+    }
+    let install_source = state
+        .file
+        .marketplaces
+        .iter()
+        .find(|m| m.name == marketplace_name)
+        .and_then(|m| m.cached_plugins.iter().find(|p| p.name == entry.id))
+        .map(|p| p.source.clone())
+        .unwrap_or_else(|| entry.repository.clone());
+    run_install_flow(
+        state,
+        entry.id,
+        install_source,
+        entry.subdir,
+        Some(marketplace_name),
+        registry,
+        config,
     ).await;
 }
 
@@ -726,6 +778,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use synaps_cli::skills::registry::CommandRegistry;
     use synaps_cli::skills::state::{CachedPlugin, Marketplace, PluginsState};
+    use synaps_cli::skills::plugin_index::{
+        PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
+    };
 
     static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -821,6 +876,93 @@ mod tests {
             installed: vec![],
             trusted_hosts: vec!["example.invalid/owner".into()],
         })
+    }
+
+    fn index_entry(repository: String) -> PluginIndexEntry {
+        PluginIndexEntry {
+            id: "policy-test".into(),
+            name: "policy-test".into(),
+            version: "0.1.0".into(),
+            description: "fixture".into(),
+            repository,
+            subdir: None,
+            license: None,
+            categories: vec![],
+            keywords: vec![],
+            checksum: PluginIndexChecksum {
+                algorithm: "sha256".into(),
+                value: "abc123".into(),
+            },
+            compatibility: PluginIndexCompatibility {
+                synaps: Some(">=0.1.0".into()),
+                extension_protocol: Some("1".into()),
+            },
+            capabilities: PluginIndexCapabilities {
+                skills: vec![],
+                has_extension: true,
+                permissions: vec!["tools.intercept".into()],
+                hooks: vec!["before_tool_call".into()],
+                commands: vec![],
+            },
+            trust: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_from_index_entry_uses_pending_install_and_reinspects_manifest() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        let (_repo_tmp, bare) = fixture_plugin_repo();
+        let source = format!("file://{}", bare.display());
+        let repository = "https://example.invalid/owner/policy-test.git".to_string();
+        let mut state = PluginsModalState::new(PluginsState {
+            marketplaces: vec![Marketplace {
+                name: "local-index".into(),
+                url: "file:///tmp/plugin-index.json".into(),
+                description: None,
+                last_refreshed: None,
+                cached_plugins: vec![CachedPlugin {
+                    name: "policy-test".into(),
+                    source: source.clone(),
+                    version: Some("0.1.0".into()),
+                    description: Some("fixture".into()),
+                }],
+                repo_url: None,
+            }],
+            installed: vec![],
+            trusted_hosts: vec!["example.invalid/owner".into()],
+        });
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let config = synaps_cli::SynapsConfig::default();
+
+        apply_install_from_index_entry(
+            &mut state,
+            "local-index".into(),
+            PluginIndexEntry {
+                repository: repository.clone(),
+                ..index_entry(source.clone())
+            },
+            &registry,
+            &config,
+        )
+        .await;
+
+        let RightMode::PendingInstallConfirm {
+            source_url,
+            marketplace_name,
+            summary,
+            temp_dir,
+            final_dir,
+            ..
+        } = &state.mode else {
+            panic!("expected pending install confirmation, got {:?}", state.mode);
+        };
+        assert_eq!(source_url, &source);
+        assert_eq!(marketplace_name.as_deref(), Some("local-index"));
+        assert!(summary.iter().any(|line| line == "executable extension: yes"));
+        assert!(temp_dir.exists());
+        assert!(!final_dir.exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
