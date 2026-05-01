@@ -128,12 +128,44 @@ pub async fn try_route(
             // built-in routing — instead return a clear routing error.
             let trust = crate::extensions::trust::load_trust_state().unwrap_or_default();
             if !crate::extensions::trust::is_provider_enabled(&trust, &provider_runtime_id) {
+                let _ = crate::extensions::audit::append_audit_entry(
+                    &crate::extensions::audit::new_audit_entry(
+                        plugin_id,
+                        provider_id,
+                        model_id,
+                        false,
+                        0,
+                        false,
+                        "blocked",
+                        Some("trust_disabled".to_string()),
+                    ),
+                );
                 return Some(Err(format!(
                     "Provider '{}' is disabled by user trust settings",
                     provider_runtime_id
                 ).into()));
             }
+            // Audit metadata captured up-front so each terminal branch can record an entry.
+            let audit_plugin = plugin_id.to_string();
+            let audit_provider = provider_id.to_string();
+            let audit_model = model_id.to_string();
+            let tools_exposed = !tools_schema.is_empty();
+            let emit_audit = |streamed: bool, outcome: &str, error_class: Option<&str>, tools_requested: u32| {
+                let _ = crate::extensions::audit::append_audit_entry(
+                    &crate::extensions::audit::new_audit_entry(
+                        audit_plugin.clone(),
+                        audit_provider.clone(),
+                        audit_model.clone(),
+                        tools_exposed,
+                        tools_requested,
+                        streamed,
+                        outcome,
+                        error_class.map(|s| s.to_string()),
+                    ),
+                );
+            };
             if cancel.is_cancelled() {
+                emit_audit(false, "error", Some("canceled"), 0);
                 return Some(Err("operation canceled".into()));
             }
             let params = crate::extensions::runtime::process::ProviderCompleteParams {
@@ -174,21 +206,33 @@ pub async fn try_route(
                     biased;
                     _ = cancel.cancelled() => {
                         forwarder.abort();
+                        emit_audit(true, "error", Some("canceled"), 0);
                         return Some(Err("operation canceled".into()));
                     }
                     res = stream_fut => res,
                 };
                 let _ = forwarder.await;
                 if cancel.is_cancelled() {
+                    emit_audit(true, "error", Some("canceled"), 0);
                     return Some(Err("operation canceled".into()));
                 }
-                return Some(result.map(|complete| {
-                    serde_json::json!({
-                        "content": complete.content,
-                        "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-                        "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
-                    })
-                }).map_err(|e| format!("extension provider: {e}").into()));
+                // TODO(audit): tools_requested is reported as 0 for the streaming
+                // path until ProviderStreamEvent::ToolUse is wired through the
+                // forwarder; tool-use over streaming is not yet routed.
+                match result {
+                    Ok(complete) => {
+                        emit_audit(true, "ok", None, 0);
+                        return Some(Ok(serde_json::json!({
+                            "content": complete.content,
+                            "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                            "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
+                        })));
+                    }
+                    Err(e) => {
+                        emit_audit(true, "error", Some("provider_error"), 0);
+                        return Some(Err(format!("extension provider: {e}").into()));
+                    }
+                }
             }
             let result = if let Some(tools) = tools_shared {
                 let registry = tools.read().await;
@@ -224,26 +268,38 @@ pub async fn try_route(
                 handler.provider_complete(params).await
             };
             if cancel.is_cancelled() {
+                emit_audit(false, "error", Some("canceled"), 0);
                 return Some(Err("operation canceled".into()));
             }
-            return Some(result.map(|complete| {
-                let text = complete
-                    .content
-                    .iter()
-                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                        crate::runtime::types::LlmEvent::Text(text)
-                    ));
+            // TODO(audit): tools_requested is reported as 0 here; the
+            // complete_provider_with_tools helper does not yet expose its
+            // observed tool-use iteration count. Wire that through when the
+            // helper grows a return-tuple or counter argument.
+            match result {
+                Ok(complete) => {
+                    let text = complete
+                        .content
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !text.is_empty() {
+                        let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                            crate::runtime::types::LlmEvent::Text(text)
+                        ));
+                    }
+                    emit_audit(false, "ok", None, 0);
+                    return Some(Ok(serde_json::json!({
+                        "content": complete.content,
+                        "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                        "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
+                    })));
                 }
-                serde_json::json!({
-                    "content": complete.content,
-                    "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-                    "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
-                })
-            }).map_err(|e| format!("extension provider: {e}").into()));
+                Err(e) => {
+                    emit_audit(false, "error", Some("provider_error"), 0);
+                    return Some(Err(format!("extension provider: {e}").into()));
+                }
+            }
         }
         return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
     }

@@ -1031,3 +1031,95 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
     manager.shutdown_all().await;
     std::env::set_current_dir(previous_cwd).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_log_records_disabled_route() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    fs::write(
+        home.path().join("config"),
+        "extension.audit-disabled-test.prefix = echo\n",
+    )
+    .unwrap();
+
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/provider_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(hook_bus)));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
+
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["providers.register".to_string()],
+        hooks: vec![],
+        config: vec![ExtensionConfigEntry {
+            key: "prefix".to_string(),
+            description: None,
+            required: true,
+            default: None,
+            secret_env: None,
+        }],
+    };
+    manager
+        .write()
+        .await
+        .load_with_cwd(
+            "audit-disabled-test",
+            &manifest,
+            Some(plugin_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+
+    // Disable the provider via persisted trust state.
+    let mut trust = synaps_cli::extensions::trust::ProviderTrustState::default();
+    synaps_cli::extensions::trust::disable_provider(
+        &mut trust,
+        "audit-disabled-test:echo",
+        Some("user disabled".into()),
+    );
+    synaps_cli::extensions::trust::save_trust_state(&trust).expect("save trust state");
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let tools = std::sync::Arc::new(Vec::new());
+    let result = synaps_cli::runtime::openai::try_route(
+        "audit-disabled-test:echo:echo-small",
+        &reqwest::Client::new(),
+        &tools,
+        &None,
+        &[serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]})],
+        &tx,
+        None,
+        None,
+        0,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("route returned Some");
+
+    assert!(result.is_err(), "disabled provider should return Err");
+
+    let entries = synaps_cli::extensions::audit::read_audit_entries()
+        .expect("read audit entries");
+    assert_eq!(entries.len(), 1, "expected exactly one audit entry, got {entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry.outcome, "blocked");
+    assert_eq!(entry.error_class.as_deref(), Some("trust_disabled"));
+    assert_eq!(entry.plugin_id, "audit-disabled-test");
+    assert_eq!(entry.provider_id, "echo");
+    assert_eq!(entry.model_id, "echo-small");
+    assert!(!entry.tools_exposed);
+    assert_eq!(entry.tools_requested, 0);
+    assert!(!entry.streamed);
+
+    manager.write().await.shutdown_all().await;
+    synaps_cli::runtime::openai::clear_extension_manager_for_routing();
+}
