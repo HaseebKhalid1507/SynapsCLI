@@ -127,6 +127,7 @@ impl Tool for SubagentStartTool {
         let start_time       = std::time::Instant::now();
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
+        let system_prompt_for_handle = system_prompt.clone();
         let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -362,6 +363,7 @@ impl Tool for SubagentStartTool {
             label.clone(),
             task_preview,
             model,
+            system_prompt_for_handle,
             timeout_secs,
             state,
             Some(steer_tx),

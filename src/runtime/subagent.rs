@@ -60,6 +60,7 @@ pub struct SubagentHandle {
     pub agent_name: String,
     pub task_preview: String,
     pub model: String,
+    pub system_prompt: String,
     pub started_at: std::time::Instant,
     pub timeout_secs: u64,
 
@@ -95,6 +96,7 @@ impl SubagentHandle {
         agent_name: String,
         task_preview: String,
         model: String,
+        system_prompt: String,
         timeout_secs: u64,
         state: Arc<RwLock<SubagentState>>,
         steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -106,6 +108,7 @@ impl SubagentHandle {
             agent_name,
             task_preview,
             model,
+            system_prompt,
             started_at: std::time::Instant::now(),
             timeout_secs,
             state,

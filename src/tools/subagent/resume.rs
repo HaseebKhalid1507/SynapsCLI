@@ -61,7 +61,7 @@ impl Tool for SubagentResumeTool {
             ))?;
 
         // Extract prior state under the lock, release immediately.
-        let (agent_name, model, prior_context) = {
+        let (agent_name, model, prior_context, prior_system_prompt, prior_timeout) = {
             let reg = registry.lock().unwrap();
             let handle = reg.get(&prior_handle_id)
                 .ok_or_else(|| RuntimeError::Tool(
@@ -85,7 +85,7 @@ impl Tool for SubagentResumeTool {
                 }
             };
 
-            (handle.agent_name.clone(), handle.model.clone(), prior)
+            (handle.agent_name.clone(), handle.model.clone(), prior, handle.system_prompt.clone(), handle.timeout_secs)
         };
 
         // ── Build resumed task: new instructions → separator → prior context.
@@ -96,12 +96,10 @@ impl Tool for SubagentResumeTool {
              {prior_context}"
         );
 
-        let system_prompt = "You are continuing a task that was interrupted. \
-                             The prior conversation context is included in your task. \
-                             Pick up where the previous agent left off.".to_string();
-
+        // Restore the original system prompt and timeout from the prior handle
+        let system_prompt = prior_system_prompt;
+        let timeout_secs = prior_timeout;
         let label = agent_name.clone();
-        let timeout_secs = ctx.limits.subagent_timeout;
         let task_preview: String = resumed_task.chars().take(80).collect();
         let task_full = resumed_task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -133,6 +131,7 @@ impl Tool for SubagentResumeTool {
         let tx_events_inner = ctx.channels.tx_events.clone();
         let start_time      = std::time::Instant::now();
 
+        let system_prompt_for_handle = system_prompt.clone();
         let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -370,6 +369,7 @@ impl Tool for SubagentResumeTool {
             label.clone(),
             task_preview,
             model,
+            system_prompt_for_handle,
             timeout_secs,
             state,
             Some(steer_tx),
