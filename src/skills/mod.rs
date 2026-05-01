@@ -97,6 +97,18 @@ pub async fn register(
         kb_registry.register_user(&config.keybinds);
     }
 
+    // Synthesize a user keybind for the configured voice toggle key,
+    // so the /voice toggle command also fires on the user-selected
+    // chord (the plugin's F8 default keeps working alongside it).
+    if let Some(toggle_key) = crate::config::read_config_value("voice_toggle_key") {
+        let trimmed = toggle_key.trim();
+        if !trimmed.is_empty() {
+            let mut overrides = std::collections::HashMap::new();
+            overrides.insert(trimmed.to_string(), "/voice toggle".to_string());
+            kb_registry.register_user(&overrides);
+        }
+    }
+
     let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));

@@ -12,6 +12,7 @@ pub(crate) enum Category {
     ToolLimits,
     Appearance,
     Plugins,
+    Voice,
 }
 
 impl Category {
@@ -23,17 +24,19 @@ impl Category {
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
             Category::Plugins => "Plugins",
+            Category::Voice => "Voice",
         }
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 6] = [
+pub(crate) const CATEGORIES: [Category; 7] = [
     Category::Model,
     Category::Providers,
     Category::Agent,
     Category::ToolLimits,
     Category::Appearance,
     Category::Plugins,
+    Category::Voice,
 ];
 
 pub(crate) enum EditorKind {
@@ -77,5 +80,30 @@ mod tests {
     #[test]
     fn plugins_category_label() {
         assert_eq!(Category::Plugins.label(), "Plugins");
+    }
+
+    #[test]
+    fn voice_category_is_present() {
+        assert!(CATEGORIES.contains(&Category::Voice));
+    }
+
+    #[test]
+    fn voice_category_label() {
+        assert_eq!(Category::Voice.label(), "Voice");
+    }
+
+    #[test]
+    fn voice_settings_belong_to_voice_category() {
+        let voice_keys = ["voice_toggle_key", "voice_language"];
+        for def in ALL_SETTINGS {
+            if voice_keys.contains(&def.key) {
+                assert_eq!(def.category, Category::Voice, "setting '{}' should be in Voice", def.key);
+            }
+        }
+        // Both keys must exist.
+        let keys: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
+        for k in voice_keys {
+            assert!(keys.contains(&k), "missing voice setting: {}", k);
+        }
     }
 }

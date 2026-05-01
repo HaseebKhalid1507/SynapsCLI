@@ -122,4 +122,14 @@ define_settings! {
     theme, "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
+
+    voice_toggle_key, "Voice toggle key", Voice,
+        EditorKind::Cycler(&["F8", "C-V", "C-S-V", "C-A-V"]),
+        "Keybind that toggles voice dictation. Takes effect on next launch.",
+        |_runtime, _app, _value| { /* picked up by KeybindRegistry at boot */ };
+
+    voice_language, "Voice language hint", Voice,
+        EditorKind::Text { numeric: false },
+        "Optional language code (e.g. 'en') sent to the voice sidecar Init handshake.",
+        |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default */ };
 }

@@ -51,12 +51,16 @@ impl VoiceUiState {
             ));
         }
 
+        let language = synaps_cli::config::read_config_value("voice_language")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let manager = VoiceManager::spawn(
             &sidecar.binary,
             &[],
             SidecarConfig {
                 mode: VoiceSidecarMode::Dictation,
-                language: None,
+                language,
                 protocol_version: VOICE_SIDECAR_PROTOCOL_VERSION,
             },
         )
