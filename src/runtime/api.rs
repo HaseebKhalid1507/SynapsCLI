@@ -229,21 +229,22 @@ impl ApiMethods {
         let mut current_thinking_signature = String::new();
         let mut in_thinking = false;
 
-        // SSE can split across chunk boundaries, so buffer partial lines
-        let mut line_buffer = String::new();
+        // SSE can split across chunk boundaries, so buffer raw bytes
+        // to avoid UTF-8 corruption from lossy conversion at chunk edges
+        let mut byte_buffer: Vec<u8> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
                 break;
             }
             let chunk = chunk?;
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            line_buffer.push_str(&chunk_str);
+            byte_buffer.extend_from_slice(&chunk);
 
-            // Process complete lines from the buffer
-            while let Some(newline_pos) = line_buffer.find('\n') {
-                let line = line_buffer[..newline_pos].trim_end().to_string();
-                line_buffer.drain(..newline_pos + 1);
+            // Process complete lines (delimited by \n) from the byte buffer
+            while let Some(newline_pos) = byte_buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes = byte_buffer[..newline_pos].to_vec();
+                byte_buffer.drain(..newline_pos + 1);
+                let line = String::from_utf8_lossy(&line_bytes).trim_end().to_string();
 
                 if !line.starts_with("data: ") {
                     continue;
@@ -413,8 +414,8 @@ impl ApiMethods {
             }
         }
 
-        // Process any remaining data in line_buffer (final line without trailing newline)
-        let remaining = line_buffer.trim().to_string();
+        // Process any remaining data in byte_buffer (final line without trailing newline)
+        let remaining = String::from_utf8_lossy(&byte_buffer).trim().to_string();
         if let Some(data_part) = remaining.strip_prefix("data: ") {
             if data_part.trim() != "[DONE]" {
                 if let Ok(event) = serde_json::from_str::<Value>(data_part) {
