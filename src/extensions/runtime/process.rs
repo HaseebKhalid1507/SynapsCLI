@@ -90,8 +90,16 @@ impl ProcessExtension {
     /// Stderr of the child process is discarded (redirect it yourself before
     /// calling this if you need to capture it).
     pub async fn spawn(id: &str, command: &str, args: &[String]) -> Result<Self, String> {
+        // Allowlist of safe environment variables — strip API keys and secrets
+        let safe_env_keys = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR", "XDG_RUNTIME_DIR"];
+        let safe_env: Vec<(String, String)> = safe_env_keys.iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+            .collect();
+
         let mut child = Command::new(command)
             .args(args)
+            .env_clear()
+            .envs(safe_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
