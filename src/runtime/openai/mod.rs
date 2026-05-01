@@ -15,10 +15,11 @@ pub mod translate;
 pub mod stream;
 pub mod ping;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::extensions::manager::ExtensionManager;
 use crate::extensions::providers::ProviderRegistry;
+use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
 pub use types::{
     ChatMessage, ChatOptions, ChatRequest, FunctionCall, FunctionDefinition,
@@ -26,14 +27,21 @@ pub use types::{
 };
 pub use wire::StreamDecoder;
 
-static EXTENSION_MANAGER: OnceLock<Arc<tokio::sync::RwLock<ExtensionManager>>> = OnceLock::new();
+static EXTENSION_MANAGER: std::sync::RwLock<Option<Arc<tokio::sync::RwLock<ExtensionManager>>>> = std::sync::RwLock::new(None);
 
 pub fn set_extension_manager_for_routing(manager: Arc<tokio::sync::RwLock<ExtensionManager>>) {
-    let _ = EXTENSION_MANAGER.set(manager);
+    *EXTENSION_MANAGER.write().expect("extension manager routing lock poisoned") = Some(manager);
+}
+
+pub fn clear_extension_manager_for_routing() {
+    *EXTENSION_MANAGER.write().expect("extension manager routing lock poisoned") = None;
 }
 
 pub fn extension_manager_for_routing() -> Option<Arc<tokio::sync::RwLock<ExtensionManager>>> {
-    EXTENSION_MANAGER.get().cloned()
+    EXTENSION_MANAGER
+        .read()
+        .expect("extension manager routing lock poisoned")
+        .clone()
 }
 
 /// Routing decision for a given model id.
@@ -95,48 +103,85 @@ pub async fn try_route(
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
-            let manager = manager.read().await;
             let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
-            if let Some(provider) = manager.provider(&provider_runtime_id) {
-                if let Some(handler) = &provider.handler {
-                    if cancel.is_cancelled() {
-                        return Some(Err("operation canceled".into()));
-                    }
-                    let params = crate::extensions::runtime::process::ProviderCompleteParams {
-                        provider_id: provider_id.to_string(),
-                        model_id: model_id.to_string(),
-                        model: model.to_string(),
-                        messages: messages.to_vec(),
-                        system_prompt: system_prompt.clone(),
-                        tools: tools_schema.as_ref().clone(),
-                        temperature,
-                        max_tokens,
-                        thinking_budget,
-                    };
-                    let result = handler.provider_complete(params).await;
-                    if cancel.is_cancelled() {
-                        return Some(Err("operation canceled".into()));
-                    }
-                    return Some(result.map(|complete| {
-                        let text = complete
-                            .content
-                            .iter()
-                            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                                crate::runtime::types::LlmEvent::Text(text)
-                            ));
-                        }
-                        serde_json::json!({
-                            "content": complete.content,
-                            "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-                            "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
-                        })
-                    }).map_err(|e| format!("extension provider: {e}").into()));
-                }
+            let Some((handler, hook_bus, tools_shared)) = ({
+                let manager = manager.read().await;
+                manager.provider(&provider_runtime_id).and_then(|provider| {
+                    provider.handler.as_ref().map(|handler| {
+                        (handler.clone(), manager.hook_bus().clone(), manager.tools_shared())
+                    })
+                })
+            }) else {
+                return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
+            };
+            if cancel.is_cancelled() {
+                return Some(Err("operation canceled".into()));
             }
+            let params = crate::extensions::runtime::process::ProviderCompleteParams {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+                model: model.to_string(),
+                messages: messages.to_vec(),
+                system_prompt: system_prompt.clone(),
+                tools: tools_schema.as_ref().clone(),
+                temperature,
+                max_tokens,
+                thinking_budget,
+            };
+            let result = if let Some(tools) = tools_shared {
+                let registry = tools.read().await;
+                crate::extensions::runtime::process::complete_provider_with_tools(
+                    handler.clone(),
+                    params,
+                    &registry,
+                    &hook_bus,
+                    || ToolContext {
+                        channels: ToolChannels {
+                            tx_delta: None,
+                            tx_events: None,
+                        },
+                        capabilities: ToolCapabilities {
+                            watcher_exit_path: None,
+                            tool_register_tx: None,
+                            session_manager: None,
+                            subagent_registry: None,
+                            event_queue: None,
+                            secret_prompt: None,
+                        },
+                        limits: ToolLimits {
+                            max_tool_output: 30000,
+                            bash_timeout: 30,
+                            bash_max_timeout: 300,
+                            subagent_timeout: 300,
+                        },
+                    },
+                    30000,
+                    8,
+                ).await
+            } else {
+                handler.provider_complete(params).await
+            };
+            if cancel.is_cancelled() {
+                return Some(Err("operation canceled".into()));
+            }
+            return Some(result.map(|complete| {
+                let text = complete
+                    .content
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                        crate::runtime::types::LlmEvent::Text(text)
+                    ));
+                }
+                serde_json::json!({
+                    "content": complete.content,
+                    "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                    "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
+                })
+            }).map_err(|e| format!("extension provider: {e}").into()));
         }
         return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
     }
@@ -182,5 +227,21 @@ mod tests {
             }
             other => panic!("expected Codex route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_extension_manager_for_routing_overwrites_previous_manager() {
+        clear_extension_manager_for_routing();
+        let first = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(crate::extensions::hooks::HookBus::new()))));
+        let second = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(crate::extensions::hooks::HookBus::new()))));
+
+        set_extension_manager_for_routing(first.clone());
+        assert!(Arc::ptr_eq(&extension_manager_for_routing().unwrap(), &first));
+
+        set_extension_manager_for_routing(second.clone());
+        assert!(Arc::ptr_eq(&extension_manager_for_routing().unwrap(), &second));
+
+        clear_extension_manager_for_routing();
+        assert!(extension_manager_for_routing().is_none());
     }
 }

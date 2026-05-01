@@ -313,7 +313,11 @@ fn build_sections_from_parts(
                         &provider.provider_id,
                         &model.id,
                     );
-                    let label = model.display_name.clone().unwrap_or_else(|| model.id.clone());
+                    let label = if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        format!("{} [tool-use]", model.display_name.clone().unwrap_or_else(|| model.id.clone()))
+                    } else {
+                        model.display_name.clone().unwrap_or_else(|| model.id.clone())
+                    };
                     ModelEntry {
                         id: runtime_id.clone(),
                         display_id: model.id.clone(),

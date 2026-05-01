@@ -13,10 +13,18 @@ pub struct RegisteredProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredProviderModelSummary {
+    pub runtime_id: String,
+    pub display_name: Option<String>,
+    pub tool_use: bool,
+    pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredProviderSummary {
     pub runtime_id: String,
     pub display_name: String,
-    pub models: Vec<String>,
+    pub models: Vec<RegisteredProviderModelSummary>,
 }
 
 #[derive(Default)]
@@ -104,7 +112,12 @@ impl ProviderRegistry {
                     .spec
                     .models
                     .iter()
-                    .map(|model| Self::model_runtime_id(&provider.plugin_id, &provider.provider_id, &model.id))
+                    .map(|model| RegisteredProviderModelSummary {
+                        runtime_id: Self::model_runtime_id(&provider.plugin_id, &provider.provider_id, &model.id),
+                        display_name: model.display_name.clone(),
+                        tool_use: model.capabilities.get("tool_use").and_then(|v| v.as_bool()).unwrap_or(false),
+                        context_window: model.context_window,
+                    })
                     .collect(),
             })
             .collect()
@@ -123,6 +136,28 @@ mod tests {
             models: vec![],
             config_schema: None,
         }
+    }
+
+    #[test]
+    fn summaries_include_model_tool_use_capability_and_context_metadata() {
+        let mut spec = spec("local");
+        spec.models = vec![crate::extensions::runtime::process::RegisteredProviderModelSpec {
+            id: "model-a".to_string(),
+            display_name: Some("Model A".to_string()),
+            capabilities: serde_json::json!({"tool_use": true}),
+            context_window: Some(8192),
+        }];
+        let mut registry = ProviderRegistry::new();
+        registry.register("plugin", spec).unwrap();
+
+        let summaries = registry.summaries();
+
+        assert_eq!(summaries[0].models, vec![RegisteredProviderModelSummary {
+            runtime_id: "plugin:local:model-a".to_string(),
+            display_name: Some("Model A".to_string()),
+            tool_use: true,
+            context_window: Some(8192),
+        }]);
     }
 
     #[test]

@@ -158,9 +158,9 @@ pub async fn execute_provider_tool_use(
     };
 
     let input_for_hook = input.clone();
-    let result = match tool.execute(input, ctx).await {
-        Ok(output) => output,
-        Err(error) => format!("Tool execution failed: {}", error),
+    let (result, is_error) = match tool.execute(input, ctx).await {
+        Ok(output) => (output, false),
+        Err(error) => (format!("Tool execution failed: {}", error), true),
     };
     let _ = crate::runtime::emit_after_tool_call(
         hook_bus,
@@ -170,11 +170,15 @@ pub async fn execute_provider_tool_use(
         result.clone(),
     ).await;
 
-    serde_json::json!({
+    let mut response = serde_json::json!({
         "type": "tool_result",
         "tool_use_id": tool_id,
         "content": crate::truncate_str(&result, max_tool_output).to_string(),
-    })
+    });
+    if is_error {
+        response["is_error"] = serde_json::json!(true);
+    }
+    response
 }
 
 pub async fn complete_provider_with_tools<F>(

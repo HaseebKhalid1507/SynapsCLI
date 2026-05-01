@@ -740,7 +740,12 @@ pub async fn run(
                                                         provider.display_name
                                                     )));
                                                     for model in &provider.models {
-                                                        app.push_msg(ChatMessage::System(format!("      model {}", model)));
+                                                        let label = if model.tool_use {
+                                                            format!("{} [tool-use]", model.runtime_id)
+                                                        } else {
+                                                            model.runtime_id.clone()
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!("      model {}", label)));
                                                     }
                                                 }
                                             }
@@ -907,6 +912,9 @@ pub async fn run(
                                                         } else {
                                                             format!("{context} ctx")
                                                         });
+                                                    }
+                                                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
+                                                        metadata.push("tool-use".to_string());
                                                     }
                                                     models::ExpandedModelEntry::with_metadata(
                                                         full_id,

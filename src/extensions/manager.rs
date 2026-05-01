@@ -376,6 +376,11 @@ impl ExtensionManager {
         &self.hook_bus
     }
 
+    /// Get the shared tool registry, when this manager was constructed with one.
+    pub fn tools_shared(&self) -> Option<Arc<tokio::sync::RwLock<crate::ToolRegistry>>> {
+        self.tools.clone()
+    }
+
     /// Discover and load all extensions from the user and project plugin directories.
     ///
     /// Scans `~/.synaps-cli/plugins/*/.synaps-plugin/plugin.json` and

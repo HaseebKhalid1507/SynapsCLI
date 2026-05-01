@@ -1,184 +1,106 @@
-# Extension-provided model providers
+# Extension Providers
 
-Status: Phase N implementation spec
+Extension providers let plugins register model backends that Synaps routes through the core runtime. Providers are discovered during extension `initialize` and are addressed as:
 
-## Objective
-
-Enable installed Synaps plugins to provide local-first model providers through standalone process extensions. A provider extension registers provider/model metadata during `initialize`; Synaps exposes those models in `/models`; when the selected model is an extension model, chat requests route to the extension over JSON-RPC instead of built-in Anthropic/OpenAI-compatible providers.
-
-Success criteria:
-
-- Provider IDs are runtime-namespaced as `plugin-id:provider-id`.
-- Model IDs are runtime-namespaced as `plugin-id:provider-id:model-id`.
-- Registration remains permission-gated by `providers.register`.
-- Non-streaming provider completion is implemented first and adapted to Synaps `StreamEvent` output.
-- Streaming is explicitly specified in the contract but may return a clear unsupported error unless a later phase wires notifications.
-- Missing required provider config blocks extension load before provider registration.
-- `plugin inspect --config` surfaces provider capability/config metadata.
-- An example `echo-provider-plugin` demonstrates the full path without network access.
-
-## Commands
-
-SynapsCLI verification:
-
-```bash
-cargo test --lib extensions
-cargo test --lib runtime::openai
-cargo test --bin synaps chatui::models
-cargo test --test extensions_e2e
+```text
+<plugin_id>:<provider_id>:<model_id>
 ```
 
-Plugin builder verification:
+## Registration metadata
 
-```bash
-bash plugin-builder-plugin/scripts/test.sh
-```
-
-Example plugin smoke check:
-
-```bash
-SYNAPS_BASE_DIR=$(mktemp -d) bash plugin-builder-plugin/scripts/test.sh
-```
-
-## Project structure
-
-SynapsCLI:
-
-- `docs/specs/extension-providers.md` — this spec.
-- `docs/extensions/contract.json` — protocol/contract source of truth updates.
-- `src/extensions/runtime/process.rs` — JSON-RPC provider method calls.
-- `src/extensions/runtime/mod.rs` — `ExtensionHandler` provider API.
-- `src/extensions/providers.rs` — provider/model registry helpers.
-- `src/extensions/manager.rs` — config validation, routing access to handlers.
-- `src/runtime/openai/mod.rs` — route extension provider models before built-ins.
-- `src/chatui/models/mod.rs` — include extension models in model picker.
-- `tests/extensions_e2e.rs` — process fixture provider tests.
-
-synaps-skills:
-
-- `plugin-builder-plugin/contracts/extensions.json` — mirrored contract.
-- `plugin-builder-plugin/lib/inspect.sh` — provider metadata/config display.
-- `echo-provider-plugin/` — example provider plugin.
-
-## Code style
-
-Prefer small typed request/response structs at protocol boundaries and keep JSON conversion explicit:
-
-```rust
-#[derive(Serialize)]
-struct ProviderCompleteParams {
-    provider_id: String,
-    model_id: String,
-    messages: Vec<Value>,
-    system_prompt: Option<String>,
-}
-
-let value = self.call("provider.complete", serde_json::to_value(params)?).await?;
-let response: ProviderCompleteResult = serde_json::from_value(value)?;
-```
-
-## Testing strategy
-
-- Unit tests for provider/model namespacing and route parsing.
-- Process E2E test with a fixture provider extension that returns deterministic text.
-- Chat/model UI tests verifying extension model sections and namespaced IDs.
-- Builder smoke tests verifying `plugin inspect --config` shows provider details.
-- No external network calls in provider tests.
-
-## Boundaries
-
-Always do:
-
-- Keep protocol names/capabilities driven by contract JSON/docs.
-- Preserve extension standalone support.
-- Fail closed on malformed provider registration or missing required config.
-- Namespace provider and model IDs.
-- Run targeted tests before commits.
-
-Ask first:
-
-- Adding third-party dependencies.
-- Changing extension protocol version.
-- Implementing provider override of built-in providers.
-- Persisting extension secrets outside existing config/env resolution.
-
-Never do:
-
-- Hardcode specific third-party provider names for extension routing.
-- Let an extension register providers without `providers.register`.
-- Send prompts to an extension provider unless the selected model belongs to that provider.
-- Implement marketplace remote execution or auto-enable trust.
-
-## Provider routing semantics
-
-### Identity
-
-An extension registers provider-local IDs during `initialize`:
+An extension returns providers from `initialize`:
 
 ```json
 {
-  "id": "echo",
-  "models": [{ "id": "echo-small", "display_name": "Echo Small" }]
+  "protocol_version": 1,
+  "capabilities": {
+    "providers": [{
+      "id": "local",
+      "display_name": "Local Provider",
+      "description": "Runs local models",
+      "models": [{
+        "id": "model-small",
+        "display_name": "Model Small",
+        "capabilities": { "streaming": false, "tool_use": true },
+        "context_window": 32768
+      }]
+    }]
+  }
 }
 ```
 
-Synaps stores/exposes:
+`capabilities.tool_use: true` declares that a model may emit mediated tool calls. Synaps surfaces this in extension status/model UX as a `tool-use` badge.
 
-- Runtime provider ID: `plugin-id:echo`
-- Runtime model ID: `plugin-id:echo:echo-small`
+## Completion request
 
-The `:` delimiter is reserved for extension model IDs. Provider IDs and model IDs must not contain `:`.
-
-### Config resolution
-
-Provider config uses existing `extension.config` entries in the plugin manifest. Synaps resolves env/config/defaults before `initialize` and passes `params.config` to the extension. If an extension declares provider config requirements in `capabilities.providers[].config_schema.required`, every required key must be present in `params.config`; otherwise extension load fails and no provider is registered.
-
-### JSON-RPC methods
-
-`provider.complete` request:
+Synaps calls `provider.complete` with Anthropic-shaped messages and the active tool schema:
 
 ```json
 {
-  "provider_id": "echo",
-  "model_id": "echo-small",
-  "model": "plugin-id:echo:echo-small",
-  "messages": [],
-  "system_prompt": "optional",
-  "tools": [],
+  "provider_id": "local",
+  "model_id": "model-small",
+  "model": "plugin:local:model-small",
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+  "system_prompt": null,
+  "tools": [{"name": "read", "description": "...", "input_schema": {"type": "object"}}],
   "temperature": null,
   "max_tokens": null,
   "thinking_budget": 0
 }
 ```
 
-`provider.complete` result:
+## Tool-use response shape
+
+A provider requests tools by returning `content` blocks with type `tool_use`:
 
 ```json
 {
-  "content": [{ "type": "text", "text": "hello" }],
-  "stop_reason": "end_turn",
-  "usage": { "input_tokens": 1, "output_tokens": 1 }
+  "content": [{
+    "type": "tool_use",
+    "id": "call-1",
+    "name": "read",
+    "input": {"path": "README.md"}
+  }],
+  "stop_reason": "tool_use"
 }
 ```
 
-`provider.stream` is reserved in the contract for later notification-based streaming. Phase N routes chat through `provider.complete` and emits returned text as stream events.
+Requirements:
 
-### Failures/timeouts/cancellation
+- `id` must be a non-empty string and is echoed in the tool result.
+- `name` must be a non-empty tool name from the provided tool schema.
+- `input` must be a JSON object. Missing `input` is treated as `{}`.
 
-- `provider.complete` has a bounded timeout (60s in Phase N).
-- Cancellation is checked before and after the call. In-flight JSON-RPC process calls may finish in the background; Synaps returns canceled to the chat caller.
-- Malformed provider responses return a config/runtime error and do not fall back to Anthropic.
-- Extension transport failures use the same restart policy as tools/hooks.
+Malformed `tool_use` blocks fail the provider turn and are reported as extension provider errors.
 
-### Phase O notes
+## Tool result loop
 
-Provider trust and distribution metadata are now part of the platform surface:
+When Synaps receives tool-use blocks it:
 
-- `providers.register` is high impact. Install/update/detail UX should explain that selected extension-provider models receive conversation content.
-- `provider.complete` is the only executable provider call in this phase.
-- `provider.stream` is reserved and implementations return a clear unsupported error until notification-based streaming semantics are specified.
-- Plugin index/package metadata may include provider summaries derived from manifest `extension.providers` metadata. Runtime registration remains authoritative because extensions return actual capabilities from `initialize`.
+1. Appends the provider response as an assistant message.
+2. Executes each requested tool through the core `ToolRegistry`.
+3. Runs normal `before_tool_call` and `after_tool_call` extension hooks around execution.
+4. Appends a user message containing `tool_result` blocks.
+5. Calls `provider.complete` again until the provider returns no tool-use blocks.
 
-### Trust/security
+Tool results are Anthropic-shaped content blocks:
 
-Provider extensions can receive conversation content when selected. `providers.register` is high impact and install/inspect UX must expose it. Secrets are resolved by Synaps and passed only via initialize config; extensions must not persist them on behalf of Synaps.
+```json
+{
+  "type": "tool_result",
+  "tool_use_id": "call-1",
+  "content": "file contents..."
+}
+```
+
+Unknown tools, blocked tools, and execution failures are returned to the provider as `tool_result` blocks with `is_error: true` when applicable. The provider should recover or return a final user-visible error.
+
+## Limits, security boundary, and current limitations
+
+- Synaps enforces a maximum provider tool-loop iteration count to prevent infinite tool recursion. The current routing default is 8 provider turns.
+- Tool output is truncated before it is returned to the provider. The current routing default is 30,000 bytes per tool result.
+- Providers never execute tools directly. They can only request tools; Synaps mediates execution.
+- Extensions must declare `providers.register` before provider metadata is accepted.
+- Existing tool permissions and hook interception remain core-owned; providers do not bypass `before_tool_call` / `after_tool_call` hooks.
+- Current Slice P routing uses a minimal tool execution context for provider-requested tools. Tool execution is mediated and works for stateless tools, but provider tool loops do not yet receive chat-session streaming deltas/events, secret prompts, subagent registry, shell session manager, event queue, or dynamic tool-registration channel. A follow-up should thread the active chat `ToolContext` factory and runtime-configured limits into provider routing.
+- Extension authors should treat tool results as untrusted model context and avoid embedding secrets in provider logs.

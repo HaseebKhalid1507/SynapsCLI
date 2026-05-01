@@ -12,7 +12,21 @@ use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::ExtensionHandler;
 use synaps_cli::extensions::manifest::ExtensionConfigEntry;
-use synaps_cli::Tool;
+use synaps_cli::{Tool, ToolContext};
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+struct EchoTestTool;
+
+#[async_trait]
+impl Tool for EchoTestTool {
+    fn name(&self) -> &str { "echo_test" }
+    fn description(&self) -> &str { "echo test" }
+    fn parameters(&self) -> Value { json!({"type": "object"}) }
+    async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
+        Ok(params["message"].as_str().unwrap_or_default().to_string())
+    }
+}
 
 fn installed_fixture_script() -> String {
     std::env::current_dir()
@@ -581,6 +595,59 @@ async fn extension_provider_complete_routes_to_process() {
         other => panic!("unexpected event: {other:?}"),
     }
     manager.write().await.shutdown_all().await;
+    synaps_cli::runtime::openai::clear_extension_manager_for_routing();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_provider_tool_use_is_executed_by_router_before_final_response() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/provider_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::empty()));
+    tools.write().await.register(Arc::new(EchoTestTool));
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new_with_tools(hook_bus, tools.clone())));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["providers.register".to_string()],
+        hooks: vec![],
+        config: vec![],
+    };
+    manager.write().await.load_with_cwd("provider-tool", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let tools_schema = tools.read().await.tools_schema();
+    let result = synaps_cli::runtime::openai::try_route(
+        "provider-tool:tools:tool-small",
+        &reqwest::Client::new(),
+        &tools_schema,
+        &None,
+        &[serde_json::json!({"role":"user","content":[{"type":"text","text":"use tool"}]})],
+        &tx,
+        None,
+        None,
+        0,
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.expect("extension route").unwrap();
+
+    assert_eq!(result["content"][0]["text"], "final:from-provider");
+    match rx.recv().await.unwrap() {
+        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => assert_eq!(text, "final:from-provider"),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    manager.write().await.shutdown_all().await;
+    synaps_cli::runtime::openai::clear_extension_manager_for_routing();
 }
 
 #[tokio::test(flavor = "current_thread")]

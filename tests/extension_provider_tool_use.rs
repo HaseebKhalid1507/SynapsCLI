@@ -21,6 +21,18 @@ impl Tool for EchoTool {
     }
 }
 
+struct FailingTool;
+
+#[async_trait::async_trait]
+impl Tool for FailingTool {
+    fn name(&self) -> &str { "fail_test" }
+    fn description(&self) -> &str { "failing test tool" }
+    fn parameters(&self) -> Value { json!({"type": "object"}) }
+    async fn execute(&self, _params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
+        Err(synaps_cli::RuntimeError::Tool("boom".to_string()))
+    }
+}
+
 struct BlockingHook;
 
 #[async_trait::async_trait]
@@ -112,6 +124,31 @@ async fn executes_provider_requested_tool_through_synaps_registry() {
         "tool_use_id": "call-1",
         "content": "hello"
     }));
+}
+
+#[tokio::test]
+async fn provider_requested_tool_execution_failure_is_marked_as_error() {
+    let mut registry = ToolRegistry::empty();
+    registry.register(Arc::new(FailingTool));
+    let hook_bus = Arc::new(HookBus::new());
+    let tool_use = ProviderToolUse {
+        id: "call-1".to_string(),
+        name: "fail_test".to_string(),
+        input: json!({}),
+    };
+
+    let result = execute_provider_tool_use(
+        &registry,
+        &hook_bus,
+        tool_use,
+        test_context(),
+        1000,
+    ).await;
+
+    assert_eq!(result["tool_use_id"], "call-1");
+    assert_eq!(result["is_error"], true);
+    assert!(result["content"].as_str().unwrap().contains("Tool execution failed"));
+    assert!(result["content"].as_str().unwrap().contains("boom"));
 }
 
 #[tokio::test]
