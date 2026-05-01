@@ -9,6 +9,60 @@ use ratatui::{
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation, Shader};
 
+/// Build the voice indicator pill rendered after the status span when
+/// the user has activated voice dictation. Returns `None` when voice
+/// is disabled — callers should skip rendering in that case.
+pub(crate) fn voice_pill_span(app: &super::app::App) -> Option<Span<'static>> {
+    let voice = app.voice.as_ref()?;
+    let (text, color) = match &voice.status {
+        super::voice::VoiceUiStatus::Idle => (" \u{25cb} voice ", THEME.load().muted),
+        super::voice::VoiceUiStatus::Listening => {
+            // Pulse like the streaming indicator so the user sees we're live.
+            let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let base = match THEME.load().status_streaming {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (220, 80, 80),
+            };
+            let r = (base.0 as f64 * pulse) as u8;
+            let g = (base.1 as f64 * pulse) as u8;
+            let b = (base.2 as f64 * pulse) as u8;
+            (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+        }
+        super::voice::VoiceUiStatus::Transcribing => {
+            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
+            let frame = SPINNER_FRAMES[spinner_idx];
+            return Some(Span::styled(
+                format!(" {} transcribing ", frame),
+                Style::default().fg(THEME.load().status_streaming),
+            ));
+        }
+        super::voice::VoiceUiStatus::Error(_) => {
+            (" \u{26a0} voice error ", Color::Red)
+        }
+    };
+    Some(Span::styled(
+        text.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
+#[cfg(test)]
+mod voice_pill_tests {
+    use super::*;
+    use synaps_cli::Session;
+
+    fn fresh_app() -> super::super::app::App {
+        super::super::app::App::new(Session::new("test", "medium", None))
+    }
+
+    #[test]
+    fn pill_is_none_when_voice_inactive() {
+        let app = fresh_app();
+        assert!(voice_pill_span(&app).is_none());
+    }
+}
+
+
 use super::theme::THEME;
 use super::markdown::format_tokens;
 use super::app::{App, SPINNER_FRAMES};
@@ -150,12 +204,19 @@ pub(crate) fn draw(
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-            status_span,
-        ]))
+        let header = Paragraph::new(Line::from({
+            let mut spans = vec![
+                Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
+                Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
+                status_span,
+            ];
+            if let Some(pill) = voice_pill_span(app) {
+                spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
+                spans.push(pill);
+            }
+            spans
+        }))
         .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(header, outer[0]);
 
