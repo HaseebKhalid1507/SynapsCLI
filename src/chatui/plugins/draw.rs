@@ -103,6 +103,14 @@ fn render_right(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     }
 }
 
+fn installed_row_up_to_date(latest_commit: Option<&String>, installed_commit: &str, checksum_value: Option<&String>) -> bool {
+    match (latest_commit, checksum_value) {
+        (Some(latest), _) if latest == installed_commit => true,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 fn render_right_list(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let rows = state.right_rows();
     if rows.is_empty() {
@@ -135,7 +143,11 @@ fn render_right_list(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         let (name, status) = match row {
             RightRow::Installed(ip) => {
                 let mut s = String::from("installed");
-                let up_to_date = matches!(&ip.latest_commit, Some(c) if c == &ip.installed_commit);
+                let up_to_date = installed_row_up_to_date(
+                    ip.latest_commit.as_ref(),
+                    &ip.installed_commit,
+                    ip.checksum_value.as_ref(),
+                );
                 if !up_to_date {
                     s.push_str(" (update)");
                 }
@@ -201,8 +213,18 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 Span::styled("commit:      ", label_style),
                 Span::styled(ip.installed_commit.clone(), value_style),
             ]));
-            let latest = ip.latest_commit.clone().unwrap_or_else(|| "?".to_string());
-            let up_to_date = matches!(&ip.latest_commit, Some(c) if c == &ip.installed_commit);
+            let latest = ip.latest_commit.clone().unwrap_or_else(|| {
+                if ip.checksum_value.is_some() {
+                    "index-verified".to_string()
+                } else {
+                    "?".to_string()
+                }
+            });
+            let up_to_date = installed_row_up_to_date(
+                ip.latest_commit.as_ref(),
+                &ip.installed_commit,
+                ip.checksum_value.as_ref(),
+            );
             let mut latest_line = latest;
             if !up_to_date {
                 latest_line.push_str("  (update available)");
@@ -215,6 +237,15 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                 Span::styled("installed:   ", label_style),
                 Span::styled(ip.installed_at.clone(), value_style),
             ]));
+            if let Some(value) = &ip.checksum_value {
+                lines.push(Line::from(vec![
+                    Span::styled("checksum:    ", label_style),
+                    Span::styled(
+                        format!("{}:{}", ip.checksum_algorithm.clone().unwrap_or_else(|| "sha256".to_string()), value),
+                        value_style,
+                    ),
+                ]));
+            }
         }
         RightRow::Browseable { plugin, installed } => {
             lines.push(Line::from(vec![
@@ -433,5 +464,27 @@ fn inset_rect(area: Rect, dx: u16, dy: u16) -> Rect {
         y: area.y + dy.min(area.height),
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::installed_row_up_to_date;
+
+    #[test]
+    fn index_verified_row_without_remote_head_is_current() {
+        let checksum = "f".repeat(64);
+        assert!(installed_row_up_to_date(None, "abc", Some(&checksum)));
+    }
+
+    #[test]
+    fn legacy_row_without_remote_head_is_not_current() {
+        assert!(!installed_row_up_to_date(None, "abc", None));
+    }
+
+    #[test]
+    fn matching_remote_head_is_current() {
+        let latest = "abc".to_string();
+        assert!(installed_row_up_to_date(Some(&latest), "abc", None));
     }
 }
