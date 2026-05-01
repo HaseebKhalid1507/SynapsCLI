@@ -6,7 +6,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~34K lines](https://img.shields.io/badge/lines-~34K-green.svg)
+![~46K lines](https://img.shields.io/badge/lines-~46K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
@@ -19,7 +19,7 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 
 ## Why SynapsCLI?
 
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~34K lines, `cargo build` and you're done.
+- ⚡ **Sub-100ms cold start.** Single Rust binary, ~46K lines, `cargo build` and you're done.
 - 🌐 **Any model, any provider.** Claude, Groq, Cerebras, NVIDIA NIM, OpenRouter, or your local Ollama. 17 providers, 55+ models. Set a key, pick a model, go.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
 - 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
@@ -29,6 +29,7 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 - 🧠 **90%+ prompt cache hit rate.** Hand-tuned cache breakpoints beat auto-cache (tested: 90% vs 53%). Built for multi-hour sessions.
 - ✍️ **Mid-stream steering.** Type while the model is generating to redirect in real time.
 - 🖱️ **Mouse text selection.** Left-click drag to select, right-click to copy/paste. Works in the TUI.
+- 🔌 **Extensions.** Process-based JSON-RPC hooks (before_message, before_tool_call, after_tool_call, on_session_start, on_session_end). `~/.synaps-cli/plugins/` auto-discovery.
 - 🔌 **MCP + plugins + skills.** Model Context Protocol servers spawn lazily. Skills load from markdown. Plugins ship as marketplaces.
 - 🔗 **Plugin agent resolution.** `subagent(agent: "dev-tools:sage")` — dispatch agents from installed plugins via `plugin:agent` syntax.
 
@@ -169,6 +170,9 @@ patterns = ["*.rs"]
 [limits]
 max_session_cost_usd = 0.50
 max_daily_cost_usd = 10.0
+
+[hooks]
+notify_inbox = true             # event bus notifications on completion
 ```
 
 Full schema in [AGENTS.md](AGENTS.md). Agents checkpoint state on exit and resume where they left off.
@@ -208,7 +212,7 @@ See [AGENTS.md](AGENTS.md) for parameters and behavior.
 
 SynapsCLI has a first-class extension system. Extensions are external processes that hook into the agent loop via JSON-RPC 2.0 over stdio.
 
-- **5 hooks:** `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`
+- **5 hooks:** `before_message`, `before_tool_call`, `after_tool_call`, `on_session_start`, `on_session_end`
 - **Tool-specific filtering:** narrow a hook to a single tool by adding `"tool"` to the registration, e.g. `{ "hook": "before_tool_call", "tool": "bash" }` fires only for bash calls
 - **Context injection:** Extensions inject context into the system prompt via `HookResult::Inject`
 - **Permission-gated:** 6 permissions control what extensions can access
@@ -277,6 +281,30 @@ keybind.F6 = disabled
 
 Provider keys can also be set via environment variables (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.) or through `/settings → Providers` in the TUI.
 
+### MCP Configuration
+
+Model Context Protocol servers are configured in `~/.synaps-cli/mcp.json`:
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-filesystem", "/path/to/directory"]
+    },
+    "brave-search": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": "your-brave-api-key"
+      }
+    }
+  }
+}
+```
+
+Use `connect_mcp_server` tool to load tools from configured servers. Servers spawn lazily on first connection.
+
 ---
 
 ## Keybinds
@@ -343,11 +371,16 @@ src/
 ├── main.rs          # unified CLI entry point + subcommand dispatch
 ├── cmd/             # subcommand handlers (run, chat, server, client, agent, login, watcher)
 ├── chatui/          # TUI: event loop, rendering, markdown, themes, settings, plugins
+│   ├── helpers.rs   # extracted helper functions
+│   ├── lifecycle.rs # session lifecycle management
 │   └── settings/    # /settings modal — model picker, provider keys, themes
 ├── runtime/         # THE BRAIN
 │   ├── api.rs       # Anthropic API + provider router (try_route)
+│   ├── api_sync.rs  # synchronous API calls (split from api.rs)
+│   ├── request.rs   # request builder helpers (split from api.rs)
 │   ├── stream.rs    # tool dispatch loop (provider-agnostic)
 │   └── openai/      # OpenAI-compatible provider engine
+│       ├── catalog/ # per-provider model catalogs (split from registry.rs)
 │       ├── registry.rs   # 17 providers, 55+ models
 │       ├── stream.rs     # SSE streaming + BytesMut/memchr parsing
 │       ├── translate.rs  # Anthropic↔OpenAI format bridge
@@ -356,6 +389,11 @@ src/
 ├── core/            # config, session, chain, auth, models, logging
 ├── events/          # event bus: types, priority queue, inotify watcher
 ├── tools/           # 15 built-in tools (bash, read, write, edit, subagent*, shell*, etc.)
+│   ├── test_helpers.rs  # testing utilities
+│   └── subagent/    # reactive subagent tools (split from subagent*.rs)
+├── extensions/      # extension system (hooks, permissions, JSON-RPC runtime)
+│   ├── hooks/       # hook event types and dispatcher
+│   └── runtime/     # process-based extension runtime
 ├── mcp/             # Model Context Protocol client, lazy server spawning
 ├── watcher/         # supervisor daemon, IPC, heartbeats
 └── skills/          # markdown-driven behavioral guidelines + plugin marketplace
