@@ -381,6 +381,71 @@ pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolU
 pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
     pub providers: Vec<RegisteredProviderSpec>,
+    pub voice: Option<VoiceCapabilityDeclaration>,
+}
+
+/// Declaration of a voice capability provided by an extension.
+///
+/// The actual sidecar implementation lives in the plugin (see
+/// `synaps-skills/`); core only tracks the metadata so it can surface
+/// the capability in `/extensions status` and gate the corresponding
+/// audio permissions.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct VoiceCapabilityDeclaration {
+    /// Display name, e.g. "Local Whisper STT".
+    pub name: String,
+    /// Modes supported: subset of ["stt", "tts", "wake_word"].
+    pub modes: Vec<String>,
+    /// Optional sidecar endpoint (e.g. "http://127.0.0.1:8723"). Informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// Validate a [`VoiceCapabilityDeclaration`] against the granted permission set.
+///
+/// Rules:
+/// - `name` must be non-empty.
+/// - `modes` must be non-empty and only contain `stt`, `tts`, or `wake_word`.
+/// - `stt` or `wake_word` modes require the `audio.input` permission.
+/// - `tts` mode requires the `audio.output` permission.
+pub fn validate_voice_capability(
+    decl: &VoiceCapabilityDeclaration,
+    permissions: &crate::extensions::permissions::PermissionSet,
+) -> Result<(), String> {
+    use crate::extensions::permissions::Permission;
+    if decl.name.trim().is_empty() {
+        return Err("voice capability 'name' must be non-empty".to_string());
+    }
+    if decl.modes.is_empty() {
+        return Err("voice capability 'modes' must be non-empty".to_string());
+    }
+    for mode in &decl.modes {
+        match mode.as_str() {
+            "stt" | "wake_word" => {
+                if !permissions.has(Permission::AudioInput) {
+                    return Err(format!(
+                        "voice capability mode '{}' requires permission 'audio.input'",
+                        mode
+                    ));
+                }
+            }
+            "tts" => {
+                if !permissions.has(Permission::AudioOutput) {
+                    return Err(
+                        "voice capability mode 'tts' requires permission 'audio.output'"
+                            .to_string(),
+                    );
+                }
+            }
+            other => {
+                return Err(format!(
+                    "voice capability declares unknown mode '{}' (expected one of 'stt', 'tts', 'wake_word')",
+                    other
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -396,6 +461,8 @@ struct InitializeCapabilities {
     tools: Vec<RegisteredExtensionToolSpec>,
     #[serde(default)]
     providers: Vec<RegisteredProviderSpec>,
+    #[serde(default)]
+    voice: Option<VoiceCapabilityDeclaration>,
 }
 
 /// A JSON-RPC notification frame received from an extension (no `id`).
@@ -993,6 +1060,7 @@ impl ProcessExtension {
         Ok(InitializeCapabilitiesResult {
             tools: result.capabilities.tools,
             providers: result.capabilities.providers,
+            voice: result.capabilities.voice,
         })
     }
 
@@ -1753,5 +1821,89 @@ mod restart_policy_tests {
         let ext = ext.with_restart_policy(custom);
         assert_eq!(ext.restart_policy.max_attempts, 7);
         ext.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod voice_validator_tests {
+    use super::*;
+    use crate::extensions::permissions::{Permission, PermissionSet};
+
+    fn perms_with(grants: &[Permission]) -> PermissionSet {
+        let mut p = PermissionSet::new();
+        for g in grants {
+            p.grant(*g);
+        }
+        p
+    }
+
+    fn decl(name: &str, modes: &[&str]) -> VoiceCapabilityDeclaration {
+        VoiceCapabilityDeclaration {
+            name: name.to_string(),
+            modes: modes.iter().map(|m| m.to_string()).collect(),
+            endpoint: None,
+        }
+    }
+
+    #[test]
+    fn voice_validator_rejects_empty_name() {
+        let d = decl("   ", &["stt"]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("name"), "got: {}", err);
+    }
+
+    #[test]
+    fn voice_validator_rejects_empty_modes() {
+        let d = decl("Whisper", &[]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("modes"), "got: {}", err);
+    }
+
+    #[test]
+    fn voice_validator_rejects_unknown_mode() {
+        let d = decl("Whisper", &["humming"]);
+        let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("unknown mode"), "got: {}", err);
+    }
+
+    #[test]
+    fn voice_validator_requires_audio_input_for_stt() {
+        let d = decl("Whisper", &["stt"]);
+        let perms = perms_with(&[]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("audio.input"), "got: {}", err);
+    }
+
+    #[test]
+    fn voice_validator_requires_audio_output_for_tts() {
+        let d = decl("Piper", &["tts"]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("audio.output"), "got: {}", err);
+    }
+
+    #[test]
+    fn voice_validator_accepts_valid_stt_with_permission() {
+        let d = decl("Whisper", &["stt"]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        validate_voice_capability(&d, &perms).expect("should validate");
+    }
+
+    #[test]
+    fn voice_validator_accepts_combined_modes_with_both_permissions() {
+        let d = decl("Voice", &["stt", "tts", "wake_word"]);
+        let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
+        validate_voice_capability(&d, &perms).expect("should validate");
+    }
+
+    #[test]
+    fn voice_validator_wake_word_requires_audio_input() {
+        let d = decl("Porcupine", &["wake_word"]);
+        let perms = perms_with(&[]);
+        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("audio.input"), "got: {}", err);
     }
 }

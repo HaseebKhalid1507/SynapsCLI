@@ -754,6 +754,36 @@ pub async fn run(
                                                         .join(", ");
                                                     app.push_msg(ChatMessage::System(format!("    tools: {}", rendered)));
                                                 }
+                                                // Voice capabilities (grouped from the `future` list).
+                                                let voice_entries: Vec<&str> = snap
+                                                    .future
+                                                    .iter()
+                                                    .filter(|e| e.kind == "voice")
+                                                    .map(|e| e.name.as_str())
+                                                    .collect();
+                                                if !voice_entries.is_empty() {
+                                                    // Each entry is "<name> (<mode>)". Group by name; collect modes.
+                                                    use std::collections::BTreeMap;
+                                                    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                                                    for entry in &voice_entries {
+                                                        if let Some(open) = entry.rfind(" (") {
+                                                            if entry.ends_with(')') {
+                                                                let name = entry[..open].to_string();
+                                                                let mode = entry[open + 2..entry.len() - 1].to_string();
+                                                                grouped.entry(name).or_default().push(mode);
+                                                                continue;
+                                                            }
+                                                        }
+                                                        grouped.entry((*entry).to_string()).or_default();
+                                                    }
+                                                    for (name, modes) in grouped {
+                                                        let modes_str = modes.join("/");
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    voice: {} [{}]",
+                                                            name, modes_str
+                                                        )));
+                                                    }
+                                                }
                                                 for provider in &snap.providers {
                                                     let disabled_suffix = match trust_view.get(&provider.runtime_id) {
                                                         Some(false) => " [disabled]",

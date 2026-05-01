@@ -313,3 +313,38 @@ declared in the manifest.
 - Cross-namespace shared memory.
 
 These remain Phase 2 follow-ups under Slice U.
+
+## Voice capabilities (sketch)
+
+Voice is delivered as an extension capability. The voice sidecar itself
+lives in plugin repos (the reference implementation is in
+`synaps-skills/`). Core supports voice plugins by:
+
+1. Recognizing the `voice` capability in `initialize` results:
+   ```json
+   {
+     "voice": {
+       "name": "Local Whisper STT",
+       "modes": ["stt"],
+       "endpoint": "http://127.0.0.1:8723"
+     }
+   }
+   ```
+2. Requiring explicit permissions:
+   - `audio.input` for any plugin declaring `stt` or `wake_word`.
+   - `audio.output` for any plugin declaring `tts`.
+3. Listing voice capabilities in `/extensions status` so users can see
+   what audio surfaces are active.
+
+Modes are currently restricted to `stt`, `tts`, and `wake_word`.
+
+The voice control protocol (start/stop, transcript delivery, push-to-talk
+toggles) is owned by the plugin and is **out of scope for core**. Plugins
+expose their controls via tools, hooks, or notifications using the
+existing extension protocol.
+
+### Microphone consent
+
+Plugins requesting `audio.input` must surface this in their distribution
+metadata so install/update prompts can warn users before granting the
+permission. Future revisions may add a per-session toggle in chatui.

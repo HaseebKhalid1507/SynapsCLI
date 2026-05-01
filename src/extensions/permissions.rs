@@ -28,6 +28,10 @@ pub enum Permission {
     MemoryRead,
     /// Can append to the local memory store via `memory.append`.
     MemoryWrite,
+    /// Can capture audio (microphone) for voice STT/wake-word capabilities.
+    AudioInput,
+    /// Can produce audio output (speakers) for voice TTS capabilities.
+    AudioOutput,
 }
 
 impl Permission {
@@ -42,6 +46,8 @@ impl Permission {
             Self::ProvidersRegister => "providers.register",
             Self::MemoryRead => "memory.read",
             Self::MemoryWrite => "memory.write",
+            Self::AudioInput => "audio.input",
+            Self::AudioOutput => "audio.output",
         }
     }
 
@@ -56,6 +62,8 @@ impl Permission {
             "providers.register" => Some(Self::ProvidersRegister),
             "memory.read" => Some(Self::MemoryRead),
             "memory.write" => Some(Self::MemoryWrite),
+            "audio.input" => Some(Self::AudioInput),
+            "audio.output" => Some(Self::AudioOutput),
             _ => None,
         }
     }
@@ -206,6 +214,21 @@ mod tests {
     }
 
     #[test]
+    fn audio_permissions_parse_and_are_not_reserved() {
+        assert_eq!(Permission::parse("audio.input"), Some(Permission::AudioInput));
+        assert_eq!(Permission::parse("audio.output"), Some(Permission::AudioOutput));
+        assert!(!Permission::AudioInput.is_reserved());
+        assert!(!Permission::AudioOutput.is_reserved());
+        let perms = PermissionSet::try_from_strings(&[
+            "audio.input".to_string(),
+            "audio.output".to_string(),
+        ])
+        .unwrap();
+        assert!(perms.has(Permission::AudioInput));
+        assert!(perms.has(Permission::AudioOutput));
+    }
+
+    #[test]
     fn round_trip_as_str() {
         for perm in [
             Permission::ToolsIntercept,
@@ -216,6 +239,8 @@ mod tests {
             Permission::ProvidersRegister,
             Permission::MemoryRead,
             Permission::MemoryWrite,
+            Permission::AudioInput,
+            Permission::AudioOutput,
         ] {
             assert_eq!(Permission::parse(perm.as_str()), Some(perm));
         }

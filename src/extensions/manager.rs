@@ -10,7 +10,7 @@ use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
 use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
-use super::capability::{ExtensionCapabilitySnapshot, HookCapabilityEntry, ToolCapabilityEntry};
+use super::capability::{ExtensionCapabilitySnapshot, FutureCapabilityEntry, HookCapabilityEntry, ToolCapabilityEntry};
 use serde_json::{Map, Value};
 
 fn project_plugins_disabled() -> bool {
@@ -80,6 +80,8 @@ pub struct ExtensionManager {
     /// Declared manifest config entries per loaded extension, kept so we can
     /// produce diagnostics without re-reading the manifest.
     manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
+    /// Voice capability declarations per loaded extension. Populated on load.
+    voice_capabilities: HashMap<String, crate::extensions::runtime::process::VoiceCapabilityDeclaration>,
 }
 
 impl ExtensionManager {
@@ -91,6 +93,7 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
+            voice_capabilities: HashMap::new(),
         }
     }
 
@@ -105,6 +108,7 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
+            voice_capabilities: HashMap::new(),
         }
     }
 
@@ -161,6 +165,7 @@ impl ExtensionManager {
         };
         let registered_tools = capabilities.tools;
         let registered_providers = capabilities.providers;
+        let voice_declaration = capabilities.voice;
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
         if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
             handler.shutdown().await;
@@ -175,6 +180,15 @@ impl ExtensionManager {
                 "Extension '{}' registered providers but lacks permission 'providers.register'",
                 id
             ));
+        }
+        if let Some(voice) = &voice_declaration {
+            if let Err(err) = crate::extensions::runtime::process::validate_voice_capability(voice, &permissions) {
+                handler.shutdown().await;
+                return Err(format!(
+                    "Extension '{}' voice capability invalid: {}",
+                    id, err
+                ));
+            }
         }
         if !registered_providers.is_empty() {
             let mut registered_ids = Vec::new();
@@ -237,6 +251,9 @@ impl ExtensionManager {
         self.extensions.insert(id.to_string(), handler);
         self.manifest_configs
             .insert(id.to_string(), manifest.config.clone());
+        if let Some(voice) = voice_declaration {
+            self.voice_capabilities.insert(id.to_string(), voice);
+        }
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
     }
@@ -318,6 +335,18 @@ impl ExtensionManager {
         Ok(Value::Object(out))
     }
 
+    /// Test-only seeder: synthetically insert a voice capability declaration
+    /// for an extension id. Used to exercise capability snapshot rendering
+    /// without spinning up a real plugin process.
+    #[cfg(test)]
+    pub(crate) fn test_seed_voice_capability(
+        &mut self,
+        id: &str,
+        decl: crate::extensions::runtime::process::VoiceCapabilityDeclaration,
+    ) {
+        self.voice_capabilities.insert(id.to_string(), decl);
+    }
+
     /// Unload an extension — unsubscribe hooks and shut down the process.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
         let handler = self
@@ -328,6 +357,7 @@ impl ExtensionManager {
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
         self.manifest_configs.remove(id);
+        self.voice_capabilities.remove(id);
         handler.shutdown().await;
 
         tracing::info!(extension = %id, "Extension unloaded");
@@ -459,6 +489,20 @@ impl ExtensionManager {
                 .cloned()
                 .collect();
 
+            let future: Vec<FutureCapabilityEntry> = self
+                .voice_capabilities
+                .get(&id)
+                .map(|decl| {
+                    decl.modes
+                        .iter()
+                        .map(|mode| FutureCapabilityEntry {
+                            kind: "voice".to_string(),
+                            name: format!("{} ({})", decl.name, mode),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             out.push(ExtensionCapabilitySnapshot {
                 id,
                 health,
@@ -466,7 +510,7 @@ impl ExtensionManager {
                 hooks,
                 tools,
                 providers,
-                future: Vec::new(),
+                future,
             });
         }
         out
@@ -769,6 +813,54 @@ mod tests {
         assert!(snap.tools.is_empty());
         assert!(snap.providers.is_empty());
         assert!(snap.future.is_empty());
+
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_surfaces_seeded_voice_capability() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus.clone());
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: crate::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-capability-voice-test.log".to_string(),
+            ],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![crate::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![],
+        };
+
+        mgr.load("voice-cap", &manifest).await.unwrap();
+
+        mgr.test_seed_voice_capability(
+            "voice-cap",
+            crate::extensions::runtime::process::VoiceCapabilityDeclaration {
+                name: "Local Whisper STT".to_string(),
+                modes: vec!["stt".to_string(), "tts".to_string()],
+                endpoint: Some("http://127.0.0.1:8723".to_string()),
+            },
+        );
+
+        let snaps = mgr.capability_snapshots().await;
+        let snap = snaps.iter().find(|s| s.id == "voice-cap").expect("voice-cap snapshot");
+        assert_eq!(snap.future.len(), 2);
+        assert!(snap.future.iter().all(|e| e.kind == "voice"));
+        let names: Vec<&str> = snap.future.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Local Whisper STT (stt)"), "got {:?}", names);
+        assert!(names.contains(&"Local Whisper STT (tts)"), "got {:?}", names);
+
+        mgr.unload("voice-cap").await.unwrap();
+        let snaps = mgr.capability_snapshots().await;
+        assert!(snaps.iter().all(|s| s.id != "voice-cap"));
 
         mgr.shutdown_all().await;
     }
