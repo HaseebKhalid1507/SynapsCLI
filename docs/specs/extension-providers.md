@@ -49,6 +49,78 @@ Synaps calls `provider.complete` with Anthropic-shaped messages and the active t
 }
 ```
 
+## Streaming completion request
+
+When a model declares `capabilities.streaming = true` in its `initialize` capability metadata, Synaps may call `provider.stream` instead of `provider.complete`. The params shape is identical to `provider.complete`:
+
+```json
+{
+  "provider_id": "local",
+  "model_id": "model-small",
+  "model": "plugin:local:model-small",
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+  "system_prompt": null,
+  "tools": [],
+  "temperature": null,
+  "max_tokens": null,
+  "thinking_budget": 0
+}
+```
+
+While the request is in flight the extension emits zero or more `provider.stream.event` JSON-RPC notifications. Each notification's `params` is discriminated by a `"type"` field:
+
+| `type`     | Shape |
+| ---------- | ----- |
+| `text`     | `{ "type": "text", "delta": "<chunk>" }` |
+| `thinking` | `{ "type": "thinking", "delta": "<chunk>" }` |
+| `tool_use` | `{ "type": "tool_use", "id": "...", "name": "...", "input": { ... } }` |
+| `usage`    | `{ "type": "usage", "input_tokens": N, "output_tokens": N, ... }` |
+| `error`    | `{ "type": "error", "code": "...", "message": "..." }` |
+| `done`     | `{ "type": "done" }` |
+
+The final JSON-RPC response carries the same shape as `provider.complete`:
+
+```json
+{
+  "content": [{"type": "text", "text": "hello world"}],
+  "stop_reason": "end_turn",
+  "usage": {"input_tokens": 4, "output_tokens": 2}
+}
+```
+
+### Capability declaration
+
+A model opts in by setting `capabilities.streaming = true` in its `initialize` response. The UX surfaces this as a `[streaming]` badge in `/extensions` and the model picker.
+
+### Routing rule
+
+`try_route` calls `provider.stream` when **both** of the following hold:
+
+1. The selected model declares `capabilities.streaming = true`.
+2. The request is not already inside an active provider tool loop.
+
+Otherwise `try_route` falls back to `provider.complete`.
+
+### Example stream sequence
+
+A fixture answering `"hi"` might emit:
+
+```text
+→ provider.stream                  (request)
+← provider.stream.event { "type": "text", "delta": "hello " }
+← provider.stream.event { "type": "text", "delta": "world" }
+← provider.stream.event { "type": "usage", "input_tokens": 4, "output_tokens": 2 }
+← provider.stream.event { "type": "done" }
+← { "result": { "content": [...], "stop_reason": "end_turn", "usage": {...} } }
+```
+
+### Known limitations
+
+- **Tool-use during streaming is currently ignored by the router.** A `tool_use` notification emitted mid-stream is logged at `warn` and dropped. Streaming + tool-use combinations should fall back to non-streaming `provider.complete` with the existing tool loop.
+- **60-second hard timeout** on the `provider.stream` call (matches `provider.complete`). On timeout the call returns `Err` and the notification subscription is cleared.
+- **Malformed `provider.stream.event` notifications are logged at `warn` and dropped**; they do not abort the in-flight call. Notifications whose method is not `provider.stream.event` are ignored entirely.
+- If the consumer's event sink is dropped mid-stream, forwarding stops but the in-flight `provider.stream` request is still allowed to complete and return its final response.
+
 ## Tool-use response shape
 
 A provider requests tools by returning `content` blocks with type `tool_use`:
