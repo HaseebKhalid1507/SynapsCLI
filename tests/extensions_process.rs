@@ -45,7 +45,7 @@ async fn exits_before_response_then_respawns_and_retries() {
         HookResult::Block { reason } => assert_eq!(reason, "respawned"),
         other => panic!("expected block after retry, got {other:?}"),
     }
-    assert_eq!(process.extension.health().await, ExtensionHealth::Restarting);
+    assert_eq!(process.extension.health().await, ExtensionHealth::Degraded);
     process.extension.shutdown().await;
 }
 
@@ -61,7 +61,7 @@ async fn crashes_after_success_then_respawns_on_next_hook() {
         HookResult::Block { reason } => assert_eq!(reason, "after-crash-respawn"),
         other => panic!("expected block after crash respawn, got {other:?}"),
     }
-    assert_eq!(process.extension.health().await, ExtensionHealth::Restarting);
+    assert_eq!(process.extension.health().await, ExtensionHealth::Degraded);
     process.extension.shutdown().await;
 }
 
