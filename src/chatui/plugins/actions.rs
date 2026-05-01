@@ -116,7 +116,7 @@ pub(crate) async fn apply_add_marketplace(state: &mut PluginsModalState, url: St
         .iter()
         .map(|p| synaps_cli::skills::state::CachedPlugin {
             name: p.name.clone(),
-            source: p.source.clone(),
+            source: p.source.clone().unwrap_or_else(|| p.index.as_ref().map(|idx| idx.repository.clone()).unwrap_or_default()),
             version: p.version.clone(),
             description: p.description.clone(),
             index: p.index.as_ref().map(cached_index_metadata),
@@ -623,7 +623,7 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
             .iter()
             .map(|p| synaps_cli::skills::state::CachedPlugin {
                 name: p.name.clone(),
-                source: p.source.clone(),
+                source: p.source.clone().unwrap_or_else(|| p.index.as_ref().map(|idx| idx.repository.clone()).unwrap_or_default()),
                 version: p.version.clone(),
                 description: p.description.clone(),
                 index: p.index.as_ref().map(cached_index_metadata),

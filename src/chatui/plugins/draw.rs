@@ -243,6 +243,56 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                     value_style,
                 ),
             ]));
+            if let Some(index) = &plugin.index {
+                lines.push(Line::from(vec![
+                    Span::styled("repository:  ", label_style),
+                    Span::styled(index.repository.clone(), value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("checksum:    ", label_style),
+                    Span::styled(format!("{}:{}", index.checksum_algorithm, index.checksum_value), value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("compatible:  ", label_style),
+                    Span::styled(format!(
+                        "Synaps {}, extension protocol {}",
+                        index.compatibility_synaps.clone().unwrap_or_else(|| "unspecified".to_string()),
+                        index.compatibility_extension_protocol.clone().unwrap_or_else(|| "unspecified".to_string())
+                    ), value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("executable:  ", label_style),
+                    Span::styled(if index.has_extension { "yes" } else { "no" }, value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("permissions: ", label_style),
+                    Span::styled(if index.permissions.is_empty() { "none".to_string() } else { index.permissions.join(", ") }, value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("hooks:       ", label_style),
+                    Span::styled(if index.hooks.is_empty() { "none".to_string() } else { index.hooks.join(", ") }, value_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("commands:    ", label_style),
+                    Span::styled(if index.commands.is_empty() { "none".to_string() } else { index.commands.join(", ") }, value_style),
+                ]));
+                if let Some(publisher) = &index.trust_publisher {
+                    lines.push(Line::from(vec![
+                        Span::styled("publisher:   ", label_style),
+                        Span::styled(publisher.clone(), value_style),
+                    ]));
+                }
+                if let Some(homepage) = &index.trust_homepage {
+                    lines.push(Line::from(vec![
+                        Span::styled("homepage:    ", label_style),
+                        Span::styled(homepage.clone(), value_style),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("install:     ", label_style),
+                    Span::styled("fetched manifest is re-inspected before final install", value_style),
+                ]));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
