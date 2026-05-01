@@ -778,11 +778,29 @@ impl ProcessExtension {
     }
 
     fn validate_registered_tool_specs(id: &str, tools: &[RegisteredExtensionToolSpec]) -> Result<(), String> {
+        use crate::extensions::validation::{validate_id_segment, IdValidationError};
         let mut names = HashSet::new();
         for tool in tools {
             let name = tool.name.trim();
-            if name.is_empty() {
-                return Err(format!("Extension '{}' registered a tool with an empty tool name", id));
+            if let Err(err) = validate_id_segment(name) {
+                return Err(match err {
+                    IdValidationError::Empty => format!(
+                        "Extension '{}' registered a tool with an empty tool name",
+                        id
+                    ),
+                    IdValidationError::ContainsReserved { ch } => format!(
+                        "Extension '{}' registered tool '{}' with invalid tool name: '{}' is reserved",
+                        id, name, ch
+                    ),
+                    IdValidationError::TooLong { len, max } => format!(
+                        "Extension '{}' registered tool '{}' with invalid tool name: must be at most {} chars (got {})",
+                        id, name, max, len
+                    ),
+                    IdValidationError::ContainsWhitespace => format!(
+                        "Extension '{}' registered tool '{}' with invalid tool name: must not contain whitespace",
+                        id, name
+                    ),
+                });
             }
             if !names.insert(name.to_string()) {
                 return Err(format!("Extension '{}' registered duplicate tool name '{}'", id, name));
@@ -804,16 +822,30 @@ impl ProcessExtension {
     }
 
     fn validate_registered_provider_specs(id: &str, providers: &[RegisteredProviderSpec]) -> Result<(), String> {
+        use crate::extensions::validation::{validate_id_segment, IdValidationError};
         for provider in providers {
             let provider_id = provider.id.trim();
-            if provider_id.is_empty() {
-                return Err(format!("Extension '{}' registered provider with empty provider id", id));
-            }
-            if !Self::is_safe_provider_id(provider_id) {
-                return Err(format!(
-                    "Extension '{}' registered provider '{}' with invalid provider id",
-                    id, provider_id,
-                ));
+            match validate_id_segment(provider_id) {
+                Ok(()) => {
+                    if !Self::is_safe_provider_id(provider_id) {
+                        return Err(format!(
+                            "Extension '{}' registered provider '{}' with invalid provider id",
+                            id, provider_id
+                        ));
+                    }
+                }
+                Err(IdValidationError::Empty) => {
+                    return Err(format!(
+                        "Extension '{}' registered provider with empty provider id",
+                        id
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "Extension '{}' registered provider '{}' with invalid provider id: {}",
+                        id, provider_id, err
+                    ));
+                }
             }
             if provider.display_name.trim().is_empty() {
                 return Err(format!(
@@ -836,17 +868,25 @@ impl ProcessExtension {
             let mut model_ids = HashSet::new();
             for model in &provider.models {
                 let model_id = model.id.trim();
-                if model_id.is_empty() {
-                    return Err(format!(
-                        "Extension '{}' registered provider '{}' with empty model id",
-                        id, provider_id,
-                    ));
-                }
-                if model_id.contains(':') {
-                    return Err(format!(
-                        "Extension '{}' registered provider '{}' with invalid model id '{}': ':' is reserved",
-                        id, provider_id, model_id,
-                    ));
+                if let Err(err) = validate_id_segment(model_id) {
+                    return Err(match err {
+                        IdValidationError::Empty => format!(
+                            "Extension '{}' registered provider '{}' with empty model id",
+                            id, provider_id
+                        ),
+                        IdValidationError::ContainsReserved { ch } => format!(
+                            "Extension '{}' registered provider '{}' with invalid model id '{}': '{}' is reserved",
+                            id, provider_id, model_id, ch
+                        ),
+                        IdValidationError::TooLong { len, max } => format!(
+                            "Extension '{}' registered provider '{}' with invalid model id '{}': must be at most {} chars (got {})",
+                            id, provider_id, model_id, max, len
+                        ),
+                        IdValidationError::ContainsWhitespace => format!(
+                            "Extension '{}' registered provider '{}' with invalid model id '{}': must not contain whitespace",
+                            id, provider_id, model_id
+                        ),
+                    });
                 }
                 if !model_ids.insert(model_id.to_string()) {
                     return Err(format!(

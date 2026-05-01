@@ -24,3 +24,4 @@ pub mod providers;
 pub mod trust;
 pub mod audit;
 pub mod capability;
+pub mod validation;

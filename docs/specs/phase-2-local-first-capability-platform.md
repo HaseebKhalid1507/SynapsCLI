@@ -297,3 +297,14 @@ bash plugin-builder-plugin/scripts/test.sh
 ```
 
 Additional tests should be added per capability, especially E2E fixture extensions for provider tool-use and streaming.
+
+## Slice progress (running tally)
+
+- Slice P (Provider tool-use) — landed.
+- Slice Q (Provider streaming) — landed.
+- Slice R (Provider config UX) — landed.
+- Slice S (Provider trust + audit) — landed.
+- Slice T (Unified capability surface) — landed: expanded health states, restart backoff, capability snapshot, shared validation helpers.
+- Slice U (Local memory/indexing) — pending.
+- Slice V (Voice sidecar integration) — pending (voice plugin already lives in `synaps-skills`).
+- Slice W (Subagent/workflow integration) — pending.

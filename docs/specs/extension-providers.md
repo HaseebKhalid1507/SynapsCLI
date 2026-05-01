@@ -255,3 +255,17 @@ trust disable` if untrusted.
 - Existing tool permissions and hook interception remain core-owned; providers do not bypass `before_tool_call` / `after_tool_call` hooks.
 - Current Slice P routing uses a minimal tool execution context for provider-requested tools. Tool execution is mediated and works for stateless tools, but provider tool loops do not yet receive chat-session streaming deltas/events, secret prompts, subagent registry, shell session manager, event queue, or dynamic tool-registration channel. A follow-up should thread the active chat `ToolContext` factory and runtime-configured limits into provider routing.
 - Extension authors should treat tool results as untrusted model context and avoid embedding secrets in provider logs.
+
+## Shared validation rules
+
+Capability IDs (tool names, provider IDs, model IDs) share a common rule
+set documented in `src/extensions/validation.rs`:
+
+- Non-empty.
+- ≤ 64 characters.
+- May not contain reserved characters (`:` reserved for namespacing).
+- May not contain whitespace.
+
+Authors of new capability types should reuse `validate_id_segment` to keep
+error messages and rules consistent across tools, providers, and any future
+capability classes.
