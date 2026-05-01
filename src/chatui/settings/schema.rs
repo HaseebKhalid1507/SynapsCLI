@@ -43,6 +43,9 @@ pub(crate) enum EditorKind {
     Cycler(&'static [&'static str]),
     ModelPicker,
     ThemePicker,
+    /// Picks a whisper STT model (`*.bin`) from
+    /// `~/.synaps-cli/models/whisper/`. Persisted as `voice_stt_model_path`.
+    WhisperModelPicker,
     Text { numeric: bool },
 }
 

@@ -139,8 +139,15 @@ define_settings! {
             }
         };
 
-    voice_language, "Voice language hint", Voice,
-        EditorKind::Text { numeric: false },
-        "Optional language code (e.g. 'en') sent to the voice sidecar Init handshake.",
+    voice_language, "Voice language", Voice,
+        EditorKind::Cycler(&[
+            "auto", "en", "es", "fr", "de", "it", "pt", "nl", "ja", "zh", "ko", "ar", "hi", "ru",
+        ]),
+        "Spoken language passed to the voice sidecar. 'auto' lets whisper detect.",
         |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default */ };
+
+    voice_stt_model, "Voice STT model", Voice,
+        EditorKind::WhisperModelPicker,
+        "Whisper model used for transcription. Lists ~/.synaps-cli/models/whisper/*.bin.",
+        |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default via voice_stt_model_path */ };
 }

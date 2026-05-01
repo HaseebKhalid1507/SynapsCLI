@@ -32,6 +32,35 @@ pub(crate) fn theme_options() -> Vec<String> {
     opts
 }
 
+/// List `*.bin` files in `~/.synaps-cli/models/whisper/`, sorted by name.
+/// Used by the WhisperModelPicker editor.
+pub(crate) fn whisper_model_options() -> Vec<String> {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let dir = std::path::PathBuf::from(home).join(".synaps-cli/models/whisper");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut opts: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("bin") {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    opts.sort();
+    opts
+}
+
 use schema::SettingDef;
 
 pub(crate) struct PluginRow {

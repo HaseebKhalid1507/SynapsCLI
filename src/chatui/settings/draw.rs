@@ -418,8 +418,12 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .unwrap_or_else(|| "F8".to_string()),
         "voice_language" => synaps_cli::config::read_config_value("voice_language")
             .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "(auto)".to_string()),
+            .filter(|v| !v.is_empty() && v != "?")
+            .unwrap_or_else(|| "auto".to_string()),
+        "voice_stt_model" => synaps_cli::config::read_config_value("voice_stt_model_path")
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| "(default)".to_string()),
         _ => "?".into(),
     }
 }

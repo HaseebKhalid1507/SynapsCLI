@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
 use super::schema::{CATEGORIES, EditorKind};
 use super::draw::current_value_for;
+use super::whisper_model_options;
 
 pub(crate) enum InputOutcome {
     None,
@@ -252,6 +253,27 @@ pub(crate) fn handle_event(
                             cursor,
                         });
                     }
+                    EditorKind::WhisperModelPicker => {
+                        state.row_error = None;
+                        let mut opts = whisper_model_options();
+                        if opts.is_empty() {
+                            opts.push("(no models found in ~/.synaps-cli/models/whisper)".to_string());
+                        }
+                        let current = synaps_cli::config::read_config_value("voice_stt_model_path")
+                            .unwrap_or_default();
+                        let current_basename = std::path::Path::new(&current)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        let cursor = opts.iter()
+                            .position(|o| o == current_basename)
+                            .unwrap_or(0);
+                        state.edit_mode = Some(ActiveEditor::Picker {
+                            setting_key: "voice_stt_model",
+                            options: opts,
+                            cursor,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -343,6 +365,25 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     if key == "theme" {
                         state.original_theme_name = None;
                     }
+                    // Whisper model picker: translate basename → absolute
+                    // path and persist under `voice_stt_model_path`.
+                    if key == "voice_stt_model" {
+                        let basename = selection.trim();
+                        if basename.starts_with('(') {
+                            // Empty-state placeholder row.
+                            return InputOutcome::None;
+                        }
+                        let home = std::env::var_os("HOME").unwrap_or_default();
+                        let full = std::path::PathBuf::from(home)
+                            .join(".synaps-cli/models/whisper")
+                            .join(basename)
+                            .to_string_lossy()
+                            .to_string();
+                        return InputOutcome::Apply {
+                            key: "voice_stt_model_path",
+                            value: full,
+                        };
+                    }
                     InputOutcome::Apply { key, value }
                 }
                 _ => InputOutcome::None,
@@ -385,6 +426,10 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
+        "voice_language" => synaps_cli::config::read_config_value("voice_language")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != "?")
+            .unwrap_or_else(|| "auto".to_string()),
         _ => String::new(),
     }
 }

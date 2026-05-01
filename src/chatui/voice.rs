@@ -57,9 +57,16 @@ impl VoiceUiState {
             ));
         }
 
+        // Read voice_language; ignore placeholder values like "?", "auto",
+        // and "(auto)" which mean "let whisper auto-detect".
         let language = synaps_cli::config::read_config_value("voice_language")
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| {
+                !s.is_empty()
+                    && s != "?"
+                    && s != "auto"
+                    && s != "(auto)"
+            });
 
         // Build sidecar args: prefer `voice_stt_model_path` from config, else
         // fall back to the manifest's `provides.voice_sidecar.model.default_path`.
