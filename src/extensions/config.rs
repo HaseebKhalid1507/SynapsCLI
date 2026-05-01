@@ -95,6 +95,50 @@ pub fn classify_config_entry(
     }
 }
 
+/// Aggregated config diagnostics for a single extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionConfigDiagnostics {
+    pub extension_id: String,
+    pub entries: Vec<ConfigEntryStatus>,
+    /// Provider-level required keys that aren't satisfied by any entry above.
+    /// Each item is `(provider_id, missing_key)`.
+    pub provider_missing: Vec<(String, String)>,
+}
+
+/// Compute diagnostics for an extension by combining manifest config classification
+/// with provider-level `config_schema.required` checks. Lookups are injected so
+/// the function is fully testable without touching real env or persisted config.
+pub fn diagnose_extension_config(
+    extension_id: &str,
+    manifest_config: &[ExtensionConfigEntry],
+    provider_required: &[(String, Vec<String>)],
+    env_lookup: &impl Fn(&str) -> Option<String>,
+    config_lookup: &impl Fn(&str) -> Option<String>,
+) -> ExtensionConfigDiagnostics {
+    let entries: Vec<ConfigEntryStatus> = manifest_config
+        .iter()
+        .map(|entry| classify_config_entry(extension_id, entry, env_lookup, config_lookup))
+        .collect();
+
+    let mut provider_missing: Vec<(String, String)> = Vec::new();
+    for (provider_id, required_keys) in provider_required {
+        for key in required_keys {
+            let satisfied = entries
+                .iter()
+                .any(|status| status.key == *key && status.has_value);
+            if !satisfied {
+                provider_missing.push((provider_id.clone(), key.clone()));
+            }
+        }
+    }
+
+    ExtensionConfigDiagnostics {
+        extension_id: extension_id.to_string(),
+        entries,
+        provider_missing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +322,91 @@ mod tests {
         e.default = Some(Value::String("us-east-1".to_string()));
         let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Default);
+    }
+
+    #[test]
+    fn diagnose_empty_manifest_no_providers() {
+        let diag = diagnose_extension_config(
+            "my-ext",
+            &[],
+            &[],
+            &empty_lookup,
+            &empty_lookup,
+        );
+        assert_eq!(diag.extension_id, "my-ext");
+        assert!(diag.entries.is_empty());
+        assert!(diag.provider_missing.is_empty());
+    }
+
+    #[test]
+    fn diagnose_entry_with_default_resolves() {
+        let mut e = entry("region");
+        e.default = Some(Value::String("us-east-1".to_string()));
+        let diag = diagnose_extension_config(
+            "my-ext",
+            std::slice::from_ref(&e),
+            &[],
+            &empty_lookup,
+            &empty_lookup,
+        );
+        assert_eq!(diag.entries.len(), 1);
+        assert_eq!(diag.entries[0].source, ConfigSource::Default);
+        assert!(diag.entries[0].has_value);
+        assert!(diag.provider_missing.is_empty());
+    }
+
+    #[test]
+    fn diagnose_provider_requires_undeclared_key() {
+        let diag = diagnose_extension_config(
+            "my-ext",
+            &[],
+            &[("p".to_string(), vec!["api-key".to_string()])],
+            &empty_lookup,
+            &empty_lookup,
+        );
+        assert_eq!(
+            diag.provider_missing,
+            vec![("p".to_string(), "api-key".to_string())]
+        );
+    }
+
+    #[test]
+    fn diagnose_provider_required_key_resolved_via_env() {
+        let mut e = entry("api-key");
+        e.required = true;
+        let env = |k: &str| {
+            if k == "SYNAPS_EXTENSION_MY_EXT_API_KEY" {
+                Some("v".to_string())
+            } else {
+                None
+            }
+        };
+        let diag = diagnose_extension_config(
+            "my-ext",
+            std::slice::from_ref(&e),
+            &[("p".to_string(), vec!["api-key".to_string()])],
+            &env,
+            &empty_lookup,
+        );
+        assert!(diag.entries[0].has_value);
+        assert!(diag.provider_missing.is_empty());
+    }
+
+    #[test]
+    fn diagnose_provider_required_key_declared_but_missing() {
+        let mut e = entry("api-key");
+        e.required = true;
+        let diag = diagnose_extension_config(
+            "my-ext",
+            std::slice::from_ref(&e),
+            &[("p".to_string(), vec!["api-key".to_string()])],
+            &empty_lookup,
+            &empty_lookup,
+        );
+        assert!(!diag.entries[0].has_value);
+        assert_eq!(
+            diag.provider_missing,
+            vec![("p".to_string(), "api-key".to_string())]
+        );
     }
 }

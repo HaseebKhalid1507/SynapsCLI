@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
 use super::hooks::HookBus;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
@@ -75,6 +76,9 @@ pub struct ExtensionManager {
     providers: ProviderRegistry,
     /// Running extensions keyed by ID.
     extensions: HashMap<String, Arc<dyn ExtensionHandler>>,
+    /// Declared manifest config entries per loaded extension, kept so we can
+    /// produce diagnostics without re-reading the manifest.
+    manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
 }
 
 impl ExtensionManager {
@@ -85,6 +89,7 @@ impl ExtensionManager {
             tools: None,
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
+            manifest_configs: HashMap::new(),
         }
     }
 
@@ -98,6 +103,7 @@ impl ExtensionManager {
             tools: Some(tools),
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
+            manifest_configs: HashMap::new(),
         }
     }
 
@@ -207,6 +213,8 @@ impl ExtensionManager {
         }
 
         self.extensions.insert(id.to_string(), handler);
+        self.manifest_configs
+            .insert(id.to_string(), manifest.config.clone());
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
     }
@@ -297,6 +305,7 @@ impl ExtensionManager {
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
+        self.manifest_configs.remove(id);
         handler.shutdown().await;
 
         tracing::info!(extension = %id, "Extension unloaded");
@@ -369,6 +378,54 @@ impl ExtensionManager {
     /// Return provider status summaries sorted by provider runtime id.
     pub fn provider_summaries(&self) -> Vec<RegisteredProviderSummary> {
         self.providers.summaries()
+    }
+
+    /// Compute config diagnostics for a loaded extension by id.
+    /// Returns `None` if the extension is not loaded.
+    pub fn config_diagnostics(&self, id: &str) -> Option<ExtensionConfigDiagnostics> {
+        let manifest_config = self.manifest_configs.get(id)?;
+
+        // Collect provider required keys from registered providers' config_schema.
+        let mut provider_required: Vec<(String, Vec<String>)> = Vec::new();
+        for provider in self.providers.list() {
+            if provider.plugin_id != id {
+                continue;
+            }
+            let required: Vec<String> = provider
+                .spec
+                .config_schema
+                .as_ref()
+                .and_then(|schema| schema.get("required"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            provider_required.push((provider.provider_id.clone(), required));
+        }
+        provider_required.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let env_lookup = |name: &str| std::env::var(name).ok();
+        let config_lookup = |key: &str| crate::config::read_config_value(key);
+
+        Some(diagnose_extension_config(
+            id,
+            manifest_config,
+            &provider_required,
+            &env_lookup,
+            &config_lookup,
+        ))
+    }
+
+    /// Diagnostics for all loaded extensions, sorted alphabetically by id.
+    pub fn all_config_diagnostics(&self) -> Vec<ExtensionConfigDiagnostics> {
+        let mut ids: Vec<&String> = self.manifest_configs.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| self.config_diagnostics(id))
+            .collect()
     }
 
     /// Get the shared hook bus.
@@ -626,5 +683,61 @@ mod tests {
             assert!(!project_plugins_disabled());
         }
         std::env::remove_var("SYNAPS_DISABLE_PROJECT_PLUGINS");
+    }
+
+    #[tokio::test]
+    async fn config_diagnostics_returns_none_for_unknown_extension() {
+        let bus = Arc::new(HookBus::new());
+        let mgr = ExtensionManager::new(bus);
+        assert!(mgr.config_diagnostics("nope").is_none());
+        assert!(mgr.all_config_diagnostics().is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_diagnostics_reports_loaded_manifest_entries() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus);
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: crate::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-config-diag-test.log".to_string(),
+            ],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![crate::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![crate::extensions::manifest::ExtensionConfigEntry {
+                key: "region".to_string(),
+                description: Some("AWS region".to_string()),
+                required: false,
+                default: Some(serde_json::Value::String("us-east-1".to_string())),
+                secret_env: None,
+            }],
+        };
+
+        mgr.load("config-diag-test", &manifest).await.unwrap();
+
+        let diag = mgr
+            .config_diagnostics("config-diag-test")
+            .expect("diagnostics should be available for loaded extension");
+        assert_eq!(diag.extension_id, "config-diag-test");
+        assert_eq!(diag.entries.len(), 1);
+        assert_eq!(diag.entries[0].key, "region");
+        assert!(diag.entries[0].has_value);
+        assert!(diag.provider_missing.is_empty());
+
+        let all = mgr.all_config_diagnostics();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].extension_id, "config-diag-test");
+
+        mgr.shutdown_all().await;
+        // After shutdown, manifest config storage is cleared.
+        assert!(mgr.config_diagnostics("config-diag-test").is_none());
     }
 }
