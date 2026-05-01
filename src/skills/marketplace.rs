@@ -576,7 +576,7 @@ mod tests {
             "description": "Policy bundle",
             "repository": "https://github.com/example/synaps-skills.git",
             "subdir": "policy-bundle-plugin",
-            "checksum": {"algorithm": "sha256", "value": "abc123"},
+            "checksum": {"algorithm": "sha256", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
             "compatibility": {"synaps": ">=0.1.0", "extension_protocol": "1"},
             "capabilities": {
               "skills": ["safe-tool-policy"],
