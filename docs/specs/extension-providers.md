@@ -269,3 +269,47 @@ set documented in `src/extensions/validation.rs`:
 Authors of new capability types should reuse `validate_id_segment` to keep
 error messages and rules consistent across tools, providers, and any future
 capability classes.
+
+## Local memory
+
+Synaps provides a local-first memory store at
+`$SYNAPS_BASE_DIR/memory/<namespace>.jsonl`. Extensions access it via
+JSON-RPC requests during their lifetime:
+
+- `memory.append { namespace, content, tags?, meta? }`
+- `memory.query { namespace, content_contains?, tag_prefix?, since_ms?, until_ms?, limit? }`
+
+### Permissions
+
+| Permission     | Wire string     | Required for |
+|----------------|-----------------|--------------|
+| `MemoryRead`   | `memory.read`   | `memory.query` |
+| `MemoryWrite`  | `memory.write`  | `memory.append` |
+
+### Namespace policy
+
+Extensions may only read and write their own namespace, where
+`namespace == <extension-id>`. Cross-namespace access is rejected at the
+RPC boundary. Future revisions may add explicit shared namespaces
+declared in the manifest.
+
+### Limits
+
+- Maximum content size per record: 16 KiB UTF-8.
+- Default query limit: 50 records (configurable via `limit`).
+- Records are sorted most-recent-first by timestamp.
+- Malformed JSONL lines are skipped on read; never block the user.
+
+### Inspecting memory
+
+- `/extensions memory` or `/extensions memory namespaces` — list known namespaces.
+- `/extensions memory recent <ns> [N]` — show the last N records (default 20).
+  `meta` fields are intentionally not displayed.
+
+### Not yet implemented
+
+- Vector embedding / semantic query.
+- Indexer capability over user-approved paths.
+- Cross-namespace shared memory.
+
+These remain Phase 2 follow-ups under Slice U.

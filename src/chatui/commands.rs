@@ -81,6 +81,8 @@ pub(super) enum CommandAction {
     ExtensionsTrust(ExtensionsTrustAction),
     /// Show last N (or all) provider audit log entries.
     ExtensionsAudit { tail: Option<usize> },
+    /// Inspect local memory store (namespaces, recent records).
+    ExtensionsMemory(ExtensionsMemoryAction),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,14 @@ pub enum ExtensionsTrustAction {
     List,
     Enable { runtime_id: String },
     Disable { runtime_id: String, reason: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionsMemoryAction {
+    /// List all known memory namespaces.
+    Namespaces,
+    /// Show the most recent N records of a namespace (default 20).
+    Recent { namespace: String, limit: Option<usize> },
 }
 
 pub(super) async fn execute_command_action(
@@ -382,6 +392,7 @@ pub(super) async fn handle_command(
                 "/extensions config [id] — show extension config diagnostics",
                 "/extensions trust [list|enable <id>|disable <id> [reason]] — manage provider trust",
                 "/extensions audit [N] — show last N provider audit log entries",
+                "/extensions memory [namespaces|recent <ns> [N]] — inspect local memory store",
                 "/status — show account usage and reset times",
                 "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
@@ -528,9 +539,54 @@ pub(super) async fn handle_command(
                         }
                     }
                 }
+                "memory" => {
+                    if rest.is_empty() || rest == "namespaces" {
+                        return CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces);
+                    }
+                    let mut mparts = rest.splitn(2, char::is_whitespace);
+                    let msub = mparts.next().unwrap_or("");
+                    let mrest = mparts.next().unwrap_or("").trim();
+                    match msub {
+                        "recent" => {
+                            if mrest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions memory recent <ns> [N]".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            let mut rparts = mrest.splitn(2, char::is_whitespace);
+                            let namespace = rparts.next().unwrap_or("").to_string();
+                            let limit_str = rparts.next().unwrap_or("").trim();
+                            let limit = if limit_str.is_empty() {
+                                None
+                            } else {
+                                match limit_str.parse::<usize>() {
+                                    Ok(n) => Some(n),
+                                    Err(_) => {
+                                        app.push_msg(ChatMessage::System(format!(
+                                            "usage: /extensions memory recent <ns> [N] (not a number: {})",
+                                            limit_str
+                                        )));
+                                        return CommandAction::None;
+                                    }
+                                }
+                            };
+                            return CommandAction::ExtensionsMemory(
+                                ExtensionsMemoryAction::Recent { namespace, limit },
+                            );
+                        }
+                        other => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions memory [namespaces|recent <ns> [N]] (unknown: {})",
+                                other
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
                 other => {
                     app.push_msg(ChatMessage::System(format!(
-                        "usage: /extensions [status|config [id]|trust [list|enable <id>|disable <id> [reason]]|audit [N]] (unknown: {})",
+                        "usage: /extensions [status|config [id]|trust [list|enable <id>|disable <id> [reason]]|audit [N]|memory [namespaces|recent <ns> [N]]] (unknown: {})",
                         other
                     )));
                     return CommandAction::None;
@@ -605,7 +661,7 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsTrustAction};
+    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -953,6 +1009,40 @@ mod tests {
         match invoke_extensions("audit 25").await {
             CommandAction::ExtensionsAudit { tail: Some(n) } => assert_eq!(n, 25),
             _ => panic!("expected ExtensionsAudit with tail=Some(25)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_namespaces() {
+        match invoke_extensions("memory").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces) => {}
+            _ => panic!("expected ExtensionsMemory(Namespaces) for `memory`"),
+        }
+        match invoke_extensions("memory namespaces").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces) => {}
+            _ => panic!("expected ExtensionsMemory(Namespaces) for `memory namespaces`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_recent_default_limit() {
+        match invoke_extensions("memory recent my-ns").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+                assert_eq!(namespace, "my-ns");
+                assert_eq!(limit, None);
+            }
+            _ => panic!("expected ExtensionsMemory(Recent) with no limit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_recent_with_limit() {
+        match invoke_extensions("memory recent my-ns 5").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+                assert_eq!(namespace, "my-ns");
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("expected ExtensionsMemory(Recent) with limit=Some(5)"),
         }
     }
 }

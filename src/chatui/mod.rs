@@ -973,6 +973,74 @@ pub async fn run(
                                             ))),
                                         }
                                     }
+                                    CommandAction::ExtensionsMemory(action) => {
+                                        use crate::chatui::commands::ExtensionsMemoryAction;
+                                        match action {
+                                            ExtensionsMemoryAction::Namespaces => {
+                                                match synaps_cli::memory::store::list_namespaces() {
+                                                    Ok(nss) if nss.is_empty() => {
+                                                        app.push_msg(ChatMessage::System(
+                                                            "No memory namespaces.".to_string(),
+                                                        ));
+                                                    }
+                                                    Ok(nss) => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "Memory namespaces ({}):", nss.len()
+                                                        )));
+                                                        for ns in nss {
+                                                            app.push_msg(ChatMessage::System(format!("  {}", ns)));
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to list memory namespaces: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                            ExtensionsMemoryAction::Recent { namespace, limit } => {
+                                                let q = synaps_cli::memory::store::MemoryQuery {
+                                                    limit: Some(limit.unwrap_or(20)),
+                                                    ..Default::default()
+                                                };
+                                                match synaps_cli::memory::store::query(&namespace, &q) {
+                                                    Ok(records) if records.is_empty() => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "No records in '{}'.", namespace
+                                                        )));
+                                                    }
+                                                    Ok(records) => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "Recent in '{}' ({}):", namespace, records.len()
+                                                        )));
+                                                        for rec in records {
+                                                            // ISO8601 / RFC3339 UTC from epoch ms via chrono.
+                                                            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                                                                rec.timestamp_ms as i64,
+                                                            )
+                                                            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                                                            .unwrap_or_else(|| rec.timestamp_ms.to_string());
+                                                            // Truncate content at 80 chars (char-aware).
+                                                            let mut content: String = rec.content.chars().take(80).collect();
+                                                            if rec.content.chars().count() > 80 {
+                                                                content.push('…');
+                                                            }
+                                                            let tags = if rec.tags.is_empty() {
+                                                                "[]".to_string()
+                                                            } else {
+                                                                format!("[{}]", rec.tags.join(", "))
+                                                            };
+                                                            // NOTE: meta intentionally not displayed (privacy).
+                                                            app.push_msg(ChatMessage::System(format!(
+                                                                "  {} {} {}", ts, tags, content
+                                                            )));
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to query memory '{}': {}", namespace, e
+                                                    ))),
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
@@ -1091,6 +1159,7 @@ pub async fn run(
                                         CommandAction::ExtensionsConfig { .. } => {}
                                         CommandAction::ExtensionsTrust(_) => {}
                                         CommandAction::ExtensionsAudit { .. } => {}
+                                        CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
                                     }
                                 } else {

@@ -305,6 +305,6 @@ Additional tests should be added per capability, especially E2E fixture extensio
 - Slice R (Provider config UX) — landed.
 - Slice S (Provider trust + audit) — landed.
 - Slice T (Unified capability surface) — landed: expanded health states, restart backoff, capability snapshot, shared validation helpers.
-- Slice U (Local memory/indexing) — pending.
+- Slice U (Local memory) — partial: append/query store and protocol landed; indexer + shared namespaces deferred.
 - Slice V (Voice sidecar integration) — pending (voice plugin already lives in `synaps-skills`).
 - Slice W (Subagent/workflow integration) — pending.
