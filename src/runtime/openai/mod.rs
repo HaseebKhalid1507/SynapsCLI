@@ -123,6 +123,16 @@ pub async fn try_route(
             }) else {
                 return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
             };
+            // Per-provider trust gate: a disabled provider must not be invoked.
+            // The check runs before any IPC and we DO NOT silently fall back to
+            // built-in routing — instead return a clear routing error.
+            let trust = crate::extensions::trust::load_trust_state().unwrap_or_default();
+            if !crate::extensions::trust::is_provider_enabled(&trust, &provider_runtime_id) {
+                return Some(Err(format!(
+                    "Provider '{}' is disabled by user trust settings",
+                    provider_runtime_id
+                ).into()));
+            }
             if cancel.is_cancelled() {
                 return Some(Err("operation canceled".into()));
             }

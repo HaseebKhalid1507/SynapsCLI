@@ -599,6 +599,89 @@ async fn extension_provider_complete_routes_to_process() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_disabled_in_trust_state_blocks_route() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    fs::write(home.path().join("config"), "extension.provider-trust-test.prefix = echo\n").unwrap();
+
+    // Use a fixture that records every invocation, so we can prove it was NOT called.
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/provider_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(hook_bus)));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
+
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["providers.register".to_string()],
+        hooks: vec![],
+        config: vec![ExtensionConfigEntry {
+            key: "prefix".to_string(),
+            description: None,
+            required: true,
+            default: None,
+            secret_env: None,
+        }],
+    };
+    manager
+        .write()
+        .await
+        .load_with_cwd("provider-trust-test", &manifest, Some(plugin_dir.path().to_path_buf()))
+        .await
+        .unwrap();
+
+    // Persist a trust state that disables this provider.
+    let mut trust = synaps_cli::extensions::trust::ProviderTrustState::default();
+    synaps_cli::extensions::trust::disable_provider(
+        &mut trust,
+        "provider-trust-test:echo",
+        Some("user disabled".into()),
+    );
+    synaps_cli::extensions::trust::save_trust_state(&trust).expect("save trust state");
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let tools = std::sync::Arc::new(Vec::new());
+    let result = synaps_cli::runtime::openai::try_route(
+        "provider-trust-test:echo:echo-small",
+        &reqwest::Client::new(),
+        &tools,
+        &None,
+        &[serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]})],
+        &tx,
+        None,
+        None,
+        0,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect("route returned Some");
+
+    let err = result.expect_err("disabled provider should error out instead of completing");
+    let msg = err.to_string();
+    assert!(msg.contains("disabled"), "error should mention disabled: {msg}");
+    assert!(
+        msg.contains("provider-trust-test:echo"),
+        "error should reference the runtime_id: {msg}"
+    );
+
+    // Provider extension fixture would echo the user text on success. Asserting that
+    // the result is an Err (above) is sufficient proof that the provider extension's
+    // provider.complete was NOT executed — the disabled trust check short-circuits
+    // before any IPC.
+
+    manager.write().await.shutdown_all().await;
+    synaps_cli::runtime::openai::clear_extension_manager_for_routing();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn extension_provider_tool_use_is_executed_by_router_before_final_response() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();

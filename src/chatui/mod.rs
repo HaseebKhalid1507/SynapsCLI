@@ -722,6 +722,7 @@ pub async fn run(
                                         let manager = ext_mgr_shared.read().await;
                                         let statuses = manager.statuses().await;
                                         let provider_summaries = manager.provider_summaries();
+                                        let trust_view = manager.provider_trust_view();
                                         if statuses.is_empty() {
                                             app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
                                         } else {
@@ -734,10 +735,15 @@ pub async fn run(
                                                     status.restart_count
                                                 )));
                                                 for provider in provider_summaries.iter().filter(|p| p.runtime_id.starts_with(&format!("{}:", status.id))) {
+                                                    let disabled_suffix = match trust_view.get(&provider.runtime_id) {
+                                                        Some(false) => " [disabled]",
+                                                        _ => "",
+                                                    };
                                                     app.push_msg(ChatMessage::System(format!(
-                                                        "    provider {} — {}",
+                                                        "    provider {} — {}{}",
                                                         provider.runtime_id,
-                                                        provider.display_name
+                                                        provider.display_name,
+                                                        disabled_suffix
                                                     )));
                                                     for model in &provider.models {
                                                         let mut badges: Vec<&str> = Vec::new();

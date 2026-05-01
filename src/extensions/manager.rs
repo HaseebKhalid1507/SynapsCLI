@@ -380,6 +380,23 @@ impl ExtensionManager {
         self.providers.summaries()
     }
 
+    /// Return a `runtime_id -> enabled` map for every registered provider, computed
+    /// from the persisted trust state. Providers without an entry default to
+    /// enabled. If the trust state cannot be loaded, all providers are reported
+    /// as enabled (fail-open default matches `load_trust_state().unwrap_or_default()`).
+    pub fn provider_trust_view(&self) -> std::collections::BTreeMap<String, bool> {
+        let trust = crate::extensions::trust::load_trust_state().unwrap_or_default();
+        self.providers
+            .list()
+            .into_iter()
+            .map(|p| {
+                let enabled =
+                    crate::extensions::trust::is_provider_enabled(&trust, &p.runtime_id);
+                (p.runtime_id.clone(), enabled)
+            })
+            .collect()
+    }
+
     /// Compute config diagnostics for a loaded extension by id.
     /// Returns `None` if the extension is not loaded.
     pub fn config_diagnostics(&self, id: &str) -> Option<ExtensionConfigDiagnostics> {
@@ -739,5 +756,13 @@ mod tests {
         mgr.shutdown_all().await;
         // After shutdown, manifest config storage is cleared.
         assert!(mgr.config_diagnostics("config-diag-test").is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_trust_view_is_empty_for_no_providers() {
+        let bus = Arc::new(HookBus::new());
+        let mgr = ExtensionManager::new(bus);
+        let view = mgr.provider_trust_view();
+        assert!(view.is_empty());
     }
 }
