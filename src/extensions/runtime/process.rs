@@ -1061,6 +1061,43 @@ impl ProcessExtension {
     pub async fn unsubscribe_notifications(&self) {
         self.inbox.notification_sink.lock().await.take();
     }
+
+    /// Forward one notification frame received during `provider.stream`.
+    ///
+    /// - Frames whose method is not `provider.stream.event` are ignored (logged at trace).
+    /// - Malformed event params are logged at warn and skipped (do not abort the call).
+    /// - If the caller's sink has been closed, sets `sink_open = false` and stops forwarding,
+    ///   but the in-flight request is still allowed to complete.
+    fn forward_provider_stream_frame(
+        extension_id: &str,
+        sink: &mpsc::UnboundedSender<ProviderStreamEvent>,
+        sink_open: &mut bool,
+        frame: NotificationFrame,
+    ) {
+        if frame.method != "provider.stream.event" {
+            tracing::trace!(
+                extension = %extension_id,
+                method = %frame.method,
+                "Ignoring non-stream notification during provider.stream",
+            );
+            return;
+        }
+        match parse_provider_stream_event(&frame.params) {
+            Ok(event) => {
+                if *sink_open && sink.send(event).is_err() {
+                    *sink_open = false;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extension = %extension_id,
+                    error = %error,
+                    params = %frame.params,
+                    "Skipping malformed provider.stream.event notification",
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1091,8 +1128,62 @@ impl ExtensionHandler for ProcessExtension {
         Ok(result)
     }
 
-    async fn provider_stream(&self, _params: ProviderCompleteParams) -> Result<(), String> {
-        Err("provider.stream is reserved but not implemented in this Synaps version".to_string())
+    async fn provider_stream(
+        &self,
+        params: ProviderCompleteParams,
+        sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+    ) -> Result<ProviderCompleteResult, String> {
+        // Subscribe BEFORE issuing the request so we don't miss early
+        // notifications that may arrive before `call(...)` even starts polling.
+        let mut rx = self.subscribe_notifications().await;
+        let params_value =
+            serde_json::to_value(params).map_err(|e| e.to_string())?;
+
+        let extension_id = self.id.clone();
+        let stream_future = async {
+            let mut call_fut = Box::pin(self.call("provider.stream", params_value));
+            let mut sink_open = true;
+            let response = loop {
+                tokio::select! {
+                    response = &mut call_fut => break response,
+                    Some(frame) = rx.recv() => {
+                        Self::forward_provider_stream_frame(
+                            &extension_id, &sink, &mut sink_open, frame,
+                        );
+                    }
+                }
+            };
+            // Response received: clear the inbox's notification sender so the
+            // receiver yields `None` once buffered frames are drained, then
+            // flush any remaining notifications before returning.
+            self.unsubscribe_notifications().await;
+            while let Some(frame) = rx.recv().await {
+                Self::forward_provider_stream_frame(
+                    &extension_id, &sink, &mut sink_open, frame,
+                );
+            }
+            response
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            stream_future,
+        )
+        .await;
+
+        // Belt-and-braces: ensure the subscription is cleared on timeout too.
+        self.unsubscribe_notifications().await;
+
+        let value = outcome
+            .map_err(|_| format!("Extension '{}' provider.stream timed out", self.id))??;
+
+        let result: ProviderCompleteResult = serde_json::from_value(value)
+            .map_err(|e| {
+                format!("Invalid provider.stream response from extension '{}': {}", self.id, e)
+            })?;
+        // NOTE: empty `content` is permitted for streaming — output may have
+        // been delivered entirely via TextDelta notifications.
+        Ok(result)
     }
 
     async fn handle(&self, event: &HookEvent) -> HookResult {

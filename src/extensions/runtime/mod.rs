@@ -5,7 +5,7 @@ pub mod process;
 use async_trait::async_trait;
 use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
-use self::process::{ProviderCompleteParams, ProviderCompleteResult};
+use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent};
 
 /// Health state for an extension handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +45,18 @@ pub trait ExtensionHandler: Send + Sync {
     }
 
     /// Stream a chat request through an extension-provided model provider.
-    async fn provider_stream(&self, _params: ProviderCompleteParams) -> Result<(), String> {
-        Err("provider.stream is reserved but not implemented in this Synaps version".to_string())
+    ///
+    /// The handler must forward `provider.stream.event` notifications to `sink`
+    /// in order. The returned `ProviderCompleteResult` is the final aggregated
+    /// response (so callers that don't need streaming can use it as the final
+    /// state). Implementations that don't support streaming should return
+    /// `Err("provider.stream is not supported by this extension")`.
+    async fn provider_stream(
+        &self,
+        _params: ProviderCompleteParams,
+        _sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+    ) -> Result<ProviderCompleteResult, String> {
+        Err("provider.stream is not supported by this extension".to_string())
     }
 
     /// Gracefully shut down the extension.
