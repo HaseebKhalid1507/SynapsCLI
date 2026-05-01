@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Recent (Dev Branch)
+- **Extension System** — process-based JSON-RPC hooks (before_message, before_tool_call, after_tool_call, on_session_start, on_session_end)
+  - Tool-specific filtering: hooks can target specific tools
+  - Context injection via HookResult::Inject
+  - Permission-gated with 6 permission types
+  - Drop-in plugin support
+  - Silent loading (only show failures)
+- **Watcher notify_inbox hook** — event bus notification on agent completion
+  - Config option: `[hooks] notify_inbox = true` in watcher agent config
+  - Drops JSON events into `~/.synaps-cli/inbox/` when agents complete
+  - Works in both 'once' and 'deploy' modes
+  - Event payload includes agent name, session number, elapsed time, exit code, timestamp
+- **Table rendering improvements**
+  - Cells wrap instead of truncating with ellipsis
+  - Inline markdown (bold/italic/code) rendered in table cells
+  - Smarter column shrinking — preserves narrow columns
+- **Structural refactoring** — improved code organization
+  - `catalog.rs` → `catalog/` directory with per-provider modules
+  - `palettes.rs` → `palettes/` directory with per-palette files
+  - `tools/subagent*.rs` → `tools/subagent/` directory
+  - `tools/tests.rs` → distributed inline test modules per tool
+  - `runtime/api.rs` split into `api.rs` + `api_sync.rs` + `request.rs`
+  - `chatui/mod.rs` helpers extracted to `helpers.rs` + `lifecycle.rs`
+- **UTF-8 char boundary panics** — multiple fixes for multi-byte character handling
+  - Hook output truncation now finds valid char boundaries
+  - Bash output highlighter fixed for emoji/CJK characters
+  - Additional edge cases found by PR review
+- **Hook system improvements**
+  - Handle HookResult::Block in before_message hook
+  - Set tool_runtime_name in all before_tool_call hook paths
+  - Track truncation explicitly in bash tool instead of string matching
+
 ### Added
 - **Multi-Provider Runtime** — OpenAI-compatible provider engine
   - 17 providers: Groq, Cerebras, NVIDIA NIM, OpenRouter, Google AI Studio, DeepInfra, HuggingFace, Fireworks, Hyperbolic, Scaleway, SiliconFlow, Together, Chutes, Codestral, Perplexity, OVHcloud, + Local (Ollama/LM Studio/vLLM)
