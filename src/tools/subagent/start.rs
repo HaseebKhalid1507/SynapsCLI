@@ -160,7 +160,18 @@ impl Tool for SubagentStartTool {
 
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
-                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    let tools = if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
+                        let mgr = ext_mgr.read().await;
+                        if let Some(shared) = mgr.tools_shared() {
+                            let extension_tools = shared.read().await;
+                            crate::ToolRegistry::without_subagent_with_extensions(&*extension_tools)
+                        } else {
+                            crate::ToolRegistry::without_subagent()
+                        }
+                    } else {
+                        crate::ToolRegistry::without_subagent()
+                    };
+                    runtime.set_tools(tools);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
