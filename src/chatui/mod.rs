@@ -29,6 +29,7 @@ use lifecycle::{setup_terminal, teardown_terminal};
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, resolve_session};
 use synaps_cli::core::compaction::compact_conversation;
+use synaps_cli::core::session_index::SessionIndexRecord;
 use crossterm::event::EventStream;
 use futures::StreamExt as _;
 use ratatui::{
@@ -473,6 +474,14 @@ pub async fn run(
 
     // ═══ HOOK: on_session_start ═══
     {
+        let mut index_record = SessionIndexRecord::start(&app.session.id);
+        index_record.model = Some(app.session.model.clone());
+        index_record.profile = synaps_cli::core::config::get_profile();
+        index_record.cwd = std::env::current_dir().ok();
+        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
+            tracing::warn!("failed to append session start index record: {}", err);
+        }
+
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
@@ -1486,6 +1495,12 @@ let display_text = app.user_display_text_for_submission(&input);
 
     // ═══ HOOK: on_session_end ═══
     {
+        let mut index_record = SessionIndexRecord::end(&app.session.id);
+        index_record.turns = Some(app.api_messages.len());
+        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
+            tracing::warn!("failed to append session end index record: {}", err);
+        }
+
         let transcript = Some(app.api_messages.clone());
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id, transcript);
         let _ = runtime.hook_bus().emit(&hook_event).await;
