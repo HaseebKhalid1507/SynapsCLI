@@ -236,7 +236,11 @@ pub async fn run(command: String, args: Vec<String>) {
                     std::process::exit(1);
                 });
                 let code = status.code().unwrap_or(1);
+                let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
                 log(&format!("[{}] exited with code {}", name, code));
+                if code == 0 && agent.config.hooks.notify_inbox {
+                    supervisor::notify_inbox_completion(name, 1, elapsed, code);
+                }
                 std::process::exit(code);
             }
         }
