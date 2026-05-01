@@ -21,3 +21,4 @@ pub mod runtime;
 pub mod manager;
 pub mod config;
 pub mod providers;
+pub mod trust;
