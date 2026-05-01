@@ -131,6 +131,9 @@ pub(crate) struct App {
     /// Holds the sidecar manager + UI status; the event loop drains its
     /// event stream and updates `status` accordingly.
     pub(crate) voice: Option<super::voice::VoiceUiState>,
+    /// True while a `/voice download <id>` is in flight; second requests
+    /// are rejected with a system message.
+    pub(crate) voice_download_in_flight: bool,
     /// Live keybind registry — held so /settings can hot-swap voice toggle.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
@@ -209,6 +212,7 @@ impl App {
             visible_line_range: None,
             suppress_paste_until: None,
             voice: None,
+            voice_download_in_flight: false,
             keybinds: None,
         }
     }

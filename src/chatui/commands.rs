@@ -87,6 +87,12 @@ pub(super) enum CommandAction {
     VoiceToggle,
     /// Show voice subsystem status (`/voice status`).
     VoiceStatus,
+    /// Print the whisper.cpp model catalog with installed status (`/voice models`).
+    VoiceModels,
+    /// Download a model from the catalog by id (`/voice download <id>`).
+    VoiceDownload { id: String },
+    /// Print `/voice` subcommand help (`/voice help`).
+    VoiceHelp,
 }
 
 #[derive(Debug, Clone)]
@@ -608,9 +614,28 @@ pub(super) async fn handle_command(
             return match trimmed {
                 "" | "toggle" => CommandAction::VoiceToggle,
                 "status" => CommandAction::VoiceStatus,
+                "models" => CommandAction::VoiceModels,
+                "help" => CommandAction::VoiceHelp,
+                "download" => {
+                    app.push_msg(ChatMessage::Error(
+                        "usage: /voice download <id> (run `/voice models` to list)".to_string(),
+                    ));
+                    CommandAction::None
+                }
+                other if other.starts_with("download ") => {
+                    let id = other["download ".len()..].trim();
+                    if id.is_empty() {
+                        app.push_msg(ChatMessage::Error(
+                            "usage: /voice download <id> (run `/voice models` to list)".to_string(),
+                        ));
+                        CommandAction::None
+                    } else {
+                        CommandAction::VoiceDownload { id: id.to_string() }
+                    }
+                }
                 other => {
                     app.push_msg(ChatMessage::Error(format!(
-                        "unknown /voice subcommand: '{}' (expected 'toggle' or 'status')",
+                        "unknown /voice subcommand: '{}' (expected toggle | status | models | download <id> | help — try `/voice help`)",
                         other
                     )));
                     CommandAction::None
@@ -677,9 +702,79 @@ pub(super) fn handle_streaming_command(
     }
 }
 
+/// Resolve the local whisper model directory (`~/.synaps-cli/models/whisper`).
+/// Mirrors `chatui::settings::mod::whisper_model_options`'s derivation.
+pub(crate) fn voice_models_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".synaps-cli/models/whisper")
+}
+
+/// Render the whisper.cpp catalog as an aligned plain-text table, marking
+/// each entry as installed (✓) or missing (✗) by checking
+/// `models_dir.join(entry.filename).exists()`.
+pub(crate) fn render_models_table(models_dir: &std::path::Path) -> String {
+    use synaps_cli::voice::models::CATALOG;
+
+    // Column widths derived from the catalog (with header minimums).
+    let id_w = CATALOG.iter().map(|e| e.id.len()).max().unwrap_or(2).max("ID".len());
+    let file_w = CATALOG
+        .iter()
+        .map(|e| e.filename.len())
+        .max()
+        .unwrap_or(4)
+        .max("FILE".len());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Whisper model catalog (downloads to {}/):\n\n",
+        models_dir.display()
+    ));
+    out.push_str(&format!(
+        "  {:<id_w$}  {:<file_w$}  {:>7}  {:<5}  STATUS\n",
+        "ID",
+        "FILE",
+        "SIZE",
+        "LANG",
+        id_w = id_w,
+        file_w = file_w,
+    ));
+    for entry in CATALOG {
+        let installed = models_dir.join(entry.filename).exists();
+        let status = if installed { "✓ installed" } else { "✗ not installed" };
+        let lang = if entry.multilingual { "multi" } else { "en" };
+        let size = format!("{} MB", entry.size_mb);
+        out.push_str(&format!(
+            "  {:<id_w$}  {:<file_w$}  {:>7}  {:<5}  {}\n",
+            entry.id,
+            entry.filename,
+            size,
+            lang,
+            status,
+            id_w = id_w,
+            file_w = file_w,
+        ));
+    }
+    out.push_str("\nRun `/voice download <id>` to install. Switch active model in `/settings → Voice → STT model`.");
+    out
+}
+
+/// One-screen help text for `/voice` subcommands.
+pub(crate) fn voice_help_text() -> String {
+    let mut s = String::new();
+    s.push_str("/voice subcommands:\n\n");
+    s.push_str("  /voice                — toggle dictation on/off (same as `/voice toggle`)\n");
+    s.push_str("  /voice toggle         — toggle dictation on/off\n");
+    s.push_str("  /voice status         — show voice subsystem status\n");
+    s.push_str("  /voice models         — list whisper.cpp model catalog and installed status\n");
+    s.push_str("  /voice download <id>  — download a model from HuggingFace\n");
+    s.push_str("  /voice help           — show this help\n\n");
+    s.push_str("Toggle key configurable in /settings → Voice.");
+    s
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, render_models_table, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1117,5 +1212,92 @@ mod tests {
     #[test]
     fn voice_is_in_builtin_commands() {
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
+    }
+
+    #[tokio::test]
+    async fn voice_models_command_parses() {
+        match invoke_voice("models").await {
+            CommandAction::VoiceModels => {}
+            _ => panic!("expected VoiceModels for `models` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_help_command_parses() {
+        match invoke_voice("help").await {
+            CommandAction::VoiceHelp => {}
+            _ => panic!("expected VoiceHelp for `help` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_download_with_id_parses() {
+        match invoke_voice("download base").await {
+            CommandAction::VoiceDownload { id } => assert_eq!(id, "base"),
+            _ => panic!("expected VoiceDownload for `download base`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_download_without_id_errors() {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "download",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        )
+        .await;
+        matches!(action, CommandAction::None)
+            .then_some(())
+            .expect("expected CommandAction::None for bare `download`");
+        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("usage: /voice download")));
+        assert!(pushed_error, "expected a usage error message to be pushed");
+    }
+
+    #[tokio::test]
+    async fn voice_download_strips_extra_whitespace() {
+        match invoke_voice("download   base.en").await {
+            CommandAction::VoiceDownload { id } => assert_eq!(id, "base.en"),
+            _ => panic!("expected VoiceDownload for whitespace-padded id"),
+        }
+    }
+
+    #[test]
+    fn voice_models_table_includes_all_catalog_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = render_models_table(tmp.path());
+        for entry in synaps_cli::voice::models::CATALOG {
+            assert!(
+                table.contains(entry.id),
+                "table missing id {}: {}",
+                entry.id,
+                table
+            );
+        }
+    }
+
+    #[test]
+    fn voice_models_table_marks_installed_with_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ggml-tiny.bin"), b"x").unwrap();
+        let table = render_models_table(tmp.path());
+        let tiny_line = table
+            .lines()
+            .find(|l: &&str| l.contains("ggml-tiny.bin") && !l.contains("ggml-tiny.en.bin"))
+            .expect("tiny line present");
+        assert!(tiny_line.contains('✓'), "expected ✓ on tiny line: {tiny_line}");
+        let base_line = table
+            .lines()
+            .find(|l: &&str| l.contains("ggml-base.bin"))
+            .expect("base line present");
+        assert!(base_line.contains('✗'), "expected ✗ on base line: {base_line}");
     }
 }

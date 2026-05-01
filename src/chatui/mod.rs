@@ -1170,6 +1170,73 @@ pub async fn run(
                                         };
                                         app.push_msg(ChatMessage::System(line));
                                     }
+
+                                    CommandAction::VoiceModels => {
+                                        let dir = commands::voice_models_dir();
+                                        app.push_msg(ChatMessage::System(commands::render_models_table(&dir)));
+                                    }
+
+                                    CommandAction::VoiceHelp => {
+                                        app.push_msg(ChatMessage::System(commands::voice_help_text()));
+                                    }
+
+                                    CommandAction::VoiceDownload { id } => {
+                                        match synaps_cli::voice::models::find_by_id(&id) {
+                                            None => {
+                                                let valid: Vec<&str> = synaps_cli::voice::models::CATALOG
+                                                    .iter()
+                                                    .map(|e| e.id)
+                                                    .collect();
+                                                app.push_msg(ChatMessage::Error(format!(
+                                                    "unknown model id '{}'. Valid: {}",
+                                                    id,
+                                                    valid.join(", ")
+                                                )));
+                                            }
+                                            Some(entry) => {
+                                                if app.voice_download_in_flight {
+                                                    app.push_msg(ChatMessage::System(
+                                                        "A model download is already in progress.".to_string(),
+                                                    ));
+                                                } else {
+                                                    app.voice_download_in_flight = true;
+                                                    let models_dir = commands::voice_models_dir();
+                                                    let filename = entry.filename.to_string();
+                                                    let size_mb = entry.size_mb;
+                                                    // Pragmatic shortcut: await the download inline. The
+                                                    // start + completion lines are emitted as one combined
+                                                    // system message at the end (UI is unresponsive during
+                                                    // the transfer; richer per-chunk progress is C2's job).
+                                                    let (tx, _rx) = tokio::sync::watch::channel(
+                                                        synaps_cli::voice::download::DownloadProgress::default(),
+                                                    );
+                                                    let entry_static = entry;
+                                                    let result = synaps_cli::voice::download::download_model(
+                                                        entry_static,
+                                                        &models_dir,
+                                                        tx,
+                                                        false,
+                                                    )
+                                                    .await;
+                                                    app.voice_download_in_flight = false;
+                                                    match result {
+                                                        Ok(_path) => {
+                                                            app.push_msg(ChatMessage::System(format!(
+                                                                "Downloading {} ({} MB) from huggingface.co...\n✓ Downloaded {} ({} MB). Switch via /settings → Voice → STT model.",
+                                                                filename, size_mb, filename, size_mb
+                                                            )));
+                                                        }
+                                                        Err(err) => {
+                                                            app.push_msg(ChatMessage::Error(format!(
+                                                                "voice model download failed ({}): {}",
+                                                                filename, err
+                                                            )));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -1273,6 +1340,9 @@ pub async fn run(
                                         CommandAction::Ping => {}
                                         CommandAction::VoiceToggle => {}
                                         CommandAction::VoiceStatus => {}
+                                        CommandAction::VoiceModels => {}
+                                        CommandAction::VoiceDownload { .. } => {}
+                                        CommandAction::VoiceHelp => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
