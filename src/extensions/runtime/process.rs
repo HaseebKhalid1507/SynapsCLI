@@ -17,11 +17,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use super::{ExtensionHandler, ExtensionHealth};
+use super::{ExtensionHandler, ExtensionHealth, RestartPolicy};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION;
-
-const MAX_RESTARTS: usize = 3;
 
 #[derive(Serialize)]
 struct JsonRpcRequest {
@@ -460,6 +458,8 @@ pub struct ProcessExtension {
     call_lock: Arc<Mutex<()>>,
     next_id: AtomicU64,
     restart_count: AtomicUsize,
+    /// Restart policy controlling exponential backoff and budget.
+    pub(crate) restart_policy: RestartPolicy,
     /// Shared mailbox between the reader task and request callers. Persists
     /// across process restarts so that any active notification subscriber
     /// survives a restart-on-error.
@@ -492,8 +492,15 @@ impl ProcessExtension {
             call_lock: Arc::new(Mutex::new(())),
             next_id: AtomicU64::new(1),
             restart_count: AtomicUsize::new(0),
+            restart_policy: RestartPolicy::default(),
             inbox,
         })
+    }
+
+    /// Override the restart policy. Intended for tests.
+    pub fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
+        self.restart_policy = policy;
+        self
     }
 
     async fn spawn_state(
@@ -873,11 +880,12 @@ impl ProcessExtension {
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if attempted > MAX_RESTARTS {
+        let max_attempts = self.restart_policy.max_attempts;
+        if attempted > max_attempts as usize {
             *state = None;
             return Err(format!(
                 "Extension '{}' exceeded restart limit ({})",
-                self.id, MAX_RESTARTS,
+                self.id, max_attempts,
             ));
         }
 
@@ -891,12 +899,23 @@ impl ProcessExtension {
             .fail_all_pending("transport closed: process restarting")
             .await;
 
+        let delay = self
+            .restart_policy
+            .delay_for_attempt(attempted as u32)
+            .unwrap_or_default();
+
         tracing::warn!(
             extension = %self.id,
             attempt = attempted,
-            max_attempts = MAX_RESTARTS,
+            max_attempts = max_attempts,
+            delay_ms = delay.as_millis() as u64,
             "Restarting extension process after transport failure",
         );
+
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
         *state = Some(Self::spawn_state(
             &self.id,
             &self.command,
@@ -1252,12 +1271,22 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn health(&self) -> ExtensionHealth {
-        if self.restart_count.load(Ordering::Relaxed) > MAX_RESTARTS {
+        let count = self.restart_count.load(Ordering::Relaxed);
+        let max = self.restart_policy.max_attempts as usize;
+        if count >= max {
             ExtensionHealth::Failed
-        } else if self.restart_count.load(Ordering::Relaxed) > 0 {
-            ExtensionHealth::Restarting
+        } else if count > 0 {
+            // Within budget. If the state slot is currently empty, we're
+            // mid-restart; otherwise the process is alive but has previously
+            // crashed at least once.
+            let state_alive = self.state.try_lock().map(|g| g.is_some()).unwrap_or(true);
+            if state_alive {
+                ExtensionHealth::Degraded
+            } else {
+                ExtensionHealth::Restarting
+            }
         } else {
-            ExtensionHealth::Healthy
+            ExtensionHealth::Running
         }
     }
 }
@@ -1433,5 +1462,37 @@ mod stream_event_tests {
     fn error_empty_message_errors() {
         let v = json!({"type": "error", "message": ""});
         assert!(parse_provider_stream_event(&v).is_err());
+    }
+}
+
+#[cfg(test)]
+mod restart_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restart_policy_default_max_attempts_is_3() {
+        // Use a command that won't actually run; we only need the struct.
+        // Since `spawn` actually launches the process, use a trivial echoer
+        // and immediately shut it down. Falls back to /bin/cat which reads
+        // from stdin and stays alive.
+        let ext = ProcessExtension::spawn("policy-test", "/bin/cat", &[])
+            .await
+            .expect("spawn /bin/cat");
+        assert_eq!(ext.restart_policy.max_attempts, 3);
+        ext.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_restart_policy_overrides_default() {
+        let ext = ProcessExtension::spawn("policy-test-override", "/bin/cat", &[])
+            .await
+            .expect("spawn /bin/cat");
+        let custom = RestartPolicy {
+            max_attempts: 7,
+            ..RestartPolicy::default()
+        };
+        let ext = ext.with_restart_policy(custom);
+        assert_eq!(ext.restart_policy.max_attempts, 7);
+        ext.shutdown().await;
     }
 }

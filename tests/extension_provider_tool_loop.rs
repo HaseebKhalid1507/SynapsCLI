@@ -48,7 +48,7 @@ impl ExtensionHandler for ToolThenTextProvider {
 
     async fn shutdown(&self) {}
 
-    async fn health(&self) -> ExtensionHealth { ExtensionHealth::Healthy }
+    async fn health(&self) -> ExtensionHealth { ExtensionHealth::Running }
 }
 
 struct EchoTool;

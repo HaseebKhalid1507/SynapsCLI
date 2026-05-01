@@ -1,6 +1,9 @@
 //! Extension runtime trait and registry.
 
 pub mod process;
+pub mod restart;
+
+pub use restart::RestartPolicy;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -10,18 +13,49 @@ use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStre
 /// Health state for an extension handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionHealth {
-    Healthy,
+    /// Manifest validated, process spawned, but `initialize` not yet completed.
+    Loaded,
+    /// Manifest failed validation — the extension never started.
+    FailedValidation,
+    /// `initialize` rpc failed — the extension started but couldn't capability-handshake.
+    FailedInitialize,
+    /// Healthy and serving requests.
+    Running,
+    /// Process restarting after transport failure but within restart budget.
     Restarting,
+    /// Running, but at least one recent operation failed (e.g. hook timeout).
+    Degraded,
+    /// Permanent failure — restart budget exhausted or unrecoverable error.
     Failed,
 }
 
 impl ExtensionHealth {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Healthy => "healthy",
+            Self::Loaded => "loaded",
+            Self::FailedValidation => "failed_validation",
+            Self::FailedInitialize => "failed_initialize",
+            Self::Running => "running",
             Self::Restarting => "restarting",
+            Self::Degraded => "degraded",
             Self::Failed => "failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::ExtensionHealth;
+
+    #[test]
+    fn as_str_covers_all_variants() {
+        assert_eq!(ExtensionHealth::Loaded.as_str(), "loaded");
+        assert_eq!(ExtensionHealth::FailedValidation.as_str(), "failed_validation");
+        assert_eq!(ExtensionHealth::FailedInitialize.as_str(), "failed_initialize");
+        assert_eq!(ExtensionHealth::Running.as_str(), "running");
+        assert_eq!(ExtensionHealth::Restarting.as_str(), "restarting");
+        assert_eq!(ExtensionHealth::Degraded.as_str(), "degraded");
+        assert_eq!(ExtensionHealth::Failed.as_str(), "failed");
     }
 }
 
@@ -64,7 +98,7 @@ pub trait ExtensionHandler: Send + Sync {
 
     /// Current health state of this handler.
     async fn health(&self) -> ExtensionHealth {
-        ExtensionHealth::Healthy
+        ExtensionHealth::Running
     }
 
     /// Number of transport restarts observed by this handler.
