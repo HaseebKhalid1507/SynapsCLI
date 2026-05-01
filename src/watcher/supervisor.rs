@@ -1,5 +1,28 @@
 use super::*;
 
+/// Drop a completion event into ~/.synaps-cli/inbox/ for the event bus.
+fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
+    let inbox_dir = synaps_cli::config::base_dir().join("inbox");
+    let _ = std::fs::create_dir_all(&inbox_dir);
+
+    let event = serde_json::json!({
+        "type": "agent_complete",
+        "agent": agent_name,
+        "session": session_count,
+        "elapsed_secs": elapsed_secs,
+        "exit_code": exit_code,
+        "message": format!("Agent '{}' completed session #{} ({:.0}s)", agent_name, session_count, elapsed_secs),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let filename = format!("watcher-{}-{}.json", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let path = inbox_dir.join(&filename);
+    if let Ok(body) = serde_json::to_string_pretty(&event) {
+        let _ = std::fs::write(&path, body);
+        log(&format!("[{}] completion event dropped to inbox", agent_name));
+    }
+}
+
 /// Spawn an agent worker process
 pub(crate) async fn spawn_agent(agent: &mut ManagedAgent, trigger_context: &str) -> Result<(), String> {
     let bin = agent_binary();
@@ -244,6 +267,9 @@ pub(crate) fn spawn_watch_task(
                                 if code == 0 {
                                     log(&format!("[{}] session #{} completed cleanly ({:.0}s)", agent_name, agent.session_count, elapsed));
                                     agent.consecutive_crashes = 0;
+                                    if agent.config.hooks.notify_inbox {
+                                        notify_inbox_completion(&agent_name, agent.session_count, elapsed, code);
+                                    }
                                 } else {
                                     agent.consecutive_crashes += 1;
                                     log(&format!("[{}] session #{} crashed (code: {})", agent_name, agent.session_count, code));
@@ -398,6 +424,9 @@ pub(crate) async fn run_supervisor() {
                             if code == 0 {
                                 log(&format!("[{}] session #{} completed cleanly ({:.0}s)", name, agent.session_count, elapsed));
                                 agent.consecutive_crashes = 0;
+                                if agent.config.hooks.notify_inbox {
+                                    notify_inbox_completion(&name, agent.session_count, elapsed, code);
+                                }
                             } else if code == 2 {
                                 log(&format!("[{}] daily cost limit reached — pausing until midnight", name));
                                 agent.stopped = true;
