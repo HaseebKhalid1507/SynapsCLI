@@ -12,5 +12,6 @@
 //! Phase 2 extension contract — see
 //! `crate::extensions::runtime::process::VoiceCapabilityDeclaration`.
 
+pub mod discovery;
 pub mod manager;
 pub mod protocol;

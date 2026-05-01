@@ -15,6 +15,7 @@ mod plugins;
 mod models;
 mod helpers;
 mod lifecycle;
+mod voice;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -244,6 +245,18 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                }
+            }
+
+            // ── Voice sidecar events — fires when the voice manager emits ──
+            voice_event = async {
+                match app.voice.as_mut() {
+                    Some(v) => v.manager.next_event().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(event) = voice_event {
+                    self::voice::handle_event(&mut app, event);
                 }
             }
 
@@ -1090,6 +1103,65 @@ pub async fn run(
                                             ).await;
                                         });
                                     }
+
+                                    CommandAction::VoiceToggle => {
+                                        // First toggle: spawn the sidecar and start listening.
+                                        if app.voice.is_none() {
+                                            match self::voice::VoiceUiState::spawn_default().await {
+                                                Ok(state) => {
+                                                    app.voice = Some(state);
+                                                    app.push_msg(ChatMessage::System(
+                                                        "🎤 voice sidecar online — press the toggle again to stop and transcribe".to_string()
+                                                    ));
+                                                    if let Some(v) = app.voice.as_mut() {
+                                                        if let Err(err) = v.manager.press().await {
+                                                            v.status = self::voice::VoiceUiStatus::Error(err.to_string());
+                                                            app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    app.push_msg(ChatMessage::Error(format!("voice unavailable: {err}")));
+                                                }
+                                            }
+                                        } else {
+                                            // Subsequent toggle: flip between listening/idle.
+                                            let v = app.voice.as_mut().unwrap();
+                                            match v.status {
+                                                self::voice::VoiceUiStatus::Listening => {
+                                                    if let Err(err) = v.manager.release().await {
+                                                        app.push_msg(ChatMessage::Error(format!("voice release failed: {err}")));
+                                                    }
+                                                }
+                                                self::voice::VoiceUiStatus::Idle
+                                                | self::voice::VoiceUiStatus::Error(_) => {
+                                                    if let Err(err) = v.manager.press().await {
+                                                        app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                    }
+                                                }
+                                                self::voice::VoiceUiStatus::Transcribing => {
+                                                    app.push_msg(ChatMessage::System(
+                                                        "voice: still transcribing — wait for final transcript before toggling again".to_string()
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    CommandAction::VoiceStatus => {
+                                        let line = match app.voice.as_ref() {
+                                            Some(v) => v.status_line(),
+                                            None => match synaps_cli::voice::discovery::discover() {
+                                                Some(s) => format!(
+                                                    "voice: not yet started — sidecar available from plugin '{}' at {}",
+                                                    s.plugin_name,
+                                                    s.binary.display()
+                                                ),
+                                                None => "voice: no plugin provides a voice sidecar (install local-voice from synaps-skills)".to_string(),
+                                            },
+                                        };
+                                        app.push_msg(ChatMessage::System(line));
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -1191,6 +1263,8 @@ pub async fn run(
                                         CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
+                                        CommandAction::VoiceToggle => {}
+                                        CommandAction::VoiceStatus => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue

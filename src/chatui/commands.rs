@@ -83,6 +83,10 @@ pub(super) enum CommandAction {
     ExtensionsAudit { tail: Option<usize> },
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
+    /// Toggle voice dictation on/off (`/voice` or `/voice toggle`).
+    VoiceToggle,
+    /// Show voice subsystem status (`/voice status`).
+    VoiceStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +603,20 @@ pub(super) async fn handle_command(
         "ping" => {
             return CommandAction::Ping;
         }
+        "voice" => {
+            let trimmed = arg.trim();
+            return match trimmed {
+                "" | "toggle" => CommandAction::VoiceToggle,
+                "status" => CommandAction::VoiceStatus,
+                other => {
+                    app.push_msg(ChatMessage::Error(format!(
+                        "unknown /voice subcommand: '{}' (expected 'toggle' or 'status')",
+                        other
+                    )));
+                    CommandAction::None
+                }
+            };
+        }
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
@@ -715,6 +733,7 @@ mod tests {
                     keybinds: vec![],
                     compatibility: None,
                     extension: None,
+                    provides: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),
@@ -1044,5 +1063,59 @@ mod tests {
             }
             _ => panic!("expected ExtensionsMemory(Recent) with limit=Some(5)"),
         }
+    }
+
+    async fn invoke_voice(arg: &str) -> CommandAction {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_command(
+            "voice",
+            arg,
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn parse_voice_empty_arg_is_toggle() {
+        match invoke_voice("").await {
+            CommandAction::VoiceToggle => {}
+            other => panic!("expected VoiceToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_toggle_subcommand() {
+        match invoke_voice("toggle").await {
+            CommandAction::VoiceToggle => {}
+            _ => panic!("expected VoiceToggle for `toggle` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_status_subcommand() {
+        match invoke_voice("status").await {
+            CommandAction::VoiceStatus => {}
+            _ => panic!("expected VoiceStatus for `status` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_unknown_subcommand_is_none() {
+        match invoke_voice("frobnicate").await {
+            CommandAction::None => {}
+            _ => panic!("expected CommandAction::None for unknown subcommand"),
+        }
+    }
+
+    #[test]
+    fn voice_is_in_builtin_commands() {
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
     }
 }

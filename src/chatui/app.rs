@@ -127,6 +127,10 @@ pub(crate) struct App {
     /// immediately after MouseDown(Right). We suppress only within a short TTL
     /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
     pub(crate) suppress_paste_until: Option<std::time::Instant>,
+    /// Active voice dictation state (Some after the first /voice toggle).
+    /// Holds the sidecar manager + UI status; the event loop drains its
+    /// event stream and updates `status` accordingly.
+    pub(crate) voice: Option<super::voice::VoiceUiState>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -202,6 +206,7 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
+            voice: None,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
