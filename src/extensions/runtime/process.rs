@@ -177,6 +177,61 @@ pub async fn execute_provider_tool_use(
     })
 }
 
+pub async fn complete_provider_with_tools<F>(
+    handler: Arc<dyn ExtensionHandler>,
+    mut params: ProviderCompleteParams,
+    registry: &crate::ToolRegistry,
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    mut context_factory: F,
+    max_tool_output: usize,
+    max_iterations: usize,
+) -> Result<ProviderCompleteResult, String>
+where
+    F: FnMut() -> crate::ToolContext,
+{
+    let max_iterations = max_iterations.max(1);
+    for iteration in 0..max_iterations {
+        let result = handler.provider_complete(params.clone()).await?;
+        let tool_uses = extract_provider_tool_uses(&result.content)?;
+        if tool_uses.is_empty() {
+            return Ok(result);
+        }
+        if iteration + 1 == max_iterations {
+            return Err(format!(
+                "extension provider '{}' exceeded provider tool-use iteration limit ({})",
+                handler.id(),
+                max_iterations,
+            ));
+        }
+
+        let assistant_content = result.content.clone();
+        params.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": assistant_content,
+        }));
+
+        let mut tool_results = Vec::with_capacity(tool_uses.len());
+        for tool_use in tool_uses {
+            tool_results.push(execute_provider_tool_use(
+                registry,
+                hook_bus,
+                tool_use,
+                context_factory(),
+                max_tool_output,
+            ).await);
+        }
+        params.messages.push(serde_json::json!({
+            "role": "user",
+            "content": tool_results,
+        }));
+    }
+    Err(format!(
+        "extension provider '{}' exceeded provider tool-use iteration limit ({})",
+        handler.id(),
+        max_iterations,
+    ))
+}
+
 pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolUse>, String> {
     let mut tool_uses = Vec::new();
     for block in content {
