@@ -77,6 +77,17 @@ pub(super) enum CommandAction {
     ExtensionsStatus,
     /// Show extension config diagnostics. `None` = all loaded extensions.
     ExtensionsConfig { id: Option<String> },
+    /// Manage per-provider trust state.
+    ExtensionsTrust(ExtensionsTrustAction),
+    /// Show last N (or all) provider audit log entries.
+    ExtensionsAudit { tail: Option<usize> },
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtensionsTrustAction {
+    List,
+    Enable { runtime_id: String },
+    Disable { runtime_id: String, reason: Option<String> },
 }
 
 pub(super) async fn execute_command_action(
@@ -369,6 +380,8 @@ pub(super) async fn handle_command(
                 "/plugins — manage marketplaces and installed plugins",
                 "/extensions status — show loaded extension health",
                 "/extensions config [id] — show extension config diagnostics",
+                "/extensions trust [list|enable <id>|disable <id> [reason]] — manage provider trust",
+                "/extensions audit [N] — show last N provider audit log entries",
                 "/status — show account usage and reset times",
                 "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
@@ -455,9 +468,69 @@ pub(super) async fn handle_command(
                     }
                     return CommandAction::ExtensionsConfig { id: Some(rest.to_string()) };
                 }
+                "trust" => {
+                    if rest.is_empty() || rest == "list" {
+                        return CommandAction::ExtensionsTrust(ExtensionsTrustAction::List);
+                    }
+                    let mut tparts = rest.splitn(2, char::is_whitespace);
+                    let tsub = tparts.next().unwrap_or("");
+                    let trest = tparts.next().unwrap_or("").trim();
+                    match tsub {
+                        "enable" => {
+                            if trest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions trust enable <runtime_id>".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            return CommandAction::ExtensionsTrust(
+                                ExtensionsTrustAction::Enable { runtime_id: trest.to_string() },
+                            );
+                        }
+                        "disable" => {
+                            if trest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions trust disable <runtime_id> [reason]".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            let mut dparts = trest.splitn(2, char::is_whitespace);
+                            let runtime_id = dparts.next().unwrap_or("").to_string();
+                            let reason = dparts
+                                .next()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            return CommandAction::ExtensionsTrust(
+                                ExtensionsTrustAction::Disable { runtime_id, reason },
+                            );
+                        }
+                        other => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions trust [list|enable <id>|disable <id> [reason]] (unknown: {})",
+                                other
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
+                "audit" => {
+                    if rest.is_empty() {
+                        return CommandAction::ExtensionsAudit { tail: None };
+                    }
+                    match rest.parse::<usize>() {
+                        Ok(n) => return CommandAction::ExtensionsAudit { tail: Some(n) },
+                        Err(_) => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions audit [N] (not a number: {})",
+                                rest
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
                 other => {
                     app.push_msg(ChatMessage::System(format!(
-                        "usage: /extensions [status|config [id]] (unknown: {})",
+                        "usage: /extensions [status|config [id]|trust [list|enable <id>|disable <id> [reason]]|audit [N]] (unknown: {})",
                         other
                     )));
                     return CommandAction::None;
@@ -532,7 +605,7 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction};
+    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsTrustAction};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -820,6 +893,66 @@ mod tests {
         match invoke_extensions("config my-ext").await {
             CommandAction::ExtensionsConfig { id: Some(id) } => assert_eq!(id, "my-ext"),
             _ => panic!("expected ExtensionsConfig with id `my-ext`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_list() {
+        match invoke_extensions("trust").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::List) => {}
+            _ => panic!("expected ExtensionsTrust(List) for `trust`"),
+        }
+        match invoke_extensions("trust list").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::List) => {}
+            _ => panic!("expected ExtensionsTrust(List) for `trust list`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_enable() {
+        match invoke_extensions("trust enable plug:prov").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Enable { runtime_id }) => {
+                assert_eq!(runtime_id, "plug:prov");
+            }
+            _ => panic!("expected ExtensionsTrust(Enable)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_disable_with_reason() {
+        match invoke_extensions("trust disable plug:prov untrusted vendor").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+                assert_eq!(runtime_id, "plug:prov");
+                assert_eq!(reason.as_deref(), Some("untrusted vendor"));
+            }
+            _ => panic!("expected ExtensionsTrust(Disable) with reason"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_disable_no_reason() {
+        match invoke_extensions("trust disable plug:prov").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+                assert_eq!(runtime_id, "plug:prov");
+                assert!(reason.is_none(), "expected no reason");
+            }
+            _ => panic!("expected ExtensionsTrust(Disable) without reason"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_audit_no_tail() {
+        match invoke_extensions("audit").await {
+            CommandAction::ExtensionsAudit { tail: None } => {}
+            _ => panic!("expected ExtensionsAudit with tail=None"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_audit_with_tail() {
+        match invoke_extensions("audit 25").await {
+            CommandAction::ExtensionsAudit { tail: Some(n) } => assert_eq!(n, 25),
+            _ => panic!("expected ExtensionsAudit with tail=Some(25)"),
         }
     }
 }

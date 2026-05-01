@@ -202,6 +202,50 @@ Synaps **never displays the resolved value** of any config entry through `/exten
 - Use `required: true` only for entries the extension cannot start without; defaults are preferred wherever sensible.
 - Provider `config_schema.required` should reference keys that are also declared in the manifest's `config` array; otherwise diagnostics will warn about a missing manifest entry.
 
+## Trust controls and audit log
+
+Provider routing is gated by a per-provider trust toggle. Trust state lives at
+`$SYNAPS_BASE_DIR/extensions/trust.json` and is **enabled-by-default** —
+absence of an entry means trusted. Disabling a provider blocks routing
+**before** any IPC starts; there is no fallback to built-in providers.
+
+### chatui commands
+
+- `/extensions trust` or `/extensions trust list` — show every registered provider with its enabled/disabled state and reason.
+- `/extensions trust disable <runtime_id> [reason]` — record a disable decision.
+- `/extensions trust enable <runtime_id>` — re-enable a previously disabled provider.
+
+### Audit log
+
+Every routing attempt appends one JSON line to
+`$SYNAPS_BASE_DIR/extensions/audit.jsonl` with:
+
+- `timestamp` (RFC3339 UTC)
+- `plugin_id`, `provider_id`, `model_id`
+- `tools_exposed` (bool) — whether tool schemas were sent to the provider
+- `tools_requested` (u32) — number of provider-requested tool calls
+- `streamed` (bool) — whether the call used `provider.stream`
+- `outcome` — `ok` | `blocked` | `error`
+- `error_class` (optional) — opaque label like `trust_disabled`, `provider_error`, `canceled`
+
+Audit entries never contain prompts, tool inputs, tool outputs, or
+config values. Inspect with `/extensions audit [N]` (last N entries).
+
+### Tool-use warning
+
+Providers that declare `tool_use: true` on any model log a warning at load
+time so authors and users can review them. Disable them with `/extensions
+trust disable` if untrusted.
+
+### Security review checklist for `providers.register`
+
+- Is the plugin source trusted (audited code, signed checksum)?
+- Does the provider declare network destinations (currently informational)?
+- Does it declare tool-use? If yes, verify which tools it can request through Synaps mediation.
+- Does it require config keys with `secret_env`? Confirm secrets are exported via env, not committed.
+- Run `/extensions config <id>` to confirm config sources before invoking.
+- Use `/extensions audit` to inspect routing history.
+
 ## Limits, security boundary, and current limitations
 
 - Synaps enforces a maximum provider tool-loop iteration count to prevent infinite tool recursion. The current routing default is 8 provider turns.

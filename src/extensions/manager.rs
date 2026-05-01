@@ -190,6 +190,24 @@ impl ExtensionManager {
                 }
             }
             tracing::info!(extension = %id, providers = ?registered_ids, "Extension provider metadata registered");
+            // Warn for tool-use-capable providers so authors and users can audit them.
+            for runtime_id in &registered_ids {
+                if let Some(provider) = self.providers.get(runtime_id) {
+                    let tool_use = provider.spec.models.iter().any(|m| {
+                        m.capabilities
+                            .get("tool_use")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    });
+                    if tool_use {
+                        tracing::warn!(
+                            "Provider '{}' is tool-use capable: it can request Synaps tools through provider mediation. Use `/extensions trust disable {}` to block routing.",
+                            runtime_id,
+                            runtime_id,
+                        );
+                    }
+                }
+            }
         }
         if !registered_tools.is_empty() {
             let Some(tools) = &self.tools else {
@@ -378,6 +396,27 @@ impl ExtensionManager {
     /// Return provider status summaries sorted by provider runtime id.
     pub fn provider_summaries(&self) -> Vec<RegisteredProviderSummary> {
         self.providers.summaries()
+    }
+
+    /// Return runtime ids of registered providers that declare at least one
+    /// tool-use-capable model. Sorted by runtime id.
+    pub fn provider_tool_use_runtime_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .providers
+            .list()
+            .into_iter()
+            .filter(|p| {
+                p.spec.models.iter().any(|m| {
+                    m.capabilities
+                        .get("tool_use")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+            })
+            .map(|p| p.runtime_id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Return a `runtime_id -> enabled` map for every registered provider, computed
@@ -764,5 +803,42 @@ mod tests {
         let mgr = ExtensionManager::new(bus);
         let view = mgr.provider_trust_view();
         assert!(view.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_tool_use_runtime_ids_lists_only_tool_use_capable() {
+        use crate::extensions::runtime::process::{RegisteredProviderModelSpec, RegisteredProviderSpec};
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus);
+        // Tool-use capable provider.
+        let tool_spec = RegisteredProviderSpec {
+            id: "alpha".into(),
+            display_name: "Alpha".into(),
+            description: "tool-use".into(),
+            models: vec![RegisteredProviderModelSpec {
+                id: "m1".into(),
+                display_name: None,
+                capabilities: serde_json::json!({"tool_use": true}),
+                context_window: None,
+            }],
+            config_schema: None,
+        };
+        // Plain provider, no tool_use.
+        let plain_spec = RegisteredProviderSpec {
+            id: "beta".into(),
+            display_name: "Beta".into(),
+            description: "plain".into(),
+            models: vec![RegisteredProviderModelSpec {
+                id: "m1".into(),
+                display_name: None,
+                capabilities: serde_json::json!({"streaming": true}),
+                context_window: None,
+            }],
+            config_schema: None,
+        };
+        mgr.providers.register("plug", tool_spec).unwrap();
+        mgr.providers.register("plug", plain_spec).unwrap();
+        let ids = mgr.provider_tool_use_runtime_ids();
+        assert_eq!(ids, vec!["plug:alpha".to_string()]);
     }
 }

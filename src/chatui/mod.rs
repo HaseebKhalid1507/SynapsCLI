@@ -843,6 +843,117 @@ pub async fn run(
                                         }
                                     }
 
+                                    CommandAction::ExtensionsTrust(action) => {
+                                        use crate::chatui::commands::ExtensionsTrustAction;
+                                        match action {
+                                            ExtensionsTrustAction::List => {
+                                                let manager = ext_mgr_shared.read().await;
+                                                let providers = manager.provider_summaries();
+                                                let trust = synaps_cli::extensions::trust::load_trust_state().unwrap_or_default();
+                                                if providers.is_empty() {
+                                                    app.push_msg(ChatMessage::System("No providers registered.".to_string()));
+                                                } else {
+                                                    app.push_msg(ChatMessage::System(format!("Provider trust ({}):", providers.len())));
+                                                    for p in providers {
+                                                        let suffix = match trust.disabled.get(&p.runtime_id) {
+                                                            Some(entry) if entry.disabled => match &entry.reason {
+                                                                Some(r) => format!(" [disabled ({})]", r),
+                                                                None => " [disabled]".to_string(),
+                                                            },
+                                                            _ => " [enabled]".to_string(),
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "  {}{}",
+                                                            p.runtime_id, suffix
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            ExtensionsTrustAction::Enable { runtime_id } => {
+                                                match synaps_cli::extensions::trust::load_trust_state() {
+                                                    Ok(mut state) => {
+                                                        synaps_cli::extensions::trust::enable_provider(&mut state, &runtime_id);
+                                                        match synaps_cli::extensions::trust::save_trust_state(&state) {
+                                                            Ok(()) => app.push_msg(ChatMessage::System(format!(
+                                                                "Provider '{}' enabled.", runtime_id
+                                                            ))),
+                                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                                "failed to save trust state: {}", e
+                                                            ))),
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to load trust state: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                            ExtensionsTrustAction::Disable { runtime_id, reason } => {
+                                                match synaps_cli::extensions::trust::load_trust_state() {
+                                                    Ok(mut state) => {
+                                                        synaps_cli::extensions::trust::disable_provider(&mut state, &runtime_id, reason.clone());
+                                                        match synaps_cli::extensions::trust::save_trust_state(&state) {
+                                                            Ok(()) => {
+                                                                let suffix = match &reason {
+                                                                    Some(r) => format!(" [reason: {}]", r),
+                                                                    None => String::new(),
+                                                                };
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "Provider '{}' disabled.{}", runtime_id, suffix
+                                                                )));
+                                                            }
+                                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                                "failed to save trust state: {}", e
+                                                            ))),
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to load trust state: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ExtensionsAudit { tail } => {
+                                        match synaps_cli::extensions::audit::read_audit_entries() {
+                                            Ok(entries) => {
+                                                let slice: Vec<_> = match tail {
+                                                    Some(n) if entries.len() > n => entries[entries.len() - n..].to_vec(),
+                                                    _ => entries,
+                                                };
+                                                if slice.is_empty() {
+                                                    app.push_msg(ChatMessage::System("No audit entries yet.".to_string()));
+                                                } else {
+                                                    app.push_msg(ChatMessage::System(format!("Audit ({} entries):", slice.len())));
+                                                    for e in slice {
+                                                        let stream_tag = if e.streamed { "[streamed]" } else { "[complete]" };
+                                                        let class_part = match &e.error_class {
+                                                            Some(c) => format!(" class={}", c),
+                                                            None => String::new(),
+                                                        };
+                                                        let tools_part = if e.tools_requested > 0 {
+                                                            format!(" tools={}", e.tools_requested)
+                                                        } else {
+                                                            String::new()
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "  {} {}:{} {} outcome={}{}{}",
+                                                            e.timestamp,
+                                                            e.provider_id,
+                                                            e.model_id,
+                                                            stream_tag,
+                                                            e.outcome,
+                                                            class_part,
+                                                            tools_part,
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                "failed to read audit log: {}", e
+                                            ))),
+                                        }
+                                    }
+
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
                                         app.ping_print = true;
@@ -958,6 +1069,8 @@ pub async fn run(
                                         CommandAction::Status => {}
                                         CommandAction::ExtensionsStatus => {}
                                         CommandAction::ExtensionsConfig { .. } => {}
+                                        CommandAction::ExtensionsTrust(_) => {}
+                                        CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::Ping => {}
                                     }
                                 } else {
