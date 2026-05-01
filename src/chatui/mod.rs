@@ -10,8 +10,6 @@ mod draw;
 mod commands;
 mod input;
 mod stream_handler;
-mod input_event;
-mod voice_input;
 mod settings;
 mod plugins;
 mod models;
@@ -22,7 +20,6 @@ use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
 use commands::CommandAction;
 use input::InputAction;
-use input_event::AppInputEvent;
 use stream_handler::StreamAction;
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
 use lifecycle::{setup_terminal, teardown_terminal};
@@ -31,276 +28,11 @@ use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, lates
 use synaps_cli::core::compaction::compact_conversation;
 use synaps_cli::core::session_index::SessionIndexRecord;
 use crossterm::event::EventStream;
-use futures::StreamExt as _;
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
+use futures::StreamExt;
 use serde_json::json;
-use std::io;
 use std::time::Instant;
 use tachyonfx::{Effect, Shader};
 
-
-fn build_voice_runtime(_config: &synaps_cli::VoiceConfig) -> Result<synaps_cli::VoiceRuntime> {
-    tracing::debug!(provider = %_config.provider, command = %_config.sidecar_command, args = ?_config.sidecar_args, mode = %_config.mode, "building voice runtime");
-    let mut voice_runtime = synaps_cli::VoiceRuntime::new();
-    if _config.provider == "disabled" {
-        return Ok(voice_runtime);
-    }
-    if _config.provider == "sidecar" {
-        let sidecar_stt = synaps_cli::SidecarSttProvider::from_config(_config);
-        voice_runtime.set_stt_provider(Box::new(sidecar_stt));
-        return Ok(voice_runtime);
-    }
-    #[cfg(all(feature = "voice-stt-whisper", feature = "voice-mic"))]
-    if _config.stt_backend == "whisper-rs" {
-        let provider = synaps_cli::WhisperSttProvider::from_config(_config)?;
-        voice_runtime.set_stt_provider(Box::new(provider));
-    }
-    Ok(voice_runtime)
-}
-
-fn voice_barge_in_should_cancel_generation(config: &synaps_cli::VoiceConfig, streaming: bool) -> bool {
-    streaming && config.barge_in_cancel_generation
-}
-
-fn command_action_name(action: &CommandAction) -> &'static str {
-    match action {
-        CommandAction::None => "none",
-        CommandAction::StartStream => "start-stream",
-        CommandAction::Quit => "quit",
-        CommandAction::LaunchGamba => "gamba",
-        CommandAction::OpenModels => "models",
-        CommandAction::OpenSettings => "settings",
-        CommandAction::OpenPlugins => "plugins",
-        CommandAction::ReloadPlugins => "plugins-reload",
-        CommandAction::LoadSkill { .. } => "load-skill",
-        CommandAction::PluginCommand { .. } => "plugin-command",
-        CommandAction::Compact { .. } => "compact",
-        CommandAction::Ping => "ping",
-        CommandAction::Chain => "chain",
-        CommandAction::ChainList => "chain-list",
-        CommandAction::ChainName { .. } => "chain-name",
-        CommandAction::ChainUnname { .. } => "chain-unname",
-        CommandAction::Status => "status",
-        CommandAction::ExtensionsStatus => "extensions-status",
-        CommandAction::Voice { .. } => "voice",
-    }
-}
-
-async fn start_user_stream(
-    input: String,
-    app: &mut App,
-    runtime: &Runtime,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    boot_fx: &mut Option<Effect>,
-    exit_fx: &mut Option<Effect>,
-    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
-    secret_prompts: &synaps_cli::tools::SecretPromptQueue,
-    secret_prompt_handle: synaps_cli::tools::SecretPromptHandle,
-    last_frame: &mut Instant,
-) -> (
-    std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>,
-    CancellationToken,
-    tokio::sync::mpsc::UnboundedSender<String>,
-) {
-    let display_text = if app.pasted_char_count > 0 {
-        let typed = app.input_before_paste.as_deref().unwrap_or("");
-        let typed_char_count = typed.chars().count();
-        let paste_byte_start = input.char_indices()
-            .nth(typed_char_count)
-            .map(|(i, _)| i)
-            .unwrap_or(input.len());
-        let paste_content = &input[paste_byte_start..];
-        let line_count = paste_content.lines().count();
-        let pasted_char_count = input.chars().count().saturating_sub(typed_char_count);
-        let paste_label = if line_count > 1 {
-            format!("[Pasted {} lines]", line_count)
-        } else {
-            format!("[Pasted {} chars]", pasted_char_count)
-        };
-        if typed.is_empty() { paste_label } else { format!("{} {}", typed.trim(), paste_label) }
-    } else {
-        input.clone()
-    };
-    app.push_msg(ChatMessage::User(display_text));
-    app.input_before_paste = None;
-    app.pasted_char_count = 0;
-    let api_content = if let Some(ref ctx) = app.abort_context {
-        let combined = format!("{}\n\n{}", ctx, input);
-        app.abort_context = None;
-        combined
-    } else {
-        input
-    };
-    app.api_messages.push(json!({"role": "user", "content": api_content}));
-    let ct = CancellationToken::new();
-    let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    app.status_text = Some("connecting…".to_string());
-    app.streaming = true;
-    app.spinner_frame = 0;
-    let elapsed = last_frame.elapsed();
-    *last_frame = Instant::now();
-    let _ = draw(terminal, app, runtime, boot_fx, exit_fx, elapsed, registry, secret_prompts);
-    let stream = runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle)).await;
-    app.status_text = None;
-    app.push_msg(ChatMessage::Thinking("…".to_string()));
-    (stream, ct, s_tx)
-}
-
-fn voice_event_status(event: &synaps_cli::VoiceEvent) -> (&'static str, tracing::Level) {
-    match event {
-        synaps_cli::VoiceEvent::ListeningStarted => ("voice listening started", tracing::Level::DEBUG),
-        synaps_cli::VoiceEvent::ListeningStopped => ("voice listening stopped", tracing::Level::DEBUG),
-        synaps_cli::VoiceEvent::PartialTranscript(_) => ("voice partial transcript received", tracing::Level::DEBUG),
-        synaps_cli::VoiceEvent::FinalTranscript(_) => ("voice final transcript received", tracing::Level::DEBUG),
-        synaps_cli::VoiceEvent::Error(_) => ("voice provider error", tracing::Level::WARN),
-    }
-}
-
-fn handle_voice_event(event: synaps_cli::VoiceEvent) {
-    let (message, level) = voice_event_status(&event);
-    match event {
-        synaps_cli::VoiceEvent::Error(err) => tracing::warn!("{}: {}", message, err),
-        _ if level == tracing::Level::WARN => tracing::warn!("{}", message),
-        _ => tracing::debug!("{}", message),
-    }
-}
-
-fn handle_voice_control_pressed(
-    app: &mut App,
-    voice_runtime: &mut Option<synaps_cli::VoiceRuntime>,
-    _config: &synaps_cli::VoiceConfig,
-) {
-    if voice_runtime.is_none() {
-        app.voice.enabled = false;
-        app.voice.listening = false;
-        app.status_text = Some("voice unavailable".to_string());
-        app.invalidate();
-        return;
-    }
-
-    app.voice.enabled = true;
-    app.status_text = None;
-    let runtime = voice_runtime.as_mut().expect("voice_runtime checked above");
-
-    if app.voice.listening || runtime.state() == synaps_cli::VoiceProviderState::Running {
-        if let Err(err) = runtime.handle_barge_in(voice_barge_in_should_cancel_generation(_config, app.streaming)) {
-            app.voice.last_error = Some(err.to_string());
-        }
-        match runtime.stop_listening() {
-            Ok(()) => {
-                app.voice.listening = false;
-                app.status_text = Some("voice off".to_string());
-            }
-            Err(err) => {
-                app.voice.last_error = Some(err.to_string());
-                app.status_text = Some("voice stop failed".to_string());
-            }
-        }
-    } else {
-        if let Err(err) = runtime.handle_barge_in(voice_barge_in_should_cancel_generation(_config, app.streaming)) {
-            app.voice.last_error = Some(err.to_string());
-        }
-        match runtime.start_listening() {
-            Ok(()) => {
-                tracing::debug!("voice runtime start_listening succeeded");
-                app.voice.listening = true;
-                app.voice.last_error = None;
-                app.status_text = Some("voice listening".to_string());
-            }
-            Err(err) => {
-                app.voice.listening = false;
-                app.voice.last_error = Some(err.to_string());
-                app.status_text = Some("voice start failed".to_string());
-            }
-        }
-    }
-    app.invalidate();
-}
-
-fn handle_voice_control_released(
-    app: &mut App,
-    voice_runtime: &mut Option<synaps_cli::VoiceRuntime>,
-    _config: &synaps_cli::VoiceConfig,
-) {
-    if app.voice.mode != app::VoiceUiMode::PushToTalk {
-        return;
-    }
-    if let Some(runtime) = voice_runtime.as_mut() {
-        if let Err(err) = runtime.stop_listening() {
-            app.voice.last_error = Some(err.to_string());
-        }
-    }
-    app.voice.listening = false;
-    app.status_text = None;
-    app.invalidate();
-}
-
-fn handle_voice_event_for_input(
-    event: synaps_cli::VoiceEvent,
-    app: &mut App,
-    max_transcript_chars: usize,
-    command_config: synaps_cli::VoiceCommandConfig,
-    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
-    streaming: bool,
-) -> InputAction {
-    match event {
-        synaps_cli::VoiceEvent::FinalTranscript(transcript) => {
-            tracing::debug!(chars = transcript.chars().count(), voice_enabled = app.voice.enabled, voice_mode = ?app.voice.mode, streaming, "voice final transcript entering TUI input pipeline");
-            if !app.voice.enabled {
-                tracing::debug!("voice final transcript ignored because voice UI is disabled");
-                return InputAction::None;
-            }
-            match voice_input::handle_voice_transcript(app, &transcript, max_transcript_chars, command_config) {
-                voice_input::VoiceTranscriptOutcome::Ignored => {
-                    tracing::debug!("voice final transcript sanitized/mapped to ignored outcome");
-                }
-                voice_input::VoiceTranscriptOutcome::Inserted { submit } => {
-                    let input_chars = app.input.chars().count();
-                    tracing::debug!(submit, input_chars, "voice final transcript inserted into TUI input");
-                    app.invalidate();
-                    if submit || app.voice.mode == app::VoiceUiMode::Conversation {
-                        tracing::debug!(submit, conversation = app.voice.mode == app::VoiceUiMode::Conversation, "voice final transcript submitting current input");
-                        return input::submit_current_input(app, registry, streaming);
-                    }
-                }
-                voice_input::VoiceTranscriptOutcome::SlashCommand { command, arg } => {
-                    tracing::debug!(command = %command, "voice final transcript mapped to slash command");
-                    return InputAction::SlashCommand(command, arg);
-                }
-                voice_input::VoiceTranscriptOutcome::Submit => {
-                    tracing::debug!("voice final transcript mapped to submit command");
-                    return input::submit_current_input(app, registry, streaming);
-                }
-                voice_input::VoiceTranscriptOutcome::Escape => {
-                    tracing::debug!("voice final transcript mapped to escape command");
-                    return InputAction::Abort;
-                }
-            }
-        }
-        synaps_cli::VoiceEvent::ListeningStarted => {
-            app.voice.listening = true;
-            app.voice.last_error = None;
-            handle_voice_event(synaps_cli::VoiceEvent::ListeningStarted);
-            app.invalidate();
-        }
-        synaps_cli::VoiceEvent::ListeningStopped => {
-            app.voice.listening = false;
-            handle_voice_event(synaps_cli::VoiceEvent::ListeningStopped);
-            app.invalidate();
-        }
-        synaps_cli::VoiceEvent::Error(err) => {
-            app.voice.listening = false;
-            app.voice.last_error = Some(err.clone());
-            handle_voice_event(synaps_cli::VoiceEvent::Error(err));
-            app.invalidate();
-        }
-        other => handle_voice_event(other),
-    }
-    InputAction::None
-}
 
 pub async fn run(
     continue_session: Option<Option<String>>,
@@ -381,7 +113,6 @@ pub async fn run(
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
     app.last_turn_context_window = runtime.context_window();
-    app.voice = app::VoiceUiState::from_config(&config.voice);
     // MCP server count logged but not shown — the banner hides the ASCII art.
     if mcp_server_count > 0 {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
@@ -390,26 +121,6 @@ pub async fn run(
     // ── Terminal setup ──
     let mut terminal = setup_terminal()?;
     let mut event_reader = EventStream::new();
-    let max_voice_transcript_chars = config.voice.max_transcript_chars;
-    let voice_command_config = synaps_cli::VoiceCommandConfig {
-        commands_enabled: config.voice.commands_enabled,
-        submit_enabled: config.voice.stt_auto_submit || config.voice.commands_submit_enabled,
-        escape_enabled: false,
-    };
-    let mut voice_runtime: Option<synaps_cli::VoiceRuntime> = if config.voice.enabled {
-        match build_voice_runtime(&config.voice) {
-            Ok(voice_runtime) => Some(voice_runtime),
-            Err(err) => {
-                tracing::warn!("voice setup failed: {}", err);
-                app.voice.last_error = Some(err.to_string());
-                app.voice.enabled = false;
-                app.push_msg(ChatMessage::Error(format!("voice setup failed: {}", err)));
-                None
-            }
-        }
-    } else {
-        None
-    };
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
@@ -553,8 +264,13 @@ pub async fn run(
                     });
 
                     if app.streaming || app.compact_task.is_some() {
-                        // Buffer during streaming — inject after MessageHistory
-                        app.pending_events.push(formatted);
+                        // Steer into active stream if possible, otherwise buffer
+                        let steered = steer_tx.as_ref()
+                            .map(|tx| tx.send(formatted.clone()).is_ok())
+                            .unwrap_or(false);
+                        if !steered {
+                            app.pending_events.push(formatted);
+                        }
                     } else {
                         app.api_messages.push(serde_json::json!({
                             "role": "user",
@@ -702,13 +418,10 @@ pub async fn run(
                 continue;
             }
 
-            // ── Input: keyboard, mouse, paste, voice ──
-            maybe_event = input_event::next_app_input_event(
-                &mut event_reader,
-                voice_runtime.as_mut().map(|voice| voice.event_receiver_mut()),
-            ), if app.gamba_child.is_none() => {
+            // ── Input: keyboard, mouse, paste ──
+            maybe_event = event_reader.next(), if app.gamba_child.is_none() => {
                 match maybe_event {
-                    Some(AppInputEvent::Terminal(event)) => {
+                    Some(Ok(event)) => {
                         if secret_prompts.is_active() {
                             match event {
                                 crossterm::event::Event::Key(key) => match key.code {
@@ -731,17 +444,6 @@ pub async fn run(
                         let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
                         match action {
                             InputAction::None => {}
-                            InputAction::VoiceControlPressed => {
-                                tracing::debug!(voice_enabled = app.voice.enabled, voice_listening = app.voice.listening, voice_mode = ?app.voice.mode, "TUI voice control pressed");
-                                if voice_barge_in_should_cancel_generation(&config.voice, app.streaming) {
-                                    if let Some(ref ct) = cancel_token { ct.cancel(); }
-                                }
-                                handle_voice_control_pressed(&mut app, &mut voice_runtime, &config.voice);
-                            }
-                            InputAction::VoiceControlReleased => {
-                                tracing::debug!(voice_enabled = app.voice.enabled, voice_listening = app.voice.listening, voice_mode = ?app.voice.mode, "TUI voice control released");
-                                handle_voice_control_released(&mut app, &mut voice_runtime, &config.voice);
-                            }
                             InputAction::Quit => {
                                 exit_fx = Some(quit_effect());
                             }
@@ -750,6 +452,13 @@ pub async fn run(
                                 app.capture_abort_context();
                                 if let Some(ref q) = app.queued_message.take() {
                                     app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
+                                }
+                                // Flush any events that arrived during streaming
+                                for formatted in app.pending_events.drain(..) {
+                                    app.api_messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": formatted
+                                    }));
                                 }
                                 stream = None;
                                 cancel_token = None;
@@ -1037,68 +746,7 @@ pub async fn run(
                                             }
                                         }
                                     }
-                                    CommandAction::Voice { subcommand } => {
-                                        if subcommand == "mode conversation" {
-                                            app.voice.mode = app::VoiceUiMode::Conversation;
-                                            app.voice.enabled = true;
-                                            if voice_runtime.is_none() {
-                                                match build_voice_runtime(&config.voice) {
-                                                    Ok(runtime) => voice_runtime = Some(runtime),
-                                                    Err(err) => {
-                                                        app.voice.last_error = Some(err.to_string());
-                                                        app.push_msg(ChatMessage::Error(format!("voice setup failed: {}", err)));
-                                                    }
-                                                }
-                                            }
-                                            app.push_msg(ChatMessage::System("voice conversation mode enabled — final transcripts auto-submit".to_string()));
-                                            continue;
-                                        }
-                                        if subcommand == "mode dictation" {
-                                            app.voice.mode = app::VoiceUiMode::Toggle;
-                                            app.push_msg(ChatMessage::System("voice dictation mode enabled".to_string()));
-                                            continue;
-                                        }
-                                        let should_enable = match subcommand.as_str() {
-                                            "toggle" => !app.voice.enabled,
-                                            "on" => true,
-                                            "off" => false,
-                                            _ => {
-                                                let mode = match app.voice.mode { app::VoiceUiMode::PushToTalk => "push-to-talk", app::VoiceUiMode::Toggle => "toggle", app::VoiceUiMode::Conversation => "conversation" };
-                                                let state = if app.voice.listening { "listening" } else if app.voice.enabled { "enabled" } else { "disabled" };
-                                                app.push_msg(ChatMessage::System(format!("voice: {} ({})", state, mode)));
-                                                continue;
-                                            }
-                                        };
 
-                                        if should_enable {
-                                            if voice_runtime.is_none() {
-                                                match build_voice_runtime(&config.voice) {
-                                                    Ok(runtime) => voice_runtime = Some(runtime),
-                                                    Err(err) => {
-                                                        app.voice.last_error = Some(err.to_string());
-                                                        app.push_msg(ChatMessage::Error(format!("voice setup failed: {}", err)));
-                                                    }
-                                                }
-                                            }
-                                            app.voice.enabled = voice_runtime.is_some();
-                                            app.voice.listening = voice_runtime
-                                                .as_ref()
-                                                .is_some_and(|runtime| runtime.state() == synaps_cli::VoiceProviderState::Running);
-                                            app.voice.mode = app::VoiceUiMode::Toggle;
-                                            app.status_text = None;
-                                            app.push_msg(ChatMessage::System("voice controls enabled — press F8 to toggle dictation".to_string()));
-                                        } else {
-                                            if let Some(runtime) = voice_runtime.as_mut() {
-                                                if let Err(err) = runtime.stop_listening() {
-                                                    app.voice.last_error = Some(err.to_string());
-                                                }
-                                            }
-                                            app.voice.enabled = false;
-                                            app.voice.listening = false;
-                                            app.status_text = Some("voice off".to_string());
-                                            app.push_msg(ChatMessage::System("voice disabled".to_string()));
-                                        }
-                                    }
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
                                         app.ping_print = true;
@@ -1126,7 +774,7 @@ pub async fn run(
                                     app.queued_message = Some(input);
                                     continue;
                                 }
-let display_text = app.user_display_text_for_submission(&input);
+                                let display_text = app.user_display_text_for_submission(&input);
                                 app.push_msg(ChatMessage::User(display_text));
                                 app.input_before_paste = None;
                                 app.pasted_char_count = 0;
@@ -1213,7 +861,6 @@ let display_text = app.user_display_text_for_submission(&input);
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
                                         CommandAction::ExtensionsStatus => {}
-                                        CommandAction::Voice { .. } => {}
                                         CommandAction::Ping => {}
                                     }
                                 } else {
@@ -1404,56 +1051,7 @@ let display_text = app.user_display_text_for_submission(&input);
                             }
                         }
                     }
-                    Some(AppInputEvent::Voice(voice_event)) => {
-                        tracing::debug!(event = ?voice_event, "TUI received voice event");
-                        let is_streaming = app.streaming;
-                        let action = handle_voice_event_for_input(
-                            voice_event,
-                            &mut app,
-                            max_voice_transcript_chars,
-                            voice_command_config,
-                            &registry,
-                            is_streaming,
-                        );
-                        match action {
-                            InputAction::None => {}
-                            InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &keybind_registry).await {
-                                    CommandAction::OpenSettings => app.settings = Some(settings::SettingsState::new()),
-                                    CommandAction::OpenModels => app.models = Some(models::ModelsModalState::new()),
-                                    CommandAction::None => {}
-                                    other => app.push_msg(ChatMessage::System(format!("voice command not available here: {}", command_action_name(&other)))),
-                                }
-                            }
-                            InputAction::Submit(input) => {
-                                if app.compact_task.is_some() {
-                                    app.push_msg(ChatMessage::System(format!("queued: {}", input)));
-                                    app.queued_message = Some(input);
-                                    continue;
-                                }
-                                let (new_stream, ct, s_tx) = start_user_stream(
-                                    input,
-                                    &mut app,
-                                    &runtime,
-                                    &mut terminal,
-                                    &mut boot_fx,
-                                    &mut exit_fx,
-                                    &registry,
-                                    &secret_prompts,
-                                    secret_prompt_handle.clone(),
-                                    &mut last_frame,
-                                ).await;
-                                stream = Some(new_stream);
-                                cancel_token = Some(ct);
-                                steer_tx = Some(s_tx);
-                            }
-                            InputAction::Abort => {
-                                if let Some(ref ct) = cancel_token { ct.cancel(); }
-                            }
-                            _ => {}
-                        }
-                    }
-                    None => break,
+                    Some(Err(_)) | None => break,
                 }
             }
 
@@ -1467,7 +1065,7 @@ let display_text = app.user_display_text_for_submission(&input);
             } => {
                 if let Some(event) = maybe_event {
                     let do_draw = stream_handler::needs_immediate_draw(&event);
-                    let action = stream_handler::handle_stream_event(event, &mut app, &runtime, voice_runtime.as_mut()).await;
+                    let action = stream_handler::handle_stream_event(event, &mut app, &runtime).await;
 
                     match action {
                         StreamAction::Continue => {
@@ -1553,14 +1151,6 @@ let display_text = app.user_display_text_for_submission(&input);
     }
 
     // Save session on exit
-    if let Some(mut voice_runtime) = voice_runtime.take() {
-        if let Err(err) = voice_runtime.shutdown() {
-            tracing::warn!("voice shutdown failed: {}", err);
-        }
-        if let Err(err) = voice_runtime.join_workers().await {
-            tracing::warn!("voice worker join failed: {}", err);
-        }
-    }
     app.save_session().await;
 
     // ═══ HOOK: on_session_end ═══

@@ -8,4 +8,3 @@ pub(crate) mod actions;
 pub(crate) use state::PluginsModalState;
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
-pub(crate) use input::insert_voice_text;

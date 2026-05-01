@@ -8,13 +8,13 @@ use super::schema::{Category, EditorKind, SettingDef};
 
 macro_rules! define_settings {
     ($(
-        $key:literal, $label:expr, $category:ident, $editor:expr, $help:expr,
+        $key:ident, $label:expr, $category:ident, $editor:expr, $help:expr,
             $apply:expr;
     )*) => {
         pub(crate) const ALL_SETTINGS: &[SettingDef] = &[
             $(
                 SettingDef {
-                    key: $key,
+                    key: stringify!($key),
                     label: $label,
                     category: Category::$category,
                     editor: $editor,
@@ -31,7 +31,7 @@ macro_rules! define_settings {
         ) {
             match key {
                 $(
-                    $key => {
+                    stringify!($key) => {
                         let handler: fn(&mut synaps_cli::Runtime, &mut crate::chatui::app::App, &str) = $apply;
                         handler(runtime, app, value);
                     }
@@ -43,11 +43,11 @@ macro_rules! define_settings {
 }
 
 define_settings! {
-    "model", "Model", Model, EditorKind::ModelPicker,
+    model, "Model", Model, EditorKind::ModelPicker,
         "Which Claude model to use.",
         |runtime, _app, value| { runtime.set_model(value.to_string()); };
 
-    "thinking", "Thinking", Model,
+    thinking, "Thinking", Model,
         EditorKind::Cycler(&["low", "medium", "high", "xhigh", "adaptive"]),
         "Thinking depth — controls effort on adaptive models, budget on legacy.",
         |runtime, _app, value| {
@@ -62,7 +62,7 @@ define_settings! {
             runtime.set_thinking_budget(budget);
         };
 
-    "context_window", "Context window", Model,
+    context_window, "Context window", Model,
         EditorKind::Cycler(&["200k", "1m", "auto"]),
         "Override context window limit (auto = model default).",
         |runtime, app, value| {
@@ -77,7 +77,7 @@ define_settings! {
             app.last_turn_context_window = runtime.context_window();
         };
 
-    "compaction_model", "Compaction model", Model,
+    compaction_model, "Compaction model", Model,
         EditorKind::ModelPicker,
         "Model used for /compact (default: claude-sonnet-4-6).",
         |runtime, _app, value| {
@@ -89,38 +89,37 @@ define_settings! {
             runtime.set_compaction_model(model);
         };
 
-    "api_retries", "API retries", Agent, EditorKind::Text { numeric: true },
+    api_retries, "API retries", Agent, EditorKind::Text { numeric: true },
         "Retries on transient API errors.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u32>() { runtime.set_api_retries(n); }
         };
 
-    "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
+    subagent_timeout, "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u64>() { runtime.set_subagent_timeout(n); }
         };
 
-    "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
+    max_tool_output, "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<usize>() { runtime.set_max_tool_output(n); }
         };
 
-    "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
+    bash_timeout, "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u64>() { runtime.set_bash_timeout(n); }
         };
 
-    "bash_max_timeout", "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
+    bash_max_timeout, "Bash max timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Legacy setting retained for config compatibility; requested bash timeouts are no longer clamped.",
         |runtime, _app, value| {
             if let Ok(n) = value.parse::<u64>() { runtime.set_bash_max_timeout(n); }
         };
 
-    "theme", "Theme", Appearance, EditorKind::ThemePicker,
+    theme, "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
-
 }

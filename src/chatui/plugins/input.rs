@@ -85,17 +85,6 @@ fn list_enter(state: &mut PluginsModalState) -> InputOutcome {
     }
 }
 
-pub(crate) fn insert_voice_text(state: &mut PluginsModalState, text: &str) -> bool {
-    match &mut state.mode {
-        RightMode::AddMarketplaceEditor { buffer, error } => {
-            buffer.push_str(text);
-            *error = None;
-            true
-        }
-        _ => false,
-    }
-}
-
 fn editor_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
     let RightMode::AddMarketplaceEditor { buffer, error } = &mut state.mode else { return InputOutcome::None };
     match key.code {
@@ -384,24 +373,6 @@ mod tests {
                 if plugin_name == "p" && host == "github.com" && source == "https://github.com/u/r"
         ));
         assert!(matches!(s.mode, RightMode::List));
-    }
-
-    #[test]
-    fn voice_text_inserts_into_add_marketplace_editor() {
-        let mut s = crate::chatui::plugins::PluginsModalState::new(PluginsState::default());
-        s.mode = crate::chatui::plugins::state::RightMode::AddMarketplaceEditor {
-            buffer: "https://".into(), error: Some("bad".into()),
-        };
-
-        assert!(insert_voice_text(&mut s, "github.com/m/repo"));
-
-        match s.mode {
-            crate::chatui::plugins::state::RightMode::AddMarketplaceEditor { buffer, error } => {
-                assert_eq!(buffer, "https://github.com/m/repo");
-                assert!(error.is_none());
-            }
-            _ => panic!("expected marketplace editor"),
-        }
     }
 
     #[test]

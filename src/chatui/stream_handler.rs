@@ -1,7 +1,7 @@
 //! Stream event handling — processes StreamEvent variants from the runtime.
 
 
-use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, VoiceRuntime};
+use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 
 use super::app::{App, ChatMessage, SubagentState};
 
@@ -34,7 +34,6 @@ pub(super) async fn handle_stream_event(
     event: StreamEvent,
     app: &mut App,
     runtime: &Runtime,
-    _voice_runtime: Option<&mut VoiceRuntime>,
 ) -> StreamAction {
     match event {
         StreamEvent::Llm(LlmEvent::Thinking(text)) => {

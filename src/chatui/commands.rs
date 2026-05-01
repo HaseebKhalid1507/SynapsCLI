@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use synaps_cli::{Runtime, Session, list_sessions, resolve_session, VoiceCommandAction, VoiceCommandConfig};
+use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
 
@@ -75,8 +75,6 @@ pub(super) enum CommandAction {
     Status,
     /// Show loaded extension health snapshots.
     ExtensionsStatus,
-    /// Control local voice capture: /voice on|off|status.
-    Voice { subcommand: String },
 }
 
 pub(super) async fn execute_command_action(
@@ -369,8 +367,6 @@ pub(super) async fn handle_command(
                 "/plugins — manage marketplaces and installed plugins",
                 "/extensions status — show loaded extension health",
                 "/status — show account usage and reset times",
-                "/voice — toggle local voice dictation controls",
-                "/voice on|off|status — explicit voice control",
                 "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
             ];
@@ -455,31 +451,6 @@ pub(super) async fn handle_command(
         }
         "status" => {
             return CommandAction::Status;
-        }
-        "voice" => {
-            let subcommand = match arg.trim() {
-                "" | "toggle" => "toggle",
-                "status" => "status",
-                "on" | "start" => "on",
-                "off" | "stop" => "off",
-                "mode conversation" | "conversation" => "mode conversation",
-                "mode dictation" | "dictation" => "mode dictation",
-                other => {
-                    app.push_msg(ChatMessage::System(format!("usage: /voice [on|off|status|mode conversation|mode dictation] (unknown: {})", other)));
-                    return CommandAction::None;
-                }
-            };
-            return CommandAction::Voice { subcommand: subcommand.to_string() };
-        }
-        "voice-map-test" if cfg!(test) => {
-            let config = VoiceCommandConfig { commands_enabled: true, submit_enabled: false, escape_enabled: false };
-            match synaps_cli::map_spoken_phrase(arg, config) {
-                VoiceCommandAction::SlashCommand { command, arg } => return CommandAction::Voice { subcommand: format!("mapped /{} {}", command, arg).trim().to_string() },
-                VoiceCommandAction::Submit => return CommandAction::Voice { subcommand: "mapped submit".to_string() },
-                VoiceCommandAction::Escape => return CommandAction::Voice { subcommand: "mapped escape".to_string() },
-                VoiceCommandAction::NewLine => return CommandAction::Voice { subcommand: "mapped newline".to_string() },
-                VoiceCommandAction::Dictation(text) => return CommandAction::Voice { subcommand: format!("dictation {}", text) },
-            }
         }
         "ping" => {
             return CommandAction::Ping;

@@ -54,8 +54,6 @@ tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.21"
 unicode-width = "0.2.0"
 arboard = "3"
-whisper-rs = { version = "0.16.0", optional = true }
-cpal = { version = "0.15", optional = true }
 
 # Shell / PTY deps
 portable-pty = "0.9"
@@ -68,16 +66,6 @@ zeroize = "1.8.2"
 
 [dev-dependencies]
 tempfile = "3"
-
-[features]
-default = []
-voice = []
-voice-stt-whisper = ["voice", "dep:whisper-rs"]
-voice-mic = ["voice", "dep:cpal"]
-voice-metal = ["voice-stt-whisper", "whisper-rs/metal"]
-voice-cuda = ["voice-stt-whisper", "whisper-rs/cuda"]
-voice-vulkan = ["voice-stt-whisper", "whisper-rs/vulkan"]
-voice-openblas = ["voice-stt-whisper", "whisper-rs/openblas"]
 
 [[bin]]
 name = "synaps"

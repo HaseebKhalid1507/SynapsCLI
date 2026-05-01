@@ -8,7 +8,6 @@ pub(crate) mod input;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
-pub(crate) use input::insert_voice_text;
 
 const BUILTIN_THEMES: &[&str] = &[
     "default", "neon-rain", "amber", "phosphor", "solarized-dark", "blood",

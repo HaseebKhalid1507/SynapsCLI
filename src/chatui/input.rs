@@ -32,10 +32,6 @@ pub(super) enum InputAction {
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
-    /// Voice control key pressed (Ctrl+Alt+V). Main loop maps to PTT or toggle mode.
-    VoiceControlPressed,
-    /// Voice control key released (Ctrl+Alt+V). Main loop maps to PTT stop when enabled.
-    VoiceControlReleased,
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -154,7 +150,7 @@ pub(super) fn handle_event(
         return InputAction::None;
     }
     match event {
-        Event::Key(key) => handle_key(key.code, key.modifiers, key.kind, app, streaming, registry, keybinds),
+        Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
             handle_mouse(mouse, app)
         }
@@ -322,7 +318,6 @@ fn paste_from_clipboard() -> Option<String> {
 fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
-    kind: crossterm::event::KeyEventKind,
     app: &mut App,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
@@ -334,15 +329,6 @@ fn handle_key(
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
         app.tab_cycle = None;
-    }
-
-    // Voice control is reserved before plugin/user keybinds so voice can always be
-    // stopped even if custom keybinds are misconfigured.
-    if code == KeyCode::Char('v') && modifiers.contains(KeyModifiers::CONTROL) && modifiers.contains(KeyModifiers::ALT) {
-        return match kind {
-            crossterm::event::KeyEventKind::Release => InputAction::VoiceControlReleased,
-            _ => InputAction::VoiceControlPressed,
-        };
     }
 
     // Plugin/user keybinds — check before core binds, but only when not streaming
@@ -370,12 +356,6 @@ fn handle_key(
         }
     }
     match (code, modifiers) {
-        (KeyCode::F(8), _) => {
-            return match kind {
-                crossterm::event::KeyEventKind::Release => InputAction::VoiceControlReleased,
-                _ => InputAction::VoiceControlPressed,
-            };
-        }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             return InputAction::Quit;
         }
@@ -428,12 +408,6 @@ fn handle_key(
             app.show_full_output = !app.show_full_output;
             app.invalidate();
         }
-        (KeyCode::Char('v'), KeyModifiers::ALT) => {
-            return InputAction::VoiceControlPressed;
-        }
-        (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
-            return InputAction::VoiceControlPressed;
-        }
         (KeyCode::Char(c), _) => {
             let byte_pos = app.cursor_byte_pos();
             app.input.insert(byte_pos, c);
@@ -469,17 +443,6 @@ fn handle_key(
         _ => {}
     }
     InputAction::None
-}
-
-pub(super) fn submit_current_input(app: &mut App, registry: &Arc<CommandRegistry>, streaming: bool) -> InputAction {
-    if app.input.is_empty() {
-        return InputAction::None;
-    }
-    if streaming {
-        process_streaming_submit(app)
-    } else {
-        process_submit(app, registry)
-    }
 }
 
 /// User pressed Enter with non-empty input while not streaming.
@@ -612,92 +575,4 @@ fn jump_word_right(app: &mut App) {
     while pos < len && chars[pos] != ' ' { pos += 1; }
     while pos < len && chars[pos] == ' ' { pos += 1; }
     app.cursor_pos = pos;
-}
-
-#[cfg(test)]
-mod voice_keybind_tests {
-    use super::*;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use std::sync::Arc;
-
-    fn registries() -> (Arc<CommandRegistry>, synaps_cli::skills::keybinds::KeybindRegistry) {
-        (
-            Arc::new(CommandRegistry::new(synaps_cli::skills::BUILTIN_COMMANDS, vec![])),
-            synaps_cli::skills::keybinds::KeybindRegistry::new(),
-        )
-    }
-
-    fn test_runtime() -> synaps_cli::Runtime {
-        let mut runtime = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(synaps_cli::Runtime::new())
-            .unwrap();
-        runtime.set_model("test-model".to_string());
-        runtime
-    }
-
-    #[test]
-    fn f8_press_and_release_support_toggle_without_double_toggling() {
-        let mut app = App::new(synaps_cli::Session::new("test-model", "low", None));
-        let runtime = test_runtime();
-        let (registry, keybinds) = registries();
-        let press = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::F(8),
-            KeyModifiers::NONE,
-            KeyEventKind::Press,
-        ));
-        let release = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::F(8),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        ));
-
-        let press_action = handle_event(press, &mut app, &runtime, false, &registry, &keybinds);
-        let release_action = handle_event(release, &mut app, &runtime, false, &registry, &keybinds);
-
-        assert!(matches!(press_action, InputAction::VoiceControlPressed));
-        assert!(matches!(release_action, InputAction::VoiceControlReleased));
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn ctrl_alt_v_requests_voice_toggle_without_inserting_text() {
-        let mut app = App::new(synaps_cli::Session::new("test-model", "low", None));
-        let runtime = test_runtime();
-        let (registry, keybinds) = registries();
-        let event = Event::Key(KeyEvent::new(
-            KeyCode::Char('v'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        ));
-
-        let action = handle_event(event, &mut app, &runtime, false, &registry, &keybinds);
-
-        assert!(matches!(action, InputAction::VoiceControlPressed));
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn ctrl_alt_v_press_and_release_support_push_to_talk() {
-        let mut app = App::new(synaps_cli::Session::new("test-model", "low", None));
-        let runtime = test_runtime();
-        let (registry, keybinds) = registries();
-        let press = Event::Key(KeyEvent {
-            code: KeyCode::Char('v'),
-            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
-        });
-        let release = Event::Key(KeyEvent {
-            code: KeyCode::Char('v'),
-            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
-            kind: KeyEventKind::Release,
-            state: crossterm::event::KeyEventState::NONE,
-        });
-
-        let press_action = handle_event(press, &mut app, &runtime, false, &registry, &keybinds);
-        let release_action = handle_event(release, &mut app, &runtime, false, &registry, &keybinds);
-
-        assert!(matches!(press_action, InputAction::VoiceControlPressed));
-        assert!(matches!(release_action, InputAction::VoiceControlReleased));
-    }
 }
