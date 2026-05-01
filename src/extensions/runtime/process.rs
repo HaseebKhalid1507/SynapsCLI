@@ -114,6 +114,125 @@ pub struct ProviderToolUse {
     pub input: Value,
 }
 
+/// A single streaming event from a provider extension.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderStreamEvent {
+    /// Incremental assistant text.
+    TextDelta { text: String },
+    /// Incremental thinking text.
+    ThinkingDelta { text: String },
+    /// A complete tool-use block (matches ProviderToolUse fields).
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Usage metadata (typically near end-of-stream).
+    Usage { usage: Value },
+    /// Provider-side error (non-fatal stream notification — caller decides).
+    Error { message: String },
+    /// Optional explicit end-of-stream marker.
+    Done,
+}
+
+/// Parse a single `provider.stream.event` notification's `params` value into a
+/// [`ProviderStreamEvent`]. Returns `Err(String)` on malformed input.
+///
+/// Accepts both `{"event": {"type": "...", ...}}` and flat `{"type": "...", ...}`
+/// shapes.
+pub fn parse_provider_stream_event(params: &Value) -> Result<ProviderStreamEvent, String> {
+    let inner = match params.get("event") {
+        Some(ev) => ev,
+        None => params,
+    };
+    let obj = inner
+        .as_object()
+        .ok_or_else(|| "provider stream event must be a JSON object".to_string())?;
+
+    let ty = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "provider stream event missing type".to_string())?;
+
+    match ty {
+        "text" => {
+            let text = obj
+                .get("delta")
+                .or_else(|| obj.get("text"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "provider stream text event missing 'delta' or 'text'".to_string()
+                })?;
+            Ok(ProviderStreamEvent::TextDelta {
+                text: text.to_string(),
+            })
+        }
+        "thinking" => {
+            let text = obj
+                .get("delta")
+                .or_else(|| obj.get("text"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "provider stream thinking event missing 'delta' or 'text'".to_string()
+                })?;
+            Ok(ProviderStreamEvent::ThinkingDelta {
+                text: text.to_string(),
+            })
+        }
+        "tool_use" => {
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "provider stream tool_use missing id".to_string())?;
+            if id.is_empty() {
+                return Err("provider stream tool_use id must be non-empty".to_string());
+            }
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "provider stream tool_use missing name".to_string())?;
+            if name.is_empty() {
+                return Err("provider stream tool_use name must be non-empty".to_string());
+            }
+            let input = match obj.get("input") {
+                None => Value::Object(Default::default()),
+                Some(v) if v.is_object() => v.clone(),
+                Some(_) => {
+                    return Err(
+                        "provider stream tool_use input must be a JSON object".to_string()
+                    );
+                }
+            };
+            Ok(ProviderStreamEvent::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            })
+        }
+        "usage" => {
+            let mut clone = obj.clone();
+            clone.remove("type");
+            Ok(ProviderStreamEvent::Usage {
+                usage: Value::Object(clone),
+            })
+        }
+        "error" => {
+            let message = obj
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "provider stream error missing message".to_string())?;
+            if message.is_empty() {
+                return Err("provider stream error message must be non-empty".to_string());
+            }
+            Ok(ProviderStreamEvent::Error {
+                message: message.to_string(),
+            })
+        }
+        "done" => Ok(ProviderStreamEvent::Done),
+        other => Err(format!("unknown provider stream event type: {other}")),
+    }
+}
+
 pub async fn execute_provider_tool_use(
     registry: &crate::ToolRegistry,
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
@@ -833,5 +952,179 @@ impl ExtensionHandler for ProcessExtension {
         } else {
             ExtensionHealth::Healthy
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_text_delta_with_delta_key() {
+        let v = json!({"type": "text", "delta": "hi"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::TextDelta { text: "hi".into() }
+        );
+    }
+
+    #[test]
+    fn parses_text_delta_with_text_key() {
+        let v = json!({"type": "text", "text": "hi"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::TextDelta { text: "hi".into() }
+        );
+    }
+
+    #[test]
+    fn parses_thinking_delta() {
+        let v = json!({"type": "thinking", "delta": "hmm"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::ThinkingDelta { text: "hmm".into() }
+        );
+        let v2 = json!({"type": "thinking", "text": "hmm"});
+        assert_eq!(
+            parse_provider_stream_event(&v2).unwrap(),
+            ProviderStreamEvent::ThinkingDelta { text: "hmm".into() }
+        );
+    }
+
+    #[test]
+    fn parses_tool_use() {
+        let v = json!({
+            "type": "tool_use",
+            "id": "t1",
+            "name": "echo",
+            "input": {"x": 1}
+        });
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::ToolUse {
+                id: "t1".into(),
+                name: "echo".into(),
+                input: json!({"x": 1}),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_use_input_defaults_to_empty_object() {
+        let v = json!({"type": "tool_use", "id": "t1", "name": "echo"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::ToolUse {
+                id: "t1".into(),
+                name: "echo".into(),
+                input: json!({}),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_usage_strips_type() {
+        let v = json!({"type": "usage", "input_tokens": 5, "output_tokens": 7});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::Usage {
+                usage: json!({"input_tokens": 5, "output_tokens": 7})
+            }
+        );
+    }
+
+    #[test]
+    fn parses_error() {
+        let v = json!({"type": "error", "message": "boom"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::Error { message: "boom".into() }
+        );
+    }
+
+    #[test]
+    fn parses_done() {
+        let v = json!({"type": "done"});
+        assert_eq!(
+            parse_provider_stream_event(&v).unwrap(),
+            ProviderStreamEvent::Done
+        );
+    }
+
+    #[test]
+    fn nested_event_shape_matches_flat() {
+        let flat = json!({"type": "text", "delta": "hi"});
+        let nested = json!({"event": {"type": "text", "delta": "hi"}});
+        assert_eq!(
+            parse_provider_stream_event(&flat).unwrap(),
+            parse_provider_stream_event(&nested).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_type_errors() {
+        let v = json!({"delta": "hi"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("missing type"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_type_errors_with_type() {
+        let v = json!({"type": "wat"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("wat"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_use_missing_id_errors() {
+        let v = json!({"type": "tool_use", "name": "echo"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("id"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_use_missing_name_errors() {
+        let v = json!({"type": "tool_use", "id": "t1"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("name"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_use_empty_id_errors() {
+        let v = json!({"type": "tool_use", "id": "", "name": "echo"});
+        assert!(parse_provider_stream_event(&v).is_err());
+    }
+
+    #[test]
+    fn tool_use_empty_name_errors() {
+        let v = json!({"type": "tool_use", "id": "t1", "name": ""});
+        assert!(parse_provider_stream_event(&v).is_err());
+    }
+
+    #[test]
+    fn tool_use_non_object_input_errors() {
+        let v = json!({"type": "tool_use", "id": "t1", "name": "echo", "input": "nope"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("input"), "got: {err}");
+    }
+
+    #[test]
+    fn text_missing_delta_and_text_errors() {
+        let v = json!({"type": "text"});
+        let err = parse_provider_stream_event(&v).unwrap_err();
+        assert!(err.contains("delta") || err.contains("text"), "got: {err}");
+    }
+
+    #[test]
+    fn error_missing_message_errors() {
+        let v = json!({"type": "error"});
+        assert!(parse_provider_stream_event(&v).is_err());
+    }
+
+    #[test]
+    fn error_empty_message_errors() {
+        let v = json!({"type": "error", "message": ""});
+        assert!(parse_provider_stream_event(&v).is_err());
     }
 }
