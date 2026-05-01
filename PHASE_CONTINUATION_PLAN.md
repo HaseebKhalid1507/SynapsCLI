@@ -93,3 +93,45 @@ Acceptance:
 - Checksums/signing design spec exists at `docs/specs/plugin-signing.md`.
 - `plugin package --dry-run PATH` validates plugin metadata and prints files, permissions, hooks, config keys, skills, and commands without creating an archive.
 Verification: `bash plugin-builder-plugin/scripts/test.sh`; spec files present. Scope M.
+
+#### Phase K: Local marketplace/index consumption — completed
+Acceptance:
+- Rust plugin index model and validation exist.
+- `plugin index validate|list|inspect` provide local index UX without remote fetch.
+- Index-backed install entries route through pending install/trust flow.
+- Manifest update diff helper reports capability changes.
+Verification: targeted Rust tests and plugin-builder smoke passed during Phase K.
+
+#### Phase L: Real marketplace/index UX + safe update flow — completed
+Acceptance:
+- Marketplace fetch accepts both legacy marketplace JSON and v1 plugin indexes.
+- `/plugins` detail pane shows index metadata.
+- Index-backed cached entries install through index flow.
+- Updates preview manifest capability diffs and apply via backup/restore.
+- `plugin index generate --dry-run PATH` emits v1 index JSON.
+Verification: `cargo test --lib skills`, `cargo test --bin synaps chatui::plugins`, and `bash plugin-builder-plugin/scripts/test.sh` passed during Phase L.
+
+#### Phase M: Distribution/update hardening — completed
+Acceptance:
+- Index-backed install/update candidates verify deterministic sha256 plugin-tree checksums before final install/update.
+- `plugin index generate --dry-run` emits checksums using the same algorithm runtime verifies.
+- Update preview tests cover real changed manifests and refreshed index checksums.
+- Index-backed installed plugins do not show false update markers when remote HEAD is unknown but checksum metadata exists.
+- Plugin index docs, checksum/signing docs, and plugin-builder README describe checksum generation and verification semantics.
+- Index validation requires 64-character lowercase sha256 digests.
+Verification:
+- `cargo test --lib skills::install`
+- `cargo test --lib skills::plugin_index`
+- `cargo test --bin synaps chatui::plugins`
+- `bash plugin-builder-plugin/scripts/test.sh`
+Scope M.
+
+#### Phase N: Provider/runtime capability expansion — planned next
+Acceptance to define before code:
+- Provider routing design refresh: provider IDs, model IDs, config, JSON-RPC methods, streaming, failures/timeouts/cancellation, trust/security.
+- Runtime provider protocol methods.
+- Model registry integration.
+- Chat routing to extension-backed providers.
+- Provider config UX.
+- Example local provider plugin.
+Verification: design spec before implementation, then targeted Rust/plugin-builder/example tests per slice.
