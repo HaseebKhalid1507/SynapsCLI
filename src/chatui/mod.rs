@@ -740,10 +740,14 @@ pub async fn run(
                                                         provider.display_name
                                                     )));
                                                     for model in &provider.models {
-                                                        let label = if model.tool_use {
-                                                            format!("{} [tool-use]", model.runtime_id)
-                                                        } else {
+                                                        let mut badges: Vec<&str> = Vec::new();
+                                                        if model.tool_use { badges.push("tool-use"); }
+                                                        if model.streaming { badges.push("streaming"); }
+                                                        let label = if badges.is_empty() {
                                                             model.runtime_id.clone()
+                                                        } else {
+                                                            let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
+                                                            format!("{} {}", model.runtime_id, suffix)
                                                         };
                                                         app.push_msg(ChatMessage::System(format!("      model {}", label)));
                                                     }

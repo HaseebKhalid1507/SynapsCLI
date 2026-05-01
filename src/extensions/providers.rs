@@ -17,6 +17,7 @@ pub struct RegisteredProviderModelSummary {
     pub runtime_id: String,
     pub display_name: Option<String>,
     pub tool_use: bool,
+    pub streaming: bool,
     pub context_window: Option<u64>,
 }
 
@@ -116,6 +117,7 @@ impl ProviderRegistry {
                         runtime_id: Self::model_runtime_id(&provider.plugin_id, &provider.provider_id, &model.id),
                         display_name: model.display_name.clone(),
                         tool_use: model.capabilities.get("tool_use").and_then(|v| v.as_bool()).unwrap_or(false),
+                        streaming: model.capabilities.get("streaming").and_then(|v| v.as_bool()).unwrap_or(false),
                         context_window: model.context_window,
                     })
                     .collect(),
@@ -144,7 +146,7 @@ mod tests {
         spec.models = vec![crate::extensions::runtime::process::RegisteredProviderModelSpec {
             id: "model-a".to_string(),
             display_name: Some("Model A".to_string()),
-            capabilities: serde_json::json!({"tool_use": true}),
+            capabilities: serde_json::json!({"tool_use": true, "streaming": true}),
             context_window: Some(8192),
         }];
         let mut registry = ProviderRegistry::new();
@@ -156,8 +158,26 @@ mod tests {
             runtime_id: "plugin:local:model-a".to_string(),
             display_name: Some("Model A".to_string()),
             tool_use: true,
+            streaming: true,
             context_window: Some(8192),
         }]);
+    }
+
+    #[test]
+    fn summaries_default_streaming_to_false_when_capability_absent() {
+        let mut spec = spec("local");
+        spec.models = vec![crate::extensions::runtime::process::RegisteredProviderModelSpec {
+            id: "model-b".to_string(),
+            display_name: None,
+            capabilities: serde_json::json!({}),
+            context_window: None,
+        }];
+        let mut registry = ProviderRegistry::new();
+        registry.register("plugin", spec).unwrap();
+
+        let summaries = registry.summaries();
+        assert!(!summaries[0].models[0].streaming);
+        assert!(!summaries[0].models[0].tool_use);
     }
 
     #[test]

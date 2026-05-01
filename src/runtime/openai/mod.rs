@@ -104,11 +104,20 @@ pub async fn try_route(
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
             let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
-            let Some((handler, hook_bus, tools_shared)) = ({
+            let Some((handler, hook_bus, tools_shared, streaming, model_tool_use)) = ({
                 let manager = manager.read().await;
                 manager.provider(&provider_runtime_id).and_then(|provider| {
                     provider.handler.as_ref().map(|handler| {
-                        (handler.clone(), manager.hook_bus().clone(), manager.tools_shared())
+                        let model_spec = provider.spec.models.iter().find(|m| m.id == model_id);
+                        let streaming = model_spec
+                            .and_then(|m| m.capabilities.get("streaming"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let model_tool_use = model_spec
+                            .and_then(|m| m.capabilities.get("tool_use"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        (handler.clone(), manager.hook_bus().clone(), manager.tools_shared(), streaming, model_tool_use)
                     })
                 })
             }) else {
@@ -128,6 +137,49 @@ pub async fn try_route(
                 max_tokens,
                 thinking_budget,
             };
+            let has_active_tools = model_tool_use && !tools_schema.is_empty();
+            // Streaming path: forward TextDelta events as LlmEvent::Text deltas in real time.
+            if streaming && !has_active_tools {
+                let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<crate::extensions::runtime::process::ProviderStreamEvent>();
+                let tx_clone = tx.clone();
+                let forwarder = tokio::spawn(async move {
+                    use crate::extensions::runtime::process::ProviderStreamEvent;
+                    while let Some(event) = sink_rx.recv().await {
+                        match event {
+                            ProviderStreamEvent::TextDelta { text } => {
+                                let _ = tx_clone.send(crate::runtime::types::StreamEvent::Llm(
+                                    crate::runtime::types::LlmEvent::Text(text)
+                                ));
+                            }
+                            ProviderStreamEvent::ToolUse { .. } => {
+                                tracing::warn!("provider.stream tool_use event ignored (streaming tool-use not yet wired)");
+                            }
+                            // Usage / Done / ThinkingDelta / Error are absorbed; final result aggregates them.
+                            _ => {}
+                        }
+                    }
+                });
+                let stream_fut = handler.provider_stream(params, sink_tx);
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        forwarder.abort();
+                        return Some(Err("operation canceled".into()));
+                    }
+                    res = stream_fut => res,
+                };
+                let _ = forwarder.await;
+                if cancel.is_cancelled() {
+                    return Some(Err("operation canceled".into()));
+                }
+                return Some(result.map(|complete| {
+                    serde_json::json!({
+                        "content": complete.content,
+                        "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                        "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
+                    })
+                }).map_err(|e| format!("extension provider: {e}").into()));
+            }
             let result = if let Some(tools) = tools_shared {
                 let registry = tools.read().await;
                 crate::extensions::runtime::process::complete_provider_with_tools(

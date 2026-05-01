@@ -313,10 +313,19 @@ fn build_sections_from_parts(
                         &provider.provider_id,
                         &model.id,
                     );
-                    let label = if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        format!("{} [tool-use]", model.display_name.clone().unwrap_or_else(|| model.id.clone()))
+                    let mut badges: Vec<&str> = Vec::new();
+                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        badges.push("tool-use");
+                    }
+                    if model.capabilities.get("streaming").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        badges.push("streaming");
+                    }
+                    let base = model.display_name.clone().unwrap_or_else(|| model.id.clone());
+                    let label = if badges.is_empty() {
+                        base
                     } else {
-                        model.display_name.clone().unwrap_or_else(|| model.id.clone())
+                        let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
+                        format!("{} {}", base, suffix)
                     };
                     ModelEntry {
                         id: runtime_id.clone(),
