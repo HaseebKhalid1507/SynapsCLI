@@ -10,3 +10,4 @@ pub mod watcher_types;
 pub mod models;
 pub mod compaction;
 pub mod chain;
+pub mod session_index;

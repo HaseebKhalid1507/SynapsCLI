@@ -7,6 +7,8 @@ use reqwest::Client;
 use crate::{Result, RuntimeError, ToolRegistry};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
+use super::{BeforeToolCallDecision, emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision};
+use crate::extensions::hooks::events::HookEvent;
 use super::api::ApiMethods;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
@@ -43,6 +45,20 @@ pub(super) struct StreamSession {
 }
 
 pub(super) struct StreamMethods;
+
+fn assistant_text_from_content(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter_map(|item| {
+            if item["type"].as_str() == Some("text") {
+                item["text"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 impl StreamMethods {
     pub(super) async fn run_stream_internal(
@@ -122,22 +138,11 @@ impl StreamMethods {
                 });
             if let Some(ref msg_text) = last_user_msg {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
-                match hook_bus.emit(&hook_event).await {
-                    crate::extensions::hooks::events::HookResult::Inject { content } => {
-                        // Prepend injected content to system prompt
-                        let base = injected_system.clone().unwrap_or_default();
-                        // Sanitize content — strip any forged boundary markers
-                        let sanitized = content
-                            .replace("[End extension context]", "")
-                            .replace("[Extension context", "");
-                        injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{sanitized}\n[End extension context]\n\n{base}"));
-                        tracing::debug!(len = sanitized.len(), "Extension context injected into system prompt");
-                    }
-                    crate::extensions::hooks::events::HookResult::Block { reason } => {
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
-                        return Err(RuntimeError::Config(format!("Message blocked by extension: {}", reason)));
-                    }
-                    _ => {}
+                if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
+                    // Prepend injected content to system prompt
+                    let base = injected_system.clone().unwrap_or_default();
+                    injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
+                    tracing::debug!(len = content.len(), "Extension context injected into system prompt");
                 }
             }
 
@@ -169,6 +174,16 @@ impl StreamMethods {
                     "role": "assistant",
                     "content": content
                 }));
+
+                let assistant_text = assistant_text_from_content(content);
+                let hook_event = HookEvent::on_message_complete(
+                    &assistant_text,
+                    json!({
+                        "content_block_count": content.len(),
+                        "has_tool_use": !tool_uses.is_empty(),
+                    }),
+                );
+                let _ = hook_bus.emit(&hook_event).await;
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -241,14 +256,20 @@ impl StreamMethods {
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
-                                let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                    &tool_name, input.clone(),
-                                );
-                                hook_event.tool_runtime_name = Some(runtime_name.clone());
-                                let hook_result = hook_bus.emit(&hook_event).await;
-                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                let decision = resolve_before_tool_call_decision(
+                                    input.clone(),
+                                    emit_before_tool_call(
+                                        &hook_bus,
+                                        &tool_name,
+                                        Some(&runtime_name),
+                                        input.clone(),
+                                    ).await,
+                                    secret_prompt.as_ref(),
+                                ).await;
+                                if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                 let input_for_hook = input.clone();
                                 tokio::select! {
                                     res = tool.execute(input, crate::ToolContext {
@@ -260,11 +281,13 @@ impl StreamMethods {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        // ═══ HOOK: after_tool_call (stream single) ═══
-                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                            &tool_name, input_for_hook, output.clone(),
-                                        );
-                                        let _ = hook_bus.emit(&hook_event).await;
+                                        let _ = emit_after_tool_call(
+                                            &hook_bus,
+                                            &tool_name,
+                                            Some(&runtime_name),
+                                            input_for_hook,
+                                            output.clone(),
+                                        ).await;
                                         output
                                     }
                                     _ = cancel.cancelled() => {
@@ -315,6 +338,7 @@ impl StreamMethods {
                         }
 
                         let tools_snapshot = tools.read().await;
+                        let runtime_name = tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                         let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
                         let tool = tools_snapshot.get(&tool_name).cloned();
                         drop(tools_snapshot);
@@ -327,20 +351,26 @@ impl StreamMethods {
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
                         let tool_name_for_hook = tool_name.clone();
+                        let runtime_name_for_hook = runtime_name.clone();
                         let prompt_inner = secret_prompt.clone();
 
                         join_set.spawn(async move {
                             let result = match tool {
                                 Some(t) => {
-                                    // ═══ HOOK: before_tool_call (stream parallel) ═══
-                                    let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                        &tool_name_for_hook, input.clone(),
-                                    );
-                                    hook_event.tool_runtime_name = Some(tool_name_for_hook.clone());
-                                    let hook_result = hook_bus_inner.emit(&hook_event).await;
-                                    if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                    let decision = resolve_before_tool_call_decision(
+                                        input.clone(),
+                                        emit_before_tool_call(
+                                            &hook_bus_inner,
+                                            &tool_name_for_hook,
+                                            Some(&runtime_name_for_hook),
+                                            input.clone(),
+                                        ).await,
+                                        prompt_inner.as_ref(),
+                                    ).await;
+                                    if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, format!("Tool call blocked by extension: {}", reason))
                                     } else {
+                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
                                     let tx_k = tx_stream.clone();
@@ -364,11 +394,13 @@ impl StreamMethods {
                                                 Ok(output) => output,
                                                 Err(e) => format!("Tool execution failed: {}", e),
                                             };
-                                            // ═══ HOOK: after_tool_call (stream parallel) ═══
-                                            let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                                &tool_name_for_hook, input_for_hook, output.clone(),
-                                            );
-                                            let _ = hook_bus_inner.emit(&hook_event).await;
+                                            let _ = emit_after_tool_call(
+                                                &hook_bus_inner,
+                                                &tool_name_for_hook,
+                                                Some(&runtime_name_for_hook),
+                                                input_for_hook,
+                                                output.clone(),
+                                            ).await;
                                             (false, output)
                                         }
                                         _ = cancel_token.cancelled() => {

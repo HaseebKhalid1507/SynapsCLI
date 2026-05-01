@@ -8,11 +8,15 @@ For a user-facing guide on installing and configuring extensions, see [README.md
 
 ## Transport
 
-Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess by directly executing the `command` declared in `plugin.json` with the supplied `args` (no shell is involved — there is no shell-string parsing, globbing, or quoting). Your process's:
+Extensions communicate with the SynapsCLI runtime over **stdio**. The runtime spawns your extension as a subprocess using the `extension.command` and `extension.args` fields declared in `.synaps-plugin/plugin.json`. Your process's:
 
 - **stdin** — receives messages from the runtime
 - **stdout** — used to send responses back to the runtime
-- **stderr** — discarded (the runtime attaches `Stdio::null()`). Anything you write to stderr is dropped on the floor.
+- **stderr** — captured by SynapsCLI and emitted to debug tracing with the extension id
+
+Set `SYNAPS_EXTENSIONS_TRACE=1` (also accepts `true`, `yes`, or `on`) to emit one structured trace log for each extension hook call. Trace records include hook kind, extension id, action, duration, timeout state, health, and restart count. Trace mode intentionally does **not** log full hook params, tool inputs, or tool outputs by default.
+
+The process is started with the plugin root as its current working directory. Relative file access from your extension should therefore be written relative to the plugin directory.
 
 The protocol is **JSON-RPC 2.0** over a length-prefixed binary framing, identical in structure to the Language Server Protocol (LSP) transport. This is a deliberate choice — tooling that works with LSP servers works here too.
 
@@ -36,17 +40,17 @@ Content-Length: <byte-length-of-body>\r\n
 **Example frame (runtime → extension):**
 
 ```
-Content-Length: 175\r\n
+Content-Length: <byte-length>\r\n
 \r\n
-{"jsonrpc":"2.0","id":1,"method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","session_id":"sess-abc","tool_input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
+{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"transcript":null,"data":null}}
 ```
 
 **Example frame (extension → runtime):**
 
 ```
-Content-Length: 46\r\n
+Content-Length: 22\r\n
 \r\n
-{"jsonrpc":"2.0","id":1,"result":{"action":"continue"}}
+{"jsonrpc":"2.0","id":"evt-001","result":{"action":"continue"}}
 ```
 
 Both directions use the same framing. Your extension must:
@@ -64,6 +68,163 @@ Both directions use the same framing. Your extension must:
 ## Methods
 
 The runtime calls methods on your extension. Your extension does not initiate calls — it only responds.
+
+### `initialize`
+
+Sent once immediately after the process starts, before any hooks are delivered. Extensions must respond with the protocol version they support.
+
+**Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "synaps_version": "0.1.0",
+    "extension_protocol_version": 1,
+    "plugin_id": "my-plugin",
+    "plugin_root": "/path/to/my-plugin",
+    "config": {}
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocol_version": 1,
+    "capabilities": {}
+  }
+}
+```
+
+If the response protocol version is unsupported, Synaps refuses to load the extension and reports the load failure.
+
+Extensions that request `tools.register` may declare extension-provided tools in
+`capabilities.tools`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocol_version": 1,
+    "capabilities": {
+      "tools": [
+        {
+          "name": "echo",
+          "description": "Echo text back to the model",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" }
+            },
+            "required": ["text"]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Registered tool runtime names are namespaced as `plugin-id:tool-name` to avoid
+collisions. API-facing tool names are sanitized by the normal tool registry, for
+example `policy-bundle:echo` becomes `policy-bundle_echo`.
+
+### Extension config
+
+Plugins may declare configuration entries in `.synaps-plugin/plugin.json` under
+`extension.config`. Synaps resolves these values before spawning the extension and
+passes the resolved object to `initialize` as `params.config`.
+
+```json
+{
+  "extension": {
+    "config": [
+      {
+        "key": "endpoint",
+        "description": "Local service endpoint",
+        "required": true,
+        "default": "http://127.0.0.1:8080"
+      },
+      {
+        "key": "api_key",
+        "description": "Service API key",
+        "required": true,
+        "secret_env": "MY_PLUGIN_API_KEY"
+      }
+    ]
+  }
+}
+```
+
+Config entry fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `key` | string | yes | Config key name. Use lowercase letters/numbers plus `_` or `-`; avoid dots, slashes, and spaces. |
+| `description` | string | no | Human-readable explanation for inspection UIs. |
+| `required` | boolean | no | If true, loading fails before process spawn when no value can be resolved. |
+| `default` | JSON value | no | Non-secret fallback value. |
+| `secret_env` | string | no | Environment variable name that contains a secret value. |
+
+Resolution order is:
+
+1. Environment override: `SYNAPS_EXTENSION_<PLUGIN_ID>_<KEY>`
+2. User config key: `extension.<plugin-id>.<key>`
+3. The environment variable named by `secret_env`
+4. Manifest `default`
+5. Error if the entry is `required`
+
+For environment override names, `<PLUGIN_ID>` and `<KEY>` are uppercased and
+non-alphanumeric characters are converted to `_`. For example, plugin
+`safe-bash` key `api_key` uses `SYNAPS_EXTENSION_SAFE_BASH_API_KEY` or the user
+config key `extension.safe-bash.api_key`.
+
+Secrets should use `secret_env`; do not put secret values in `default`.
+
+---
+
+### `tool.call`
+
+Called when the model invokes an extension-provided tool declared during
+`initialize`.
+
+**Request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tool.call",
+  "params": {
+    "name": "echo",
+    "input": { "text": "hello" }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": { "content": "echo: hello" }
+}
+```
+
+If `result` is a string, Synaps uses it as the tool output. If `result.content`
+is a string, Synaps uses that. Otherwise Synaps serializes the JSON result as the
+tool output. JSON-RPC errors are surfaced as normal tool execution failures.
+
+---
 
 ### `hook.handle`
 
@@ -109,6 +270,24 @@ After receiving `shutdown`, your process should exit within 2 seconds. The runti
 
 ---
 
+## Hook Matchers
+
+Manifest hook subscriptions may include simple matcher conditions:
+
+```json
+{
+  "hook": "before_tool_call",
+  "tool": "bash",
+  "match": {
+    "input_contains": "rm -rf"
+  }
+}
+```
+
+Supported matcher keys are listed in `docs/extensions/contract.json` under `matchers`. Phase G supports `input_contains` and `input_equals` against `tool_input`. All specified matcher keys must match for the handler to be invoked.
+
+---
+
 ## HookEvent Schema
 
 The `params` field of a `hook.handle` request is a `HookEvent` object.
@@ -117,38 +296,89 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 {
   "kind": "before_tool_call",
   "tool_name": "bash",
-  "session_id": "sess-abc123",
+  "tool_runtime_name": "bash",
   "tool_input": {
     "command": "rm -rf /tmp/scratch"
   },
   "tool_output": null,
   "message": null,
-  "timestamp": "2024-11-14T10:23:01Z",
-  "metadata": {
-    "model": "claude-opus-4-5",
-    "turn": 3
+  "session_id": null,
+  "transcript": null,
+  "data": null
+}
+```
+
+| Field               | Type            | Present on hooks                              | Description                                                      |
+|---------------------|-----------------|-----------------------------------------------|------------------------------------------------------------------|
+| `kind`              | string          | all                                           | The hook name that fired (e.g. `"before_tool_call"`)             |
+| `tool_name`         | string \| null  | `before_tool_call`, `after_tool_call`         | API-safe name of the tool being called                           |
+| `tool_runtime_name` | string \| null  | `before_tool_call`, `after_tool_call`         | Original runtime tool name (before API sanitization)             |
+| `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
+| `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)             |
+| `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
+| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
+| `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
+| `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
+
+Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
+
+### `on_compaction`
+
+`on_compaction` is emitted after manual conversation compaction creates and saves
+a replacement session. It requires `privacy.llm_content` and supports only
+`continue`. `message` contains the compaction summary. `session_id` is the new
+session id; `data` includes both old and new session ids plus the number of
+messages compacted.
+
+```json
+{
+  "kind": "on_compaction",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": "Compacted summary text...",
+  "session_id": "20260501-120000-abcd",
+  "transcript": null,
+  "data": {
+    "old_session_id": "20260501-110000-wxyz",
+    "new_session_id": "20260501-120000-abcd",
+    "message_count": 42,
+    "source": "manual"
   }
 }
 ```
 
-| Field         | Type               | Present on hooks                              | Description                                               |
-|---------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
-| `kind`        | string             | all                                           | The hook name that fired                                  |
-| `tool_name`   | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
-| `session_id`  | string \| null     | `on_session_start`, `on_session_end`          | Stable identifier for the current session                 |
-| `tool_input`  | object \| null     | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                |
-| `tool_output` | string \| null     | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)      |
-| `message`     | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
-| `timestamp`   | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
-| `metadata`    | object             | all                                           | Runtime context: active model, turn count, etc.           |
+### `on_message_complete`
 
-Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
+`on_message_complete` is emitted after an assistant response is completed and
+added to session history. It requires `privacy.llm_content` and supports only
+`continue`. `message` contains concatenated assistant text blocks when present;
+tool-use blocks are summarized in `data` instead of being serialized into
+`message`.
+
+```json
+{
+  "kind": "on_message_complete",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": "The build passed.",
+  "session_id": null,
+  "transcript": null,
+  "data": {
+    "content_block_count": 1,
+    "has_tool_use": false
+  }
+}
+```
 
 ---
 
 ## HookResult Variants
 
-Your response's `result` field must be one of three variants, identified by the `action` field.
+Your response's `result` field must be one of these variants, identified by the `action` field.
 
 ### `continue`
 
@@ -174,6 +404,36 @@ Prevent the event from proceeding. Only valid on hooks marked **Can block?** in 
 | `reason` | string | yes      | Human-readable explanation surfaced to the user/logs  |
 
 When a tool call is blocked, the LLM receives a synthetic tool result indicating the tool was not executed, along with the reason.
+
+### `confirm`
+
+Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on `before_tool_call`; on other hooks, `confirm` is treated as `continue` and logged as an unsupported action. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
+
+```json
+{
+  "action": "confirm",
+  "message": "Run `deploy-prod` now?"
+}
+```
+
+| Field     | Type   | Required | Description                                      |
+|-----------|--------|----------|--------------------------------------------------|
+| `message` | string | yes      | Human-readable confirmation prompt for the user  |
+
+### `modify`
+
+Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.
+
+```json
+{
+  "action": "modify",
+  "input": { "command": "echo safe" }
+}
+```
+
+| Field   | Type   | Required | Description                       |
+|---------|--------|----------|-----------------------------------|
+| `input` | object | yes      | Replacement tool input JSON value |
 
 ### `inject`
 
@@ -251,7 +511,14 @@ def main():
 
         method = message.get("method")
 
-        if method == "hook.handle":
+        if method == "initialize":
+            write_message({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {"protocol_version": 1, "capabilities": {}}
+            })
+
+        elif method == "hook.handle":
             result = handle_hook(message["params"])
             write_message({
                 "jsonrpc": "2.0",
@@ -271,6 +538,7 @@ if __name__ == "__main__":
 
 - Reading is byte-exact based on `Content-Length`. Do not use `readline()` alone.
 - Writing uses `sys.stdout.buffer` (raw bytes), not `print()`.
+- `initialize` is handled before hooks and returns the supported protocol version.
 - `shutdown` is handled gracefully — the loop exits and the process terminates naturally.
 - No threads, no async — a simple synchronous loop is sufficient for most extensions.
 
@@ -288,31 +556,33 @@ Full `plugin.json` with all supported extension fields:
   "author": "Your Name <you@example.com>",
   "license": "MIT",
   "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
     "command": "python3",
     "args": ["main.py"],
+    "permissions": ["tools.intercept"],
     "hooks": [
       {
         "hook": "before_tool_call",
         "tool": "bash"
       }
-    ],
-    "permissions": [
-      "tools.intercept"
     ]
   }
 }
 ```
 
-| Field                    | Type            | Required | Description                                                                                                |
-|--------------------------|-----------------|----------|------------------------------------------------------------------------------------------------------------|
-| `extension.command`      | string          | yes      | Executable to launch (resolved against `PATH` if bare, otherwise relative to the plugin directory). No shell. |
-| `extension.args`         | array of string | no       | Arguments passed to `command`. Defaults to `[]`. Each element is a single argv entry — no shell splitting. |
-| `extension.hooks`        | array           | yes      | One or more hook registrations                                                                             |
-| `extension.hooks[].hook` | string          | yes      | Hook name (see Available Hooks table)                                                                      |
-| `extension.hooks[].tool` | string          | no       | If set, narrows the hook to a specific tool name                                                           |
-| `extension.permissions`  | array of string | no       | Permissions the extension declares it requires (empty = observe-only)                                      |
+| Field                         | Type            | Required | Description                                                           |
+|-------------------------------|-----------------|----------|-----------------------------------------------------------------------|
+| `extension.protocol_version`  | integer         | no       | Protocol version; defaults to `1`, future versions are rejected       |
+| `extension.runtime`           | string          | yes      | Runtime type; phase 1 supports `process` only                         |
+| `extension.command`           | string          | yes      | Executable or plugin-relative script path to launch                   |
+| `extension.args`              | array           | no       | Arguments passed to `command`                                         |
+| `extension.hooks`             | array           | yes      | One or more hook registrations                                        |
+| `extension.hooks[].hook`      | string          | yes      | Hook name (see Available Hooks table)                                 |
+| `extension.hooks[].tool`      | string          | no       | If set, narrows the hook to a specific tool name                      |
+| `extension.permissions`       | array of string | no       | Active permissions the extension declares it requires                 |
 
-The `command` is executed with the plugin directory as the working directory. Relative paths in `command` resolve from there. Because there is no shell, you cannot use shell features (pipes, `&&`, env-var expansion, glob patterns) inside `command` or `args` — invoke an interpreter explicitly (e.g. `"command": "python3", "args": ["main.py"]`).
+Relative command paths and local argument paths are resolved from the plugin directory when safe. Bare commands such as `python3` and `node` are resolved through `PATH`.
 
 ---
 
@@ -320,14 +590,15 @@ The `command` is executed with the plugin directory as the working directory. Re
 
 | Permission           | What it unlocks                                                                            |
 |----------------------|--------------------------------------------------------------------------------------------|
-| `tools.intercept`    | Enables `block` results on `before_tool_call`. Without this, block is silently ignored.    |
-| `privacy.llm_content`| Populates `message` and `output` fields. Without this, those fields are always `null`.     |
+| `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
+| `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
-| `tools.register`     | Allows the extension to declare new tools the LLM can call (separate registration flow).   |
-| `providers.register` | Allows the extension to register a new LLM backend provider.                               |
-| `tools.override`     | Allows replacing a built-in tool's implementation with the extension's own handler.        |
+| `tools.register`    | Register extension-provided tools during initialization.                                    |
+| `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 
-Permissions are declared but not enforced cryptographically — they serve as an explicit contract between the extension author and the user installing it. SynapsCLI will display the requested permissions at install time and warn if an extension is attempting to use capabilities it hasn't declared.
+Reserved future permissions are rejected if declared today: `tools.override`.
+
+Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 
 ---
 
@@ -337,32 +608,39 @@ Permissions are declared but not enforced cryptographically — they serve as an
 
 SynapsCLI is designed to degrade gracefully when extensions misbehave. If your extension:
 
-- **Does not respond within 5 seconds** — the event proceeds as `continue`. Your extension is not killed; the next event will still be sent.
-- **Sends a malformed response** — treated as `continue`. The error is dropped (stderr is not captured; see below).
-- **Crashes (exits unexpectedly)** — the runtime marks your extension as failed for this session. All subsequent hook events for your registered hooks are skipped. The session continues normally.
-- **Sends an error object** instead of a result — treated as `continue`. The error message is discarded.
+- **Does not respond within 5 seconds** — the event proceeds as `continue`.
+- **Sends a malformed response** — treated as `continue`. The error is logged through SynapsCLI tracing.
+- **Crashes or closes stdout** — the runtime restarts the process and retries the request. If retry also fails, hook delivery fails open for that call.
+- **Sends an error object** instead of a result — treated as `continue`. The error message is logged.
+
+After three restart attempts, the extension health becomes `Failed`; subsequent hook calls continue fail-open.
 
 ### Timeouts
 
-| Scenario                      | Timeout | Behavior on expiry                       |
-|-------------------------------|---------|------------------------------------------|
-| `hook.handle` response        | 5s      | Treat as `continue`, log warning         |
-| Extension startup (first msg) | 10s     | Extension marked failed, not retried     |
-| `shutdown` grace period       | 2s      | `SIGKILL` sent to extension process      |
+| Scenario               | Timeout | Behavior on expiry                       |
+|------------------------|---------|------------------------------------------|
+| `hook.handle` response | 5s      | Treat as `continue`, log warning         |
+| `shutdown` grace period| 500ms request timeout, then kill after a short grace period | Best-effort shutdown, then child kill |
 
 ### On Crash
 
 When an extension process exits without receiving `shutdown`:
 
-1. The runtime logs the exit code
-2. The extension is marked inactive for the session
-3. No attempt is made to restart it
-4. Other extensions continue operating normally
+1. The runtime logs the transport error through tracing
+2. The runtime respawns the process and retries the in-flight request
+3. If retry fails, the triggering event proceeds as `continue`
+4. After three restart attempts, the extension is marked `Failed`
+5. Other extensions continue operating normally
 
 Design your extension to be stateless where possible. If you maintain state, write it to disk promptly — do not rely on an orderly `shutdown` call.
 
-### Stderr Handling
+### Stderr Logging
 
-The runtime currently attaches `Stdio::null()` to extension stderr — anything you write there is **discarded**, not captured or surfaced. Do not rely on stderr for diagnostics that you need to see.
+Child stderr is captured and forwarded to SynapsCLI debug tracing with the extension id. Use stderr for human/debug diagnostics only; stdout is reserved for framed JSON-RPC responses.
 
-For debugging, write to a file inside your plugin directory (or a temp path) and tail it externally. A future runtime version may capture stderr into the SynapsCLI debug log, but that is **not yet implemented**.
+```
+[rm-rf-guard] Checked command: "ls -la" — allowed
+[rm-rf-guard] Checked command: "rm -rf /home/user/docs" — blocked
+```
+
+Do not write protocol data to stderr; stdout is reserved for framed JSON-RPC responses.

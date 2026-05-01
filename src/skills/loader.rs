@@ -138,7 +138,8 @@ fn walk_root(
         {
             Some(m) => {
                 for entry in &m.plugins {
-                    let plugin_root = root.join(&entry.source);
+                    let Some(source) = entry.source.as_ref() else { continue; };
+                    let plugin_root = root.join(source);
                     load_plugin(&plugin_root, Some(&m.name), plugins, skills, seen);
                 }
                 Some(m.name)
@@ -211,12 +212,13 @@ fn load_plugin(
     if plugins.iter().any(|p| p.root == root_abs) {
         return;
     }
-    plugins.push(Plugin {
+        plugins.push(Plugin {
         name: m.name.clone(),
         root: root_abs,
         marketplace: marketplace.map(str::to_string),
         version: m.version.clone(),
         description: m.description.clone(),
+        extension: m.extension.clone(),
         manifest: Some(m.clone()),
     });
 
@@ -400,8 +402,39 @@ mod tests {
         let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "my-plugin");
+        assert!(plugins[0].manifest.as_ref().unwrap().commands.is_empty());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].plugin.as_deref(), Some("my-plugin"));
+    }
+
+    #[test]
+    fn load_all_plugin_commands_are_carried_in_manifest() {
+        let tmp = tempdir();
+        let plugin_dir = tmp.join("cmd-plugin");
+        fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            plugin_dir.join(".synaps-plugin").join("plugin.json"),
+            r#"{
+                "name": "cmd-plugin",
+                "commands": [
+                    {"name":"hello","description":"Say hello","command":"printf","args":["hello"]}
+                ]
+            }"#,
+        ).unwrap();
+
+        let (plugins, skills) = load_all(std::slice::from_ref(&tmp));
+
+        assert_eq!(plugins.len(), 1);
+        assert!(skills.is_empty());
+        let commands = &plugins[0].manifest.as_ref().unwrap().commands;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            crate::skills::manifest::ManifestCommand::Shell(cmd) => {
+                assert_eq!(cmd.name, "hello");
+                assert_eq!(cmd.command, "printf");
+            }
+            other => panic!("expected shell command, got {other:?}"),
+        }
     }
 
     #[test]

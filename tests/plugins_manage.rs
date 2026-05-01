@@ -74,9 +74,10 @@ async fn end_to_end_add_install_uninstall() {
         last_refreshed: Some("now".into()),
         cached_plugins: m.plugins.iter().map(|p| CachedPlugin {
             name: p.name.clone(),
-            source: p.source.clone(),
+            source: p.source.clone().unwrap_or_default(),
             version: None,
             description: None,
+            index: None,
         }).collect(),
         repo_url: None,
     });
@@ -93,6 +94,8 @@ async fn end_to_end_add_install_uninstall() {
         latest_commit: None,
         installed_at: "now".into(),
         source_subdir: None,
+        checksum_algorithm: None,
+        checksum_value: None,
     });
 
     let state_path = tmp.path().join("plugins.json");

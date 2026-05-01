@@ -2,7 +2,7 @@
 
 Extensions are external processes that hook into SynapsCLI's runtime. They observe and intercept events — tool calls, messages, sessions — and can modify behavior without touching core source code.
 
-This document covers everything you need to **use** extensions. If you want to **build** one, see [protocol.md](./protocol.md).
+This document covers everything you need to **use** extensions. If you want to **build** one, see [protocol.md](./protocol.md), [hooks.md](./hooks.md), and [permissions.md](./permissions.md).
 
 ---
 
@@ -13,17 +13,20 @@ An extension is an independent process that SynapsCLI spawns alongside the main 
 Extensions can:
 
 - **Observe** — log, audit, or monitor tool calls and messages
-- **Block** — prevent a tool call or message from proceeding
+- **Block** — prevent a `before_tool_call` event from proceeding
+- **Confirm** — ask for explicit user approval before a tool call proceeds
+- **Modify** — replace `before_tool_call` input before execution
 - **Inject** — prepend context into the system prompt before a request reaches the LLM
-- **Register** — expose new tools or providers into the runtime
 
-SynapsCLI spawns each extension as a subprocess on session start and tears it down on session end. If an extension crashes or times out, the runtime fails open — the event proceeds as if the extension wasn't there.
+Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
+
+SynapsCLI spawns each extension as a subprocess on session start and tears it down on session end. Extensions run with the plugin root as their current working directory. If an extension crashes or times out, the runtime fails open — the event proceeds as if the extension wasn't there. Transport failures trigger up to three restart attempts before the extension is marked failed.
 
 ---
 
 ## Installing Extensions
 
-Extensions live under `~/.synaps-cli/plugins/`. Each plugin gets its own directory named after the extension:
+Extensions live under the user plugin directory (`~/.synaps-cli/plugins/`) and may also live under a project-local directory (`./.synaps/plugins/`). Each plugin gets its own directory named after the extension:
 
 ```
 ~/.synaps-cli/plugins/
@@ -31,7 +34,8 @@ Extensions live under `~/.synaps-cli/plugins/`. Each plugin gets its own directo
     .synaps-plugin/
       plugin.json
     main.py
-  another-extension/
+./.synaps/plugins/
+  project-auditor/
     .synaps-plugin/
       plugin.json
     index.js
@@ -43,13 +47,13 @@ To install an extension from a git repository:
 git clone https://github.com/example/my-auditor ~/.synaps-cli/plugins/my-auditor
 ```
 
-SynapsCLI scans this directory on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically.
+SynapsCLI scans both locations on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically. If the same plugin directory name exists in both locations, the project-local plugin in `./.synaps/plugins/` overrides the user plugin for that project. Set `SYNAPS_DISABLE_PROJECT_PLUGINS=1` (also accepts `true`, `yes`, or `on`) to disable project-local extension discovery for a run.
 
 ---
 
 ## Plugin Structure
 
-Every extension must include a manifest at `.synaps-plugin/plugin.json`. The manifest declares metadata, the entry point, requested permissions, and which hooks to register.
+Every extension must include a manifest at `.synaps-plugin/plugin.json`. The manifest declares metadata, optional compatibility metadata, the process command, requested permissions, and which hooks to subscribe to.
 
 ```json
 {
@@ -58,14 +62,14 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
   "description": "Logs all tool calls to a local audit file.",
   "author": "Your Name",
   "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
     "command": "python3",
     "args": ["main.py"],
+    "permissions": ["tools.intercept"],
     "hooks": [
       { "hook": "before_tool_call" },
       { "hook": "after_tool_call" }
-    ],
-    "permissions": [
-      "tools.intercept"
     ]
   }
 }
@@ -73,30 +77,34 @@ Every extension must include a manifest at `.synaps-plugin/plugin.json`. The man
 
 The `extension` field is what distinguishes a plugin that provides an extension from one that only declares tools or themes. Its fields:
 
-| Field         | Type            | Description                                                                                          |
-|---------------|-----------------|------------------------------------------------------------------------------------------------------|
-| `command`     | string          | Executable used to launch the extension process. Run directly — no shell, no glob/quoting expansion. |
-| `args`        | array of string | Arguments passed to `command` (each element is a single argv entry). Defaults to `[]`.               |
-| `hooks`       | array           | List of hook registrations (see below)                                                               |
-| `permissions` | array of string | Permissions the extension requires to function correctly                                             |
+| Field              | Type            | Description                                              |
+|--------------------|-----------------|----------------------------------------------------------|
+| `protocol_version` | integer         | Extension protocol version; phase 1 uses `1`             |
+| `runtime`          | string          | Runtime type; phase 1 supports `process` only            |
+| `command`          | string          | Executable or plugin-relative script path to launch      |
+| `args`             | array           | Arguments passed to `command`; local files resolve from the plugin dir when safe |
+| `permissions`      | array of string | Permissions the extension requires to function correctly |
+| `hooks`            | array           | List of hook subscriptions (see below)                   |
 
 ---
 
 ## Available Hooks
 
-| Hook                | Fires when…                                              | Can block? | Can inject? |
-|---------------------|----------------------------------------------------------|------------|-------------|
-| `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅           |
-| `after_tool_call`   | A tool has finished executing                            | ❌          | ❌           |
-| `before_message`    | A user or assistant message is about to be processed     | ✅          | ✅           |
-| `on_session_start`  | A new session has been initialized                       | ❌          | ✅           |
-| `on_session_end`    | A session is being torn down                             | ❌          | ❌           |
+| Hook                | Fires when…                                              | Can block? | Can confirm? | Can inject? |
+|---------------------|----------------------------------------------------------|------------|--------------|-------------|
+| `before_tool_call`  | A tool is about to be executed                           | ✅          | ✅            | ✅ modify    |
+| `after_tool_call`   | A tool has finished executing                            | ❌          | ❌            | ❌           |
+| `before_message`    | A user message is about to be sent to the model          | ❌          | ❌            | ✅           |
+| `on_session_start`  | A new session has been initialized                       | ❌          | ❌            | ❌           |
+| `on_session_end`    | A session is being torn down                             | ❌          | ❌            | ❌           |
 
 **Notes:**
 
-- `after_tool_call` and `on_session_end` are observation-only. Returning a `block` or `inject` result from these hooks has no effect.
-- `on_session_start` supports `inject` — content injected here is prepended to the system prompt for the duration of the session.
-- Multiple extensions can register the same hook. They are called in load order. If any extension blocks an event, subsequent extensions for that event are not called.
+- `before_tool_call` supports `block`; if any extension blocks, the tool is not executed and later handlers are skipped.
+- `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
+- `before_tool_call` supports `modify`, which replaces the tool input before execution. Trace logs record that modification occurred without logging the modified input.
+- `before_message` supports `inject`; injected content from matching extensions is accumulated.
+- Other hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 
 ---
 
@@ -119,20 +127,44 @@ Omitting the `"tool"` field registers a wildcard — your extension receives tha
 
 ---
 
+## Hook Matchers
+
+Hook subscriptions may include a small `match` object to avoid invoking an extension unless the event payload is relevant:
+
+```json
+"hooks": [
+  {
+    "hook": "before_tool_call",
+    "tool": "bash",
+    "match": { "input_contains": "rm -rf" }
+  }
+]
+```
+
+Current matchers are contract-defined:
+
+- `input_contains` — substring search against JSON-stringified `tool_input`
+- `input_equals` — exact JSON equality against `tool_input`
+
+No policy language is embedded in manifests; complex logic belongs in the extension process.
+
+---
+
 ## Permissions
 
-Extensions must declare the permissions they require. SynapsCLI will warn (and optionally refuse) if an extension requests permissions that aren't granted.
+Extensions must declare the permissions they require. SynapsCLI rejects unknown permission strings and refuses hook subscriptions that lack the hook's required permission.
 
 | Permission           | What it grants                                                                 |
 |----------------------|--------------------------------------------------------------------------------|
-| `tools.intercept`    | Ability to block tool calls via `before_tool_call`                             |
-| `privacy.llm_content`| Access to the full content of messages and tool outputs sent to/from the LLM  |
+| `tools.intercept`    | Ability to receive `before_tool_call` / `after_tool_call` events               |
+| `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
-| `tools.register`     | Ability to expose new tools into the runtime for the LLM to call               |
-| `providers.register` | Ability to register a new LLM provider                                         |
-| `tools.override`     | Ability to replace the implementation of an existing built-in tool             |
+| `tools.register`    | Register extension-provided tools during initialization                         |
+| `providers.register`| Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 
-Extensions that do not declare a required permission **cannot subscribe to the corresponding hook at all**. The runtime rejects the subscription at load time with an error like `Extension '<name>' lacks permission '<perm>' required for hook '<hook>'`, and the extension simply does not receive any of those events. There is no per-field redaction or partial delivery — it is all-or-nothing per hook.
+Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override`.
+
+Permissions are checked before events are delivered. An extension that lacks a hook's required permission is not subscribed to that hook.
 
 ---
 
@@ -167,10 +199,7 @@ This is useful for debugging when you want to isolate whether behavior is coming
 
 | Variable      | Description                                                                              |
 |---------------|------------------------------------------------------------------------------------------|
-| `AXEL_BRAIN`  | When set to `1`, enables verbose extension lifecycle logging (spawns, hook calls, errors)|
-| `HUB_PORT`    | Port used by the internal extension hub for inter-extension communication (default: auto) |
-
-`HUB_PORT` is typically managed automatically. You only need to set it manually if you're running multiple SynapsCLI instances on the same machine and experiencing port conflicts.
+| standard tracing/log configuration | Extension lifecycle and hook errors are emitted through SynapsCLI tracing |
 
 ---
 

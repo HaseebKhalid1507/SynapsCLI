@@ -5,6 +5,7 @@ pub mod mcp;
 pub mod skills;
 pub mod events;
 pub mod extensions;
+pub mod memory;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;

@@ -18,6 +18,7 @@ mod find;
 mod ls;
 mod subagent;
 mod secret_prompt;
+mod extension;
 
 pub mod watcher_exit;
 pub(crate) mod util;
@@ -46,6 +47,7 @@ pub use respond::RespondTool;
 pub use send_channel::SendChannelTool;
 pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
 pub use secret_prompt::SecretPromptQueue;
+pub use extension::ExtensionTool;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -97,6 +99,11 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given parameters.
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
+
+    /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
+    fn extension_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

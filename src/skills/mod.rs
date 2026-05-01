@@ -15,14 +15,19 @@ pub mod registry;
 pub mod tool;
 pub mod state;
 pub mod marketplace;
+pub mod plugin_index;
+pub mod update_diff;
 pub mod install;
 pub mod keybinds;
+pub mod commands;
+pub mod trust;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::skills::registry::CommandRegistry;
 use crate::skills::tool::LoadSkillTool;
+use crate::extensions::manifest::ExtensionManifest;
 
 /// A plugin discovered during skill loading.
 #[derive(Debug, Clone)]
@@ -32,6 +37,7 @@ pub struct Plugin {
     pub marketplace: Option<String>,
     pub version: Option<String>,
     pub description: Option<String>,
+    pub extension: Option<ExtensionManifest>,
     pub manifest: Option<manifest::PluginManifest>,
 }
 
@@ -51,7 +57,7 @@ pub struct LoadedSkill {
 pub const BUILTIN_COMMANDS: &[&str] = &[
     "clear", "compact", "chain", "model", "models", "system", "thinking", "sessions",
     "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
-    "settings", "plugins", "status", "ping", "keybinds",
+    "settings", "plugins", "extensions", "status", "ping", "keybinds",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,
@@ -90,7 +96,7 @@ pub async fn register(
         kb_registry.register_user(&config.keybinds);
     }
 
-    let registry = Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, skills));
+    let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
     (registry, Arc::new(kb_registry))
@@ -99,8 +105,8 @@ pub async fn register(
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
-    let (_plugins, mut skills) = loader::load_all(&loader::default_roots());
+    let (plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
     tracing::info!(skills = skills.len(), "reloaded skills");
-    registry.rebuild_with(skills);
+    registry.rebuild_with_plugins(skills, plugins);
 }

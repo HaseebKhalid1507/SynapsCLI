@@ -27,10 +27,19 @@ pub fn set_profile(name: Option<String>) {
 }
 
 pub fn base_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("SYNAPS_BASE_DIR") {
+        return PathBuf::from(path);
+    }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".synaps-cli")
+}
+
+/// Overrides the Synaps base directory. Intended for tests and embedded harnesses.
+#[doc(hidden)]
+pub fn set_base_dir_for_tests(path: PathBuf) {
+    std::env::set_var("SYNAPS_BASE_DIR", path);
 }
 
 /// Resolves a path for reading. Checks the profile folder first, then falls back to the default folder.
@@ -300,6 +309,21 @@ pub fn load_config() -> SynapsConfig {
     let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
 
     config
+}
+
+/// Read a single config value by exact key from the active config file.
+pub fn read_config_value(key: &str) -> Option<String> {
+    let path = resolve_read_path("config");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if k.trim() == key.trim() {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
 }
 
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).

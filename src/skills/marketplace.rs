@@ -120,7 +120,8 @@ pub fn is_trusted(source_url: &str, trusted_hosts: &[String]) -> bool {
     }
 }
 
-use crate::skills::manifest::MarketplaceManifest;
+use crate::skills::manifest::{MarketplaceManifest, MarketplacePluginEntry};
+use crate::skills::plugin_index::{PluginIndex, PluginIndexEntry, validate_plugin_index};
 
 pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
     if !is_safe_plugin_name(&m.name) {
@@ -129,6 +130,15 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
             m.name
         ));
     }
+    validate_keywords("marketplace keywords", &m.keywords)?;
+    validate_categories(&m.categories)?;
+    if let Some(trust) = &m.trust {
+        if let Some(homepage) = &trust.homepage {
+            if !homepage.starts_with("https://") {
+                return Err("marketplace trust.homepage must be https://".to_string());
+            }
+        }
+    }
     for p in &m.plugins {
         if !is_safe_plugin_name(&p.name) {
             return Err(format!(
@@ -136,7 +146,8 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
                 p.name
             ));
         }
-        let s = p.source.trim();
+        let source = p.source.as_deref().or_else(|| p.index.as_ref().map(|idx| idx.repository.as_str())).ok_or_else(|| format!("plugin '{}' missing source", p.name))?;
+        let s = source.trim();
         // Repo-relative source: "./<safe-name>" — a direct child subdir of
         // the marketplace repo. Claude Code marketplaces use this form.
         if let Some(subdir) = s.strip_prefix("./") {
@@ -161,6 +172,36 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
                 p.name, s
             ));
         }
+        if let Some(category) = &p.category {
+            validate_category(category)?;
+        }
+        validate_keywords(&format!("plugin '{}' keywords", p.name), &p.keywords)?;
+    }
+    Ok(())
+}
+
+fn validate_categories(categories: &[String]) -> Result<(), String> {
+    for category in categories {
+        validate_category(category)?;
+    }
+    Ok(())
+}
+
+fn validate_category(category: &str) -> Result<(), String> {
+    if category.is_empty() || !category.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("invalid marketplace category '{}'", category));
+    }
+    Ok(())
+}
+
+fn validate_keywords(label: &str, keywords: &[String]) -> Result<(), String> {
+    if keywords.len() > 20 {
+        return Err(format!("{} may contain at most 20 entries", label));
+    }
+    for keyword in keywords {
+        if keyword.is_empty() || keyword.len() > 40 || !keyword.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(format!("invalid {} entry '{}'", label, keyword));
+        }
     }
     Ok(())
 }
@@ -172,10 +213,57 @@ pub async fn fetch_manifest(url: &str) -> Result<MarketplaceManifest, String> {
         return Err(format!("fetch_manifest requires https:// URL, got: {}", url));
     }
     let body = fetch_raw(url).await?;
-    let m: MarketplaceManifest = serde_json::from_str(&body)
-        .map_err(|e| format!("invalid marketplace.json: {}", e))?;
-    validate_manifest(&m)?;
-    Ok(m)
+    parse_marketplace_or_plugin_index(&body)
+}
+
+pub fn parse_marketplace_or_plugin_index(body: &str) -> Result<MarketplaceManifest, String> {
+    match serde_json::from_str::<MarketplaceManifest>(body) {
+        Ok(m) => {
+            validate_manifest(&m)?;
+            Ok(m)
+        }
+        Err(marketplace_err) => {
+            let index: PluginIndex = serde_json::from_str(body)
+                .map_err(|index_err| format!("invalid marketplace/index JSON: marketplace: {}; plugin index: {}", marketplace_err, index_err))?;
+            marketplace_from_plugin_index(index)
+        }
+    }
+}
+
+fn marketplace_from_plugin_index(index: PluginIndex) -> Result<MarketplaceManifest, String> {
+    validate_plugin_index(&index)?;
+    let plugins = index
+        .plugins
+        .into_iter()
+        .map(marketplace_entry_from_index_entry)
+        .collect();
+    Ok(MarketplaceManifest {
+        name: "plugin-index".to_string(),
+        version: None,
+        description: Some("Synaps plugin index".to_string()),
+        categories: vec![],
+        keywords: vec![],
+        trust: None,
+        plugins,
+    })
+}
+
+fn marketplace_entry_from_index_entry(entry: PluginIndexEntry) -> MarketplacePluginEntry {
+    let source = if let Some(subdir) = &entry.subdir {
+        Some(format!("./{}", subdir))
+    } else {
+        Some(entry.repository.clone())
+    };
+    MarketplacePluginEntry {
+        name: entry.id.clone(),
+        source,
+        version: Some(entry.version.clone()),
+        description: Some(entry.description.clone()),
+        category: entry.categories.first().cloned(),
+        keywords: entry.keywords.clone(),
+        license: entry.license.clone(),
+        index: Some(entry),
+    }
 }
 
 /// Resolve a user-entered URL to a marketplace manifest. For GitHub URLs,
@@ -331,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_manifest_accepts_marketplace_metadata() {
+        let m: MarketplaceManifest = serde_json::from_str(r#"{
+            "name":"index",
+            "categories":["productivity"],
+            "keywords":["local-first"],
+            "trust":{"publisher":"Acme","homepage":"https://example.com"},
+            "plugins":[{"name":"p","source":"https://example.com/p.json","category":"tools","keywords":["safe"]}]
+        }"#).unwrap();
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_bad_marketplace_metadata() {
+        let m: MarketplaceManifest = serde_json::from_str(r#"{
+            "name":"index",
+            "categories":["Bad Category"],
+            "keywords":["Local First"],
+            "trust":{"homepage":"http://example.com"},
+            "plugins":[{"name":"p","source":"https://example.com/p.json","category":"bad/category"}]
+        }"#).unwrap();
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
     fn validate_manifest_accepts_https_sources() {
         let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
             {"name":"x","plugins":[{"name":"p","source":"https://github.com/a/b.git"}]}
@@ -390,11 +502,18 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "../etc/hostile".into(),
-                source: "https://github.com/u/r".into(),
+                source: Some("https://github.com/u/r".into()),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
+                index: None,
             }],
         };
         assert!(validate_manifest(&m).is_err());
@@ -406,11 +525,18 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "foo/bar".into(),
-                source: "https://github.com/u/r".into(),
+                source: Some("https://github.com/u/r".into()),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
+                index: None,
             }],
         };
         assert!(validate_manifest(&m).is_err());
@@ -422,14 +548,57 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "web-search_v2".into(),
-                source: "https://github.com/u/r".into(),
+                source: Some("https://github.com/u/r".into()),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
+                index: None,
             }],
         };
         assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn parse_plugin_index_as_marketplace_preserves_index_metadata() {
+        let body = r#"{
+          "schema_version": 1,
+          "plugins": [{
+            "id": "policy-bundle",
+            "name": "policy-bundle",
+            "version": "0.1.0",
+            "description": "Policy bundle",
+            "repository": "https://github.com/example/synaps-skills.git",
+            "subdir": "policy-bundle-plugin",
+            "checksum": {"algorithm": "sha256", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+            "compatibility": {"synaps": ">=0.1.0", "extension_protocol": "1"},
+            "capabilities": {
+              "skills": ["safe-tool-policy"],
+              "has_extension": true,
+              "permissions": ["tools.intercept"],
+              "hooks": ["before_tool_call"],
+              "commands": ["scan"]
+            },
+            "trust": {"publisher": "Example", "homepage": "https://example.com"}
+          }]
+        }"#;
+
+        let marketplace = parse_marketplace_or_plugin_index(body).unwrap();
+        assert_eq!(marketplace.plugins.len(), 1);
+        let plugin = &marketplace.plugins[0];
+        assert_eq!(plugin.name, "policy-bundle");
+        assert_eq!(plugin.source.as_deref(), Some("./policy-bundle-plugin"));
+        let index = plugin.index.as_ref().unwrap();
+        assert_eq!(index.repository, "https://github.com/example/synaps-skills.git");
+        assert_eq!(index.checksum.algorithm, "sha256");
+        assert_eq!(index.capabilities.permissions, vec!["tools.intercept"]);
+        assert_eq!(index.trust.as_ref().unwrap().publisher.as_deref(), Some("Example"));
     }
 
     #[tokio::test]

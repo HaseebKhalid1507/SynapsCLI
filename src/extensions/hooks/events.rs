@@ -29,6 +29,10 @@ pub enum HookKind {
     AfterToolCall,
     /// Fires before an LLM message is sent. Handlers may inspect or block.
     BeforeMessage,
+    /// Fires after an assistant response is completed and added to history.
+    OnMessageComplete,
+    /// Fires after conversation compaction creates a replacement session.
+    OnCompaction,
     /// Fires when a new session is created.
     OnSessionStart,
     /// Fires when a session is torn down.
@@ -43,6 +47,8 @@ impl HookKind {
             Self::BeforeToolCall => "before_tool_call",
             Self::AfterToolCall => "after_tool_call",
             Self::BeforeMessage => "before_message",
+            Self::OnMessageComplete => "on_message_complete",
+            Self::OnCompaction => "on_compaction",
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
         }
@@ -57,9 +63,38 @@ impl HookKind {
             "before_tool_call" => Some(Self::BeforeToolCall),
             "after_tool_call" => Some(Self::AfterToolCall),
             "before_message" => Some(Self::BeforeMessage),
+            "on_message_complete" => Some(Self::OnMessageComplete),
+            "on_compaction" => Some(Self::OnCompaction),
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
             _ => None,
+        }
+    }
+
+    /// Supported action names for this hook in the extension contract.
+    pub fn allowed_action_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
+            Self::AfterToolCall => &["continue"],
+            Self::BeforeMessage => &["continue", "inject"],
+            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
+        }
+    }
+
+    /// Whether this hook can be filtered by tool name in a manifest.
+    pub fn allows_tool_filter(&self) -> bool {
+        matches!(self, Self::BeforeToolCall | Self::AfterToolCall)
+    }
+
+    /// Whether this hook accepts a handler result action.
+    pub fn allows_result(&self, result: &HookResult) -> bool {
+        match (self, result) {
+            (_, HookResult::Continue) => true,
+            (Self::BeforeToolCall, HookResult::Block { .. }) => true,
+            (Self::BeforeToolCall, HookResult::Confirm { .. }) => true,
+            (Self::BeforeToolCall, HookResult::Modify { .. }) => true,
+            (Self::BeforeMessage, HookResult::Inject { .. }) => true,
+            _ => false,
         }
     }
 
@@ -71,7 +106,7 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage => Permission::LlmContent,
+            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => Permission::LlmContent,
             Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
@@ -83,13 +118,15 @@ impl HookKind {
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
 ///
-/// | Kind              | tool_name | tool_input | tool_output | message | session_id |
-/// |-------------------|-----------|------------|-------------|---------|------------|
-/// | `before_tool_call`| ✓         | ✓          |             |         |            |
-/// | `after_tool_call` | ✓         | ✓          | ✓           |         |            |
-/// | `before_message`  |           |            |             | ✓       |            |
-/// | `on_session_start`|           |            |             |         | ✓          |
-/// | `on_session_end`  |           |            |             |         | ✓          |
+/// | Kind                  | tool_name | tool_input | tool_output | message | session_id |
+/// |-----------------------|-----------|------------|-------------|---------|------------|
+/// | `before_tool_call`    | ✓         | ✓          |             |         |            |
+/// | `after_tool_call`     | ✓         | ✓          | ✓           |         |            |
+/// | `before_message`      |           |            |             | ✓       |            |
+/// | `on_message_complete` |           |            |             | ✓       |            |
+/// | `on_compaction`       |           |            |             | ✓       | ✓          |
+/// | `on_session_start`    |           |            |             |         | ✓          |
+/// | `on_session_end`      |           |            |             |         | ✓          |
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -143,12 +180,17 @@ impl HookEvent {
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
         const MAX_HOOK_OUTPUT: usize = 32 * 1024; // 32 KB
         let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
-            // Find the last valid UTF-8 char boundary at or before MAX_HOOK_OUTPUT
-            let mut end = MAX_HOOK_OUTPUT;
-            while end > 0 && !output.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…[truncated, {} total bytes]", &output[..end], output.len())
+            let boundary = output
+                .char_indices()
+                .map(|(idx, _)| idx)
+                .take_while(|idx| *idx <= MAX_HOOK_OUTPUT)
+                .last()
+                .unwrap_or(0);
+            format!(
+                "{}…[truncated, {} total bytes]",
+                &output[..boundary],
+                output.len()
+            )
         } else {
             output
         };
@@ -177,6 +219,50 @@ impl HookEvent {
             tool_runtime_name: None,
             transcript: None,
             data: Value::Null,
+        }
+    }
+
+    /// Construct an `on_message_complete` event.
+    pub fn on_message_complete(message: &str, data: Value) -> Self {
+        Self {
+            kind: HookKind::OnMessageComplete,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: Some(message.to_string()),
+            session_id: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data,
+        }
+    }
+
+    /// Construct an `on_compaction` event.
+    pub fn on_compaction(
+        old_session_id: &str,
+        new_session_id: &str,
+        summary: &str,
+        message_count: usize,
+        mut data: Value,
+    ) -> Self {
+        if !data.is_object() {
+            data = Value::Object(Default::default());
+        }
+        if let Some(object) = data.as_object_mut() {
+            object.insert("old_session_id".to_string(), Value::String(old_session_id.to_string()));
+            object.insert("new_session_id".to_string(), Value::String(new_session_id.to_string()));
+            object.insert("message_count".to_string(), Value::Number(message_count.into()));
+        }
+        Self {
+            kind: HookKind::OnCompaction,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: Some(summary.to_string()),
+            session_id: Some(new_session_id.to_string()),
+            tool_runtime_name: None,
+            transcript: None,
+            data,
         }
     }
 
@@ -216,8 +302,8 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - Any `Block` from any handler prevents the operation.
-///   and the runtime should re-read them before proceeding.
+/// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
+/// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -229,10 +315,11 @@ pub enum HookResult {
     /// Inject context — the extension provides text to prepend to the
     /// system prompt or conversation. Used by before_message hooks.
     Inject { content: String },
-    // NOTE: `Modify` was removed in the review pass. Process-based extensions
-    // can't mutate events in-place (they get a serialized copy). If mutation
-    // support is needed, add a `ModifyWith { fields: Value }` variant that
-    // carries the modified data back.
+    /// Ask the runtime to get explicit user confirmation before proceeding.
+    /// Only valid on before_tool_call hooks.
+    Confirm { message: String },
+    /// Replace the tool input before execution. Only valid on before_tool_call hooks.
+    Modify { input: Value },
 }
 
 impl Default for HookResult {
@@ -257,6 +344,8 @@ mod tests {
             HookKind::BeforeToolCall,
             HookKind::AfterToolCall,
             HookKind::BeforeMessage,
+            HookKind::OnMessageComplete,
+            HookKind::OnCompaction,
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
         ];
@@ -301,6 +390,14 @@ mod tests {
         );
         assert_eq!(
             HookKind::BeforeMessage.required_permission(),
+            Permission::LlmContent
+        );
+        assert_eq!(
+            HookKind::OnMessageComplete.required_permission(),
+            Permission::LlmContent
+        );
+        assert_eq!(
+            HookKind::OnCompaction.required_permission(),
             Permission::LlmContent
         );
         assert_eq!(
@@ -356,6 +453,39 @@ mod tests {
     }
 
     #[test]
+    fn hook_event_on_message_complete() {
+        let ev = HookEvent::on_message_complete("Done", json!({"content_block_count": 1}));
+
+        assert_eq!(ev.kind, HookKind::OnMessageComplete);
+        assert!(ev.tool_name.is_none());
+        assert!(ev.tool_input.is_none());
+        assert!(ev.tool_output.is_none());
+        assert_eq!(ev.message.as_deref(), Some("Done"));
+        assert_eq!(ev.data["content_block_count"], 1);
+        assert!(ev.session_id.is_none());
+    }
+
+    #[test]
+    fn hook_event_on_compaction() {
+        let ev = HookEvent::on_compaction(
+            "old-session",
+            "new-session",
+            "Summary",
+            7,
+            json!({"source": "manual"}),
+        );
+
+        assert_eq!(ev.kind, HookKind::OnCompaction);
+        assert_eq!(ev.message.as_deref(), Some("Summary"));
+        assert_eq!(ev.session_id.as_deref(), Some("new-session"));
+        assert_eq!(ev.data["old_session_id"], "old-session");
+        assert_eq!(ev.data["new_session_id"], "new-session");
+        assert_eq!(ev.data["message_count"], 7);
+        assert_eq!(ev.data["source"], "manual");
+        assert!(ev.transcript.is_none());
+    }
+
+    #[test]
     fn hook_event_on_session_start() {
         let ev = HookEvent::on_session_start("sess-abc-123");
 
@@ -408,6 +538,30 @@ mod tests {
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, HookResult::Block { reason } if reason == "denied by policy"));
+    }
+
+    /// Confirm carries its message through serialization.
+    #[test]
+    fn hook_result_confirm_serde() {
+        let r = HookResult::Confirm {
+            message: "Run this command?".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"action":"confirm","message":"Run this command?"}"#);
+
+        let back: HookResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
+    }
+
+    /// Modify carries replacement input through serialization.
+    #[test]
+    fn hook_result_modify_serde() {
+        let r = HookResult::Modify { input: json!({"command": "echo safe"}) };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"action":"modify","input":{"command":"echo safe"}}"#);
+
+        let back: HookResult = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, HookResult::Modify { input } if input == json!({"command": "echo safe"})));
     }
 
     /// Continue serialises as {"action":"continue"}.
