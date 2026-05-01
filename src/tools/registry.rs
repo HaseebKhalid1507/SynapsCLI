@@ -265,6 +265,19 @@ impl ToolRegistry {
     pub fn tools_schema(&self) -> Arc<Vec<Value>> {
         Arc::clone(&self.cached_schema)
     }
+
+    /// Return runtime names of tools owned by the given extension id, sorted ascending.
+    /// Built-in tools (which return `None` from `Tool::extension_id`) are excluded.
+    pub fn tool_names_for_extension(&self, extension_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tools
+            .values()
+            .filter(|t| t.extension_id() == Some(extension_id))
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -450,4 +463,35 @@ mod tests {
         assert!(registry.get("test_tool").is_some());
     }
 
+    #[test]
+    fn tool_names_for_extension_filters_by_owner_and_sorts() {
+        struct OwnedTool(&'static str, Option<&'static str>);
+        #[async_trait::async_trait]
+        impl Tool for OwnedTool {
+            fn name(&self) -> &str { self.0 }
+            fn description(&self) -> &str { "owned" }
+            fn parameters(&self) -> Value { json!({"type": "object"}) }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                Ok("ok".to_string())
+            }
+            fn extension_id(&self) -> Option<&str> { self.1 }
+        }
+
+        let mut registry = ToolRegistry::without_subagent();
+        registry.register(Arc::new(OwnedTool("alpha:zed", Some("alpha"))));
+        registry.register(Arc::new(OwnedTool("alpha:bar", Some("alpha"))));
+        registry.register(Arc::new(OwnedTool("beta:thing", Some("beta"))));
+
+        assert_eq!(
+            registry.tool_names_for_extension("alpha"),
+            vec!["alpha:bar".to_string(), "alpha:zed".to_string()]
+        );
+        assert_eq!(
+            registry.tool_names_for_extension("beta"),
+            vec!["beta:thing".to_string()]
+        );
+        assert!(registry.tool_names_for_extension("ghost").is_empty());
+        // Built-in tools (no owner) must not leak.
+        assert!(registry.tool_names_for_extension("bash").is_empty());
+    }
 }

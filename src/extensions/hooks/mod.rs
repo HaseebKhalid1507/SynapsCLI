@@ -282,6 +282,26 @@ impl HookBus {
         let handlers = self.handlers.read().await;
         handlers.values().all(|v| v.is_empty())
     }
+
+    /// Return all (kind, tool_filter) pairs subscribed by the given extension id.
+    /// Sorted by kind name, then by tool_filter (None first), for stable output.
+    pub async fn subscriptions_for(&self, extension_id: &str) -> Vec<(HookKind, Option<String>)> {
+        let handlers = self.handlers.read().await;
+        let mut out: Vec<(HookKind, Option<String>)> = Vec::new();
+        for (kind, regs) in handlers.iter() {
+            for reg in regs {
+                if reg.handler.id() == extension_id {
+                    out.push((*kind, reg.tool_filter.clone()));
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.0.as_str()
+                .cmp(b.0.as_str())
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        out
+    }
 }
 
 impl Default for HookBus {
@@ -579,6 +599,38 @@ mod tests {
 
         bus.unsubscribe_all("removable").await;
         assert_eq!(bus.handler_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_for_lists_only_matching_extension() {
+        let bus = HookBus::new();
+        let alpha = TestHandler::new("alpha", HookResult::Continue);
+        let beta = TestHandler::new("beta", HookResult::Continue);
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, alpha.clone(), Some("bash".into()), None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::AfterToolCall, alpha.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, beta.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let alpha_subs = bus.subscriptions_for("alpha").await;
+        assert_eq!(alpha_subs.len(), 2);
+        // sorted by kind name then by tool_filter (None first)
+        assert_eq!(alpha_subs[0].0, HookKind::AfterToolCall);
+        assert_eq!(alpha_subs[0].1, None);
+        assert_eq!(alpha_subs[1].0, HookKind::BeforeToolCall);
+        assert_eq!(alpha_subs[1].1, Some("bash".to_string()));
+
+        let beta_subs = bus.subscriptions_for("beta").await;
+        assert_eq!(beta_subs, vec![(HookKind::BeforeToolCall, None)]);
+
+        let none_subs = bus.subscriptions_for("ghost").await;
+        assert!(none_subs.is_empty());
     }
 
     #[tokio::test]

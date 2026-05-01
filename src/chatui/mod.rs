@@ -720,21 +720,41 @@ pub async fn run(
                                     }
                                     CommandAction::ExtensionsStatus => {
                                         let manager = ext_mgr_shared.read().await;
-                                        let statuses = manager.statuses().await;
-                                        let provider_summaries = manager.provider_summaries();
+                                        let snapshots = manager.capability_snapshots().await;
                                         let trust_view = manager.provider_trust_view();
-                                        if statuses.is_empty() {
+                                        if snapshots.is_empty() {
                                             app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
                                         } else {
-                                            app.push_msg(ChatMessage::System(format!("Extensions ({}):", statuses.len())));
-                                            for status in statuses {
+                                            app.push_msg(ChatMessage::System(format!("Extensions ({}):", snapshots.len())));
+                                            for snap in &snapshots {
                                                 app.push_msg(ChatMessage::System(format!(
                                                     "  {} — {} (restarts: {})",
-                                                    status.id,
-                                                    status.health.as_str(),
-                                                    status.restart_count
+                                                    snap.id,
+                                                    snap.health.as_str(),
+                                                    snap.restart_count
                                                 )));
-                                                for provider in provider_summaries.iter().filter(|p| p.runtime_id.starts_with(&format!("{}:", status.id))) {
+                                                if !snap.hooks.is_empty() {
+                                                    let rendered = snap
+                                                        .hooks
+                                                        .iter()
+                                                        .map(|h| match &h.tool_filter {
+                                                            Some(t) => format!("{}[{}]", h.kind, t),
+                                                            None => h.kind.clone(),
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
+                                                    app.push_msg(ChatMessage::System(format!("    hooks: {}", rendered)));
+                                                }
+                                                if !snap.tools.is_empty() {
+                                                    let rendered = snap
+                                                        .tools
+                                                        .iter()
+                                                        .map(|t| t.name.clone())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
+                                                    app.push_msg(ChatMessage::System(format!("    tools: {}", rendered)));
+                                                }
+                                                for provider in &snap.providers {
                                                     let disabled_suffix = match trust_view.get(&provider.runtime_id) {
                                                         Some(false) => " [disabled]",
                                                         _ => "",
@@ -759,7 +779,7 @@ pub async fn run(
                                                     }
                                                 }
                                                 // Surface config diagnostics warnings (no values printed).
-                                                if let Some(diag) = manager.config_diagnostics(&status.id) {
+                                                if let Some(diag) = manager.config_diagnostics(&snap.id) {
                                                     let missing_required: Vec<&str> = diag
                                                         .entries
                                                         .iter()

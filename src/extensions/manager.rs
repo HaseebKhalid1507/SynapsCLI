@@ -10,6 +10,7 @@ use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
 use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
+use super::capability::{ExtensionCapabilitySnapshot, HookCapabilityEntry, ToolCapabilityEntry};
 use serde_json::{Map, Value};
 
 fn project_plugins_disabled() -> bool {
@@ -398,6 +399,76 @@ impl ExtensionManager {
         self.providers.summaries()
     }
 
+    /// Unified capability snapshot per loaded extension, sorted by id.
+    ///
+    /// Aggregates hook subscriptions, extension-provided tools, and registered
+    /// providers. `future` is intentionally empty until memory/indexer/voice
+    /// capabilities land.
+    pub async fn capability_snapshots(&self) -> Vec<ExtensionCapabilitySnapshot> {
+        let mut handlers: Vec<(String, Arc<dyn ExtensionHandler>)> = self
+            .extensions
+            .iter()
+            .map(|(id, handler)| (id.clone(), handler.clone()))
+            .collect();
+        handlers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let provider_summaries = self.providers.summaries();
+        let plugin_id_lookup: std::collections::HashMap<String, String> = self
+            .providers
+            .list()
+            .into_iter()
+            .map(|p| (p.runtime_id.clone(), p.plugin_id.clone()))
+            .collect();
+
+        let mut out = Vec::with_capacity(handlers.len());
+        for (id, handler) in handlers {
+            let health = handler.health().await;
+            let restart_count = handler.restart_count().await;
+
+            let hook_pairs = self.hook_bus.subscriptions_for(&id).await;
+            let hooks: Vec<HookCapabilityEntry> = hook_pairs
+                .into_iter()
+                .map(|(kind, tool_filter)| HookCapabilityEntry {
+                    kind: kind.as_str().to_string(),
+                    tool_filter,
+                })
+                .collect();
+
+            let tools: Vec<ToolCapabilityEntry> = if let Some(tools) = &self.tools {
+                let registry = tools.read().await;
+                registry
+                    .tool_names_for_extension(&id)
+                    .into_iter()
+                    .map(|name| ToolCapabilityEntry { name })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let providers: Vec<RegisteredProviderSummary> = provider_summaries
+                .iter()
+                .filter(|summary| {
+                    plugin_id_lookup
+                        .get(&summary.runtime_id)
+                        .map(|p| p == &id)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            out.push(ExtensionCapabilitySnapshot {
+                id,
+                health,
+                restart_count,
+                hooks,
+                tools,
+                providers,
+                future: Vec::new(),
+            });
+        }
+        out
+    }
+
     /// Return runtime ids of registered providers that declare at least one
     /// tool-use-capable model. Sorted by runtime id.
     pub fn provider_tool_use_runtime_ids(&self) -> Vec<String> {
@@ -653,6 +724,51 @@ impl ExtensionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capability_snapshots_empty_when_no_extensions() {
+        let bus = Arc::new(HookBus::new());
+        let mgr = ExtensionManager::new(bus);
+        assert!(mgr.capability_snapshots().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_lists_hooks_for_loaded_extension() {
+        let bus = Arc::new(HookBus::new());
+        let mut mgr = ExtensionManager::new(bus.clone());
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: crate::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec![
+                "tests/fixtures/process_extension.py".to_string(),
+                "normal".to_string(),
+                "/tmp/synaps-capability-test.log".to_string(),
+            ],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![crate::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![],
+        };
+
+        mgr.load("cap-snap", &manifest).await.unwrap();
+
+        let snaps = mgr.capability_snapshots().await;
+        assert_eq!(snaps.len(), 1);
+        let snap = &snaps[0];
+        assert_eq!(snap.id, "cap-snap");
+        assert_eq!(snap.hooks.len(), 1);
+        assert_eq!(snap.hooks[0].kind, "before_tool_call");
+        assert_eq!(snap.hooks[0].tool_filter.as_deref(), Some("bash"));
+        assert!(snap.tools.is_empty());
+        assert!(snap.providers.is_empty());
+        assert!(snap.future.is_empty());
+
+        mgr.shutdown_all().await;
+    }
 
     #[tokio::test]
     async fn new_manager_has_no_extensions() {

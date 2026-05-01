@@ -12,6 +12,7 @@ pub struct ExtensionTool {
     input_schema: Value,
     handler: Arc<dyn ExtensionHandler>,
     tool_name: String,
+    plugin_id: String,
 }
 
 impl ExtensionTool {
@@ -22,6 +23,7 @@ impl ExtensionTool {
             input_schema: spec.input_schema,
             handler,
             tool_name: spec.name,
+            plugin_id: plugin_id.to_string(),
         }
     }
 }
@@ -53,5 +55,9 @@ impl crate::tools::Tool for ExtensionTool {
         } else {
             Ok(value.to_string())
         }
+    }
+
+    fn extension_id(&self) -> Option<&str> {
+        Some(&self.plugin_id)
     }
 }

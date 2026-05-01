@@ -23,3 +23,4 @@ pub mod config;
 pub mod providers;
 pub mod trust;
 pub mod audit;
+pub mod capability;

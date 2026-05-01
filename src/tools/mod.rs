@@ -99,6 +99,11 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given parameters.
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
+
+    /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
+    fn extension_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]
