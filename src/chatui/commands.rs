@@ -75,6 +75,8 @@ pub(super) enum CommandAction {
     Status,
     /// Show loaded extension health snapshots.
     ExtensionsStatus,
+    /// Show extension config diagnostics. `None` = all loaded extensions.
+    ExtensionsConfig { id: Option<String> },
 }
 
 pub(super) async fn execute_command_action(
@@ -366,6 +368,7 @@ pub(super) async fn handle_command(
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
                 "/extensions status — show loaded extension health",
+                "/extensions config [id] — show extension config diagnostics",
                 "/status — show account usage and reset times",
                 "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
@@ -438,11 +441,23 @@ pub(super) async fn handle_command(
             }
         }
         "extensions" => {
-            match arg.trim() {
-                "status" | "" => return CommandAction::ExtensionsStatus,
+            let trimmed = arg.trim();
+            if trimmed.is_empty() || trimmed == "status" {
+                return CommandAction::ExtensionsStatus;
+            }
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let sub = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("").trim();
+            match sub {
+                "config" => {
+                    if rest.is_empty() {
+                        return CommandAction::ExtensionsConfig { id: None };
+                    }
+                    return CommandAction::ExtensionsConfig { id: Some(rest.to_string()) };
+                }
                 other => {
                     app.push_msg(ChatMessage::System(format!(
-                        "usage: /extensions status (unknown: {})",
+                        "usage: /extensions [status|config [id]] (unknown: {})",
                         other
                     )));
                     return CommandAction::None;
@@ -759,5 +774,52 @@ mod tests {
         // "s" matches system, sessions, saveas, settings, status — returns raw
         let cmds = commands();
         assert_eq!(resolve_prefix("s", &cmds), "s");
+    }
+
+    // -- /extensions parsing tests --
+
+    async fn invoke_extensions(arg: &str) -> CommandAction {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_command(
+            "extensions",
+            arg,
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_status_unchanged() {
+        match invoke_extensions("status").await {
+            CommandAction::ExtensionsStatus => {}
+            _ => panic!("expected ExtensionsStatus for `status`"),
+        }
+        match invoke_extensions("").await {
+            CommandAction::ExtensionsStatus => {}
+            _ => panic!("expected ExtensionsStatus for empty arg"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_config_no_arg() {
+        match invoke_extensions("config").await {
+            CommandAction::ExtensionsConfig { id: None } => {}
+            _ => panic!("expected ExtensionsConfig {{ id: None }}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_config_with_id() {
+        match invoke_extensions("config my-ext").await {
+            CommandAction::ExtensionsConfig { id: Some(id) } => assert_eq!(id, "my-ext"),
+            _ => panic!("expected ExtensionsConfig with id `my-ext`"),
+        }
     }
 }

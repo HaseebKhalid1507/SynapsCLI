@@ -752,6 +752,87 @@ pub async fn run(
                                                         app.push_msg(ChatMessage::System(format!("      model {}", label)));
                                                     }
                                                 }
+                                                // Surface config diagnostics warnings (no values printed).
+                                                if let Some(diag) = manager.config_diagnostics(&status.id) {
+                                                    let missing_required: Vec<&str> = diag
+                                                        .entries
+                                                        .iter()
+                                                        .filter(|e| e.required && matches!(e.source, synaps_cli::extensions::config::ConfigSource::Missing))
+                                                        .map(|e| e.key.as_str())
+                                                        .collect();
+                                                    if !missing_required.is_empty() {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    ⚠ missing required config: {}",
+                                                            missing_required.join(", ")
+                                                        )));
+                                                    }
+                                                    // Group provider_missing by provider id.
+                                                    let mut by_provider: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+                                                    for (pid, key) in &diag.provider_missing {
+                                                        by_provider.entry(pid.as_str()).or_default().push(key.as_str());
+                                                    }
+                                                    for (pid, keys) in by_provider {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    ⚠ provider {} missing required config: {}",
+                                                            pid,
+                                                            keys.join(", ")
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ExtensionsConfig { id } => {
+                                        let manager = ext_mgr_shared.read().await;
+                                        let diags: Vec<synaps_cli::extensions::config::ExtensionConfigDiagnostics> = match &id {
+                                            Some(want) => match manager.config_diagnostics(want) {
+                                                Some(d) => vec![d],
+                                                None => {
+                                                    app.push_msg(ChatMessage::Error(format!(
+                                                        "extension not found: {}",
+                                                        want
+                                                    )));
+                                                    Vec::new()
+                                                }
+                                            },
+                                            None => manager.all_config_diagnostics(),
+                                        };
+                                        if diags.is_empty() && id.is_none() {
+                                            app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
+                                        }
+                                        for diag in diags {
+                                            app.push_msg(ChatMessage::System(format!(
+                                                "Extension {} config:",
+                                                diag.extension_id
+                                            )));
+                                            if diag.entries.is_empty() {
+                                                app.push_msg(ChatMessage::System("  (no manifest config entries)".to_string()));
+                                            }
+                                            for entry in &diag.entries {
+                                                let source_label = match &entry.source {
+                                                    synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => format!("env override ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::SecretEnv(name) => format!("secret env ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::ConfigKey(name) => format!("config key ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::Default => "default".to_string(),
+                                                    synaps_cli::extensions::config::ConfigSource::Missing => "missing".to_string(),
+                                                };
+                                                let req = if entry.required { " [required]" } else { "" };
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  {}{} — source: {}, has_value: {}",
+                                                    entry.key, req, source_label, entry.has_value
+                                                )));
+                                                if let Some(desc) = &entry.description {
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "    description: {}",
+                                                        desc
+                                                    )));
+                                                }
+                                            }
+                                            for (pid, key) in &diag.provider_missing {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  ⚠ provider {} requires config '{}' (no manifest entry)",
+                                                    pid, key
+                                                )));
                                             }
                                         }
                                     }
@@ -870,6 +951,7 @@ pub async fn run(
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
                                         CommandAction::ExtensionsStatus => {}
+                                        CommandAction::ExtensionsConfig { .. } => {}
                                         CommandAction::Ping => {}
                                     }
                                 } else {
