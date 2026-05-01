@@ -228,7 +228,18 @@ impl SubagentRegistry {
     }
 
     pub fn cleanup_finished(&mut self) {
-        self.handles.retain(|_, h| !h.is_finished());
+        let finished_ids: Vec<String> = self.handles.iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished_ids {
+            if let Some(mut handle) = self.handles.remove(&id) {
+                // Join the thread to avoid zombies/resource leaks
+                if let Some(th) = handle.thread_handle.take() {
+                    let _ = th.join();
+                }
+            }
+        }
     }
 }
 

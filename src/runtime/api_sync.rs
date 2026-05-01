@@ -257,6 +257,13 @@ impl ApiMethods {
 
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
+        // Fail early with a clear message if no Anthropic credentials
+        if auth_type == "none" {
+            return Err(RuntimeError::Auth(
+                "No API key or OAuth token found. Run `synaps login` to authenticate.".to_string()
+            ));
+        }
+
         let mut body = json!({
             "model": model,
             "max_tokens": HelperMethods::max_tokens_for_model(model),
