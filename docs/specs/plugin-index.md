@@ -50,7 +50,7 @@ Each entry describes one installable plugin version:
   "keywords": ["local-first", "session"],
   "checksum": {
     "algorithm": "sha256",
-    "value": "hex-encoded-content-or-package-digest"
+    "value": "64-character-hex-plugin-tree-digest"
   },
   "compatibility": {
     "synaps": ">=0.1.0",
@@ -77,7 +77,7 @@ Required fields:
 - `version`: Semver plugin version from `.synaps-plugin/plugin.json`.
 - `description`: Short human-readable description.
 - `repository`: Source repository URL or local file URL.
-- `checksum`: Digest metadata for the indexed content or package artifact.
+- `checksum`: Digest metadata for the installable plugin tree. v1 supports `sha256` only; `value` is the deterministic plugin tree digest described below.
 - `compatibility`: Minimum Synaps/runtime compatibility metadata.
 - `capabilities`: Static capability summary.
 
@@ -87,6 +87,27 @@ Optional fields:
 - `license`: SPDX license identifier when known.
 - `categories`, `keywords`: Marketplace/browse metadata.
 - `trust`: Publisher metadata copied from plugin marketplace metadata when present.
+
+## Checksum semantics
+
+v1 index checksums are deterministic plugin tree digests, not git commit IDs.
+For the effective plugin root (the fetched repository root, or `subdir` when an
+entry points at a plugin inside a repository), tooling computes:
+
+1. Recursively enumerate regular files under the plugin root.
+2. Exclude any `.git` directory and its contents.
+3. Ignore symlinks and non-regular files.
+4. Sort relative file paths lexically.
+5. Feed sha256 with, for each file: relative path bytes, a NUL byte, file bytes,
+   and another NUL byte.
+
+`plugin index generate --dry-run PATH` emits this checksum. Runtime install and
+update flows fetch to a pending directory, recompute the same digest, and abort
+before final install/update if it does not match the index metadata.
+
+For index-backed updates, Synaps prefers the latest refreshed index checksum for
+the plugin entry. If no refreshed index metadata is available, it falls back to
+the checksum recorded when the plugin was installed.
 
 ## Capability summary
 
@@ -105,7 +126,7 @@ Indexers should not execute extension code to populate these fields.
 - Index consumers must treat repositories and plugin code as untrusted until the user approves install/enable.
 - Executable extensions require a permission/trust confirmation before enablement.
 - Index metadata is advisory. Installers must re-read the plugin manifest from fetched content and compare the permission summary shown to the user.
-- Checksums should be verified before installing packaged artifacts when available.
+- Checksums are verified for index-backed install and update candidates before content is moved into the final plugin directory.
 - Plugins must not receive secrets during indexing, inspection, or dry-run packaging.
 
 ## Install lifecycle
@@ -113,7 +134,7 @@ Indexers should not execute extension code to populate these fields.
 1. Fetch index JSON from a configured local path, Git source, or HTTPS URL.
 2. Display entry metadata and capability summary.
 3. Fetch selected plugin content to a pending-install location.
-4. Recompute/verify checksum when the distribution form supports it.
+4. Recompute and verify the v1 plugin tree checksum from the pending content.
 5. Inspect the fetched manifest locally.
 6. Show permission/config/trust summary for executable extensions.
 7. On user confirmation, move from pending install to the final plugin directory.
