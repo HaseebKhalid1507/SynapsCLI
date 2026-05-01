@@ -82,6 +82,12 @@ pub struct InstalledPlugin {
     /// then refers to the marketplace repo, not a standalone plugin repo.
     #[serde(default)]
     pub source_subdir: Option<String>,
+    /// Optional index checksum captured at install time for index-backed plugins.
+    /// Used to verify future installs/updates before applying them.
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
 }
 
 impl PluginsState {
@@ -141,6 +147,8 @@ mod tests {
                 latest_commit: Some("abc123".into()),
                 installed_at: "2026-04-18T12:01:00Z".into(),
                 source_subdir: None,
+                checksum_algorithm: None,
+                checksum_value: None,
             }],
             trusted_hosts: vec!["github.com/maha-media".into()],
         };

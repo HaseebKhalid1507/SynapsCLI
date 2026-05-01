@@ -208,7 +208,7 @@ pub(crate) async fn apply_install(
         return;
     }
     run_install_flow(
-        state, plugin_name, effective_source, subdir, Some(marketplace_name),
+        state, plugin_name, effective_source, subdir, Some(marketplace_name), None,
         registry, config,
     ).await;
 }
@@ -294,12 +294,14 @@ pub(crate) async fn apply_install_from_index_entry(
         .and_then(|m| m.cached_plugins.iter().find(|p| p.name == entry.id))
         .map(|p| p.source.clone())
         .unwrap_or_else(|| entry.repository.clone());
+    let checksum = Some((entry.checksum.algorithm.clone(), entry.checksum.value.clone()));
     run_install_flow(
         state,
         entry.id,
         install_source,
         entry.subdir,
         Some(marketplace_name),
+        checksum,
         registry,
         config,
     ).await;
@@ -332,15 +334,16 @@ pub(crate) async fn apply_trust_and_install(
             break;
         }
     }
-    run_install_flow(state, plugin_name, source, subdir, marketplace_name, registry, config).await;
+    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config).await;
 }
 
 /// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
-fn install_plugin_to_temp(
+fn install_plugin_to_temp_with_checksum(
     plugin_name: &str,
     source_url: &str,
     subdir: Option<String>,
     final_dest: &std::path::Path,
+    expected_checksum: Option<(String, String)>,
 ) -> Result<(String, PathBuf), String> {
     let parent = final_dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
@@ -350,6 +353,12 @@ fn install_plugin_to_temp(
         Some(s) => install::install_plugin_from_subdir(source_url, &s, &tmp),
         None => install::install_plugin(source_url, &tmp),
     }?;
+    if let Some((algorithm, expected)) = expected_checksum {
+        if let Err(e) = install::verify_plugin_dir_checksum(&tmp, &algorithm, &expected) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    }
     Ok((sha, tmp))
 }
 
@@ -396,6 +405,7 @@ fn record_installed_plugin(
     source_url: String,
     installed_commit: String,
     source_subdir: Option<String>,
+    checksum: Option<(String, String)>,
 ) {
     state.file.installed.push(InstalledPlugin {
         name: plugin_name,
@@ -405,6 +415,8 @@ fn record_installed_plugin(
         latest_commit: None,
         installed_at: now_rfc3339(),
         source_subdir,
+        checksum_algorithm: checksum.as_ref().map(|(algorithm, _)| algorithm.clone()),
+        checksum_value: checksum.map(|(_, value)| value),
     });
 }
 
@@ -414,6 +426,7 @@ async fn run_install_flow(
     source_url: String,
     subdir: Option<String>,
     marketplace_name: Option<String>,
+    expected_checksum: Option<(String, String)>,
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
@@ -430,8 +443,15 @@ async fn run_install_flow(
     let dest_clone = dest.clone();
     let subdir_for_install = subdir.clone();
     let plugin_name_for_task = plugin_name.clone();
+    let expected_checksum_for_task = expected_checksum.clone();
     let install_res = tokio::task::spawn_blocking(move || {
-        install_plugin_to_temp(&plugin_name_for_task, &src, subdir_for_install, &dest_clone)
+        install_plugin_to_temp_with_checksum(
+            &plugin_name_for_task,
+            &src,
+            subdir_for_install,
+            &dest_clone,
+            expected_checksum_for_task,
+        )
     })
     .await;
     let (sha, temp_dir) = match install_res {
@@ -455,6 +475,8 @@ async fn run_install_flow(
             marketplace_name,
             summary,
             installed_commit: sha,
+            checksum_algorithm: expected_checksum.as_ref().map(|(algorithm, _)| algorithm.clone()),
+            checksum_value: expected_checksum.as_ref().map(|(_, value)| value.clone()),
             temp_dir,
             final_dir: dest,
         };
@@ -473,6 +495,7 @@ async fn run_install_flow(
         source_url,
         sha,
         subdir,
+        expected_checksum,
     );
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
@@ -497,6 +520,8 @@ pub(crate) async fn apply_confirm_pending_install(
         subdir,
         marketplace_name,
         installed_commit,
+        checksum_algorithm,
+        checksum_value,
         temp_dir,
         final_dir,
         ..
@@ -528,6 +553,7 @@ pub(crate) async fn apply_confirm_pending_install(
         source_url,
         installed_commit,
         subdir,
+        checksum_algorithm.zip(checksum_value),
     );
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
@@ -620,13 +646,21 @@ pub(crate) async fn apply_update(
     let temp_dir = parent.join(format!(".{}-pending-update", name));
     let source = installed.source_url.clone();
     let subdir = installed.source_subdir.clone();
+    let expected_checksum = installed.checksum_algorithm.clone().zip(installed.checksum_value.clone());
     let temp_for_task = temp_dir.clone();
     let update_res = tokio::task::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(&temp_for_task);
-        match subdir {
+        let sha = match subdir {
             Some(subdir) => install::install_plugin_from_subdir(&source, &subdir, &temp_for_task),
             None => install::install_plugin(&source, &temp_for_task),
+        }?;
+        if let Some((algorithm, expected)) = expected_checksum {
+            if let Err(e) = install::verify_plugin_dir_checksum(&temp_for_task, &algorithm, &expected) {
+                let _ = std::fs::remove_dir_all(&temp_for_task);
+                return Err(e);
+            }
         }
+        Ok(sha)
     }).await;
     let sha = match update_res {
         Ok(Ok(sha)) => sha,
@@ -1075,6 +1109,12 @@ mod tests {
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
         let source = format!("file://{}", bare.display());
+        let checksum = {
+            let clone_parent = tempfile::tempdir().unwrap();
+            let clone = clone_parent.path().join("clone");
+            install::install_plugin(&source, &clone).unwrap();
+            install::plugin_dir_sha256(&clone).unwrap()
+        };
         let repository = "https://example.invalid/owner/policy-test.git".to_string();
         let mut state = PluginsModalState::new(PluginsState {
             marketplaces: vec![Marketplace {
@@ -1091,7 +1131,7 @@ mod tests {
                         repository: repository.clone(),
                         subdir: None,
                         checksum_algorithm: "sha256".into(),
-                        checksum_value: "abc123".into(),
+                        checksum_value: checksum.clone(),
                         compatibility_synaps: Some(">=0.1.0".into()),
                         compatibility_extension_protocol: Some("1".into()),
                         has_extension: true,
@@ -1114,10 +1154,14 @@ mod tests {
         apply_install_from_index_entry(
             &mut state,
             "local-index".into(),
-            PluginIndexEntry {
-                repository: repository.clone(),
-                ..index_entry(source.clone())
+        PluginIndexEntry {
+            repository: repository.clone(),
+            checksum: PluginIndexChecksum {
+                algorithm: "sha256".into(),
+                value: checksum.clone(),
             },
+            ..index_entry(source.clone())
+        },
             &registry,
             &config,
         )
@@ -1131,13 +1175,48 @@ mod tests {
             final_dir,
             ..
         } = &state.mode else {
-            panic!("expected pending install confirmation, got {:?}", state.mode);
+            panic!("expected pending install confirmation, got {:?}; error {:?}", state.mode, state.row_error);
         };
         assert_eq!(source_url, &source);
         assert_eq!(marketplace_name.as_deref(), Some("local-index"));
         assert!(summary.iter().any(|line| line == "executable extension: yes"));
         assert!(temp_dir.exists());
         assert!(!final_dir.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_rejects_index_checksum_mismatch_before_preview() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        let (_repo_tmp, bare) = fixture_plugin_repo();
+        let source = format!("file://{}", bare.display());
+        let mut state = PluginsModalState::new(PluginsState {
+            marketplaces: vec![],
+            installed: vec![InstalledPlugin {
+                name: "policy-test".into(),
+                marketplace: None,
+                source_url: source.clone(),
+                installed_commit: "abc".into(),
+                latest_commit: Some("def".into()),
+                installed_at: "now".into(),
+                source_subdir: None,
+                checksum_algorithm: Some("sha256".into()),
+                checksum_value: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            }],
+            trusted_hosts: vec![],
+        });
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let config = synaps_cli::SynapsConfig::default();
+
+        let final_dir = install_dir_for("policy-test").unwrap();
+        install::install_plugin(&source, &final_dir).unwrap();
+
+        apply_update(&mut state, "policy-test".into(), &registry, &config).await;
+
+        assert!(matches!(state.mode, RightMode::List));
+        assert!(state.row_error.as_deref().unwrap_or_default().contains("checksum mismatch"));
+        assert!(!final_dir.parent().unwrap().join(".policy-test-pending-update").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1157,6 +1236,7 @@ mod tests {
             format!("file://{}", bare.display()),
             None,
             Some("local-market".into()),
+            None,
             &registry,
             &config,
         )
@@ -1200,6 +1280,7 @@ mod tests {
             source.clone(),
             None,
             Some("local-market".into()),
+            None,
             &registry,
             &config,
         )

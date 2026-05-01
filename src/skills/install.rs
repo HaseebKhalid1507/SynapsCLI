@@ -1,8 +1,9 @@
 //! Git-backed plugin install/uninstall/update.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
 
 /// Shared git clone logic. Validates URL, ensures dest parent exists,
 /// runs `git clone --depth=1`. Returns Ok(()) on success, cleans up on failure.
@@ -125,6 +126,107 @@ pub fn uninstall_plugin(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("remove {}: {}", path.display(), e)),
     }
+}
+
+/// Compute the plugin package checksum used by v1 plugin indexes.
+///
+/// The digest is sha256 over each regular file below `path` (excluding `.git`),
+/// in lexical relative-path order. Each file contributes its relative path,
+/// a NUL separator, its bytes, and another NUL. This makes the checksum stable
+/// across machines while detecting file rename/content changes. Symlinks and
+/// non-regular files are ignored, matching installer snapshot behavior.
+pub fn plugin_dir_sha256(path: &Path) -> Result<String, String> {
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let effective_root = path.join(".synaps-plugin").join("plugin.json");
+    if effective_root.is_file() {
+        hash_regular_files(path)
+    } else {
+        let mut candidates = Vec::new();
+        collect_plugin_roots(path, path, &mut candidates)?;
+        candidates.sort();
+        if candidates.len() == 1 {
+            hash_regular_files(&candidates[0])
+        } else {
+            hash_regular_files(path)
+        }
+    }
+}
+
+fn hash_regular_files(path: &Path) -> Result<String, String> {
+    let mut files = Vec::new();
+    collect_regular_files(path, path, &mut files)?;
+    files.sort();
+
+    let mut hasher = Sha256::new();
+    for rel in files {
+        let full = path.join(&rel);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        let bytes = std::fs::read(&full)
+            .map_err(|e| format!("read {}: {}", full.display(), e))?;
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn verify_plugin_dir_checksum(path: &Path, algorithm: &str, expected: &str) -> Result<(), String> {
+    if algorithm != "sha256" {
+        return Err(format!("unsupported plugin checksum algorithm: {}", algorithm));
+    }
+    let actual = plugin_dir_sha256(path)?;
+    if actual != expected {
+        return Err(format!(
+            "plugin checksum mismatch: expected sha256:{}, got sha256:{}",
+            expected, actual
+        ));
+    }
+    Ok(())
+}
+
+fn collect_plugin_roots(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read dir {}: {}", dir.display(), e))? {
+        let entry = entry.map_err(|e| format!("read dir {}: {}", dir.display(), e))?;
+        let path = entry.path();
+        if entry.file_name().to_string_lossy() == ".git" {
+            continue;
+        }
+        let ty = entry.file_type().map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        if ty.is_dir() {
+            if path.join(".synaps-plugin").join("plugin.json").is_file() && path != root {
+                out.push(path);
+            } else {
+                collect_plugin_roots(root, &path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_regular_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read dir {}: {}", dir.display(), e))? {
+        let entry = entry.map_err(|e| format!("read dir {}: {}", dir.display(), e))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy() == ".git" {
+            continue;
+        }
+        let ty = entry
+            .file_type()
+            .map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        if ty.is_dir() {
+            collect_regular_files(root, &path, out)?;
+        } else if ty.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("strip prefix {}: {}", path.display(), e))?
+                .to_path_buf();
+            out.push(rel);
+        }
+    }
+    Ok(())
 }
 
 /// `git -C <path> pull --ff-only`, then capture new SHA.
@@ -329,6 +431,30 @@ mod tests {
         let (_tmp, bare) = mk_local_repo();
         let sha = ls_remote_head(&format!("file://{}", bare.display())).unwrap();
         assert_eq!(sha.len(), 40);
+    }
+
+    #[test]
+    fn checksum_ignores_git_and_detects_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("demo");
+        std::fs::create_dir_all(plugin.join(".synaps-plugin")).unwrap();
+        std::fs::create_dir_all(plugin.join(".git")).unwrap();
+        std::fs::write(plugin.join(".synaps-plugin/plugin.json"), "{}").unwrap();
+        std::fs::write(plugin.join("README.md"), "one").unwrap();
+        std::fs::write(plugin.join(".git/HEAD"), "ignored").unwrap();
+
+        let first = plugin_dir_sha256(&plugin).unwrap();
+        assert_eq!(first.len(), 64);
+        verify_plugin_dir_checksum(&plugin, "sha256", &first).unwrap();
+
+        std::fs::write(plugin.join(".git/HEAD"), "still ignored").unwrap();
+        assert_eq!(plugin_dir_sha256(&plugin).unwrap(), first);
+
+        std::fs::write(plugin.join("README.md"), "two").unwrap();
+        let second = plugin_dir_sha256(&plugin).unwrap();
+        assert_ne!(second, first);
+        let err = verify_plugin_dir_checksum(&plugin, "sha256", &first).unwrap_err();
+        assert!(err.contains("checksum mismatch"));
     }
 
     #[test]
