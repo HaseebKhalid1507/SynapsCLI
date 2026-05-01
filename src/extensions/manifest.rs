@@ -72,7 +72,10 @@ impl ExtensionManifest {
         }
 
         let has_capability_permission = self.permissions.iter().any(|permission| {
-            matches!(permission.as_str(), "tools.register" | "providers.register")
+            matches!(
+                permission.as_str(),
+                "tools.register" | "providers.register" | "memory.read" | "memory.write"
+            )
         });
         if self.hooks.is_empty() && !has_capability_permission {
             return Err(format!("Extension '{}' must subscribe to at least one hook or request a registration permission", id));

@@ -24,6 +24,10 @@ pub enum Permission {
     ToolsRegister,
     /// Can register new providers.
     ProvidersRegister,
+    /// Can read from the local memory store via `memory.query`.
+    MemoryRead,
+    /// Can append to the local memory store via `memory.append`.
+    MemoryWrite,
 }
 
 impl Permission {
@@ -36,6 +40,8 @@ impl Permission {
             Self::SessionLifecycle => "session.lifecycle",
             Self::ToolsRegister => "tools.register",
             Self::ProvidersRegister => "providers.register",
+            Self::MemoryRead => "memory.read",
+            Self::MemoryWrite => "memory.write",
         }
     }
 
@@ -48,6 +54,8 @@ impl Permission {
             "session.lifecycle" => Some(Self::SessionLifecycle),
             "tools.register" => Some(Self::ToolsRegister),
             "providers.register" => Some(Self::ProvidersRegister),
+            "memory.read" => Some(Self::MemoryRead),
+            "memory.write" => Some(Self::MemoryWrite),
             _ => None,
         }
     }
@@ -183,6 +191,21 @@ mod tests {
     }
 
     #[test]
+    fn memory_permissions_parse_and_are_not_reserved() {
+        assert_eq!(Permission::parse("memory.read"), Some(Permission::MemoryRead));
+        assert_eq!(Permission::parse("memory.write"), Some(Permission::MemoryWrite));
+        assert!(!Permission::MemoryRead.is_reserved());
+        assert!(!Permission::MemoryWrite.is_reserved());
+        let perms = PermissionSet::try_from_strings(&[
+            "memory.read".to_string(),
+            "memory.write".to_string(),
+        ])
+        .unwrap();
+        assert!(perms.has(Permission::MemoryRead));
+        assert!(perms.has(Permission::MemoryWrite));
+    }
+
+    #[test]
     fn round_trip_as_str() {
         for perm in [
             Permission::ToolsIntercept,
@@ -191,6 +214,8 @@ mod tests {
             Permission::SessionLifecycle,
             Permission::ToolsRegister,
             Permission::ProvidersRegister,
+            Permission::MemoryRead,
+            Permission::MemoryWrite,
         ] {
             assert_eq!(Permission::parse(perm.as_str()), Some(perm));
         }

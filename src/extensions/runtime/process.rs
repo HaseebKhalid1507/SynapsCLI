@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use super::{ExtensionHandler, ExtensionHealth, RestartPolicy};
@@ -419,13 +419,25 @@ pub struct NotificationFrame {
 struct Inbox {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     notification_sink: Mutex<Option<mpsc::UnboundedSender<NotificationFrame>>>,
+    /// Permissions granted to the calling extension. Set after manifest
+    /// validation; checked by inbound RPC handlers (e.g. memory.append).
+    permissions: RwLock<Option<crate::extensions::permissions::PermissionSet>>,
+    /// Stdin handle of the currently-running child process. Used by the
+    /// reader task to write JSON-RPC responses for inbound requests.
+    /// Replaced on each spawn (initial spawn + restarts).
+    inbound_stdin: Mutex<Option<Arc<Mutex<ChildStdin>>>>,
+    /// Extension id, used for namespace policy and diagnostics.
+    extension_id: String,
 }
 
 impl Inbox {
-    fn new() -> Self {
+    fn new(extension_id: String) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             notification_sink: Mutex::new(None),
+            permissions: RwLock::new(None),
+            inbound_stdin: Mutex::new(None),
+            extension_id,
         }
     }
 
@@ -481,7 +493,7 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let inbox = Arc::new(Inbox::new());
+        let inbox = Arc::new(Inbox::new(id.to_string()));
         let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
@@ -554,11 +566,16 @@ impl ProcessExtension {
             });
         }
 
-        let reader_handle = Self::spawn_reader(stdout, inbox, id.to_string());
+        let reader_handle = Self::spawn_reader(stdout, inbox.clone(), id.to_string());
+
+        let stdin_arc = Arc::new(Mutex::new(stdin));
+        // Publish current stdin into the inbox so the reader task can write
+        // JSON-RPC responses for inbound requests (e.g. memory.append).
+        *inbox.inbound_stdin.lock().await = Some(stdin_arc.clone());
 
         Ok(ProcessState {
             child,
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin: stdin_arc,
             reader_handle,
         })
     }
@@ -670,12 +687,87 @@ impl ProcessExtension {
     }
 
     /// Route a parsed JSON-RPC frame to the right consumer:
-    /// - response (`id` numeric) → matching pending oneshot
+    /// - response (`id` numeric, no `method`) → matching pending oneshot
+    /// - request (`id` numeric and `method`) → inbound request handler
     /// - notification (`method` set, no `id`) → notification subscriber
     /// - anything else → trace and drop
-    async fn dispatch_frame(value: Value, inbox: &Inbox, extension_id: &str) {
+    async fn dispatch_frame(value: Value, inbox: &Arc<Inbox>, extension_id: &str) {
         let id_field = value.get("id");
         let id_is_present = !matches!(id_field, None | Some(Value::Null));
+        let method_field = value.get("method").and_then(Value::as_str).map(str::to_string);
+
+        if id_is_present && method_field.is_some() {
+            // Inbound request from the extension. Spawn a task to handle it
+            // so the reader loop is never blocked on memory I/O or other work.
+            let id = match id_field.and_then(Value::as_u64) {
+                Some(id) => id,
+                None => {
+                    tracing::trace!(
+                        extension = %extension_id,
+                        frame = %value,
+                        "Discarding inbound request with non-numeric id",
+                    );
+                    return;
+                }
+            };
+            let method = method_field.unwrap();
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let inbox = inbox.clone();
+            let extension_id = extension_id.to_string();
+            tokio::spawn(async move {
+                let outcome = Self::handle_inbound_request(&inbox, &method, params).await;
+                let payload = match outcome {
+                    Ok(result) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    }),
+                    Err((code, message)) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": code, "message": message},
+                    }),
+                };
+                let stdin_handle = inbox.inbound_stdin.lock().await.clone();
+                if let Some(stdin) = stdin_handle {
+                    let body = match serde_json::to_string(&payload) {
+                        Ok(s) => s,
+                        Err(error) => {
+                            tracing::warn!(
+                                extension = %extension_id,
+                                error = %error,
+                                "Failed to serialize inbound response",
+                            );
+                            return;
+                        }
+                    };
+                    let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+                    let mut stdin = stdin.lock().await;
+                    if let Err(error) = stdin.write_all(frame.as_bytes()).await {
+                        tracing::warn!(
+                            extension = %extension_id,
+                            error = %error,
+                            "Failed to write inbound response",
+                        );
+                        return;
+                    }
+                    if let Err(error) = stdin.flush().await {
+                        tracing::warn!(
+                            extension = %extension_id,
+                            error = %error,
+                            "Failed to flush inbound response",
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        extension = %extension_id,
+                        "No stdin available to reply to inbound request",
+                    );
+                }
+            });
+            return;
+        }
+
         if id_is_present {
             let id = match id_field.and_then(Value::as_u64) {
                 Some(id) => id,
@@ -744,6 +836,133 @@ impl ProcessExtension {
 
     pub fn restart_count(&self) -> usize {
         self.restart_count.load(Ordering::Relaxed)
+    }
+
+    /// Public for tests: set the permission set used by inbound RPC handlers
+    /// (e.g. memory.append). Called by the manager after manifest validation.
+    pub async fn set_permissions(&self, perms: crate::extensions::permissions::PermissionSet) {
+        *self.inbox.permissions.write().await = Some(perms);
+    }
+
+    /// Handle a JSON-RPC request initiated by the extension.
+    ///
+    /// Returns `Ok(result_value)` on success or `Err((code, message))` for a
+    /// JSON-RPC error response. Currently routes:
+    /// - `memory.append` (requires `memory.write`)
+    /// - `memory.query`  (requires `memory.read`)
+    /// All other methods return -32601 (method not found).
+    async fn handle_inbound_request(
+        inbox: &Arc<Inbox>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, (i32, String)> {
+        use crate::extensions::permissions::Permission;
+        use crate::memory::store::{self, MemoryQuery};
+
+        match method {
+            "memory.append" => {
+                Self::require_permission(inbox, Permission::MemoryWrite, "memory.write").await?;
+                let namespace = Self::param_str(&params, "namespace")?;
+                Self::require_namespace_matches(inbox, &namespace).await?;
+                let content = Self::param_str(&params, "content")?;
+                let tags = match params.get("tags") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(arr)) => {
+                        let mut out = Vec::with_capacity(arr.len());
+                        for v in arr {
+                            match v.as_str() {
+                                Some(s) => out.push(s.to_string()),
+                                None => {
+                                    return Err((
+                                        -32602,
+                                        "tags must be an array of strings".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        out
+                    }
+                    _ => {
+                        return Err((
+                            -32602,
+                            "tags must be an array of strings".to_string(),
+                        ))
+                    }
+                };
+                let meta = match params.get("meta") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.clone()),
+                };
+                let record = store::new_record(namespace, content, tags, meta);
+                let timestamp_ms = record.timestamp_ms;
+                store::append(&record).map_err(|e| (-32000, e.to_string()))?;
+                Ok(serde_json::json!({"ok": true, "timestamp_ms": timestamp_ms}))
+            }
+            "memory.query" => {
+                Self::require_permission(inbox, Permission::MemoryRead, "memory.read").await?;
+                let namespace = Self::param_str(&params, "namespace")?;
+                Self::require_namespace_matches(inbox, &namespace).await?;
+                let q = MemoryQuery {
+                    content_contains: params
+                        .get("content_contains")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    tag_prefix: params
+                        .get("tag_prefix")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    since_ms: params.get("since_ms").and_then(Value::as_u64),
+                    until_ms: params.get("until_ms").and_then(Value::as_u64),
+                    limit: params
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize),
+                };
+                let records = store::query(&namespace, &q).map_err(|e| (-32000, e.to_string()))?;
+                Ok(serde_json::json!({"records": records}))
+            }
+            other => Err((-32601, format!("method not found: {other}"))),
+        }
+    }
+
+    async fn require_permission(
+        inbox: &Arc<Inbox>,
+        perm: crate::extensions::permissions::Permission,
+        wire: &str,
+    ) -> Result<(), (i32, String)> {
+        let guard = inbox.permissions.read().await;
+        match guard.as_ref() {
+            Some(set) if set.has(perm) => Ok(()),
+            _ => Err((
+                -32602,
+                format!("permission denied: {wire} required"),
+            )),
+        }
+    }
+
+    async fn require_namespace_matches(
+        inbox: &Arc<Inbox>,
+        namespace: &str,
+    ) -> Result<(), (i32, String)> {
+        if namespace == inbox.extension_id {
+            Ok(())
+        } else {
+            Err((
+                -32602,
+                format!(
+                    "namespace must equal extension id '{}' (got '{}')",
+                    inbox.extension_id, namespace
+                ),
+            ))
+        }
+    }
+
+    fn param_str(params: &Value, name: &str) -> Result<String, (i32, String)> {
+        params
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| (-32602, format!("missing or invalid '{name}' parameter")))
     }
 
     pub async fn initialize(&self, plugin_root: Option<PathBuf>, config: Value) -> Result<InitializeCapabilitiesResult, String> {

@@ -149,6 +149,9 @@ impl ExtensionManager {
 
         // Spawn the extension process only after the manifest is known-good.
         let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
+        // Publish permissions to the inbound-request dispatcher so memory.*
+        // calls during initialize can be authorized correctly.
+        process.set_permissions(permissions.clone()).await;
         let capabilities = match process.initialize(cwd.clone(), config.clone()).await {
             Ok(capabilities) => capabilities,
             Err(error) => {
