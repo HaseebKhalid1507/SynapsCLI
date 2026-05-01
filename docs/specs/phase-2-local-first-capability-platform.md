@@ -307,4 +307,4 @@ Additional tests should be added per capability, especially E2E fixture extensio
 - Slice T (Unified capability surface) — landed: expanded health states, restart backoff, capability snapshot, shared validation helpers.
 - Slice U (Local memory) — partial: append/query store and protocol landed; indexer + shared namespaces deferred.
 - Slice V (Voice metadata) — landed: contract sketch, permissions, capability surface in /extensions status. Sidecar lives in synaps-skills.
-- Slice W (Subagent/workflow integration) — pending.
+- Slice W (Subagent/workflow integration) — partial: subagents inherit extension tools and route extension provider models via existing `try_route`. Workflow trust/audit covered by provider audit log. Composite skill+tool+memory examples remain illustrative-only.

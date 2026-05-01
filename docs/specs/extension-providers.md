@@ -348,3 +348,59 @@ existing extension protocol.
 Plugins requesting `audio.input` must surface this in their distribution
 metadata so install/update prompts can warn users before granting the
 permission. Future revisions may add a per-session toggle in chatui.
+
+## Subagent and workflow composition
+
+Subagents (spawned via `subagent_start` / `subagent`) are first-class
+participants in the extension capability surface:
+
+- **Extension tools are available** to subagent runtimes by default.
+  `ToolRegistry::without_subagent_with_extensions()` merges any
+  extension-registered tools (those whose `extension_id()` is `Some`)
+  into the subagent's built-in toolset, while excluding the recursive
+  `subagent_*` tools.
+- **Extension provider models** can be used as subagent backends. Pass a
+  qualified id like `<plugin-id>:<provider-id>:<model-id>` to
+  `subagent_start` `model` parameter — the same `try_route` that handles
+  chat routing applies, with full trust gating, streaming, tool-use
+  loops, and audit log entries.
+- **Audit semantics** are unchanged from chat routing: every provider
+  invocation by a subagent appends an audit entry to
+  `$SYNAPS_BASE_DIR/extensions/audit.jsonl` with
+  `tools_exposed`/`tools_requested`/`outcome` metadata. Subagent identity
+  is not currently part of the audit row — entries describe the provider
+  call, not the calling agent.
+
+### Composite workflow example
+
+A plugin can expose:
+
+1. A **skill prompt** (`skills/<name>.md`) that primes the model.
+2. **Extension tools** registered via `tools.register` during
+   `initialize`.
+3. An **extension provider model** registered via `providers.register`.
+4. **Local memory** writes via `memory.append` (with `memory.write`
+   permission and namespace = the extension id).
+
+A user invokes the skill, which the chat runtime applies; the model is
+the extension's provider model; the model issues tool calls that the
+extension's own tools handle; results are appended to local memory for
+later recall via `memory.query` or `/extensions memory recent`.
+
+### Workflow trust
+
+Workflow capabilities do not bypass the central permission/hook system:
+
+- Tool invocations still go through `before_tool_call` / `after_tool_call`.
+- Provider calls still go through the trust gate.
+- Memory access still requires `memory.read` / `memory.write` permissions.
+- Audit log entries land for every provider invocation, including those
+  initiated by subagents.
+
+### Not yet implemented
+
+- Plugin commands launching multi-step workflows with declarative steps.
+- Subagent-aware audit columns.
+- Workflow templates as a first-class manifest concept.
+
+These remain Phase 2 follow-ups under Slice W.
