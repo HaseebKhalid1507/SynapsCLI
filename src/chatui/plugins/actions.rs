@@ -15,7 +15,10 @@ use synaps_cli::skills::{
         derive_git_clone_url, fetch_manifest, fetch_marketplace, is_safe_plugin_name, is_trusted,
         trust_host_for_source,
     },
-    plugin_index::PluginIndexEntry,
+    plugin_index::{
+        PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
+        PluginIndexTrust,
+    },
     reload_registry,
     registry::CommandRegistry,
     state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState},
@@ -197,10 +200,56 @@ pub(crate) async fn apply_install(
         };
         return;
     }
+    if let Some(index) = cached.index.clone() {
+        let entry = plugin_index_entry_from_cached(&cached.name, &cached, index);
+        apply_install_from_index_entry(state, marketplace_name, entry, registry, config).await;
+        return;
+    }
     run_install_flow(
         state, plugin_name, effective_source, subdir, Some(marketplace_name),
         registry, config,
     ).await;
+}
+
+fn plugin_index_entry_from_cached(
+    fallback_name: &str,
+    cached: &synaps_cli::skills::state::CachedPlugin,
+    index: CachedPluginIndexMetadata,
+) -> PluginIndexEntry {
+    PluginIndexEntry {
+        id: fallback_name.to_string(),
+        name: cached.name.clone(),
+        version: cached.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+        description: cached.description.clone().unwrap_or_default(),
+        repository: index.repository,
+        subdir: index.subdir,
+        license: None,
+        categories: vec![],
+        keywords: vec![],
+        checksum: PluginIndexChecksum {
+            algorithm: index.checksum_algorithm,
+            value: index.checksum_value,
+        },
+        compatibility: PluginIndexCompatibility {
+            synaps: index.compatibility_synaps,
+            extension_protocol: index.compatibility_extension_protocol,
+        },
+        capabilities: PluginIndexCapabilities {
+            skills: index.skills,
+            has_extension: index.has_extension,
+            permissions: index.permissions,
+            hooks: index.hooks,
+            commands: index.commands,
+        },
+        trust: if index.trust_publisher.is_some() || index.trust_homepage.is_some() {
+            Some(PluginIndexTrust {
+                publisher: index.trust_publisher,
+                homepage: index.trust_homepage,
+            })
+        } else {
+            None
+        },
+    }
 }
 
 pub(crate) async fn apply_install_from_index_entry(
@@ -948,7 +997,21 @@ mod tests {
                     source: source.clone(),
                     version: Some("0.1.0".into()),
                     description: Some("fixture".into()),
-                    index: None,
+                    index: Some(CachedPluginIndexMetadata {
+                        repository: repository.clone(),
+                        subdir: None,
+                        checksum_algorithm: "sha256".into(),
+                        checksum_value: "abc123".into(),
+                        compatibility_synaps: Some(">=0.1.0".into()),
+                        compatibility_extension_protocol: Some("1".into()),
+                        has_extension: true,
+                        skills: vec![],
+                        permissions: vec!["tools.intercept".into()],
+                        hooks: vec!["before_tool_call".into()],
+                        commands: vec![],
+                        trust_publisher: Some("Example".into()),
+                        trust_homepage: Some("https://example.com".into()),
+                    }),
                 }],
                 repo_url: None,
             }],
