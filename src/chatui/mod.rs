@@ -1299,6 +1299,12 @@ let display_text = app.user_display_text_for_submission(&input);
                                         PO::CancelPendingInstall => {
                                             plugins::actions::apply_cancel_pending_install(state);
                                         }
+                                        PO::ConfirmPendingUpdate => {
+                                            plugins::actions::apply_confirm_pending_update(state, &registry, &config).await;
+                                        }
+                                        PO::CancelPendingUpdate => {
+                                            plugins::actions::apply_cancel_pending_update(state);
+                                        }
                                         PO::RemoveMarketplace(name) => {
                                             plugins::actions::apply_remove_marketplace(
                                                 state, name, &registry, &config,

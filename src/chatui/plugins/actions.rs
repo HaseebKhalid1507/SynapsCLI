@@ -15,6 +15,7 @@ use synaps_cli::skills::{
         derive_git_clone_url, fetch_manifest, fetch_marketplace, is_safe_plugin_name, is_trusted,
         trust_host_for_source,
     },
+    manifest::PluginManifest,
     plugin_index::{
         PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
         PluginIndexTrust,
@@ -22,6 +23,7 @@ use synaps_cli::skills::{
     reload_registry,
     registry::CommandRegistry,
     state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState},
+    update_diff::diff_plugin_manifests,
 };
 
 use super::state::{PluginsModalState, RightMode};
@@ -364,6 +366,14 @@ fn cancel_pending_temp(temp_dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+fn read_plugin_manifest(path: &std::path::Path) -> Result<PluginManifest, String> {
+    let manifest_path = path.join(".synaps-plugin/plugin.json");
+    let body = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
+    serde_json::from_str(&body)
+        .map_err(|e| format!("parse {}: {}", manifest_path.display(), e))
+}
+
 fn summarize_plugin_dir(path: &std::path::Path) -> Vec<String> {
     let Some(parent) = path.parent() else {
         return vec!["plugin manifest could not be inspected before install".to_string()];
@@ -578,55 +588,135 @@ pub(crate) async fn apply_uninstall(
 pub(crate) async fn apply_update(
     state: &mut PluginsModalState,
     name: String,
-    registry: &Arc<CommandRegistry>,
-    config: &synaps_cli::SynapsConfig,
+    _registry: &Arc<CommandRegistry>,
+    _config: &synaps_cli::SynapsConfig,
 ) {
-    let dir = match install_dir_for(&name) {
+    let final_dir = match install_dir_for(&name) {
         Ok(d) => d,
         Err(e) => {
             state.row_error = Some(e);
             return;
         }
     };
-    // Plugins installed from a marketplace subdir have no `.git` on disk
-    // (they're snapshots), so `git pull` can't update them. Instead, remove
-    // the snapshot and re-clone+snapshot from the marketplace repo.
     let installed = state.file.installed.iter().find(|p| p.name == name).cloned();
     let Some(installed) = installed else {
         state.row_error = Some(format!("plugin '{}' is not installed", name));
         return;
     };
-    let sha = if let Some(subdir) = installed.source_subdir.clone() {
-        let source = installed.source_url.clone();
-        let dir_for_task = dir.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            install::uninstall_plugin(&dir_for_task)
-                .and_then(|_| install::install_plugin_from_subdir(&source, &subdir, &dir_for_task))
-        }).await;
-        match task {
-            Ok(Ok(sha)) => sha,
-            Ok(Err(e)) => { state.row_error = Some(e); return; }
-            Err(e) => { state.row_error = Some(format!("update task join error: {}", e)); return; }
-        }
-    } else {
-        let update_res = tokio::task::spawn_blocking(move || install::update_plugin(&dir)).await;
-        match update_res {
-            Ok(Ok(sha)) => sha,
-            Ok(Err(e)) => { state.row_error = Some(e); return; }
-            Err(e) => { state.row_error = Some(format!("update task join error: {}", e)); return; }
+    let old_manifest = match read_plugin_manifest(&final_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            state.row_error = Some(e);
+            return;
         }
     };
-    if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == name) {
-        p.installed_commit = sha;
+    let parent = match final_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            state.row_error = Some("plugin install path has no parent".to_string());
+            return;
+        }
+    };
+    let temp_dir = parent.join(format!(".{}-pending-update", name));
+    let source = installed.source_url.clone();
+    let subdir = installed.source_subdir.clone();
+    let temp_for_task = temp_dir.clone();
+    let update_res = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&temp_for_task);
+        match subdir {
+            Some(subdir) => install::install_plugin_from_subdir(&source, &subdir, &temp_for_task),
+            None => install::install_plugin(&source, &temp_for_task),
+        }
+    }).await;
+    let sha = match update_res {
+        Ok(Ok(sha)) => sha,
+        Ok(Err(e)) => {
+            state.row_error = Some(e);
+            return;
+        }
+        Err(e) => {
+            state.row_error = Some(format!("update preview task join error: {}", e));
+            return;
+        }
+    };
+    let new_manifest = match read_plugin_manifest(&temp_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            cancel_pending_temp(&temp_dir);
+            state.row_error = Some(e);
+            return;
+        }
+    };
+    let diff = diff_plugin_manifests(&old_manifest, &new_manifest);
+    state.mode = RightMode::PendingUpdateConfirm {
+        plugin_name: name,
+        summary: diff.lines(),
+        installed_commit: sha,
+        temp_dir,
+        final_dir,
+    };
+    state.row_error = None;
+}
+
+pub(crate) async fn apply_confirm_pending_update(
+    state: &mut PluginsModalState,
+    registry: &Arc<CommandRegistry>,
+    config: &synaps_cli::SynapsConfig,
+) {
+    let RightMode::PendingUpdateConfirm {
+        plugin_name,
+        installed_commit,
+        temp_dir,
+        final_dir,
+        ..
+    } = std::mem::replace(&mut state.mode, RightMode::List) else {
+        return;
+    };
+    let final_for_task = final_dir.clone();
+    let temp_for_task = temp_dir.clone();
+    let apply_res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let backup = final_for_task.with_extension("update-backup");
+        let _ = std::fs::remove_dir_all(&backup);
+        std::fs::rename(&final_for_task, &backup)
+            .map_err(|e| format!("backup existing plugin {}: {}", final_for_task.display(), e))?;
+        if let Err(e) = std::fs::rename(&temp_for_task, &final_for_task) {
+            let _ = std::fs::rename(&backup, &final_for_task);
+            return Err(format!("apply update {} -> {}: {}", temp_for_task.display(), final_for_task.display(), e));
+        }
+        let _ = std::fs::remove_dir_all(&backup);
+        Ok(())
+    }).await;
+    match apply_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            state.row_error = Some(e);
+            return;
+        }
+        Err(e) => {
+            state.row_error = Some(format!("update apply task join error: {}", e));
+            return;
+        }
+    }
+    if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
+        p.installed_commit = installed_commit;
+        p.latest_commit = None;
     }
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
             "updated '{}' but failed to save state: {}. State may be stale.",
-            name, e
+            plugin_name, e
         ));
         return;
     }
     reload_registry(registry, config);
+    state.row_error = None;
+}
+
+pub(crate) fn apply_cancel_pending_update(state: &mut PluginsModalState) {
+    let old = std::mem::replace(&mut state.mode, RightMode::List);
+    if let RightMode::PendingUpdateConfirm { temp_dir, .. } = old {
+        cancel_pending_temp(&temp_dir);
+    }
     state.row_error = None;
 }
 

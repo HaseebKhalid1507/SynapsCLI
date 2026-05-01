@@ -15,6 +15,8 @@ pub(crate) enum InputOutcome {
     RemoveMarketplace(String),
     ConfirmPendingInstall,
     CancelPendingInstall,
+    ConfirmPendingUpdate,
+    CancelPendingUpdate,
     TrustAndInstall { plugin_name: String, host: String, source: String, summary: Vec<String> },
     /// Toggle disabled state of a plugin. enabled=true means "make it enabled".
     TogglePlugin { name: String, enabled: bool },
@@ -27,6 +29,7 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         RightMode::TrustPrompt { .. } => return trust_key(state, key),
         RightMode::Confirm { .. } => return confirm_key(state, key),
         RightMode::PendingInstallConfirm { .. } => return pending_install_key(key),
+        RightMode::PendingUpdateConfirm { .. } => return pending_update_key(key),
         RightMode::Detail { .. } => return detail_key(state, key),
         RightMode::List => {}
     }
@@ -155,6 +158,14 @@ fn pending_install_key(key: KeyEvent) -> InputOutcome {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => InputOutcome::ConfirmPendingInstall,
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => InputOutcome::CancelPendingInstall,
+        _ => InputOutcome::None,
+    }
+}
+
+fn pending_update_key(key: KeyEvent) -> InputOutcome {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => InputOutcome::ConfirmPendingUpdate,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => InputOutcome::CancelPendingUpdate,
         _ => InputOutcome::None,
     }
 }

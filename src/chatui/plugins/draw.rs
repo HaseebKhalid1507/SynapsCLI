@@ -95,7 +95,10 @@ fn render_right(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         }
         RightMode::Confirm { prompt, summary, .. } => render_confirm(frame, area, prompt, summary),
         RightMode::PendingInstallConfirm { plugin_name, summary, .. } => {
-            render_confirm(frame, area, &format!("Install executable plugin '{}'?", plugin_name), summary)
+            render_confirm(frame, area, &format!("Install executable plugin '{}' ?", plugin_name).replace("' ?", "'?"), summary)
+        }
+        RightMode::PendingUpdateConfirm { plugin_name, summary, .. } => {
+            render_confirm(frame, area, &format!("Update plugin '{}' ?", plugin_name).replace("' ?", "'?"), summary)
         }
     }
 }
@@ -399,6 +402,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         (_, RightMode::TrustPrompt { .. }) => "y trust  n cancel",
         (_, RightMode::Confirm { .. }) => "y yes  n no  Esc cancel",
         (_, RightMode::PendingInstallConfirm { .. }) => "y install  n cancel  Esc cancel",
+        (_, RightMode::PendingUpdateConfirm { .. }) => "y update  n cancel  Esc cancel",
         (Focus::Left, RightMode::List) => {
             "↑↓ nav  Tab switch  Enter select  r refresh  R remove  Esc close"
         }

@@ -34,6 +34,13 @@ pub enum RightMode {
         temp_dir: std::path::PathBuf,
         final_dir: std::path::PathBuf,
     },
+    PendingUpdateConfirm {
+        plugin_name: String,
+        summary: Vec<String>,
+        installed_commit: String,
+        temp_dir: std::path::PathBuf,
+        final_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
