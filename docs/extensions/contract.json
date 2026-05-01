@@ -97,8 +97,18 @@
     },
     "providers": {
       "permission": "providers.register",
-      "status": "reserved",
-      "spec": "docs/specs/extension-provider-registration.md"
+      "status": "active",
+      "model_id_format": "<plugin-id>:<provider-id>:<model-id>",
+      "methods": {
+        "provider.complete": {
+          "streaming": false,
+          "timeout_secs": 60
+        },
+        "provider.stream": {
+          "status": "reserved"
+        }
+      },
+      "spec": "docs/specs/extension-providers.md"
     }
   }
 }
