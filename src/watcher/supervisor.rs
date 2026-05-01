@@ -1,20 +1,36 @@
 use super::*;
 
 /// Drop a completion event into ~/.synaps-cli/inbox/ for the event bus.
-fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
+pub(crate) fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
+    use synaps_cli::events::types::{Event, EventSource, EventContent, Severity};
+
+    let event = Event {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        source: EventSource {
+            source_type: "watcher".to_string(),
+            name: agent_name.to_string(),
+            callback: None,
+        },
+        channel: None,
+        sender: None,
+        content: EventContent {
+            text: format!("Agent '{}' completed session #{} ({:.0}s, exit {})", agent_name, session_count, elapsed_secs, exit_code),
+            content_type: "agent_complete".to_string(),
+            severity: if exit_code == 0 { Some(Severity::Medium) } else { Some(Severity::High) },
+            data: Some(serde_json::json!({
+                "agent": agent_name,
+                "session": session_count,
+                "elapsed_secs": elapsed_secs,
+                "exit_code": exit_code,
+            })),
+        },
+        expects_response: false,
+        reply_to: None,
+    };
+
     let inbox_dir = synaps_cli::config::base_dir().join("inbox");
     let _ = std::fs::create_dir_all(&inbox_dir);
-
-    let event = serde_json::json!({
-        "type": "agent_complete",
-        "agent": agent_name,
-        "session": session_count,
-        "elapsed_secs": elapsed_secs,
-        "exit_code": exit_code,
-        "message": format!("Agent '{}' completed session #{} ({:.0}s)", agent_name, session_count, elapsed_secs),
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
     let filename = format!("watcher-{}-{}.json", agent_name, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
     let path = inbox_dir.join(&filename);
     if let Ok(body) = serde_json::to_string_pretty(&event) {
