@@ -15,6 +15,7 @@ pub mod registry;
 pub mod tool;
 pub mod state;
 pub mod marketplace;
+pub mod plugin_index;
 pub mod install;
 pub mod keybinds;
 pub mod commands;
