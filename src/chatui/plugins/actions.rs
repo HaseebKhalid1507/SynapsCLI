@@ -420,6 +420,17 @@ fn record_installed_plugin(
     });
 }
 
+fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -> Option<(String, String)> {
+    let marketplace_name = installed.marketplace.as_deref()?;
+    state
+        .marketplaces
+        .iter()
+        .find(|m| m.name == marketplace_name)
+        .and_then(|m| m.cached_plugins.iter().find(|p| p.name == installed.name))
+        .and_then(|p| p.index.as_ref())
+        .map(|index| (index.checksum_algorithm.clone(), index.checksum_value.clone()))
+}
+
 async fn run_install_flow(
     state: &mut PluginsModalState,
     plugin_name: String,
@@ -646,7 +657,8 @@ pub(crate) async fn apply_update(
     let temp_dir = parent.join(format!(".{}-pending-update", name));
     let source = installed.source_url.clone();
     let subdir = installed.source_subdir.clone();
-    let expected_checksum = installed.checksum_algorithm.clone().zip(installed.checksum_value.clone());
+    let expected_checksum = expected_update_checksum(&state.file, &installed)
+        .or_else(|| installed.checksum_algorithm.clone().zip(installed.checksum_value.clone()));
     let temp_for_task = temp_dir.clone();
     let update_res = tokio::task::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(&temp_for_task);
@@ -1051,6 +1063,58 @@ mod tests {
         (dir, bare)
     }
 
+    fn push_manifest_update(work: &Path, version: &str, extra_permission: Option<&str>) {
+        let permissions = match extra_permission {
+            Some(permission) => format!("[\"tools.intercept\",\"{}\"]", permission),
+            None => "[\"tools.intercept\"]".to_string(),
+        };
+        fs::write(
+            work.join(".synaps-plugin/plugin.json"),
+            format!(r#"{{
+  "name": "policy-test",
+  "version": "{}",
+  "description": "test plugin with an executable extension",
+  "extension": {{
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extension.py"],
+    "permissions": {},
+    "hooks": [{{"hook": "before_tool_call", "tool": "bash"}}]
+  }}
+}}"#, version, permissions),
+        )
+        .unwrap();
+        git(&["add", "."], work);
+        git(&["commit", "-q", "-m", "update"], work);
+    }
+
+    fn fixture_plugin_repo_with_work() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir_all(work.join(".synaps-plugin")).unwrap();
+        fs::write(work.join("extension.py"), "#!/usr/bin/env python3\n").unwrap();
+
+        git(&["init", "-q"], &work);
+        git(&["config", "user.email", "t@t"], &work);
+        git(&["config", "user.name", "t"], &work);
+        push_manifest_update(&work, "0.1.0", None);
+        git(&["branch", "-M", "main"], &work);
+
+        let bare = dir.path().join("plugin.git");
+        let work_s = work.to_string_lossy().to_string();
+        let bare_s = bare.to_string_lossy().to_string();
+        git(&["clone", "--bare", "-q", &work_s, &bare_s], dir.path());
+        (dir, bare, work)
+    }
+
+    fn cloned_plugin_checksum(source: &str) -> String {
+        let clone_parent = tempfile::tempdir().unwrap();
+        let clone = clone_parent.path().join("clone");
+        install::install_plugin(source, &clone).unwrap();
+        install::plugin_dir_sha256(&clone).unwrap()
+    }
+
     fn state_for_marketplace(source_url: String) -> PluginsModalState {
         PluginsModalState::new(PluginsState {
             marketplaces: vec![Marketplace {
@@ -1109,12 +1173,7 @@ mod tests {
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
         let source = format!("file://{}", bare.display());
-        let checksum = {
-            let clone_parent = tempfile::tempdir().unwrap();
-            let clone = clone_parent.path().join("clone");
-            install::install_plugin(&source, &clone).unwrap();
-            install::plugin_dir_sha256(&clone).unwrap()
-        };
+        let checksum = cloned_plugin_checksum(&source);
         let repository = "https://example.invalid/owner/policy-test.git".to_string();
         let mut state = PluginsModalState::new(PluginsState {
             marketplaces: vec![Marketplace {
@@ -1154,14 +1213,14 @@ mod tests {
         apply_install_from_index_entry(
             &mut state,
             "local-index".into(),
-        PluginIndexEntry {
+            PluginIndexEntry {
             repository: repository.clone(),
             checksum: PluginIndexChecksum {
                 algorithm: "sha256".into(),
                 value: checksum.clone(),
             },
             ..index_entry(source.clone())
-        },
+            },
             &registry,
             &config,
         )
@@ -1217,6 +1276,77 @@ mod tests {
         assert!(matches!(state.mode, RightMode::List));
         assert!(state.row_error.as_deref().unwrap_or_default().contains("checksum mismatch"));
         assert!(!final_dir.parent().unwrap().join(".policy-test-pending-update").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_preview_uses_refreshed_index_checksum_and_shows_manifest_diff() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        let (_repo_tmp, bare, work) = fixture_plugin_repo_with_work();
+        let source = format!("file://{}", bare.display());
+        let old_checksum = cloned_plugin_checksum(&source);
+        let final_dir = install_dir_for("policy-test").unwrap();
+        let installed_sha = install::install_plugin(&source, &final_dir).unwrap();
+
+        push_manifest_update(&work, "0.2.0", Some("privacy.llm_content"));
+        git(&["push", "-q", bare.to_str().unwrap(), "HEAD:main"], &work);
+        let new_checksum = cloned_plugin_checksum(&source);
+
+        let mut state = PluginsModalState::new(PluginsState {
+            marketplaces: vec![Marketplace {
+                name: "local-index".into(),
+                url: "file:///tmp/plugin-index.json".into(),
+                description: None,
+                last_refreshed: None,
+                cached_plugins: vec![CachedPlugin {
+                    name: "policy-test".into(),
+                    source: source.clone(),
+                    version: Some("0.2.0".into()),
+                    description: Some("fixture".into()),
+                    index: Some(CachedPluginIndexMetadata {
+                        repository: source.clone(),
+                        subdir: None,
+                        checksum_algorithm: "sha256".into(),
+                        checksum_value: new_checksum,
+                        compatibility_synaps: Some(">=0.1.0".into()),
+                        compatibility_extension_protocol: Some("1".into()),
+                        has_extension: true,
+                        skills: vec![],
+                        permissions: vec!["tools.intercept".into(), "privacy.llm_content".into()],
+                        hooks: vec!["before_tool_call".into()],
+                        commands: vec![],
+                        trust_publisher: None,
+                        trust_homepage: None,
+                    }),
+                }],
+                repo_url: None,
+            }],
+            installed: vec![InstalledPlugin {
+                name: "policy-test".into(),
+                marketplace: Some("local-index".into()),
+                source_url: source.clone(),
+                installed_commit: installed_sha,
+                latest_commit: Some("updated".into()),
+                installed_at: "now".into(),
+                source_subdir: None,
+                checksum_algorithm: Some("sha256".into()),
+                checksum_value: Some(old_checksum),
+            }],
+            trusted_hosts: vec![],
+        });
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let config = synaps_cli::SynapsConfig::default();
+
+        apply_update(&mut state, "policy-test".into(), &registry, &config).await;
+
+        let RightMode::PendingUpdateConfirm { summary, temp_dir, final_dir: pending_final, .. } = &state.mode else {
+            panic!("expected pending update confirmation, got {:?}; error {:?}", state.mode, state.row_error);
+        };
+        assert_eq!(pending_final, &final_dir);
+        assert!(temp_dir.exists());
+        assert!(summary.iter().any(|line| line == "version: 0.1.0 -> 0.2.0"));
+        assert!(summary.iter().any(|line| line == "added permissions: privacy.llm_content"));
     }
 
     #[tokio::test(flavor = "current_thread")]
