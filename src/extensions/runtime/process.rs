@@ -7,14 +7,15 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use super::{ExtensionHandler, ExtensionHealth};
 use crate::extensions::hooks::events::{HookEvent, HookResult};
@@ -28,22 +29,6 @@ struct JsonRpcRequest {
     method: String,
     params: Value,
     id: u64,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    result: Option<Value>,
-    error: Option<JsonRpcError>,
-    id: u64,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcError {
-    #[allow(dead_code)]
-    code: i64,
-    message: String,
 }
 
 
@@ -415,10 +400,53 @@ struct InitializeCapabilities {
     providers: Vec<RegisteredProviderSpec>,
 }
 
+/// A JSON-RPC notification frame received from an extension (no `id`).
+///
+/// Internal API exposed publicly (`#[doc(hidden)]`) so integration tests
+/// can subscribe to notifications via [`ProcessExtension::subscribe_notifications`].
+/// Extension authors should not depend on this type — it may change without notice.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct NotificationFrame {
+    pub method: String,
+    pub params: Value,
+}
+
+/// Shared mailbox for the background reader task. Holds in-flight request
+/// senders (keyed by JSON-RPC id) and an optional notification subscriber.
+///
+/// Persists across process restarts: a new reader task replaces the old one
+/// but the `Inbox` itself is reused. Pending requests are drained with
+/// errors when the reader observes EOF or a transport failure.
+struct Inbox {
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    notification_sink: Mutex<Option<mpsc::UnboundedSender<NotificationFrame>>>,
+}
+
+impl Inbox {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            notification_sink: Mutex::new(None),
+        }
+    }
+
+    /// Drains all pending request senders, sending `Err(reason)` to each.
+    async fn fail_all_pending(&self, reason: &str) {
+        let drained: Vec<_> = {
+            let mut pending = self.pending.lock().await;
+            pending.drain().collect()
+        };
+        for (_, tx) in drained {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+}
+
 struct ProcessState {
     child: Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    reader_handle: JoinHandle<()>,
 }
 
 /// A running extension process communicating via JSON-RPC 2.0 over stdio.
@@ -432,6 +460,10 @@ pub struct ProcessExtension {
     call_lock: Arc<Mutex<()>>,
     next_id: AtomicU64,
     restart_count: AtomicUsize,
+    /// Shared mailbox between the reader task and request callers. Persists
+    /// across process restarts so that any active notification subscriber
+    /// survives a restart-on-error.
+    inbox: Arc<Inbox>,
 }
 
 impl ProcessExtension {
@@ -449,7 +481,8 @@ impl ProcessExtension {
         args: &[String],
         cwd: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let state = Self::spawn_state(id, command, args, cwd.as_ref()).await?;
+        let inbox = Arc::new(Inbox::new());
+        let state = Self::spawn_state(id, command, args, cwd.as_ref(), inbox.clone()).await?;
         Ok(Self {
             id: id.to_string(),
             command: command.to_string(),
@@ -459,6 +492,7 @@ impl ProcessExtension {
             call_lock: Arc::new(Mutex::new(())),
             next_id: AtomicU64::new(1),
             restart_count: AtomicUsize::new(0),
+            inbox,
         })
     }
 
@@ -467,6 +501,7 @@ impl ProcessExtension {
         command: &str,
         args: &[String],
         cwd: Option<&PathBuf>,
+        inbox: Arc<Inbox>,
     ) -> Result<ProcessState, String> {
         let mut cmd = Command::new(command);
         cmd.args(args)
@@ -512,11 +547,192 @@ impl ProcessExtension {
             });
         }
 
+        let reader_handle = Self::spawn_reader(stdout, inbox, id.to_string());
+
         Ok(ProcessState {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            stdin: Arc::new(Mutex::new(stdin)),
+            reader_handle,
         })
+    }
+
+    /// Spawn the background reader task that owns `stdout`, demultiplexing
+    /// JSON-RPC responses (by id) and notifications (no id) into the shared
+    /// [`Inbox`]. Returns a `JoinHandle` so callers can `.abort()` it on
+    /// restart or shutdown.
+    fn spawn_reader(
+        stdout: ChildStdout,
+        inbox: Arc<Inbox>,
+        extension_id: String,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match Self::read_one_frame(&mut reader, &extension_id).await {
+                    Ok(Some(value)) => {
+                        Self::dispatch_frame(value, &inbox, &extension_id).await;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            extension = %extension_id,
+                            "Extension stdout closed (EOF); failing pending requests",
+                        );
+                        inbox.fail_all_pending("transport closed: EOF").await;
+                        // Drop notification subscriber on EOF.
+                        inbox.notification_sink.lock().await.take();
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            extension = %extension_id,
+                            error = %error,
+                            "Extension transport read error",
+                        );
+                        inbox
+                            .fail_all_pending(&format!("transport error: {}", error))
+                            .await;
+                        inbox.notification_sink.lock().await.take();
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Read one Content-Length-framed JSON message from `reader`. Returns
+    /// `Ok(None)` on a clean EOF *before* any header bytes are read; any
+    /// other unexpected EOF is reported as `Err`.
+    async fn read_one_frame(
+        reader: &mut BufReader<ChildStdout>,
+        extension_id: &str,
+    ) -> Result<Option<Value>, String> {
+        let mut content_length: Option<usize> = None;
+        let mut saw_any_header = false;
+        loop {
+            let mut header_line = String::new();
+            let n = reader
+                .read_line(&mut header_line)
+                .await
+                .map_err(|e| format!("Read header error: {}", e))?;
+            if n == 0 {
+                if saw_any_header {
+                    return Err("Unexpected EOF while reading response headers".into());
+                }
+                return Ok(None);
+            }
+            saw_any_header = true;
+            if header_line.len() > 1024 {
+                return Err(format!(
+                    "Extension '{}' header line too long ({} bytes)",
+                    extension_id,
+                    header_line.len()
+                ));
+            }
+            let trimmed = header_line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    content_length = Some(value.trim().parse().map_err(|_| {
+                        format!("Invalid Content-Length value: {:?}", value.trim())
+                    })?);
+                }
+            }
+        }
+        let content_length = content_length.ok_or_else(|| {
+            format!(
+                "Extension '{}' frame missing Content-Length header",
+                extension_id
+            )
+        })?;
+        const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024;
+        if content_length > MAX_RESPONSE_SIZE {
+            return Err(format!(
+                "Extension '{}' frame too large: {} bytes (max {})",
+                extension_id, content_length, MAX_RESPONSE_SIZE
+            ));
+        }
+        let mut buf = vec![0u8; content_length];
+        tokio::io::AsyncReadExt::read_exact(reader, &mut buf)
+            .await
+            .map_err(|e| format!("Read body error: {}", e))?;
+        let value: Value = serde_json::from_slice(&buf)
+            .map_err(|e| format!("Parse frame error: {}", e))?;
+        Ok(Some(value))
+    }
+
+    /// Route a parsed JSON-RPC frame to the right consumer:
+    /// - response (`id` numeric) → matching pending oneshot
+    /// - notification (`method` set, no `id`) → notification subscriber
+    /// - anything else → trace and drop
+    async fn dispatch_frame(value: Value, inbox: &Inbox, extension_id: &str) {
+        let id_field = value.get("id");
+        let id_is_present = !matches!(id_field, None | Some(Value::Null));
+        if id_is_present {
+            let id = match id_field.and_then(Value::as_u64) {
+                Some(id) => id,
+                None => {
+                    tracing::trace!(
+                        extension = %extension_id,
+                        frame = %value,
+                        "Discarding frame with non-numeric id",
+                    );
+                    return;
+                }
+            };
+            let sender = inbox.pending.lock().await.remove(&id);
+            match sender {
+                Some(tx) => {
+                    let payload = if let Some(err) = value.get("error") {
+                        let message = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown extension error")
+                            .to_string();
+                        Err(format!("Extension error: {}", message))
+                    } else {
+                        Ok(value
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(Value::Null))
+                    };
+                    let _ = tx.send(payload);
+                }
+                None => {
+                    tracing::trace!(
+                        extension = %extension_id,
+                        id = id,
+                        "Response with unknown id (no pending request); dropping",
+                    );
+                }
+            }
+        } else if let Some(method) = value.get("method").and_then(Value::as_str) {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let frame = NotificationFrame {
+                method: method.to_string(),
+                params,
+            };
+            let mut sink_guard = inbox.notification_sink.lock().await;
+            if let Some(sink) = sink_guard.as_ref() {
+                if sink.send(frame).is_err() {
+                    // Receiver dropped; clear subscription.
+                    sink_guard.take();
+                }
+            } else {
+                tracing::trace!(
+                    extension = %extension_id,
+                    method = %method,
+                    "Notification with no active subscriber; dropping",
+                );
+            }
+        } else {
+            tracing::trace!(
+                extension = %extension_id,
+                frame = %value,
+                "Unrecognized frame; dropping",
+            );
+        }
     }
 
     pub fn restart_count(&self) -> usize {
@@ -665,9 +881,15 @@ impl ProcessExtension {
             ));
         }
 
-        if let Some(mut old) = state.take() {
-            let _ = old.child.kill().await;
+        if let Some(old) = state.take() {
+            old.reader_handle.abort();
+            let mut child = old.child;
+            let _ = child.kill().await;
         }
+        // Drain any stale pending entries before reusing the inbox.
+        self.inbox
+            .fail_all_pending("transport closed: process restarting")
+            .await;
 
         tracing::warn!(
             extension = %self.id,
@@ -680,6 +902,7 @@ impl ProcessExtension {
             &self.command,
             &self.args,
             self.cwd.as_ref(),
+            self.inbox.clone(),
         ).await?);
         self.initialize_locked(state).await?;
         Ok(())
@@ -706,6 +929,9 @@ impl ProcessExtension {
         Self::parse_initialize_result(&self.id, value).map(|_| ())
     }
 
+    /// Send a single JSON-RPC request and await the matching response,
+    /// using the shared inbox for response delivery. The reader task runs
+    /// concurrently and may dispatch interleaved notifications.
     async fn call_once_locked(
         &self,
         state: &mut ProcessState,
@@ -721,80 +947,36 @@ impl ProcessExtension {
         })
         .map_err(|e| format!("Serialize error: {}", e))?;
 
+        let (tx, rx) = oneshot::channel::<Result<Value, String>>();
+        // Register pending BEFORE writing so the reader can route a fast
+        // response without racing against the insert.
+        self.inbox.pending.lock().await.insert(id, tx);
+
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        state
-            .stdin
-            .write_all(frame.as_bytes())
-            .await
-            .map_err(|e| format!("Write error: {}", e))?;
-        state
-            .stdin
-            .flush()
-            .await
-            .map_err(|e| format!("Flush error: {}", e))?;
-
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut header_line = String::new();
-            state
-                .stdout
-                .read_line(&mut header_line)
-                .await
-                .map_err(|e| format!("Read header error: {}", e))?;
-
-            if header_line.is_empty() {
-                return Err("Unexpected EOF while reading response headers".into());
+        let write_result = {
+            let mut stdin = state.stdin.lock().await;
+            match stdin.write_all(frame.as_bytes()).await {
+                Ok(()) => stdin.flush().await,
+                Err(e) => Err(e),
             }
-            if header_line.len() > 1024 {
-                return Err(format!(
-                    "Extension '{}' header line too long ({} bytes)",
-                    self.id, header_line.len()
-                ));
-            }
-
-            let trimmed = header_line.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = trimmed.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    content_length = Some(
-                        value.trim().parse().map_err(|_| {
-                            format!("Invalid Content-Length value: {:?}", value.trim())
-                        })?
-                    );
-                }
-            }
+        };
+        if let Err(e) = write_result {
+            // Make sure we don't leak the pending entry if the write fails.
+            self.inbox.pending.lock().await.remove(&id);
+            return Err(format!("Write error: {}", e));
         }
 
-        let content_length = content_length.ok_or_else(|| {
-            format!("Extension '{}' response missing Content-Length header", self.id)
-        })?;
-        const MAX_RESPONSE_SIZE: usize = 4 * 1024 * 1024;
-        if content_length > MAX_RESPONSE_SIZE {
-            return Err(format!(
-                "Extension '{}' response too large: {} bytes (max {})",
-                self.id, content_length, MAX_RESPONSE_SIZE
-            ));
+        match rx.await {
+            Ok(payload) => payload,
+            Err(_) => {
+                // Sender was dropped without sending — typically because the
+                // reader task observed EOF/error after we registered. The
+                // reader normally sends an Err first; this branch is a
+                // belt-and-braces fallback.
+                self.inbox.pending.lock().await.remove(&id);
+                Err("transport closed: response channel dropped".to_string())
+            }
         }
-
-        let mut buf = vec![0u8; content_length];
-        tokio::io::AsyncReadExt::read_exact(&mut state.stdout, &mut buf)
-            .await
-            .map_err(|e| format!("Read body error: {}", e))?;
-
-        let response: JsonRpcResponse = serde_json::from_slice(&buf)
-            .map_err(|e| format!("Parse response error: {}", e))?;
-        if response.id != id {
-            return Err(format!(
-                "Extension '{}' response ID mismatch: expected {}, got {} (protocol desync)",
-                self.id, id, response.id
-            ));
-        }
-        if let Some(err) = response.error {
-            return Err(format!("Extension error: {}", err.message));
-        }
-        Ok(response.result.unwrap_or(Value::Null))
     }
 
     async fn call_no_restart(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -807,6 +989,7 @@ impl ProcessExtension {
                 &self.command,
                 &self.args,
                 self.cwd.as_ref(),
+                self.inbox.clone(),
             ).await?);
         }
         self.call_once_locked(
@@ -851,6 +1034,32 @@ impl ProcessExtension {
                 })
             }
         }
+    }
+
+    /// Subscribe to JSON-RPC notifications emitted by the extension.
+    ///
+    /// Returns an unbounded receiver that will yield every notification
+    /// frame (no `id`, has `method`) the extension sends until either:
+    /// - the receiver is dropped,
+    /// - the reader observes EOF or a transport error, or
+    /// - another caller calls `subscribe_notifications`, in which case the
+    ///   previous subscriber's sender is dropped (only one subscription is
+    ///   supported at a time).
+    ///
+    /// Internal API: exposed publicly with `#[doc(hidden)]` only so
+    /// integration tests can exercise the bidirectional transport.
+    #[doc(hidden)]
+    pub async fn subscribe_notifications(&self) -> mpsc::UnboundedReceiver<NotificationFrame> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sink = self.inbox.notification_sink.lock().await;
+        *sink = Some(tx);
+        rx
+    }
+
+    /// Drop the current notification subscription, if any.
+    #[doc(hidden)]
+    pub async fn unsubscribe_notifications(&self) {
+        self.inbox.notification_sink.lock().await.take();
     }
 }
 
@@ -935,9 +1144,16 @@ impl ExtensionHandler for ProcessExtension {
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let mut state_guard = self.state.lock().await;
-        if let Some(mut state) = state_guard.take() {
-            let _ = state.child.kill().await;
+        if let Some(state) = state_guard.take() {
+            state.reader_handle.abort();
+            let mut child = state.child;
+            let _ = child.kill().await;
         }
+        // Drop any active notification subscriber and signal pending callers.
+        self.inbox.notification_sink.lock().await.take();
+        self.inbox
+            .fail_all_pending("transport closed: extension shutdown")
+            .await;
     }
 
     async fn restart_count(&self) -> usize {
