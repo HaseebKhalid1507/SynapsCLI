@@ -2,7 +2,7 @@
 
 This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~45K LOC across 161 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~46K LOC across 189 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -15,6 +15,7 @@ cargo test --lib                         # most tests
 cargo test --lib -- --test-threads=1     # required for PTY tests in src/tools/shell/pty.rs
 cargo test --lib extensions::            # extension system tests
 cargo test --test extensions_e2e         # end-to-end with real extension process
+cargo test --lib test_helpers::          # testing utilities tests
 cargo clippy --all-targets               # linting
 ```
 
@@ -44,7 +45,15 @@ cargo clippy --all-targets               # linting
 src/
 ├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, config, models, etc.
 ├── main.rs               — unified CLI entry point, subcommand dispatch
-├── cmd_*.rs              — subcommand handlers (run, chat, server, client, agent, login, watcher)
+├── cmd/                  — subcommand handlers
+│   ├── run.rs            — one-shot prompt (was cli run)
+│   ├── chat.rs           — streaming chat (was chat binary)
+│   ├── server.rs         — WebSocket API (was server)
+│   ├── client.rs         — WS client (was client)
+│   ├── agent.rs          — headless worker (was synaps-agent)
+│   ├── watcher.rs        — supervisor (was watcher)
+│   ├── login.rs          — OAuth (was login)
+│   └── send.rs           — event bus injection
 ├── core/                 — shared primitives
 │   ├── config.rs         — SynapsConfig, load/write, profile resolution
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
@@ -58,24 +67,40 @@ src/
 ├── runtime/              — THE BRAIN
 │   ├── mod.rs            — Runtime struct, orchestration loop
 │   ├── api.rs            — Anthropic API body construction + SSE parsing
+│   ├── api_sync.rs       — synchronous API calls (split from api.rs)
+│   ├── request.rs        — request builder helpers (split from api.rs)
 │   ├── stream.rs         — tool dispatch from streamed tool_use events
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
 │   ├── types.rs          — StreamEvent enum (the wire between runtime and UIs)
 │   ├── auth.rs           — auth token refresh before request
+│   ├── subagent.rs       — reactive subagent management
 │   └── openai/           — OpenAI-compatible provider engine
 │       ├── mod.rs        — Provider enum, resolve_route(), try_route()
 │       ├── registry.rs   — 17 providers, 55+ models, env+config key resolution
+│       ├── catalog/      — per-provider model definitions (split from registry.rs)
+│       │   ├── groq.rs   — Groq models and config
+│       │   ├── nvidia.rs — NVIDIA NIM models
+│       │   ├── anthropic.rs — Anthropic-compatible models via OpenAI
+│       │   └── ...       — one file per provider
 │       ├── types.rs      — ChatMessage, ToolCall, ChatRequest, OaiEvent, ProviderConfig
 │       ├── wire.rs       — SSE parser + StreamDecoder (HashMap-based tool call accumulation)
 │       ├── translate.rs  — Anthropic↔OpenAI message/tool/event translation
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       └── ping.rs       — /ping health check (parallel, non-blocking)
-├── tools/                — 10 built-in tools, each impls the Tool trait
+├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
+│   ├── test_helpers.rs   — testing utilities (split from tests.rs)
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
-│   ├── subagent.rs       — spawns a child Runtime in an isolated thread
-│   ├── agent.rs          — (legacy — prefer subagent.rs)
+│   ├── subagent/         — reactive subagent tools (split into directory)
+│   │   ├── mod.rs        — main subagent tool (blocking)
+│   │   ├── start.rs      — subagent_start (reactive)
+│   │   ├── status.rs     — subagent_status
+│   │   ├── steer.rs      — subagent_steer
+│   │   ├── collect.rs    — subagent_collect
+│   │   ├── resume.rs     — subagent_resume
+│   │   └── oneshot.rs    — one-shot subagent helper
+│   ├── agent.rs          — (legacy — prefer subagent/)
 │   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
 │   ├── secret_prompt.rs  — secure sudo password prompt handling
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
@@ -83,6 +108,8 @@ src/
 ├── chatui/               — the TUI (module, entered via default `synaps` subcommand)
 │   ├── mod.rs            — event loop + apply_setting()
 │   ├── app.rs            — App state, record_cost(), line cache
+│   ├── helpers.rs        — helper functions (split from mod.rs)
+│   ├── lifecycle.rs      — session lifecycle management (split from mod.rs)
 │   ├── input.rs          — key handling, process_submit()
 │   ├── draw.rs           — render dispatch
 │   ├── render.rs         — message rendering
@@ -90,7 +117,11 @@ src/
 │   ├── highlight.rs      — syntect-backed syntax highlighting
 │   ├── stream_handler.rs — StreamEvent → UI mutation
 │   ├── commands.rs       — slash-command dispatch (ALL_COMMANDS, handle_command)
-│   ├── theme/            — 17 built-in palettes + user TOML loader
+│   ├── theme/            — built-in palettes + user TOML loader
+│   │   └── palettes/     — per-palette files (split from palettes.rs)
+│   │       ├── cyberpunk.rs — individual theme definitions
+│   │       ├── tokyo_night.rs
+│   │       └── ...       — one file per theme
 │   ├── settings/         — /settings modal (schema, input, draw)
 │   ├── plugins/          — /plugins modal
 │   └── gamba.rs          — easter egg. Don't touch.
@@ -105,17 +136,29 @@ src/
 │   └── tool.rs           — MCP tools wrapped as Tool impls
 ├── extensions/           — Extension system (hooks, permissions, JSON-RPC runtime)
 │   ├── mod.rs            — crate-level re-exports
-│   ├── hooks/mod.rs      — HookBus dispatcher
-│   ├── hooks/events.rs   — HookKind, HookEvent, HookResult types
+│   ├── hooks/            — hook system
+│   │   ├── mod.rs        — HookBus dispatcher
+│   │   └── events.rs     — HookKind, HookEvent, HookResult types
 │   ├── permissions.rs    — Permission flags and PermissionSet
 │   ├── manifest.rs       — ExtensionManifest from plugin.json
 │   ├── manager.rs        — ExtensionManager lifecycle
-│   └── runtime/process.rs — JSON-RPC over stdio ProcessExtension
+│   └── runtime/          — process-based extension runtime
+│       ├── mod.rs        — runtime abstractions
+│       └── process.rs    — JSON-RPC over stdio ProcessExtension
+├── events/               — event bus system
+│   ├── mod.rs            — module exports
+│   ├── types.rs          — event types and priority
+│   ├── queue.rs          — priority event queue
+│   ├── socket.rs         — Unix socket handling
+│   ├── ingest.rs         — event ingestion
+│   ├── registry.rs       — event registry
+│   └── format.rs         — event formatting
 └── skills/               — skill discovery + command registry
     ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
     ├── manifest.rs       — plugin.json / marketplace.json parsers
     ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
     ├── marketplace.rs    — plugin install from marketplace
+    ├── keybinds.rs       — plugin keybind system
     └── tool.rs           — load_skill Tool impl
 ```
 
@@ -451,6 +494,8 @@ Trigger modes:
 
 Limits (per-agent, in `config.toml`): `max_session_tokens`, `max_session_duration_mins`, `max_session_cost_usd`, `max_daily_cost_usd`, `max_tool_calls`, `cooldown_secs`, `max_retries`.
 
+Hooks (optional, in `config.toml`): `notify_inbox = true` pushes events to `~/.synaps-cli/inbox/` on agent completion for event bus integration.
+
 When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `src/tools/watcher_exit.rs` and `src/watcher/supervisor.rs`.
 
 IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, `stop`, `logs`.
@@ -592,10 +637,12 @@ subagent_start(agent, task, ...)   → {"handle_id": "sa_1", "status": "running"
 subagent_status(handle_id)         → {"status": "running", "partial_output": "..."}
 subagent_steer(handle_id, message) → {"acknowledged": true}
 subagent_collect(handle_id)        → {"status": "completed", "output": "full result"}
+subagent_resume(handle_id, instructions) → {"handle_id": "sa_2", "status": "running"}
 ```
 
 Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
+Use `subagent_resume` to restart completed/timed-out subagents with new instructions.
 
 ---
 
