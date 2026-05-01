@@ -147,6 +147,7 @@ mod tests {
                             source: "https://github.com/m/web.git".into(),
                             version: None,
                             description: None,
+                            index: None,
                         },
                     ],
                     repo_url: None,

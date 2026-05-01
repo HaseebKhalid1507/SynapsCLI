@@ -138,7 +138,8 @@ fn walk_root(
         {
             Some(m) => {
                 for entry in &m.plugins {
-                    let plugin_root = root.join(&entry.source);
+                    let Some(source) = entry.source.as_ref() else { continue; };
+                    let plugin_root = root.join(source);
                     load_plugin(&plugin_root, Some(&m.name), plugins, skills, seen);
                 }
                 Some(m.name)

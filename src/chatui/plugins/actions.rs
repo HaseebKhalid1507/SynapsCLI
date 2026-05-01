@@ -18,7 +18,7 @@ use synaps_cli::skills::{
     plugin_index::PluginIndexEntry,
     reload_registry,
     registry::CommandRegistry,
-    state::{InstalledPlugin, Marketplace, PluginsState},
+    state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState},
 };
 
 use super::state::{PluginsModalState, RightMode};
@@ -42,6 +42,24 @@ fn install_dir_for(name: &str) -> Result<PathBuf, String> {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn cached_index_metadata(entry: &PluginIndexEntry) -> CachedPluginIndexMetadata {
+    CachedPluginIndexMetadata {
+        repository: entry.repository.clone(),
+        subdir: entry.subdir.clone(),
+        checksum_algorithm: entry.checksum.algorithm.clone(),
+        checksum_value: entry.checksum.value.clone(),
+        compatibility_synaps: entry.compatibility.synaps.clone(),
+        compatibility_extension_protocol: entry.compatibility.extension_protocol.clone(),
+        has_extension: entry.capabilities.has_extension,
+        skills: entry.capabilities.skills.clone(),
+        permissions: entry.capabilities.permissions.clone(),
+        hooks: entry.capabilities.hooks.clone(),
+        commands: entry.capabilities.commands.clone(),
+        trust_publisher: entry.trust.as_ref().and_then(|t| t.publisher.clone()),
+        trust_homepage: entry.trust.as_ref().and_then(|t| t.homepage.clone()),
+    }
 }
 
 /// Resolve a cached plugin's `source` into the concrete info needed to
@@ -101,6 +119,7 @@ pub(crate) async fn apply_add_marketplace(state: &mut PluginsModalState, url: St
             source: p.source.clone(),
             version: p.version.clone(),
             description: p.description.clone(),
+            index: p.index.as_ref().map(cached_index_metadata),
         })
         .collect();
     let new_m = Marketplace {
@@ -607,6 +626,7 @@ pub(crate) async fn apply_refresh_marketplace(state: &mut PluginsModalState, nam
                 source: p.source.clone(),
                 version: p.version.clone(),
                 description: p.description.clone(),
+                index: p.index.as_ref().map(cached_index_metadata),
             })
             .collect();
         m.last_refreshed = Some(now_rfc3339());
@@ -870,6 +890,7 @@ mod tests {
                     source: source_url,
                     version: None,
                     description: Some("fixture".into()),
+                    index: None,
                 }],
                 repo_url: None,
             }],
@@ -927,6 +948,7 @@ mod tests {
                     source: source.clone(),
                     version: Some("0.1.0".into()),
                     description: Some("fixture".into()),
+                    index: None,
                 }],
                 repo_url: None,
             }],

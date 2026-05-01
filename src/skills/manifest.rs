@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use super::keybinds::ManifestKeybind;
+use super::plugin_index::PluginIndexEntry;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PluginCompatibility {
@@ -93,7 +94,8 @@ pub struct MarketplaceTrust {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplacePluginEntry {
     pub name: String,
-    pub source: String,
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -104,6 +106,8 @@ pub struct MarketplacePluginEntry {
     pub keywords: Vec<String>,
     #[serde(default)]
     pub license: Option<String>,
+    #[serde(default)]
+    pub index: Option<PluginIndexEntry>,
 }
 
 #[cfg(test)]
@@ -253,7 +257,7 @@ mod tests {
         assert_eq!(m.trust.as_ref().unwrap().publisher.as_deref(), Some("Maha Media"));
         assert_eq!(m.plugins.len(), 2);
         assert_eq!(m.plugins[0].name, "web-tools");
-        assert_eq!(m.plugins[0].source, "./web-tools-plugin");
+        assert_eq!(m.plugins[0].source.as_deref(), Some("./web-tools-plugin"));
         assert_eq!(m.plugins[0].category.as_deref(), Some("research"));
         assert_eq!(m.plugins[0].keywords, vec!["web"]);
     }
@@ -266,9 +270,9 @@ mod tests {
     }
 
     #[test]
-    fn marketplace_entry_missing_source_fails() {
+    fn marketplace_entry_missing_source_is_allowed_for_index_backed_entries() {
         let json = r#"{"name":"p","plugins":[{"name":"x"}]}"#;
-        let result: Result<MarketplaceManifest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
+        let m: MarketplaceManifest = serde_json::from_str(json).unwrap();
+        assert!(m.plugins[0].source.is_none());
     }
 }

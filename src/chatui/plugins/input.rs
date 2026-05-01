@@ -452,6 +452,7 @@ mod tests {
                     source: "https://github.com/x/web.git".into(),
                     version: None,
                     description: None,
+                    index: None,
                 },
             ],
             repo_url: None,
