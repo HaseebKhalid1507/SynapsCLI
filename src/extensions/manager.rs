@@ -142,7 +142,7 @@ impl ExtensionManager {
 
         // Spawn the extension process only after the manifest is known-good.
         let process = ProcessExtension::spawn_with_cwd(id, &manifest.command, &manifest.args, cwd.clone()).await?;
-        let capabilities = match process.initialize(cwd.clone(), config).await {
+        let capabilities = match process.initialize(cwd.clone(), config.clone()).await {
             Ok(capabilities) => capabilities,
             Err(error) => {
                 process.shutdown().await;
@@ -151,15 +151,16 @@ impl ExtensionManager {
         };
         let registered_tools = capabilities.tools;
         let registered_providers = capabilities.providers;
+        let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
         if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
-            process.shutdown().await;
+            handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered tools but lacks permission 'tools.register'",
                 id
             ));
         }
         if !registered_providers.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ProvidersRegister) {
-            process.shutdown().await;
+            handler.shutdown().await;
             return Err(format!(
                 "Extension '{}' registered providers but lacks permission 'providers.register'",
                 id
@@ -168,19 +169,22 @@ impl ExtensionManager {
         if !registered_providers.is_empty() {
             let mut registered_ids = Vec::new();
             for provider in registered_providers {
-                match self.providers.register(id, provider) {
+                if let Err(error) = Self::validate_provider_config_requirements(id, &provider, &config) {
+                    self.providers.unregister_plugin(id);
+                    handler.shutdown().await;
+                    return Err(error);
+                }
+                match self.providers.register_with_handler(id, provider, Some(handler.clone())) {
                     Ok(runtime_id) => registered_ids.push(runtime_id),
                     Err(error) => {
                         self.providers.unregister_plugin(id);
-                        process.shutdown().await;
+                        handler.shutdown().await;
                         return Err(error);
                     }
                 }
             }
             tracing::info!(extension = %id, providers = ?registered_ids, "Extension provider metadata registered");
         }
-        let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
-
         if !registered_tools.is_empty() {
             let Some(tools) = &self.tools else {
                 handler.shutdown().await;
@@ -204,6 +208,39 @@ impl ExtensionManager {
 
         self.extensions.insert(id.to_string(), handler);
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
+        Ok(())
+    }
+
+    fn validate_provider_config_requirements(
+        id: &str,
+        provider: &crate::extensions::runtime::process::RegisteredProviderSpec,
+        config: &Value,
+    ) -> Result<(), String> {
+        let Some(required) = provider
+            .config_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array) else {
+            return Ok(());
+        };
+        for key in required {
+            let Some(key) = key.as_str() else {
+                return Err(format!(
+                    "Extension '{}' provider '{}' config_schema.required must contain only strings",
+                    id, provider.id,
+                ));
+            };
+            let present = config
+                .as_object()
+                .map(|map| map.contains_key(key))
+                .unwrap_or(false);
+            if !present {
+                return Err(format!(
+                    "Extension '{}' provider '{}' missing required provider config '{}'",
+                    id, provider.id, key,
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -322,6 +359,11 @@ impl ExtensionManager {
     /// Return registered provider metadata sorted by runtime id.
     pub fn providers(&self) -> Vec<&RegisteredProvider> {
         self.providers.list()
+    }
+
+    /// Return registered provider metadata by runtime id.
+    pub fn provider(&self, runtime_id: &str) -> Option<&RegisteredProvider> {
+        self.providers.get(runtime_id)
     }
 
     /// Get the shared hook bus.

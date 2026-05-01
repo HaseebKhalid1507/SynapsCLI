@@ -5,6 +5,7 @@ pub mod process;
 use async_trait::async_trait;
 use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
+use self::process::{ProviderCompleteParams, ProviderCompleteResult};
 
 /// Health state for an extension handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub trait ExtensionHandler: Send + Sync {
     /// Call an extension-provided tool.
     async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
         Err("extension runtime does not support tool.call".to_string())
+    }
+
+    /// Complete a chat request through an extension-provided model provider.
+    async fn provider_complete(&self, _params: ProviderCompleteParams) -> Result<ProviderCompleteResult, String> {
+        Err("extension runtime does not support provider.complete".to_string())
     }
 
     /// Gracefully shut down the extension.

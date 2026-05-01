@@ -526,6 +526,63 @@ async fn extension_missing_required_config_fails_before_spawn() {
     assert!(!error.contains("spawn"), "config validation should happen before spawn: {error}");
 }
 
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_provider_complete_routes_to_process() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    fs::write(home.path().join("config"), "extension.provider-test.prefix = echo\n").unwrap();
+
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/provider_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(hook_bus)));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["providers.register".to_string()],
+        hooks: vec![],
+        config: vec![ExtensionConfigEntry {
+            key: "prefix".to_string(),
+            description: None,
+            required: true,
+            default: None,
+            secret_env: None,
+        }],
+    };
+    manager.write().await.load_with_cwd("provider-test", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let tools = std::sync::Arc::new(Vec::new());
+    let result = synaps_cli::runtime::openai::try_route(
+        "provider-test:echo:echo-small",
+        &reqwest::Client::new(),
+        &tools,
+        &None,
+        &[serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]})],
+        &tx,
+        None,
+        None,
+        0,
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.expect("extension route").unwrap();
+
+    assert_eq!(result["content"][0]["text"], "echo:hello");
+    match rx.recv().await.unwrap() {
+        synaps_cli::runtime::StreamEvent::Llm(synaps_cli::runtime::LlmEvent::Text(text)) => assert_eq!(text, "echo:hello"),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    manager.write().await.shutdown_all().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();

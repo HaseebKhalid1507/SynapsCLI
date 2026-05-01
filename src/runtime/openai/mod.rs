@@ -15,11 +15,26 @@ pub mod translate;
 pub mod stream;
 pub mod ping;
 
+use std::sync::{Arc, OnceLock};
+
+use crate::extensions::manager::ExtensionManager;
+use crate::extensions::providers::ProviderRegistry;
+
 pub use types::{
     ChatMessage, ChatOptions, ChatRequest, FunctionCall, FunctionDefinition,
     OaiEvent, ProviderConfig, StreamOptions, ToolCall, ToolChoice, ToolDefinition,
 };
 pub use wire::StreamDecoder;
+
+static EXTENSION_MANAGER: OnceLock<Arc<tokio::sync::RwLock<ExtensionManager>>> = OnceLock::new();
+
+pub fn set_extension_manager_for_routing(manager: Arc<tokio::sync::RwLock<ExtensionManager>>) {
+    let _ = EXTENSION_MANAGER.set(manager);
+}
+
+pub fn extension_manager_for_routing() -> Option<Arc<tokio::sync::RwLock<ExtensionManager>>> {
+    EXTENSION_MANAGER.get().cloned()
+}
 
 /// Routing decision for a given model id.
 #[derive(Debug, Clone)]
@@ -78,6 +93,54 @@ pub async fn try_route(
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
+        if let Some(manager) = extension_manager_for_routing() {
+            let manager = manager.read().await;
+            let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
+            if let Some(provider) = manager.provider(&provider_runtime_id) {
+                if let Some(handler) = &provider.handler {
+                    if cancel.is_cancelled() {
+                        return Some(Err("operation canceled".into()));
+                    }
+                    let params = crate::extensions::runtime::process::ProviderCompleteParams {
+                        provider_id: provider_id.to_string(),
+                        model_id: model_id.to_string(),
+                        model: model.to_string(),
+                        messages: messages.to_vec(),
+                        system_prompt: system_prompt.clone(),
+                        tools: tools_schema.as_ref().clone(),
+                        temperature,
+                        max_tokens,
+                        thinking_budget,
+                    };
+                    let result = handler.provider_complete(params).await;
+                    if cancel.is_cancelled() {
+                        return Some(Err("operation canceled".into()));
+                    }
+                    return Some(result.map(|complete| {
+                        let text = complete
+                            .content
+                            .iter()
+                            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() {
+                            let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
+                                crate::runtime::types::LlmEvent::Text(text)
+                            ));
+                        }
+                        serde_json::json!({
+                            "content": complete.content,
+                            "stop_reason": complete.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                            "usage": complete.usage.unwrap_or_else(|| serde_json::json!({}))
+                        })
+                    }).map_err(|e| format!("extension provider: {e}").into()));
+                }
+            }
+        }
+        return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
+    }
+
     let provider_keys = crate::core::config::get_provider_keys();
     match resolve_route(model, &provider_keys) {
         Provider::OpenAi(cfg) => {

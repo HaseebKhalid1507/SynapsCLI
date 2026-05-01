@@ -454,12 +454,14 @@ pub async fn run(
 
     // ═══ Extension Discovery ═══
     // Scan ~/.synaps-cli/plugins/ for extensions and load them
-    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new_with_tools(
+    let ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new_with_tools(
         std::sync::Arc::clone(runtime.hook_bus()),
         runtime.tools_shared(),
     );
+    let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
     if !no_extensions {
-        let (loaded, failed) = ext_mgr.discover_and_load().await;
+        let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
         tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
         // Extensions load silently — only surface failures
@@ -1008,7 +1010,7 @@ pub async fn run(
                                         }
                                     }
                                     CommandAction::ExtensionsStatus => {
-                                        let statuses = ext_mgr.statuses().await;
+                                        let statuses = ext_mgr_shared.read().await.statuses().await;
                                         if statuses.is_empty() {
                                             app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
                                         } else {
@@ -1522,7 +1524,7 @@ let display_text = app.user_display_text_for_submission(&input);
     }
 
     // Gracefully shut down all extensions
-    ext_mgr.shutdown_all().await;
+    ext_mgr_shared.write().await.shutdown_all().await;
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -1,16 +1,18 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::extensions::runtime::process::RegisteredProviderSpec;
+use crate::extensions::runtime::ExtensionHandler;
 
-#[derive(Debug, Clone, PartialEq)]
 pub struct RegisteredProvider {
     pub plugin_id: String,
     pub provider_id: String,
     pub runtime_id: String,
     pub spec: RegisteredProviderSpec,
+    pub handler: Option<Arc<dyn ExtensionHandler>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, RegisteredProvider>,
 }
@@ -25,6 +27,15 @@ impl ProviderRegistry {
         plugin_id: &str,
         spec: RegisteredProviderSpec,
     ) -> Result<String, String> {
+        self.register_with_handler(plugin_id, spec, None)
+    }
+
+    pub fn register_with_handler(
+        &mut self,
+        plugin_id: &str,
+        spec: RegisteredProviderSpec,
+        handler: Option<Arc<dyn ExtensionHandler>>,
+    ) -> Result<String, String> {
         let runtime_id = format!("{}:{}", plugin_id, spec.id);
         if self.providers.contains_key(&runtime_id) {
             return Err(format!("provider '{}' is already registered", runtime_id));
@@ -34,6 +45,7 @@ impl ProviderRegistry {
             provider_id: spec.id.clone(),
             runtime_id: runtime_id.clone(),
             spec,
+            handler,
         });
         Ok(runtime_id)
     }
@@ -58,6 +70,21 @@ impl ProviderRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
+    }
+
+    pub fn parse_model_id(model: &str) -> Option<(&str, &str, &str)> {
+        let mut parts = model.split(':');
+        let plugin_id = parts.next()?;
+        let provider_id = parts.next()?;
+        let model_id = parts.next()?;
+        if parts.next().is_some() || plugin_id.is_empty() || provider_id.is_empty() || model_id.is_empty() {
+            return None;
+        }
+        Some((plugin_id, provider_id, model_id))
+    }
+
+    pub fn model_runtime_id(plugin_id: &str, provider_id: &str, model_id: &str) -> String {
+        format!("{}:{}:{}", plugin_id, provider_id, model_id)
     }
 }
 
@@ -103,5 +130,16 @@ mod tests {
 
         assert!(registry.get("one:local").is_none());
         assert!(registry.get("two:local").is_some());
+    }
+
+    #[test]
+    fn model_ids_use_three_part_namespace() {
+        assert_eq!(
+            ProviderRegistry::parse_model_id("plugin:local:model-a"),
+            Some(("plugin", "local", "model-a"))
+        );
+        assert_eq!(ProviderRegistry::model_runtime_id("plugin", "local", "model-a"), "plugin:local:model-a");
+        assert!(ProviderRegistry::parse_model_id("plugin:local").is_none());
+        assert!(ProviderRegistry::parse_model_id("plugin:local:model:extra").is_none());
     }
 }

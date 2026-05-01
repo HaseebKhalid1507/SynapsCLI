@@ -85,6 +85,28 @@ pub struct RegisteredProviderModelSpec {
     pub context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderCompleteParams {
+    pub provider_id: String,
+    pub model_id: String,
+    pub model: String,
+    pub messages: Vec<Value>,
+    pub system_prompt: Option<String>,
+    pub tools: Vec<Value>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub thinking_budget: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ProviderCompleteResult {
+    pub content: Vec<Value>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Value>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
@@ -310,6 +332,12 @@ impl ProcessExtension {
                         id, provider_id,
                     ));
                 }
+                if model_id.contains(':') {
+                    return Err(format!(
+                        "Extension '{}' registered provider '{}' with invalid model id '{}': ':' is reserved",
+                        id, provider_id, model_id,
+                    ));
+                }
                 if !model_ids.insert(model_id.to_string()) {
                     return Err(format!(
                         "Extension '{}' registered provider '{}' with duplicate model id '{}'",
@@ -331,6 +359,7 @@ impl ProcessExtension {
 
     fn is_safe_provider_id(id: &str) -> bool {
         !id.is_empty()
+            && !id.contains(':')
             && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     }
 
@@ -549,6 +578,21 @@ impl ExtensionHandler for ProcessExtension {
             "name": name,
             "input": input,
         })).await
+    }
+
+    async fn provider_complete(&self, params: ProviderCompleteParams) -> Result<ProviderCompleteResult, String> {
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.call("provider.complete", serde_json::to_value(params).map_err(|e| e.to_string())?),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' provider.complete timed out", self.id))??;
+        let result: ProviderCompleteResult = serde_json::from_value(value)
+            .map_err(|e| format!("Invalid provider.complete response from extension '{}': {}", self.id, e))?;
+        if result.content.is_empty() {
+            return Err(format!("Extension '{}' provider.complete returned empty content", self.id));
+        }
+        Ok(result)
     }
 
     async fn handle(&self, event: &HookEvent) -> HookResult {
