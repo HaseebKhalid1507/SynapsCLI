@@ -8,7 +8,8 @@ Convergence: none (per prior decision).
 3. H3 spec: provider registration design before code.
 4. E2/E3/F3: config, trust inspection, marketplace metadata.
 5. Phase I: memory/session intelligence foundations.
-6. Later platform groundwork: richer marketplace, config UI/CLI, examples/templates, provider implementation after H3.
+6. Phase J: marketplace/distribution foundations.
+7. Later platform groundwork: richer marketplace, config UI/CLI, examples/templates, provider implementation after H3.
 
 ### Immediate vertical slices
 
@@ -71,3 +72,24 @@ Acceptance:
 Verification: docs/tests appropriate to chosen slice. Scope M.
 
 Checkpoint after H1.5/H1.6: run Rust extension tests and plugin-builder smoke before proceeding.
+
+
+#### Phase I checkpoint: completed
+Verification run:
+- `cargo test --test contracts_sync`
+- `cargo test --test extensions_contract`
+- `cargo test --lib extensions`
+- `cargo test --test extensions_e2e`
+- `cargo test --test extensions_process`
+- `cargo test --bin synaps chatui::commands::tests::plugin`
+- `cargo test --bin synaps chatui::plugins`
+- `bash plugin-builder-plugin/scripts/test.sh`
+
+Results: all listed tests passed in the Phase I checkpoint run.
+
+#### Phase J: Marketplace and distribution foundations
+Acceptance:
+- Plugin index schema spec exists at `docs/specs/plugin-index.md`.
+- Checksums/signing design spec exists at `docs/specs/plugin-signing.md`.
+- `plugin package --dry-run PATH` validates plugin metadata and prints files, permissions, hooks, config keys, skills, and commands without creating an archive.
+Verification: `bash plugin-builder-plugin/scripts/test.sh`; spec files present. Scope M.
