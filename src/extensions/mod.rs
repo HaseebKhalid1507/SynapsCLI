@@ -19,4 +19,5 @@ pub mod permissions;
 pub mod manifest;
 pub mod runtime;
 pub mod manager;
+pub mod config;
 pub mod providers;
