@@ -15,7 +15,23 @@ use tachyonfx::{fx, Effect, Interpolation, Shader};
 pub(crate) fn voice_pill_span(app: &super::app::App) -> Option<Span<'static>> {
     let voice = app.voice.as_ref()?;
     let (text, color) = match &voice.status {
-        super::voice::VoiceUiStatus::Idle => (" \u{25cb} voice ", THEME.load().muted),
+        super::voice::VoiceUiStatus::Idle => {
+            // Show armed-but-quiet (between VAD utterances) as listening
+            // — to the user the mic is still hot.
+            if voice.armed {
+                let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let base = match THEME.load().status_streaming {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (220, 80, 80),
+                };
+                let r = (base.0 as f64 * pulse) as u8;
+                let g = (base.1 as f64 * pulse) as u8;
+                let b = (base.2 as f64 * pulse) as u8;
+                (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+            } else {
+                (" \u{25cb} voice ", THEME.load().muted)
+            }
+        }
         super::voice::VoiceUiStatus::Listening => {
             // Pulse like the streaming indicator so the user sees we're live.
             let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);

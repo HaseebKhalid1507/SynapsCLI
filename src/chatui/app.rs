@@ -131,6 +131,8 @@ pub(crate) struct App {
     /// Holds the sidecar manager + UI status; the event loop drains its
     /// event stream and updates `status` accordingly.
     pub(crate) voice: Option<super::voice::VoiceUiState>,
+    /// Live keybind registry — held so /settings can hot-swap voice toggle.
+    pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -207,6 +209,7 @@ impl App {
             visible_line_range: None,
             suppress_paste_until: None,
             voice: None,
+            keybinds: None,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.

@@ -381,6 +381,10 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
     match key {
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
+        "voice_toggle_key" => synaps_cli::config::read_config_value("voice_toggle_key")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "F8".to_string()),
         _ => String::new(),
     }
 }

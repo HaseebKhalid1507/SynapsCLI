@@ -333,6 +333,18 @@ fn handle_key(
 
     // Plugin/user keybinds — check before core binds, but only when not streaming
     if !streaming {
+        // Trace modifier-heavy or special keys to help debug "key X not
+        // working" issues across terminals. Plain typing isn't logged.
+        let traceable = matches!(code, KeyCode::F(_))
+            || modifiers.contains(KeyModifiers::CONTROL)
+            || modifiers.contains(KeyModifiers::ALT);
+        if traceable {
+            tracing::info!(
+                ?code,
+                ?modifiers,
+                "key event received in chatui input"
+            );
+        }
         if let Some(bind) = keybinds.match_key(code, modifiers) {
             use synaps_cli::skills::keybinds::KeybindAction;
             return match &bind.action {

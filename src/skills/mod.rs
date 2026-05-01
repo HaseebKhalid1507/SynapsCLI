@@ -67,7 +67,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
-) -> (Arc<CommandRegistry>, Arc<keybinds::KeybindRegistry>) {
+) -> (Arc<CommandRegistry>, Arc<std::sync::RwLock<keybinds::KeybindRegistry>>) {
     let (plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
 
@@ -97,22 +97,23 @@ pub async fn register(
         kb_registry.register_user(&config.keybinds);
     }
 
-    // Synthesize a user keybind for the configured voice toggle key,
-    // so the /voice toggle command also fires on the user-selected
-    // chord (the plugin's F8 default keeps working alongside it).
-    if let Some(toggle_key) = crate::config::read_config_value("voice_toggle_key") {
-        let trimmed = toggle_key.trim();
-        if !trimmed.is_empty() {
-            let mut overrides = std::collections::HashMap::new();
-            overrides.insert(trimmed.to_string(), "/voice toggle".to_string());
-            kb_registry.register_user(&overrides);
-        }
-    }
+    // Synthesize the voice toggle keybind. The selected key in
+    // `voice_toggle_key` is the *only* active voice toggle binding —
+    // there's no plugin-level F8 anymore, so picking a value in
+    // /settings → Voice fully replaces the previous chord. Defaults to
+    // F8 when no value has been chosen.
+    let voice_key = crate::config::read_config_value("voice_toggle_key")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "F8".to_string());
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(voice_key, "/voice toggle".to_string());
+    kb_registry.register_user(&overrides);
 
     let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
-    (registry, Arc::new(kb_registry))
+    (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
 }
 
 /// Re-walks discovery roots and swaps in the new skill set atomically.

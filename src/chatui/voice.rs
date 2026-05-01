@@ -30,6 +30,12 @@ pub(crate) struct VoiceUiState {
     pub manager: VoiceManager,
     pub status: VoiceUiStatus,
     pub sidecar: DiscoveredVoiceSidecar,
+    /// `true` once the user has issued `press()`. The sidecar is logically
+    /// "armed" until the user toggles off — even when the VAD has just
+    /// flushed an utterance and momentarily quiesced. Without this we'd
+    /// flap back to `Idle` after every utterance and the next toggle would
+    /// (incorrectly) issue another press.
+    pub armed: bool,
 }
 
 impl VoiceUiState {
@@ -55,9 +61,32 @@ impl VoiceUiState {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // Build sidecar args: prefer `voice_stt_model_path` from config, else
+        // fall back to the manifest's `provides.voice_sidecar.model.default_path`.
+        // Tilde-expand and verify the file exists before passing it.
+        let mut args: Vec<String> = Vec::new();
+        let model_override = synaps_cli::config::read_config_value("voice_stt_model_path")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let model_default = sidecar
+            .model
+            .as_ref()
+            .and_then(|m| m.default_path.clone());
+        let resolved_model = model_override.or(model_default).map(expand_tilde);
+        if let Some(path) = resolved_model {
+            if std::path::Path::new(&path).is_file() {
+                args.push("--model-path".to_string());
+                args.push(path);
+            }
+        }
+        if let Some(lang) = language.as_deref() {
+            args.push("--language".to_string());
+            args.push(lang.to_string());
+        }
+
         let manager = VoiceManager::spawn(
             &sidecar.binary,
-            &[],
+            &args,
             SidecarConfig {
                 mode: VoiceSidecarMode::Dictation,
                 language,
@@ -71,6 +100,7 @@ impl VoiceUiState {
             manager,
             status: VoiceUiStatus::Idle,
             sidecar,
+            armed: false,
         })
     }
 
@@ -108,7 +138,12 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             SidecarProviderState::Listening => v.status = VoiceUiStatus::Listening,
             SidecarProviderState::Transcribing => v.status = VoiceUiStatus::Transcribing,
             SidecarProviderState::Ready | SidecarProviderState::Stopped => {
-                v.status = VoiceUiStatus::Idle
+                // Only fall back to Idle when the user has actually
+                // released. Otherwise the VAD is just between utterances
+                // and the sidecar is still armed.
+                if !v.armed {
+                    v.status = VoiceUiStatus::Idle;
+                }
             }
             SidecarProviderState::Error => {
                 v.status = VoiceUiStatus::Error("sidecar reported error state".into())
@@ -119,7 +154,12 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             v.status = VoiceUiStatus::Listening;
         }
         VoiceManagerEvent::ListeningStopped => {
-            v.status = VoiceUiStatus::Idle;
+            // The whisper provider emits ListeningStopped between VAD
+            // utterances *and* on real shutdown. Only clear status if the
+            // user has unarmed (toggled off).
+            if !v.armed {
+                v.status = VoiceUiStatus::Idle;
+            }
         }
         VoiceManagerEvent::TranscribingStarted => {
             v.status = VoiceUiStatus::Transcribing;
@@ -128,8 +168,17 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             // Reserved for V5+ — drop for now.
         }
         VoiceManagerEvent::FinalTranscript(text) => {
-            v.status = VoiceUiStatus::Idle;
+            // Insert text but do NOT reset status: the VAD will keep
+            // emitting more utterances until the user toggles off.
+            let armed = v.armed;
             insert_transcript_into_input(app, &text);
+            if !armed {
+                // Re-borrow because insert_transcript_into_input took
+                // a mutable borrow of `app`.
+                if let Some(v) = app.voice.as_mut() {
+                    v.status = VoiceUiStatus::Idle;
+                }
+            }
         }
         VoiceManagerEvent::Error(message) => {
             v.status = VoiceUiStatus::Error(message.clone());
@@ -234,4 +283,15 @@ mod tests {
         insert_transcript_into_input(&mut app, "beautiful");
         assert_eq!(app.input, "hello beautiful world");
     }
+}
+
+fn expand_tilde(path: String) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut full = std::path::PathBuf::from(home);
+            full.push(rest);
+            return full.to_string_lossy().into_owned();
+        }
+    }
+    path
 }

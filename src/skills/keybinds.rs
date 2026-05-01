@@ -47,6 +47,7 @@ pub struct Keybind {
 }
 
 /// Registry of all keybinds with conflict resolution.
+#[derive(Debug, Clone)]
 pub struct KeybindRegistry {
     binds: Vec<Keybind>,
     reserved: HashSet<KeyCombo>,
@@ -188,6 +189,34 @@ impl KeybindRegistry {
                 source: KeybindSource::User,
             });
         }
+    }
+
+    /// Live-replace the keybind that fires `slash_command`.
+    ///
+    /// Removes every existing user/plugin bind whose action is the same
+    /// slash command, then registers `new_key → /slash_command` as a User
+    /// bind. Used by /settings to hot-swap the voice toggle key without
+    /// requiring a restart.
+    pub fn set_slash_command_key(&mut self, slash_command: &str, new_key: &str) -> Result<(), String> {
+        let combo = parse_key(new_key)?;
+        if self.reserved.contains(&combo) {
+            return Err(format!("'{}' is reserved by core — cannot rebind", new_key));
+        }
+        // Drop any existing bind for this exact command (any source ≠ Core).
+        self.binds.retain(|b| {
+            if b.source == KeybindSource::Core { return true; }
+            !matches!(&b.action, KeybindAction::SlashCommand(c) if c == slash_command)
+        });
+        // Drop any existing non-core bind sitting on the new key (avoid
+        // collision with another plugin bind).
+        self.binds.retain(|b| b.key != combo || b.source == KeybindSource::Core);
+        self.binds.push(Keybind {
+            key: combo,
+            action: KeybindAction::SlashCommand(slash_command.to_string()),
+            description: format!("User: /{}", slash_command),
+            source: KeybindSource::User,
+        });
+        Ok(())
     }
 
     /// Match a key event against registered keybinds.
@@ -571,5 +600,33 @@ mod tests {
         let reg = KeybindRegistry::new();
         let custom = reg.custom_binds();
         assert!(custom.is_empty()); // No plugins registered = no custom binds
+    }
+
+    #[test]
+    fn set_slash_command_key_replaces_existing_voice_toggle() {
+        let mut reg = KeybindRegistry::new();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("F8".to_string(), "/voice toggle".to_string());
+        reg.register_user(&overrides);
+        let f8 = parse_key("F8").unwrap();
+        assert!(reg.match_key(f8.code, f8.modifiers).is_some());
+
+        // Move voice toggle from F8 → C-G
+        reg.set_slash_command_key("voice toggle", "C-G").unwrap();
+
+        // F8 no longer fires
+        assert!(reg.match_key(f8.code, f8.modifiers).is_none());
+        // C-G now does
+        let cg = parse_key("C-G").unwrap();
+        let bind = reg.match_key(cg.code, cg.modifiers).expect("C-G bind missing");
+        assert!(matches!(&bind.action, KeybindAction::SlashCommand(c) if c == "voice toggle"));
+    }
+
+    #[test]
+    fn set_slash_command_key_rejects_core_chord() {
+        let mut reg = KeybindRegistry::new();
+        // Esc is reserved core
+        let err = reg.set_slash_command_key("voice toggle", "Esc").unwrap_err();
+        assert!(err.contains("reserved"), "expected reserved error, got: {err}");
     }
 }

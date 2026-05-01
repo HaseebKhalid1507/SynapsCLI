@@ -124,9 +124,20 @@ define_settings! {
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
 
     voice_toggle_key, "Voice toggle key", Voice,
-        EditorKind::Cycler(&["F8", "C-V", "C-S-V", "C-A-V"]),
-        "Keybind that toggles voice dictation. Takes effect on next launch.",
-        |_runtime, _app, _value| { /* picked up by KeybindRegistry at boot */ };
+        EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
+        "Keybind that toggles voice dictation. Takes effect immediately.",
+        |_runtime, app, value| {
+            if let Some(kb) = app.keybinds.as_ref() {
+                match kb.write() {
+                    Ok(mut g) => {
+                        if let Err(e) = g.set_slash_command_key("voice toggle", value) {
+                            tracing::warn!("voice_toggle_key apply failed: {}", e);
+                        }
+                    }
+                    Err(_) => tracing::warn!("voice_toggle_key apply: registry poisoned"),
+                }
+            }
+        };
 
     voice_language, "Voice language hint", Voice,
         EditorKind::Text { numeric: false },

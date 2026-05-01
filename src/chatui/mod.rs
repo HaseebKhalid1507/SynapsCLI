@@ -110,6 +110,7 @@ pub async fn run(
             App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
         }
     };
+    app.keybinds = Some(keybind_registry.clone());
 
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
@@ -454,7 +455,9 @@ pub async fn run(
                             continue;
                         }
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
+                        let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
+                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
+                        drop(kb_guard);
                         match action {
                             InputAction::None => {}
                             InputAction::Quit => {
@@ -496,7 +499,11 @@ pub async fn run(
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &keybind_registry).await {
+                                let kb_snapshot = {
+                                    let g = keybind_registry.read().expect("keybind registry poisoned");
+                                    g.clone()
+                                };
+                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &kb_snapshot).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
@@ -1114,7 +1121,9 @@ pub async fn run(
                                                         "🎤 voice sidecar online — press the toggle again to stop and transcribe".to_string()
                                                     ));
                                                     if let Some(v) = app.voice.as_mut() {
+                                                        v.armed = true;
                                                         if let Err(err) = v.manager.press().await {
+                                                            v.armed = false;
                                                             v.status = self::voice::VoiceUiStatus::Error(err.to_string());
                                                             app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
                                                         }
@@ -1125,24 +1134,23 @@ pub async fn run(
                                                 }
                                             }
                                         } else {
-                                            // Subsequent toggle: flip between listening/idle.
+                                            // Subsequent toggle: arm flag is the source of truth.
+                                            // (status flaps between Listening/Idle as the VAD
+                                            // delivers utterances, so we can't key off it.)
                                             let v = app.voice.as_mut().unwrap();
-                                            match v.status {
-                                                self::voice::VoiceUiStatus::Listening => {
-                                                    if let Err(err) = v.manager.release().await {
-                                                        app.push_msg(ChatMessage::Error(format!("voice release failed: {err}")));
-                                                    }
+                                            if v.armed {
+                                                v.armed = false;
+                                                if let Err(err) = v.manager.release().await {
+                                                    app.push_msg(ChatMessage::Error(format!("voice release failed: {err}")));
                                                 }
-                                                self::voice::VoiceUiStatus::Idle
-                                                | self::voice::VoiceUiStatus::Error(_) => {
-                                                    if let Err(err) = v.manager.press().await {
-                                                        app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
-                                                    }
-                                                }
-                                                self::voice::VoiceUiStatus::Transcribing => {
-                                                    app.push_msg(ChatMessage::System(
-                                                        "voice: still transcribing — wait for final transcript before toggling again".to_string()
-                                                    ));
+                                                app.push_msg(ChatMessage::System(
+                                                    "voice: stopping — final transcript will be appended".to_string()
+                                                ));
+                                            } else {
+                                                v.armed = true;
+                                                if let Err(err) = v.manager.press().await {
+                                                    v.armed = false;
+                                                    app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
                                                 }
                                             }
                                         }
