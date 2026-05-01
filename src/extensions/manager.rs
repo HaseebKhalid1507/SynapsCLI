@@ -164,8 +164,27 @@ impl ExtensionManager {
                 // Resolve via PATH, don't join with plugin directory
                 ext_manifest.command.clone()
             } else {
-                plugin_dir.join(&ext_manifest.command)
-                    .to_string_lossy().to_string()
+                // Relative path — resolve and confine to plugin directory
+                let resolved = plugin_dir.join(&ext_manifest.command);
+                match resolved.canonicalize() {
+                    Ok(canonical) if canonical.starts_with(&plugin_dir) => {
+                        canonical.to_string_lossy().to_string()
+                    }
+                    Ok(canonical) => {
+                        tracing::warn!(
+                            "Extension '{}' command escapes plugin directory: {} → {}",
+                            plugin_name, ext_manifest.command, canonical.display()
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Extension '{}' command not found: {}",
+                            plugin_name, ext_manifest.command
+                        );
+                        continue;
+                    }
+                }
             };
 
             // Resolve args relative to plugin directory
