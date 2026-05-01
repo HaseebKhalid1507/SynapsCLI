@@ -75,8 +75,10 @@ struct JsonRpcError {
 /// [`HookResult::Continue`] so a misbehaving extension never blocks the agent.
 pub struct ProcessExtension {
     id: String,
-    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<tokio::process::ChildStdout>>>,
+    /// Single lock for the entire call cycle (write request + read response).
+    /// Prevents concurrent calls from interleaving on the stdio pipe,
+    /// which would cause response ID mismatches and silent fail-open.
+    io: Arc<Mutex<(tokio::process::ChildStdin, BufReader<tokio::process::ChildStdout>)>>,
     child: Arc<Mutex<Child>>,
     /// Monotonically-increasing JSON-RPC request id.
     next_id: AtomicU64,
@@ -107,8 +109,7 @@ impl ProcessExtension {
 
         Ok(Self {
             id: id.to_string(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+            io: Arc::new(Mutex::new((stdin, BufReader::new(stdout)))),
             child: Arc::new(Mutex::new(child)),
             next_id: AtomicU64::new(1),
         })
@@ -130,10 +131,13 @@ impl ProcessExtension {
         })
         .map_err(|e| format!("Serialize error: {}", e))?;
 
-        // ── Write request ───────────────────────────────────────────────────
-        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-        {
-            let mut stdin = self.stdin.lock().await;
+        // ── Single lock for write + read — prevents concurrent call interleaving ──
+        let body_buf = {
+            let mut io = self.io.lock().await;
+            let (ref mut stdin, ref mut stdout) = *io;
+
+            // Write request
+            let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
             stdin
                 .write_all(frame.as_bytes())
                 .await
@@ -142,15 +146,8 @@ impl ProcessExtension {
                 .flush()
                 .await
                 .map_err(|e| format!("Flush error: {}", e))?;
-        } // drop stdin lock before reading
-
-        // ── Read response ───────────────────────────────────────────────────
-        let body_buf = {
-            let mut stdout = self.stdout.lock().await;
 
             // Read headers until blank line, extract Content-Length
-            // case-insensitively. Supports extensions that send additional
-            // headers (e.g. Content-Type) like full LSP implementations.
             let mut content_length: Option<usize> = None;
             loop {
                 let mut header_line = String::new();
@@ -206,7 +203,7 @@ impl ProcessExtension {
                 .await
                 .map_err(|e| format!("Read body error: {}", e))?;
             buf
-        }; // drop stdout lock
+        }; // drop io lock
 
         let response: JsonRpcResponse = serde_json::from_slice(&body_buf)
             .map_err(|e| format!("Parse response error: {}", e))?;
