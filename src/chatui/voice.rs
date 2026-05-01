@@ -89,9 +89,9 @@ impl VoiceUiState {
 
 /// Apply a [`VoiceManagerEvent`] to the chatui state.
 ///
-/// V4 only updates the status indicator and surfaces transcripts as
-/// system messages — V5 will route final transcripts directly into
-/// the input buffer.
+/// Final transcripts are inserted at the cursor position (with a
+/// leading space when the existing input doesn't already end in
+/// whitespace), so the user can keep dictating into the same line.
 pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
     let Some(v) = app.voice.as_mut() else {
         return;
@@ -121,20 +121,113 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             v.status = VoiceUiStatus::Transcribing;
         }
         VoiceManagerEvent::PartialTranscript(_) => {
-            // Reserved for V5 — drop for now.
+            // Reserved for V5+ — drop for now.
         }
         VoiceManagerEvent::FinalTranscript(text) => {
-            // V5 will insert into the input buffer; V4 just shows it.
             v.status = VoiceUiStatus::Idle;
-            app.push_msg(ChatMessage::System(format!("🎤 transcript: {}", text)));
+            insert_transcript_into_input(app, &text);
         }
         VoiceManagerEvent::Error(message) => {
             v.status = VoiceUiStatus::Error(message.clone());
-            app.push_msg(ChatMessage::Error(format!("voice sidecar error: {}", message)));
+            app.push_msg(ChatMessage::Error(format!(
+                "voice sidecar error: {}",
+                message
+            )));
         }
         VoiceManagerEvent::Exited => {
             app.push_msg(ChatMessage::System("voice sidecar exited".to_string()));
             app.voice = None;
         }
+    }
+}
+
+/// Insert a transcript at the current cursor position with sensible
+/// whitespace handling. Pure function over `App` so it's unit-testable
+/// without any sidecar plumbing.
+pub(crate) fn insert_transcript_into_input(app: &mut App, transcript: &str) {
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let needs_leading_space = !app.input.is_empty()
+        && app.cursor_byte_pos() > 0
+        && !app
+            .input
+            .as_bytes()
+            .get(app.cursor_byte_pos().saturating_sub(1))
+            .copied()
+            .map(|b| (b as char).is_whitespace())
+            .unwrap_or(true);
+    let to_insert = if needs_leading_space {
+        format!(" {}", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+    let byte_pos = app.cursor_byte_pos();
+    app.input.insert_str(byte_pos, &to_insert);
+    app.cursor_pos += to_insert.chars().count();
+    app.invalidate();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synaps_cli::Session;
+
+    fn fresh_app() -> App {
+        App::new(Session::new("test", "medium", None))
+    }
+
+    #[test]
+    fn insert_transcript_into_empty_input() {
+        let mut app = fresh_app();
+        insert_transcript_into_input(&mut app, "hello world");
+        assert_eq!(app.input, "hello world");
+        assert_eq!(app.cursor_pos, "hello world".chars().count());
+    }
+
+    #[test]
+    fn insert_transcript_appends_with_leading_space() {
+        let mut app = fresh_app();
+        app.input = "first".to_string();
+        app.cursor_pos = "first".chars().count();
+        insert_transcript_into_input(&mut app, "second sentence");
+        assert_eq!(app.input, "first second sentence");
+        assert_eq!(app.cursor_pos, "first second sentence".chars().count());
+    }
+
+    #[test]
+    fn insert_transcript_no_double_space_when_input_ends_with_space() {
+        let mut app = fresh_app();
+        app.input = "first ".to_string();
+        app.cursor_pos = "first ".chars().count();
+        insert_transcript_into_input(&mut app, "second");
+        assert_eq!(app.input, "first second");
+    }
+
+    #[test]
+    fn insert_transcript_trims_whitespace_from_payload() {
+        let mut app = fresh_app();
+        insert_transcript_into_input(&mut app, "  spaced text  ");
+        assert_eq!(app.input, "spaced text");
+    }
+
+    #[test]
+    fn insert_transcript_ignores_empty_or_whitespace_only() {
+        let mut app = fresh_app();
+        insert_transcript_into_input(&mut app, "");
+        insert_transcript_into_input(&mut app, "   ");
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_pos, 0);
+    }
+
+    #[test]
+    fn insert_transcript_inserts_at_cursor_not_end() {
+        let mut app = fresh_app();
+        app.input = "hello world".to_string();
+        // Place cursor between "hello" and " world" (after "hello")
+        app.cursor_pos = 5;
+        insert_transcript_into_input(&mut app, "beautiful");
+        assert_eq!(app.input, "hello beautiful world");
     }
 }
