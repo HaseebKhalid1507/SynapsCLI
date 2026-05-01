@@ -508,37 +508,46 @@ impl App {
                 }
 
                 ChatMessage::Error(err) => {
-                    // Same multi-line handling as System: split on '\n' so
-                    // long error messages with embedded newlines render across
-                    // multiple rows. The error glyph appears only on the first
-                    // row; continuation rows use blank padding to keep the
-                    // text aligned under it.
+                    // Newline-aware AND wrap-aware. The ✘ glyph appears on
+                    // the first row only; continuation rows (whether from a
+                    // hard \n or from soft-wrap) use blank padding aligned
+                    // under the message body.
                     let err_style = Style::default().fg(THEME.load().error_color);
-                    let mut first = true;
-                    for sub in err.split('\n') {
-                        let prefix = if first {
-                            format!("{}  \u{2718} ", m)
-                        } else {
-                            format!("{}    ", m)
-                        };
-                        first = false;
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, err_style),
-                            Span::styled(sub.to_string(), err_style),
-                        ]));
+                    let mut first_row = true;
+                    for line in err.lines() {
+                        for wline in wrap_text(&format!("{}    {}", m, line), width) {
+                            // wrap_text emits the prefix on every output row;
+                            // strip ours so we can re-add the glyph or padding
+                            // exactly once at the head.
+                            let body = wline
+                                .strip_prefix(&format!("{}    ", m))
+                                .unwrap_or(&wline)
+                                .to_string();
+                            let prefix = if first_row {
+                                format!("{}  \u{2718} ", m)
+                            } else {
+                                format!("{}    ", m)
+                            };
+                            first_row = false;
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix, err_style),
+                                Span::styled(body, err_style),
+                            ]));
+                        }
                     }
                 }
 
                 ChatMessage::System(msg) => {
-                    // Render each newline-separated chunk as its own row so
-                    // multi-line system messages (e.g. /voice models, /voice
-                    // help, /chain ls, /keybinds) render correctly.
+                    // Newline-aware AND wrap-aware: split on '\n' first so
+                    // explicit line breaks always render as separate rows,
+                    // then wrap each line on word boundaries to fit `width`.
+                    // Mirrors the User/Text pattern using wrap_text() so all
+                    // chat content wraps consistently.
                     let style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
-                    for sub in msg.split('\n') {
-                        lines.push(Line::from(Span::styled(
-                            format!("{}  {}", m, sub),
-                            style,
-                        )));
+                    for line in msg.lines() {
+                        for wline in wrap_text(&format!("{}  {}", m, line), width) {
+                            lines.push(Line::from(Span::styled(wline, style)));
+                        }
                     }
                 }
 
