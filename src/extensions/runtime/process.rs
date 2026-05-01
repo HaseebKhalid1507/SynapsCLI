@@ -114,6 +114,69 @@ pub struct ProviderToolUse {
     pub input: Value,
 }
 
+pub async fn execute_provider_tool_use(
+    registry: &crate::ToolRegistry,
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_use: ProviderToolUse,
+    ctx: crate::ToolContext,
+    max_tool_output: usize,
+) -> Value {
+    let tool_id = tool_use.id;
+    let tool_name = tool_use.name;
+    let input = tool_use.input;
+
+    let Some(tool) = registry.get(&tool_name).cloned() else {
+        return serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": format!("Unknown tool: {}", tool_name),
+            "is_error": true,
+        });
+    };
+
+    let runtime_name = registry.runtime_name_for_api(&tool_name).to_string();
+    let input = registry.translate_input_for_api_tool(&tool_name, input);
+    let decision = crate::runtime::resolve_before_tool_call_decision(
+        input.clone(),
+        crate::runtime::emit_before_tool_call(
+            hook_bus,
+            &tool_name,
+            Some(&runtime_name),
+            input.clone(),
+        ).await,
+        ctx.capabilities.secret_prompt.as_ref(),
+    ).await;
+
+    let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else {
+        let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else { unreachable!() };
+        return serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": format!("Tool call blocked by extension: {}", reason),
+            "is_error": true,
+        });
+    };
+
+    let input_for_hook = input.clone();
+    let result = match tool.execute(input, ctx).await {
+        Ok(output) => output,
+        Err(error) => format!("Tool execution failed: {}", error),
+    };
+    let _ = crate::runtime::emit_after_tool_call(
+        hook_bus,
+        &tool_name,
+        Some(&runtime_name),
+        input_for_hook,
+        result.clone(),
+    ).await;
+
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": tool_id,
+        "content": crate::truncate_str(&result, max_tool_output).to_string(),
+    })
+}
+
 pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolUse>, String> {
     let mut tool_uses = Vec::new();
     for block in content {

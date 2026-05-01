@@ -54,6 +54,12 @@ impl ToolRegistry {
         Self::from_tools(tools)
     }
 
+    /// Empty registry for tests and narrow embedded runtimes that want to opt in
+    /// to specific tools explicitly.
+    pub fn empty() -> Self {
+        Self::from_tools(Vec::new())
+    }
+
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
     pub fn without_subagent() -> Self {
         let tools: Vec<Arc<dyn Tool>> = vec![
