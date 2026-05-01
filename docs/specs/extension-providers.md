@@ -167,6 +167,41 @@ Tool results are Anthropic-shaped content blocks:
 
 Unknown tools, blocked tools, and execution failures are returned to the provider as `tool_result` blocks with `is_error: true` when applicable. The provider should recover or return a final user-visible error.
 
+## Configuration and diagnostics
+
+Provider extensions declare configuration in two places:
+
+- The plugin manifest's `extensions[].config` array — describes non-secret config entries the extension expects (`key`, `description`, `required`, `default`, `secret_env`).
+- Per-provider `config_schema` returned from `initialize` — currently a JSON object with optional `required: [string]` listing keys the provider needs at runtime.
+
+Synaps resolves config values at extension load time using this precedence (see `src/extensions/manager.rs::resolve_config`):
+
+1. Process env override `SYNAPS_EXTENSION_<EXTENSION_ID>_<KEY>` (uppercased, dashes → underscores).
+2. The entry's `secret_env` env var, if declared.
+3. Persisted config key `extension.<extension-id>.<key>`.
+4. The entry's `default` value.
+5. Otherwise: missing — load fails if `required: true`.
+
+### Inspecting config
+
+The chatui surfaces config diagnostics without leaking values:
+
+- `/extensions status` — appends `⚠ missing required config: …` and `⚠ provider <pid> missing required config: …` lines for any loaded extension whose declared or provider-required keys aren't satisfied.
+- `/extensions config` — lists every loaded extension's manifest config: each entry shows `key [required] — source: <label>, has_value: <bool>` plus its description if set. Source labels are `env override (NAME)`, `secret env (NAME)`, `config key (extension.<id>.<key>)`, `default`, or `missing`.
+- `/extensions config <id>` — same as above for a single extension.
+
+Provider-required keys that have no matching manifest entry are reported as `⚠ provider <pid> requires config '<key>' (no manifest entry)` so authors can correct the manifest.
+
+### Redaction rules
+
+Synaps **never displays the resolved value** of any config entry through `/extensions` UX, regardless of whether the source is plain config, default, secret env, or env override. The diagnostics surface only references the source identifier (env var name, config key) — not the value. The internal helper `extensions::config::redact_secret_value` is reserved for future log/error contexts where a partial value must appear; it never returns the full input.
+
+### Authoring guidance
+
+- Mark API keys, tokens, and any other credential as `secret_env` so authors can surface a clear env-var hint without committing values.
+- Use `required: true` only for entries the extension cannot start without; defaults are preferred wherever sensible.
+- Provider `config_schema.required` should reference keys that are also declared in the manifest's `config` array; otherwise diagnostics will warn about a missing manifest entry.
+
 ## Limits, security boundary, and current limitations
 
 - Synaps enforces a maximum provider tool-loop iteration count to prevent infinite tool recursion. The current routing default is 8 provider turns.
