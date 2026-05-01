@@ -508,17 +508,38 @@ impl App {
                 }
 
                 ChatMessage::Error(err) => {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(THEME.load().error_color)),
-                        Span::styled(err.clone(), Style::default().fg(THEME.load().error_color)),
-                    ]));
+                    // Same multi-line handling as System: split on '\n' so
+                    // long error messages with embedded newlines render across
+                    // multiple rows. The error glyph appears only on the first
+                    // row; continuation rows use blank padding to keep the
+                    // text aligned under it.
+                    let err_style = Style::default().fg(THEME.load().error_color);
+                    let mut first = true;
+                    for sub in err.split('\n') {
+                        let prefix = if first {
+                            format!("{}  \u{2718} ", m)
+                        } else {
+                            format!("{}    ", m)
+                        };
+                        first = false;
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, err_style),
+                            Span::styled(sub.to_string(), err_style),
+                        ]));
+                    }
                 }
 
                 ChatMessage::System(msg) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("{}  {}", m, msg),
-                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM),
-                    )));
+                    // Render each newline-separated chunk as its own row so
+                    // multi-line system messages (e.g. /voice models, /voice
+                    // help, /chain ls, /keybinds) render correctly.
+                    let style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
+                    for sub in msg.split('\n') {
+                        lines.push(Line::from(Span::styled(
+                            format!("{}  {}", m, sub),
+                            style,
+                        )));
+                    }
                 }
 
                 ChatMessage::Event { source, severity, text } => {
