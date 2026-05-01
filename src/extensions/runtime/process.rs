@@ -107,6 +107,52 @@ pub struct ProviderCompleteResult {
     pub usage: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
+pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolUse>, String> {
+    let mut tool_uses = Vec::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let id = block
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "provider tool_use missing id".to_string())?;
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "provider tool_use missing name".to_string())?;
+        if id.trim().is_empty() {
+            return Err("provider tool_use id is empty".to_string());
+        }
+        if name.trim().is_empty() {
+            return Err("provider tool_use name is empty".to_string());
+        }
+        let input = block
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !input.is_object() {
+            return Err(format!(
+                "provider tool_use '{}' input must be a JSON object",
+                id
+            ));
+        }
+        tool_uses.push(ProviderToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        });
+    }
+    Ok(tool_uses)
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
