@@ -170,6 +170,15 @@ Provider config uses existing `extension.config` entries in the plugin manifest.
 - Malformed provider responses return a config/runtime error and do not fall back to Anthropic.
 - Extension transport failures use the same restart policy as tools/hooks.
 
+### Phase O notes
+
+Provider trust and distribution metadata are now part of the platform surface:
+
+- `providers.register` is high impact. Install/update/detail UX should explain that selected extension-provider models receive conversation content.
+- `provider.complete` is the only executable provider call in this phase.
+- `provider.stream` is reserved and implementations return a clear unsupported error until notification-based streaming semantics are specified.
+- Plugin index/package metadata may include provider summaries derived from manifest `extension.providers` metadata. Runtime registration remains authoritative because extensions return actual capabilities from `initialize`.
+
 ### Trust/security
 
 Provider extensions can receive conversation content when selected. `providers.register` is high impact and install/inspect UX must expose it. Secrets are resolved by Synaps and passed only via initialize config; extensions must not persist them on behalf of Synaps.

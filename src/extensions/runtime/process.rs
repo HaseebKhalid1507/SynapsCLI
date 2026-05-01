@@ -595,6 +595,10 @@ impl ExtensionHandler for ProcessExtension {
         Ok(result)
     }
 
+    async fn provider_stream(&self, _params: ProviderCompleteParams) -> Result<(), String> {
+        Err("provider.stream is reserved but not implemented in this Synaps version".to_string())
+    }
+
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {

@@ -62,6 +62,8 @@ pub struct CachedPluginIndexMetadata {
     #[serde(default)]
     pub commands: Vec<String>,
     #[serde(default)]
+    pub providers: Vec<crate::skills::plugin_index::PluginIndexProviderCapability>,
+    #[serde(default)]
     pub trust_publisher: Option<String>,
     #[serde(default)]
     pub trust_homepage: Option<String>,

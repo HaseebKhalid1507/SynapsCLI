@@ -1,6 +1,6 @@
 //! Plugin index schema support.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PluginIndex {
@@ -57,6 +57,17 @@ pub struct PluginIndexCapabilities {
     pub hooks: Vec<String>,
     #[serde(default)]
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<PluginIndexProviderCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginIndexProviderCapability {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -97,6 +108,19 @@ pub fn validate_plugin_index(index: &PluginIndex) -> Result<(), String> {
             if let Some(homepage) = &trust.homepage {
                 if !homepage.starts_with("https://") {
                     return Err(format!("plugins[{idx}].trust.homepage must be https://"));
+                }
+            }
+        }
+        for (provider_idx, provider) in plugin.capabilities.providers.iter().enumerate() {
+            if provider.id.trim().is_empty() {
+                return Err(format!("plugins[{idx}].capabilities.providers[{provider_idx}].id is required"));
+            }
+            if provider.id.contains(':') {
+                return Err(format!("plugins[{idx}].capabilities.providers[{provider_idx}].id must not contain ':'"));
+            }
+            for (model_idx, model) in provider.models.iter().enumerate() {
+                if model.trim().is_empty() || model.contains(':') {
+                    return Err(format!("plugins[{idx}].capabilities.providers[{provider_idx}].models[{model_idx}] must be non-empty and must not contain ':'"));
                 }
             }
         }

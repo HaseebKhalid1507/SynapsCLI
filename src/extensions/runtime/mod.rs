@@ -44,6 +44,11 @@ pub trait ExtensionHandler: Send + Sync {
         Err("extension runtime does not support provider.complete".to_string())
     }
 
+    /// Stream a chat request through an extension-provided model provider.
+    async fn provider_stream(&self, _params: ProviderCompleteParams) -> Result<(), String> {
+        Err("provider.stream is reserved but not implemented in this Synaps version".to_string())
+    }
+
     /// Gracefully shut down the extension.
     async fn shutdown(&self);
 

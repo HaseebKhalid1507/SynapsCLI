@@ -12,6 +12,13 @@ pub struct RegisteredProvider {
     pub handler: Option<Arc<dyn ExtensionHandler>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredProviderSummary {
+    pub runtime_id: String,
+    pub display_name: String,
+    pub models: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, RegisteredProvider>,
@@ -85,6 +92,22 @@ impl ProviderRegistry {
 
     pub fn model_runtime_id(plugin_id: &str, provider_id: &str, model_id: &str) -> String {
         format!("{}:{}:{}", plugin_id, provider_id, model_id)
+    }
+
+    pub fn summaries(&self) -> Vec<RegisteredProviderSummary> {
+        self.list()
+            .into_iter()
+            .map(|provider| RegisteredProviderSummary {
+                runtime_id: provider.runtime_id.clone(),
+                display_name: provider.spec.display_name.clone(),
+                models: provider
+                    .spec
+                    .models
+                    .iter()
+                    .map(|model| Self::model_runtime_id(&provider.plugin_id, &provider.provider_id, &model.id))
+                    .collect(),
+            })
+            .collect()
     }
 }
 

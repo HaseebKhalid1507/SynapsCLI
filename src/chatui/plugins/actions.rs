@@ -62,6 +62,7 @@ fn cached_index_metadata(entry: &PluginIndexEntry) -> CachedPluginIndexMetadata 
         permissions: entry.capabilities.permissions.clone(),
         hooks: entry.capabilities.hooks.clone(),
         commands: entry.capabilities.commands.clone(),
+        providers: entry.capabilities.providers.clone(),
         trust_publisher: entry.trust.as_ref().and_then(|t| t.publisher.clone()),
         trust_homepage: entry.trust.as_ref().and_then(|t| t.homepage.clone()),
     }
@@ -242,6 +243,7 @@ fn plugin_index_entry_from_cached(
             permissions: index.permissions,
             hooks: index.hooks,
             commands: index.commands,
+            providers: index.providers,
         },
         trust: if index.trust_publisher.is_some() || index.trust_homepage.is_some() {
             Some(PluginIndexTrust {
@@ -261,15 +263,24 @@ pub(crate) async fn apply_install_from_index_entry(
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
-    let summary = vec![
+    let mut summary = vec![
         format!("index plugin: {} {}", entry.id, entry.version),
         format!("repository: {}", entry.repository),
         format!("checksum: {}:{}", entry.checksum.algorithm, entry.checksum.value),
         format!("executable extension: {}", if entry.capabilities.has_extension { "yes" } else { "no" }),
         format!("permissions: {}", if entry.capabilities.permissions.is_empty() { "none".to_string() } else { entry.capabilities.permissions.join(", ") }),
         format!("hooks: {}", if entry.capabilities.hooks.is_empty() { "none".to_string() } else { entry.capabilities.hooks.join(", ") }),
-        "fetched plugin manifest will be re-inspected before final install".to_string(),
     ];
+    if !entry.capabilities.providers.is_empty() {
+        summary.push(format!(
+            "providers: {}",
+            entry.capabilities.providers.iter().map(|p| format!("{} ({})", p.id, p.models.join(", "))).collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if entry.capabilities.permissions.iter().any(|permission| permission == "providers.register") {
+        summary.push("HIGH IMPACT: selected provider models receive conversation content".to_string());
+    }
+    summary.push("fetched plugin manifest will be re-inspected before final install".to_string());
     let host = match trust_host_for_source(&entry.repository) {
         Ok(h) => h,
         Err(e) => {
@@ -1161,6 +1172,7 @@ mod tests {
                 permissions: vec!["tools.intercept".into()],
                 hooks: vec!["before_tool_call".into()],
                 commands: vec![],
+                providers: vec![],
             },
             trust: None,
         }

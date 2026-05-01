@@ -310,6 +310,18 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
                     Span::styled("commands:    ", label_style),
                     Span::styled(if index.commands.is_empty() { "none".to_string() } else { index.commands.join(", ") }, value_style),
                 ]));
+                if !index.providers.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("providers:   ", label_style),
+                        Span::styled(index.providers.iter().map(|p| format!("{} ({})", p.id, p.models.join(", "))).collect::<Vec<_>>().join("; "), value_style),
+                    ]));
+                }
+                if index.permissions.iter().any(|permission| permission == "providers.register") {
+                    lines.push(Line::from(vec![
+                        Span::styled("provider UX: ", label_style),
+                        Span::styled("high impact — selected provider models receive conversation content", Style::default().fg(THEME.load().error_color)),
+                    ]));
+                }
                 if let Some(publisher) = &index.trust_publisher {
                     lines.push(Line::from(vec![
                         Span::styled("publisher:   ", label_style),

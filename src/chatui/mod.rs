@@ -1010,7 +1010,9 @@ pub async fn run(
                                         }
                                     }
                                     CommandAction::ExtensionsStatus => {
-                                        let statuses = ext_mgr_shared.read().await.statuses().await;
+                                        let manager = ext_mgr_shared.read().await;
+                                        let statuses = manager.statuses().await;
+                                        let provider_summaries = manager.provider_summaries();
                                         if statuses.is_empty() {
                                             app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
                                         } else {
@@ -1022,6 +1024,16 @@ pub async fn run(
                                                     status.health.as_str(),
                                                     status.restart_count
                                                 )));
+                                                for provider in provider_summaries.iter().filter(|p| p.runtime_id.starts_with(&format!("{}:", status.id))) {
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "    provider {} — {}",
+                                                        provider.runtime_id,
+                                                        provider.display_name
+                                                    )));
+                                                    for model in &provider.models {
+                                                        app.push_msg(ChatMessage::System(format!("      model {}", model)));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1225,6 +1237,47 @@ let display_text = app.user_display_text_for_submission(&input);
                                 app.push_msg(ChatMessage::System(format!("model set to: {}", applied)));
                             }
                             InputAction::ModelsExpandProvider(provider_key) => {
+                                if provider_key.contains(':') {
+                                    let tx = app.model_list_tx.clone();
+                                    let manager = synaps_cli::runtime::openai::extension_manager_for_routing();
+                                    tokio::spawn(async move {
+                                        let result = if let Some(manager) = manager {
+                                            let manager = manager.read().await;
+                                            if let Some(provider) = manager.provider(&provider_key) {
+                                                Ok(provider.spec.models.iter().map(|model| {
+                                                    let full_id = synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
+                                                        &provider.plugin_id,
+                                                        &provider.provider_id,
+                                                        &model.id,
+                                                    );
+                                                    let mut metadata = vec![format!("plugin {}", provider.plugin_id)];
+                                                    metadata.push(format!("provider {}", provider.provider_id));
+                                                    if let Some(context) = model.context_window {
+                                                        metadata.push(if context >= 1_000_000 {
+                                                            format!("{}M ctx", context / 1_000_000)
+                                                        } else if context >= 1_000 {
+                                                            format!("{}K ctx", context / 1_000)
+                                                        } else {
+                                                            format!("{context} ctx")
+                                                        });
+                                                    }
+                                                    models::ExpandedModelEntry::with_metadata(
+                                                        full_id,
+                                                        model.display_name.clone().unwrap_or_else(|| model.id.clone()),
+                                                        false,
+                                                        metadata,
+                                                    )
+                                                }).collect())
+                                            } else {
+                                                Err(format!("extension provider '{}' is not loaded", provider_key))
+                                            }
+                                        } else {
+                                            Err("extension provider registry is not available".to_string())
+                                        };
+                                        let _ = tx.send((provider_key, result));
+                                    });
+                                    continue;
+                                }
                                 let client = runtime.http_client().clone();
                                 let provider_keys = synaps_cli::config::get_provider_keys();
                                 let tx = app.model_list_tx.clone();

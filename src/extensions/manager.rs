@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::hooks::HookBus;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
-use super::providers::{ProviderRegistry, RegisteredProvider};
+use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
 use super::runtime::{ExtensionHandler, ExtensionHealth};
 use super::runtime::process::ProcessExtension;
 use serde_json::{Map, Value};
@@ -364,6 +364,11 @@ impl ExtensionManager {
     /// Return registered provider metadata by runtime id.
     pub fn provider(&self, runtime_id: &str) -> Option<&RegisteredProvider> {
         self.providers.get(runtime_id)
+    }
+
+    /// Return provider status summaries sorted by provider runtime id.
+    pub fn provider_summaries(&self) -> Vec<RegisteredProviderSummary> {
+        self.providers.summaries()
     }
 
     /// Get the shared hook bus.
