@@ -1,7 +1,7 @@
 use super::*;
 
 /// Drop a completion event into ~/.synaps-cli/inbox/ for the event bus.
-pub(crate) fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
+fn notify_inbox_completion(agent_name: &str, session_count: u64, elapsed_secs: f64, exit_code: i32) {
     let inbox_dir = synaps_cli::config::base_dir().join("inbox");
     let _ = std::fs::create_dir_all(&inbox_dir);
 
