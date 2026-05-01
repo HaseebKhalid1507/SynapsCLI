@@ -249,13 +249,8 @@ pub async fn run(
                     });
 
                     if app.streaming || app.compact_task.is_some() {
-                        // Steer into active stream if possible, otherwise buffer
-                        let steered = steer_tx.as_ref()
-                            .map(|tx| tx.send(formatted.clone()).is_ok())
-                            .unwrap_or(false);
-                        if !steered {
-                            app.pending_events.push(formatted);
-                        }
+                        // Buffer during streaming — inject after MessageHistory
+                        app.pending_events.push(formatted);
                     } else {
                         app.api_messages.push(serde_json::json!({
                             "role": "user",
