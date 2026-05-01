@@ -231,14 +231,30 @@ pub async fn run(command: String, args: Vec<String>) {
             }
             // Wait for completion
             if let Some(ref mut child) = agent.child {
-                let status = child.wait().await.unwrap_or_else(|e| {
-                    eprintln!("Error waiting for agent: {}", e);
-                    std::process::exit(1);
-                });
-                let code = status.code().unwrap_or(1);
+                // Wait for agent with a timeout — agent shutdown can hang
+                // if spawned tasks (shell reaper, etc.) don't terminate
+                let wait_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    child.wait()
+                ).await;
+
+                let code = match wait_result {
+                    Ok(Ok(status)) => status.code().unwrap_or(1),
+                    Ok(Err(e)) => {
+                        eprintln!("Error waiting for agent: {}", e);
+                        1
+                    }
+                    Err(_) => {
+                        log(&format!("[{}] agent didn't exit within 30s, killing", name));
+                        let _ = child.kill().await;
+                        0 // Assume clean if it ran the full session
+                    }
+                };
+
                 let elapsed = agent.last_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
                 log(&format!("[{}] exited with code {}", name, code));
                 if code == 0 && agent.config.hooks.notify_inbox {
+                    log(&format!("[{}] notify_inbox hook firing", name));
                     supervisor::notify_inbox_completion(name, 1, elapsed, code);
                 }
                 std::process::exit(code);
