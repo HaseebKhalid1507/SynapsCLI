@@ -90,8 +90,8 @@ pub fn validate_plugin_index(index: &PluginIndex) -> Result<(), String> {
         if plugin.checksum.algorithm != "sha256" {
             return Err(format!("plugins[{idx}].checksum.algorithm must be sha256"));
         }
-        if plugin.checksum.value.trim().is_empty() {
-            return Err(format!("plugins[{idx}].checksum.value is required"));
+        if plugin.checksum.value.len() != 64 || !plugin.checksum.value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+            return Err(format!("plugins[{idx}].checksum.value must be 64 lowercase hex characters"));
         }
         if let Some(trust) = &plugin.trust {
             if let Some(homepage) = &trust.homepage {
@@ -129,7 +129,7 @@ mod tests {
             "description": "Extracts local session notes.",
             "repository": "https://github.com/example/synaps-skills.git",
             "subdir": "session-memory-plugin",
-            "checksum": {"algorithm": "sha256", "value": "abc123"},
+            "checksum": {"algorithm": "sha256", "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
             "compatibility": {"synaps": ">=0.1.0", "extension_protocol": "1"},
             "capabilities": {
               "skills": ["session-memory"],
@@ -160,9 +160,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_checksum_shape() {
+    fn rejects_bad_checksum_algorithm() {
         let mut index: PluginIndex = serde_json::from_str(sample_index_json()).unwrap();
         index.plugins[0].checksum.algorithm = "md5".into();
         assert!(validate_plugin_index(&index).unwrap_err().contains("checksum.algorithm"));
+    }
+
+    #[test]
+    fn rejects_bad_checksum_shape() {
+        let mut index: PluginIndex = serde_json::from_str(sample_index_json()).unwrap();
+        index.plugins[0].checksum.value = "abc123".into();
+        assert!(validate_plugin_index(&index).unwrap_err().contains("checksum.value"));
     }
 }

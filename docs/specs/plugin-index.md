@@ -77,7 +77,7 @@ Required fields:
 - `version`: Semver plugin version from `.synaps-plugin/plugin.json`.
 - `description`: Short human-readable description.
 - `repository`: Source repository URL or local file URL.
-- `checksum`: Digest metadata for the installable plugin tree. v1 supports `sha256` only; `value` is the deterministic plugin tree digest described below.
+- `checksum`: Digest metadata for the installable plugin tree. v1 supports `sha256` only; `value` is the deterministic plugin tree digest described below. It must be a 64-character lowercase hex digest.
 - `compatibility`: Minimum Synaps/runtime compatibility metadata.
 - `capabilities`: Static capability summary.
 
@@ -168,7 +168,10 @@ Indexers should not execute extension code to populate these fields.
       "description": "Local safe tool policy bundle.",
       "repository": "file:///home/me/synaps-skills",
       "subdir": "policy-bundle-plugin",
-      "checksum": {"algorithm": "sha256", "value": "pending"},
+      "checksum": {
+        "algorithm": "sha256",
+        "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
       "compatibility": {"synaps": ">=0.1.0", "extension_protocol": "1"},
       "capabilities": {
         "skills": ["safe-tool-policy"],
