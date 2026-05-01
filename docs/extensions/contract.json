@@ -37,6 +37,13 @@
         "continue"
       ]
     },
+    "on_compaction": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ]
+    },
     "on_session_start": {
       "permission": "session.lifecycle",
       "tool_filter": false,

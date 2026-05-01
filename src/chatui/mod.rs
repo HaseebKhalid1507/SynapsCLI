@@ -643,6 +643,15 @@ pub async fn run(
                                     tracing::warn!("Failed to update old session {}: {}", old_id, e);
                                 }
                             }
+                            let compaction_event = synaps_cli::extensions::hooks::events::HookEvent::on_compaction(
+                                &old_id,
+                                &new_id,
+                                &summary,
+                                msg_count,
+                                serde_json::json!({"source": "manual"}),
+                            );
+                            let _ = runtime.hook_bus().emit(&compaction_event).await;
+
                             // Advance any named chains that pointed at the old head
                             for ch in &chains_to_advance {
                                 match synaps_cli::chain::save_chain(&ch.name, &new_id) {

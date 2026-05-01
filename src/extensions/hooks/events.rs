@@ -31,6 +31,8 @@ pub enum HookKind {
     BeforeMessage,
     /// Fires after an assistant response is completed and added to history.
     OnMessageComplete,
+    /// Fires after conversation compaction creates a replacement session.
+    OnCompaction,
     /// Fires when a new session is created.
     OnSessionStart,
     /// Fires when a session is torn down.
@@ -46,6 +48,7 @@ impl HookKind {
             Self::AfterToolCall => "after_tool_call",
             Self::BeforeMessage => "before_message",
             Self::OnMessageComplete => "on_message_complete",
+            Self::OnCompaction => "on_compaction",
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
         }
@@ -61,6 +64,7 @@ impl HookKind {
             "after_tool_call" => Some(Self::AfterToolCall),
             "before_message" => Some(Self::BeforeMessage),
             "on_message_complete" => Some(Self::OnMessageComplete),
+            "on_compaction" => Some(Self::OnCompaction),
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
             _ => None,
@@ -73,7 +77,7 @@ impl HookKind {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue"],
             Self::BeforeMessage => &["continue", "inject"],
-            Self::OnMessageComplete | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
+            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -102,7 +106,7 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage | Self::OnMessageComplete => Permission::LlmContent,
+            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => Permission::LlmContent,
             Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
@@ -120,6 +124,7 @@ impl HookKind {
 /// | `after_tool_call`     | ✓         | ✓          | ✓           |         |            |
 /// | `before_message`      |           |            |             | ✓       |            |
 /// | `on_message_complete` |           |            |             | ✓       |            |
+/// | `on_compaction`       |           |            |             | ✓       | ✓          |
 /// | `on_session_start`    |           |            |             |         | ✓          |
 /// | `on_session_end`      |           |            |             |         | ✓          |
 ///
@@ -232,6 +237,35 @@ impl HookEvent {
         }
     }
 
+    /// Construct an `on_compaction` event.
+    pub fn on_compaction(
+        old_session_id: &str,
+        new_session_id: &str,
+        summary: &str,
+        message_count: usize,
+        mut data: Value,
+    ) -> Self {
+        if !data.is_object() {
+            data = Value::Object(Default::default());
+        }
+        if let Some(object) = data.as_object_mut() {
+            object.insert("old_session_id".to_string(), Value::String(old_session_id.to_string()));
+            object.insert("new_session_id".to_string(), Value::String(new_session_id.to_string()));
+            object.insert("message_count".to_string(), Value::Number(message_count.into()));
+        }
+        Self {
+            kind: HookKind::OnCompaction,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: Some(summary.to_string()),
+            session_id: Some(new_session_id.to_string()),
+            tool_runtime_name: None,
+            transcript: None,
+            data,
+        }
+    }
+
     /// Construct an `on_session_start` event.
     pub fn on_session_start(session_id: &str) -> Self {
         Self {
@@ -311,6 +345,7 @@ mod tests {
             HookKind::AfterToolCall,
             HookKind::BeforeMessage,
             HookKind::OnMessageComplete,
+            HookKind::OnCompaction,
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
         ];
@@ -359,6 +394,10 @@ mod tests {
         );
         assert_eq!(
             HookKind::OnMessageComplete.required_permission(),
+            Permission::LlmContent
+        );
+        assert_eq!(
+            HookKind::OnCompaction.required_permission(),
             Permission::LlmContent
         );
         assert_eq!(
@@ -424,6 +463,26 @@ mod tests {
         assert_eq!(ev.message.as_deref(), Some("Done"));
         assert_eq!(ev.data["content_block_count"], 1);
         assert!(ev.session_id.is_none());
+    }
+
+    #[test]
+    fn hook_event_on_compaction() {
+        let ev = HookEvent::on_compaction(
+            "old-session",
+            "new-session",
+            "Summary",
+            7,
+            json!({"source": "manual"}),
+        );
+
+        assert_eq!(ev.kind, HookKind::OnCompaction);
+        assert_eq!(ev.message.as_deref(), Some("Summary"));
+        assert_eq!(ev.session_id.as_deref(), Some("new-session"));
+        assert_eq!(ev.data["old_session_id"], "old-session");
+        assert_eq!(ev.data["new_session_id"], "new-session");
+        assert_eq!(ev.data["message_count"], 7);
+        assert_eq!(ev.data["source"], "manual");
+        assert!(ev.transcript.is_none());
     }
 
     #[test]

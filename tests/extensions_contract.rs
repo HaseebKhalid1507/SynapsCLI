@@ -9,11 +9,12 @@ use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::manifest::HookMatcher;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 
-const ALL_HOOK_KINDS: [HookKind; 6] = [
+const ALL_HOOK_KINDS: [HookKind; 7] = [
     HookKind::BeforeToolCall,
     HookKind::AfterToolCall,
     HookKind::BeforeMessage,
     HookKind::OnMessageComplete,
+    HookKind::OnCompaction,
     HookKind::OnSessionStart,
     HookKind::OnSessionEnd,
 ];
@@ -155,6 +156,28 @@ fn on_message_complete_event_carries_assistant_content_as_message() {
     assert!(event.tool_output.is_none());
     assert!(event.session_id.is_none());
     assert!(event.transcript.is_none());
+}
+
+#[test]
+fn on_compaction_event_carries_summary_metadata_without_transcript() {
+    let event = HookEvent::on_compaction(
+        "old-session",
+        "new-session",
+        "summary text",
+        42,
+        serde_json::json!({"source": "manual"}),
+    );
+
+    assert_eq!(event.kind, HookKind::OnCompaction);
+    assert!(event.message.as_deref().unwrap().contains("summary text"));
+    assert_eq!(event.session_id.as_deref(), Some("new-session"));
+    assert_eq!(event.data["old_session_id"], "old-session");
+    assert_eq!(event.data["new_session_id"], "new-session");
+    assert_eq!(event.data["message_count"], 42);
+    assert_eq!(event.data["source"], "manual");
+    assert!(event.transcript.is_none());
+    assert!(event.tool_input.is_none());
+    assert!(event.tool_output.is_none());
 }
 
 #[tokio::test]

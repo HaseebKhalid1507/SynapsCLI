@@ -315,12 +315,39 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_runtime_name` | string \| null  | `before_tool_call`, `after_tool_call`         | Original runtime tool name (before API sanitization)             |
 | `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
 | `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)             |
-| `message`           | string \| null  | `before_message`, `on_message_complete`       | User/assistant message content for message hooks                 |
-| `session_id`        | string \| null  | `on_session_start`, `on_session_end`          | Stable identifier for the current session                        |
+| `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
+| `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
 | `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
+
+### `on_compaction`
+
+`on_compaction` is emitted after manual conversation compaction creates and saves
+a replacement session. It requires `privacy.llm_content` and supports only
+`continue`. `message` contains the compaction summary. `session_id` is the new
+session id; `data` includes both old and new session ids plus the number of
+messages compacted.
+
+```json
+{
+  "kind": "on_compaction",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": "Compacted summary text...",
+  "session_id": "20260501-120000-abcd",
+  "transcript": null,
+  "data": {
+    "old_session_id": "20260501-110000-wxyz",
+    "new_session_id": "20260501-120000-abcd",
+    "message_count": 42,
+    "source": "manual"
+  }
+}
+```
 
 ### `on_message_complete`
 

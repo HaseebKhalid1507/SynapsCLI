@@ -579,6 +579,70 @@ async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn installed_extension_receives_on_compaction_as_observe_only() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+
+    let plugin_dir = home.path().join("plugins/compaction-test");
+    let log_path = plugin_dir.join("compaction.jsonl");
+    fs::create_dir_all(plugin_dir.join(".synaps-plugin")).unwrap();
+    fs::create_dir_all(plugin_dir.join("extensions")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("tests/fixtures/compaction_extension.py"),
+        plugin_dir.join("extensions/compaction_extension.py"),
+    )
+    .unwrap();
+
+    fs::write(
+        plugin_dir.join(".synaps-plugin/plugin.json"),
+        r#"{
+  "name": "compaction-test",
+  "version": "0.1.0",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extensions/compaction_extension.py"],
+    "permissions": ["privacy.llm_content"],
+    "hooks": [{"hook": "on_compaction"}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    std::env::set_var("SYNAPS_COMPACTION_LOG", &log_path);
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let (loaded, failed) = manager.discover_and_load().await;
+
+    assert_eq!(loaded, vec!["compaction-test".to_string()]);
+    assert!(failed.is_empty(), "unexpected discovery failures: {failed:?}");
+
+    let event = HookEvent::on_compaction(
+        "old-session",
+        "new-session",
+        "Summary text",
+        12,
+        serde_json::json!({"source": "manual"}),
+    );
+    let result = hook_bus.emit(&event).await;
+    assert!(matches!(result, HookResult::Continue), "on_compaction should ignore non-continue actions, got {result:?}");
+
+    let seen = fs::read_to_string(&log_path).unwrap();
+    assert!(seen.contains("on_compaction"));
+    assert!(seen.contains("Summary text"));
+    assert!(seen.contains("old-session"));
+    assert!(seen.contains("new-session"));
+    assert!(seen.contains("message_count"));
+
+    manager.shutdown_all().await;
+    std::env::remove_var("SYNAPS_COMPACTION_LOG");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn on_message_complete_is_observe_only() {
     let fixture = std::env::current_dir()
         .unwrap()
