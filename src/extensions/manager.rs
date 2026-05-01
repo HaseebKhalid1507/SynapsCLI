@@ -48,13 +48,25 @@ impl ExtensionManager {
 
         // Register hook subscriptions
         for sub in &manifest.hooks {
-            let kind = HookKind::from_str(&sub.hook).ok_or_else(|| {
-                format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id)
-            })?;
+            let kind = match HookKind::from_str(&sub.hook) {
+                Some(k) => k,
+                None => {
+                    // Rollback: unsubscribe any registered hooks and shutdown process
+                    self.hook_bus.unsubscribe_all(id).await;
+                    handler.shutdown().await;
+                    return Err(format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id));
+                }
+            };
 
-            self.hook_bus
+            if let Err(e) = self.hook_bus
                 .subscribe(kind, handler.clone(), sub.tool.clone(), permissions.clone())
-                .await?;
+                .await
+            {
+                // Rollback: unsubscribe any registered hooks and shutdown process
+                self.hook_bus.unsubscribe_all(id).await;
+                handler.shutdown().await;
+                return Err(e);
+            }
         }
 
         self.extensions.insert(id.to_string(), handler);
