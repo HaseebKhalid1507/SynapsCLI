@@ -284,6 +284,7 @@ mod tests {
                 "test-agent".to_string(),
                 "test task".to_string(),
                 "claude-sonnet-4-6".to_string(),
+                "You are a test agent.".to_string(),
                 300,
                 state,
                 Some(steer_tx),
@@ -340,7 +341,7 @@ mod tests {
         let (_, result_rx) = oneshot::channel();
         let h = SubagentHandle::new(
             "sa_1".into(), "test".into(), "task".into(),
-            "model".into(), 300, state, None, None, Some(result_rx),
+            "model".into(), "prompt".into(), 300, state, None, None, Some(result_rx),
         );
         assert!(h.steer("msg").is_err());
     }

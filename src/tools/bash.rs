@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use zeroize::Zeroize;
 use crate::{Result, RuntimeError};
 use super::{Tool, ToolContext, strip_ansi};
 
@@ -204,10 +205,12 @@ impl Tool for BashTool {
                                     redactions.push(secret_value);
                                 }
                                 value.push('\n');
-                                stdin.write_all(value.as_bytes()).await
-                                    .map_err(|e| RuntimeError::Tool(e.to_string()))?;
-                                stdin.flush().await
-                                    .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+                                let write_result = stdin.write_all(value.as_bytes()).await;
+                                let flush_result = stdin.flush().await;
+                                // Zeroize the password from memory immediately after use
+                                value.zeroize();
+                                write_result.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+                                flush_result.map_err(|e| RuntimeError::Tool(e.to_string()))?;
                             }
                             None => {
                                 let _ = child.kill().await;
@@ -265,6 +268,10 @@ impl Tool for BashTool {
                 }
             }
             let status = child.wait().await.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+            // Zeroize redactions (passwords) from memory now that command is done
+            for secret in &mut redactions {
+                secret.zeroize();
+            }
             Ok::<_, RuntimeError>((status, full_output, truncated))
         }).await;
 
