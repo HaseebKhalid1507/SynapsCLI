@@ -35,6 +35,7 @@ fn pi_skills_discovery() {
     for name in expected {
         match registry.resolve(name) {
             Resolution::Skill(s) => println!("  resolve /{} → {:?}:{}", name, s.plugin, s.name),
+            Resolution::PluginCommand(c) => println!("  resolve /{} → PluginCommand {:?}:{}", name, c.plugin, c.name),
             Resolution::Builtin => println!("  resolve /{} → Builtin (collision)", name),
             Resolution::Ambiguous(v) => println!("  resolve /{} → Ambiguous {:?}", name, v),
             Resolution::Unknown => println!("  resolve /{} → Unknown (MISSING)", name),
