@@ -429,6 +429,13 @@ pub async fn run(
                                 if let Some(ref q) = app.queued_message.take() {
                                     app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
                                 }
+                                // Flush any events that arrived during streaming
+                                for formatted in app.pending_events.drain(..) {
+                                    app.api_messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": formatted
+                                    }));
+                                }
                                 stream = None;
                                 cancel_token = None;
                                 steer_tx = None;
