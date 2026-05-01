@@ -75,7 +75,7 @@ pub(crate) fn check_heartbeat(agent_dir: &std::path::Path, stale_threshold: u64)
     if let Ok(content) = std::fs::read_to_string(&hb_path) {
         if let Ok(ts) = content.trim().parse::<i64>() {
             let now = chrono::Utc::now().timestamp();
-            return (now - ts).unsigned_abs() < stale_threshold;
+            return now.saturating_sub(ts) < stale_threshold as i64;
         }
     }
     false
