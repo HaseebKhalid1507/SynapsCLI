@@ -152,6 +152,8 @@ pub(crate) async fn apply_install(
         state.row_error = Some(format!("plugin '{}' not found in '{}'", plugin_name, marketplace_name));
         return;
     };
+    let summary = permission_summary_for_plugin_name(&plugin_name)
+        .unwrap_or_else(|| vec![format!("source: {}", cached.source)]);
     let (effective_source, subdir) = match resolve_install_target(&cached.source, &marketplace) {
         Ok(v) => v,
         Err(e) => {
@@ -171,6 +173,7 @@ pub(crate) async fn apply_install(
             plugin_name: plugin_name.clone(),
             host,
             pending_source: effective_source,
+            summary,
         };
         return;
     }
@@ -186,6 +189,7 @@ pub(crate) async fn apply_trust_and_install(
     plugin_name: String,
     host: String,
     source: String,
+    _summary: Vec<String>,
     registry: &Arc<CommandRegistry>,
     config: &synaps_cli::SynapsConfig,
 ) {
@@ -209,6 +213,71 @@ pub(crate) async fn apply_trust_and_install(
     run_install_flow(state, plugin_name, source, subdir, marketplace_name, registry, config).await;
 }
 
+/// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
+fn install_plugin_to_temp(
+    plugin_name: &str,
+    source_url: &str,
+    subdir: Option<String>,
+    final_dest: &std::path::Path,
+) -> Result<(String, PathBuf), String> {
+    let parent = final_dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    let tmp = parent.join(format!(".{}-pending-install", plugin_name));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sha = match subdir {
+        Some(s) => install::install_plugin_from_subdir(source_url, &s, &tmp),
+        None => install::install_plugin(source_url, &tmp),
+    }?;
+    Ok((sha, tmp))
+}
+
+fn finalize_pending_install(temp_dir: &std::path::Path, final_dir: &std::path::Path) -> Result<(), String> {
+    if final_dir.exists() {
+        let _ = std::fs::remove_dir_all(temp_dir);
+        return Err(format!("{} already exists on disk; uninstall first", final_dir.display()));
+    }
+    std::fs::rename(temp_dir, final_dir)
+        .map_err(|e| format!("finalize install {} -> {}: {}", temp_dir.display(), final_dir.display(), e))
+}
+
+fn cancel_pending_temp(temp_dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+fn summarize_plugin_dir(path: &std::path::Path) -> Vec<String> {
+    let Some(parent) = path.parent() else {
+        return vec!["plugin manifest could not be inspected before install".to_string()];
+    };
+    let Ok(path_abs) = path.canonicalize() else {
+        return vec!["plugin manifest could not be inspected before install".to_string()];
+    };
+    let (plugins, _) = synaps_cli::skills::loader::load_all(&[parent.to_path_buf()]);
+    if let Some(plugin) = plugins.into_iter().find(|plugin| plugin.root == path_abs) {
+        synaps_cli::skills::trust::summarize_plugin_permissions(&plugin).lines()
+    } else {
+        vec!["plugin manifest could not be inspected before install".to_string()]
+    }
+}
+
+fn record_installed_plugin(
+    state: &mut PluginsModalState,
+    plugin_name: String,
+    marketplace_name: Option<String>,
+    source_url: String,
+    installed_commit: String,
+    source_subdir: Option<String>,
+) {
+    state.file.installed.push(InstalledPlugin {
+        name: plugin_name,
+        marketplace: marketplace_name,
+        source_url,
+        installed_commit,
+        latest_commit: None,
+        installed_at: now_rfc3339(),
+        source_subdir,
+    });
+}
+
 async fn run_install_flow(
     state: &mut PluginsModalState,
     plugin_name: String,
@@ -225,19 +294,18 @@ async fn run_install_flow(
             return;
         }
     };
-    // Run git on a blocking thread. Subdir case clones the marketplace
-    // repo and snapshots <repo>/<subdir> into dest; non-subdir case is a
-    // straight shallow clone.
+    // Run git on a blocking thread into a temp directory first. If the plugin has
+    // an executable extension, show the inspected permissions before finalizing.
     let src = source_url.clone();
     let dest_clone = dest.clone();
     let subdir_for_install = subdir.clone();
-    let install_res = tokio::task::spawn_blocking(move || match subdir_for_install {
-        Some(s) => install::install_plugin_from_subdir(&src, &s, &dest_clone),
-        None => install::install_plugin(&src, &dest_clone),
+    let plugin_name_for_task = plugin_name.clone();
+    let install_res = tokio::task::spawn_blocking(move || {
+        install_plugin_to_temp(&plugin_name_for_task, &src, subdir_for_install, &dest_clone)
     })
     .await;
-    let sha = match install_res {
-        Ok(Ok(sha)) => sha,
+    let (sha, temp_dir) = match install_res {
+        Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             state.row_error = Some(e);
             return;
@@ -247,16 +315,35 @@ async fn run_install_flow(
             return;
         }
     };
+    let summary = summarize_plugin_dir(&temp_dir);
+    let has_executable_extension = summary.iter().any(|line| line == "executable extension: yes");
+    if has_executable_extension {
+        state.mode = RightMode::PendingInstallConfirm {
+            plugin_name,
+            source_url,
+            subdir,
+            marketplace_name,
+            summary,
+            installed_commit: sha,
+            temp_dir,
+            final_dir: dest,
+        };
+        state.row_error = None;
+        return;
+    }
+    if let Err(e) = finalize_pending_install(&temp_dir, &dest) {
+        state.row_error = Some(e);
+        return;
+    }
     let plugin_name_for_msg = plugin_name.clone();
-    state.file.installed.push(InstalledPlugin {
-        name: plugin_name,
-        marketplace: marketplace_name,
+    record_installed_plugin(
+        state,
+        plugin_name,
+        marketplace_name,
         source_url,
-        installed_commit: sha,
-        latest_commit: None,
-        installed_at: now_rfc3339(),
-        source_subdir: subdir,
-    });
+        sha,
+        subdir,
+    );
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
             "installed '{}' but failed to save state: {}. Restart may lose this install.",
@@ -266,6 +353,68 @@ async fn run_install_flow(
     }
     reload_registry(registry, config);
     state.mode = RightMode::List;
+    state.row_error = None;
+}
+
+pub(crate) async fn apply_confirm_pending_install(
+    state: &mut PluginsModalState,
+    registry: &Arc<CommandRegistry>,
+    config: &synaps_cli::SynapsConfig,
+) {
+    let RightMode::PendingInstallConfirm {
+        plugin_name,
+        source_url,
+        subdir,
+        marketplace_name,
+        installed_commit,
+        temp_dir,
+        final_dir,
+        ..
+    } = std::mem::replace(&mut state.mode, RightMode::List) else {
+        return;
+    };
+
+    let final_dir_for_task = final_dir.clone();
+    let temp_dir_for_task = temp_dir.clone();
+    let finalize_res = tokio::task::spawn_blocking(move || {
+        finalize_pending_install(&temp_dir_for_task, &final_dir_for_task)
+    }).await;
+    match finalize_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            state.row_error = Some(e);
+            return;
+        }
+        Err(e) => {
+            state.row_error = Some(format!("install finalize task join error: {}", e));
+            return;
+        }
+    }
+
+    record_installed_plugin(
+        state,
+        plugin_name.clone(),
+        marketplace_name,
+        source_url,
+        installed_commit,
+        subdir,
+    );
+    if let Err(e) = commit_plugins_state(&state.file) {
+        state.row_error = Some(format!(
+            "installed '{}' but failed to save state: {}. Restart may lose this install.",
+            plugin_name, e
+        ));
+        return;
+    }
+    reload_registry(registry, config);
+    state.row_error = None;
+}
+
+pub(crate) fn apply_cancel_pending_install(state: &mut PluginsModalState) {
+    let old = std::mem::replace(&mut state.mode, RightMode::List);
+    if let RightMode::PendingInstallConfirm { temp_dir, .. } = old {
+        cancel_pending_temp(&temp_dir);
+    }
     state.row_error = None;
 }
 
@@ -536,6 +685,29 @@ pub(crate) fn apply_toggle_plugin(
     }
 }
 
+fn permission_summary_for_plugin_name(name: &str) -> Option<Vec<String>> {
+    let roots = synaps_cli::skills::loader::default_roots();
+    let (plugins, _) = synaps_cli::skills::loader::load_all(&roots);
+    plugins
+        .into_iter()
+        .find(|plugin| plugin.name == name)
+        .map(|plugin| synaps_cli::skills::trust::summarize_plugin_permissions(&plugin).lines())
+}
+
+pub(crate) fn confirm_enable_plugin(
+    state: &mut PluginsModalState,
+    name: String,
+) {
+    let summary = permission_summary_for_plugin_name(&name).unwrap_or_else(|| {
+        vec!["plugin manifest not found; enabling will reload available plugin content".to_string()]
+    });
+    state.mode = RightMode::Confirm {
+        prompt: format!("Enable plugin '{}'? y/n", name),
+        on_yes: super::state::ConfirmAction::EnablePlugin(name),
+        summary,
+    };
+}
+
 fn set_editor_or_row_error(state: &mut PluginsModalState, msg: String) {
     if let RightMode::AddMarketplaceEditor { error, .. } = &mut state.mode {
         *error = Some(msg);
@@ -544,3 +716,201 @@ fn set_editor_or_row_error(state: &mut PluginsModalState, msg: String) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use synaps_cli::skills::registry::CommandRegistry;
+    use synaps_cli::skills::state::{CachedPlugin, Marketplace, PluginsState};
+
+    static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        old_base_dir: Option<String>,
+        old_git_config_global: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set_base_dir(path: &Path, git_config_global: &Path) -> Self {
+            let old_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+            let old_git_config_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+            synaps_cli::config::set_base_dir_for_tests(path.to_path_buf());
+            std::env::set_var("GIT_CONFIG_GLOBAL", git_config_global);
+            Self { old_base_dir, old_git_config_global }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = &self.old_base_dir {
+                std::env::set_var("SYNAPS_BASE_DIR", old);
+            } else {
+                std::env::remove_var("SYNAPS_BASE_DIR");
+            }
+            if let Some(old) = &self.old_git_config_global {
+                std::env::set_var("GIT_CONFIG_GLOBAL", old);
+            } else {
+                std::env::remove_var("GIT_CONFIG_GLOBAL");
+            }
+        }
+    }
+
+    fn git(args: &[&str], cwd: &Path) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn fixture_plugin_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir_all(work.join(".synaps-plugin")).unwrap();
+        fs::write(
+            work.join(".synaps-plugin/plugin.json"),
+            r#"{
+  "name": "policy-test",
+  "description": "test plugin with an executable extension",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["extension.py"],
+    "permissions": ["tools.intercept"],
+    "hooks": [{"hook": "before_tool_call", "tool": "bash"}]
+  }
+}"#,
+        )
+        .unwrap();
+        fs::write(work.join("extension.py"), "#!/usr/bin/env python3\n").unwrap();
+
+        git(&["init", "-q"], &work);
+        git(&["config", "user.email", "t@t"], &work);
+        git(&["config", "user.name", "t"], &work);
+        git(&["add", "."], &work);
+        git(&["commit", "-q", "-m", "init"], &work);
+
+        let bare = dir.path().join("plugin.git");
+        let work_s = work.to_string_lossy().to_string();
+        let bare_s = bare.to_string_lossy().to_string();
+        git(&["clone", "--bare", "-q", &work_s, &bare_s], dir.path());
+        (dir, bare)
+    }
+
+    fn state_for_marketplace(source_url: String) -> PluginsModalState {
+        PluginsModalState::new(PluginsState {
+            marketplaces: vec![Marketplace {
+                name: "local-market".into(),
+                url: "https://example.invalid/marketplace.json".into(),
+                description: None,
+                last_refreshed: None,
+                cached_plugins: vec![CachedPlugin {
+                    name: "policy-test".into(),
+                    source: source_url,
+                    version: None,
+                    description: Some("fixture".into()),
+                }],
+                repo_url: None,
+            }],
+            installed: vec![],
+            trusted_hosts: vec!["example.invalid/owner".into()],
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_extension_install_can_be_cancelled_without_touching_real_state() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        let (_repo_tmp, bare) = fixture_plugin_repo();
+        let source = format!("file://{}", bare.display());
+        let mut state = state_for_marketplace(source);
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let config = synaps_cli::SynapsConfig::default();
+
+        run_install_flow(
+            &mut state,
+            "policy-test".into(),
+            format!("file://{}", bare.display()),
+            None,
+            Some("local-market".into()),
+            &registry,
+            &config,
+        )
+        .await;
+
+        let (temp_dir, final_dir) = match &state.mode {
+            RightMode::PendingInstallConfirm { temp_dir, final_dir, summary, .. } => {
+                assert!(summary.iter().any(|line| line == "executable extension: yes"));
+                (temp_dir.clone(), final_dir.clone())
+            }
+            other => panic!("expected pending install confirmation, got {other:?}"),
+        };
+        assert!(temp_dir.exists());
+        assert!(temp_dir.ends_with(".policy-test-pending-install"));
+        assert!(!final_dir.exists());
+        assert!(state.file.installed.is_empty());
+
+        apply_cancel_pending_install(&mut state);
+
+        assert!(matches!(state.mode, RightMode::List));
+        assert!(!temp_dir.exists());
+        assert!(!final_dir.exists());
+        assert!(state.file.installed.is_empty());
+        assert!(!home.path().join("plugins.json").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_extension_install_confirm_moves_temp_and_records_plugin() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        let (_repo_tmp, bare) = fixture_plugin_repo();
+        let source = format!("file://{}", bare.display());
+        let mut state = state_for_marketplace(source.clone());
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let config = synaps_cli::SynapsConfig::default();
+
+        run_install_flow(
+            &mut state,
+            "policy-test".into(),
+            source.clone(),
+            None,
+            Some("local-market".into()),
+            &registry,
+            &config,
+        )
+        .await;
+
+        let (temp_dir, final_dir) = match &state.mode {
+            RightMode::PendingInstallConfirm { temp_dir, final_dir, .. } => {
+                (temp_dir.clone(), final_dir.clone())
+            }
+            other => panic!("expected pending install confirmation, got {other:?}"),
+        };
+        assert!(temp_dir.exists());
+        assert!(!final_dir.exists());
+
+        apply_confirm_pending_install(&mut state, &registry, &config).await;
+
+        assert!(matches!(state.mode, RightMode::List));
+        assert!(!temp_dir.exists());
+        assert!(final_dir.join(".synaps-plugin/plugin.json").exists());
+        assert_eq!(state.file.installed.len(), 1);
+        let installed = &state.file.installed[0];
+        assert_eq!(installed.name, "policy-test");
+        assert_eq!(installed.marketplace.as_deref(), Some("local-market"));
+        assert_eq!(installed.source_url, source);
+        assert_eq!(installed.installed_commit.len(), 40);
+
+        let saved = PluginsState::load_from(&home.path().join("plugins.json")).unwrap();
+        assert_eq!(saved.installed.len(), 1);
+        assert_eq!(saved.installed[0].name, "policy-test");
+    }
+}

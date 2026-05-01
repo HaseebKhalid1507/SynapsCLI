@@ -843,24 +843,11 @@ pub async fn run(
                                         steer_tx = Some(s_tx);
                                     }
                                     CommandAction::PluginCommand { command, arg } => {
-                                        match synaps_cli::skills::commands::execute_plugin_command(&command, &arg).await {
-                                            Ok(output) => {
-                                                let mut lines = vec![format!(
-                                                    "plugin command /{}:{} exited with {}",
-                                                    command.plugin,
-                                                    command.name,
-                                                    output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
-                                                )];
-                                                if !output.stdout.trim().is_empty() {
-                                                    lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
-                                                }
-                                                if !output.stderr.trim().is_empty() {
-                                                    lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
-                                                }
-                                                app.push_msg(ChatMessage::System(lines.join("\n")));
-                                            }
-                                            Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
-                                        }
+                                        commands::execute_command_action(
+                                            CommandAction::PluginCommand { command, arg },
+                                            &mut app,
+                                            &runtime,
+                                        ).await;
                                     }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).
@@ -1265,14 +1252,14 @@ let display_text = app.user_display_text_for_submission(&input);
                                         PO::AddMarketplace(url) => {
                                             plugins::actions::apply_add_marketplace(state, url).await;
                                         }
-                                        PO::Install { marketplace, plugin } => {
+                                        PO::InstallRequested { marketplace, plugin } => {
                                             plugins::actions::apply_install(
                                                 state, marketplace, plugin, &registry, &config,
                                             ).await;
                                         }
-                                        PO::TrustAndInstall { plugin_name, host, source } => {
+                                        PO::TrustAndInstall { plugin_name, host, source, summary } => {
                                             plugins::actions::apply_trust_and_install(
-                                                state, plugin_name, host, source, &registry, &config,
+                                                state, plugin_name, host, source, summary, &registry, &config,
                                             ).await;
                                         }
                                         PO::Uninstall(name) => {
@@ -1285,8 +1272,14 @@ let display_text = app.user_display_text_for_submission(&input);
                                                 state, name, &registry, &config,
                                             ).await;
                                         }
-                                        PO::RefreshMarketplace(name) => {
+        PO::RefreshMarketplace(name) => {
                                             plugins::actions::apply_refresh_marketplace(state, name).await;
+                                        }
+                                        PO::ConfirmPendingInstall => {
+                                            plugins::actions::apply_confirm_pending_install(state, &registry, &config).await;
+                                        }
+                                        PO::CancelPendingInstall => {
+                                            plugins::actions::apply_cancel_pending_install(state);
                                         }
                                         PO::RemoveMarketplace(name) => {
                                             plugins::actions::apply_remove_marketplace(
@@ -1297,6 +1290,9 @@ let display_text = app.user_display_text_for_submission(&input);
                                             plugins::actions::apply_toggle_plugin(
                                                 state, name, enabled, &registry, &mut config,
                                             );
+                                        }
+                                        PO::EnablePluginRequested(name) => {
+                                            plugins::actions::confirm_enable_plugin(state, name);
                                         }
                                     }
                                 }

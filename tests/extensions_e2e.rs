@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use synaps_cli::config;
 use synaps_cli::extensions::hooks::events::{HookEvent, HookKind, HookResult};
@@ -10,6 +11,7 @@ use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::ExtensionHandler;
+use synaps_cli::extensions::manifest::ExtensionConfigEntry;
 use synaps_cli::Tool;
 
 fn installed_fixture_script() -> String {
@@ -139,6 +141,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                 matcher: None,
             },
         ],
+        config: vec![],
     };
     manager.load("modify-test", &manifest).await.unwrap();
 
@@ -236,6 +239,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
         args: vec![fixture],
         permissions: vec!["tools.register".to_string()],
         hooks: vec![],
+        config: vec![],
     };
 
     manager.load("register-tool-test", &manifest).await.unwrap();
@@ -283,7 +287,167 @@ async fn extension_registering_tools_requires_tools_register_permission() {
         .join("tests/fixtures/register_tool_extension.py")
         .to_string_lossy()
         .to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("extension.pid");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "env".to_string(),
+        args: vec![
+            format!("SYNAPS_REGISTER_TOOL_PID_FILE={}", pid_file.display()),
+            "python3".to_string(),
+            fixture,
+        ],
+        permissions: vec!["tools.intercept".to_string()],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+            hook: "before_tool_call".to_string(),
+            tool: Some("bash".to_string()),
+            matcher: None,
+        }],
+        config: vec![],
+    };
+
+    let error = manager.load("register-tool-test", &manifest).await.unwrap_err();
+    assert!(error.contains("tools.register"), "{error}");
+    manager.shutdown_all().await;
+
+    let pid: i32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let still_running = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(!still_running, "extension process {pid} leaked after load failure");
+}
+
+#[tokio::test]
+async fn extension_tool_specs_are_validated() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+
+    for (mode, expected) in [
+        ("empty_name", "empty tool name"),
+        ("empty_description", "empty description"),
+        ("duplicate_name", "duplicate tool name"),
+        ("non_object_schema", "input_schema must be a JSON object"),
+    ] {
+        let hook_bus = Arc::new(HookBus::new());
+        let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
+        let mut manager = ExtensionManager::new_with_tools(hook_bus, tools);
+        let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+            runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+            command: "env".to_string(),
+            args: vec![
+                format!("SYNAPS_REGISTER_TOOL_MODE={mode}"),
+                "python3".to_string(),
+                fixture.clone(),
+            ],
+            permissions: vec!["tools.register".to_string()],
+            hooks: vec![],
+            config: vec![],
+        };
+
+        let error = manager.load("invalid-tool-spec", &manifest).await.unwrap_err();
+        assert!(error.contains(expected), "mode={mode}; error={error}");
+        manager.shutdown_all().await;
+    }
+}
+
+#[tokio::test]
+async fn extension_provider_metadata_is_registered_when_permission_is_declared() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_provider_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus);
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        args: vec![fixture],
+        permissions: vec!["providers.register".to_string()],
+        hooks: vec![],
+        config: vec![],
+    };
+
+    manager.load("provider-plugin", &manifest).await.unwrap();
+
+    let providers = manager.providers();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].runtime_id, "provider-plugin:local-llama");
+    assert_eq!(providers[0].spec.models[0].id, "llama-3-8b");
+    manager.shutdown_all().await;
+    assert!(manager.providers().is_empty());
+}
+
+#[tokio::test]
+async fn provider_capability_specs_are_validated() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/register_provider_extension.py")
+        .to_string_lossy()
+        .to_string();
+
+    for (mode, expected) in [
+        ("empty_id", "empty provider id"),
+        ("bad_id", "invalid provider id"),
+        ("empty_display_name", "empty display_name"),
+        ("empty_description", "empty description"),
+        ("empty_models", "must declare at least one model"),
+        ("empty_model_id", "empty model id"),
+        ("duplicate_model_id", "duplicate model id"),
+        ("bad_config_schema", "config_schema must be a JSON object"),
+    ] {
+        let hook_bus = Arc::new(HookBus::new());
+        let mut manager = ExtensionManager::new(hook_bus);
+        let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+            runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+            command: "env".to_string(),
+            args: vec![
+                format!("SYNAPS_PROVIDER_MODE={mode}"),
+                "python3".to_string(),
+                fixture.clone(),
+            ],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![],
+        };
+
+        let error = manager.load("invalid-provider-spec", &manifest).await.unwrap_err();
+        assert!(error.contains(expected), "mode={mode}; error={error}");
+        manager.shutdown_all().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_config_is_resolved_and_passed_to_initialize() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    fs::write(home.path().join("config"), "extension.config-test.endpoint = http://localhost:1234\n").unwrap();
+    std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
+
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/config_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus);
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
@@ -295,11 +459,71 @@ async fn extension_registering_tools_requires_tools_register_permission() {
             tool: Some("bash".to_string()),
             matcher: None,
         }],
+        config: vec![
+            ExtensionConfigEntry {
+                key: "endpoint".to_string(),
+                description: None,
+                required: true,
+                default: None,
+                secret_env: None,
+            },
+            ExtensionConfigEntry {
+                key: "mode".to_string(),
+                description: None,
+                required: false,
+                default: Some(serde_json::json!("safe")),
+                secret_env: None,
+            },
+            ExtensionConfigEntry {
+                key: "token".to_string(),
+                description: None,
+                required: true,
+                default: None,
+                secret_env: Some("CONFIG_TEST_TOKEN".to_string()),
+            },
+        ],
     };
 
-    let error = manager.load("register-tool-test", &manifest).await.unwrap_err();
-    assert!(error.contains("tools.register"), "{error}");
+    manager.load_with_cwd("config-test", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap();
     manager.shutdown_all().await;
+    std::env::remove_var("CONFIG_TEST_TOKEN");
+
+    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(plugin_dir.path().join("config-seen.json")).unwrap()).unwrap();
+    assert_eq!(seen["endpoint"], "http://localhost:1234");
+    assert_eq!(seen["mode"], "safe");
+    assert_eq!(seen["token"], "secret-token");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extension_missing_required_config_fails_before_spawn() {
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    config::set_base_dir_for_tests(home.path().to_path_buf());
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "/definitely/not/spawned".to_string(),
+        args: vec![],
+        permissions: vec!["tools.intercept".to_string()],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+            hook: "before_tool_call".to_string(),
+            tool: Some("bash".to_string()),
+            matcher: None,
+        }],
+        config: vec![ExtensionConfigEntry {
+            key: "endpoint".to_string(),
+            description: None,
+            required: true,
+            default: None,
+            secret_env: None,
+        }],
+    };
+
+    let error = manager.load_with_cwd("missing-config", &manifest, Some(plugin_dir.path().to_path_buf())).await.unwrap_err();
+    assert!(error.contains("missing required config 'endpoint'"), "{error}");
+    assert!(!error.contains("spawn"), "config validation should happen before spawn: {error}");
 }
 
 #[tokio::test(flavor = "current_thread")]

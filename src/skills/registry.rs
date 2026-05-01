@@ -10,14 +10,20 @@ pub struct PluginSummary {
     pub skill_count: usize,
 }
 
+#[derive(Clone, Debug)]
+pub enum RegisteredPluginCommandBackend {
+    Shell { command: String, args: Vec<String> },
+    ExtensionTool { tool: String, input: serde_json::Value },
+    SkillPrompt { skill: String, prompt: String },
+}
+
 /// Resolution outcome for a typed slash command.
 #[derive(Clone, Debug)]
 pub struct RegisteredPluginCommand {
     pub plugin: String,
     pub name: String,
     pub description: Option<String>,
-    pub command: String,
-    pub args: Vec<String>,
+    pub backend: RegisteredPluginCommandBackend,
     pub plugin_root: std::path::PathBuf,
 }
 
@@ -78,13 +84,29 @@ impl CommandRegistry {
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
                 for cmd in manifest.commands {
-                    let q = format!("{}:{}", manifest.name, cmd.name);
+                    let (name, description, backend) = match cmd {
+                        crate::skills::manifest::ManifestCommand::Shell(cmd) => (
+                            cmd.name,
+                            cmd.description,
+                            RegisteredPluginCommandBackend::Shell { command: cmd.command, args: cmd.args },
+                        ),
+                        crate::skills::manifest::ManifestCommand::ExtensionTool(cmd) => (
+                            cmd.name,
+                            cmd.description,
+                            RegisteredPluginCommandBackend::ExtensionTool { tool: cmd.tool, input: cmd.input },
+                        ),
+                        crate::skills::manifest::ManifestCommand::SkillPrompt(cmd) => (
+                            cmd.name,
+                            cmd.description,
+                            RegisteredPluginCommandBackend::SkillPrompt { skill: cmd.skill, prompt: cmd.prompt },
+                        ),
+                    };
+                    let q = format!("{}:{}", manifest.name, name);
                     new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
                         plugin: manifest.name.clone(),
-                        name: cmd.name,
-                        description: cmd.description,
-                        command: cmd.command,
-                        args: cmd.args,
+                        name,
+                        description,
+                        backend,
                         plugin_root: plugin.root.clone(),
                     }));
                 }
@@ -197,7 +219,7 @@ impl CommandRegistry {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use crate::skills::manifest::ManifestCommand;
+    use crate::skills::manifest::{ManifestCommand, ManifestShellCommand};
 
     fn mk_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
         Plugin {
@@ -206,18 +228,20 @@ mod tests {
             marketplace: None,
             version: None,
             description: None,
+            extension: None,
             manifest: Some(crate::skills::manifest::PluginManifest {
                 name: plugin.to_string(),
                 version: None,
                 description: None,
                 keybinds: vec![],
                 compatibility: None,
-                commands: vec![ManifestCommand {
+                commands: vec![ManifestCommand::Shell(ManifestShellCommand {
                     name: name.to_string(),
                     description: Some("desc".to_string()),
                     command: "printf".to_string(),
                     args: vec!["hi".to_string()],
-                }],
+                })],
+                extension: None,
             }),
         }
     }
@@ -355,7 +379,10 @@ mod tests {
             Resolution::PluginCommand(cmd) => {
                 assert_eq!(cmd.plugin, "p");
                 assert_eq!(cmd.name, "hello");
-                assert_eq!(cmd.command, "printf");
+                assert!(matches!(
+                    &cmd.backend,
+                    RegisteredPluginCommandBackend::Shell { command, .. } if command == "printf"
+                ));
                 assert_eq!(cmd.plugin_root, PathBuf::from("/tmp/p"));
             }
             _ => panic!(),

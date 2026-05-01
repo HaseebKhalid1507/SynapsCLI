@@ -18,12 +18,14 @@ pub mod marketplace;
 pub mod install;
 pub mod keybinds;
 pub mod commands;
+pub mod trust;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::skills::registry::CommandRegistry;
 use crate::skills::tool::LoadSkillTool;
+use crate::extensions::manifest::ExtensionManifest;
 
 /// A plugin discovered during skill loading.
 #[derive(Debug, Clone)]
@@ -33,6 +35,7 @@ pub struct Plugin {
     pub marketplace: Option<String>,
     pub version: Option<String>,
     pub description: Option<String>,
+    pub extension: Option<ExtensionManifest>,
     pub manifest: Option<manifest::PluginManifest>,
 }
 

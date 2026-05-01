@@ -1,6 +1,7 @@
 //! Extension manifest model and validation.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::hooks::events::HookKind;
 use super::permissions::PermissionSet;
@@ -31,6 +32,22 @@ pub struct ExtensionManifest {
     /// Hooks the extension wants to subscribe to.
     #[serde(default)]
     pub hooks: Vec<HookSubscription>,
+    /// Non-secret config declarations resolved by Synaps and passed to initialize.
+    #[serde(default)]
+    pub config: Vec<ExtensionConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionConfigEntry {
+    pub key: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<Value>,
+    #[serde(default)]
+    pub secret_env: Option<String>,
 }
 
 /// A validated extension manifest prepared for loading.
@@ -54,8 +71,11 @@ impl ExtensionManifest {
             return Err(format!("Extension '{}' has empty command", id));
         }
 
-        if self.hooks.is_empty() && !self.permissions.iter().any(|permission| permission == "tools.register") {
-            return Err(format!("Extension '{}' must subscribe to at least one hook or request tools.register", id));
+        let has_capability_permission = self.permissions.iter().any(|permission| {
+            matches!(permission.as_str(), "tools.register" | "providers.register")
+        });
+        if self.hooks.is_empty() && !has_capability_permission {
+            return Err(format!("Extension '{}' must subscribe to at least one hook or request a registration permission", id));
         }
 
         let permissions = PermissionSet::try_from_strings(&self.permissions)?;
@@ -249,10 +269,26 @@ mod tests {
                 tool: None,
                 matcher: None,
             }],
+            config: vec![],
         };
 
         let err = manifest.validate("bad-version").unwrap_err();
         assert!(err.contains("unsupported protocol_version 999"));
+    }
+
+    #[test]
+    fn validate_allows_hookless_provider_registration_extensions() {
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: ExtensionRuntime::Process,
+            command: "ext".to_string(),
+            args: vec![],
+            permissions: vec!["providers.register".to_string()],
+            hooks: vec![],
+            config: vec![],
+        };
+
+        manifest.validate("provider-only").unwrap();
     }
 
     #[test]
@@ -268,6 +304,7 @@ mod tests {
                 tool: Some("bash".to_string()),
                 matcher: None,
             }],
+            config: vec![],
         };
 
         let err = manifest.validate("bad-filter").unwrap_err();
@@ -289,6 +326,7 @@ mod tests {
                 tool: Some("bash".to_string()),
                 matcher: None,
             }],
+            config: vec![],
         };
 
         let json = serde_json::to_string(&original).unwrap();

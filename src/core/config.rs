@@ -513,6 +513,21 @@ pub fn load_config() -> SynapsConfig {
     config
 }
 
+/// Read a single config value by exact key from the active config file.
+pub fn read_config_value(key: &str) -> Option<String> {
+    let path = resolve_read_path("config");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if k.trim() == key.trim() {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
 /// Replaces the first existing line that matches the key, or appends if absent.
 /// Preserves comments and unknown keys. Writes atomically via temp file + rename.

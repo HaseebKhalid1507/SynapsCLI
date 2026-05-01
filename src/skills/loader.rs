@@ -211,12 +211,13 @@ fn load_plugin(
     if plugins.iter().any(|p| p.root == root_abs) {
         return;
     }
-    plugins.push(Plugin {
+        plugins.push(Plugin {
         name: m.name.clone(),
         root: root_abs,
         marketplace: marketplace.map(str::to_string),
         version: m.version.clone(),
         description: m.description.clone(),
+        extension: m.extension.clone(),
         manifest: Some(m.clone()),
     });
 
@@ -426,8 +427,13 @@ mod tests {
         assert!(skills.is_empty());
         let commands = &plugins[0].manifest.as_ref().unwrap().commands;
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].name, "hello");
-        assert_eq!(commands[0].command, "printf");
+        match &commands[0] {
+            crate::skills::manifest::ManifestCommand::Shell(cmd) => {
+                assert_eq!(cmd.name, "hello");
+                assert_eq!(cmd.command, "printf");
+            }
+            other => panic!("expected shell command, got {other:?}"),
+        }
     }
 
     #[test]

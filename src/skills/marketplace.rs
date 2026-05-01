@@ -129,6 +129,15 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
             m.name
         ));
     }
+    validate_keywords("marketplace keywords", &m.keywords)?;
+    validate_categories(&m.categories)?;
+    if let Some(trust) = &m.trust {
+        if let Some(homepage) = &trust.homepage {
+            if !homepage.starts_with("https://") {
+                return Err("marketplace trust.homepage must be https://".to_string());
+            }
+        }
+    }
     for p in &m.plugins {
         if !is_safe_plugin_name(&p.name) {
             return Err(format!(
@@ -160,6 +169,36 @@ pub fn validate_manifest(m: &MarketplaceManifest) -> Result<(), String> {
                 "plugin '{}' source must be https:// or ./<name> (got '{}')",
                 p.name, s
             ));
+        }
+        if let Some(category) = &p.category {
+            validate_category(category)?;
+        }
+        validate_keywords(&format!("plugin '{}' keywords", p.name), &p.keywords)?;
+    }
+    Ok(())
+}
+
+fn validate_categories(categories: &[String]) -> Result<(), String> {
+    for category in categories {
+        validate_category(category)?;
+    }
+    Ok(())
+}
+
+fn validate_category(category: &str) -> Result<(), String> {
+    if category.is_empty() || !category.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("invalid marketplace category '{}'", category));
+    }
+    Ok(())
+}
+
+fn validate_keywords(label: &str, keywords: &[String]) -> Result<(), String> {
+    if keywords.len() > 20 {
+        return Err(format!("{} may contain at most 20 entries", label));
+    }
+    for keyword in keywords {
+        if keyword.is_empty() || keyword.len() > 40 || !keyword.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(format!("invalid {} entry '{}'", label, keyword));
         }
     }
     Ok(())
@@ -331,6 +370,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_manifest_accepts_marketplace_metadata() {
+        let m: MarketplaceManifest = serde_json::from_str(r#"{
+            "name":"index",
+            "categories":["productivity"],
+            "keywords":["local-first"],
+            "trust":{"publisher":"Acme","homepage":"https://example.com"},
+            "plugins":[{"name":"p","source":"https://example.com/p.json","category":"tools","keywords":["safe"]}]
+        }"#).unwrap();
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_bad_marketplace_metadata() {
+        let m: MarketplaceManifest = serde_json::from_str(r#"{
+            "name":"index",
+            "categories":["Bad Category"],
+            "keywords":["Local First"],
+            "trust":{"homepage":"http://example.com"},
+            "plugins":[{"name":"p","source":"https://example.com/p.json","category":"bad/category"}]
+        }"#).unwrap();
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
     fn validate_manifest_accepts_https_sources() {
         let m: crate::skills::manifest::MarketplaceManifest = serde_json::from_str(r#"
             {"name":"x","plugins":[{"name":"p","source":"https://github.com/a/b.git"}]}
@@ -390,11 +453,17 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "../etc/hostile".into(),
                 source: "https://github.com/u/r".into(),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
             }],
         };
         assert!(validate_manifest(&m).is_err());
@@ -406,11 +475,17 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "foo/bar".into(),
                 source: "https://github.com/u/r".into(),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
             }],
         };
         assert!(validate_manifest(&m).is_err());
@@ -422,11 +497,17 @@ mod tests {
             name: "mk".into(),
             version: None,
             description: None,
+            categories: vec![],
+            keywords: vec![],
+            trust: None,
             plugins: vec![crate::skills::manifest::MarketplacePluginEntry {
                 name: "web-search_v2".into(),
                 source: "https://github.com/u/r".into(),
                 description: None,
                 version: None,
+                category: None,
+                keywords: vec![],
+                license: None,
             }],
         };
         assert!(validate_manifest(&m).is_ok());

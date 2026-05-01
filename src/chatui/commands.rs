@@ -28,6 +28,7 @@ pub(super) fn to_owned_commands(commands: &[&str]) -> Vec<String> {
 }
 
 /// What the event loop should do after a command executes.
+#[derive(Clone)]
 pub(super) enum CommandAction {
     /// Nothing special — continue the loop.
     None,
@@ -76,6 +77,40 @@ pub(super) enum CommandAction {
     ExtensionsStatus,
     /// Control local voice capture: /voice on|off|status.
     Voice { subcommand: String },
+}
+
+pub(super) async fn execute_command_action(
+    action: CommandAction,
+    app: &mut App,
+    runtime: &Runtime,
+) {
+    match action {
+        CommandAction::PluginCommand { command, arg } => {
+            match synaps_cli::skills::commands::execute_plugin_command_with_tools(
+                &command,
+                &arg,
+                runtime.tools_shared(),
+            ).await {
+                Ok(output) => {
+                    let mut lines = vec![format!(
+                        "plugin command /{}:{} exited with {}",
+                        command.plugin,
+                        command.name,
+                        output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                    )];
+                    if !output.stdout.trim().is_empty() {
+                        lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
+                    }
+                    if !output.stderr.trim().is_empty() {
+                        lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
+                    }
+                    app.push_msg(ChatMessage::System(lines.join("\n")));
+                }
+                Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Levenshtein edit distance between two strings.
@@ -511,23 +546,139 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use synaps_cli::skills::BUILTIN_COMMANDS as ALL_COMMANDS;
-    use super::{edit_distance, fuzzy_match, resolve_prefix};
+    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction};
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use synaps_cli::skills::manifest::ManifestSkillPromptCommand;
+    use synaps_cli::skills::registry::{CommandRegistry, RegisteredPluginCommand, RegisteredPluginCommandBackend};
+    use synaps_cli::{Tool, ToolContext, ToolRegistry};
 
     #[test]
     fn plugins_is_in_all_commands() {
-        assert!(ALL_COMMANDS.contains(&"plugins"));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"plugins"));
     }
 
     #[test]
     fn extensions_is_in_all_commands() {
-        assert!(ALL_COMMANDS.contains(&"extensions"));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"extensions"));
     }
 
     #[test]
     fn resolve_prefix_keeps_exact_plugin_command_name() {
         let cmds = vec!["help".to_string(), "my-plugin:hello".to_string()];
         assert_eq!(resolve_prefix("my-plugin:hello", &cmds), "my-plugin:hello");
+    }
+
+    #[tokio::test]
+    async fn plugin_colon_command_resolves_to_plugin_command_action() {
+        let command = RegisteredPluginCommand {
+            plugin: "policy".to_string(),
+            name: "mode".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::SkillPrompt {
+                skill: "policy".to_string(),
+                prompt: "Mode: ${args}".to_string(),
+            },
+            plugin_root: PathBuf::from("/tmp/policy"),
+        };
+        let registry = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![synaps_cli::skills::Plugin {
+                name: "policy".to_string(),
+                root: PathBuf::from("/tmp/policy"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "policy".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    extension: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
+                        ManifestSkillPromptCommand {
+                            name: command.name.clone(),
+                            description: None,
+                            skill: "policy".to_string(),
+                            prompt: "Mode: ${args}".to_string(),
+                        },
+                    )],
+                }),
+            }],
+        );
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(registry);
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command(
+            "policy:mode",
+            "strict",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!(command.plugin, "policy");
+                assert_eq!(command.name, "mode");
+                assert_eq!(arg, "strict");
+            }
+            _ => panic!("expected plugin command action"),
+        }
+    }
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str { "policy:echo" }
+        fn description(&self) -> &str { "echo" }
+        fn parameters(&self) -> Value { serde_json::json!({"type":"object"}) }
+        async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
+            Ok(format!("echo {}", params["text"].as_str().unwrap_or_default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_command_action_executes_extension_tool_and_prints_result() {
+        let mut tools = ToolRegistry::without_subagent();
+        tools.register(Arc::new(EchoTool));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_tools(tools);
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let command = Arc::new(RegisteredPluginCommand {
+            plugin: "policy".to_string(),
+            name: "echo".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::ExtensionTool {
+                tool: "echo".to_string(),
+                input: serde_json::json!({"text":"${args}"}),
+            },
+            plugin_root: PathBuf::from("/tmp/policy"),
+        });
+
+        execute_command_action(
+            CommandAction::PluginCommand { command, arg: "hello".to_string() },
+            &mut app,
+            &runtime,
+        ).await;
+
+        let last = app.messages.last().expect("system message should be pushed");
+        match &last.msg {
+            crate::chatui::app::ChatMessage::System(text) => {
+                assert!(text.contains("plugin command /policy:echo exited with 0"), "{text}");
+                assert!(text.contains("stdout:\necho hello"), "{text}");
+            }
+            _ => panic!("expected system message"),
+        }
     }
 
     // -- edit_distance tests --

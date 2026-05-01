@@ -17,16 +17,16 @@ const ALL_HOOK_KINDS: [HookKind; 5] = [
     HookKind::OnSessionEnd,
 ];
 
-const ALL_PERMISSIONS: [Permission; 4] = [
+const ALL_PERMISSIONS: [Permission; 5] = [
     Permission::ToolsIntercept,
     Permission::LlmContent,
     Permission::SessionLifecycle,
     Permission::ToolsRegister,
+    Permission::ProvidersRegister,
 ];
 
-const RESERVED_PERMISSIONS: [Permission; 2] = [
+const RESERVED_PERMISSIONS: [Permission; 1] = [
     Permission::ToolsOverride,
-    Permission::ProvidersRegister,
 ];
 
 fn extension_contract() -> Value {
@@ -164,6 +164,7 @@ async fn manager_rejects_bad_manifest_before_spawning_process() {
             tool: Some("bash".to_string()),
             matcher: None,
         }],
+        config: vec![],
     };
 
     let err = manager.load("bad-ext", &manifest).await.unwrap_err();

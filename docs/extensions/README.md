@@ -47,7 +47,7 @@ To install an extension from a git repository:
 git clone https://github.com/example/my-auditor ~/.synaps-cli/plugins/my-auditor
 ```
 
-SynapsCLI scans both locations on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically. If the same plugin directory name exists in both locations, the project-local plugin in `./.synaps/plugins/` overrides the user plugin for that project.
+SynapsCLI scans both locations on startup. Any subdirectory containing a `.synaps-plugin/plugin.json` with a valid `extension` field is loaded automatically. If the same plugin directory name exists in both locations, the project-local plugin in `./.synaps/plugins/` overrides the user plugin for that project. Set `SYNAPS_DISABLE_PROJECT_PLUGINS=1` (also accepts `true`, `yes`, or `on`) to disable project-local extension discovery for a run.
 
 ---
 
@@ -160,8 +160,9 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 | `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
 | `tools.register`    | Register extension-provided tools during initialization                         |
+| `providers.register`| Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 
-Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override` and `providers.register`.
+Reserved future permissions are documented in [permissions.md](./permissions.md) but are rejected if declared today: `tools.override`.
 
 Permissions are checked before events are delivered. An extension that lacks a hook's required permission is not subscribed to that hook.
 

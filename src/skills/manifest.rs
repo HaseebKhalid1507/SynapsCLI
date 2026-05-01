@@ -13,13 +13,40 @@ pub struct PluginCompatibility {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ManifestCommand {
+#[serde(untagged)]
+pub enum ManifestCommand {
+    Shell(ManifestShellCommand),
+    ExtensionTool(ManifestExtensionToolCommand),
+    SkillPrompt(ManifestSkillPromptCommand),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestShellCommand {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestExtensionToolCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub tool: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestSkillPromptCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub skill: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +62,8 @@ pub struct PluginManifest {
     pub compatibility: Option<PluginCompatibility>,
     #[serde(default)]
     pub commands: Vec<ManifestCommand>,
+    #[serde(default)]
+    pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,7 +73,21 @@ pub struct MarketplaceManifest {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub trust: Option<MarketplaceTrust>,
     pub plugins: Vec<MarketplacePluginEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketplaceTrust {
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +98,12 @@ pub struct MarketplacePluginEntry {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub license: Option<String>,
 }
 
 #[cfg(test)]
@@ -110,10 +159,63 @@ mod tests {
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.commands.len(), 1);
-        assert_eq!(m.commands[0].name, "lint");
-        assert_eq!(m.commands[0].description.as_deref(), Some("Run lint"));
-        assert_eq!(m.commands[0].command, "bash");
-        assert_eq!(m.commands[0].args, vec!["scripts/lint.sh"]);
+        match &m.commands[0] {
+            ManifestCommand::Shell(cmd) => {
+                assert_eq!(cmd.name, "lint");
+                assert_eq!(cmd.description.as_deref(), Some("Run lint"));
+                assert_eq!(cmd.command, "bash");
+                assert_eq!(cmd.args, vec!["scripts/lint.sh"]);
+            }
+            other => panic!("expected shell command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_manifest_parses_extension_tool_command() {
+        let json = r#"{
+            "name": "dev-tools",
+            "commands": [
+                {
+                    "name": "echo",
+                    "description": "Echo via extension tool",
+                    "tool": "echo",
+                    "input": {"text": "hello"}
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        match &m.commands[0] {
+            ManifestCommand::ExtensionTool(cmd) => {
+                assert_eq!(cmd.name, "echo");
+                assert_eq!(cmd.tool, "echo");
+                assert_eq!(cmd.input["text"], "hello");
+            }
+            other => panic!("expected extension tool command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_manifest_parses_skill_prompt_command() {
+        let json = r#"{
+            "name": "dev-tools",
+            "commands": [
+                {
+                    "name": "review",
+                    "description": "Run review skill",
+                    "skill": "reviewer",
+                    "prompt": "Review this diff"
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        match &m.commands[0] {
+            ManifestCommand::SkillPrompt(cmd) => {
+                assert_eq!(cmd.name, "review");
+                assert_eq!(cmd.skill, "reviewer");
+                assert_eq!(cmd.prompt, "Review this diff");
+            }
+            other => panic!("expected skill prompt command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -134,16 +236,26 @@ mod tests {
     fn marketplace_manifest_basic() {
         let json = r#"{
             "name": "pi-skills",
+            "version": "1.0.0",
+            "description": "Plugin index",
+            "categories": ["productivity"],
+            "keywords": ["local-first"],
+            "trust": {"publisher":"Maha Media","homepage":"https://example.com"},
             "plugins": [
-                {"name": "web-tools", "source": "./web-tools-plugin"},
-                {"name": "dev-tools", "source": "./dev-tools", "version": "2.0.0"}
+                {"name": "web-tools", "source": "./web-tools-plugin", "category":"research", "keywords":["web"]},
+                {"name": "dev-tools", "source": "./dev-tools", "version": "2.0.0", "license":"MIT"}
             ]
         }"#;
         let m: MarketplaceManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.name, "pi-skills");
+        assert_eq!(m.categories, vec!["productivity"]);
+        assert_eq!(m.keywords, vec!["local-first"]);
+        assert_eq!(m.trust.as_ref().unwrap().publisher.as_deref(), Some("Maha Media"));
         assert_eq!(m.plugins.len(), 2);
         assert_eq!(m.plugins[0].name, "web-tools");
         assert_eq!(m.plugins[0].source, "./web-tools-plugin");
+        assert_eq!(m.plugins[0].category.as_deref(), Some("research"));
+        assert_eq!(m.plugins[0].keywords, vec!["web"]);
     }
 
     #[test]

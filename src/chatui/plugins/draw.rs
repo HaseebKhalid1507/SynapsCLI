@@ -90,10 +90,13 @@ fn render_right(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         RightMode::AddMarketplaceEditor { buffer, error } => {
             render_add_editor(frame, area, buffer, error.as_deref())
         }
-        RightMode::TrustPrompt { plugin_name, host, .. } => {
-            render_trust_prompt(frame, area, plugin_name, host)
+        RightMode::TrustPrompt { plugin_name, host, summary, .. } => {
+            render_trust_prompt(frame, area, plugin_name, host, summary)
         }
-        RightMode::Confirm { prompt, .. } => render_confirm(frame, area, prompt),
+        RightMode::Confirm { prompt, summary, .. } => render_confirm(frame, area, prompt, summary),
+        RightMode::PendingInstallConfirm { plugin_name, summary, .. } => {
+            render_confirm(frame, area, &format!("Install executable plugin '{}'?", plugin_name), summary)
+        }
     }
 }
 
@@ -245,9 +248,9 @@ fn render_right_detail(frame: &mut Frame, area: Rect, state: &PluginsModalState,
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn centered_overlay(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+fn centered_overlay_with_height(frame: &mut Frame, area: Rect, title: &str, height: u16) -> Rect {
     let w = area.width.saturating_sub(4).clamp(24, OVERLAY_MAX_WIDTH);
-    let h = OVERLAY_HEIGHT;
+    let h = height;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect { x, y, width: w, height: h.min(area.height) };
@@ -261,6 +264,10 @@ fn centered_overlay(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner
+}
+
+fn centered_overlay(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    centered_overlay_with_height(frame, area, title, OVERLAY_HEIGHT)
 }
 
 fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&str>) {
@@ -285,37 +292,53 @@ fn render_add_editor(frame: &mut Frame, area: Rect, buffer: &str, error: Option<
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &str) {
-    let inner = centered_overlay(frame, area, " Trust Host ");
+fn render_trust_prompt(frame: &mut Frame, area: Rect, plugin_name: &str, host: &str, summary: &[String]) {
+    let height = (7 + summary.len() as u16).min(area.height.max(1));
+    let inner = centered_overlay_with_height(frame, area, " Trust Plugin ", height);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
-            format!("Trust source {} for plugin {}?", host, plugin_name),
+            format!("Trust source {} and install {}?", host, plugin_name),
             Style::default().fg(THEME.load().claude_text),
         )),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            "  [y]es  [n]o",
-            Style::default().fg(THEME.load().help_fg),
-        )),
     ];
+    for line in summary {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            Style::default().fg(THEME.load().help_fg),
+        )));
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled(
+        "  [y]es  [n]o",
+        Style::default().fg(THEME.load().help_fg),
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str) {
-    let inner = centered_overlay(frame, area, " Confirm ");
+fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str, summary: &[String]) {
+    let height = (5 + summary.len() as u16).max(OVERLAY_HEIGHT).min(area.height.max(1));
+    let inner = centered_overlay_with_height(frame, area, " Confirm ", height);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             prompt.to_string(),
             Style::default().fg(THEME.load().claude_text),
         )),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            "  [y]es  [n]o",
-            Style::default().fg(THEME.load().help_fg),
-        )),
     ];
+    for line in summary {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            Style::default().fg(THEME.load().help_fg),
+        )));
+    }
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled(
+        "  [y]es  [n]o",
+        Style::default().fg(THEME.load().help_fg),
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -325,6 +348,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         (_, RightMode::AddMarketplaceEditor { .. }) => "Type URL  Enter submit  Esc cancel",
         (_, RightMode::TrustPrompt { .. }) => "y trust  n cancel",
         (_, RightMode::Confirm { .. }) => "y yes  n no  Esc cancel",
+        (_, RightMode::PendingInstallConfirm { .. }) => "y install  n cancel  Esc cancel",
         (Focus::Left, RightMode::List) => {
             "↑↓ nav  Tab switch  Enter select  r refresh  R remove  Esc close"
         }

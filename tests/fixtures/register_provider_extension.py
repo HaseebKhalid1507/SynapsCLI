@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 import json
 import os
-import signal
 import sys
 
-
-MODE = os.environ.get("SYNAPS_REGISTER_TOOL_MODE", "valid")
-PID_FILE = os.environ.get("SYNAPS_REGISTER_TOOL_PID_FILE")
-if PID_FILE:
-    with open(PID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+MODE = os.environ.get("SYNAPS_PROVIDER_MODE", "valid")
 
 
 def read_message():
@@ -39,24 +33,41 @@ def write_message(request, result=None, error=None):
     sys.stdout.buffer.flush()
 
 
-def tool_specs():
-    valid = {
-        "name": "echo",
-        "description": "Echo text",
-        "input_schema": {
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
+def provider_specs():
+    model = {
+        "id": "llama-3-8b",
+        "display_name": "Llama 3 8B",
+        "capabilities": {
+            "streaming": True,
+            "tool_use": False,
+            "vision": False,
+            "reasoning": False,
         },
+        "context_window": 8192,
     }
-    if MODE == "empty_name":
-        return [{**valid, "name": ""}]
+    valid = {
+        "id": "local-llama",
+        "display_name": "Local Llama",
+        "description": "Local model provider",
+        "models": [model],
+        "config_schema": {"type": "object"},
+    }
+    if MODE == "empty_id":
+        return [{**valid, "id": ""}]
+    if MODE == "bad_id":
+        return [{**valid, "id": "Local Llama"}]
+    if MODE == "empty_display_name":
+        return [{**valid, "display_name": ""}]
     if MODE == "empty_description":
         return [{**valid, "description": ""}]
-    if MODE == "duplicate_name":
-        return [valid, valid]
-    if MODE == "non_object_schema":
-        return [{**valid, "input_schema": True}]
+    if MODE == "empty_models":
+        return [{**valid, "models": []}]
+    if MODE == "empty_model_id":
+        return [{**valid, "models": [{**model, "id": ""}]}]
+    if MODE == "duplicate_model_id":
+        return [{**valid, "models": [model, model]}]
+    if MODE == "bad_config_schema":
+        return [{**valid, "config_schema": True}]
     return [valid]
 
 
@@ -68,14 +79,8 @@ while True:
     if method == "initialize":
         write_message(request, {
             "protocol_version": 1,
-            "capabilities": {"tools": tool_specs()},
+            "capabilities": {"providers": provider_specs()},
         })
-    elif method == "tool.call":
-        params = request.get("params") or {}
-        if params.get("name") == "echo":
-            write_message(request, {"content": f"echo: {params.get('input', {}).get('text', '')}"})
-        else:
-            write_message(request, error={"code": -32602, "message": "unknown tool"})
     elif method == "hook.handle":
         write_message(request, {"action": "continue"})
     elif method == "shutdown":

@@ -40,9 +40,9 @@ Content-Length: <byte-length-of-body>\r\n
 **Example frame (runtime → extension):**
 
 ```
-Content-Length: 187\r\n
+Content-Length: <byte-length>\r\n
 \r\n
-{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"hook":"before_tool_call","tool":"bash","session_id":"sess-abc","input":{"command":"ls -la"},"timestamp":"2024-11-14T10:23:01Z"}}
+{"jsonrpc":"2.0","id":"evt-001","method":"hook.handle","params":{"kind":"before_tool_call","tool_name":"bash","tool_runtime_name":"bash","tool_input":{"command":"ls -la"},"tool_output":null,"message":null,"session_id":null,"transcript":null,"data":null}}
 ```
 
 **Example frame (extension → runtime):**
@@ -136,6 +136,58 @@ Extensions that request `tools.register` may declare extension-provided tools in
 Registered tool runtime names are namespaced as `plugin-id:tool-name` to avoid
 collisions. API-facing tool names are sanitized by the normal tool registry, for
 example `policy-bundle:echo` becomes `policy-bundle_echo`.
+
+### Extension config
+
+Plugins may declare configuration entries in `.synaps-plugin/plugin.json` under
+`extension.config`. Synaps resolves these values before spawning the extension and
+passes the resolved object to `initialize` as `params.config`.
+
+```json
+{
+  "extension": {
+    "config": [
+      {
+        "key": "endpoint",
+        "description": "Local service endpoint",
+        "required": true,
+        "default": "http://127.0.0.1:8080"
+      },
+      {
+        "key": "api_key",
+        "description": "Service API key",
+        "required": true,
+        "secret_env": "MY_PLUGIN_API_KEY"
+      }
+    ]
+  }
+}
+```
+
+Config entry fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `key` | string | yes | Config key name. Use lowercase letters/numbers plus `_` or `-`; avoid dots, slashes, and spaces. |
+| `description` | string | no | Human-readable explanation for inspection UIs. |
+| `required` | boolean | no | If true, loading fails before process spawn when no value can be resolved. |
+| `default` | JSON value | no | Non-secret fallback value. |
+| `secret_env` | string | no | Environment variable name that contains a secret value. |
+
+Resolution order is:
+
+1. Environment override: `SYNAPS_EXTENSION_<PLUGIN_ID>_<KEY>`
+2. User config key: `extension.<plugin-id>.<key>`
+3. The environment variable named by `secret_env`
+4. Manifest `default`
+5. Error if the entry is `required`
+
+For environment override names, `<PLUGIN_ID>` and `<KEY>` are uppercased and
+non-alphanumeric characters are converted to `_`. For example, plugin
+`safe-bash` key `api_key` uses `SYNAPS_EXTENSION_SAFE_BASH_API_KEY` or the user
+config key `extension.safe-bash.api_key`.
+
+Secrets should use `secret_env`; do not put secret values in `default`.
 
 ---
 
@@ -242,34 +294,31 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 
 ```json
 {
-  "hook": "before_tool_call",
-  "tool": "bash",
-  "session_id": "sess-abc123",
-  "input": {
+  "kind": "before_tool_call",
+  "tool_name": "bash",
+  "tool_runtime_name": "bash",
+  "tool_input": {
     "command": "rm -rf /tmp/scratch"
   },
-  "output": null,
+  "tool_output": null,
   "message": null,
-  "role": null,
-  "timestamp": "2024-11-14T10:23:01Z",
-  "metadata": {
-    "model": "claude-opus-4-5",
-    "turn": 3
-  }
+  "session_id": null,
+  "transcript": null,
+  "data": null
 }
 ```
 
-| Field        | Type               | Present on hooks                              | Description                                               |
-|--------------|--------------------|-----------------------------------------------|-----------------------------------------------------------|
-| `hook`       | string             | all                                           | The hook name that fired                                  |
-| `tool`       | string \| null     | `before_tool_call`, `after_tool_call`         | Name of the tool being called                             |
-| `session_id` | string             | all                                           | Stable identifier for the current session                 |
-| `input`      | object \| null     | `before_tool_call`                            | The raw input arguments passed to the tool                |
-| `output`     | object \| null     | `after_tool_call`                             | The result returned by the tool                           |
-| `message`    | string \| null     | `before_message`                              | The message content (null without `privacy.llm_content`)  |
-| `role`       | string \| null     | `before_message`                              | `"user"` or `"assistant"`                                 |
-| `timestamp`  | string (ISO 8601)  | all                                           | When the event was generated, in UTC                      |
-| `metadata`   | object             | all                                           | Runtime context: active model, turn count, etc.           |
+| Field               | Type            | Present on hooks                              | Description                                                      |
+|---------------------|-----------------|-----------------------------------------------|------------------------------------------------------------------|
+| `kind`              | string          | all                                           | The hook name that fired (e.g. `"before_tool_call"`)             |
+| `tool_name`         | string \| null  | `before_tool_call`, `after_tool_call`         | API-safe name of the tool being called                           |
+| `tool_runtime_name` | string \| null  | `before_tool_call`, `after_tool_call`         | Original runtime tool name (before API sanitization)             |
+| `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
+| `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)             |
+| `message`           | string \| null  | `before_message`                              | The message content (null without `privacy.llm_content`)         |
+| `session_id`        | string \| null  | `on_session_start`, `on_session_end`          | Stable identifier for the current session                        |
+| `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
+| `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
 
@@ -493,8 +542,9 @@ Relative command paths and local argument paths are resolved from the plugin dir
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
 | `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
+| `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 
-Reserved future permissions are rejected if declared today: `providers.register` and `tools.override`.
+Reserved future permissions are rejected if declared today: `tools.override`.
 
 Permissions are enforced before hook subscriptions are installed. Unknown permission strings are rejected, reserved permission strings are rejected, and a hook subscription without its required permission fails manifest loading.
 

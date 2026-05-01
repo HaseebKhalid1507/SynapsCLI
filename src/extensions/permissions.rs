@@ -55,7 +55,7 @@ impl Permission {
     pub fn is_reserved(&self) -> bool {
         matches!(
             self,
-            Self::ToolsOverride | Self::ProvidersRegister
+            Self::ToolsOverride
         )
     }
 }
@@ -171,6 +171,15 @@ mod tests {
         let perms = PermissionSet::new();
         assert!(perms.is_empty());
         assert_eq!(perms.len(), 0);
+    }
+
+    #[test]
+    fn providers_register_is_active_but_tools_override_remains_reserved() {
+        let perms = PermissionSet::try_from_strings(&["providers.register".to_string()]).unwrap();
+        assert!(perms.has(Permission::ProvidersRegister));
+
+        let err = PermissionSet::try_from_strings(&["tools.override".to_string()]).unwrap_err();
+        assert!(err.contains("Reserved extension permission"));
     }
 
     #[test]

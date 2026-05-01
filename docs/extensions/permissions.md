@@ -15,6 +15,7 @@ These are the only permissions currently accepted in `extension.permissions`:
 | `privacy.llm_content` | Subscribe to `before_message` and receive message content |
 | `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
 | `tools.register` | Register extension-provided tools during initialization |
+| `providers.register` | Register extension-provided provider metadata during initialization; chat routing is not wired yet |
 
 ## Reserved permissions
 
@@ -24,7 +25,6 @@ plugins today:
 | Permission | Reserved for |
 |---|---|
 | `tools.override` | Replacing or wrapping built-in tool implementations |
-| `providers.register` | Registering extension-provided model providers |
 
 If a manifest includes a reserved permission, SynapsCLI rejects the extension
 with a validation error instead of silently granting future power.

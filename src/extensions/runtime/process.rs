@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,34 @@ pub struct RegisteredExtensionToolSpec {
     pub input_schema: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RegisteredProviderSpec {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub models: Vec<RegisteredProviderModelSpec>,
+    #[serde(default)]
+    pub config_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RegisteredProviderModelSpec {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub capabilities: Value,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InitializeCapabilitiesResult {
+    pub tools: Vec<RegisteredExtensionToolSpec>,
+    pub providers: Vec<RegisteredProviderSpec>,
+}
+
 #[derive(Deserialize)]
 struct InitializeResult {
     protocol_version: u32,
@@ -73,6 +102,8 @@ struct InitializeResult {
 struct InitializeCapabilities {
     #[serde(default)]
     tools: Vec<RegisteredExtensionToolSpec>,
+    #[serde(default)]
+    providers: Vec<RegisteredProviderSpec>,
 }
 
 struct ProcessState {
@@ -183,7 +214,7 @@ impl ProcessExtension {
         self.restart_count.load(Ordering::Relaxed)
     }
 
-    pub async fn initialize(&self, plugin_root: Option<PathBuf>) -> Result<Vec<RegisteredExtensionToolSpec>, String> {
+    pub async fn initialize(&self, plugin_root: Option<PathBuf>, config: Value) -> Result<InitializeCapabilitiesResult, String> {
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
@@ -191,13 +222,13 @@ impl ProcessExtension {
             plugin_root: plugin_root
                 .or_else(|| self.cwd.clone())
                 .map(|path| path.to_string_lossy().to_string()),
-            config: Value::Object(Default::default()),
+            config,
         };
         let value = self.call_no_restart("initialize", serde_json::to_value(params).map_err(|e| e.to_string())?).await?;
         Self::parse_initialize_result(&self.id, value)
     }
 
-    fn parse_initialize_result(id: &str, value: Value) -> Result<Vec<RegisteredExtensionToolSpec>, String> {
+    fn parse_initialize_result(id: &str, value: Value) -> Result<InitializeCapabilitiesResult, String> {
         let result: InitializeResult = serde_json::from_value(value)
             .map_err(|e| format!("Invalid initialize response from extension '{}': {}", id, e))?;
         if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
@@ -206,12 +237,106 @@ impl ProcessExtension {
                 id, result.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
             ));
         }
-        Ok(result.capabilities.tools)
+        Self::validate_registered_tool_specs(id, &result.capabilities.tools)?;
+        Self::validate_registered_provider_specs(id, &result.capabilities.providers)?;
+        Ok(InitializeCapabilitiesResult {
+            tools: result.capabilities.tools,
+            providers: result.capabilities.providers,
+        })
+    }
+
+    fn validate_registered_tool_specs(id: &str, tools: &[RegisteredExtensionToolSpec]) -> Result<(), String> {
+        let mut names = HashSet::new();
+        for tool in tools {
+            let name = tool.name.trim();
+            if name.is_empty() {
+                return Err(format!("Extension '{}' registered a tool with an empty tool name", id));
+            }
+            if !names.insert(name.to_string()) {
+                return Err(format!("Extension '{}' registered duplicate tool name '{}'", id, name));
+            }
+            if tool.description.trim().is_empty() {
+                return Err(format!(
+                    "Extension '{}' registered tool '{}' with an empty description",
+                    id, name,
+                ));
+            }
+            if !tool.input_schema.is_object() {
+                return Err(format!(
+                    "Extension '{}' registered tool '{}' with invalid input_schema: input_schema must be a JSON object",
+                    id, name,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_registered_provider_specs(id: &str, providers: &[RegisteredProviderSpec]) -> Result<(), String> {
+        for provider in providers {
+            let provider_id = provider.id.trim();
+            if provider_id.is_empty() {
+                return Err(format!("Extension '{}' registered provider with empty provider id", id));
+            }
+            if !Self::is_safe_provider_id(provider_id) {
+                return Err(format!(
+                    "Extension '{}' registered provider '{}' with invalid provider id",
+                    id, provider_id,
+                ));
+            }
+            if provider.display_name.trim().is_empty() {
+                return Err(format!(
+                    "Extension '{}' registered provider '{}' with empty display_name",
+                    id, provider_id,
+                ));
+            }
+            if provider.description.trim().is_empty() {
+                return Err(format!(
+                    "Extension '{}' registered provider '{}' with empty description",
+                    id, provider_id,
+                ));
+            }
+            if provider.models.is_empty() {
+                return Err(format!(
+                    "Extension '{}' registered provider '{}' must declare at least one model",
+                    id, provider_id,
+                ));
+            }
+            let mut model_ids = HashSet::new();
+            for model in &provider.models {
+                let model_id = model.id.trim();
+                if model_id.is_empty() {
+                    return Err(format!(
+                        "Extension '{}' registered provider '{}' with empty model id",
+                        id, provider_id,
+                    ));
+                }
+                if !model_ids.insert(model_id.to_string()) {
+                    return Err(format!(
+                        "Extension '{}' registered provider '{}' with duplicate model id '{}'",
+                        id, provider_id, model_id,
+                    ));
+                }
+            }
+            if let Some(config_schema) = &provider.config_schema {
+                if !config_schema.is_object() {
+                    return Err(format!(
+                        "Extension '{}' registered provider '{}' with invalid config_schema: config_schema must be a JSON object",
+                        id, provider_id,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_safe_provider_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     }
 
     #[doc(hidden)]
     pub async fn initialize_for_test(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
-        self.initialize(plugin_root).await.map(|_| ())
+        self.initialize(plugin_root, Value::Object(Default::default())).await.map(|_| ())
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
