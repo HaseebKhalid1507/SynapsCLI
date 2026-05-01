@@ -65,6 +65,47 @@ pub struct PluginManifest {
     pub commands: Vec<ManifestCommand>,
     #[serde(default)]
     pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
+    #[serde(default)]
+    pub provides: Option<PluginProvides>,
+}
+
+/// Plugin-provided capabilities consumed by Synaps CLI core.
+///
+/// Currently only `voice_sidecar` is recognised. A plugin advertises a
+/// voice sidecar binary by setting `provides.voice_sidecar.command`; the
+/// integration layer in `src/voice/` discovers and supervises it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct PluginProvides {
+    #[serde(default)]
+    pub voice_sidecar: Option<VoiceSidecarManifest>,
+}
+
+/// Sidecar binary that Synaps CLI launches to provide voice dictation.
+///
+/// `command` is resolved relative to the plugin root unless absolute.
+/// `protocol_version` is matched against the line-JSON protocol version
+/// understood by `src/voice/protocol.rs` (currently `1`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VoiceSidecarManifest {
+    pub command: String,
+    #[serde(default)]
+    pub setup: Option<String>,
+    #[serde(default = "default_voice_protocol_version")]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub model: Option<VoiceSidecarModel>,
+}
+
+fn default_voice_protocol_version() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct VoiceSidecarModel {
+    #[serde(default)]
+    pub default_path: Option<String>,
+    #[serde(default)]
+    pub required_for_real_stt: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +187,43 @@ mod tests {
         assert_eq!(m.description.as_deref(), Some("Web tools"));
         assert_eq!(m.compatibility.as_ref().unwrap().synaps.as_deref(), Some(">=0.1.0"));
         assert_eq!(m.compatibility.as_ref().unwrap().extension_protocol.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn plugin_manifest_parses_provides_voice_sidecar() {
+        let json = r#"{
+            "name": "local-voice",
+            "provides": {
+                "voice_sidecar": {
+                    "command": "bin/synaps-voice-plugin",
+                    "setup": "scripts/setup.sh",
+                    "protocol_version": 1,
+                    "model": {
+                        "default_path": "~/.synaps-cli/models/whisper/ggml-base.en.bin",
+                        "required_for_real_stt": true
+                    }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let provides = m.provides.expect("provides should deserialize");
+        let sidecar = provides.voice_sidecar.expect("voice_sidecar should deserialize");
+        assert_eq!(sidecar.command, "bin/synaps-voice-plugin");
+        assert_eq!(sidecar.setup.as_deref(), Some("scripts/setup.sh"));
+        assert_eq!(sidecar.protocol_version, 1);
+        let model = sidecar.model.expect("model should deserialize");
+        assert_eq!(
+            model.default_path.as_deref(),
+            Some("~/.synaps-cli/models/whisper/ggml-base.en.bin")
+        );
+        assert!(model.required_for_real_stt);
+    }
+
+    #[test]
+    fn plugin_manifest_without_provides_is_ok() {
+        let json = r#"{"name":"plain"}"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.provides.is_none());
     }
 
     #[test]

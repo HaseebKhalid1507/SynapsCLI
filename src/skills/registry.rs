@@ -242,6 +242,7 @@ mod tests {
                     args: vec!["hi".to_string()],
                 })],
                 extension: None,
+                provides: None,
             }),
         }
     }
