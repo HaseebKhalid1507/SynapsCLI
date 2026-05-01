@@ -240,7 +240,20 @@ impl ExtensionHandler for ProcessExtension {
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match self.call("hook.handle", params).await {
-            Ok(value) => serde_json::from_value(value).unwrap_or(HookResult::Continue),
+            Ok(value) => {
+                match serde_json::from_value::<HookResult>(value.clone()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::warn!(
+                            extension = %self.id,
+                            error = %e,
+                            raw = %value,
+                            "Extension returned malformed hook result — failing open",
+                        );
+                        HookResult::Continue
+                    }
+                }
+            },
             Err(e) => {
                 tracing::warn!(
                     extension = %self.id,
