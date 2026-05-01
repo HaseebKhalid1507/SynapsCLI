@@ -9,10 +9,11 @@ use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::manifest::HookMatcher;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
 
-const ALL_HOOK_KINDS: [HookKind; 5] = [
+const ALL_HOOK_KINDS: [HookKind; 6] = [
     HookKind::BeforeToolCall,
     HookKind::AfterToolCall,
     HookKind::BeforeMessage,
+    HookKind::OnMessageComplete,
     HookKind::OnSessionStart,
     HookKind::OnSessionEnd,
 ];
@@ -141,6 +142,19 @@ fn after_tool_call_truncates_utf8_safely() {
 
     let truncated = event.tool_output.expect("after_tool_call should carry output");
     assert!(truncated.contains("[truncated"));
+}
+
+#[test]
+fn on_message_complete_event_carries_assistant_content_as_message() {
+    let event = HookEvent::on_message_complete("Final answer", serde_json::json!({"content_block_count": 1}));
+
+    assert_eq!(event.kind, HookKind::OnMessageComplete);
+    assert_eq!(event.message.as_deref(), Some("Final answer"));
+    assert_eq!(event.data["content_block_count"], 1);
+    assert!(event.tool_input.is_none());
+    assert!(event.tool_output.is_none());
+    assert!(event.session_id.is_none());
+    assert!(event.transcript.is_none());
 }
 
 #[tokio::test]

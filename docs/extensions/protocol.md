@@ -315,12 +315,37 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_runtime_name` | string \| null  | `before_tool_call`, `after_tool_call`         | Original runtime tool name (before API sanitization)             |
 | `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
 | `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)             |
-| `message`           | string \| null  | `before_message`                              | The message content (null without `privacy.llm_content`)         |
+| `message`           | string \| null  | `before_message`, `on_message_complete`       | User/assistant message content for message hooks                 |
 | `session_id`        | string \| null  | `on_session_start`, `on_session_end`          | Stable identifier for the current session                        |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
 | `data`              | any             | all                                           | Extension-defined pass-through data; `null` in runtime events    |
 
 Fields that are not applicable to the current hook are always `null`, never omitted. You can safely access any field without a key-existence check.
+
+### `on_message_complete`
+
+`on_message_complete` is emitted after an assistant response is completed and
+added to session history. It requires `privacy.llm_content` and supports only
+`continue`. `message` contains concatenated assistant text blocks when present;
+tool-use blocks are summarized in `data` instead of being serialized into
+`message`.
+
+```json
+{
+  "kind": "on_message_complete",
+  "tool_name": null,
+  "tool_runtime_name": null,
+  "tool_input": null,
+  "tool_output": null,
+  "message": "The build passed.",
+  "session_id": null,
+  "transcript": null,
+  "data": {
+    "content_block_count": 1,
+    "has_tool_use": false
+  }
+}
+```
 
 ---
 

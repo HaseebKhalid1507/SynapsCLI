@@ -29,6 +29,8 @@ pub enum HookKind {
     AfterToolCall,
     /// Fires before an LLM message is sent. Handlers may inspect or block.
     BeforeMessage,
+    /// Fires after an assistant response is completed and added to history.
+    OnMessageComplete,
     /// Fires when a new session is created.
     OnSessionStart,
     /// Fires when a session is torn down.
@@ -43,6 +45,7 @@ impl HookKind {
             Self::BeforeToolCall => "before_tool_call",
             Self::AfterToolCall => "after_tool_call",
             Self::BeforeMessage => "before_message",
+            Self::OnMessageComplete => "on_message_complete",
             Self::OnSessionStart => "on_session_start",
             Self::OnSessionEnd => "on_session_end",
         }
@@ -57,6 +60,7 @@ impl HookKind {
             "before_tool_call" => Some(Self::BeforeToolCall),
             "after_tool_call" => Some(Self::AfterToolCall),
             "before_message" => Some(Self::BeforeMessage),
+            "on_message_complete" => Some(Self::OnMessageComplete),
             "on_session_start" => Some(Self::OnSessionStart),
             "on_session_end" => Some(Self::OnSessionEnd),
             _ => None,
@@ -69,7 +73,7 @@ impl HookKind {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue"],
             Self::BeforeMessage => &["continue", "inject"],
-            Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
+            Self::OnMessageComplete | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -98,7 +102,7 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage => Permission::LlmContent,
+            Self::BeforeMessage | Self::OnMessageComplete => Permission::LlmContent,
             Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
@@ -110,13 +114,14 @@ impl HookKind {
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
 ///
-/// | Kind              | tool_name | tool_input | tool_output | message | session_id |
-/// |-------------------|-----------|------------|-------------|---------|------------|
-/// | `before_tool_call`| ✓         | ✓          |             |         |            |
-/// | `after_tool_call` | ✓         | ✓          | ✓           |         |            |
-/// | `before_message`  |           |            |             | ✓       |            |
-/// | `on_session_start`|           |            |             |         | ✓          |
-/// | `on_session_end`  |           |            |             |         | ✓          |
+/// | Kind                  | tool_name | tool_input | tool_output | message | session_id |
+/// |-----------------------|-----------|------------|-------------|---------|------------|
+/// | `before_tool_call`    | ✓         | ✓          |             |         |            |
+/// | `after_tool_call`     | ✓         | ✓          | ✓           |         |            |
+/// | `before_message`      |           |            |             | ✓       |            |
+/// | `on_message_complete` |           |            |             | ✓       |            |
+/// | `on_session_start`    |           |            |             |         | ✓          |
+/// | `on_session_end`      |           |            |             |         | ✓          |
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -212,6 +217,21 @@ impl HookEvent {
         }
     }
 
+    /// Construct an `on_message_complete` event.
+    pub fn on_message_complete(message: &str, data: Value) -> Self {
+        Self {
+            kind: HookKind::OnMessageComplete,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            message: Some(message.to_string()),
+            session_id: None,
+            tool_runtime_name: None,
+            transcript: None,
+            data,
+        }
+    }
+
     /// Construct an `on_session_start` event.
     pub fn on_session_start(session_id: &str) -> Self {
         Self {
@@ -290,6 +310,7 @@ mod tests {
             HookKind::BeforeToolCall,
             HookKind::AfterToolCall,
             HookKind::BeforeMessage,
+            HookKind::OnMessageComplete,
             HookKind::OnSessionStart,
             HookKind::OnSessionEnd,
         ];
@@ -334,6 +355,10 @@ mod tests {
         );
         assert_eq!(
             HookKind::BeforeMessage.required_permission(),
+            Permission::LlmContent
+        );
+        assert_eq!(
+            HookKind::OnMessageComplete.required_permission(),
             Permission::LlmContent
         );
         assert_eq!(
@@ -385,6 +410,19 @@ mod tests {
         assert!(ev.tool_input.is_none());
         assert!(ev.tool_output.is_none());
         assert_eq!(ev.message.as_deref(), Some("Hello, LLM"));
+        assert!(ev.session_id.is_none());
+    }
+
+    #[test]
+    fn hook_event_on_message_complete() {
+        let ev = HookEvent::on_message_complete("Done", json!({"content_block_count": 1}));
+
+        assert_eq!(ev.kind, HookKind::OnMessageComplete);
+        assert!(ev.tool_name.is_none());
+        assert!(ev.tool_input.is_none());
+        assert!(ev.tool_output.is_none());
+        assert_eq!(ev.message.as_deref(), Some("Done"));
+        assert_eq!(ev.data["content_block_count"], 1);
         assert!(ev.session_id.is_none());
     }
 

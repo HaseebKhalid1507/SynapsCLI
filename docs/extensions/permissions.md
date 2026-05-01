@@ -12,7 +12,7 @@ These are the only permissions currently accepted in `extension.permissions`:
 | Permission | Allows |
 |---|---|
 | `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` |
-| `privacy.llm_content` | Subscribe to `before_message` and receive message content |
+| `privacy.llm_content` | Subscribe to `before_message` and `on_message_complete`; receive message content |
 | `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
 | `tools.register` | Register extension-provided tools during initialization |
 | `providers.register` | Register extension-provided provider metadata during initialization; chat routing is not wired yet |

@@ -8,6 +8,7 @@ use crate::{Result, RuntimeError, ToolRegistry};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 use super::{BeforeToolCallDecision, emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision};
+use crate::extensions::hooks::events::HookEvent;
 use super::api::ApiMethods;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
@@ -44,6 +45,20 @@ pub(super) struct StreamSession {
 }
 
 pub(super) struct StreamMethods;
+
+fn assistant_text_from_content(content: &[Value]) -> String {
+    content
+        .iter()
+        .filter_map(|item| {
+            if item["type"].as_str() == Some("text") {
+                item["text"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 impl StreamMethods {
     pub(super) async fn run_stream_internal(
@@ -159,6 +174,16 @@ impl StreamMethods {
                     "role": "assistant",
                     "content": content
                 }));
+
+                let assistant_text = assistant_text_from_content(content);
+                let hook_event = HookEvent::on_message_complete(
+                    &assistant_text,
+                    json!({
+                        "content_block_count": content.len(),
+                        "has_tool_use": !tool_uses.is_empty(),
+                    }),
+                );
+                let _ = hook_bus.emit(&hook_event).await;
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.

@@ -28,6 +28,7 @@ name.
 | `before_tool_call` | `tools.intercept` | yes | `continue`, `block`, `confirm`, `modify` | Inspect/block/confirm/modify a tool call before execution |
 | `after_tool_call` | `tools.intercept` | yes | `continue` | Observe tool input/output after execution |
 | `before_message` | `privacy.llm_content` | no | `continue`, `inject` | Inspect the user message and optionally inject context |
+| `on_message_complete` | `privacy.llm_content` | no | `continue` | Observe completed assistant responses |
 | `on_session_start` | `session.lifecycle` | no | `continue` | Observe session creation |
 | `on_session_end` | `session.lifecycle` | no | `continue` | Observe session shutdown and transcript |
 
@@ -45,6 +46,12 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   model context. It is accepted only on `before_message`.
 - `modify` replaces the tool input before execution. It is accepted only on
   `before_tool_call`; the first modifier stops the handler chain.
+
+`on_message_complete` fires after an assistant response is added to session
+history. It requires `privacy.llm_content` and is observe-only. The `message`
+field contains concatenated assistant text blocks when present; tool-use blocks
+are not serialized into `message`. Summary metadata is available in `data`,
+including `content_block_count` and `has_tool_use`.
 
 `block`, `confirm`, and `modify` all stop the `before_tool_call` handler chain in
 registration order. Put high-priority security policy extensions earlier in plugin
