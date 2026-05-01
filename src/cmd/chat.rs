@@ -35,7 +35,7 @@ pub async fn run() -> Result<()> {
         flush_stdout();
 
         let cancel = CancellationToken::new();
-        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None).await;
+        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None, None).await;
         let mut in_thinking = false;
 
         while let Some(event) = stream.next().await {

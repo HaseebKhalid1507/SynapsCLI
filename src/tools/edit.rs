@@ -93,3 +93,109 @@ impl Tool for EditTool {
         ))
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_edit_tool_schema() {
+        let tool = EditTool;
+        assert_eq!(tool.name(), "edit");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("edit_tool_test.txt");
+
+        // Create file with known content
+        let initial_content = "Hello world\nThis is a test\nEnd of file";
+        std::fs::write(&test_file, initial_content).unwrap();
+
+        let tool = EditTool;
+
+        // Test successful replacement
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "This is a test",
+            "new_string": "This is modified"
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+        assert!(result.contains("Edited"));
+        assert!(result.contains("replaced 1 line(s) with 1 line(s)"));
+
+        let modified_content = std::fs::read_to_string(&test_file).unwrap();
+        assert!(modified_content.contains("This is modified"));
+        assert!(!modified_content.contains("This is a test"));
+
+        // Test old_string not found
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "nonexistent string",
+            "new_string": "replacement"
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("old_string not found"));
+
+        // Test old_string found multiple times
+        std::fs::write(&test_file, "test\ntest\nother").unwrap();
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "test",
+            "new_string": "replacement"
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("found 2 times"));
+        assert!(error_msg.contains("must be unique"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_no_match() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_edit_tool_no_match.txt");
+
+        // Create file with known content
+        let content = "some content\nmore content";
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = EditTool;
+        let ctx = create_tool_context();
+
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "old_string": "this string does not exist",
+            "new_string": "replacement"
+        });
+
+        let result = tool.execute(params, ctx).await;
+
+        // Should return error about string not found
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("old_string not found"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+}

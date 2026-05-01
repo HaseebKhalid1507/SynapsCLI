@@ -298,7 +298,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
     let mut stream = {
         let rt = state.runtime.lock().await;
-        rt.run_stream_with_messages(messages, cancel, None).await
+        rt.run_stream_with_messages(messages, cancel, None, None).await
     };
 
     let broadcast = state.broadcast_tx.clone();

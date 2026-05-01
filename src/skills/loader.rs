@@ -11,7 +11,12 @@ pub(super) fn parse_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
     }
     if let Some(end) = text[3..].find("\n---") {
         let frontmatter_str = &text[3..3 + end];
-        let body = text[3 + end + 4..].trim().to_string();
+        let body_start = 3 + end + 4;
+        let body = if body_start <= text.len() && text.is_char_boundary(body_start) {
+            text[body_start..].trim().to_string()
+        } else {
+            String::new()
+        };
         let fields: Vec<(String, String)> = frontmatter_str
             .lines()
             .filter_map(|line| {

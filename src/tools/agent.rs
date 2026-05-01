@@ -19,6 +19,17 @@ fn is_valid_name(s: &str) -> bool {
 
 /// Resolve an agent name to a system prompt.
 pub fn resolve_agent_prompt(name: &str) -> std::result::Result<String, String> {
+    // Defense-in-depth: callers should already filter blank names to None, but if
+    // one slips through we must not search `~/.synaps-cli/agents/.md` — that path
+    // looks valid on disk and produces a confusing error that models retry forever.
+    // Reject names that are empty or entirely whitespace/control chars (incl. NUL).
+    if name.chars().all(|c| c.is_whitespace() || c.is_control()) {
+        return Err(
+            "Empty 'agent' parameter. Pass a non-empty agent name, omit the field entirely, \
+             or provide 'system_prompt' inline instead.".to_string()
+        );
+    }
+
     // 1. File path — name contains '/'
     if name.contains('/') {
         let path = expand_path(name);
@@ -236,5 +247,73 @@ mod tests {
         assert!(is_valid_name("sage"));
         assert!(is_valid_name("my_agent_123"));
         assert!(is_valid_name("BBE"));
+    }
+
+    #[test]
+    fn resolve_agent_prompt_rejects_blank_name() {
+        // Empty string, whitespace, and NUL must all error early — never search disk.
+        for name in ["", " ", "  \t  ", "\n", "\u{0}"] {
+            let err = resolve_agent_prompt(name).unwrap_err();
+            assert!(
+                err.contains("Empty 'agent' parameter"),
+                "blank name {:?} should produce the empty-agent error, got: {}",
+                name,
+                err,
+            );
+            // Critical: the error must NOT mention `agents/.md` — that's the bug
+            // signature that caused models to loop with sentinel agent values.
+            assert!(
+                !err.contains("agents/.md"),
+                "blank name {:?} leaked path-search error: {}",
+                name,
+                err,
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_frontmatter_removes_frontmatter() {
+        let content = "---\ntitle: test\ndate: 2023-01-01\n---\nThis is the content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, "This is the content.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_without_frontmatter() {
+        let content = "This is just plain content.";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_strip_frontmatter_only_opening_delimiter() {
+        let content = "---\ntitle: test\nno closing delimiter";
+        let result = strip_frontmatter(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_nonexistent() {
+        let result = resolve_agent_prompt("definitely_does_not_exist_12345");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Agent 'definitely_does_not_exist_12345' not found"));
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_path_not_found() {
+        let result = resolve_agent_prompt("/nonexistent/path/agent.md");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to read agent file"));
+    }
+
+    #[test]
+    fn test_resolve_agent_prompt_blank_rejected_without_agent_lookup() {
+        let result = resolve_agent_prompt("");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Empty 'agent' parameter"));
+        assert!(!error.contains("agents/.md"));
     }
 }

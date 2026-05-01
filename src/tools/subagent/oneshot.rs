@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
+use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
 pub use crate::runtime::subagent::SubagentResult;
 
 pub struct SubagentTool;
@@ -49,8 +49,20 @@ impl Tool for SubagentTool {
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
-        let agent_name = params["agent"].as_str().map(|s| s.to_string());
-        let inline_prompt = params["system_prompt"].as_str().map(|s| s.to_string());
+        // Treat blank / whitespace / control-char strings as absent — see
+        // subagent_start.rs for full rationale. Models occasionally pass `agent: ""`
+        // (or "\u{0}", or " ") alongside a real `system_prompt`; without this filter
+        // we'd try to resolve an empty agent name and fail, instead of falling
+        // through to the inline prompt.
+        let is_blank = |s: &String| s.chars().all(|c| c.is_whitespace() || c.is_control());
+        let agent_name = params["agent"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
+        let inline_prompt = params["system_prompt"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
         let model_override = params["model"].as_str().map(|s| s.to_string());
         let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
@@ -371,3 +383,39 @@ impl Tool for SubagentTool {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_subagent_tool_schema() {
+        let tool = SubagentTool;
+        assert_eq!(tool.name(), "subagent");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_blank_agent_uses_system_prompt() {
+        let tool = SubagentTool;
+        let ctx = create_tool_context();
+        let params = json!({
+            "agent": "",
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "claude-sonnet-4-6",
+            "timeout": 1
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+    }
+}

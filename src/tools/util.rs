@@ -55,3 +55,35 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_expand_path_home_prefix() {
+        let home = env::var("HOME").expect("HOME env var should be set");
+        let result = expand_path("~/foo");
+        assert_eq!(result, PathBuf::from(home).join("foo"));
+    }
+
+    #[test]
+    fn test_expand_path_tilde_alone() {
+        let home = env::var("HOME").expect("HOME env var should be set");
+        let result = expand_path("~");
+        assert_eq!(result, PathBuf::from(home));
+    }
+
+    #[test]
+    fn test_expand_path_absolute_unchanged() {
+        let result = expand_path("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_expand_path_relative_unchanged() {
+        let result = expand_path("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+}

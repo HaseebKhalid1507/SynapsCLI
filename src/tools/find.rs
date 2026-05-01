@@ -67,3 +67,47 @@ impl Tool for FindTool {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_find_tool_schema() {
+        let tool = FindTool;
+        assert_eq!(tool.name(), "find");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_find_tool_execution() {
+        let temp_dir = std::env::temp_dir().join("test_find_tool_execution");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let test_file = temp_dir.join("test_find_me.txt");
+        std::fs::write(&test_file, "test content").unwrap();
+
+        let tool = FindTool;
+        let ctx = create_tool_context();
+
+        let params = json!({
+            "pattern": "test_find_me*",
+            "path": temp_dir.to_string_lossy()
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        // Should contain the filename
+        assert!(result.contains("test_find_me.txt"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

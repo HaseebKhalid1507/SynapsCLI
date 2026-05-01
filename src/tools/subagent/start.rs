@@ -1,8 +1,8 @@
-//! SubagentResumeTool — restart a finished or timed-out subagent with new instructions.
+//! SubagentStartTool — dispatch a reactive subagent and return a handle_id immediately.
 //!
-//! Takes the completed conversation state stored in the prior `SubagentHandle`,
-//! prepends new instructions, and dispatches a fresh subagent via the same flow as
-//! `subagent_start`. The caller gets a new `handle_id` for the continuation run.
+//! Unlike the one-shot `subagent` tool, this tool returns *before* the subagent
+//! finishes. The caller gets a `handle_id` they can poll via `subagent_status`,
+//! steer via `subagent_steer`, or block on via `subagent_collect`.
 
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -11,113 +11,105 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{Result, RuntimeError, LlmEvent, SessionEvent, AgentEvent};
-use super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
+use super::super::{Tool, ToolContext, resolve_agent_prompt, NEXT_SUBAGENT_ID};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentStatus, SubagentState};
 
-pub struct SubagentResumeTool;
+pub struct SubagentStartTool;
 
 #[async_trait::async_trait]
-impl Tool for SubagentResumeTool {
-    fn name(&self) -> &str { "subagent_resume" }
+impl Tool for SubagentStartTool {
+    fn name(&self) -> &str { "subagent_start" }
 
     fn description(&self) -> &str {
-        "Resume a finished or timed-out reactive subagent with new instructions. \
-         The previous subagent's conversation state is prepended as context so the \
-         new run has full history. Returns a new handle_id — the original handle \
-         remains readable for comparison. Only works on subagents in \
-         finished/timed_out/failed state."
+        "Dispatch a reactive subagent and return immediately with a handle_id. \
+         The subagent runs in the background — use subagent_status to poll, \
+         subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call \
+         repeatedly until done). Use this for parallel execution or when you \
+         want to continue working while the subagent runs. For simple sequential \
+         delegation, use subagent instead. Provide either an agent name (resolves \
+         from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "handle_id": {
+                "agent": {
                     "type": "string",
-                    "description": "Handle ID of the completed subagent to resume (e.g. \"sa_3\")."
+                    "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt."
                 },
-                "instructions": {
+                "system_prompt": {
                     "type": "string",
-                    "description": "New task or context to prepend to the resumed subagent. \
-                                    Injected before the prior conversation history."
+                    "description": "Inline system prompt for the subagent. Use when you don't have a named agent file."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The task/prompt to send to the subagent."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model override (default: claude-opus-4-7). Use claude-sonnet-4-6 for lighter tasks."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 300). Increase for long-running tasks."
                 }
             },
-            "required": ["handle_id", "instructions"]
+            "required": ["task"]
         })
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let prior_handle_id = params["handle_id"].as_str()
-            .ok_or_else(|| RuntimeError::Tool("Missing 'handle_id' parameter".to_string()))?
+        // ── Parse params ───────────────────────────────────────────────────────
+        let task = params["task"].as_str()
+            .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
 
-        let instructions = params["instructions"].as_str()
-            .ok_or_else(|| RuntimeError::Tool("Missing 'instructions' parameter".to_string()))?
-            .to_string();
+        // Treat blank / whitespace / control-char strings as absent.
+        // Some model providers serialize "unset" as "" rather than omitting the field,
+        // and we must not try to resolve "" (or " ", or "\u{0}") as an agent name —
+        // doing so produces a hard "Agent '' not found" error that the model then
+        // retries forever with sentinel values instead of falling back to system_prompt.
+        let is_blank = |s: &String| s.chars().all(|c| c.is_whitespace() || c.is_control());
+        let agent_name = params["agent"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
+        let inline_prompt = params["system_prompt"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !is_blank(s));
+        let model_override = params["model"].as_str().map(|s| s.to_string());
+        let timeout_secs   = params["timeout"].as_u64().unwrap_or(ctx.limits.subagent_timeout);
 
-        let registry = ctx.capabilities.subagent_registry.as_ref()
-            .ok_or_else(|| RuntimeError::Tool(
-                "SubagentRegistry not available on this ToolContext".to_string()
-            ))?;
-
-        // Extract prior state under the lock, release immediately.
-        let (agent_name, model, prior_context) = {
-            let reg = registry.lock().unwrap();
-            let handle = reg.get(&prior_handle_id)
-                .ok_or_else(|| RuntimeError::Tool(
-                    format!("No subagent found with handle_id '{}'", prior_handle_id)
-                ))?;
-
-            if handle.status() == SubagentStatus::Running {
-                return Err(RuntimeError::Tool(format!(
-                    "Subagent '{}' is still running. Call subagent_collect first, \
-                     or wait until it finishes.",
-                    prior_handle_id
-                )));
+        let system_prompt = match (&agent_name, &inline_prompt) {
+            (Some(name), _) => resolve_agent_prompt(name).map_err(RuntimeError::Tool)?,
+            (None, Some(p)) => p.clone(),
+            (None, None) => {
+                return Err(RuntimeError::Tool(
+                    "Must provide either 'agent' (name) or 'system_prompt' (inline). Got neither.".to_string()
+                ));
             }
-
-            let prior = {
-                let state = handle.conversation_state();
-                if state.is_empty() {
-                    handle.partial_output()
-                } else {
-                    serde_json::to_string(&state).unwrap_or_else(|_| handle.partial_output())
-                }
-            };
-
-            (handle.agent_name.clone(), handle.model.clone(), prior)
         };
 
-        // ── Build resumed task: new instructions → separator → prior context.
-        let resumed_task = format!(
-            "{instructions}\n\n\
-             ---\n\
-             [Prior conversation context from handle {prior_handle_id}]\n\
-             {prior_context}"
-        );
-
-        let system_prompt = "You are continuing a task that was interrupted. \
-                             The prior conversation context is included in your task. \
-                             Pick up where the previous agent left off.".to_string();
-
-        let label = agent_name.clone();
-        let timeout_secs = ctx.limits.subagent_timeout;
-        let task_preview: String = resumed_task.chars().take(80).collect();
-        let task_full = resumed_task.clone();
+        let label = agent_name.as_deref().unwrap_or("inline").to_string();
+        let model = model_override.unwrap_or_else(|| crate::models::default_model().to_string());
+        let task_preview: String = task.chars().take(80).collect();
+        let task_full = task.clone();
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
 
-        tracing::info!(
-            "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
-            label, handle_id, prior_handle_id, model
-        );
+        tracing::info!("subagent_start: dispatching '{}' (id={}) model={}", label, handle_id, model);
 
+        // ── Shared state ───────────────────────────────────────────────────────
         let state = Arc::new(RwLock::new(SubagentState::new()));
 
+        // ── Channels ───────────────────────────────────────────────────────────
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (result_tx, result_rx) = oneshot::channel::<SubagentResult>();
 
+        // ── Forward SubagentStart event to TUI ─────────────────────────────────
         if let Some(ref tx) = ctx.channels.tx_events {
             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentStart {
                 subagent_id,
@@ -126,13 +118,15 @@ impl Tool for SubagentResumeTool {
             }));
         }
 
-        let state_t         = Arc::clone(&state);
-        let task_full_a     = task_full.clone();
-        let label_inner     = label.clone();
-        let model_inner     = model.clone();
-        let tx_events_inner = ctx.channels.tx_events.clone();
-        let start_time      = std::time::Instant::now();
+        // ── Clone state for the spawned thread ─────────────────────────────────
+        let state_t          = Arc::clone(&state);
+        let task_full_a      = task_full.clone();
+        let label_inner      = label.clone();
+        let model_inner      = model.clone();
+        let tx_events_inner  = ctx.channels.tx_events.clone();
+        let start_time       = std::time::Instant::now();
 
+        // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
         let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -147,13 +141,13 @@ impl Tool for SubagentResumeTool {
                     }
                 };
 
-                let state_a           = Arc::clone(&state_t);
-                let label_a           = label_inner.clone();
-                let model_a           = model_inner.clone();
-                let tx_events_a       = tx_events_inner.clone();
-                let task_for_timeout  = task_full_a.clone();
-                let task_for_complete = task_full_a.clone();
-                let task_for_stream   = task_full_a;
+                // Clones for the async block — the outer closure still needs the originals.
+                let state_a        = Arc::clone(&state_t);
+                let label_a        = label_inner.clone();
+                let model_a        = model_inner.clone();
+                let tx_events_a    = tx_events_inner.clone();
+                let task_for_timeout = task_full_a.clone();
+                let task_for_complete = task_full_a;
 
                 let outcome: std::result::Result<SubagentResult, String> = rt.block_on(async move {
                     use futures::StreamExt;
@@ -174,11 +168,7 @@ impl Tool for SubagentResumeTool {
                         cancel_inner.cancel();
                     });
 
-                    let mut stream = runtime.run_stream_with_messages(
-                        vec![serde_json::json!({"role": "user", "content": task_for_stream})],
-                        cancel,
-                        Some(steer_rx),
-                    ).await;
+                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx), None).await;
 
                     let mut tool_count = 0u32;
                     let mut total_input_tokens = 0u64;
@@ -314,6 +304,7 @@ impl Tool for SubagentResumeTool {
 
                 match outcome {
                     Ok(sa_result) => {
+                        // Only overwrite Running → Completed (don't stomp TimedOut).
                         {
                             let mut s = state_t.write().unwrap();
                             if matches!(s.status, SubagentStatus::Running) {
@@ -347,6 +338,7 @@ impl Tool for SubagentResumeTool {
                                 duration_secs: elapsed,
                             }));
                         }
+                        // drop result_tx — collect() will surface the closed channel
                     }
                 }
             }));
@@ -359,11 +351,12 @@ impl Tool for SubagentResumeTool {
                 } else {
                     "unknown panic".to_string()
                 };
-                tracing::error!("Resumed subagent thread panicked: {}", msg);
+                tracing::error!("Subagent thread panicked: {}", msg);
                 state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
         });
 
+        // ── Build handle + register ────────────────────────────────────────────
         let handle = SubagentHandle::new(
             handle_id.clone(),
             label.clone(),
@@ -376,19 +369,52 @@ impl Tool for SubagentResumeTool {
             Some(result_rx),
         );
 
-        {
+        if let Some(registry) = &ctx.capabilities.subagent_registry {
             let mut reg = registry.lock().unwrap();
             reg.register(handle);
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }
+        } else {
+            return Err(RuntimeError::Tool(
+                "subagent_start requires a subagent_registry in ToolContext".to_string()
+            ));
         }
 
         Ok(json!({
-            "handle_id":    handle_id,
-            "resumed_from": prior_handle_id,
-            "agent_name":   label,
-            "status":       "running"
+            "handle_id":  handle_id,
+            "agent_name": label,
+            "status":     "running"
         }).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::{SubagentRegistry, Tool};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn test_subagent_start_blank_agent_uses_system_prompt() {
+        let tool = SubagentStartTool;
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(Arc::new(Mutex::new(SubagentRegistry::new())));
+
+        let params = json!({
+            "agent": "",
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "claude-sonnet-4-6",
+            "timeout": 1
+        });
+
+        let result = tool.execute(params, ctx).await;
+        assert!(result.is_ok(), "blank agent should not be resolved as ~/.synaps-cli/agents/.md: {result:?}");
+        let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(body["agent_name"], "inline");
+        assert!(body["handle_id"].as_str().unwrap_or_default().starts_with("sa_"));
     }
 }

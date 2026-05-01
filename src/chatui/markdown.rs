@@ -65,6 +65,123 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
+/// Strip inline markdown markers (`**`, `*`, `` ` ``) from text for width calculation.
+/// Returns the visible text without formatting markers.
+fn strip_inline_md(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                // Skip backtick, consume until closing backtick
+                while let Some(&c) = chars.peek() {
+                    if c == '`' { chars.next(); break; }
+                    result.push(c);
+                    chars.next();
+                }
+            }
+            '*' => {
+                let is_bold = chars.peek() == Some(&'*');
+                if is_bold { chars.next(); } // skip second *
+                // Consume content until closing delimiter
+                let mut found_end = false;
+                while let Some(c) = chars.next() {
+                    if c == '*' {
+                        if is_bold {
+                            if chars.peek() == Some(&'*') { chars.next(); found_end = true; break; }
+                            result.push(c);
+                        } else {
+                            found_end = true;
+                            break;
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                let _ = found_end;
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// Word-wrap a table cell's content to fit within `max_width` display columns.
+/// Breaks on word boundaries where possible; forces a break mid-word if a single
+/// word exceeds the column width. Returns one String per visual line.
+/// Width calculations strip inline markdown markers so `**bold**` counts as
+/// the width of `bold`, not `**bold**`.
+fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let stripped = strip_inline_md(text);
+    let display_w = UnicodeWidthStr::width(stripped.as_str());
+    if display_w <= max_width {
+        return vec![text.to_string()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w: usize = 0;
+
+    for word in text.split_whitespace() {
+        let word_w = UnicodeWidthStr::width(word);
+        if current.is_empty() {
+            // First word on this line
+            if word_w <= max_width {
+                current.push_str(word);
+                current_w = word_w;
+            } else {
+                // Word is wider than column — force-break it char by char
+                for ch in word.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_w + ch_w > max_width && !current.is_empty() {
+                        lines.push(current);
+                        current = String::new();
+                        current_w = 0;
+                    }
+                    current.push(ch);
+                    current_w += ch_w;
+                }
+            }
+        } else if current_w + 1 + word_w <= max_width {
+            // Fits on current line with a space
+            current.push(' ');
+            current.push_str(word);
+            current_w += 1 + word_w;
+        } else {
+            // Doesn't fit — start a new line
+            lines.push(current);
+            current = String::new();
+            current_w = 0;
+            if word_w <= max_width {
+                current.push_str(word);
+                current_w = word_w;
+            } else {
+                // Force-break long word
+                for ch in word.chars() {
+                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_w + ch_w > max_width && !current.is_empty() {
+                        lines.push(current);
+                        current = String::new();
+                        current_w = 0;
+                    }
+                    current.push(ch);
+                    current_w += ch_w;
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Render a markdown table into styled Lines.
 ///
 /// No outer border — clean, breathable layout. Header row is bold with a
@@ -114,17 +231,23 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         }
     }
 
-    // Calculate column widths using display width
+    // Calculate column widths using display width of stripped content
+    // (markdown formatting like **bold** shouldn't count toward column width)
     let mut col_widths: Vec<usize> = vec![3; num_cols];
     for row in &rows {
         for (j, cell) in row.iter().enumerate() {
             if j < num_cols {
-                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(cell.as_str()));
+                let stripped = strip_inline_md(cell);
+                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(stripped.as_str()));
             }
         }
     }
 
-    // Shrink columns if total table width exceeds terminal width
+    // Shrink columns if total table width exceeds terminal width.
+    // Strategy: lock narrow columns at their natural width (they're already
+    // compact), then distribute the remaining budget among the wide columns.
+    // This prevents short fields like "✅" or "5.0s" from being crushed to
+    // "…" while giving long-text columns as much room as possible.
     let prefix_overhead = UnicodeWidthStr::width(prefix) + 2; // prefix + "  "
     let per_col_overhead = 3; // " " + cell + " " + gap
     let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
@@ -133,9 +256,41 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         if available > 0 && num_cols > 0 {
             let total_content: usize = col_widths.iter().sum();
             if total_content > available {
-                let mut new_widths: Vec<usize> = col_widths.iter()
-                    .map(|&w| (w * available / total_content).max(3))
-                    .collect();
+                // Phase 1: columns that fit in ≤ 12 chars keep their natural
+                // width — they're already tight and truncating them destroys
+                // readability. Everything else is "shrinkable".
+                let narrow_threshold = 12;
+                let mut new_widths = col_widths.clone();
+                let mut locked_total: usize = 0;
+                let mut shrinkable_total: usize = 0;
+                let mut shrinkable_indices: Vec<usize> = Vec::new();
+
+                for (i, &w) in col_widths.iter().enumerate() {
+                    if w <= narrow_threshold {
+                        locked_total += w;
+                    } else {
+                        shrinkable_indices.push(i);
+                        shrinkable_total += w;
+                    }
+                }
+
+                let budget_for_shrinkable = available.saturating_sub(locked_total);
+
+                if shrinkable_indices.is_empty() || budget_for_shrinkable == 0 {
+                    // All columns are narrow or no budget left — fall back to
+                    // proportional shrink across everything.
+                    new_widths = col_widths.iter()
+                        .map(|&w| (w * available / total_content).max(3))
+                        .collect();
+                } else {
+                    // Distribute budget proportionally among shrinkable columns
+                    for &idx in &shrinkable_indices {
+                        let share = (col_widths[idx] * budget_for_shrinkable / shrinkable_total).max(6);
+                        new_widths[idx] = share;
+                    }
+                }
+
+                // Distribute any leftover chars to the widest columns first
                 let used: usize = new_widths.iter().sum();
                 if used < available {
                     let mut remainder = available - used;
@@ -163,38 +318,51 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     let body_count = rows.len().saturating_sub(body_start);
 
     for (i, row) in rows.iter().enumerate() {
-        // Data row: padded cells separated by spaces (no vertical borders)
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(format!("{}  ", prefix), Style::default()));
+        let style = if has_header && i == 0 { header_style } else { cell_style };
 
+        // Wrap each cell into multiple visual lines
+        let mut wrapped_cols: Vec<Vec<String>> = Vec::new();
         for (j, cell) in row.iter().enumerate() {
             let w = col_widths[j];
-            let display_w = UnicodeWidthStr::width(cell.as_str());
-            let display_cell = if display_w > w {
-                let mut truncated = String::new();
-                let mut tw = 0;
-                for ch in cell.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if tw + cw > w.saturating_sub(1) { break; }
-                    truncated.push(ch);
-                    tw += cw;
-                }
-                truncated.push('\u{2026}');
-                truncated
-            } else {
-                cell.clone()
-            };
-            let truncated_w = UnicodeWidthStr::width(display_cell.as_str());
-            let padding = w.saturating_sub(truncated_w);
-            let padded = format!(" {}{} ", display_cell, " ".repeat(padding));
-            let style = if has_header && i == 0 { header_style } else { cell_style };
-            spans.push(Span::styled(padded, style));
-            // Light separator between columns (not after last)
-            if j < num_cols - 1 {
-                spans.push(Span::styled(" ", Style::default()));
-            }
+            wrapped_cols.push(wrap_cell(cell, w));
         }
-        result.push(Line::from(spans));
+        let max_lines = wrapped_cols.iter().map(|c| c.len()).max().unwrap_or(1);
+
+        for line_idx in 0..max_lines {
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(format!("{}  ", prefix), Style::default()));
+
+            for (j, col_lines) in wrapped_cols.iter().enumerate() {
+                let w = col_widths[j];
+                let cell_text = col_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
+                let stripped_text = strip_inline_md(cell_text);
+                let display_w = UnicodeWidthStr::width(stripped_text.as_str());
+                let padding = w.saturating_sub(display_w);
+
+                // Leading space
+                spans.push(Span::styled(" ".to_string(), style));
+                // Parse inline markdown (bold, italic, code) within cell
+                spans.extend(parse_inline_md(cell_text, style));
+                // Trailing padding + space
+                spans.push(Span::styled(format!("{} ", " ".repeat(padding)), style));
+
+                if j < num_cols - 1 {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+            }
+            result.push(Line::from(spans));
+        }
+
+        // Add a faint separator after multi-line wrapped body rows
+        // so adjacent rows don't blur together
+        if max_lines > 1 && i >= body_start && i < rows.len() - 1 {
+            let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
+            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+            result.push(Line::from(Span::styled(
+                sep,
+                Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
+            )));
+        }
 
         // After header row, draw a single ─ rule
         if has_header && i == 0 {
@@ -542,4 +710,170 @@ pub(crate) fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
     else if n >= 1_000 { format!("{:.1}k", n as f64 / 1_000.0) }
     else { format!("{}", n) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: extract all text content from rendered lines
+    fn rendered_text(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| {
+            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        }).collect()
+    }
+
+    #[test]
+    fn table_narrow_cols_preserved_when_shrinking() {
+        // Table with mixed column widths: short status + long description
+        // On a narrow terminal, the short columns should keep their size
+        let table_lines = vec![
+            "| Status | Name | Description |".to_string(),
+            "|--------|------|-------------|".to_string(),
+            "| ✅ | Spike | The executor workhorse agent that handles grunt work |".to_string(),
+            "| ❌ | Chrollo | Deep analyst for recon and complex reasoning tasks |".to_string(),
+        ];
+
+        // Render at width=60 — tight squeeze
+        let result = render_table(&table_lines, "  ", 60);
+        let texts = rendered_text(&result);
+
+        // Status column (✅/❌) should NOT be truncated to "…"
+        let has_checkmark = texts.iter().any(|t| t.contains('✅'));
+        let has_cross = texts.iter().any(|t| t.contains('❌'));
+        assert!(has_checkmark, "Status ✅ was truncated away");
+        assert!(has_cross, "Status ❌ was truncated away");
+
+        // Names should survive too (short columns)
+        let has_spike = texts.iter().any(|t| t.contains("Spike"));
+        let has_chrollo = texts.iter().any(|t| t.contains("Chrollo"));
+        assert!(has_spike, "Name 'Spike' was truncated");
+        assert!(has_chrollo, "Name 'Chrollo' was truncated");
+    }
+
+    #[test]
+    fn table_six_columns_dont_all_become_ellipsis() {
+        // The exact scenario from S182: wide table with 6 columns
+        let table_lines = vec![
+            "| # | Test | Status | Quality | Speed | Notes |".to_string(),
+            "|---|------|--------|---------|-------|-------|".to_string(),
+            "| 1 | example.com | ✅ Yes | Good | 0.13s | Perfect output |".to_string(),
+            "| 2 | HN | ✅ Yes | Meh | 0.41s | Table-noisy but works |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "  ", 80);
+        let texts = rendered_text(&result);
+
+        // Short columns (#, Status, Speed) must survive intact
+        let row1 = texts.iter().find(|t| t.contains("example")).unwrap();
+        assert!(row1.contains("0.13s"), "Speed column was truncated in: {}", row1);
+        assert!(row1.contains("✅"), "Status was truncated in: {}", row1);
+    }
+
+    #[test]
+    fn table_fits_width_no_truncation() {
+        // Table that fits — nothing should be truncated or wrapped
+        let table_lines = vec![
+            "| A | B |".to_string(),
+            "|---|---|".to_string(),
+            "| x | y |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+        // No ellipsis anywhere
+        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
+            "Small table was unnecessarily truncated");
+    }
+
+    #[test]
+    fn wrap_cell_fits_returns_single_line() {
+        let result = wrap_cell("hello world", 20);
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_cell_breaks_on_word_boundary() {
+        let result = wrap_cell("hello world foo", 11);
+        assert_eq!(result, vec!["hello world", "foo"]);
+    }
+
+    #[test]
+    fn wrap_cell_force_breaks_long_word() {
+        let result = wrap_cell("abcdefghij", 5);
+        assert_eq!(result, vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn table_wraps_instead_of_truncating() {
+        let table_lines = vec![
+            "| Name | Description |".to_string(),
+            "|------|-------------|".to_string(),
+            "| Spike | The executor workhorse agent that handles all grunt work |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 40);
+        let texts = rendered_text(&result);
+
+        // Full description text should be present across wrapped lines
+        let all_text: String = texts.join(" ");
+        assert!(all_text.contains("grunt work"),
+            "Wrapped table lost content: {}", all_text);
+        // No ellipsis — we wrap, not truncate
+        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
+            "Table used truncation instead of wrapping");
+    }
+
+    #[test]
+    fn table_renders_bold_markdown_in_cells() {
+        let table_lines = vec![
+            "| Category | Value |".to_string(),
+            "|----------|-------|".to_string(),
+            "| **Era** | 130 million years |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+
+        // The ** markers should NOT appear in rendered text
+        let all_text: String = texts.join(" ");
+        assert!(!all_text.contains("**"), "Bold markers ** still visible in: {}", all_text);
+        assert!(all_text.contains("Era"), "Bold content 'Era' missing from: {}", all_text);
+
+        // Check that the Era span actually has BOLD modifier
+        let era_line = result.iter().find(|l| {
+            l.spans.iter().any(|s| s.content.contains("Era"))
+        }).expect("No line contains 'Era'");
+        let era_span = era_line.spans.iter().find(|s| s.content.contains("Era")).unwrap();
+        assert!(era_span.style.add_modifier == Modifier::BOLD,
+            "Era span is not bold: {:?}", era_span.style);
+    }
+
+    #[test]
+    fn strip_inline_md_removes_bold_markers() {
+        assert_eq!(strip_inline_md("**hello**"), "hello");
+        assert_eq!(strip_inline_md("**a** and **b**"), "a and b");
+        assert_eq!(strip_inline_md("plain text"), "plain text");
+        assert_eq!(strip_inline_md("*italic*"), "italic");
+        assert_eq!(strip_inline_md("`code`"), "code");
+    }
+
+    #[test]
+    fn table_bold_cells_dont_waste_width_on_markers() {
+        // **Signature Move** is 20 chars raw but only 14 stripped
+        // Width calc should use 14, giving the column more room
+        let table_lines = vec![
+            "| Label | Data |".to_string(),
+            "|-------|------|".to_string(),
+            "| **Signature Move** | some data |".to_string(),
+            "| **Era** | more data |".to_string(),
+        ];
+
+        let result = render_table(&table_lines, "", 80);
+        let texts = rendered_text(&result);
+        let all_text: String = texts.join(" ");
+        // Full label should be visible, not truncated
+        assert!(all_text.contains("Signature Move"),
+            "Label was truncated: {}", all_text);
+    }
 }

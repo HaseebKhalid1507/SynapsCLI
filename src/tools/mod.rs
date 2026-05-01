@@ -17,17 +17,13 @@ mod grep;
 mod find;
 mod ls;
 mod subagent;
+mod secret_prompt;
 
 pub mod watcher_exit;
 pub(crate) mod util;
 mod agent;
 mod registry;
 pub mod shell;
-pub mod subagent_start;
-pub mod subagent_status;
-pub mod subagent_steer;
-pub mod subagent_collect;
-pub mod subagent_resume;
 pub mod respond;
 pub mod send_channel;
 
@@ -40,19 +36,16 @@ pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use find::FindTool;
 pub use ls::LsTool;
-pub use subagent::SubagentTool;
+pub use subagent::{SubagentTool, SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentCollectTool, SubagentResumeTool};
 pub use crate::runtime::subagent::{SubagentResult, SubagentHandle, SubagentRegistry, SubagentStatus, SubagentState};
 pub use watcher_exit::WatcherExitTool;
 pub use registry::ToolRegistry;
 pub use agent::resolve_agent_prompt;
 pub use shell::{ShellStartTool, ShellSendTool, ShellEndTool};
-pub use subagent_start::SubagentStartTool;
-pub use subagent_status::SubagentStatusTool;
-pub use subagent_steer::SubagentSteerTool;
-pub use subagent_collect::SubagentCollectTool;
-pub use subagent_resume::SubagentResumeTool;
 pub use respond::RespondTool;
 pub use send_channel::SendChannelTool;
+pub use secret_prompt::{SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::SecretPromptQueue;
 
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{NEXT_SUBAGENT_ID, strip_ansi, expand_path};
@@ -72,6 +65,7 @@ pub struct ToolCapabilities {
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
     pub subagent_registry: Option<Arc<Mutex<SubagentRegistry>>>,
     pub event_queue: Option<Arc<crate::events::EventQueue>>,
+    pub secret_prompt: Option<SecretPromptHandle>,
 }
 
 /// Configuration limits and timeouts.
@@ -106,4 +100,4 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests;
+mod test_helpers;

@@ -2,7 +2,7 @@
 
 This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~21K LOC across 87 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~45K LOC across 161 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -13,6 +13,8 @@ cargo build --release                    # full release build (lto, single codeg
 cargo build                              # dev build — faster compile, slower runtime
 cargo test --lib                         # most tests
 cargo test --lib -- --test-threads=1     # required for PTY tests in src/tools/shell/pty.rs
+cargo test --lib extensions::            # extension system tests
+cargo test --test extensions_e2e         # end-to-end with real extension process
 cargo clippy --all-targets               # linting
 ```
 
@@ -22,6 +24,7 @@ cargo clippy --all-targets               # linting
 
 - `synaps` (no args) — interactive TUI (the main product)
 - `synaps --continue [NAME_OR_ID]` — resume last session, or resolve a chain bookmark / session alias / partial session ID via `resolve_session()` (chain name → session name → partial ID)
+- `synaps --no-extensions` — disable the extension system (skips plugin hook registration)
 - `synaps chat` — single-shot CLI chat
 - `synaps run` — non-interactive one-shot command
 - `synaps agent` — headless worker managed by the watcher
@@ -74,6 +77,7 @@ src/
 │   ├── subagent.rs       — spawns a child Runtime in an isolated thread
 │   ├── agent.rs          — (legacy — prefer subagent.rs)
 │   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
+│   ├── secret_prompt.rs  — secure sudo password prompt handling
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
 ├── chatui/               — the TUI (module, entered via default `synaps` subcommand)
@@ -99,6 +103,14 @@ src/
 │   ├── connection.rs     — JSON-RPC over stdio to MCP servers
 │   ├── lazy.rs           — lazy server spawn (don't pay until connect_mcp_server called)
 │   └── tool.rs           — MCP tools wrapped as Tool impls
+├── extensions/           — Extension system (hooks, permissions, JSON-RPC runtime)
+│   ├── mod.rs            — crate-level re-exports
+│   ├── hooks/mod.rs      — HookBus dispatcher
+│   ├── hooks/events.rs   — HookKind, HookEvent, HookResult types
+│   ├── permissions.rs    — Permission flags and PermissionSet
+│   ├── manifest.rs       — ExtensionManifest from plugin.json
+│   ├── manager.rs        — ExtensionManager lifecycle
+│   └── runtime/process.rs — JSON-RPC over stdio ProcessExtension
 └── skills/               — skill discovery + command registry
     ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
     ├── manifest.rs       — plugin.json / marketplace.json parsers
@@ -387,6 +399,14 @@ Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`.
 - **Tests** live in `#[cfg(test)] mod tests { ... }` at the bottom of each file.
 - **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `main.rs::apply_setting()`.
 - **Re-exports** happen at module roots (`tools/mod.rs`, `core/mod.rs`) and at the crate root (`lib.rs`). Prefer using the crate-root re-exports: `synaps_cli::Runtime`, `synaps_cli::config::...`, `synaps_cli::models::...`.
+
+### Notable Docs
+
+| File | Purpose |
+|------|---------|
+| `docs/extensions/README.md` | Extension user guide (install, configure, write your own) |
+| `docs/extensions/protocol.md` | JSON-RPC protocol spec for extension authors |
+| `docs/open-provider-issues.md` | Known provider-specific bugs and workarounds |
 
 ---
 

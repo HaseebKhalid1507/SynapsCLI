@@ -6,7 +6,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~32K lines](https://img.shields.io/badge/lines-~32K-green.svg)
+![~34K lines](https://img.shields.io/badge/lines-~34K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
@@ -19,7 +19,7 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 
 ## Why SynapsCLI?
 
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~32K lines, `cargo build` and you're done.
+- ⚡ **Sub-100ms cold start.** Single Rust binary, ~34K lines, `cargo build` and you're done.
 - 🌐 **Any model, any provider.** Claude, Groq, Cerebras, NVIDIA NIM, OpenRouter, or your local Ollama. 17 providers, 55+ models. Set a key, pick a model, go.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
 - 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
@@ -106,6 +106,7 @@ synaps                              # launch TUI
 synaps --continue                   # resume last session
 synaps --continue my-project        # resume by name (session alias or chain bookmark)
 synaps --system prompt.md           # custom system prompt
+synaps --no-extensions              # disable extension system
 ```
 
 Name a session with `/saveas my-project`, or bookmark a compaction lineage with `/chain name my-project` — then `synaps --continue my-project` picks up where you left off. Resolution tries chain name → session name → partial ID.
@@ -200,6 +201,25 @@ Events appear as styled cards in the TUI and auto-trigger the agent to respond. 
 | `load_skill` | Load behavioral guidelines from markdown |
 
 See [AGENTS.md](AGENTS.md) for parameters and behavior.
+
+---
+
+## Extensions
+
+SynapsCLI has a first-class extension system. Extensions are external processes that hook into the agent loop via JSON-RPC 2.0 over stdio.
+
+- **5 hooks:** `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`
+- **Tool-specific filtering:** narrow a hook to a single tool by adding `"tool"` to the registration, e.g. `{ "hook": "before_tool_call", "tool": "bash" }` fires only for bash calls
+- **Context injection:** Extensions inject context into the system prompt via `HookResult::Inject`
+- **Permission-gated:** 6 permissions control what extensions can access
+- **Drop-in plugins:** Clone into `~/.synaps-cli/plugins/<name>/` and restart
+
+### Available Extensions
+
+- [**Synaps Deck**](https://github.com/HaseebKhalid1507/synaps-deck) — Live agent dashboard at localhost:3456
+- [**Axel**](https://github.com/HaseebKhalid1507/axel) — Portable agent intelligence (.r8 brain files)
+
+See [docs/extensions/](docs/extensions/) for the full guide and protocol spec.
 
 ---
 

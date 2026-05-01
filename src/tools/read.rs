@@ -71,3 +71,94 @@ impl Tool for ReadTool {
         Ok(result)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[test]
+    fn test_read_tool_schema() {
+        let tool = ReadTool;
+        assert_eq!(tool.name(), "read");
+        assert!(!tool.description().is_empty());
+
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"].is_object());
+        assert!(params["required"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_execution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("read_tool_test.txt");
+
+        // Create temp file with known content
+        let content = "line 1\nline 2\nline 3\nline 4\nline 5";
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = ReadTool;
+        let ctx = create_tool_context();
+
+        // Test basic read
+        let params = json!({
+            "path": test_file.to_string_lossy()
+        });
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        // Verify line numbers and content
+        assert!(result.contains("1\tline 1"));
+        assert!(result.contains("2\tline 2"));
+        assert!(result.contains("5\tline 5"));
+
+        // Test with offset and limit
+        let ctx = create_tool_context();
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "offset": 2,
+            "limit": 2
+        });
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        assert!(result.contains("3\tline 3"));
+        assert!(result.contains("4\tline 4"));
+        assert!(!result.contains("1\tline 1"));
+        assert!(!result.contains("5\tline 5"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_offset() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_read_tool_offset.txt");
+
+        // Write 10 lines
+        let lines = (1..=10).map(|i| format!("line {}", i)).collect::<Vec<_>>();
+        let content = lines.join("\n");
+        std::fs::write(&test_file, &content).unwrap();
+
+        let tool = ReadTool;
+        let ctx = create_tool_context();
+
+        // Read with offset=5 (0-indexed, so starts at line 6)
+        let params = json!({
+            "path": test_file.to_string_lossy(),
+            "offset": 5
+        });
+
+        let result = tool.execute(params, ctx).await.unwrap();
+
+        // First line shown should be line 6 (1-indexed in output)
+        assert!(result.contains("6\tline 6"));
+        // Should not contain earlier lines
+        assert!(!result.contains("1\tline 1"));
+        assert!(!result.contains("5\tline 5"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&test_file);
+    }
+}

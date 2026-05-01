@@ -42,11 +42,11 @@ impl ToolRegistry {
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
             Arc::new(crate::tools::subagent::SubagentTool),
-            Arc::new(crate::tools::subagent_start::SubagentStartTool),
-            Arc::new(crate::tools::subagent_status::SubagentStatusTool),
-            Arc::new(crate::tools::subagent_steer::SubagentSteerTool),
-            Arc::new(crate::tools::subagent_collect::SubagentCollectTool),
-            Arc::new(crate::tools::subagent_resume::SubagentResumeTool),
+            Arc::new(crate::tools::subagent::start::SubagentStartTool),
+            Arc::new(crate::tools::subagent::status::SubagentStatusTool),
+            Arc::new(crate::tools::subagent::steer::SubagentSteerTool),
+            Arc::new(crate::tools::subagent::collect::SubagentCollectTool),
+            Arc::new(crate::tools::subagent::resume::SubagentResumeTool),
             Arc::new(crate::tools::shell::ShellStartTool),
             Arc::new(crate::tools::shell::ShellSendTool),
             Arc::new(crate::tools::shell::ShellEndTool),
@@ -369,6 +369,79 @@ mod tests {
 
         assert_eq!(translated["bad:key/that/is/far/too/long/for/anthropic/property/names/and/keeps/going"], "value");
         assert_eq!(translated["nested:obj"]["inner/key"], "nested");
+    }
+
+    #[test]
+    fn test_tool_registry_new() {
+        let registry = ToolRegistry::new();
+
+        // Should have 11 tools including subagent + 3 shell tools
+        assert_eq!(registry.tools_schema().len(), 16);
+
+        // Should find bash tool
+        assert!(registry.get("bash").is_some());
+
+        // Should not find nonexistent tool
+        assert!(registry.get("nonexistent").is_none());
+
+        // Verify all expected tools are present
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("ls").is_some());
+        assert!(registry.get("subagent").is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_without_subagent() {
+        let registry = ToolRegistry::without_subagent();
+
+        // Should have 10 tools without subagent (7 base + 3 shell)
+        assert_eq!(registry.tools_schema().len(), 10);
+
+        // Should not have subagent tool
+        assert!(registry.get("subagent").is_none());
+
+        // Should still have bash tool
+        assert!(registry.get("bash").is_some());
+
+        // Verify all expected tools are present except subagent
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("ls").is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_register() {
+        let mut registry = ToolRegistry::without_subagent();
+        let initial_count = registry.tools_schema().len();
+
+        // Register a new tool (using BashTool with different name for simplicity)
+        struct TestTool;
+        #[async_trait::async_trait]
+        impl Tool for TestTool {
+            fn name(&self) -> &str { "test_tool" }
+            fn description(&self) -> &str { "A test tool" }
+            fn parameters(&self) -> Value { json!({"type": "object"}) }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                Ok("test result".to_string())
+            }
+        }
+
+        registry.register(Arc::new(TestTool));
+
+        // Should have one more tool now
+        assert_eq!(registry.tools_schema().len(), initial_count + 1);
+
+        // Should find the new tool
+        assert!(registry.get("test_tool").is_some());
     }
 
 }

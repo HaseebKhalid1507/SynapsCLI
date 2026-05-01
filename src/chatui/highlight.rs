@@ -9,6 +9,7 @@ use syntect::util::LinesWithEndings;
 use std::sync::LazyLock;
 
 use super::theme::THEME;
+use unicode_width::UnicodeWidthStr;
 
 /// Clamp a `Line` to fit within `width` terminal columns.
 /// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
@@ -20,16 +21,27 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     let mut remaining = width;
     let mut clamped: Vec<Span<'static>> = Vec::new();
     for span in line.spans {
-        let span_len = span.content.chars().count();
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
         if remaining == 0 {
             break;
         }
-        if span_len <= remaining {
-            remaining -= span_len;
+        if span_width <= remaining {
+            remaining -= span_width;
             clamped.push(span);
         } else {
-            // Truncate this span to fit
-            let truncated: String = span.content.chars().take(remaining).collect();
+            // Truncate this span by display width. Multi-column chars must be
+            // counted by terminal cells, not scalar values, or a supposedly
+            // clamped line can still overrun the viewport and leave artifacts.
+            let mut used = 0;
+            let mut truncated = String::new();
+            for ch in span.content.chars() {
+                let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + ch_width > remaining {
+                    break;
+                }
+                used += ch_width;
+                truncated.push(ch);
+            }
             clamped.push(Span::styled(truncated, span.style));
             remaining = 0;
         }
@@ -156,7 +168,9 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                     if slash_pos > 0 {
                         let before = &remaining[..slash_pos];
                         // Find the start of the path (walk back to whitespace)
-                        let path_start = before.rfind(|c: char| c.is_whitespace()).map(|p| p + 1).unwrap_or(0);
+                        let path_start = before.rfind(|c: char| c.is_whitespace())
+                            .map(|p| p + before[p..].chars().next().unwrap().len_utf8())
+                            .unwrap_or(0);
                         if path_start > 0 {
                             spans.push(Span::styled(
                                 remaining[..path_start].to_string(),
@@ -169,11 +183,12 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                             .unwrap_or(after_slash.len());
                         // Guard: if path_end is 0, we'd loop forever — consume at least 1 char
                         if path_end == 0 {
+                            let first_char_len = after_slash.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                             spans.push(Span::styled(
-                                after_slash[..1].to_string(),
+                                after_slash[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
                             ));
-                            remaining = &after_slash[1..];
+                            remaining = &after_slash[first_char_len..];
                         } else {
                             spans.push(Span::styled(
                                 after_slash[..path_end].to_string(),
@@ -186,11 +201,12 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
                             .unwrap_or(remaining.len());
                         // Guard: if path_end is 0, consume at least 1 char to avoid infinite loop
                         if path_end == 0 {
+                            let first_char_len = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                             spans.push(Span::styled(
-                                remaining[..1].to_string(),
+                                remaining[..first_char_len].to_string(),
                                 Style::default().fg(THEME.load().tool_result_color),
                             ));
-                            remaining = &remaining[1..];
+                            remaining = &remaining[first_char_len..];
                         } else {
                             spans.push(Span::styled(
                                 remaining[..path_end].to_string(),
@@ -332,3 +348,72 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
     Some(result)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{style::Style, text::{Line, Span}};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clamp_line_truncates_by_display_width_not_char_count() {
+        let line = Line::from(vec![Span::styled("ab漢字c", Style::default())]);
+
+        let clamped = clamp_line(line, 5);
+        let rendered: String = clamped
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered, "ab漢");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+
+    #[test]
+    fn clamp_line_preserves_spans_within_display_width_budget() {
+        let line = Line::from(vec![
+            Span::styled("ab", Style::default()),
+            Span::styled("漢", Style::default()),
+            Span::styled("cd", Style::default()),
+        ]);
+
+        let clamped = clamp_line(line, 4);
+        let rendered: String = clamped
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered, "ab漢");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_nbsp_in_path_context() {
+        // Regression: \u{a0} (NBSP) is whitespace but 2 bytes in UTF-8.
+        // rfind(whitespace) + 1 landed mid-char → panic on slice.
+        // This is the exact crash string from S182.
+        let lines = vec![") \\| [395 comments](https://news.ycombinator.com/item?id=47961319) |"];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_nbsp_before_slash() {
+        // NBSP (\u{00a0}) right before a slash — rfind finds NBSP as whitespace,
+        // +1 byte would land inside the 2-byte char. Must use char boundary.
+        let line_with_nbsp = "text\u{00a0}/some/path here";
+        let lines = vec![line_with_nbsp];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn highlight_bash_output_handles_multibyte_at_path_boundary() {
+        // Multi-byte char (é = 2 bytes) near a slash
+        let lines = vec!["café/menu"];
+        let result = highlight_bash_output(&lines, "");
+        assert!(!result.is_empty());
+    }
+}

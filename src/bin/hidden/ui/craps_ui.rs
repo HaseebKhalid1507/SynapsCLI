@@ -245,7 +245,11 @@ fn draw_roll_history(buf: &mut Buffer, area: Rect, game: &CrapsGame, w: usize, h
 
         // Show last 10 characters to fit
         let display_history = if history_str.len() > 15 {
-            format!("...{}", &history_str[history_str.len()-12..])
+            let mut start = history_str.len().saturating_sub(12);
+            while start > 0 && !history_str.is_char_boundary(start) {
+                start -= 1;
+            }
+            format!("...{}", &history_str[start..])
         } else {
             history_str
         };

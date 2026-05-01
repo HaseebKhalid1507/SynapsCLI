@@ -204,6 +204,57 @@ impl App {
             suppress_paste_until: None,
         }
     }
+    /// Build the text shown in the chat transcript for a submitted user message.
+    /// Large pasted payloads are collapsed to a label, while any text typed before
+    /// or after the pasted range remains visible.
+    pub(crate) fn user_display_text_for_submission(&self, input: &str) -> String {
+        if self.pasted_char_count == 0 {
+            return input.to_string();
+        }
+
+        let before_paste = self.input_before_paste.as_deref().unwrap_or("");
+        let before_chars = before_paste.chars().count();
+        let total_chars = input.chars().count();
+        let paste_chars = self.pasted_char_count.min(total_chars.saturating_sub(before_chars));
+        let after_chars = total_chars.saturating_sub(before_chars + paste_chars);
+
+        let paste_byte_start = input
+            .char_indices()
+            .nth(before_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(input.len());
+        let paste_byte_end = input
+            .char_indices()
+            .nth(before_chars + paste_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(input.len());
+
+        let pasted = &input[paste_byte_start..paste_byte_end];
+        let after_paste = if after_chars == 0 {
+            ""
+        } else {
+            &input[paste_byte_end..]
+        };
+
+        let line_count = pasted.lines().count();
+        let paste_label = if line_count > 1 {
+            format!("[Pasted {} lines]", line_count)
+        } else {
+            format!("[Pasted {} chars]", paste_chars)
+        };
+
+        match (before_paste.is_empty(), after_paste.is_empty()) {
+            (true, true) => paste_label,
+            (false, true) => format!("{} {}", before_paste.trim(), paste_label),
+            (true, false) => format!("{} {}", paste_label, after_paste.trim()),
+            (false, false) => format!(
+                "{} {} {}",
+                before_paste.trim(),
+                paste_label,
+                after_paste.trim()
+            ),
+        }
+    }
 
     /// Restore SynapsCLI's TUI after casino (or failed spawn).
     /// Convert char-based cursor_pos to byte offset in self.input.
@@ -340,6 +391,53 @@ impl App {
     /// Call this after any mutation that changes how `messages` renders.
     pub(crate) fn invalidate(&mut self) {
         self.line_cache = None;
+    }
+
+    /// Advance spinner/animation state.
+    ///
+    /// Returns true only when text generated from `render_lines` may have changed
+    /// and the cached message lines must be rebuilt. Full-screen overlays and
+    /// header/panel spinners are redrawn from current state without touching the
+    /// message cache, avoiding unnecessary whole-terminal clears on every frame.
+    pub(crate) fn advance_animations(&mut self) -> bool {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        if self.spinner_frame % 3 != 0 {
+            return false;
+        }
+
+        self.render_lines_uses_spinner()
+    }
+
+    fn render_lines_uses_spinner(&self) -> bool {
+        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
+            ChatMessage::Thinking(text) => text == "…",
+            ChatMessage::ToolUseStart(_, _) => true,
+            ChatMessage::ToolUse { .. } => {
+                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+            }
+            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
+            _ => false,
+        })
+    }
+
+    /// True when a full terminal clear is needed before an animated redraw.
+    ///
+    /// The message pane is already cleared locally in `draw()` before rendering
+    /// the transcript, and rendered lines are clamped to terminal display width.
+    /// Calling `terminal.clear()` on streaming animation frames repaints the
+    /// whole alternate screen and causes visible flicker, so animation ticks
+    /// should not request a full-screen clear.
+    pub(crate) fn needs_clear_for_animation_redraw(&self) -> bool {
+        false
+    }
+
+    /// Returns true when the chat message at `idx` is the tool result currently
+    /// being streamed/executed. Completed historical tool results must render as
+    /// done even while a later tool call is active.
+    pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
+        self.tool_start_time.is_some()
+            && idx == self.messages.len().saturating_sub(1)
+            && matches!(self.messages.get(idx).map(|m| &m.msg), Some(ChatMessage::ToolResult { elapsed_ms: None, .. }))
     }
 
     /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
@@ -638,4 +736,108 @@ impl App {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(Session::new("test-model", "low", None))
+    }
+
+    #[test]
+    fn active_tool_result_is_only_latest_incomplete_result() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "first output".to_string(),
+            elapsed_ms: None,
+        });
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "second output".to_string(),
+            elapsed_ms: None,
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+
+        assert!(!app.is_active_tool_result(1), "completed historical result must render done while later tool runs");
+        assert!(app.is_active_tool_result(3), "latest incomplete result is the actively running tool result");
+    }
+
+    #[test]
+    fn completed_latest_tool_result_is_not_active() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: "done".to_string(),
+            elapsed_ms: Some(25),
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+
+        assert!(!app.is_active_tool_result(1));
+    }
+
+    #[test]
+    fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("stable transcript".to_string()));
+        app.line_cache = Some((80, app.render_lines(80)));
+        app.subagents.push(SubagentState {
+            id: 1,
+            name: "tester".to_string(),
+            status: "running".to_string(),
+            start_time: std::time::Instant::now(),
+            done: false,
+            duration_secs: None,
+        });
+        app.spinner_frame = 2;
+
+        let invalidate_messages = app.advance_animations();
+
+        assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
+        assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
+        assert!(app.line_cache.is_some(), "message cache should remain valid for panel-only animation");
+    }
+
+    #[test]
+    fn animation_tick_for_active_bash_result_invalidates_message_cache() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::ToolUse {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            content: String::new(),
+            elapsed_ms: None,
+        });
+        app.tool_start_time = Some(std::time::Instant::now());
+        app.line_cache = Some((80, app.render_lines(80)));
+        app.spinner_frame = 2;
+
+        let invalidate_messages = app.advance_animations();
+
+        assert!(invalidate_messages, "active message-area bash animation must rebuild message cache");
+        assert!(!app.needs_clear_for_animation_redraw(), "streaming animation must not force whole-terminal clear flicker");
+    }
+
+    #[test]
+    fn pasted_message_display_preserves_text_typed_after_paste() {
+        let mut app = test_app();
+        app.input_before_paste = Some("before".to_string());
+        app.pasted_char_count = "PASTED".chars().count();
+
+        let display = app.user_display_text_for_submission("beforePASTED after");
+
+        assert_eq!(display, "before [Pasted 6 chars] after");
+    }
 }

@@ -224,6 +224,7 @@ pub async fn run(
                     std::mem::take(&mut messages),
                     cancel,
                     None,
+                    None,
                 ).await;
 
                 while let Some(event) = stream.next().await {
