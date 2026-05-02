@@ -263,13 +263,13 @@ pub async fn run(
             }
 
             // ── Voice sidecar events — fires when the voice manager emits ──
-            voice_event = async {
+            sidecar_event = async {
                 match app.sidecar.as_mut() {
                     Some(v) => v.manager.next_event().await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(event) = voice_event {
+                if let Some(event) = sidecar_event {
                     self::sidecar::handle_event(&mut app, event);
                 }
             }
@@ -811,34 +811,43 @@ pub async fn run(
                                                         .join(", ");
                                                     app.push_msg(ChatMessage::System(format!("    tools: {}", rendered)));
                                                 }
-                                                // Voice capabilities (grouped from the `future` list).
-                                                let voice_entries: Vec<&str> = snap
-                                                    .future
-                                                    .iter()
-                                                    .filter(|e| e.kind == "voice")
-                                                    .map(|e| e.name.as_str())
-                                                    .collect();
-                                                if !voice_entries.is_empty() {
-                                                    // Each entry is "<name> (<mode>)". Group by name; collect modes.
+                                                // Capability declarations (grouped from the `future` list).
+                                                // Each entry has a free-form kind declared by the plugin
+                                                // (e.g. "voice", "ocr", "agent"). Render grouped by kind so
+                                                // future capability types surface without core changes.
+                                                if !snap.future.is_empty() {
                                                     use std::collections::BTreeMap;
-                                                    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                                                    for entry in &voice_entries {
-                                                        if let Some(open) = entry.rfind(" (") {
-                                                            if entry.ends_with(')') {
-                                                                let name = entry[..open].to_string();
-                                                                let mode = entry[open + 2..entry.len() - 1].to_string();
-                                                                grouped.entry(name).or_default().push(mode);
+                                                    // kind -> name -> Vec<mode>
+                                                    let mut by_kind: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+                                                    for entry in &snap.future {
+                                                        let bucket = by_kind.entry(entry.kind.clone()).or_default();
+                                                        // entry.name is "<plugin-name> (<mode>)" in the legacy
+                                                        // shim; preserve the existing display behaviour.
+                                                        if let Some(open) = entry.name.rfind(" (") {
+                                                            if entry.name.ends_with(')') {
+                                                                let name = entry.name[..open].to_string();
+                                                                let mode = entry.name[open + 2..entry.name.len() - 1].to_string();
+                                                                bucket.entry(name).or_default().push(mode);
                                                                 continue;
                                                             }
                                                         }
-                                                        grouped.entry((*entry).to_string()).or_default();
+                                                        bucket.entry(entry.name.clone()).or_default();
                                                     }
-                                                    for (name, modes) in grouped {
-                                                        let modes_str = modes.join("/");
-                                                        app.push_msg(ChatMessage::System(format!(
-                                                            "    voice: {} [{}]",
-                                                            name, modes_str
-                                                        )));
+                                                    for (kind, names) in &by_kind {
+                                                        for (name, modes) in names {
+                                                            let modes_str = modes.join("/");
+                                                            if modes_str.is_empty() {
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "    {}: {}",
+                                                                    kind, name
+                                                                )));
+                                                            } else {
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "    {}: {} [{}]",
+                                                                    kind, name, modes_str
+                                                                )));
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 for provider in &snap.providers {
@@ -1152,7 +1161,7 @@ pub async fn run(
                                     CommandAction::SidecarToggle => {
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.sidecar.is_none() {
-                                            let voice_plugin_info = {
+                                            let sidecar_plugin_info = {
                                                 let sidecar = synaps_cli::sidecar::discovery::discover();
                                                 if let Some(sidecar) = sidecar {
                                                     let manager = ext_mgr_shared.read().await;
@@ -1161,23 +1170,23 @@ pub async fn run(
                                                     None
                                                 }
                                             };
-                                            match self::sidecar::SidecarUiState::spawn_default_with_plugin_info(voice_plugin_info.as_ref()).await {
+                                            match self::sidecar::SidecarUiState::spawn_default_with_plugin_info(sidecar_plugin_info.as_ref()).await {
                                                 Ok(state) => {
                                                     app.sidecar = Some(state);
                                                     app.push_msg(ChatMessage::System(
-                                                        "🎤 voice sidecar online — press the toggle again to stop and transcribe".to_string()
+                                                        "🎤 sidecar online — press the toggle again to stop and transcribe".to_string()
                                                     ));
                                                     if let Some(v) = app.sidecar.as_mut() {
                                                         v.armed = true;
                                                         if let Err(err) = v.manager.press().await {
                                                             v.armed = false;
                                                             v.status = self::sidecar::SidecarUiStatus::Error(err.to_string());
-                                                            app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                            app.push_msg(ChatMessage::Error(format!("sidecar press failed: {err}")));
                                                         }
                                                     }
                                                 }
                                                 Err(err) => {
-                                                    app.push_msg(ChatMessage::Error(format!("voice unavailable: {err}")));
+                                                    app.push_msg(ChatMessage::Error(format!("sidecar unavailable: {err}")));
                                                 }
                                             }
                                         } else {
@@ -1188,16 +1197,16 @@ pub async fn run(
                                             if v.armed {
                                                 v.armed = false;
                                                 if let Err(err) = v.manager.release().await {
-                                                    app.push_msg(ChatMessage::Error(format!("voice release failed: {err}")));
+                                                    app.push_msg(ChatMessage::Error(format!("sidecar release failed: {err}")));
                                                 }
                                                 app.push_msg(ChatMessage::System(
-                                                    "voice: stopping — final transcript will be appended".to_string()
+                                                    "sidecar: stopping — final transcript will be appended".to_string()
                                                 ));
                                             } else {
                                                 v.armed = true;
                                                 if let Err(err) = v.manager.press().await {
                                                     v.armed = false;
-                                                    app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                    app.push_msg(ChatMessage::Error(format!("sidecar press failed: {err}")));
                                                 }
                                             }
                                         }
@@ -1208,11 +1217,11 @@ pub async fn run(
                                             Some(v) => v.status_line(),
                                             None => match synaps_cli::sidecar::discovery::discover() {
                                                 Some(s) => format!(
-                                                    "voice: not yet started — sidecar available from plugin '{}' at {}",
+                                                    "sidecar: not yet started — sidecar available from plugin '{}' at {}",
                                                     s.plugin_name,
                                                     s.binary.display()
                                                 ),
-                                                None => "voice: no plugin provides a voice sidecar (install local-voice from synaps-skills)".to_string(),
+                                                None => "sidecar: no plugin provides a sidecar binary (install one, e.g. local-voice from synaps-skills)".to_string(),
                                             },
                                         };
                                         app.push_msg(ChatMessage::System(line));

@@ -18,7 +18,7 @@ use synaps_cli::sidecar::protocol::{
 
 use super::app::{App, ChatMessage};
 
-/// What the chatui currently shows for the voice indicator.
+/// What the chatui currently shows for the sidecar indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarUiStatus {
     /// Manager is alive but not currently capturing audio.
@@ -27,11 +27,11 @@ pub(crate) enum SidecarUiStatus {
     Listening,
     /// Sidecar reported `TranscribingStarted`.
     Transcribing,
-    /// Sidecar reported an error; user should `/voice toggle` to retry.
+    /// Sidecar reported an error; user should `/sidecar toggle` to retry.
     Error(String),
 }
 
-/// State held by the chatui while voice dictation is enabled.
+/// State held by the chatui while a sidecar plugin is enabled.
 pub(crate) struct SidecarUiState {
     pub manager: SidecarManager,
     pub status: SidecarUiStatus,
@@ -53,7 +53,7 @@ impl SidecarUiState {
     /// with a default dictation-mode handshake.
     ///
     /// Returns `Err` with a user-facing message if no plugin provides
-    /// a voice sidecar or the spawn itself fails.
+    /// a sidecar binary or the spawn itself fails.
     #[allow(dead_code)]
     pub async fn spawn_default() -> Result<Self, String> {
         Self::spawn_default_with_plugin_info(None).await
@@ -72,7 +72,7 @@ impl SidecarUiState {
 
         if !sidecar.binary.is_file() {
             return Err(format!(
-                "voice sidecar binary not found at {} — run the plugin's setup.sh first",
+                "sidecar binary not found at {} — run the plugin's setup.sh first",
                 sidecar.binary.display()
             ));
         }
@@ -123,7 +123,7 @@ impl SidecarUiState {
             },
         )
         .await
-        .map_err(|err: SidecarError| format!("failed to start voice sidecar: {}", err))?;
+        .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
 
         // Read the sidecar's compiled backend straight from the cached
         // `info.get` response (Phase 5). Falls back to None when the plugin
@@ -142,16 +142,16 @@ impl SidecarUiState {
         })
     }
 
-    /// Render a human-readable status line for `/voice status`.
+    /// Render a human-readable status line for `/sidecar status`.
     pub fn status_line(&self) -> String {
         let state = match &self.status {
             SidecarUiStatus::Idle => "idle",
             SidecarUiStatus::Listening => "listening",
             SidecarUiStatus::Transcribing => "transcribing",
-            SidecarUiStatus::Error(msg) => return format!("voice: error — {}", msg),
+            SidecarUiStatus::Error(msg) => return format!("sidecar: error — {}", msg),
         };
         format!(
-            "voice: {} ({}) — sidecar: {} | backend: {}",
+            "sidecar: {} ({}) — process: {} | backend: {}",
             state,
             self.sidecar.plugin_name,
             self.sidecar.binary.display(),
@@ -222,12 +222,12 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
         SidecarLifecycleEvent::Error(message) => {
             v.status = SidecarUiStatus::Error(message.clone());
             app.push_msg(ChatMessage::Error(format!(
-                "voice sidecar error: {}",
+                "sidecar error: {}",
                 message
             )));
         }
         SidecarLifecycleEvent::Exited => {
-            app.push_msg(ChatMessage::System("voice sidecar exited".to_string()));
+            app.push_msg(ChatMessage::System("sidecar exited".to_string()));
             app.sidecar = None;
         }
     }

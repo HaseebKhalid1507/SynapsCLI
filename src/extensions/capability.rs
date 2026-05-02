@@ -35,7 +35,7 @@ pub struct ToolCapabilityEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FutureCapabilityEntry {
-    pub kind: String, // "memory" | "indexer" | "voice"
+    pub kind: String, // free-form capability kind declared by the plugin
     pub name: String,
 }
 
