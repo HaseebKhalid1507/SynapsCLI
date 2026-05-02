@@ -94,8 +94,6 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
     let visible_height = chunks[1].height as usize;
     state.set_visible_height(visible_height);
     let rows = state.filtered_rows();
-    let start = state.scroll().min(rows.len());
-    let end = (start + visible_height).min(rows.len());
     let result_count = state.filtered_entries().len();
     let lines: Vec<Line<'static>> = if rows.is_empty() {
         state
@@ -104,38 +102,28 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
             .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
             .collect()
     } else {
-        rows[start..end]
-            .iter()
-            .enumerate()
-            .flat_map(|(offset, row)| {
-                let idx = start + offset;
-                match row {
-                    synaps_cli::help::HelpFindRow::Category(category) => vec![Line::from(Span::styled(
-                        category.to_string(),
-                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
-                    ))],
-                    synaps_cli::help::HelpFindRow::Entry(entry) => {
-                        let selected = idx == state.cursor();
-                        let marker = if selected { "›" } else { " " };
-                        let command_style = if selected {
-                            Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(THEME.load().input_fg)
-                        };
-                        let summary_style = Style::default().fg(THEME.load().muted);
-                        let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
-                        wrapped_entry_lines(
-                            marker,
-                            entry,
-                            state.filter(),
-                            chunks[1].width as usize,
-                            command_style,
-                            summary_style,
-                            match_style,
-                        )
-                    }
+        let rendered_rows = render_help_find_rows(&rows, state, chunks[1].width as usize);
+        let row_heights = rendered_rows.iter().map(Vec::len).collect::<Vec<_>>();
+        let start = synaps_cli::help::visible_help_find_window(
+            &row_heights,
+            state.cursor(),
+            state.scroll(),
+            visible_height,
+        );
+        let mut used_height = 0usize;
+        rendered_rows
+            .into_iter()
+            .skip(start)
+            .take_while(|row_lines| {
+                let next = used_height + row_lines.len().max(1);
+                if next <= visible_height {
+                    used_height = next;
+                    true
+                } else {
+                    false
                 }
             })
+            .flatten()
             .collect()
     };
     frame.render_widget(Paragraph::new(lines), chunks[1]);
@@ -151,6 +139,40 @@ fn highlighted_spans(text: &str, query: &str, base: Style, matched: Style) -> Ve
     synaps_cli::help::highlight_segments(text, query)
         .into_iter()
         .map(|segment| Span::styled(segment.text, if segment.matched { matched } else { base }))
+        .collect()
+}
+
+fn render_help_find_rows(
+    rows: &[synaps_cli::help::HelpFindRow<'_>],
+    state: &synaps_cli::help::HelpFindState,
+    width: usize,
+) -> Vec<Vec<Line<'static>>> {
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| match row {
+            synaps_cli::help::HelpFindRow::Category(category) => {
+                let spacer = if idx == 0 { Vec::new() } else { vec![Line::from("")] };
+                spacer
+                    .into_iter()
+                    .chain(std::iter::once(Line::from(Span::styled(
+                        category.to_string(),
+                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
+                    ))))
+                    .collect()
+            }
+            synaps_cli::help::HelpFindRow::Entry(entry) => {
+                let selected = idx == state.cursor();
+                let marker = if selected { "›" } else { " " };
+                let command_style = if selected {
+                    Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME.load().input_fg)
+                };
+                let summary_style = Style::default().fg(THEME.load().muted);
+                let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
+                wrapped_entry_lines(marker, entry, state.filter(), width, command_style, summary_style, match_style)
+            }
+        })
         .collect()
 }
 

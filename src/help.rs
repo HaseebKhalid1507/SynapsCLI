@@ -912,6 +912,25 @@ pub fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
     }
 }
 
+pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: usize, visible_height: usize) -> usize {
+    if row_heights.is_empty() || visible_height == 0 {
+        return 0;
+    }
+    let cursor = cursor.min(row_heights.len() - 1);
+    let mut start = scroll.min(cursor);
+    while start < cursor && visual_height_between(row_heights, start, cursor) > visible_height {
+        start += 1;
+    }
+    start
+}
+
+fn visual_height_between(row_heights: &[usize], start: usize, end_inclusive: usize) -> usize {
+    row_heights[start..=end_inclusive]
+        .iter()
+        .map(|height| (*height).max(1))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +955,13 @@ mod tests {
         let lines = wrap_help_text("abc def", 0);
 
         assert_eq!(lines, vec!["abc def"]);
+    }
+
+    #[test]
+    fn visible_help_find_window_scrolls_by_visual_row_height_to_keep_cursor_visible() {
+        let heights = vec![1, 1, 3, 1, 1];
+
+        assert_eq!(visible_help_find_window(&heights, 2, 0, 3), 2);
+        assert_eq!(visible_help_find_window(&heights, 4, 2, 4), 3);
     }
 }
