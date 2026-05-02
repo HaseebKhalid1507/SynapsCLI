@@ -185,6 +185,10 @@ pub async fn run(
     // pruned manually after upgrade.
     migrate_legacy_voice_config_keys();
     migrate_legacy_sidecar_toggle_key();
+    // Phase 8 slice 8A.8: copy legacy `sidecar_toggle_key` into the
+    // namespace of any plugin that has staked a lifecycle claim with
+    // a settings_category. Idempotent: skips already-set new keys.
+    migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
     if !no_extensions {
         let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
@@ -1875,5 +1879,180 @@ fn migrate_legacy_sidecar_toggle_key() {
             LEGACY,
             NEW
         );
+    }
+}
+
+/// Phase 8 slice 8A.8: when a plugin has staked a lifecycle claim and
+/// declared a `settings_category`, copy the legacy global
+/// `sidecar_toggle_key` value into the plugin-namespaced equivalent
+/// (`plugins.{plugin}.{cat}._lifecycle_toggle_key`) so the user's
+/// toggle-key choice follows them across the rename. Idempotent: any
+/// claim whose new key is already set is skipped, and a missing legacy
+/// value is a no-op.
+fn migrate_sidecar_toggle_key_to_claimed_plugins(
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) {
+    const LEGACY: &str = "sidecar_toggle_key";
+    let Some(legacy_value) = synaps_cli::config::read_config_value(LEGACY) else {
+        return;
+    };
+    let trimmed = legacy_value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    for claim in claims {
+        let Some(ref cat) = claim.settings_category else { continue };
+        let new_key = format!(
+            "plugins.{}.{}._lifecycle_toggle_key",
+            claim.plugin, cat
+        );
+        if synaps_cli::config::read_config_value(&new_key).is_some() {
+            continue;
+        }
+        match synaps_cli::config::write_config_value(&new_key, trimmed) {
+            Ok(()) => tracing::info!(
+                "sidecar migration: copied global `{}` → `{}` for plugin `{}`",
+                LEGACY,
+                new_key,
+                claim.plugin,
+            ),
+            Err(err) => tracing::warn!(
+                "sidecar migration: failed to copy `{}` → `{}`: {}",
+                LEGACY,
+                new_key,
+                err,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn make_test_home(subdir: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/tmp/synaps-mig-test-{}", subdir));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".synaps-cli")).unwrap();
+        dir
+    }
+
+    fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        f();
+        if let Some(h) = original {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    fn claim(plugin: &str, command: &str, cat: Option<&str>) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: plugin.to_string(),
+            command: command.to_string(),
+            settings_category: cat.map(str::to_string),
+            display_name: command.to_string(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn migrate_copies_legacy_into_namespaced_key() {
+        let home = make_test_home("copy-into-namespaced");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = F2\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "local-voice",
+                "voice",
+                Some("voice"),
+            )]);
+            let v = synaps_cli::config::read_config_value(
+                "plugins.local-voice.voice._lifecycle_toggle_key",
+            );
+            assert_eq!(v.as_deref(), Some("F2"));
+        });
+    }
+
+    #[test]
+    fn migrate_skips_when_new_key_already_set() {
+        let home = make_test_home("skip-existing");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(
+            &cfg,
+            "sidecar_toggle_key = F2\nplugins.local-voice.voice._lifecycle_toggle_key = F12\n",
+        ).unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "local-voice",
+                "voice",
+                Some("voice"),
+            )]);
+            let v = synaps_cli::config::read_config_value(
+                "plugins.local-voice.voice._lifecycle_toggle_key",
+            );
+            assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
+        });
+    }
+
+    #[test]
+    fn migrate_is_noop_when_legacy_unset() {
+        let home = make_test_home("noop-no-legacy");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "local-voice",
+                "voice",
+                Some("voice"),
+            )]);
+            assert!(synaps_cli::config::read_config_value(
+                "plugins.local-voice.voice._lifecycle_toggle_key"
+            ).is_none());
+        });
+    }
+
+    #[test]
+    fn migrate_skips_claim_without_settings_category() {
+        let home = make_test_home("skip-no-category");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = F8\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim("p", "ocr", None)]);
+            // No namespaced key written for a claim with no category.
+            let contents = std::fs::read_to_string(&cfg).unwrap();
+            assert!(
+                !contents.contains("_lifecycle_toggle_key"),
+                "no namespaced key should be written when settings_category is None: {contents}"
+            );
+        });
+    }
+
+    #[test]
+    fn migrate_handles_multiple_claims_in_one_pass() {
+        let home = make_test_home("multi-claim");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = C-V\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[
+                claim("local-voice", "voice", Some("voice")),
+                claim("ocr-plugin", "ocr", Some("ocr")),
+            ]);
+            assert_eq!(
+                synaps_cli::config::read_config_value(
+                    "plugins.local-voice.voice._lifecycle_toggle_key"
+                ).as_deref(),
+                Some("C-V")
+            );
+            assert_eq!(
+                synaps_cli::config::read_config_value(
+                    "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
+                ).as_deref(),
+                Some("C-V")
+            );
+        });
     }
 }

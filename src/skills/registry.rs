@@ -301,6 +301,45 @@ impl CommandRegistry {
                 new_qualified.insert(q, arc.clone());
             }
         }
+        // Phase 8 slice 8A.3: for each lifecycle claim with a
+        // settings_category, inject a synthetic `_lifecycle_toggle_key`
+        // field at the front of the matching plugin-declared category.
+        // No-op (with a warn) if the named category doesn't exist.
+        for claim in new_lifecycle_claims.values() {
+            let Some(ref cat_id) = claim.settings_category else {
+                continue;
+            };
+            let pos = new_plugin_settings_categories
+                .iter()
+                .position(|c| c.plugin == claim.plugin && &c.id == cat_id);
+            match pos {
+                Some(idx) => {
+                    let injected = PluginSettingsField {
+                        key: "_lifecycle_toggle_key".to_string(),
+                        label: "Toggle key".to_string(),
+                        editor: PluginSettingsEditor::Cycler {
+                            options: ["F8", "F2", "F12", "C-V", "C-G"]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
+                        },
+                        help: Some("Keybind that toggles this sidecar.".to_string()),
+                        default: None,
+                    };
+                    new_plugin_settings_categories[idx]
+                        .fields
+                        .insert(0, injected);
+                }
+                None => {
+                    tracing::warn!(
+                        "lifecycle claim for plugin '{}' references settings_category '{}' but no such category was declared; skipping toggle-key injection",
+                        claim.plugin,
+                        cat_id,
+                    );
+                }
+            }
+        }
+
         let mut w = self.inner.write().unwrap();
         w.skills = new_skills;
         w.qualified = new_qualified;
@@ -999,5 +1038,166 @@ mod tests {
         reg.rebuild_with_plugins(vec![], vec![]);
         assert!(reg.lifecycle_for_command("voice").is_none());
         assert!(reg.lifecycle_claim_collisions().is_empty());
+    }
+
+    // ---- Phase 8 slice 8A.3: virtual toggle-key field injection ----
+
+    fn mk_plugin_lifecycle_plus_settings(
+        plugin: &str,
+        command: &str,
+        lifecycle_settings_category: Option<&str>,
+        category_ids: &[&str],
+    ) -> Plugin {
+        use crate::skills::manifest::{
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
+            ManifestSettingsField, PluginManifest, PluginProvides, SidecarLifecycle,
+            SidecarManifest,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: lifecycle_settings_category.map(str::to_string),
+                            display_name: None,
+                            importance: 0,
+                        }),
+                    }),
+                }),
+                settings: Some(ManifestSettings {
+                    categories: category_ids
+                        .iter()
+                        .map(|id| ManifestSettingsCategory {
+                            id: id.to_string(),
+                            label: id.to_string(),
+                            fields: vec![ManifestSettingsField {
+                                key: "existing".to_string(),
+                                label: "Existing".to_string(),
+                                editor: ManifestEditorKind::Text,
+                                options: vec![],
+                                help: None,
+                                default: None,
+                                numeric: false,
+                            }],
+                        })
+                        .collect(),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn lifecycle_injects_virtual_toggle_key_into_matching_category() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings(
+                "local-voice",
+                "voice",
+                Some("voice"),
+                &["voice"],
+            )],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats
+            .iter()
+            .find(|c| c.id == "voice" && c.plugin == "local-voice")
+            .expect("voice category present");
+        assert!(!voice.fields.is_empty());
+        let first = &voice.fields[0];
+        assert_eq!(first.key, "_lifecycle_toggle_key");
+        assert_eq!(first.label, "Toggle key");
+        match &first.editor {
+            PluginSettingsEditor::Cycler { options } => {
+                assert_eq!(
+                    options,
+                    &vec![
+                        "F8".to_string(),
+                        "F2".to_string(),
+                        "F12".to_string(),
+                        "C-V".to_string(),
+                        "C-G".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected cycler, got {other:?}"),
+        }
+        assert_eq!(voice.fields[1].key, "existing");
+    }
+
+    #[test]
+    fn lifecycle_no_injection_when_settings_category_is_none() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings("p", "ocr", None, &["voice"])],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats.iter().find(|c| c.id == "voice").expect("category");
+        assert!(voice.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+    }
+
+    #[test]
+    fn lifecycle_no_injection_when_category_does_not_exist() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings(
+                "p",
+                "voice",
+                Some("nonexistent"),
+                &["voice"],
+            )],
+        );
+        let cats = reg.plugin_settings_categories();
+        for c in &cats {
+            assert!(c.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+        }
+    }
+
+    #[test]
+    fn lifecycle_two_plugins_each_get_injection_in_their_own_category() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_lifecycle_plus_settings(
+                    "voice-plugin",
+                    "voice",
+                    Some("voice"),
+                    &["voice"],
+                ),
+                mk_plugin_lifecycle_plus_settings(
+                    "ocr-plugin",
+                    "ocr",
+                    Some("ocr"),
+                    &["ocr"],
+                ),
+            ],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats.iter().find(|c| c.plugin == "voice-plugin").unwrap();
+        let ocr = cats.iter().find(|c| c.plugin == "ocr-plugin").unwrap();
+        assert_eq!(voice.fields[0].key, "_lifecycle_toggle_key");
+        assert_eq!(ocr.fields[0].key, "_lifecycle_toggle_key");
     }
 }

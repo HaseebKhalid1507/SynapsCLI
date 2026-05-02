@@ -152,4 +152,25 @@ mod tests {
             .expect("sidecar_toggle_key setting should be defined");
         assert_eq!(def.category, Category::Sidecar);
     }
+
+    #[test]
+    fn sidecar_toggle_key_static_setting_still_defined_for_backward_compat() {
+        // Phase 8 slice 8A.4: even after `visible_categories(claims)`
+        // hides the global Sidecar page when a plugin claims its own
+        // settings_category, the static def stays in ALL_SETTINGS so
+        // legacy users without claimed plugins keep a working toggle
+        // and config round-trips remain stable.
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "sidecar_toggle_key")
+            .expect("sidecar_toggle_key setting must remain in ALL_SETTINGS for back-compat");
+        assert_eq!(def.category, Category::Sidecar);
+        match def.editor {
+            EditorKind::Cycler(opts) => {
+                assert!(opts.contains(&"F8"));
+                assert!(opts.contains(&"C-V"));
+            }
+            _ => panic!("expected Cycler editor for sidecar_toggle_key"),
+        }
+    }
 }
