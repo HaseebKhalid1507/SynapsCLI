@@ -55,6 +55,33 @@ fn sidecar_pill_segment(
     Span::styled(text, Style::default().fg(color).add_modifier(modifier))
 }
 
+/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// pairs and the registry's lifecycle claims, return the plugin ids in
+/// display order: importance desc, then display_name alphabetical, then
+/// plugin id. Pulled out so the ordering can be unit-tested without
+/// constructing a full `SidecarUiState` (which owns a child process).
+pub(crate) fn order_sidecar_pills(
+    sidecars: &[(String, Option<String>)],
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Vec<String> {
+    let importance_for = |pid: &str| -> i32 {
+        claims.iter().find(|c| c.plugin == pid).map(|c| c.importance).unwrap_or(0)
+    };
+    let mut keys: Vec<&(String, Option<String>)> = sidecars.iter().collect();
+    keys.sort_by(|a, b| {
+        let imp_a = importance_for(&a.0);
+        let imp_b = importance_for(&b.0);
+        imp_b.cmp(&imp_a)
+            .then_with(|| {
+                let an = a.1.as_deref().unwrap_or(a.0.as_str());
+                let bn = b.1.as_deref().unwrap_or(b.0.as_str());
+                an.cmp(bn)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    keys.into_iter().map(|(p, _)| p.clone()).collect()
+}
+
 /// Build sidecar pill spans for all active sidecars, ordered by
 /// importance (desc) then display_name alphabetical (Phase 8 8B.3).
 ///
@@ -69,25 +96,13 @@ pub(crate) fn sidecar_pill_spans(
         return Vec::new();
     }
     let claims = registry.lifecycle_claims();
-    let importance_for = |pid: &str| -> i32 {
-        claims.iter().find(|c| c.plugin == pid).map(|c| c.importance).unwrap_or(0)
-    };
-    let mut entries: Vec<(&String, &super::sidecar::SidecarUiState)> =
-        app.sidecars.iter().collect();
-    entries.sort_by(|a, b| {
-        let imp_a = importance_for(a.0);
-        let imp_b = importance_for(b.0);
-        // Higher importance first; tiebreak alphabetical by display name then plugin id.
-        imp_b.cmp(&imp_a)
-            .then_with(|| {
-                let an = a.1.display_name.as_deref().unwrap_or(a.0.as_str());
-                let bn = b.1.display_name.as_deref().unwrap_or(b.0.as_str());
-                an.cmp(bn)
-            })
-            .then_with(|| a.0.cmp(b.0))
-    });
-    let mut spans = Vec::with_capacity(entries.len() * 2);
-    for (_pid, state) in entries {
+    let inputs: Vec<(String, Option<String>)> = app.sidecars.iter()
+        .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
+        .collect();
+    let order = order_sidecar_pills(&inputs, &claims);
+    let mut spans = Vec::with_capacity(order.len() * 2);
+    for pid in &order {
+        let Some(state) = app.sidecars.get(pid) else { continue; };
         spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
         spans.push(sidecar_pill_segment(state, app.spinner_frame));
     }
@@ -191,7 +206,41 @@ mod sidecar_pill_tests {
         assert!(!text.contains("Voice"), "got: {text:?}");
     }
 
+    fn claim(plugin: &str, command: &str, importance: i32) -> synaps_cli::skills::registry::LifecycleClaim {
+        synaps_cli::skills::registry::LifecycleClaim {
+            plugin: plugin.into(),
+            command: command.into(),
+            settings_category: None,
+            display_name: command.into(),
+            importance,
+        }
+    }
+
     #[test]
+    fn multi_segment_pill_orders_by_importance_desc() {
+        // alpha @ 10, beta @ 90 — beta should come first.
+        let claims = vec![claim("alpha", "alpha", 10), claim("beta", "beta", 90)];
+        let inputs = vec![
+            ("alpha".to_string(), Some("Alpha".to_string())),
+            ("beta".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["beta".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn multi_segment_pill_tiebreaks_alphabetical_by_display_name() {
+        // Both importance 50 — Alpha before Beta by display name.
+        let claims = vec![claim("p2", "p2", 50), claim("p1", "p1", 50)];
+        let inputs = vec![
+            ("p2".to_string(), Some("Alpha".to_string())),
+            ("p1".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["p2".to_string(), "p1".to_string()]);
+    }
+
+        #[test]
     fn active_tasks_progress_line_renders_fraction() {
         let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
         tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
