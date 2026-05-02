@@ -1161,16 +1161,34 @@ pub async fn run(
                                     CommandAction::SidecarToggle => {
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.sidecar.is_none() {
-                                            let sidecar_plugin_info = {
+                                            // Discover the plugin once, then ask the
+                                            // ExtensionManager for the cached `info.get`
+                                            // payload AND the plugin-supplied
+                                            // `sidecar.spawn_args`. The manager call is
+                                            // best-effort: legacy plugins return Err and
+                                            // we fall back to manifest defaults.
+                                            let (sidecar_plugin_info, sidecar_spawn_args) = {
                                                 let sidecar = synaps_cli::sidecar::discovery::discover();
                                                 if let Some(sidecar) = sidecar {
                                                     let manager = ext_mgr_shared.read().await;
-                                                    manager.plugin_info(&sidecar.plugin_name).cloned()
+                                                    let info = manager.plugin_info(&sidecar.plugin_name).cloned();
+                                                    let args = match manager.sidecar_spawn_args(&sidecar.plugin_name).await {
+                                                        Ok(a) => Some(a),
+                                                        Err(err) => {
+                                                            tracing::debug!(
+                                                                plugin = %sidecar.plugin_name,
+                                                                error = %err,
+                                                                "sidecar.spawn_args RPC unavailable; using manifest defaults",
+                                                            );
+                                                            None
+                                                        }
+                                                    };
+                                                    (info, args)
                                                 } else {
-                                                    None
+                                                    (None, None)
                                                 }
                                             };
-                                            match self::sidecar::SidecarUiState::spawn_default_with_plugin_info(sidecar_plugin_info.as_ref()).await {
+                                            match self::sidecar::SidecarUiState::spawn_with(sidecar_spawn_args, sidecar_plugin_info.as_ref()).await {
                                                 Ok(state) => {
                                                     app.sidecar = Some(state);
                                                     app.push_msg(ChatMessage::System(

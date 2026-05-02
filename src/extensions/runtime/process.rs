@@ -1837,6 +1837,23 @@ impl ExtensionHandler for ProcessExtension {
             .map_err(|e| format!("Invalid info.get response from extension '{}': {}", self.id, e))
     }
 
+    async fn sidecar_spawn_args(
+        &self,
+    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("sidecar.spawn_args", Value::Null),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' sidecar.spawn_args timed out", self.id))??;
+        serde_json::from_value(value).map_err(|e| {
+            format!(
+                "Invalid sidecar.spawn_args response from extension '{}': {}",
+                self.id, e
+            )
+        })
+    }
+
     async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {
         let params = crate::extensions::settings_editor::SettingsEditorOpenParams {
             category: category.to_string(),

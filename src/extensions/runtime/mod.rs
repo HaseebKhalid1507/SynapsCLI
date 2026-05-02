@@ -123,6 +123,15 @@ pub trait ExtensionHandler: Send + Sync {
         Err("extension runtime does not support info.get".to_string())
     }
 
+    /// Ask the plugin to supply sidecar spawn arguments. Used by the
+    /// modality-neutral sidecar bootstrap path (see
+    /// `crate::sidecar::spawn`); plugins that don't host a sidecar
+    /// should leave the default `Err` in place. Core treats the
+    /// returned [`SidecarSpawnArgs::args`] as opaque.
+    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        Err("extension runtime does not support sidecar.spawn_args".to_string())
+    }
+
     /// Open a plugin-owned custom settings editor and return its initial render payload.
     async fn settings_editor_open(&self, _category: &str, _field: &str) -> Result<Value, String> {
         Err("extension runtime does not support settings.editor.open".to_string())

@@ -480,6 +480,22 @@ impl ExtensionManager {
         self.plugin_info.get(id)
     }
 
+    /// Ask a plugin for its sidecar spawn arguments. Best-effort —
+    /// plugins that don't host a sidecar (or pre-Phase-7 plugins that
+    /// haven't implemented the RPC yet) return `Err`. Callers are
+    /// expected to treat that as "no overrides; use manifest defaults".
+    pub async fn sidecar_spawn_args(
+        &self,
+        id: &str,
+    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.sidecar_spawn_args().await
+    }
+
     /// Invoke an interactive plugin command on extension `id`. Streams
     /// `command.output` (matching `request_id`) and `task.*` notifications
     /// to `sink`. Returns the final JSON-RPC response value.
