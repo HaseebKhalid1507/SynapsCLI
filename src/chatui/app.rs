@@ -835,7 +835,37 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_system_messages_are_separated_by_a_center_rule() {
+    fn grouped_system_output_does_not_insert_rules_between_indented_lines() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("Extensions (1):".to_string()));
+        app.push_msg(ChatMessage::System("  voice — ok".to_string()));
+        app.push_msg(ChatMessage::System("    tools: speak".to_string()));
+
+        let lines = app.render_lines(80);
+        let header_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("Extensions (1):")))
+            .expect("header system message should render");
+        let child_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("voice — ok")))
+            .expect("child system message should render");
+        let grandchild_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("tools: speak")))
+            .expect("grandchild system message should render");
+
+        let has_rule = |slice: &[ratatui::text::Line]| {
+            slice
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("─ · ─")))
+        };
+        assert!(!has_rule(&lines[header_idx + 1..child_idx]));
+        assert!(!has_rule(&lines[child_idx + 1..grandchild_idx]));
+    }
+
+    #[test]
+    fn unrelated_consecutive_system_messages_still_get_a_rule() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("first".to_string()));
         app.push_msg(ChatMessage::System("second".to_string()));
