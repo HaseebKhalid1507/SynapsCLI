@@ -1,5 +1,25 @@
 use synaps_cli::help::{builtin_entries, render_entry, render_help, HelpEntry, HelpRegistry, HelpTopicKind};
 
+fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpEntry {
+    HelpEntry {
+        id: command.trim_start_matches('/').replace(' ', "-").to_string(),
+        command: command.to_string(),
+        title: title.to_string(),
+        summary: String::new(),
+        category: category.to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common,
+        aliases: vec![],
+        keywords: vec![],
+        lines: vec![],
+        usage: None,
+        examples: vec![],
+        related: vec![],
+        source: None,
+    }
+}
+
 #[test]
 fn base_help_is_brief_and_points_to_find() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
@@ -243,4 +263,83 @@ fn help_find_filters_in_memory_by_command_summary_keywords_and_aliases() {
 
     let plugin_matches = registry.search("PLUGIN");
     assert!(plugin_matches.iter().any(|entry| entry.command == "/help plugins"), "filter should be case-insensitive");
+}
+
+#[test]
+fn search_ranking_exact_command_and_title_outrank_prefix_and_body() {
+    let mut exact_command = test_entry("/model", "Switch Model", "Models", false);
+    exact_command.lines = vec!["Body mentions model palette.".to_string()];
+    let mut exact_title = test_entry("/zzz", "model", "Advanced", false);
+    exact_title.lines = vec!["Body mentions model palette.".to_string()];
+    let mut prefix = test_entry("/modelist", "Modelist", "Advanced", false);
+    prefix.summary = "Prefix command.".to_string();
+    let mut body = test_entry("/alpha", "Alpha", "Advanced", false);
+    body.lines = vec!["Only the body mentions model.".to_string()];
+    let registry = HelpRegistry::new(vec![body, prefix, exact_title, exact_command], Vec::new());
+
+    let commands = registry
+        .search("model")
+        .into_iter()
+        .map(|entry| entry.command.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(commands[..4], ["/model", "/zzz", "/modelist", "/alpha"]);
+}
+
+#[test]
+fn search_ranking_prefix_outranks_alias_keyword_summary_and_body() {
+    let prefix = test_entry("/chain", "Chain", "Sessions", false);
+    let mut alias = test_entry("/alias-hit", "Alias Hit", "Advanced", false);
+    alias.aliases = vec!["/chain-alias".to_string()];
+    let mut keyword = test_entry("/keyword-hit", "Keyword Hit", "Advanced", false);
+    keyword.keywords = vec!["chain".to_string()];
+    let mut summary = test_entry("/summary-hit", "Summary Hit", "Advanced", false);
+    summary.summary = "Summary mentions chain.".to_string();
+    let mut body = test_entry("/body-hit", "Body Hit", "Advanced", false);
+    body.lines = vec!["Body mentions chain.".to_string()];
+    let registry = HelpRegistry::new(vec![body, summary, keyword, alias, prefix], Vec::new());
+
+    let commands = registry
+        .search("chain")
+        .into_iter()
+        .map(|entry| entry.command.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(commands[0], "/chain");
+    assert_eq!(commands[1], "/alias-hit");
+    assert!(commands.iter().position(|command| *command == "/summary-hit").unwrap()
+        < commands.iter().position(|command| *command == "/body-hit").unwrap());
+}
+
+#[test]
+fn search_alias_match_returns_canonical_entry() {
+    let mut entry = test_entry("/canonical", "Canonical", "Core", false);
+    entry.aliases = vec!["/shortcut".to_string()];
+    let registry = HelpRegistry::new(vec![entry], Vec::new());
+
+    let matches = registry.search("shortcut");
+
+    assert_eq!(matches.first().map(|entry| entry.command.as_str()), Some("/canonical"));
+}
+
+#[test]
+fn empty_search_orders_common_then_core_then_category_and_command() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/zeta", "Zeta", "Advanced", false),
+            test_entry("/beta", "Beta", "Core", false),
+            test_entry("/alpha", "Alpha", "Core", false),
+            test_entry("/settings", "Settings", "Settings", true),
+            test_entry("/model", "Model", "Models", true),
+        ],
+        Vec::new(),
+    );
+
+    let commands = registry
+        .search("")
+        .into_iter()
+        .map(|entry| entry.command.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(commands, ["/model", "/settings", "/alpha", "/beta", "/zeta"]);
 }

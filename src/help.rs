@@ -86,14 +86,19 @@ impl HelpFindState {
     }
 
     pub fn filtered_entries(&self) -> Vec<&HelpEntry> {
-        let needle = self.filter.to_ascii_lowercase();
-        if needle.trim().is_empty() {
-            return self.entries.iter().collect();
+        ranked_entries(&self.entries, &self.filter)
+    }
+
+    pub fn no_results_message(&self) -> String {
+        let query = self.filter.trim();
+        if query.is_empty() {
+            "No help topics available. Try: model, settings, plugins, sessions, doctor".to_string()
+        } else {
+            format!(
+                "No help matches for '{}'. Try: model, settings, plugins, sessions, doctor",
+                query
+            )
         }
-        self.entries
-            .iter()
-            .filter(|entry| searchable_text(entry).contains(&needle))
-            .collect()
     }
 
     pub fn selected(&self) -> Option<&HelpEntry> {
@@ -224,14 +229,7 @@ impl HelpRegistry {
     }
 
     pub fn search(&self, query: &str) -> Vec<&HelpEntry> {
-        let needle = query.trim().to_ascii_lowercase();
-        if needle.is_empty() {
-            return self.entries.iter().collect();
-        }
-        self.entries
-            .iter()
-            .filter(|entry| searchable_text(entry).contains(&needle))
-            .collect()
+        ranked_entries(&self.entries, query)
     }
 }
 
@@ -322,34 +320,90 @@ fn protected_commands(entries: &[HelpEntry]) -> HashSet<String> {
     protected
 }
 
-fn searchable_text(entry: &HelpEntry) -> String {
-    let mut text = format!(
-        "{} {} {} {} {}",
-        entry.command, entry.title, entry.summary, entry.category, entry.id
-    );
-    for alias in &entry.aliases {
-        text.push(' ');
-        text.push_str(alias);
+fn ranked_entries<'a>(entries: &'a [HelpEntry], query: &str) -> Vec<&'a HelpEntry> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut scored: Vec<(&HelpEntry, i32)> = entries
+        .iter()
+        .filter_map(|entry| {
+            if needle.is_empty() {
+                Some((entry, empty_query_score(entry)))
+            } else {
+                match_score(entry, &needle).map(|score| (entry, score))
+            }
+        })
+        .collect();
+
+    scored.sort_by(|(a, score_a), (b, score_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| a.command.cmp(&b.command))
+    });
+    scored.into_iter().map(|(entry, _)| entry).collect()
+}
+
+fn empty_query_score(entry: &HelpEntry) -> i32 {
+    let mut score = 0;
+    if entry.common {
+        score += 2_000;
     }
-    for keyword in &entry.keywords {
-        text.push(' ');
-        text.push_str(keyword);
+    if entry.category.eq_ignore_ascii_case("core") {
+        score += 1_000;
     }
-    for line in &entry.lines {
-        text.push(' ');
-        text.push_str(line);
+    score
+}
+
+fn match_score(entry: &HelpEntry, needle: &str) -> Option<i32> {
+    let command = entry.command.to_ascii_lowercase();
+    let title = entry.title.to_ascii_lowercase();
+    if command == needle || command.trim_start_matches('/') == needle {
+        return Some(11_000 + common_bonus(entry));
     }
-    if let Some(usage) = &entry.usage {
-        text.push(' ');
-        text.push_str(usage);
+    if title == needle {
+        return Some(10_000 + common_bonus(entry));
     }
-    for example in &entry.examples {
-        text.push(' ');
-        text.push_str(&example.command);
-        text.push(' ');
-        text.push_str(&example.description);
+    if command.starts_with(needle)
+        || command.trim_start_matches('/').starts_with(needle.trim_start_matches('/'))
+    {
+        return Some(8_500 + common_bonus(entry));
     }
-    text.to_ascii_lowercase()
+    if title.starts_with(needle) {
+        return Some(8_000 + common_bonus(entry));
+    }
+    if entry
+        .aliases
+        .iter()
+        .any(|alias| field_matches(alias, needle))
+    {
+        return Some(6_000 + common_bonus(entry));
+    }
+    if entry
+        .keywords
+        .iter()
+        .any(|keyword| field_matches(keyword, needle))
+    {
+        return Some(5_000 + common_bonus(entry));
+    }
+    if field_matches(&entry.summary, needle) {
+        return Some(4_000 + common_bonus(entry));
+    }
+    if entry.lines.iter().any(|line| field_matches(line, needle))
+        || entry.usage.as_ref().is_some_and(|usage| field_matches(usage, needle))
+        || entry.examples.iter().any(|example| {
+            field_matches(&example.command, needle) || field_matches(&example.description, needle)
+        })
+    {
+        return Some(3_000 + common_bonus(entry));
+    }
+    None
+}
+
+fn field_matches(value: &str, needle: &str) -> bool {
+    value.to_ascii_lowercase().contains(needle)
+}
+
+fn common_bonus(entry: &HelpEntry) -> i32 {
+    if entry.common { 100 } else { 0 }
 }
 
 #[cfg(test)]
