@@ -45,16 +45,15 @@ pub(crate) enum EditorKind {
     ThemePicker,
     /// Picks a whisper STT model (`*.bin`) from
     /// `~/.synaps-cli/models/whisper/`. Persisted as `voice_stt_model_path`.
+    ///
+    /// Superseded by `ModelBrowser` — kept for back-compat with any
+    /// downstream definitions that haven't migrated yet.
+    #[allow(dead_code)]
     WhisperModelPicker,
     /// Browses the whisper.cpp catalog: shows installed status against
     /// `~/.synaps-cli/models/whisper/`, lets the user select an installed
     /// model OR trigger a download for an uninstalled one. Persists the
     /// selected model's absolute path under `voice_stt_model_path`.
-    ///
-    /// Currently unreferenced from `defs.rs` — `voice_stt_model` still
-    /// uses `WhisperModelPicker`. The cutover happens in a follow-up
-    /// commit after both Track C and Track D land.
-    #[allow(dead_code)]
     ModelBrowser,
     Text { numeric: bool },
 }

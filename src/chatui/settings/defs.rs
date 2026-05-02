@@ -147,8 +147,9 @@ define_settings! {
         |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default */ };
 
     voice_stt_model, "Voice STT model", Voice,
-        EditorKind::WhisperModelPicker,
-        "Whisper model used for transcription. Lists ~/.synaps-cli/models/whisper/*.bin.",
+        EditorKind::ModelBrowser,
+        "Whisper model used for transcription. Browse the catalog — \
+         installed models are marked, uninstalled rows trigger a download.",
         |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default via voice_stt_model_path */ };
 
     voice_stt_backend, "Voice STT backend", Voice,
