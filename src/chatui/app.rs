@@ -96,6 +96,8 @@ pub(crate) struct App {
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
     /// Active models router modal state (Some while /model or /models is open).
     pub(crate) models: Option<super::models::ModelsModalState>,
+    /// Active /help find lightbox state.
+    pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -188,6 +190,7 @@ impl App {
             settings: None,
             plugins: None,
             models: None,
+            help_find: None,
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),

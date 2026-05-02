@@ -13,6 +13,7 @@ mod stream_handler;
 mod settings;
 mod plugins;
 mod models;
+mod help_find;
 mod helpers;
 mod lifecycle;
 
@@ -444,6 +445,7 @@ pub async fn run(
                         let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
                         match action {
                             InputAction::None => {}
+                            InputAction::HelpFindOutcome => {}
                             InputAction::Quit => {
                                 exit_fx = Some(quit_effect());
                             }
@@ -518,6 +520,16 @@ pub async fn run(
                                                 )));
                                             }
                                         }
+                                    }
+                                    CommandAction::OpenHelpFind { query } => {
+                                        let registry = synaps_cli::help::HelpRegistry::new(
+                                            synaps_cli::help::builtin_entries(),
+                                            Vec::new(),
+                                        );
+                                        app.help_find = Some(synaps_cli::help::HelpFindState::new(
+                                            registry.entries().to_vec(),
+                                            &query,
+                                        ));
                                     }
                                     CommandAction::ReloadPlugins => {
                                         synaps_cli::skills::reload_registry(&registry, &config);
@@ -1175,6 +1187,7 @@ pub async fn run(
                                         CommandAction::OpenModels => {}
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
+                                        CommandAction::OpenHelpFind { .. } => {}
                                         CommandAction::ReloadPlugins => {}
                                         // handle_streaming_command never returns LoadSkill, PluginCommand, or Compact.
                                         CommandAction::LoadSkill { .. } => {}
