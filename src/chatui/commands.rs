@@ -44,6 +44,8 @@ pub(super) enum CommandAction {
     OpenSettings,
     /// Open the /plugins modal.
     OpenPlugins,
+    /// Open the searchable /help find lightbox.
+    OpenHelpFind { query: String },
     /// Force-reload registered plugins (for `/plugins reload`).
     ReloadPlugins,
     /// Synthesize load_skill tool-result + user message, then start stream.
@@ -371,48 +373,21 @@ pub(super) async fn handle_command(
             }
         }
         "help" => {
-            let help_lines = [
-                "/clear — reset conversation",
-                "/compact [focus] — summarize & compact conversation history",
-                "/chain — show session compaction history",
-                "/chain list — list named chains",
-                "/chain name <name> — bookmark current session as <name> (auto-advances on compaction)",
-                "/chain unname <name> — delete a named chain",
-                "/saveas [name] — name the current session, or clear if empty",
-                "/model, /models — open model router; /model <name> still sets directly",
-                "/system <prompt|show|save> — system prompt",
-                "/thinking [low|medium|high|xhigh] — thinking budget",
-                "/sessions — list saved sessions",
-                "/resume <name_or_id> — switch to a different session (chain > name > id)",
-                "/help — show this",
-                "/theme — list available themes",
-                "/settings — open the settings menu",
-                "/plugins — manage marketplaces and installed plugins",
-                "/extensions status — show loaded extension health",
-                "/extensions config [id] — show extension config diagnostics",
-                "/extensions trust [list|enable <id>|disable <id> [reason]] — manage provider trust",
-                "/extensions audit [N] — show last N provider audit log entries",
-                "/extensions memory [namespaces|recent <ns> [N]] — inspect local memory store",
-                "/status — show account usage and reset times",
-                "/ping — health-check configured providers (set keys in /settings)",
-                "/gamba — open the casino 🎰",
-            ];
-            for line in help_lines {
-                app.push_msg(ChatMessage::System(line.to_string()));
+            let trimmed = arg.trim();
+            if trimmed == "find" || trimmed.starts_with("find ") {
+                let query = trimmed.strip_prefix("find").unwrap_or("").trim().to_string();
+                return CommandAction::OpenHelpFind { query };
             }
-            let skills = registry.all_skills();
-            if !skills.is_empty() {
-                app.push_msg(ChatMessage::System(String::new()));
-                app.push_msg(ChatMessage::System("## Skills".to_string()));
-                let mut sorted = skills.clone();
-                sorted.sort_by(|a, b| a.name.cmp(&b.name));
-                for s in sorted {
-                    let display = match &s.plugin {
-                        Some(p) => format!("/{} ({}:{}) — {}", s.name, p, s.name, s.description),
-                        None => format!("/{} — {}", s.name, s.description),
-                    };
-                    app.push_msg(ChatMessage::System(display));
-                }
+
+            let registry = synaps_cli::help::HelpRegistry::new(
+                synaps_cli::help::builtin_entries(),
+                registry.plugin_help_entries(),
+            );
+            if let Some(rendered) = synaps_cli::help::render_help(
+                &registry,
+                if trimmed.is_empty() { None } else { Some(trimmed) },
+            ) {
+                app.push_msg(ChatMessage::System(rendered));
             }
         }
         "quit" | "exit" => {
@@ -715,6 +690,7 @@ mod tests {
                     keybinds: vec![],
                     compatibility: None,
                     extension: None,
+                    help_entries: vec![],
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),

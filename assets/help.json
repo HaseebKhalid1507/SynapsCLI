@@ -1,0 +1,520 @@
+[
+  {
+    "id": "root",
+    "command": "/help",
+    "title": "SynapsCLI Help",
+    "summary": "Fast paths for finding commands, settings, plugins, models, and diagnostics.",
+    "category": "Core",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["help", "start", "commands"],
+    "lines": [
+      "Start here. Pick a path or search everything.",
+      "",
+      "Common paths",
+      "  /help find      Search every help topic",
+      "  /model          Choose or inspect models",
+      "  /settings       Configure providers and preferences",
+      "  /plugins        Manage extensions",
+      "  /doctor         Diagnose local setup",
+      "",
+      "Guides",
+      "  /help models    Models, providers, and routing",
+      "  /help plugins   Plugins, skills, commands, and trust",
+      "  /help sessions  Sessions, resume, compact, and chains",
+      "",
+      "Tip: type /help find and start typing."
+    ],
+    "related": []
+  },
+  {
+    "id": "find",
+    "command": "/help find",
+    "title": "Find help",
+    "summary": "Open a searchable lightbox of all help topics.",
+    "category": "Core",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["search", "filter", "index", "discover"],
+    "lines": ["Open the in-memory help index, type to filter, use ↑/↓ to move, Enter for detail, Esc to close."],
+    "related": ["/help"]
+  },
+  {
+    "id": "settings",
+    "command": "/help settings",
+    "title": "Settings",
+    "summary": "Configure providers, API keys, themes, plugins, and defaults.",
+    "category": "Settings",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": ["/settings help"],
+    "keywords": ["settings", "config", "api key", "theme", "preferences"],
+    "lines": [
+      "Configure SynapsCLI from a focused modal.",
+      "",
+      "Common commands",
+      "  /settings        Open settings",
+      "  /ping            Check configured provider health",
+      "  /model           Choose the active model",
+      "",
+      "Use settings for provider API keys, themes, plugin toggles, model defaults, and context preferences.",
+      "",
+      "Related: /help models, /help login, /help plugins, /help find"
+    ],
+    "related": ["/help models", "/help login", "/help plugins", "/help find"]
+  },
+  {
+    "id": "plugins",
+    "command": "/help plugins",
+    "title": "Plugins",
+    "summary": "Install, update, configure, and diagnose extensions.",
+    "category": "Plugins",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": ["/plugins help"],
+    "keywords": ["plugins", "extensions", "marketplace", "hooks", "install"],
+    "lines": [
+      "Extend SynapsCLI with skills, commands, tools, hooks, and help entries.",
+      "",
+      "Common commands",
+      "  /plugins         Open plugin manager",
+      "  /plugins reload  Reload installed plugins",
+      "  /extensions status       Show loaded extension health",
+      "  /extensions config [id]  Show config diagnostics",
+      "",
+      "Plugin help may be added by extensions, but protected internal help cannot be replaced."
+    ],
+    "usage": "/plugins",
+    "examples": [
+      {
+        "command": "/plugins",
+        "description": "Open marketplace and installed plugin management."
+      },
+      {
+        "command": "/plugins reload",
+        "description": "Reload installed plugins after manifest changes."
+      }
+    ],
+    "related": ["/help doctor", "/help settings", "/help find"]
+  },
+  {
+    "id": "models",
+    "command": "/help models",
+    "title": "Models",
+    "summary": "Choose providers, inspect health, and switch runtime models.",
+    "category": "Models",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": ["/help model", "/model help"],
+    "keywords": ["models", "model", "provider", "routing", "health", "favorite"],
+    "lines": [
+      "Use models to choose the runtime model and inspect provider health.",
+      "",
+      "Common commands",
+      "  /model           Open model router",
+      "  /models          Open model router",
+      "  /model <name>    Switch directly",
+      "  /ping            Health-check configured providers",
+      "",
+      "Provider keys and defaults live in /settings.",
+      "",
+      "Related: /help settings, /help login, /help doctor, /help find"
+    ],
+    "related": ["/help settings", "/help login", "/help doctor", "/help find"]
+  },
+  {
+    "id": "doctor",
+    "command": "/help doctor",
+    "title": "Doctor",
+    "summary": "Troubleshoot auth, providers, extensions, and runtime health.",
+    "category": "Diagnostics",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["doctor", "diagnostics", "health", "troubleshoot", "ping", "logs"],
+    "lines": [
+      "Quick checks for common issues.",
+      "",
+      "Useful diagnostics",
+      "  /ping                    Check provider connectivity",
+      "  /status                  Show usage and reset windows",
+      "  /extensions status       Show extension health",
+      "  /extensions config [id]  Validate extension config",
+      "  /extensions audit [N]    Inspect recent provider audit entries",
+      "",
+      "If auth fails, see /help login. If models fail, see /help models.",
+      "",
+      "Related: /help login, /help models, /help plugins, /help find"
+    ],
+    "related": ["/help login", "/help models", "/help plugins", "/help find"]
+  },
+  {
+    "id": "login",
+    "command": "/help login",
+    "title": "Login",
+    "summary": "Authenticate with OAuth or provider API keys.",
+    "category": "Auth",
+    "topic": "Branch",
+    "protected": true,
+    "common": true,
+    "aliases": ["/help auth"],
+    "keywords": ["login", "auth", "oauth", "api key", "token", "provider"],
+    "lines": [
+      "SynapsCLI can authenticate with OAuth for supported accounts or provider API keys in /settings.",
+      "",
+      "Common commands",
+      "  synaps login     Start OAuth login from the shell",
+      "  /settings        Add or update provider API keys",
+      "  /status          Check account usage when available",
+      "",
+      "Secrets are never shown in help output.",
+      "",
+      "Related: /help settings, /help models, /help doctor, /help find"
+    ],
+    "related": ["/help settings", "/help models", "/help doctor", "/help find"]
+  },
+  {
+    "id": "commands",
+    "command": "/help commands",
+    "title": "Commands",
+    "summary": "Core slash command reference and discovery tips.",
+    "category": "Core",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["commands", "slash", "reference"],
+    "lines": ["Use /help for common commands and /help find for the full searchable index."],
+    "related": ["/help", "/help find"]
+  },
+  {
+    "id": "sessions",
+    "command": "/help sessions",
+    "title": "Sessions",
+    "summary": "Resume, name, compact, and chain conversation sessions.",
+    "category": "Sessions",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": ["/help session"],
+    "keywords": ["session", "sessions", "resume", "saveas", "name", "compact", "chain", "conversation history"],
+    "lines": [
+      "Sessions keep conversation history so you can resume work later, name important threads, and compact long context.",
+      "",
+      "Common commands",
+      "  /sessions        List saved sessions",
+      "  /resume <id>     Switch to a saved session",
+      "  /saveas [name]   Name or clear the current session name",
+      "  /compact [focus] Summarize history and continue with a smaller context",
+      "  /chain           Show compaction history for the current session",
+      "",
+      "Use compact before a conversation gets too large; use chain to inspect how summaries were produced.",
+      "",
+      "Related: /help compact, /help chain, /help find"
+    ],
+    "related": ["/help compact", "/help chain", "/help find"]
+  },
+  {
+    "id": "extensions",
+    "command": "/help extensions",
+    "title": "Extensions",
+    "summary": "Inspect extension health, configuration, audits, and contributed commands.",
+    "category": "Plugins",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": ["/extensions help"],
+    "keywords": ["extensions", "extension audit", "extension status", "config diagnostics", "plugins", "hooks", "commands", "skills"],
+    "lines": [
+      "Extensions are plugin packages that can contribute skills, slash commands, tools, hooks, and help entries.",
+      "",
+      "Common commands",
+      "  /extensions status       Show loaded extension health",
+      "  /extensions config [id]  Show extension config diagnostics",
+      "  /extensions audit [N]    Inspect recent provider audit entries",
+      "  /plugins                 Open plugin manager",
+      "",
+      "Extension help appears in /help find, but protected core help cannot be replaced."
+    ],
+    "usage": "/help extensions",
+    "examples": [
+      {
+        "command": "/extensions status",
+        "description": "Show loaded extension health."
+      },
+      {
+        "command": "/extensions audit 20",
+        "description": "Inspect recent provider audit entries."
+      }
+    ],
+    "related": ["/help plugins", "/help trust", "/help doctor", "/help find"]
+  },
+  {
+    "id": "trust",
+    "command": "/help trust",
+    "title": "Trust and protected namespaces",
+    "summary": "Understand extension trust, permissions, and protected help and command namespaces.",
+    "category": "Security",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": ["/help permissions"],
+    "keywords": ["trust", "trusted", "permissions", "protected namespace", "protected namespaces", "security", "extension trust", "plugin trust"],
+    "lines": [
+      "SynapsCLI treats extensions as powerful integrations and keeps core command, alias, and help namespaces protected.",
+      "",
+      "What to check",
+      "  • Review extension manifests before enabling tools or hooks",
+      "  • Use /extensions status for loaded extension health",
+      "  • Use /extensions config [id] for configuration diagnostics",
+      "  • Use /extensions audit [N] to inspect recent provider activity",
+      "",
+      "Plugins may add help entries, but they cannot shadow protected internal commands like /help, /settings, or /plugins."
+    ],
+    "usage": "/help trust",
+    "examples": [
+      {
+        "command": "/extensions audit",
+        "description": "Inspect recent provider activity."
+      },
+      {
+        "command": "/extensions config acme-tools",
+        "description": "Check configuration diagnostics for one extension."
+      }
+    ],
+    "related": ["/help extensions", "/help plugins", "/help doctor"]
+  },
+  {
+    "id": "compact",
+    "command": "/compact",
+    "title": "/compact",
+    "summary": "Summarize history and compact the current conversation context.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": ["/help compact"],
+    "keywords": ["compact", "summarize history", "summary", "context", "conversation history", "session"],
+    "lines": [
+      "Summarize and compact the current conversation so the session can continue with less context."
+    ],
+    "usage": "/compact [focus]",
+    "examples": [
+      {
+        "command": "/compact",
+        "description": "Compact the current conversation."
+      },
+      {
+        "command": "/compact keep the auth debugging context",
+        "description": "Compact while preserving an important focus."
+      }
+    ],
+    "related": ["/help sessions", "/help chain"]
+  },
+  {
+    "id": "chain",
+    "command": "/chain",
+    "title": "/chain",
+    "summary": "Show compaction history for the current session.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": ["/help chain"],
+    "keywords": ["chain", "compaction history", "compact chain", "session history", "summaries"],
+    "lines": [
+      "Show the compaction chain for the current session, including previous summaries created by /compact.",
+      "",
+      "Use this when you need to understand what context was preserved across compactions."
+    ],
+    "usage": "/chain",
+    "examples": [
+      {
+        "command": "/chain",
+        "description": "Show compaction history for the current session."
+      }
+    ],
+    "related": ["/help sessions", "/help compact"]
+  },
+  {
+    "id": "extensions-audit-command",
+    "command": "/extensions audit",
+    "title": "/extensions audit",
+    "summary": "Inspect recent extension provider audit entries.",
+    "category": "Plugins",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["extensions", "extension audit", "audit", "provider activity", "trust", "security"],
+    "lines": [
+      "Review recent extension provider activity for diagnostics and trust checks.",
+      "",
+      "Use this when an extension behaves unexpectedly or before trusting a new integration."
+    ],
+    "usage": "/extensions audit [limit]",
+    "examples": [
+      {
+        "command": "/extensions audit",
+        "description": "Inspect recent provider audit entries."
+      },
+      {
+        "command": "/extensions audit 20",
+        "description": "Show up to 20 recent audit entries."
+      }
+    ],
+    "related": ["/help extensions", "/help trust", "/help doctor"]
+  },
+  {
+    "id": "tools",
+    "command": "/help tools",
+    "title": "Tools",
+    "summary": "Understand tool usage and extension tool access.",
+    "category": "Tools",
+    "topic": "Branch",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["tools", "permissions", "bash", "read", "write", "extensions"],
+    "lines": ["Tools are exposed to the model by the runtime. Extensions may add tools subject to manifest permissions and trust."],
+    "related": ["/help plugins", "/help doctor"]
+  },
+  {
+    "id": "clear",
+    "command": "/clear",
+    "title": "Clear",
+    "summary": "Reset the current conversation and start fresh.",
+    "category": "Core",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["clear", "reset", "new"],
+    "lines": ["/clear resets conversation state and starts a new session."],
+    "related": ["/help sessions"]
+  },
+  {
+    "id": "model-command",
+    "command": "/model",
+    "title": "Model router",
+    "summary": "Open model picker or switch directly with /model <name>.",
+    "category": "Core",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": ["/models"],
+    "keywords": ["model", "models", "provider"],
+    "lines": ["/model opens the model router. /model <name> switches directly."],
+    "usage": "/model [name]",
+    "examples": [
+      {
+        "command": "/model",
+        "description": "Open the model picker."
+      },
+      {
+        "command": "/model claude-sonnet-4",
+        "description": "Switch directly when the model is configured."
+      }
+    ],
+    "related": ["/help models"]
+  },
+  {
+    "id": "settings-command",
+    "command": "/settings",
+    "title": "Settings command",
+    "summary": "Open the settings modal.",
+    "category": "Core",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["settings", "config"],
+    "lines": ["/settings opens configuration for providers, themes, plugins, and defaults."],
+    "related": ["/help settings"]
+  },
+  {
+    "id": "sessions-command",
+    "command": "/sessions",
+    "title": "Sessions command",
+    "summary": "List saved sessions.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["sessions", "session", "history", "saved"],
+    "lines": ["/sessions lists saved conversations so you can resume prior work."],
+    "related": ["/help sessions", "/resume"]
+  },
+  {
+    "id": "plugins-command",
+    "command": "/plugins",
+    "title": "Plugins command",
+    "summary": "Open the plugin manager.",
+    "category": "Plugins",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["plugins", "extensions"],
+    "lines": ["/plugins opens marketplace and installed plugin management."],
+    "usage": "/plugins",
+    "examples": [
+      {
+        "command": "/plugins",
+        "description": "Open the plugin manager."
+      }
+    ],
+    "related": ["/help plugins"]
+  },
+  {
+    "id": "status-command",
+    "command": "/status",
+    "title": "Status",
+    "summary": "Show account usage and reset times when available.",
+    "category": "Diagnostics",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["status", "usage", "auth"],
+    "lines": ["/status checks account usage for supported providers."],
+    "related": ["/help doctor", "/help login"]
+  },
+  {
+    "id": "ping-command",
+    "command": "/ping",
+    "title": "Ping providers",
+    "summary": "Health-check configured provider models.",
+    "category": "Diagnostics",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["ping", "health", "provider", "doctor"],
+    "lines": ["/ping checks configured provider models and reports health."],
+    "related": ["/help doctor", "/help models"]
+  },
+  {
+    "id": "quit-command",
+    "command": "/quit",
+    "title": "Quit",
+    "summary": "Exit SynapsCLI.",
+    "category": "Core",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": ["/exit"],
+    "keywords": ["quit", "exit"],
+    "lines": ["/quit or /exit leaves SynapsCLI."],
+    "related": ["/help"]
+  }
+]

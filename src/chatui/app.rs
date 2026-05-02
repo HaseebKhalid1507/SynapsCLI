@@ -96,6 +96,8 @@ pub(crate) struct App {
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
     /// Active models router modal state (Some while /model or /models is open).
     pub(crate) models: Option<super::models::ModelsModalState>,
+    /// Active /help find lightbox state.
+    pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -188,6 +190,7 @@ impl App {
             settings: None,
             plugins: None,
             models: None,
+            help_find: None,
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
@@ -740,6 +743,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use crate::chatui::theme::THEME;
     use super::*;
 
     fn test_app() -> App {
@@ -828,6 +832,68 @@ mod tests {
 
         assert!(invalidate_messages, "active message-area bash animation must rebuild message cache");
         assert!(!app.needs_clear_for_animation_redraw(), "streaming animation must not force whole-terminal clear flicker");
+    }
+
+    #[test]
+    fn grouped_system_output_does_not_insert_rules_between_indented_lines() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("Extensions (1):".to_string()));
+        app.push_msg(ChatMessage::System("  voice — ok".to_string()));
+        app.push_msg(ChatMessage::System("    tools: speak".to_string()));
+
+        let lines = app.render_lines(80);
+        let header_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("Extensions (1):")))
+            .expect("header system message should render");
+        let child_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("voice — ok")))
+            .expect("child system message should render");
+        let grandchild_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("tools: speak")))
+            .expect("grandchild system message should render");
+
+        let has_rule = |slice: &[ratatui::text::Line]| {
+            slice
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("─ · ─")))
+        };
+        assert!(!has_rule(&lines[header_idx + 1..child_idx]));
+        assert!(!has_rule(&lines[child_idx + 1..grandchild_idx]));
+    }
+
+    #[test]
+    fn unrelated_consecutive_system_messages_still_get_a_rule() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("first".to_string()));
+        app.push_msg(ChatMessage::System("second".to_string()));
+
+        let lines = app.render_lines(80);
+        let first_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("first")))
+            .expect("first system message should render");
+        let second_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
+            .expect("second system message should render");
+
+        let between = &lines[first_idx + 1..second_idx];
+        let rule_idx = between
+            .iter()
+            .position(|line| line.spans.iter().any(|span| {
+                span.content.contains("─ · ─")
+                    && span.style.fg == Some(THEME.load().muted)
+                    && !span.style.add_modifier.contains(ratatui::style::Modifier::DIM)
+            }))
+            .expect("expected centered rule between consecutive system messages");
+        let is_blank = |line: &ratatui::text::Line| {
+            line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
+        };
+        assert!(rule_idx > 0 && is_blank(&between[rule_idx - 1]), "expected blank line before centered rule; got {:?}", between);
+        assert!(rule_idx + 1 < between.len() && is_blank(&between[rule_idx + 1]), "expected blank line after centered rule; got {:?}", between);
     }
 
     #[test]
