@@ -127,6 +127,7 @@ impl Tool for SubagentStartTool {
         let start_time       = std::time::Instant::now();
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
+        let system_prompt_for_handle = system_prompt.clone();
         let thread_handle = std::thread::spawn(move || {
             let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -159,7 +160,18 @@ impl Tool for SubagentStartTool {
 
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
-                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    let tools = if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
+                        let mgr = ext_mgr.read().await;
+                        if let Some(shared) = mgr.tools_shared() {
+                            let extension_tools = shared.read().await;
+                            crate::ToolRegistry::without_subagent_with_extensions(&*extension_tools)
+                        } else {
+                            crate::ToolRegistry::without_subagent()
+                        }
+                    } else {
+                        crate::ToolRegistry::without_subagent()
+                    };
+                    runtime.set_tools(tools);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -362,6 +374,7 @@ impl Tool for SubagentStartTool {
             label.clone(),
             task_preview,
             model,
+            system_prompt_for_handle,
             timeout_secs,
             state,
             Some(steer_tx),

@@ -7,15 +7,20 @@ pub(crate) enum InputOutcome {
     Close,
     /// Caller should: fetch marketplace metadata and, on success, insert into state.
     AddMarketplace(String),
-    /// Caller should: install the given plugin (from marketplace at index, plugin at index).
-    Install { marketplace: String, plugin: String },
+    /// Caller should: inspect trust/permissions, then install or show a confirmation prompt.
+    InstallRequested { marketplace: String, plugin: String },
     Uninstall(String),
     Update(String),
     RefreshMarketplace(String),
     RemoveMarketplace(String),
-    TrustAndInstall { plugin_name: String, host: String, source: String },
+    ConfirmPendingInstall,
+    CancelPendingInstall,
+    ConfirmPendingUpdate,
+    CancelPendingUpdate,
+    TrustAndInstall { plugin_name: String, host: String, source: String, summary: Vec<String> },
     /// Toggle disabled state of a plugin. enabled=true means "make it enabled".
     TogglePlugin { name: String, enabled: bool },
+    EnablePluginRequested(String),
 }
 
 pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
@@ -23,6 +28,8 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         RightMode::AddMarketplaceEditor { .. } => return editor_key(state, key),
         RightMode::TrustPrompt { .. } => return trust_key(state, key),
         RightMode::Confirm { .. } => return confirm_key(state, key),
+        RightMode::PendingInstallConfirm { .. } => return pending_install_key(key),
+        RightMode::PendingUpdateConfirm { .. } => return pending_update_key(key),
         RightMode::Detail { .. } => return detail_key(state, key),
         RightMode::List => {}
     }
@@ -46,7 +53,7 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         }
         KeyCode::Enter => list_enter(state),
         KeyCode::Char('i') if matches!(state.focus, Focus::Right) => install_on_row(state),
-        KeyCode::Char('e') if matches!(state.focus, Focus::Right) => toggle_installed(state, true),
+        KeyCode::Char('e') if matches!(state.focus, Focus::Right) => enable_installed_requested(state),
         KeyCode::Char('d') if matches!(state.focus, Focus::Right) => toggle_installed(state, false),
         KeyCode::Char('u') if matches!(state.focus, Focus::Right) => update_on_row(state),
         KeyCode::Char('U') if matches!(state.focus, Focus::Right) => {
@@ -94,7 +101,7 @@ fn editor_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
 }
 
 fn trust_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
-    let RightMode::TrustPrompt { plugin_name, host, pending_source } = &state.mode else {
+    let RightMode::TrustPrompt { plugin_name, host, pending_source, summary } = &state.mode else {
         return InputOutcome::None;
     };
     match key.code {
@@ -103,6 +110,7 @@ fn trust_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
                 plugin_name: plugin_name.clone(),
                 host: host.clone(),
                 source: pending_source.clone(),
+                summary: summary.clone(),
             };
             state.mode = RightMode::List;
             out
@@ -122,6 +130,7 @@ fn confirm_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
             let action = match on_yes {
                 crate::chatui::plugins::state::ConfirmAction::Uninstall(n) => InputOutcome::Uninstall(n.clone()),
                 crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(n) => InputOutcome::RemoveMarketplace(n.clone()),
+                crate::chatui::plugins::state::ConfirmAction::EnablePlugin(n) => InputOutcome::TogglePlugin { name: n.clone(), enabled: true },
             };
             state.mode = RightMode::List;
             action
@@ -130,6 +139,22 @@ fn confirm_key(state: &mut PluginsModalState, key: KeyEvent) -> InputOutcome {
             state.mode = RightMode::List;
             InputOutcome::None
         }
+        _ => InputOutcome::None,
+    }
+}
+
+fn pending_install_key(key: KeyEvent) -> InputOutcome {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => InputOutcome::ConfirmPendingInstall,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => InputOutcome::CancelPendingInstall,
+        _ => InputOutcome::None,
+    }
+}
+
+fn pending_update_key(key: KeyEvent) -> InputOutcome {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => InputOutcome::ConfirmPendingUpdate,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => InputOutcome::CancelPendingUpdate,
         _ => InputOutcome::None,
     }
 }
@@ -176,8 +201,8 @@ fn install_on_row(state: &mut PluginsModalState) -> InputOutcome {
     let rows = state.right_rows();
     match rows.get(state.selected_right) {
         Some(RightRow::Browseable { plugin, installed: false }) => {
-            // TOFU check done by the main loop; we just emit the intent.
-            InputOutcome::Install { marketplace: mname.clone(), plugin: plugin.name.clone() }
+            // Trust/permission check done by the main loop before install.
+            InputOutcome::InstallRequested { marketplace: mname.clone(), plugin: plugin.name.clone() }
         }
         Some(RightRow::Browseable { installed: true, .. }) => {
             state.row_error = Some("already installed".into());
@@ -191,6 +216,14 @@ fn toggle_installed(state: &mut PluginsModalState, enabled: bool) -> InputOutcom
     let rows = state.right_rows();
     if let Some(super::state::RightRow::Installed(p)) = rows.get(state.selected_right) {
         return InputOutcome::TogglePlugin { name: p.name.clone(), enabled };
+    }
+    InputOutcome::None
+}
+
+fn enable_installed_requested(state: &mut PluginsModalState) -> InputOutcome {
+    let rows = state.right_rows();
+    if let Some(super::state::RightRow::Installed(p)) = rows.get(state.selected_right) {
+        return InputOutcome::EnablePluginRequested(p.name.clone());
     }
     InputOutcome::None
 }
@@ -215,6 +248,7 @@ fn ask_uninstall(state: &mut PluginsModalState) -> InputOutcome {
         state.mode = RightMode::Confirm {
             prompt: format!("Uninstall '{}'? y/n", name),
             on_yes: crate::chatui::plugins::state::ConfirmAction::Uninstall(name),
+            summary: Vec::new(),
         };
     }
     InputOutcome::None
@@ -249,6 +283,7 @@ fn ask_remove_marketplace(state: &mut PluginsModalState) -> InputOutcome {
     state.mode = RightMode::Confirm {
         prompt,
         on_yes: crate::chatui::plugins::state::ConfirmAction::RemoveMarketplace(name),
+        summary: Vec::new(),
     };
     InputOutcome::None
 }
@@ -300,6 +335,7 @@ mod tests {
         s.mode = RightMode::Confirm {
             prompt: "Uninstall 'x'? y/n".into(),
             on_yes: ConfirmAction::Uninstall("x".into()),
+            summary: Vec::new(),
         };
         let out = handle_event(&mut s, key(KeyCode::Char('y')));
         assert!(matches!(out, InputOutcome::Uninstall(ref n) if n == "x"));
@@ -313,6 +349,7 @@ mod tests {
         s.mode = RightMode::Confirm {
             prompt: "x".into(),
             on_yes: ConfirmAction::RemoveMarketplace("m".into()),
+            summary: Vec::new(),
         };
         let out = handle_event(&mut s, key(KeyCode::Char('n')));
         assert!(matches!(out, InputOutcome::None));
@@ -327,11 +364,12 @@ mod tests {
             plugin_name: "p".into(),
             host: "github.com".into(),
             pending_source: "https://github.com/u/r".into(),
+            summary: vec!["permissions: tools.intercept".into()],
         };
         let out = handle_event(&mut s, key(KeyCode::Char('y')));
         assert!(matches!(
             out,
-            InputOutcome::TrustAndInstall { ref plugin_name, ref host, ref source }
+            InputOutcome::TrustAndInstall { ref plugin_name, ref host, ref source, .. }
                 if plugin_name == "p" && host == "github.com" && source == "https://github.com/u/r"
         ));
         assert!(matches!(s.mode, RightMode::List));
@@ -367,6 +405,8 @@ mod tests {
                 latest_commit: None,
                 installed_at: "now".into(),
                 source_subdir: None,
+                checksum_algorithm: None,
+                checksum_value: None,
             });
         }
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
@@ -396,6 +436,7 @@ mod tests {
                     source: "https://github.com/x/web.git".into(),
                     version: None,
                     description: None,
+                    index: None,
                 },
             ],
             repo_url: None,
@@ -408,6 +449,8 @@ mod tests {
             latest_commit: None,
             installed_at: "now".into(),
             source_subdir: None,
+            checksum_algorithm: None,
+            checksum_value: None,
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 1; // marketplace row
@@ -417,7 +460,7 @@ mod tests {
         // Press U to ask uninstall
         handle_event(&mut s, KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
         match &s.mode {
-            RightMode::Confirm { prompt, on_yes } => {
+            RightMode::Confirm { prompt, on_yes, .. } => {
                 assert!(prompt.contains("web"), "prompt should mention plugin name, got: {}", prompt);
                 assert!(matches!(on_yes, ConfirmAction::Uninstall(n) if n == "web"));
             }
@@ -442,6 +485,8 @@ mod tests {
             latest_commit: None,
             installed_at: "now".into(),
             source_subdir: None,
+            checksum_algorithm: None,
+            checksum_value: None,
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 0; // Installed
@@ -453,7 +498,7 @@ mod tests {
         // Press U while in detail view
         handle_event(&mut s, KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
         match &s.mode {
-            RightMode::Confirm { prompt, on_yes } => {
+            RightMode::Confirm { prompt, on_yes, .. } => {
                 assert!(prompt.contains("tools"), "prompt should mention plugin name, got: {}", prompt);
                 assert!(matches!(on_yes, ConfirmAction::Uninstall(n) if n == "tools"));
             }
@@ -481,7 +526,7 @@ mod tests {
         // Press R from right pane — should still open remove confirm
         handle_event(&mut s, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
         match &s.mode {
-            RightMode::Confirm { prompt, on_yes } => {
+            RightMode::Confirm { prompt, on_yes, .. } => {
                 assert!(prompt.contains("mp"), "prompt should mention marketplace name, got: {}", prompt);
                 assert!(matches!(on_yes, ConfirmAction::RemoveMarketplace(n) if n == "mp"));
             }

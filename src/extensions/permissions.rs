@@ -24,6 +24,14 @@ pub enum Permission {
     ToolsRegister,
     /// Can register new providers.
     ProvidersRegister,
+    /// Can read from the local memory store via `memory.query`.
+    MemoryRead,
+    /// Can append to the local memory store via `memory.append`.
+    MemoryWrite,
+    /// Can capture audio (microphone) for voice STT/wake-word capabilities.
+    AudioInput,
+    /// Can produce audio output (speakers) for voice TTS capabilities.
+    AudioOutput,
 }
 
 impl Permission {
@@ -36,6 +44,10 @@ impl Permission {
             Self::SessionLifecycle => "session.lifecycle",
             Self::ToolsRegister => "tools.register",
             Self::ProvidersRegister => "providers.register",
+            Self::MemoryRead => "memory.read",
+            Self::MemoryWrite => "memory.write",
+            Self::AudioInput => "audio.input",
+            Self::AudioOutput => "audio.output",
         }
     }
 
@@ -48,8 +60,19 @@ impl Permission {
             "session.lifecycle" => Some(Self::SessionLifecycle),
             "tools.register" => Some(Self::ToolsRegister),
             "providers.register" => Some(Self::ProvidersRegister),
+            "memory.read" => Some(Self::MemoryRead),
+            "memory.write" => Some(Self::MemoryWrite),
+            "audio.input" => Some(Self::AudioInput),
+            "audio.output" => Some(Self::AudioOutput),
             _ => None,
         }
+    }
+    /// Whether this permission is reserved for a future implementation.
+    pub fn is_reserved(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolsOverride
+        )
     }
 }
 
@@ -66,9 +89,29 @@ impl PermissionSet {
     }
 
     /// Parse permission strings (from manifest) into a set.
+    ///
+    /// This lenient parser is kept for tests and internal callers that have
+    /// already validated manifests. Extension manifests should use
+    /// [`try_from_strings`](Self::try_from_strings) so typos fail loudly.
     pub fn from_strings(perms: &[String]) -> Self {
         let permissions = perms.iter().filter_map(|s| Permission::parse(s)).collect();
         Self { permissions }
+    }
+
+    /// Parse permission strings and reject unknown values.
+    pub fn try_from_strings(perms: &[String]) -> Result<Self, String> {
+        let mut permissions = HashSet::new();
+        for perm in perms {
+            let parsed = Permission::parse(perm)
+                .ok_or_else(|| format!("Unknown extension permission: {perm}"))?;
+            if parsed.is_reserved() {
+                return Err(format!(
+                    "Reserved extension permission is not implemented yet: {perm}"
+                ));
+            }
+            permissions.insert(parsed);
+        }
+        Ok(Self { permissions })
     }
 
     /// Check if a permission is granted.
@@ -147,6 +190,45 @@ mod tests {
     }
 
     #[test]
+    fn providers_register_is_active_but_tools_override_remains_reserved() {
+        let perms = PermissionSet::try_from_strings(&["providers.register".to_string()]).unwrap();
+        assert!(perms.has(Permission::ProvidersRegister));
+
+        let err = PermissionSet::try_from_strings(&["tools.override".to_string()]).unwrap_err();
+        assert!(err.contains("Reserved extension permission"));
+    }
+
+    #[test]
+    fn memory_permissions_parse_and_are_not_reserved() {
+        assert_eq!(Permission::parse("memory.read"), Some(Permission::MemoryRead));
+        assert_eq!(Permission::parse("memory.write"), Some(Permission::MemoryWrite));
+        assert!(!Permission::MemoryRead.is_reserved());
+        assert!(!Permission::MemoryWrite.is_reserved());
+        let perms = PermissionSet::try_from_strings(&[
+            "memory.read".to_string(),
+            "memory.write".to_string(),
+        ])
+        .unwrap();
+        assert!(perms.has(Permission::MemoryRead));
+        assert!(perms.has(Permission::MemoryWrite));
+    }
+
+    #[test]
+    fn audio_permissions_parse_and_are_not_reserved() {
+        assert_eq!(Permission::parse("audio.input"), Some(Permission::AudioInput));
+        assert_eq!(Permission::parse("audio.output"), Some(Permission::AudioOutput));
+        assert!(!Permission::AudioInput.is_reserved());
+        assert!(!Permission::AudioOutput.is_reserved());
+        let perms = PermissionSet::try_from_strings(&[
+            "audio.input".to_string(),
+            "audio.output".to_string(),
+        ])
+        .unwrap();
+        assert!(perms.has(Permission::AudioInput));
+        assert!(perms.has(Permission::AudioOutput));
+    }
+
+    #[test]
     fn round_trip_as_str() {
         for perm in [
             Permission::ToolsIntercept,
@@ -155,6 +237,10 @@ mod tests {
             Permission::SessionLifecycle,
             Permission::ToolsRegister,
             Permission::ProvidersRegister,
+            Permission::MemoryRead,
+            Permission::MemoryWrite,
+            Permission::AudioInput,
+            Permission::AudioOutput,
         ] {
             assert_eq!(Permission::parse(perm.as_str()), Some(perm));
         }

@@ -37,6 +37,36 @@ pub struct CachedPlugin {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub index: Option<CachedPluginIndexMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPluginIndexMetadata {
+    pub repository: String,
+    #[serde(default)]
+    pub subdir: Option<String>,
+    pub checksum_algorithm: String,
+    pub checksum_value: String,
+    #[serde(default)]
+    pub compatibility_synaps: Option<String>,
+    #[serde(default)]
+    pub compatibility_extension_protocol: Option<String>,
+    pub has_extension: bool,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<crate::skills::plugin_index::PluginIndexProviderCapability>,
+    #[serde(default)]
+    pub trust_publisher: Option<String>,
+    #[serde(default)]
+    pub trust_homepage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +84,12 @@ pub struct InstalledPlugin {
     /// then refers to the marketplace repo, not a standalone plugin repo.
     #[serde(default)]
     pub source_subdir: Option<String>,
+    /// Optional index checksum captured at install time for index-backed plugins.
+    /// Used to verify future installs/updates before applying them.
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
 }
 
 impl PluginsState {
@@ -101,6 +137,7 @@ mod tests {
                     source: "https://github.com/maha-media/pi-web.git".into(),
                     version: Some("1.0".into()),
                     description: Some("Web tools".into()),
+                    index: None,
                 }],
                 repo_url: Some("https://github.com/maha-media/pi-skills.git".into()),
             }],
@@ -112,6 +149,8 @@ mod tests {
                 latest_commit: Some("abc123".into()),
                 installed_at: "2026-04-18T12:01:00Z".into(),
                 source_subdir: None,
+                checksum_algorithm: None,
+                checksum_value: None,
             }],
             trusted_hosts: vec!["github.com/maha-media".into()],
         };

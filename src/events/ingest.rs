@@ -118,16 +118,27 @@ pub async fn watch_inbox(inbox_dir: PathBuf, queue: Arc<EventQueue>, shutdown: A
     let queue_ref = &queue;
     let dir_ref = &inbox_dir;
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
-            Some(paths) = async_rx.recv() => {
-                for path in &paths {
-                    process_file(path, queue_ref).await;
+            result = async_rx.recv() => {
+                match result {
+                    Some(paths) => {
+                        for path in &paths {
+                            process_file(path, queue_ref).await;
+                        }
+                        // Sweep for any files inotify missed in the batch
+                        scan_inbox(dir_ref, queue_ref).await;
+                    }
+                    None => break, // Watcher thread exited, channel closed
                 }
-                // Sweep for any files inotify missed in the batch
-                scan_inbox(dir_ref, queue_ref).await;
             }
             // Safety scan every 2s in case inotify misses something
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 scan_inbox(dir_ref, queue_ref).await;
             }
         }
@@ -147,7 +158,9 @@ mod tests {
         let queue = Arc::new(EventQueue::new(10));
         let q = queue.clone();
         let ibx = inbox.clone();
-        let handle = tokio::spawn(async move { watch_inbox(ibx, q, Arc::new(std::sync::atomic::AtomicBool::new(false))).await });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_for_task = shutdown.clone();
+        let handle = tokio::spawn(async move { watch_inbox(ibx, q, shutdown_for_task).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let event = Event::simple("test", "hello inbox", Some(Severity::High));
@@ -158,7 +171,8 @@ mod tests {
             if queue.len() > 0 { break; }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        handle.abort();
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         let popped = queue.pop().expect("event should have been ingested");
         assert_eq!(popped.content.text, "hello inbox");
     }
@@ -170,7 +184,9 @@ mod tests {
         let queue = Arc::new(EventQueue::new(10));
         let q = queue.clone();
         let ibx = inbox.clone();
-        let handle = tokio::spawn(async move { watch_inbox(ibx, q, Arc::new(std::sync::atomic::AtomicBool::new(false))).await });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_for_task = shutdown.clone();
+        let handle = tokio::spawn(async move { watch_inbox(ibx, q, shutdown_for_task).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let path = inbox.join("bad.json");
@@ -180,7 +196,8 @@ mod tests {
             if err_path.exists() { break; }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        handle.abort();
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(err_path.exists());
         assert_eq!(queue.len(), 0);
     }

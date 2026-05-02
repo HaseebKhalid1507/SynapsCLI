@@ -28,6 +28,7 @@ pub(super) fn to_owned_commands(commands: &[&str]) -> Vec<String> {
 }
 
 /// What the event loop should do after a command executes.
+#[derive(Clone)]
 pub(super) enum CommandAction {
     /// Nothing special — continue the loop.
     None,
@@ -50,6 +51,11 @@ pub(super) enum CommandAction {
         skill: std::sync::Arc<synaps_cli::skills::LoadedSkill>,
         arg: String,
     },
+    /// Execute a plugin manifest command.
+    PluginCommand {
+        command: std::sync::Arc<synaps_cli::skills::registry::RegisteredPluginCommand>,
+        arg: String,
+    },
     /// Compact the conversation history into a summary.
     Compact {
         custom_instructions: Option<String>,
@@ -67,6 +73,65 @@ pub(super) enum CommandAction {
     /// Assign (or clear, if empty) a name to the current session. Persists via save.
     /// Show account usage and reset times.
     Status,
+    /// Show loaded extension health snapshots.
+    ExtensionsStatus,
+    /// Show extension config diagnostics. `None` = all loaded extensions.
+    ExtensionsConfig { id: Option<String> },
+    /// Manage per-provider trust state.
+    ExtensionsTrust(ExtensionsTrustAction),
+    /// Show last N (or all) provider audit log entries.
+    ExtensionsAudit { tail: Option<usize> },
+    /// Inspect local memory store (namespaces, recent records).
+    ExtensionsMemory(ExtensionsMemoryAction),
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtensionsTrustAction {
+    List,
+    Enable { runtime_id: String },
+    Disable { runtime_id: String, reason: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionsMemoryAction {
+    /// List all known memory namespaces.
+    Namespaces,
+    /// Show the most recent N records of a namespace (default 20).
+    Recent { namespace: String, limit: Option<usize> },
+}
+
+pub(super) async fn execute_command_action(
+    action: CommandAction,
+    app: &mut App,
+    runtime: &Runtime,
+) {
+    match action {
+        CommandAction::PluginCommand { command, arg } => {
+            match synaps_cli::skills::commands::execute_plugin_command_with_tools(
+                &command,
+                &arg,
+                runtime.tools_shared(),
+            ).await {
+                Ok(output) => {
+                    let mut lines = vec![format!(
+                        "plugin command /{}:{} exited with {}",
+                        command.plugin,
+                        command.name,
+                        output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                    )];
+                    if !output.stdout.trim().is_empty() {
+                        lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
+                    }
+                    if !output.stderr.trim().is_empty() {
+                        lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
+                    }
+                    app.push_msg(ChatMessage::System(lines.join("\n")));
+                }
+                Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Levenshtein edit distance between two strings.
@@ -323,6 +388,11 @@ pub(super) async fn handle_command(
                 "/theme — list available themes",
                 "/settings — open the settings menu",
                 "/plugins — manage marketplaces and installed plugins",
+                "/extensions status — show loaded extension health",
+                "/extensions config [id] — show extension config diagnostics",
+                "/extensions trust [list|enable <id>|disable <id> [reason]] — manage provider trust",
+                "/extensions audit [N] — show last N provider audit log entries",
+                "/extensions memory [namespaces|recent <ns> [N]] — inspect local memory store",
                 "/status — show account usage and reset times",
                 "/ping — health-check configured providers (set keys in /settings)",
                 "/gamba — open the casino 🎰",
@@ -394,6 +464,135 @@ pub(super) async fn handle_command(
                 }
             }
         }
+        "extensions" => {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() || trimmed == "status" {
+                return CommandAction::ExtensionsStatus;
+            }
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let sub = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("").trim();
+            match sub {
+                "config" => {
+                    if rest.is_empty() {
+                        return CommandAction::ExtensionsConfig { id: None };
+                    }
+                    return CommandAction::ExtensionsConfig { id: Some(rest.to_string()) };
+                }
+                "trust" => {
+                    if rest.is_empty() || rest == "list" {
+                        return CommandAction::ExtensionsTrust(ExtensionsTrustAction::List);
+                    }
+                    let mut tparts = rest.splitn(2, char::is_whitespace);
+                    let tsub = tparts.next().unwrap_or("");
+                    let trest = tparts.next().unwrap_or("").trim();
+                    match tsub {
+                        "enable" => {
+                            if trest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions trust enable <runtime_id>".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            return CommandAction::ExtensionsTrust(
+                                ExtensionsTrustAction::Enable { runtime_id: trest.to_string() },
+                            );
+                        }
+                        "disable" => {
+                            if trest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions trust disable <runtime_id> [reason]".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            let mut dparts = trest.splitn(2, char::is_whitespace);
+                            let runtime_id = dparts.next().unwrap_or("").to_string();
+                            let reason = dparts
+                                .next()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            return CommandAction::ExtensionsTrust(
+                                ExtensionsTrustAction::Disable { runtime_id, reason },
+                            );
+                        }
+                        other => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions trust [list|enable <id>|disable <id> [reason]] (unknown: {})",
+                                other
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
+                "audit" => {
+                    if rest.is_empty() {
+                        return CommandAction::ExtensionsAudit { tail: None };
+                    }
+                    match rest.parse::<usize>() {
+                        Ok(n) => return CommandAction::ExtensionsAudit { tail: Some(n) },
+                        Err(_) => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions audit [N] (not a number: {})",
+                                rest
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
+                "memory" => {
+                    if rest.is_empty() || rest == "namespaces" {
+                        return CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces);
+                    }
+                    let mut mparts = rest.splitn(2, char::is_whitespace);
+                    let msub = mparts.next().unwrap_or("");
+                    let mrest = mparts.next().unwrap_or("").trim();
+                    match msub {
+                        "recent" => {
+                            if mrest.is_empty() {
+                                app.push_msg(ChatMessage::System(
+                                    "usage: /extensions memory recent <ns> [N]".to_string(),
+                                ));
+                                return CommandAction::None;
+                            }
+                            let mut rparts = mrest.splitn(2, char::is_whitespace);
+                            let namespace = rparts.next().unwrap_or("").to_string();
+                            let limit_str = rparts.next().unwrap_or("").trim();
+                            let limit = if limit_str.is_empty() {
+                                None
+                            } else {
+                                match limit_str.parse::<usize>() {
+                                    Ok(n) => Some(n),
+                                    Err(_) => {
+                                        app.push_msg(ChatMessage::System(format!(
+                                            "usage: /extensions memory recent <ns> [N] (not a number: {})",
+                                            limit_str
+                                        )));
+                                        return CommandAction::None;
+                                    }
+                                }
+                            };
+                            return CommandAction::ExtensionsMemory(
+                                ExtensionsMemoryAction::Recent { namespace, limit },
+                            );
+                        }
+                        other => {
+                            app.push_msg(ChatMessage::System(format!(
+                                "usage: /extensions memory [namespaces|recent <ns> [N]] (unknown: {})",
+                                other
+                            )));
+                            return CommandAction::None;
+                        }
+                    }
+                }
+                other => {
+                    app.push_msg(ChatMessage::System(format!(
+                        "usage: /extensions [status|config [id]|trust [list|enable <id>|disable <id> [reason]]|audit [N]|memory [namespaces|recent <ns> [N]]] (unknown: {})",
+                        other
+                    )));
+                    return CommandAction::None;
+                }
+            }
+        }
         "status" => {
             return CommandAction::Status;
         }
@@ -422,6 +621,9 @@ pub(super) async fn handle_command(
             match registry.resolve(cmd) {
                 Resolution::Skill(skill) => {
                     return CommandAction::LoadSkill { skill, arg: arg.to_string() };
+                }
+                Resolution::PluginCommand(command) => {
+                    return CommandAction::PluginCommand { command, arg: arg.to_string() };
                 }
                 Resolution::Ambiguous(opts) => {
                     app.push_msg(ChatMessage::Error(format!(
@@ -459,12 +661,139 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use synaps_cli::skills::BUILTIN_COMMANDS as ALL_COMMANDS;
-    use super::{edit_distance, fuzzy_match, resolve_prefix};
+    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use synaps_cli::skills::manifest::ManifestSkillPromptCommand;
+    use synaps_cli::skills::registry::{CommandRegistry, RegisteredPluginCommand, RegisteredPluginCommandBackend};
+    use synaps_cli::{Tool, ToolContext, ToolRegistry};
 
     #[test]
     fn plugins_is_in_all_commands() {
-        assert!(ALL_COMMANDS.contains(&"plugins"));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"plugins"));
+    }
+
+    #[test]
+    fn extensions_is_in_all_commands() {
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"extensions"));
+    }
+
+    #[test]
+    fn resolve_prefix_keeps_exact_plugin_command_name() {
+        let cmds = vec!["help".to_string(), "my-plugin:hello".to_string()];
+        assert_eq!(resolve_prefix("my-plugin:hello", &cmds), "my-plugin:hello");
+    }
+
+    #[tokio::test]
+    async fn plugin_colon_command_resolves_to_plugin_command_action() {
+        let command = RegisteredPluginCommand {
+            plugin: "policy".to_string(),
+            name: "mode".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::SkillPrompt {
+                skill: "policy".to_string(),
+                prompt: "Mode: ${args}".to_string(),
+            },
+            plugin_root: PathBuf::from("/tmp/policy"),
+        };
+        let registry = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![synaps_cli::skills::Plugin {
+                name: "policy".to_string(),
+                root: PathBuf::from("/tmp/policy"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "policy".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    extension: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
+                        ManifestSkillPromptCommand {
+                            name: command.name.clone(),
+                            description: None,
+                            skill: "policy".to_string(),
+                            prompt: "Mode: ${args}".to_string(),
+                        },
+                    )],
+                }),
+            }],
+        );
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(registry);
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command(
+            "policy:mode",
+            "strict",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!(command.plugin, "policy");
+                assert_eq!(command.name, "mode");
+                assert_eq!(arg, "strict");
+            }
+            _ => panic!("expected plugin command action"),
+        }
+    }
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str { "policy:echo" }
+        fn description(&self) -> &str { "echo" }
+        fn parameters(&self) -> Value { serde_json::json!({"type":"object"}) }
+        async fn execute(&self, params: Value, _ctx: ToolContext) -> synaps_cli::Result<String> {
+            Ok(format!("echo {}", params["text"].as_str().unwrap_or_default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_command_action_executes_extension_tool_and_prints_result() {
+        let mut tools = ToolRegistry::without_subagent();
+        tools.register(Arc::new(EchoTool));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        runtime.set_tools(tools);
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let command = Arc::new(RegisteredPluginCommand {
+            plugin: "policy".to_string(),
+            name: "echo".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::ExtensionTool {
+                tool: "echo".to_string(),
+                input: serde_json::json!({"text":"${args}"}),
+            },
+            plugin_root: PathBuf::from("/tmp/policy"),
+        });
+
+        execute_command_action(
+            CommandAction::PluginCommand { command, arg: "hello".to_string() },
+            &mut app,
+            &runtime,
+        ).await;
+
+        let last = app.messages.last().expect("system message should be pushed");
+        match &last.msg {
+            crate::chatui::app::ChatMessage::System(text) => {
+                assert!(text.contains("plugin command /policy:echo exited with 0"), "{text}");
+                assert!(text.contains("stdout:\necho hello"), "{text}");
+            }
+            _ => panic!("expected system message"),
+        }
     }
 
     // -- edit_distance tests --
@@ -574,5 +903,146 @@ mod tests {
         // "s" matches system, sessions, saveas, settings, status — returns raw
         let cmds = commands();
         assert_eq!(resolve_prefix("s", &cmds), "s");
+    }
+
+    // -- /extensions parsing tests --
+
+    async fn invoke_extensions(arg: &str) -> CommandAction {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_command(
+            "extensions",
+            arg,
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_status_unchanged() {
+        match invoke_extensions("status").await {
+            CommandAction::ExtensionsStatus => {}
+            _ => panic!("expected ExtensionsStatus for `status`"),
+        }
+        match invoke_extensions("").await {
+            CommandAction::ExtensionsStatus => {}
+            _ => panic!("expected ExtensionsStatus for empty arg"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_config_no_arg() {
+        match invoke_extensions("config").await {
+            CommandAction::ExtensionsConfig { id: None } => {}
+            _ => panic!("expected ExtensionsConfig {{ id: None }}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_config_with_id() {
+        match invoke_extensions("config my-ext").await {
+            CommandAction::ExtensionsConfig { id: Some(id) } => assert_eq!(id, "my-ext"),
+            _ => panic!("expected ExtensionsConfig with id `my-ext`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_list() {
+        match invoke_extensions("trust").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::List) => {}
+            _ => panic!("expected ExtensionsTrust(List) for `trust`"),
+        }
+        match invoke_extensions("trust list").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::List) => {}
+            _ => panic!("expected ExtensionsTrust(List) for `trust list`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_enable() {
+        match invoke_extensions("trust enable plug:prov").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Enable { runtime_id }) => {
+                assert_eq!(runtime_id, "plug:prov");
+            }
+            _ => panic!("expected ExtensionsTrust(Enable)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_disable_with_reason() {
+        match invoke_extensions("trust disable plug:prov untrusted vendor").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+                assert_eq!(runtime_id, "plug:prov");
+                assert_eq!(reason.as_deref(), Some("untrusted vendor"));
+            }
+            _ => panic!("expected ExtensionsTrust(Disable) with reason"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_trust_disable_no_reason() {
+        match invoke_extensions("trust disable plug:prov").await {
+            CommandAction::ExtensionsTrust(ExtensionsTrustAction::Disable { runtime_id, reason }) => {
+                assert_eq!(runtime_id, "plug:prov");
+                assert!(reason.is_none(), "expected no reason");
+            }
+            _ => panic!("expected ExtensionsTrust(Disable) without reason"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_audit_no_tail() {
+        match invoke_extensions("audit").await {
+            CommandAction::ExtensionsAudit { tail: None } => {}
+            _ => panic!("expected ExtensionsAudit with tail=None"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_audit_with_tail() {
+        match invoke_extensions("audit 25").await {
+            CommandAction::ExtensionsAudit { tail: Some(n) } => assert_eq!(n, 25),
+            _ => panic!("expected ExtensionsAudit with tail=Some(25)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_namespaces() {
+        match invoke_extensions("memory").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces) => {}
+            _ => panic!("expected ExtensionsMemory(Namespaces) for `memory`"),
+        }
+        match invoke_extensions("memory namespaces").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Namespaces) => {}
+            _ => panic!("expected ExtensionsMemory(Namespaces) for `memory namespaces`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_recent_default_limit() {
+        match invoke_extensions("memory recent my-ns").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+                assert_eq!(namespace, "my-ns");
+                assert_eq!(limit, None);
+            }
+            _ => panic!("expected ExtensionsMemory(Recent) with no limit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_extensions_memory_recent_with_limit() {
+        match invoke_extensions("memory recent my-ns 5").await {
+            CommandAction::ExtensionsMemory(ExtensionsMemoryAction::Recent { namespace, limit }) => {
+                assert_eq!(namespace, "my-ns");
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("expected ExtensionsMemory(Recent) with limit=Some(5)"),
+        }
     }
 }

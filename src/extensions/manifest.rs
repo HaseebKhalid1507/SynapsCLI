@@ -1,10 +1,24 @@
-//! Extension manifest — parsed from plugin.json's `extension` field.
+//! Extension manifest model and validation.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::hooks::events::HookKind;
+use super::permissions::PermissionSet;
+
+/// Current extension protocol version supported by SynapsCLI.
+pub const CURRENT_EXTENSION_PROTOCOL_VERSION: u32 = 1;
+
+fn default_protocol_version() -> u32 {
+    CURRENT_EXTENSION_PROTOCOL_VERSION
+}
 
 /// Extension declaration inside a plugin manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
+    /// Extension protocol version. Defaults to v1 for pre-versioned manifests.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
     /// Runtime type (only "process" in phase 1).
     pub runtime: ExtensionRuntime,
     /// Command to start the extension process.
@@ -18,6 +32,84 @@ pub struct ExtensionManifest {
     /// Hooks the extension wants to subscribe to.
     #[serde(default)]
     pub hooks: Vec<HookSubscription>,
+    /// Non-secret config declarations resolved by Synaps and passed to initialize.
+    #[serde(default)]
+    pub config: Vec<ExtensionConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtensionConfigEntry {
+    pub key: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<Value>,
+    #[serde(default)]
+    pub secret_env: Option<String>,
+}
+
+/// A validated extension manifest prepared for loading.
+#[derive(Debug, Clone)]
+pub struct ValidatedExtensionManifest {
+    pub permissions: PermissionSet,
+    pub subscriptions: Vec<(HookKind, Option<String>, Option<HookMatcher>)>,
+}
+
+impl ExtensionManifest {
+    /// Validate manifest fields and derive typed permissions/subscriptions.
+    pub fn validate(&self, id: &str) -> Result<ValidatedExtensionManifest, String> {
+        if self.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
+            return Err(format!(
+                "Extension '{}' uses unsupported protocol_version {} (supported: {})",
+                id, self.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION,
+            ));
+        }
+
+        if self.command.trim().is_empty() {
+            return Err(format!("Extension '{}' has empty command", id));
+        }
+
+        let has_capability_permission = self.permissions.iter().any(|permission| {
+            matches!(
+                permission.as_str(),
+                "tools.register" | "providers.register" | "memory.read" | "memory.write"
+            )
+        });
+        if self.hooks.is_empty() && !has_capability_permission {
+            return Err(format!("Extension '{}' must subscribe to at least one hook or request a registration permission", id));
+        }
+
+        let permissions = PermissionSet::try_from_strings(&self.permissions)?;
+        let mut subscriptions = Vec::with_capacity(self.hooks.len());
+        for sub in &self.hooks {
+            let kind = HookKind::from_str(&sub.hook).ok_or_else(|| {
+                format!("Unknown hook kind: '{}' in extension '{}'", sub.hook, id)
+            })?;
+            if !permissions.allows_hook(kind) {
+                return Err(format!(
+                    "Extension '{}' lacks permission '{}' required for hook '{}'",
+                    id,
+                    kind.required_permission().as_str(),
+                    kind.as_str(),
+                ));
+            }
+            if sub.tool.is_some() && !kind.allows_tool_filter() {
+                return Err(format!(
+                    "Extension '{}' hook '{}' does not allow a tool filter",
+                    id,
+                    kind.as_str(),
+                ));
+            }
+            subscriptions.push((kind, sub.tool.clone(), sub.matcher.clone()));
+        }
+
+        Ok(ValidatedExtensionManifest {
+            permissions,
+            subscriptions,
+        })
+    }
 }
 
 /// Supported extension runtime types.
@@ -35,6 +127,38 @@ pub struct HookSubscription {
     /// Optional tool filter (e.g. "bash" for tool-specific hooks)
     #[serde(default)]
     pub tool: Option<String>,
+    /// Optional simple matcher conditions.
+    #[serde(default, rename = "match")]
+    pub matcher: Option<HookMatcher>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HookMatcher {
+    #[serde(default)]
+    pub input_contains: Option<String>,
+    #[serde(default)]
+    pub input_equals: Option<serde_json::Value>,
+}
+
+impl HookMatcher {
+    pub const SUPPORTED_KEYS: &'static [&'static str] = &["input_contains", "input_equals"];
+
+    pub fn matches(&self, event: &crate::extensions::hooks::events::HookEvent) -> bool {
+        let input = event.tool_input.as_ref().unwrap_or(&serde_json::Value::Null);
+        if let Some(expected) = &self.input_equals {
+            if input != expected {
+                return false;
+            }
+        }
+        if let Some(needle) = &self.input_contains {
+            let haystack = serde_json::to_string(input).unwrap_or_default();
+            if !haystack.contains(needle) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -46,6 +170,7 @@ mod tests {
     #[test]
     fn deserialize_full_manifest() {
         let json = r#"{
+            "protocol_version": 1,
             "runtime": "process",
             "command": "/usr/bin/my-ext",
             "args": ["--port", "0"],
@@ -57,6 +182,7 @@ mod tests {
         }"#;
 
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.protocol_version, 1);
         assert_eq!(m.runtime, ExtensionRuntime::Process);
         assert_eq!(m.command, "/usr/bin/my-ext");
         assert_eq!(m.args, vec!["--port", "0"]);
@@ -78,6 +204,7 @@ mod tests {
         }"#;
 
         let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.protocol_version, CURRENT_EXTENSION_PROTOCOL_VERSION);
         assert_eq!(m.runtime, ExtensionRuntime::Process);
         assert_eq!(m.command, "my-ext");
         assert!(m.args.is_empty(), "args should default to []");
@@ -97,7 +224,7 @@ mod tests {
         assert_eq!(m.hooks[0].tool, None);
     }
 
-    // ── Required fields ────────────────────────────────────────────────────
+    // ── Required fields ─────────────────────────────────────────────────────
 
     #[test]
     fn missing_command_fails() {
@@ -127,10 +254,64 @@ mod tests {
 
     #[test]
     fn runtime_is_case_sensitive() {
-        // serde rename_all = "lowercase" means "Process" (capitalised) is invalid
         let json = r#"{"runtime": "Process", "command": "ext"}"#;
         let result: Result<ExtensionManifest, _> = serde_json::from_str(json);
         assert!(result.is_err(), "runtime matching is lowercase-only");
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_protocol_version() {
+        let manifest = ExtensionManifest {
+            protocol_version: 999,
+            runtime: ExtensionRuntime::Process,
+            command: "ext".to_string(),
+            args: vec![],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: None,
+                matcher: None,
+            }],
+            config: vec![],
+        };
+
+        let err = manifest.validate("bad-version").unwrap_err();
+        assert!(err.contains("unsupported protocol_version 999"));
+    }
+
+    #[test]
+    fn validate_allows_hookless_provider_registration_extensions() {
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: ExtensionRuntime::Process,
+            command: "ext".to_string(),
+            args: vec![],
+            permissions: vec!["providers.register".to_string()],
+            hooks: vec![],
+            config: vec![],
+        };
+
+        manifest.validate("provider-only").unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_tool_filter_on_non_tool_hook() {
+        let manifest = ExtensionManifest {
+            protocol_version: 1,
+            runtime: ExtensionRuntime::Process,
+            command: "ext".to_string(),
+            args: vec![],
+            permissions: vec!["session.lifecycle".to_string()],
+            hooks: vec![HookSubscription {
+                hook: "on_session_start".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![],
+        };
+
+        let err = manifest.validate("bad-filter").unwrap_err();
+        assert!(err.contains("does not allow a tool filter"));
     }
 
     // ── Round-trip ─────────────────────────────────────────────────────────
@@ -138,19 +319,23 @@ mod tests {
     #[test]
     fn serialize_roundtrip() {
         let original = ExtensionManifest {
+            protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),
             args: vec!["--verbose".to_string()],
-            permissions: vec!["read_context".to_string()],
+            permissions: vec!["tools.intercept".to_string()],
             hooks: vec![HookSubscription {
                 hook: "before_tool_call".to_string(),
                 tool: Some("bash".to_string()),
+                matcher: None,
             }],
+            config: vec![],
         };
 
         let json = serde_json::to_string(&original).unwrap();
         let restored: ExtensionManifest = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(restored.protocol_version, original.protocol_version);
         assert_eq!(restored.runtime, original.runtime);
         assert_eq!(restored.command, original.command);
         assert_eq!(restored.args, original.args);
@@ -160,6 +345,46 @@ mod tests {
     }
 
     // ── Runtime serialises as lowercase string ──────────────────────────────
+
+    #[test]
+    fn matcher_input_equals_requires_exact_tool_input() {
+        let matcher = HookMatcher {
+            input_contains: None,
+            input_equals: Some(serde_json::json!({"command": "echo safe"})),
+        };
+
+        let matching = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe"}),
+        );
+        let different = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe", "extra": true}),
+        );
+
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&different));
+    }
+
+    #[test]
+    fn matcher_conditions_are_combined_with_and() {
+        let matcher = HookMatcher {
+            input_contains: Some("safe".to_string()),
+            input_equals: Some(serde_json::json!({"command": "echo safe"})),
+        };
+
+        let matching = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo safe"}),
+        );
+        let equals_but_missing_contains = crate::extensions::hooks::events::HookEvent::before_tool_call(
+            "bash",
+            serde_json::json!({"command": "echo ok"}),
+        );
+
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&equals_but_missing_contains));
+    }
 
     #[test]
     fn runtime_serializes_as_lowercase() {

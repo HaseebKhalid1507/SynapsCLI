@@ -68,7 +68,7 @@ impl crate::Tool for LoadSkillTool {
             Resolution::Ambiguous(opts) => Err(crate::RuntimeError::Tool(format!(
                 "ambiguous skill '{}'; specify one of: {}", name, opts.join(", ")
             ))),
-            Resolution::Builtin | Resolution::Unknown => Err(crate::RuntimeError::Tool(
+            Resolution::PluginCommand(_) | Resolution::Builtin | Resolution::Unknown => Err(crate::RuntimeError::Tool(
                 format!("unknown skill '{}'", name)
             )),
         }

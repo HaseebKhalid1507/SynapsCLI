@@ -9,15 +9,35 @@ pub mod events;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
 use self::events::{HookEvent, HookKind, HookResult};
+use crate::extensions::manifest::HookMatcher;
 use crate::extensions::permissions::PermissionSet;
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn extensions_trace_enabled() -> bool {
+    std::env::var("SYNAPS_EXTENSIONS_TRACE")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn hook_result_action(result: &HookResult) -> &'static str {
+    match result {
+        HookResult::Continue => "continue",
+        HookResult::Block { .. } => "block",
+        HookResult::Inject { .. } => "inject",
+        HookResult::Confirm { .. } => "confirm",
+        HookResult::Modify { .. } => "modify",
+    }
+}
 
 /// A registered hook handler with its metadata.
 #[derive(Clone)]
@@ -26,6 +46,8 @@ pub struct HandlerRegistration {
     pub handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
     /// Optional tool name filter (None = all tools).
     pub tool_filter: Option<String>,
+    /// Optional matcher for event payloads.
+    pub matcher: Option<HookMatcher>,
     /// Permissions granted to this handler's extension.
     pub permissions: PermissionSet,
 }
@@ -55,6 +77,7 @@ impl HookBus {
         kind: HookKind,
         handler: Arc<dyn crate::extensions::runtime::ExtensionHandler>,
         tool_filter: Option<String>,
+        matcher: Option<HookMatcher>,
         permissions: PermissionSet,
     ) -> Result<(), String> {
         // Permission check
@@ -70,6 +93,7 @@ impl HookBus {
         let reg = HandlerRegistration {
             handler,
             tool_filter,
+            matcher,
             permissions,
         };
 
@@ -117,16 +141,70 @@ impl HookBus {
                 }
             }
 
+            if let Some(ref matcher) = reg.matcher {
+                if !matcher.matches(event) {
+                    continue;
+                }
+            }
+
             // Call handler with timeout
             let handler = reg.handler.clone();
             let event_clone = event.clone();
+            let trace_enabled = extensions_trace_enabled();
+            let started_at = trace_enabled.then(Instant::now);
             let result = tokio::time::timeout(
                 HANDLER_TIMEOUT,
                 handler.handle(&event_clone),
             )
             .await;
 
+            if trace_enabled {
+                let health = reg.handler.health().await;
+                let health = health.as_str();
+                let restart_count = reg.handler.restart_count().await;
+                let duration_ms = started_at
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                match &result {
+                    Ok(hook_result) => {
+                        let action = hook_result_action(hook_result);
+                        tracing::info!(
+                            extension_trace = true,
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = action,
+                            duration_ms = duration_ms,
+                            health = health,
+                            restart_count = restart_count,
+                            "Extension hook trace"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            extension_trace = true,
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            action = "timeout",
+                            duration_ms = duration_ms,
+                            timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                            health = health,
+                            restart_count = restart_count,
+                            "Extension hook trace"
+                        );
+                    }
+                }
+            }
+
             match result {
+                Ok(result) if !event.kind.allows_result(&result) => {
+                    tracing::warn!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        action = hook_result_action(&result),
+                        "Extension returned action not allowed for hook — ignoring"
+                    );
+                    continue;
+                }
                 Ok(HookResult::Block { reason }) => {
                     tracing::info!(
                         hook = %event.kind.as_str(),
@@ -146,6 +224,22 @@ impl HookBus {
                     );
                     // Accumulate — don't early-return. Multiple extensions can inject.
                     injections.push(content);
+                }
+                Ok(HookResult::Modify { input }) => {
+                    tracing::info!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Hook modified tool input by extension"
+                    );
+                    return HookResult::Modify { input };
+                }
+                Ok(HookResult::Confirm { message }) => {
+                    tracing::info!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Hook requested confirmation by extension"
+                    );
+                    return HookResult::Confirm { message };
                 }
                 Err(_timeout) => {
                     tracing::warn!(
@@ -187,6 +281,26 @@ impl HookBus {
     pub async fn is_empty(&self) -> bool {
         let handlers = self.handlers.read().await;
         handlers.values().all(|v| v.is_empty())
+    }
+
+    /// Return all (kind, tool_filter) pairs subscribed by the given extension id.
+    /// Sorted by kind name, then by tool_filter (None first), for stable output.
+    pub async fn subscriptions_for(&self, extension_id: &str) -> Vec<(HookKind, Option<String>)> {
+        let handlers = self.handlers.read().await;
+        let mut out: Vec<(HookKind, Option<String>)> = Vec::new();
+        for (kind, regs) in handlers.iter() {
+            for reg in regs {
+                if reg.handler.id() == extension_id {
+                    out.push((*kind, reg.tool_filter.clone()));
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.0.as_str()
+                .cmp(b.0.as_str())
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        out
     }
 }
 
@@ -247,6 +361,73 @@ mod tests {
         set
     }
 
+    #[test]
+    fn trace_env_value_parser_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("SYNAPS_EXTENSIONS_TRACE", value);
+            assert!(extensions_trace_enabled(), "{value} should enable trace mode");
+        }
+
+        for value in ["", "0", "false", "off", "no"] {
+            std::env::set_var("SYNAPS_EXTENSIONS_TRACE", value);
+            assert!(!extensions_trace_enabled(), "{value:?} should not enable trace mode");
+        }
+        std::env::remove_var("SYNAPS_EXTENSIONS_TRACE");
+    }
+
+    #[tokio::test]
+    async fn matcher_skips_handler_when_input_does_not_contain_value() {
+        let bus = HookBus::new();
+        let handler = TestHandler::new("matcher", HookResult::Block { reason: "matched".into() });
+        let mut perms = PermissionSet::new();
+        perms.grant(Permission::ToolsIntercept);
+        bus.subscribe(
+            HookKind::BeforeToolCall,
+            handler.clone(),
+            None,
+            Some(HookMatcher {
+                input_contains: Some("danger".to_string()),
+                input_equals: None,
+            }),
+            perms,
+        ).await.unwrap();
+
+        let safe = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo safe"}));
+        assert!(matches!(bus.emit(&safe).await, HookResult::Continue));
+
+        let danger = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo danger"}));
+        assert!(matches!(bus.emit(&danger).await, HookResult::Block { .. }));
+    }
+
+    #[test]
+    fn hook_result_action_names_are_stable_for_trace_logs() {
+        assert_eq!(hook_result_action(&HookResult::Continue), "continue");
+        assert_eq!(
+            hook_result_action(&HookResult::Block {
+                reason: "stop".into(),
+            }),
+            "block"
+        );
+        assert_eq!(
+            hook_result_action(&HookResult::Inject {
+                content: "context".into(),
+            }),
+            "inject"
+        );
+        assert_eq!(
+            hook_result_action(&HookResult::Confirm {
+                message: "Proceed?".into(),
+            }),
+            "confirm"
+        );
+        assert_eq!(
+            hook_result_action(&HookResult::Modify {
+                input: serde_json::json!({"command": "echo safe"}),
+            }),
+            "modify"
+        );
+    }
+
     #[tokio::test]
     async fn empty_bus_returns_continue() {
         let bus = HookBus::new();
@@ -261,7 +442,7 @@ mod tests {
         let handler = TestHandler::new("test-ext", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
 
-        bus.subscribe(HookKind::BeforeToolCall, handler.clone(), None, perms)
+        bus.subscribe(HookKind::BeforeToolCall, handler.clone(), None, None, perms)
             .await
             .unwrap();
 
@@ -269,6 +450,49 @@ mod tests {
         bus.emit(&event).await;
 
         assert_eq!(handler.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirm_stops_chain_for_before_tool_call() {
+        let bus = HookBus::new();
+        let confirmer = TestHandler::new("confirmer", HookResult::Confirm {
+            message: "Run this command?".into(),
+        });
+        let after = TestHandler::new("after", HookResult::Continue);
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, confirmer.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({}));
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Confirm { .. }));
+        assert_eq!(confirmer.calls(), 1);
+        assert_eq!(after.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn confirm_is_ignored_for_non_tool_hooks() {
+        let bus = HookBus::new();
+        let confirmer = TestHandler::new("confirmer", HookResult::Confirm {
+            message: "Not allowed here".into(),
+        });
+        let perms = perms_with(&[Permission::LlmContent]);
+
+        bus.subscribe(HookKind::BeforeMessage, confirmer.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_message("hello");
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Continue));
+        assert_eq!(confirmer.calls(), 1);
     }
 
     #[tokio::test]
@@ -280,10 +504,10 @@ mod tests {
         let after = TestHandler::new("after", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
 
-        bus.subscribe(HookKind::BeforeToolCall, blocker.clone(), None, perms.clone())
+        bus.subscribe(HookKind::BeforeToolCall, blocker.clone(), None, None, perms.clone())
             .await
             .unwrap();
-        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, perms)
+        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
             .await
             .unwrap();
 
@@ -292,6 +516,32 @@ mod tests {
 
         assert!(matches!(result, HookResult::Block { .. }));
         assert_eq!(blocker.calls(), 1);
+        assert_eq!(after.calls(), 0); // never reached
+    }
+
+    #[tokio::test]
+    async fn modify_stops_chain() {
+        let bus = HookBus::new();
+        let modifier = TestHandler::new("modifier", HookResult::Modify {
+            input: serde_json::json!({"command": "echo safe"}),
+        });
+        let after = TestHandler::new("after", HookResult::Block {
+            reason: "should not run".into(),
+        });
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, modifier.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, after.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "rm -rf /"}));
+        let result = bus.emit(&event).await;
+
+        assert!(matches!(result, HookResult::Modify { input } if input == serde_json::json!({"command": "echo safe"})));
+        assert_eq!(modifier.calls(), 1);
         assert_eq!(after.calls(), 0); // never reached
     }
 
@@ -305,6 +555,7 @@ mod tests {
             HookKind::AfterToolCall,
             handler.clone(),
             Some("bash".into()),
+            None,
             perms,
         )
         .await
@@ -328,7 +579,7 @@ mod tests {
         let perms = PermissionSet::new(); // empty — no permissions
 
         let result = bus
-            .subscribe(HookKind::BeforeToolCall, handler, None, perms)
+            .subscribe(HookKind::BeforeToolCall, handler, None, None, perms)
             .await;
 
         assert!(result.is_err());
@@ -341,7 +592,7 @@ mod tests {
         let handler = TestHandler::new("removable", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
 
-        bus.subscribe(HookKind::BeforeToolCall, handler.clone(), None, perms)
+        bus.subscribe(HookKind::BeforeToolCall, handler.clone(), None, None, perms)
             .await
             .unwrap();
         assert_eq!(bus.handler_count().await, 1);
@@ -351,13 +602,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscriptions_for_lists_only_matching_extension() {
+        let bus = HookBus::new();
+        let alpha = TestHandler::new("alpha", HookResult::Continue);
+        let beta = TestHandler::new("beta", HookResult::Continue);
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::BeforeToolCall, alpha.clone(), Some("bash".into()), None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::AfterToolCall, alpha.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::BeforeToolCall, beta.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let alpha_subs = bus.subscriptions_for("alpha").await;
+        assert_eq!(alpha_subs.len(), 2);
+        // sorted by kind name then by tool_filter (None first)
+        assert_eq!(alpha_subs[0].0, HookKind::AfterToolCall);
+        assert_eq!(alpha_subs[0].1, None);
+        assert_eq!(alpha_subs[1].0, HookKind::BeforeToolCall);
+        assert_eq!(alpha_subs[1].1, Some("bash".to_string()));
+
+        let beta_subs = bus.subscriptions_for("beta").await;
+        assert_eq!(beta_subs, vec![(HookKind::BeforeToolCall, None)]);
+
+        let none_subs = bus.subscriptions_for("ghost").await;
+        assert!(none_subs.is_empty());
+    }
+
+    #[tokio::test]
     async fn is_empty_reflects_state() {
         let bus = HookBus::new();
         assert!(bus.is_empty().await);
 
         let handler = TestHandler::new("ext", HookResult::Continue);
         let perms = perms_with(&[Permission::ToolsIntercept]);
-        bus.subscribe(HookKind::BeforeToolCall, handler, None, perms)
+        bus.subscribe(HookKind::BeforeToolCall, handler, None, None, perms)
             .await
             .unwrap();
         assert!(!bus.is_empty().await);

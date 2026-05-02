@@ -28,6 +28,103 @@ use api::ApiMethods;
 use stream::StreamMethods;
 use helpers::HelperMethods;
 
+/// Result of resolving before_tool_call extension policy.
+pub enum BeforeToolCallDecision {
+    Continue { input: Value },
+    Block { reason: String },
+}
+
+/// Emit a `before_tool_call` event and include the runtime tool name when it
+/// differs from the API-safe name.
+pub async fn emit_before_tool_call(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+) -> crate::extensions::hooks::events::HookResult {
+    let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input);
+    if let Some(runtime_tool_name) = runtime_tool_name {
+        event.tool_runtime_name = Some(runtime_tool_name.to_string());
+    }
+    hook_bus.emit(&event).await
+}
+
+
+/// Resolve a before_tool_call result that may request user confirmation.
+///
+/// Headless/non-interactive callers fail closed for `confirm` by returning `Block`.
+pub async fn resolve_before_tool_call_result(
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+) -> crate::extensions::hooks::events::HookResult {
+    match hook_result {
+        crate::extensions::hooks::events::HookResult::Confirm { message } => {
+            let Some(prompt) = secret_prompt else {
+                return crate::extensions::hooks::events::HookResult::Block {
+                    reason: format!(
+                        "Tool call requires confirmation but no interactive prompt is available: {}",
+                        message
+                    ),
+                };
+            };
+
+            let response = prompt
+                .prompt(
+                    "Confirm tool call".to_string(),
+                    format!("{}\n\nType 'yes' or 'y' to allow.", message),
+                )
+                .await;
+
+            match response.as_deref().map(str::trim) {
+                Some(answer) if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") => {
+                    crate::extensions::hooks::events::HookResult::Continue
+                }
+                _ => crate::extensions::hooks::events::HookResult::Block {
+                    reason: format!("Tool call confirmation denied: {}", message),
+                },
+            }
+        }
+        other => other,
+    }
+}
+
+/// Resolve before_tool_call policy into executable input or a block reason.
+pub async fn resolve_before_tool_call_decision(
+    original_input: Value,
+    hook_result: crate::extensions::hooks::events::HookResult,
+    secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+) -> BeforeToolCallDecision {
+    match resolve_before_tool_call_result(hook_result, secret_prompt).await {
+        crate::extensions::hooks::events::HookResult::Block { reason } => {
+            BeforeToolCallDecision::Block { reason }
+        }
+        crate::extensions::hooks::events::HookResult::Modify { input } => {
+            BeforeToolCallDecision::Continue { input }
+        }
+        _ => BeforeToolCallDecision::Continue { input: original_input },
+    }
+}
+
+/// Emit an `after_tool_call` event and include the runtime tool name when it
+/// differs from the API-safe name.
+pub async fn emit_after_tool_call(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+) -> crate::extensions::hooks::events::HookResult {
+    let mut event = crate::extensions::hooks::events::HookEvent::after_tool_call(
+        tool_name,
+        input,
+        output,
+    );
+    if let Some(runtime_tool_name) = runtime_tool_name {
+        event.tool_runtime_name = Some(runtime_tool_name.to_string());
+    }
+    hook_bus.emit(&event).await
+}
+
 /// The core runtime — manages API communication, tool execution, authentication,
 /// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
 pub struct Runtime {
@@ -350,6 +447,7 @@ impl Runtime {
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
                                 let input = self.tools.read().await.translate_input_for_api_tool(tool_name, input.clone());
+                                let runtime_name = self.tools.read().await.runtime_name_for_api(tool_name).to_string();
                                 let ctx = crate::ToolContext {
                                     channels: crate::tools::ToolChannels {
                                         tx_delta: None,
@@ -370,25 +468,32 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                // ═══ HOOK: before_tool_call ═══
-                                let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                    &tool_name, input.clone(),
-                                );
-                                hook_event.tool_runtime_name = Some(tool_name.to_string());
-                                let hook_result = self.hook_bus.emit(&hook_event).await;
-                                if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                let decision = resolve_before_tool_call_decision(
+                                    input.clone(),
+                                    emit_before_tool_call(
+                                        &self.hook_bus,
+                                        &tool_name,
+                                        Some(&runtime_name),
+                                        input.clone(),
+                                    ).await,
+                                    None,
+                                ).await;
+                                if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
+                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
                                     let output = match tool.execute(input, ctx).await {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
                                     };
-                                    // ═══ HOOK: after_tool_call ═══
-                                    let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                        &tool_name, input_for_hook, output.clone(),
-                                    );
-                                    let _ = self.hook_bus.emit(&hook_event).await;
+                                    let _ = emit_after_tool_call(
+                                        &self.hook_bus,
+                                        &tool_name,
+                                        Some(&runtime_name),
+                                        input_for_hook,
+                                        output.clone(),
+                                    ).await;
                                     output
                                 }
                             }
@@ -422,6 +527,7 @@ impl Runtime {
                             let input = tool_use["input"].clone();
                             let tools_snapshot = self.tools.read().await;
                             let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                            let runtime_name = tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                             let tool = tools_snapshot.get(&tool_name).cloned();
                             drop(tools_snapshot);
                             let exit_path = self.watcher_exit_path.clone();
@@ -430,21 +536,25 @@ impl Runtime {
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let tool_name_for_hook = tool_name.clone();
+                            let runtime_name_for_hook = runtime_name.clone();
                             
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        // ═══ HOOK: before_tool_call (parallel) ═══
-                                        let mut hook_event = crate::extensions::hooks::events::HookEvent::before_tool_call(
-                                            &tool_name_for_hook, input.clone(),
-                                        );
-                                        hook_event.tool_runtime_name = Some(tool_name_for_hook.clone());
-                                        tracing::debug!(tool = %tool_name_for_hook, "before_tool_call hook firing (parallel)");
-                                        let hook_result = hook_bus_inner.emit(&hook_event).await;
-                                        tracing::debug!(?hook_result, "before_tool_call hook result (parallel)");
-                                        if let crate::extensions::hooks::events::HookResult::Block { reason } = hook_result {
+                                        let decision = crate::runtime::resolve_before_tool_call_decision(
+                                            input.clone(),
+                                            crate::runtime::emit_before_tool_call(
+                                                &hook_bus_inner,
+                                                &tool_name_for_hook,
+                                                Some(&runtime_name_for_hook),
+                                                input.clone(),
+                                            ).await,
+                                            None,
+                                        ).await;
+                                        if let crate::runtime::BeforeToolCallDecision::Block { reason } = decision {
                                             format!("Tool call blocked by extension: {}", reason)
                                         } else {
+                                        let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                         let ctx = crate::ToolContext {
                                             channels: crate::tools::ToolChannels {
                                                 tx_delta: None,
@@ -470,11 +580,13 @@ impl Runtime {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        // ═══ HOOK: after_tool_call (parallel) ═══
-                                        let hook_event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-                                            &tool_name_for_hook, input_for_hook, output.clone(),
-                                        );
-                                        let _ = hook_bus_inner.emit(&hook_event).await;
+                                        let _ = crate::runtime::emit_after_tool_call(
+                                            &hook_bus_inner,
+                                            &tool_name_for_hook,
+                                            Some(&runtime_name_for_hook),
+                                            input_for_hook,
+                                            output.clone(),
+                                        ).await;
                                         output
                                         }
                                     }
@@ -626,6 +738,94 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirm_without_prompt_fails_closed() {
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Block { reason }
+                if reason.contains("requires confirmation") && reason.contains("Run deploy?")
+        ));
+    }
+
+    #[tokio::test]
+    async fn modify_result_replaces_tool_input() {
+        let result = resolve_before_tool_call_decision(
+            serde_json::json!({"command":"rm -rf /"}),
+            crate::extensions::hooks::events::HookResult::Modify {
+                input: serde_json::json!({"command":"echo safe"}),
+            },
+            None,
+        ).await;
+
+        match result {
+            BeforeToolCallDecision::Continue { input } => {
+                assert_eq!(input, serde_json::json!({"command":"echo safe"}));
+            }
+            BeforeToolCallDecision::Block { reason } => panic!("unexpected block: {reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_prompt_yes_continues() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            assert_eq!(request.title, "Confirm tool call");
+            assert!(request.prompt.contains("Run deploy?"));
+            let _ = request.response_tx.send(Some("yes".to_string()));
+        });
+
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            Some(&handle),
+        )
+        .await;
+
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_prompt_non_yes_blocks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let request = rx.recv().await.expect("confirm prompt request");
+            let _ = request.response_tx.send(Some("no".to_string()));
+        });
+
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run deploy?".into(),
+            },
+            Some(&handle),
+        )
+        .await;
+
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Block { reason }
+                if reason.contains("confirmation denied")
+        ));
+    }
 
     #[test]
     fn test_max_tokens_for_model() {

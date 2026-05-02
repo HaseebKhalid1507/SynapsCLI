@@ -26,11 +26,13 @@ use lifecycle::{setup_terminal, teardown_terminal};
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session, latest_session, resolve_session};
 use synaps_cli::core::compaction::compact_conversation;
+use synaps_cli::core::session_index::SessionIndexRecord;
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use serde_json::json;
 use std::time::Instant;
 use tachyonfx::{Effect, Shader};
+
 
 pub async fn run(
     continue_session: Option<Option<String>>,
@@ -163,23 +165,36 @@ pub async fn run(
 
     // ═══ Extension Discovery ═══
     // Scan ~/.synaps-cli/plugins/ for extensions and load them
-    let mut ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new(
+    let ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new_with_tools(
         std::sync::Arc::clone(runtime.hook_bus()),
+        runtime.tools_shared(),
     );
+    let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
+    synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
     if !no_extensions {
-        let (loaded, failed) = ext_mgr.discover_and_load().await;
+        let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
         tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
         // Extensions load silently — only surface failures
-        for (name, error) in &failed {
+        for failure in &failed {
             app.push_msg(ChatMessage::System(format!(
-                "⚠ Extension '{}' failed: {}", name, error
+                "⚠ Extension '{}' failed: {}",
+                failure.plugin,
+                failure.concise_message()
             )));
         }
     }
 
     // ═══ HOOK: on_session_start ═══
     {
+        let mut index_record = SessionIndexRecord::start(&app.session.id);
+        index_record.model = Some(app.session.model.clone());
+        index_record.profile = synaps_cli::core::config::get_profile();
+        index_record.cwd = std::env::current_dir().ok();
+        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
+            tracing::warn!("failed to append session start index record: {}", err);
+        }
+
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
@@ -346,6 +361,15 @@ pub async fn run(
                                     tracing::warn!("Failed to update old session {}: {}", old_id, e);
                                 }
                             }
+                            let compaction_event = synaps_cli::extensions::hooks::events::HookEvent::on_compaction(
+                                &old_id,
+                                &new_id,
+                                &summary,
+                                msg_count,
+                                serde_json::json!({"source": "manual"}),
+                            );
+                            let _ = runtime.hook_bus().emit(&compaction_event).await;
+
                             // Advance any named chains that pointed at the old head
                             for ch in &chains_to_advance {
                                 match synaps_cli::chain::save_chain(&ch.name, &new_id) {
@@ -428,6 +452,13 @@ pub async fn run(
                                 app.capture_abort_context();
                                 if let Some(ref q) = app.queued_message.take() {
                                     app.push_msg(ChatMessage::System(format!("dequeued: {}", q)));
+                                }
+                                // Flush any events that arrived during streaming
+                                for formatted in app.pending_events.drain(..) {
+                                    app.api_messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": formatted
+                                    }));
                                 }
                                 stream = None;
                                 cancel_token = None;
@@ -539,6 +570,13 @@ pub async fn run(
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
                                         cancel_token = Some(ct);
                                         steer_tx = Some(s_tx);
+                                    }
+                                    CommandAction::PluginCommand { command, arg } => {
+                                        commands::execute_command_action(
+                                            CommandAction::PluginCommand { command, arg },
+                                            &mut app,
+                                            &runtime,
+                                        ).await;
                                     }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).
@@ -680,6 +718,360 @@ pub async fn run(
                                             }
                                         }
                                     }
+                                    CommandAction::ExtensionsStatus => {
+                                        let manager = ext_mgr_shared.read().await;
+                                        let snapshots = manager.capability_snapshots().await;
+                                        let trust_view = manager.provider_trust_view();
+                                        if snapshots.is_empty() {
+                                            app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
+                                        } else {
+                                            app.push_msg(ChatMessage::System(format!("Extensions ({}):", snapshots.len())));
+                                            for snap in &snapshots {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  {} — {} (restarts: {})",
+                                                    snap.id,
+                                                    snap.health.as_str(),
+                                                    snap.restart_count
+                                                )));
+                                                if !snap.hooks.is_empty() {
+                                                    let rendered = snap
+                                                        .hooks
+                                                        .iter()
+                                                        .map(|h| match &h.tool_filter {
+                                                            Some(t) => format!("{}[{}]", h.kind, t),
+                                                            None => h.kind.clone(),
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
+                                                    app.push_msg(ChatMessage::System(format!("    hooks: {}", rendered)));
+                                                }
+                                                if !snap.tools.is_empty() {
+                                                    let rendered = snap
+                                                        .tools
+                                                        .iter()
+                                                        .map(|t| t.name.clone())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
+                                                    app.push_msg(ChatMessage::System(format!("    tools: {}", rendered)));
+                                                }
+                                                // Voice capabilities (grouped from the `future` list).
+                                                let voice_entries: Vec<&str> = snap
+                                                    .future
+                                                    .iter()
+                                                    .filter(|e| e.kind == "voice")
+                                                    .map(|e| e.name.as_str())
+                                                    .collect();
+                                                if !voice_entries.is_empty() {
+                                                    // Each entry is "<name> (<mode>)". Group by name; collect modes.
+                                                    use std::collections::BTreeMap;
+                                                    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                                                    for entry in &voice_entries {
+                                                        if let Some(open) = entry.rfind(" (") {
+                                                            if entry.ends_with(')') {
+                                                                let name = entry[..open].to_string();
+                                                                let mode = entry[open + 2..entry.len() - 1].to_string();
+                                                                grouped.entry(name).or_default().push(mode);
+                                                                continue;
+                                                            }
+                                                        }
+                                                        grouped.entry((*entry).to_string()).or_default();
+                                                    }
+                                                    for (name, modes) in grouped {
+                                                        let modes_str = modes.join("/");
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    voice: {} [{}]",
+                                                            name, modes_str
+                                                        )));
+                                                    }
+                                                }
+                                                for provider in &snap.providers {
+                                                    let disabled_suffix = match trust_view.get(&provider.runtime_id) {
+                                                        Some(false) => " [disabled]",
+                                                        _ => "",
+                                                    };
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "    provider {} — {}{}",
+                                                        provider.runtime_id,
+                                                        provider.display_name,
+                                                        disabled_suffix
+                                                    )));
+                                                    for model in &provider.models {
+                                                        let mut badges: Vec<&str> = Vec::new();
+                                                        if model.tool_use { badges.push("tool-use"); }
+                                                        if model.streaming { badges.push("streaming"); }
+                                                        let label = if badges.is_empty() {
+                                                            model.runtime_id.clone()
+                                                        } else {
+                                                            let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
+                                                            format!("{} {}", model.runtime_id, suffix)
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!("      model {}", label)));
+                                                    }
+                                                }
+                                                // Surface config diagnostics warnings (no values printed).
+                                                if let Some(diag) = manager.config_diagnostics(&snap.id) {
+                                                    let missing_required: Vec<&str> = diag
+                                                        .entries
+                                                        .iter()
+                                                        .filter(|e| e.required && matches!(e.source, synaps_cli::extensions::config::ConfigSource::Missing))
+                                                        .map(|e| e.key.as_str())
+                                                        .collect();
+                                                    if !missing_required.is_empty() {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    ⚠ missing required config: {}",
+                                                            missing_required.join(", ")
+                                                        )));
+                                                    }
+                                                    // Group provider_missing by provider id.
+                                                    let mut by_provider: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+                                                    for (pid, key) in &diag.provider_missing {
+                                                        by_provider.entry(pid.as_str()).or_default().push(key.as_str());
+                                                    }
+                                                    for (pid, keys) in by_provider {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "    ⚠ provider {} missing required config: {}",
+                                                            pid,
+                                                            keys.join(", ")
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ExtensionsConfig { id } => {
+                                        let manager = ext_mgr_shared.read().await;
+                                        let diags: Vec<synaps_cli::extensions::config::ExtensionConfigDiagnostics> = match &id {
+                                            Some(want) => match manager.config_diagnostics(want) {
+                                                Some(d) => vec![d],
+                                                None => {
+                                                    app.push_msg(ChatMessage::Error(format!(
+                                                        "extension not found: {}",
+                                                        want
+                                                    )));
+                                                    Vec::new()
+                                                }
+                                            },
+                                            None => manager.all_config_diagnostics(),
+                                        };
+                                        if diags.is_empty() && id.is_none() {
+                                            app.push_msg(ChatMessage::System("No extensions loaded.".to_string()));
+                                        }
+                                        for diag in diags {
+                                            app.push_msg(ChatMessage::System(format!(
+                                                "Extension {} config:",
+                                                diag.extension_id
+                                            )));
+                                            if diag.entries.is_empty() {
+                                                app.push_msg(ChatMessage::System("  (no manifest config entries)".to_string()));
+                                            }
+                                            for entry in &diag.entries {
+                                                let source_label = match &entry.source {
+                                                    synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => format!("env override ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::SecretEnv(name) => format!("secret env ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::ConfigKey(name) => format!("config key ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::Default => "default".to_string(),
+                                                    synaps_cli::extensions::config::ConfigSource::Missing => "missing".to_string(),
+                                                };
+                                                let req = if entry.required { " [required]" } else { "" };
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  {}{} — source: {}, has_value: {}",
+                                                    entry.key, req, source_label, entry.has_value
+                                                )));
+                                                if let Some(desc) = &entry.description {
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "    description: {}",
+                                                        desc
+                                                    )));
+                                                }
+                                            }
+                                            for (pid, key) in &diag.provider_missing {
+                                                app.push_msg(ChatMessage::System(format!(
+                                                    "  ⚠ provider {} requires config '{}' (no manifest entry)",
+                                                    pid, key
+                                                )));
+                                            }
+                                        }
+                                    }
+
+                                    CommandAction::ExtensionsTrust(action) => {
+                                        use crate::chatui::commands::ExtensionsTrustAction;
+                                        match action {
+                                            ExtensionsTrustAction::List => {
+                                                let manager = ext_mgr_shared.read().await;
+                                                let providers = manager.provider_summaries();
+                                                let trust = synaps_cli::extensions::trust::load_trust_state().unwrap_or_default();
+                                                if providers.is_empty() {
+                                                    app.push_msg(ChatMessage::System("No providers registered.".to_string()));
+                                                } else {
+                                                    app.push_msg(ChatMessage::System(format!("Provider trust ({}):", providers.len())));
+                                                    for p in providers {
+                                                        let suffix = match trust.disabled.get(&p.runtime_id) {
+                                                            Some(entry) if entry.disabled => match &entry.reason {
+                                                                Some(r) => format!(" [disabled ({})]", r),
+                                                                None => " [disabled]".to_string(),
+                                                            },
+                                                            _ => " [enabled]".to_string(),
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "  {}{}",
+                                                            p.runtime_id, suffix
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            ExtensionsTrustAction::Enable { runtime_id } => {
+                                                match synaps_cli::extensions::trust::load_trust_state() {
+                                                    Ok(mut state) => {
+                                                        synaps_cli::extensions::trust::enable_provider(&mut state, &runtime_id);
+                                                        match synaps_cli::extensions::trust::save_trust_state(&state) {
+                                                            Ok(()) => app.push_msg(ChatMessage::System(format!(
+                                                                "Provider '{}' enabled.", runtime_id
+                                                            ))),
+                                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                                "failed to save trust state: {}", e
+                                                            ))),
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to load trust state: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                            ExtensionsTrustAction::Disable { runtime_id, reason } => {
+                                                match synaps_cli::extensions::trust::load_trust_state() {
+                                                    Ok(mut state) => {
+                                                        synaps_cli::extensions::trust::disable_provider(&mut state, &runtime_id, reason.clone());
+                                                        match synaps_cli::extensions::trust::save_trust_state(&state) {
+                                                            Ok(()) => {
+                                                                let suffix = match &reason {
+                                                                    Some(r) => format!(" [reason: {}]", r),
+                                                                    None => String::new(),
+                                                                };
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "Provider '{}' disabled.{}", runtime_id, suffix
+                                                                )));
+                                                            }
+                                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                                "failed to save trust state: {}", e
+                                                            ))),
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to load trust state: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CommandAction::ExtensionsAudit { tail } => {
+                                        match synaps_cli::extensions::audit::read_audit_entries() {
+                                            Ok(entries) => {
+                                                let slice: Vec<_> = match tail {
+                                                    Some(n) if entries.len() > n => entries[entries.len() - n..].to_vec(),
+                                                    _ => entries,
+                                                };
+                                                if slice.is_empty() {
+                                                    app.push_msg(ChatMessage::System("No audit entries yet.".to_string()));
+                                                } else {
+                                                    app.push_msg(ChatMessage::System(format!("Audit ({} entries):", slice.len())));
+                                                    for e in slice {
+                                                        let stream_tag = if e.streamed { "[streamed]" } else { "[complete]" };
+                                                        let class_part = match &e.error_class {
+                                                            Some(c) => format!(" class={}", c),
+                                                            None => String::new(),
+                                                        };
+                                                        let tools_part = if e.tools_requested > 0 {
+                                                            format!(" tools={}", e.tools_requested)
+                                                        } else {
+                                                            String::new()
+                                                        };
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "  {} {}:{} {} outcome={}{}{}",
+                                                            e.timestamp,
+                                                            e.provider_id,
+                                                            e.model_id,
+                                                            stream_tag,
+                                                            e.outcome,
+                                                            class_part,
+                                                            tools_part,
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                "failed to read audit log: {}", e
+                                            ))),
+                                        }
+                                    }
+                                    CommandAction::ExtensionsMemory(action) => {
+                                        use crate::chatui::commands::ExtensionsMemoryAction;
+                                        match action {
+                                            ExtensionsMemoryAction::Namespaces => {
+                                                match synaps_cli::memory::store::list_namespaces() {
+                                                    Ok(nss) if nss.is_empty() => {
+                                                        app.push_msg(ChatMessage::System(
+                                                            "No memory namespaces.".to_string(),
+                                                        ));
+                                                    }
+                                                    Ok(nss) => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "Memory namespaces ({}):", nss.len()
+                                                        )));
+                                                        for ns in nss {
+                                                            app.push_msg(ChatMessage::System(format!("  {}", ns)));
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to list memory namespaces: {}", e
+                                                    ))),
+                                                }
+                                            }
+                                            ExtensionsMemoryAction::Recent { namespace, limit } => {
+                                                let q = synaps_cli::memory::store::MemoryQuery {
+                                                    limit: Some(limit.unwrap_or(20)),
+                                                    ..Default::default()
+                                                };
+                                                match synaps_cli::memory::store::query(&namespace, &q) {
+                                                    Ok(records) if records.is_empty() => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "No records in '{}'.", namespace
+                                                        )));
+                                                    }
+                                                    Ok(records) => {
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "Recent in '{}' ({}):", namespace, records.len()
+                                                        )));
+                                                        for rec in records {
+                                                            // ISO8601 / RFC3339 UTC from epoch ms via chrono.
+                                                            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                                                                rec.timestamp_ms as i64,
+                                                            )
+                                                            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                                                            .unwrap_or_else(|| rec.timestamp_ms.to_string());
+                                                            // Truncate content at 80 chars (char-aware).
+                                                            let mut content: String = rec.content.chars().take(80).collect();
+                                                            if rec.content.chars().count() > 80 {
+                                                                content.push('…');
+                                                            }
+                                                            let tags = if rec.tags.is_empty() {
+                                                                "[]".to_string()
+                                                            } else {
+                                                                format!("[{}]", rec.tags.join(", "))
+                                                            };
+                                                            // NOTE: meta intentionally not displayed (privacy).
+                                                            app.push_msg(ChatMessage::System(format!(
+                                                                "  {} {} {}", ts, tags, content
+                                                            )));
+                                                        }
+                                                    }
+                                                    Err(e) => app.push_msg(ChatMessage::Error(format!(
+                                                        "failed to query memory '{}': {}", namespace, e
+                                                    ))),
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     CommandAction::Ping => {
                                         app.push_msg(ChatMessage::System("📡 Pinging models...".to_string()));
                                         app.ping_print = true;
@@ -784,14 +1176,20 @@ pub async fn run(
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
                                         CommandAction::ReloadPlugins => {}
-                                        // handle_streaming_command never returns LoadSkill or Compact.
+                                        // handle_streaming_command never returns LoadSkill, PluginCommand, or Compact.
                                         CommandAction::LoadSkill { .. } => {}
+                                        CommandAction::PluginCommand { .. } => {}
                                         CommandAction::Compact { .. } => {}
                                         CommandAction::Chain => {}
                                         CommandAction::ChainList => {}
                                         CommandAction::ChainName { .. } => {}
                                         CommandAction::ChainUnname { .. } => {}
                                         CommandAction::Status => {}
+                                        CommandAction::ExtensionsStatus => {}
+                                        CommandAction::ExtensionsConfig { .. } => {}
+                                        CommandAction::ExtensionsTrust(_) => {}
+                                        CommandAction::ExtensionsAudit { .. } => {}
+                                        CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
                                     }
                                 } else {
@@ -815,6 +1213,50 @@ pub async fn run(
                                 app.push_msg(ChatMessage::System(format!("model set to: {}", applied)));
                             }
                             InputAction::ModelsExpandProvider(provider_key) => {
+                                if provider_key.contains(':') {
+                                    let tx = app.model_list_tx.clone();
+                                    let manager = synaps_cli::runtime::openai::extension_manager_for_routing();
+                                    tokio::spawn(async move {
+                                        let result = if let Some(manager) = manager {
+                                            let manager = manager.read().await;
+                                            if let Some(provider) = manager.provider(&provider_key) {
+                                                Ok(provider.spec.models.iter().map(|model| {
+                                                    let full_id = synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
+                                                        &provider.plugin_id,
+                                                        &provider.provider_id,
+                                                        &model.id,
+                                                    );
+                                                    let mut metadata = vec![format!("plugin {}", provider.plugin_id)];
+                                                    metadata.push(format!("provider {}", provider.provider_id));
+                                                    if let Some(context) = model.context_window {
+                                                        metadata.push(if context >= 1_000_000 {
+                                                            format!("{}M ctx", context / 1_000_000)
+                                                        } else if context >= 1_000 {
+                                                            format!("{}K ctx", context / 1_000)
+                                                        } else {
+                                                            format!("{context} ctx")
+                                                        });
+                                                    }
+                                                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
+                                                        metadata.push("tool-use".to_string());
+                                                    }
+                                                    models::ExpandedModelEntry::with_metadata(
+                                                        full_id,
+                                                        model.display_name.clone().unwrap_or_else(|| model.id.clone()),
+                                                        false,
+                                                        metadata,
+                                                    )
+                                                }).collect())
+                                            } else {
+                                                Err(format!("extension provider '{}' is not loaded", provider_key))
+                                            }
+                                        } else {
+                                            Err("extension provider registry is not available".to_string())
+                                        };
+                                        let _ = tx.send((provider_key, result));
+                                    });
+                                    continue;
+                                }
                                 let client = runtime.http_client().clone();
                                 let provider_keys = synaps_cli::config::get_provider_keys();
                                 let tx = app.model_list_tx.clone();
@@ -862,14 +1304,14 @@ pub async fn run(
                                         PO::AddMarketplace(url) => {
                                             plugins::actions::apply_add_marketplace(state, url).await;
                                         }
-                                        PO::Install { marketplace, plugin } => {
+                                        PO::InstallRequested { marketplace, plugin } => {
                                             plugins::actions::apply_install(
                                                 state, marketplace, plugin, &registry, &config,
                                             ).await;
                                         }
-                                        PO::TrustAndInstall { plugin_name, host, source } => {
+                                        PO::TrustAndInstall { plugin_name, host, source, summary } => {
                                             plugins::actions::apply_trust_and_install(
-                                                state, plugin_name, host, source, &registry, &config,
+                                                state, plugin_name, host, source, summary, &registry, &config,
                                             ).await;
                                         }
                                         PO::Uninstall(name) => {
@@ -882,8 +1324,20 @@ pub async fn run(
                                                 state, name, &registry, &config,
                                             ).await;
                                         }
-                                        PO::RefreshMarketplace(name) => {
+        PO::RefreshMarketplace(name) => {
                                             plugins::actions::apply_refresh_marketplace(state, name).await;
+                                        }
+                                        PO::ConfirmPendingInstall => {
+                                            plugins::actions::apply_confirm_pending_install(state, &registry, &config).await;
+                                        }
+                                        PO::CancelPendingInstall => {
+                                            plugins::actions::apply_cancel_pending_install(state);
+                                        }
+                                        PO::ConfirmPendingUpdate => {
+                                            plugins::actions::apply_confirm_pending_update(state, &registry, &config).await;
+                                        }
+                                        PO::CancelPendingUpdate => {
+                                            plugins::actions::apply_cancel_pending_update(state);
                                         }
                                         PO::RemoveMarketplace(name) => {
                                             plugins::actions::apply_remove_marketplace(
@@ -894,6 +1348,9 @@ pub async fn run(
                                             plugins::actions::apply_toggle_plugin(
                                                 state, name, enabled, &registry, &mut config,
                                             );
+                                        }
+                                        PO::EnablePluginRequested(name) => {
+                                            plugins::actions::confirm_enable_plugin(state, name);
                                         }
                                     }
                                 }
@@ -1030,13 +1487,19 @@ pub async fn run(
 
     // ═══ HOOK: on_session_end ═══
     {
+        let mut index_record = SessionIndexRecord::end(&app.session.id);
+        index_record.turns = Some(app.api_messages.len());
+        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
+            tracing::warn!("failed to append session end index record: {}", err);
+        }
+
         let transcript = Some(app.api_messages.clone());
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id, transcript);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
     // Gracefully shut down all extensions
-    ext_mgr.shutdown_all().await;
+    ext_mgr_shared.write().await.shutdown_all().await;
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

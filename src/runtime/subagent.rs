@@ -60,6 +60,7 @@ pub struct SubagentHandle {
     pub agent_name: String,
     pub task_preview: String,
     pub model: String,
+    pub system_prompt: String,
     pub started_at: std::time::Instant,
     pub timeout_secs: u64,
 
@@ -95,6 +96,7 @@ impl SubagentHandle {
         agent_name: String,
         task_preview: String,
         model: String,
+        system_prompt: String,
         timeout_secs: u64,
         state: Arc<RwLock<SubagentState>>,
         steer_tx: Option<mpsc::UnboundedSender<String>>,
@@ -106,6 +108,7 @@ impl SubagentHandle {
             agent_name,
             task_preview,
             model,
+            system_prompt,
             started_at: std::time::Instant::now(),
             timeout_secs,
             state,
@@ -225,7 +228,18 @@ impl SubagentRegistry {
     }
 
     pub fn cleanup_finished(&mut self) {
-        self.handles.retain(|_, h| !h.is_finished());
+        let finished_ids: Vec<String> = self.handles.iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished_ids {
+            if let Some(mut handle) = self.handles.remove(&id) {
+                // Join the thread to avoid zombies/resource leaks
+                if let Some(th) = handle.thread_handle.take() {
+                    let _ = th.join();
+                }
+            }
+        }
     }
 }
 
@@ -270,6 +284,7 @@ mod tests {
                 "test-agent".to_string(),
                 "test task".to_string(),
                 "claude-sonnet-4-6".to_string(),
+                "You are a test agent.".to_string(),
                 300,
                 state,
                 Some(steer_tx),
@@ -326,7 +341,7 @@ mod tests {
         let (_, result_rx) = oneshot::channel();
         let h = SubagentHandle::new(
             "sa_1".into(), "test".into(), "task".into(),
-            "model".into(), 300, state, None, None, Some(result_rx),
+            "model".into(), "prompt".into(), 300, state, None, None, Some(result_rx),
         );
         assert!(h.steer("msg").is_err());
     }

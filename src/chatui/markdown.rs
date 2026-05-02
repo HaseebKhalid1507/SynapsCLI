@@ -357,7 +357,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         // so adjacent rows don't blur together
         if max_lines > 1 && i >= body_start && i < rows.len() - 1 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
             result.push(Line::from(Span::styled(
                 sep,
                 Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -367,7 +367,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         // After header row, draw a single ─ rule
         if has_header && i == 0 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
             result.push(Line::from(Span::styled(sep, border_style)));
         }
 
@@ -376,7 +376,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             let body_idx = i - body_start; // 0-indexed body row
             if body_idx > 0 && body_idx % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
                     Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -386,7 +386,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             // No header case — stripe from row 0
             if i > 0 && i % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(prefix.len() + 2))));
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
                     Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -432,7 +432,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 let lang_style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
 
                 // Calculate block width: use a reasonable portion of available width
-                let block_inner_width = width.saturating_sub(prefix.len() + 4); // prefix + "  " + borders
+                let block_inner_width = width.saturating_sub(UnicodeWidthStr::width(prefix) + 4); // prefix + "  " + borders
                 let rule_width = block_inner_width.min(60).max(20);
 
                 // Top rule with optional language tag

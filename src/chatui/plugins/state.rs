@@ -22,13 +22,33 @@ pub enum RightMode {
     List,
     Detail { row_idx: usize },
     AddMarketplaceEditor { buffer: String, error: Option<String> },
-    TrustPrompt { plugin_name: String, host: String, pending_source: String },
-    Confirm { prompt: String, on_yes: ConfirmAction },
+    TrustPrompt { plugin_name: String, host: String, pending_source: String, summary: Vec<String> },
+    Confirm { prompt: String, on_yes: ConfirmAction, summary: Vec<String> },
+    PendingInstallConfirm {
+        plugin_name: String,
+        source_url: String,
+        subdir: Option<String>,
+        marketplace_name: Option<String>,
+        summary: Vec<String>,
+        installed_commit: String,
+        checksum_algorithm: Option<String>,
+        checksum_value: Option<String>,
+        temp_dir: std::path::PathBuf,
+        final_dir: std::path::PathBuf,
+    },
+    PendingUpdateConfirm {
+        plugin_name: String,
+        summary: Vec<String>,
+        installed_commit: String,
+        temp_dir: std::path::PathBuf,
+        final_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
 pub enum ConfirmAction {
     Uninstall(String),       // plugin name
+    EnablePlugin(String),
     RemoveMarketplace(String),
 }
 
@@ -136,6 +156,7 @@ mod tests {
                             source: "https://github.com/m/web.git".into(),
                             version: None,
                             description: None,
+                            index: None,
                         },
                     ],
                     repo_url: None,
@@ -150,6 +171,8 @@ mod tests {
                     latest_commit: Some("aaa".into()),
                     installed_at: "now".into(),
                     source_subdir: None,
+                    checksum_algorithm: None,
+                    checksum_value: None,
                 },
             ],
             trusted_hosts: vec![],

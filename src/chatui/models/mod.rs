@@ -304,6 +304,56 @@ fn build_sections_from_parts(
         }
     }
 
+    if let Some(manager) = synaps_cli::runtime::openai::extension_manager_for_routing() {
+        if let Ok(manager) = manager.try_read() {
+            for provider in manager.providers() {
+                let mut entries: Vec<ModelEntry> = provider.spec.models.iter().enumerate().map(|(order, model)| {
+                    let runtime_id = synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
+                        &provider.plugin_id,
+                        &provider.provider_id,
+                        &model.id,
+                    );
+                    let mut badges: Vec<&str> = Vec::new();
+                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        badges.push("tool-use");
+                    }
+                    if model.capabilities.get("streaming").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        badges.push("streaming");
+                    }
+                    let base = model.display_name.clone().unwrap_or_else(|| model.id.clone());
+                    let label = if badges.is_empty() {
+                        base
+                    } else {
+                        let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
+                        format!("{} {}", base, suffix)
+                    };
+                    ModelEntry {
+                        id: runtime_id.clone(),
+                        display_id: model.id.clone(),
+                        label,
+                        tier: "extension".to_string(),
+                        provider_key: provider.runtime_id.clone(),
+                        provider_name: provider.spec.display_name.clone(),
+                        configured: true,
+                        is_current: current_model == runtime_id,
+                        is_favorite: state.favorites.contains(&runtime_id),
+                        favorite_id: runtime_id,
+                        order,
+                    }
+                }).filter(|m| model_matches(m, &query, favorites_only)).collect();
+                pin_favorites_first(&mut entries);
+                if !entries.is_empty() {
+                    sections.push(ModelSection {
+                        provider_key: provider.runtime_id.clone(),
+                        provider_name: provider.spec.display_name.clone(),
+                        configured: true,
+                        entries,
+                    });
+                }
+            }
+        }
+    }
+
     sections
 }
 

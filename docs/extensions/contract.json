@@ -1,0 +1,114 @@
+{
+  "manifest_version": 1,
+  "extension_protocol_version": 1,
+  "runtimes": [
+    "process"
+  ],
+  "hooks": {
+    "before_tool_call": {
+      "permission": "tools.intercept",
+      "tool_filter": true,
+      "actions": [
+        "continue",
+        "block",
+        "confirm",
+        "modify"
+      ]
+    },
+    "after_tool_call": {
+      "permission": "tools.intercept",
+      "tool_filter": true,
+      "actions": [
+        "continue"
+      ]
+    },
+    "before_message": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue",
+        "inject"
+      ]
+    },
+    "on_message_complete": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ]
+    },
+    "on_compaction": {
+      "permission": "privacy.llm_content",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ]
+    },
+    "on_session_start": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ]
+    },
+    "on_session_end": {
+      "permission": "session.lifecycle",
+      "tool_filter": false,
+      "actions": [
+        "continue"
+      ]
+    }
+  },
+  "permissions": [
+    "tools.intercept",
+    "privacy.llm_content",
+    "session.lifecycle",
+    "tools.register",
+    "providers.register"
+  ],
+  "reserved_permissions": [
+    "tools.override"
+  ],
+  "matchers": {
+    "input_contains": "substring match against JSON-stringified tool_input",
+    "input_equals": "exact JSON equality against tool_input"
+  },
+  "config": {
+    "manifest_key": "extension.config",
+    "storage_key_prefix": "extension.<plugin-id>.",
+    "secret_env_field": "secret_env",
+    "validation": [
+      "key must be non-empty and must not contain dots, slashes, or spaces",
+      "required must be boolean when present",
+      "secret_env must be an environment variable name when present"
+    ]
+  },
+  "registered_capabilities": {
+    "tools": {
+      "permission": "tools.register",
+      "spec": {
+        "required": ["name", "description", "input_schema"],
+        "validation": [
+          "name must be non-empty and unique per extension",
+          "description must be non-empty",
+          "input_schema must be a JSON object"
+        ]
+      }
+    },
+    "providers": {
+      "permission": "providers.register",
+      "status": "active",
+      "model_id_format": "<plugin-id>:<provider-id>:<model-id>",
+      "methods": {
+        "provider.complete": {
+          "streaming": false,
+          "timeout_secs": 60
+        },
+        "provider.stream": {
+          "status": "reserved"
+        }
+      },
+      "spec": "docs/specs/extension-providers.md"
+    }
+  }
+}
