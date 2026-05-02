@@ -134,7 +134,8 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
                             Some("tool_use") => {
                                 let name = block["name"].as_str().unwrap_or("").to_string();
                                 let input = serde_json::to_string(&block["input"]).unwrap_or_default();
-                                app.push_msg(ChatMessage::ToolUse { tool_name: name, input });
+                                let tool_id = block["id"].as_str().unwrap_or("").to_string();
+                                app.push_msg(ChatMessage::ToolUse { tool_id, tool_name: name, input });
                             }
                             _ => {}
                         }

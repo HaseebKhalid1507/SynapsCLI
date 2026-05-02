@@ -226,6 +226,7 @@ impl StreamDecoder {
                     acc.arguments.push_str(&args);
                     sink.extend(Some(OaiEvent::ToolCallArgumentsDelta {
                         index: idx,
+                        id: acc.id.clone(),
                         delta: args,
                     }));
                 }
