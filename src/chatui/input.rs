@@ -515,7 +515,7 @@ fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegis
     if help_registry.command_prefix_match_count(&query) < 2 {
         return false;
     }
-    app.help_find = Some(synaps_cli::help::HelpFindState::new_help_commands(
+    app.help_find = Some(synaps_cli::help::HelpFindState::new(
         help_registry.entries().to_vec(),
         &query,
     ));
