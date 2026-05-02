@@ -79,6 +79,76 @@ pub struct PluginManifest {
     pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
     #[serde(default)]
     pub provides: Option<PluginProvides>,
+    /// Plugin-declared Settings categories (Path B Phase 4). Each plugin
+    /// may contribute one or more categories to the `/settings` modal,
+    /// each with declarative `text`/`cycler`/`picker` fields or a
+    /// plugin-rendered `custom` editor (JSON-RPC `settings.editor.*`).
+    #[serde(default)]
+    pub settings: Option<ManifestSettings>,
+}
+
+/// Container for plugin-declared settings categories.
+///
+/// JSON shape:
+/// ```jsonc
+/// "settings": {
+///   "category": [
+///     { "id": "voice", "label": "Voice", "fields": [ ... ] }
+///   ]
+/// }
+/// ```
+/// The TOML equivalent (`[[settings.category]]`) deserializes through the
+/// `category` alias. The plural Rust field name is preferred internally.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettings {
+    #[serde(default, alias = "category")]
+    pub categories: Vec<ManifestSettingsCategory>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettingsCategory {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub fields: Vec<ManifestSettingsField>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettingsField {
+    pub key: String,
+    pub label: String,
+    pub editor: ManifestEditorKind,
+    /// Discrete options for `cycler` editors. Ignored otherwise.
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub help: Option<String>,
+    /// Optional default value seeded into the plugin's config namespace
+    /// when the field is first read. Type-erased JSON; consumer decides
+    /// how to interpret based on `editor`.
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    /// `true` for fields whose editor is `text` and accepts only numeric
+    /// input. Mirrors `EditorKind::Text { numeric }` in the core schema.
+    #[serde(default)]
+    pub numeric: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEditorKind {
+    /// Free-text input (optionally numeric — see `numeric`).
+    Text,
+    /// Discrete-option cycler — uses `options`.
+    Cycler,
+    /// Generic picker. Options are supplied by the plugin at editor-open
+    /// time via the `settings.editor.*` JSON-RPC contract.
+    Picker,
+    /// Plugin-rendered overlay using `settings.editor.open` /
+    /// `settings.editor.render` / `settings.editor.key` /
+    /// `settings.editor.commit`. See
+    /// `src/extensions/settings_editor.rs` for the typed payloads.
+    Custom,
 }
 
 /// Plugin-provided capabilities consumed by Synaps CLI core.
@@ -382,6 +452,121 @@ mod tests {
         let json = r#"{"name":"empty"}"#;
         let result: Result<MarketplaceManifest, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_manifest_parses_settings_categories_with_declarative_fields() {
+        let json = r#"{
+            "name": "demo",
+            "settings": {
+                "category": [
+                    {
+                        "id": "demo",
+                        "label": "Demo",
+                        "fields": [
+                            {
+                                "key": "backend",
+                                "label": "Backend",
+                                "editor": "cycler",
+                                "options": ["auto", "cpu", "cuda"]
+                            },
+                            {
+                                "key": "endpoint",
+                                "label": "API endpoint",
+                                "editor": "text",
+                                "help": "Base URL"
+                            },
+                            {
+                                "key": "max_tokens",
+                                "label": "Max tokens",
+                                "editor": "text",
+                                "numeric": true,
+                                "default": 2048
+                            },
+                            {
+                                "key": "model_path",
+                                "label": "Model",
+                                "editor": "custom"
+                            },
+                            {
+                                "key": "preset",
+                                "label": "Preset",
+                                "editor": "picker"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let s = m.settings.expect("settings should deserialize");
+        assert_eq!(s.categories.len(), 1);
+        let cat = &s.categories[0];
+        assert_eq!(cat.id, "demo");
+        assert_eq!(cat.label, "Demo");
+        assert_eq!(cat.fields.len(), 5);
+
+        assert_eq!(cat.fields[0].key, "backend");
+        assert_eq!(cat.fields[0].editor, ManifestEditorKind::Cycler);
+        assert_eq!(cat.fields[0].options, vec!["auto", "cpu", "cuda"]);
+
+        assert_eq!(cat.fields[1].editor, ManifestEditorKind::Text);
+        assert!(!cat.fields[1].numeric);
+        assert_eq!(cat.fields[1].help.as_deref(), Some("Base URL"));
+
+        assert_eq!(cat.fields[2].editor, ManifestEditorKind::Text);
+        assert!(cat.fields[2].numeric);
+        assert_eq!(cat.fields[2].default, Some(serde_json::json!(2048)));
+
+        assert_eq!(cat.fields[3].editor, ManifestEditorKind::Custom);
+        assert_eq!(cat.fields[4].editor, ManifestEditorKind::Picker);
+    }
+
+    #[test]
+    fn plugin_manifest_settings_default_to_none() {
+        let json = r#"{"name":"plain"}"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.settings.is_none());
+    }
+
+    #[test]
+    fn plugin_manifest_settings_unknown_editor_kind_fails() {
+        let json = r#"{
+            "name": "demo",
+            "settings": {
+                "category": [
+                    { "id": "x", "label": "X", "fields": [
+                        { "key": "k", "label": "L", "editor": "bogus" }
+                    ] }
+                ]
+            }
+        }"#;
+        let result: Result<PluginManifest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_manifest_settings_additive_with_help_entries_field() {
+        // Forward-compat smoke test: the help-command worktree adds a
+        // `help_entries` field to PluginManifest. Until those changes
+        // merge here, this manifest must continue to parse cleanly with
+        // the new `settings` field present alongside it (treated as an
+        // unknown sibling). When the merge happens, this exact JSON is
+        // what both worktrees should agree on.
+        let json = r#"{
+            "name": "merge-friendly",
+            "settings": {
+                "category": [
+                    { "id": "x", "label": "X", "fields": [] }
+                ]
+            },
+            "help_entries": [
+                { "command": "/x:do", "description": "do a thing" }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.settings.is_some());
+        assert_eq!(m.settings.unwrap().categories[0].id, "x");
     }
 
     #[test]

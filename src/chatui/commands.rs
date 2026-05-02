@@ -921,6 +921,7 @@ mod tests {
                     compatibility: None,
                     extension: None,
                     provides: None,
+                    settings: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),
@@ -1397,6 +1398,7 @@ mod tests {
                     )],
                     extension: None,
                     provides: None,
+                    settings: None,
                 }),
             }],
         );

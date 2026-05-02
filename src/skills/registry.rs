@@ -18,6 +18,40 @@ pub enum RegisteredPluginCommandBackend {
     Interactive { plugin_extension_id: String },
 }
 
+/// Editor kind for a plugin-declared settings field, normalised from the
+/// manifest into a form the settings UI can consume directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginSettingsEditor {
+    Text { numeric: bool },
+    Cycler { options: Vec<String> },
+    Picker,
+    /// Editor body rendered by the plugin via the
+    /// `settings.editor.*` JSON-RPC contract.
+    Custom,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginSettingsField {
+    pub key: String,
+    pub label: String,
+    pub editor: PluginSettingsEditor,
+    pub help: Option<String>,
+    pub default: Option<serde_json::Value>,
+}
+
+/// A plugin-declared category contributed to the `/settings` modal.
+///
+/// The owning plugin is recorded in `plugin` so that the settings UI can
+/// scope reads/writes to that plugin's config namespace and dispatch
+/// custom-editor JSON-RPC events to the right extension.
+#[derive(Clone, Debug)]
+pub struct PluginSettingsCategory {
+    pub plugin: String,
+    pub id: String,
+    pub label: String,
+    pub fields: Vec<PluginSettingsField>,
+}
+
 /// Resolution outcome for a typed slash command.
 #[derive(Clone, Debug)]
 pub struct RegisteredPluginCommand {
@@ -45,6 +79,9 @@ struct Inner {
     skills: HashMap<String, Vec<Arc<LoadedSkill>>>, // unqualified name -> all matches
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
     plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>>, // "plugin:cmd" -> single
+    /// Plugin-declared settings categories, in plugin discovery order.
+    /// Path B Phase 4. The settings UI snapshots this on each open.
+    plugin_settings_categories: Vec<PluginSettingsCategory>,
 }
 
 pub struct CommandRegistry {
@@ -64,6 +101,7 @@ impl CommandRegistry {
                 skills: HashMap::new(),
                 qualified: HashMap::new(),
                 plugin_commands: HashMap::new(),
+                plugin_settings_categories: Vec::new(),
             }),
         };
         r.rebuild_with_plugins(skills, plugins);
@@ -82,8 +120,45 @@ impl CommandRegistry {
         let mut new_skills: HashMap<String, Vec<Arc<LoadedSkill>>> = HashMap::new();
         let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
         let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
+        let mut new_plugin_settings_categories: Vec<PluginSettingsCategory> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
+                if let Some(ref settings) = manifest.settings {
+                    for cat in &settings.categories {
+                        let fields = cat
+                            .fields
+                            .iter()
+                            .map(|f| PluginSettingsField {
+                                key: f.key.clone(),
+                                label: f.label.clone(),
+                                editor: match f.editor {
+                                    crate::skills::manifest::ManifestEditorKind::Text => {
+                                        PluginSettingsEditor::Text { numeric: f.numeric }
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Cycler => {
+                                        PluginSettingsEditor::Cycler {
+                                            options: f.options.clone(),
+                                        }
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Picker => {
+                                        PluginSettingsEditor::Picker
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Custom => {
+                                        PluginSettingsEditor::Custom
+                                    }
+                                },
+                                help: f.help.clone(),
+                                default: f.default.clone(),
+                            })
+                            .collect();
+                        new_plugin_settings_categories.push(PluginSettingsCategory {
+                            plugin: manifest.name.clone(),
+                            id: cat.id.clone(),
+                            label: cat.label.clone(),
+                            fields,
+                        });
+                    }
+                }
                 for cmd in manifest.commands {
                     let (name, description, backend) = match cmd {
                         crate::skills::manifest::ManifestCommand::Shell(cmd) => (
@@ -152,6 +227,7 @@ impl CommandRegistry {
         w.skills = new_skills;
         w.qualified = new_qualified;
         w.plugin_commands = new_plugin_commands;
+        w.plugin_settings_categories = new_plugin_settings_categories;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
@@ -213,6 +289,13 @@ impl CommandRegistry {
             .collect()
     }
 
+    /// Snapshot of every plugin-declared settings category, preserving
+    /// plugin discovery order. The settings UI calls this on each open
+    /// to merge plugin categories with the built-in ones.
+    pub fn plugin_settings_categories(&self) -> Vec<PluginSettingsCategory> {
+        self.inner.read().unwrap().plugin_settings_categories.clone()
+    }
+
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
         let r = self.inner.read().unwrap();
         let mut seen: std::collections::HashSet<(Option<String>, String)> =
@@ -260,6 +343,7 @@ mod tests {
                 })],
                 extension: None,
                 provides: None,
+                settings: None,
             }),
         }
     }
@@ -287,6 +371,7 @@ mod tests {
                 })],
                 extension: None,
                 provides: None,
+                settings: None,
             }),
         }
     }
@@ -477,5 +562,128 @@ mod tests {
         assert_eq!(plugins[0].skill_count, 2);
         assert_eq!(plugins[1].name, "p2");
         assert_eq!(plugins[1].skill_count, 1);
+    }
+
+    fn mk_plugin_with_settings(plugin: &str, root: PathBuf) -> Plugin {
+        use crate::skills::manifest::{
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
+            ManifestSettingsField,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root,
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(crate::skills::manifest::PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                provides: None,
+                settings: Some(ManifestSettings {
+                    categories: vec![ManifestSettingsCategory {
+                        id: "demo".to_string(),
+                        label: "Demo".to_string(),
+                        fields: vec![
+                            ManifestSettingsField {
+                                key: "backend".to_string(),
+                                label: "Backend".to_string(),
+                                editor: ManifestEditorKind::Cycler,
+                                options: vec!["a".to_string(), "b".to_string()],
+                                help: None,
+                                default: None,
+                                numeric: false,
+                            },
+                            ManifestSettingsField {
+                                key: "endpoint".to_string(),
+                                label: "Endpoint".to_string(),
+                                editor: ManifestEditorKind::Text,
+                                options: vec![],
+                                help: Some("URL".to_string()),
+                                default: None,
+                                numeric: false,
+                            },
+                        ],
+                    }],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn plugin_settings_categories_exposed_after_rebuild() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+        );
+        let cats = r.plugin_settings_categories();
+        assert_eq!(cats.len(), 1, "expected one plugin settings category");
+        let cat = &cats[0];
+        assert_eq!(cat.plugin, "demo-plugin");
+        assert_eq!(cat.id, "demo");
+        assert_eq!(cat.label, "Demo");
+        assert_eq!(cat.fields.len(), 2);
+
+        match &cat.fields[0].editor {
+            PluginSettingsEditor::Cycler { options } => {
+                assert_eq!(options, &vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected cycler, got {other:?}"),
+        }
+        assert!(matches!(
+            cat.fields[1].editor,
+            PluginSettingsEditor::Text { numeric: false }
+        ));
+        assert_eq!(cat.fields[1].help.as_deref(), Some("URL"));
+    }
+
+    #[test]
+    fn plugin_settings_categories_empty_without_settings_block() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))],
+        );
+        assert!(r.plugin_settings_categories().is_empty());
+    }
+
+    #[test]
+    fn plugin_settings_categories_replaced_on_rebuild() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+        );
+        assert_eq!(r.plugin_settings_categories().len(), 1);
+        r.rebuild_with_plugins(vec![], vec![]);
+        assert!(r.plugin_settings_categories().is_empty());
+    }
+
+    #[test]
+    fn plugin_settings_categories_does_not_hardcode_voice() {
+        // Acceptance: declarative cycler/text fields are represented in
+        // core data without any voice-specific knowledge.
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("totally-unrelated", PathBuf::from("/tmp/x"))],
+        );
+        let cats = r.plugin_settings_categories();
+        assert_eq!(cats[0].plugin, "totally-unrelated");
+        assert_eq!(cats[0].id, "demo");
+        assert!(cats[0].fields.iter().any(|f| matches!(
+            f.editor,
+            PluginSettingsEditor::Cycler { .. }
+        )));
+        assert!(cats[0].fields.iter().any(|f| matches!(
+            f.editor,
+            PluginSettingsEditor::Text { .. }
+        )));
     }
 }

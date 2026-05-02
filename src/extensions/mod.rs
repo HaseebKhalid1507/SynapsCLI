@@ -23,6 +23,7 @@ pub mod config;
 pub mod config_store;
 pub mod info;
 pub mod commands;
+pub mod settings_editor;
 pub mod tasks;
 pub mod active_tasks;
 pub mod providers;
