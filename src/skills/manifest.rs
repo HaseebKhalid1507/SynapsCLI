@@ -65,6 +65,8 @@ pub struct PluginManifest {
     pub commands: Vec<ManifestCommand>,
     #[serde(default)]
     pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
+    #[serde(default, alias = "help")]
+    pub help_entries: Vec<crate::help::HelpEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +124,7 @@ mod tests {
         assert_eq!(m.version, None);
         assert_eq!(m.description, None);
         assert!(m.commands.is_empty());
+        assert!(m.help_entries.is_empty());
         assert!(m.compatibility.is_none());
     }
 
@@ -146,6 +149,114 @@ mod tests {
         assert_eq!(m.description.as_deref(), Some("Web tools"));
         assert_eq!(m.compatibility.as_ref().unwrap().synaps.as_deref(), Some(">=0.1.0"));
         assert_eq!(m.compatibility.as_ref().unwrap().extension_protocol.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn plugin_manifest_parses_help_entries_with_usage_examples() {
+        let json = r#"{
+            "name": "web-tools",
+            "help_entries": [
+                {
+                    "id": "web-search-help",
+                    "command": "/web:search",
+                    "title": "Web Search",
+                    "summary": "Search the web from a plugin.",
+                    "category": "Plugin",
+                    "topic": "Command",
+                    "protected": false,
+                    "common": false,
+                    "keywords": ["web", "search"],
+                    "usage": "/web:search <query>",
+                    "examples": [
+                        {
+                            "command": "/web:search rust serde",
+                            "description": "Search for Rust serde resources."
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].command, "/web:search");
+        assert_eq!(m.help_entries[0].usage.as_deref(), Some("/web:search <query>"));
+        assert_eq!(m.help_entries[0].examples[0].command, "/web:search rust serde");
+    }
+
+    #[test]
+    fn plugin_manifest_accepts_help_alias_for_help_entries() {
+        let json = r#"{
+            "name": "web-tools",
+            "help": [
+                {
+                    "id": "web-help",
+                    "command": "/help web",
+                    "title": "Web Tools",
+                    "summary": "Use web tools from the plugin.",
+                    "category": "Plugin",
+                    "topic": "Branch",
+                    "protected": false,
+                    "common": false
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].command, "/help web");
+        assert_eq!(m.help_entries[0].topic, crate::help::HelpTopicKind::Branch);
+    }
+
+    #[test]
+    fn plugin_manifest_can_add_command_and_matching_help_entries_together() {
+        let json = r#"{
+            "name": "dev-tools",
+            "commands": [
+                {
+                    "name": "lint",
+                    "description": "Run lint",
+                    "command": "bash",
+                    "args": ["scripts/lint.sh"]
+                }
+            ],
+            "help_entries": [
+                {
+                    "id": "dev-lint-help",
+                    "command": "/dev-tools:lint",
+                    "title": "Lint",
+                    "summary": "Run plugin lint checks.",
+                    "category": "Plugin",
+                    "topic": "Command",
+                    "protected": false,
+                    "common": false,
+                    "usage": "/dev-tools:lint"
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.commands.len(), 1);
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].command, "/dev-tools:lint");
+    }
+
+    #[test]
+    fn plugin_manifest_help_entries_default_boilerplate_fields() {
+        let json = r#"{
+            "name": "dev-tools",
+            "help": [
+                {
+                    "id": "dev-lint-help",
+                    "command": "/dev-tools:lint",
+                    "title": "Lint",
+                    "summary": "Run plugin lint checks."
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].category, "Plugin");
+        assert_eq!(m.help_entries[0].topic, crate::help::HelpTopicKind::Command);
+        assert!(!m.help_entries[0].protected);
+        assert!(!m.help_entries[0].common);
     }
 
     #[test]

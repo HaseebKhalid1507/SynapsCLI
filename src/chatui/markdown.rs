@@ -653,19 +653,58 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
     lines
 }
 
+/// Tab width used to expand `\t` characters before wrapping.
+const TAB_WIDTH: usize = 4;
+
+/// Expand tabs to the next [`TAB_WIDTH`]-column boundary (proper tab-stop
+/// expansion, not a fixed 4-space replacement) and report the column
+/// position immediately after the *last* tab in the input.
+///
+/// The returned anchor lets `wrap_text` align continuation rows under the
+/// element that was wrapped — e.g. for `"key:\tvalue that wraps a lot"`,
+/// continuation rows indent to the column where `value` started, so the
+/// wrapped text stays visually under the value column instead of
+/// collapsing back to the leading indent.
+fn expand_tabs_with_anchor(input: &str) -> (String, Option<usize>) {
+    let mut out = String::with_capacity(input.len());
+    let mut anchor: Option<usize> = None;
+    for ch in input.chars() {
+        if ch == '\t' {
+            let col = out.chars().count();
+            let pad = TAB_WIDTH - (col % TAB_WIDTH);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            anchor = Some(out.chars().count());
+        } else {
+            out.push(ch);
+        }
+    }
+    (out, anchor)
+}
+
 #[allow(unused_assignments)]
 pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
-    let text = raw_text.replace('\t', "    ");
+    let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
     if width == 0 || text.chars().count() <= width {
         return vec![text];
     }
 
-    // Detect leading whitespace to carry forward on continuation lines.
-    // This prevents wrapped text from bleeding to column 0 and leaving
-    // scroll artifacts in the TUI.
-    let indent_len = text.chars().take_while(|c| *c == ' ').count();
-    let indent: String = " ".repeat(indent_len);
-    let wrap_width = width.saturating_sub(indent_len);
+    // Continuation lines normally indent to match the leading whitespace of
+    // the source line so wrapped text doesn't bleed back to column 0. If the
+    // source contained any tab characters, prefer the column immediately
+    // after the *last* tab so tabbed/aligned data stays visually aligned
+    // under the element it was wrapped from.
+    let leading_indent = text.chars().take_while(|c| *c == ' ').count();
+    let cont_indent_len = match tab_anchor {
+        // Safety clamp: if the tab anchor would leave fewer than ~16 chars
+        // of body width, fall back to the leading indent. Prevents pathological
+        // narrow-pane cases from starving content to a few chars per row.
+        Some(a) if a + 16 <= width => a,
+        _ => leading_indent,
+    };
+    let indent: String = " ".repeat(cont_indent_len);
+    let wrap_width = width.saturating_sub(cont_indent_len);
 
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -875,5 +914,101 @@ mod tests {
         // Full label should be visible, not truncated
         assert!(all_text.contains("Signature Move"),
             "Label was truncated: {}", all_text);
+    }
+
+    // --- tab-anchor wrap tests ---
+
+    #[test]
+    fn expand_tabs_fixed_4col_boundary_no_tab_returns_no_anchor() {
+        let (out, anchor) = expand_tabs_with_anchor("hello world");
+        assert_eq!(out, "hello world");
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn expand_tabs_to_next_tab_stop() {
+        // "ab" is 2 chars → next stop is col 4 → 2 spaces of padding.
+        let (out, anchor) = expand_tabs_with_anchor("ab\tcd");
+        assert_eq!(out, "ab  cd");
+        assert_eq!(anchor, Some(4));
+    }
+
+    #[test]
+    fn expand_tabs_anchor_uses_last_tab() {
+        // Two tabs — anchor must point to the column after the LAST tab.
+        let (out, anchor) = expand_tabs_with_anchor("a\tb\tc");
+        // "a" → col 1; tab → pad to col 4 → "    "; "b" → col 5;
+        // tab → pad to col 8 → "   "; "c" → col 9. Anchor = 8.
+        assert_eq!(out, "a   b   c");
+        assert_eq!(anchor, Some(8));
+    }
+
+    #[test]
+    fn wrap_continuation_aligns_after_tab_anchor() {
+        // "key:\tlong value with several words that wraps" — width 30.
+        // After tab expansion: "key:" (4) + 4 pad → "key:    " then body.
+        // Anchor is col 8. Continuation rows must indent 8 spaces.
+        let input = "key:\tlong value with several words that should wrap onto a second line";
+        let lines = wrap_text(input, 30);
+        assert!(lines.len() >= 2, "expected wrap, got: {:?}", lines);
+        for cont in lines.iter().skip(1) {
+            // Every continuation line starts with 8 spaces (tab anchor),
+            // not the leading-indent of 0.
+            assert!(
+                cont.starts_with("        "),
+                "continuation line not aligned to tab anchor: {:?}",
+                cont
+            );
+            // But it shouldn't start with 9 spaces (over-indented).
+            assert!(
+                !cont.starts_with("         "),
+                "continuation over-indented: {:?}",
+                cont
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_falls_back_to_leading_indent_when_no_tab() {
+        // No tab in input → continuation should use leading-whitespace indent
+        // (4 spaces here), preserving prior behavior.
+        let input = "    bullet item with a fairly long description that will need to wrap";
+        let lines = wrap_text(input, 30);
+        assert!(lines.len() >= 2);
+        for cont in lines.iter().skip(1) {
+            assert!(
+                cont.starts_with("    "),
+                "continuation lost leading indent: {:?}",
+                cont
+            );
+            assert!(
+                !cont.starts_with("     "),
+                "continuation over-indented: {:?}",
+                cont
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_clamps_huge_tab_anchor_to_leading_indent() {
+        // Pathological: tab anchor would leave only ~6 chars of body width.
+        // Safety clamp falls back to leading indent (0 in this case).
+        // Without the clamp, every continuation row would be 60 spaces of
+        // indent in a 64-wide pane — usable but cramped.
+        let padded = format!(
+            "{}\tbody content with a few words to force a wrap event",
+            "x".repeat(50)
+        );
+        let lines = wrap_text(&padded, 64);
+        assert!(lines.len() >= 2);
+        // Continuation should NOT be indented to col 52 (which would leave
+        // only 12 chars of body). Clamp falls back to leading indent (0).
+        for cont in lines.iter().skip(1) {
+            assert!(
+                !cont.starts_with("                                "),
+                "continuation was over-indented despite safety clamp: {:?}",
+                cont
+            );
+        }
     }
 }

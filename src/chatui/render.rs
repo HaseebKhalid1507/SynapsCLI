@@ -508,17 +508,55 @@ impl App {
                 }
 
                 ChatMessage::Error(err) => {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}  \u{2718} ", m), Style::default().fg(THEME.load().error_color)),
-                        Span::styled(err.clone(), Style::default().fg(THEME.load().error_color)),
-                    ]));
+                    // Newline-aware AND wrap-aware. The ✘ glyph appears on
+                    // the first row only; continuation rows (whether from a
+                    // hard \n or from soft-wrap) use blank padding aligned
+                    // under the message body.
+                    let err_style = Style::default().fg(THEME.load().error_color);
+                    let mut first_row = true;
+                    for line in err.lines() {
+                        for wline in wrap_text(&format!("{}    {}", m, line), width) {
+                            // wrap_text emits the prefix on every output row;
+                            // strip ours so we can re-add the glyph or padding
+                            // exactly once at the head.
+                            let body = wline
+                                .strip_prefix(&format!("{}    ", m))
+                                .unwrap_or(&wline)
+                                .to_string();
+                            let prefix = if first_row {
+                                format!("{}  \u{2718} ", m)
+                            } else {
+                                format!("{}    ", m)
+                            };
+                            first_row = false;
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix, err_style),
+                                Span::styled(body, err_style),
+                            ]));
+                        }
+                    }
                 }
 
                 ChatMessage::System(msg) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("{}  {}", m, msg),
-                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM),
-                    )));
+                    if should_separate_system_messages(
+                        self.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
+                        &tmsg.msg,
+                    ) {
+                        lines.push(Line::from(""));
+                        lines.push(system_separator_line(m, width));
+                        lines.push(Line::from(""));
+                    }
+                    // Newline-aware AND wrap-aware: split on '\n' first so
+                    // explicit line breaks always render as separate rows,
+                    // then wrap each line on word boundaries to fit `width`.
+                    // Mirrors the User/Text pattern using wrap_text() so all
+                    // chat content wraps consistently.
+                    let style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
+                    for line in msg.lines() {
+                        for wline in wrap_text(&format!("{}  {}", m, line), width) {
+                            lines.push(Line::from(Span::styled(wline, style)));
+                        }
+                    }
                 }
 
                 ChatMessage::Event { source, severity, text } => {
@@ -564,4 +602,32 @@ impl App {
 
         lines
     }
+}
+
+fn should_separate_system_messages(prev: Option<&ChatMessage>, current: &ChatMessage) -> bool {
+    let Some(ChatMessage::System(prev)) = prev else {
+        return false;
+    };
+    let ChatMessage::System(current) = current else {
+        return false;
+    };
+    !is_grouped_system_continuation(prev, current)
+}
+
+fn is_grouped_system_continuation(prev: &str, current: &str) -> bool {
+    current.starts_with(' ')
+        || current.starts_with('\t')
+        || prev.trim_end().ends_with(':')
+        || prev.trim_end().ends_with('…')
+}
+
+fn system_separator_line(margin: &str, width: usize) -> Line<'static> {
+    let rule_width = width.saturating_sub(margin.len()).min(34).max(9);
+    let side = "─".repeat(rule_width.saturating_sub(3) / 2);
+    let rule = format!("{} · {}", side, side);
+    let pad = width.saturating_sub(margin.len() + rule.chars().count()) / 2;
+    Line::from(vec![
+        Span::raw(format!("{}{}", margin, " ".repeat(pad))),
+        Span::styled(rule, Style::default().fg(THEME.load().muted)),
+    ])
 }

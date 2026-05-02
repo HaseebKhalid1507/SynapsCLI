@@ -29,6 +29,8 @@ pub(super) enum InputAction {
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
     PluginsOutcome(super::plugins::InputOutcome),
+    /// /help find lightbox emitted an outcome.
+    HelpFindOutcome,
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
@@ -43,6 +45,20 @@ pub(super) fn handle_event(
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
+    // Route events to /help find while it's open.
+    if let Some(state) = app.help_find.as_mut() {
+        if let Event::Key(key) = event {
+            let outcome = super::help_find::handle_event(state, key);
+            return match outcome {
+                super::help_find::HelpFindAction::Close => {
+                    app.help_find = None;
+                    InputAction::None
+                }
+                super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+            };
+        }
+        return InputAction::None;
+    }
     // Route events to the models modal while it's open.
     if let Some(state) = app.models.as_mut() {
         if let Event::Key(key) = event {
@@ -374,6 +390,9 @@ fn handle_key(
             return process_streaming_submit(app);
         }
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
+            if open_help_find_for_ambiguous_slash(app, registry) {
+                return InputAction::HelpFindOutcome;
+            }
             handle_tab_complete(app, registry);
             // Skip the tab_cycle reset below — we just set it.
             return InputAction::None;
@@ -483,6 +502,24 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
+    let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
+        return false;
+    };
+    let help_registry = synaps_cli::help::HelpRegistry::new(
+        synaps_cli::help::builtin_entries(),
+        registry.plugin_help_entries(),
+    );
+    if help_registry.command_prefix_match_count(&query) < 2 {
+        return false;
+    }
+    app.help_find = Some(synaps_cli::help::HelpFindState::new(
+        help_registry.entries().to_vec(),
+        &query,
+    ));
+    true
 }
 
 /// Tab completion for slash commands. First Tab completes to the longest
