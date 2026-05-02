@@ -1152,7 +1152,7 @@ pub async fn run(
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.voice.is_none() {
                                             let voice_plugin_info = {
-                                                let sidecar = synaps_cli::voice::discovery::discover();
+                                                let sidecar = synaps_cli::sidecar::discovery::discover();
                                                 if let Some(sidecar) = sidecar {
                                                     let manager = ext_mgr_shared.read().await;
                                                     manager.plugin_info(&sidecar.plugin_name).cloned()
@@ -1205,7 +1205,7 @@ pub async fn run(
                                     CommandAction::VoiceStatus => {
                                         let line = match app.voice.as_ref() {
                                             Some(v) => v.status_line(),
-                                            None => match synaps_cli::voice::discovery::discover() {
+                                            None => match synaps_cli::sidecar::discovery::discover() {
                                                 Some(s) => format!(
                                                     "voice: not yet started — sidecar available from plugin '{}' at {}",
                                                     s.plugin_name,

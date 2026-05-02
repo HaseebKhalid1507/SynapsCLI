@@ -1,21 +1,28 @@
-//! Discover a voice sidecar from loaded plugin manifests.
+//! Discover a sidecar from loaded plugin manifests.
 //!
 //! Walks the loaded plugin set and returns the first plugin that
-//! declares `provides.voice_sidecar` in its manifest. Synaps CLI today
-//! supports at most one active voice sidecar per session.
+//! declares a sidecar binary in its manifest. Synaps CLI today supports
+//! at most one active sidecar per session.
 //!
 //! The `command` field from the manifest is resolved to an absolute
 //! path: relative paths are joined to the plugin root.
+//!
+//! ## Manifest schema note
+//!
+//! The JSON manifest field is still named `provides.voice_sidecar` for
+//! plugin compatibility — renaming it requires a coordinated change in
+//! the synaps-skills plugins and is deferred. The Rust types here are
+//! modality-neutral; the wire shape is unchanged.
 
 use std::path::{Path, PathBuf};
 
 use crate::skills::manifest::{VoiceSidecarManifest, VoiceSidecarModel};
 use crate::skills::Plugin;
 
-/// A discovered voice sidecar, resolved against its plugin root and
-/// ready to be spawned by `crate::voice::manager::VoiceManager`.
+/// A discovered sidecar, resolved against its plugin root and ready to
+/// be spawned by [`crate::sidecar::manager::SidecarManager`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredVoiceSidecar {
+pub struct DiscoveredSidecar {
     /// Plugin name from the manifest (e.g. "local-voice").
     pub plugin_name: String,
     /// Absolute path to the plugin's root directory.
@@ -24,13 +31,13 @@ pub struct DiscoveredVoiceSidecar {
     pub binary: PathBuf,
     /// Sidecar wire-protocol version declared by the plugin.
     pub protocol_version: u16,
-    /// Optional setup script path (relative to plugin root, if relative).
+    /// Optional setup script path (resolved against plugin root).
     pub setup_script: Option<PathBuf>,
-    /// Optional STT model metadata.
+    /// Optional model metadata (modality-specific; opaque to core).
     pub model: Option<VoiceSidecarModel>,
 }
 
-impl DiscoveredVoiceSidecar {
+impl DiscoveredSidecar {
     fn from_plugin(plugin: &Plugin, sidecar: &VoiceSidecarManifest) -> Self {
         let binary = resolve_relative(&plugin.root, &sidecar.command);
         let setup_script = sidecar
@@ -48,8 +55,8 @@ impl DiscoveredVoiceSidecar {
     }
 }
 
-/// Discover the first voice sidecar declared by any plugin in `plugins`.
-pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredVoiceSidecar> {
+/// Discover the first sidecar declared by any plugin in `plugins`.
+pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredSidecar> {
     for plugin in plugins {
         let Some(manifest) = plugin.manifest.as_ref() else {
             continue;
@@ -60,7 +67,7 @@ pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredVoiceSidecar> {
         let Some(sidecar) = provides.voice_sidecar.as_ref() else {
             continue;
         };
-        return Some(DiscoveredVoiceSidecar::from_plugin(plugin, sidecar));
+        return Some(DiscoveredSidecar::from_plugin(plugin, sidecar));
     }
     None
 }
@@ -68,7 +75,7 @@ pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredVoiceSidecar> {
 /// Discover by walking the default plugin roots — a thin wrapper
 /// around [`crate::skills::loader::load_all`] for callers that don't
 /// already hold the plugin set.
-pub fn discover() -> Option<DiscoveredVoiceSidecar> {
+pub fn discover() -> Option<DiscoveredSidecar> {
     let (plugins, _) = crate::skills::loader::load_all(&crate::skills::loader::default_roots());
     discover_in(&plugins)
 }
@@ -88,7 +95,7 @@ mod tests {
     use crate::skills::manifest::PluginManifest;
     use std::path::PathBuf;
 
-    fn voice_plugin() -> Plugin {
+    fn sidecar_plugin() -> Plugin {
         let manifest_json = r#"{
             "name": "local-voice",
             "provides": {
@@ -130,15 +137,15 @@ mod tests {
     }
 
     #[test]
-    fn discover_returns_none_when_no_plugin_provides_voice() {
+    fn discover_returns_none_when_no_plugin_provides_a_sidecar() {
         let plugins = vec![plain_plugin("a"), plain_plugin("b")];
         assert_eq!(discover_in(&plugins), None);
     }
 
     #[test]
     fn discover_resolves_relative_binary_under_plugin_root() {
-        let plugins = vec![voice_plugin()];
-        let sidecar = discover_in(&plugins).expect("voice plugin should be discovered");
+        let plugins = vec![sidecar_plugin()];
+        let sidecar = discover_in(&plugins).expect("sidecar plugin should be discovered");
         assert_eq!(sidecar.plugin_name, "local-voice");
         assert_eq!(
             sidecar.binary,
@@ -157,18 +164,18 @@ mod tests {
     #[test]
     fn discover_keeps_absolute_binary_path_unchanged() {
         let plugin_json = r#"{
-            "name": "abs-voice",
+            "name": "abs-sidecar",
             "provides": {
                 "voice_sidecar": {
-                    "command": "/usr/local/bin/voice",
+                    "command": "/usr/local/bin/sidecar",
                     "protocol_version": 1
                 }
             }
         }"#;
         let manifest: PluginManifest = serde_json::from_str(plugin_json).unwrap();
         let plugin = Plugin {
-            name: "abs-voice".into(),
-            root: PathBuf::from("/opt/abs-voice"),
+            name: "abs-sidecar".into(),
+            root: PathBuf::from("/opt/abs-sidecar"),
             marketplace: None,
             version: None,
             description: None,
@@ -176,13 +183,13 @@ mod tests {
             manifest: Some(manifest),
         };
         let sidecar = discover_in(&[plugin]).expect("absolute path should be discovered");
-        assert_eq!(sidecar.binary, PathBuf::from("/usr/local/bin/voice"));
+        assert_eq!(sidecar.binary, PathBuf::from("/usr/local/bin/sidecar"));
     }
 
     #[test]
-    fn discover_picks_first_plugin_with_voice_sidecar() {
-        let plugins = vec![plain_plugin("zzz"), voice_plugin(), plain_plugin("aaa")];
-        let sidecar = discover_in(&plugins).expect("should find voice plugin");
+    fn discover_picks_first_plugin_with_a_sidecar() {
+        let plugins = vec![plain_plugin("zzz"), sidecar_plugin(), plain_plugin("aaa")];
+        let sidecar = discover_in(&plugins).expect("should find sidecar plugin");
         assert_eq!(sidecar.plugin_name, "local-voice");
     }
 }

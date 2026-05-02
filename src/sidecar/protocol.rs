@@ -1,32 +1,58 @@
 //! Sidecar protocol types — line-JSON over stdio.
 //!
-//! These are mirrored from `synaps-skills/local-voice-plugin/src/protocol.rs`
-//! so Synaps CLI core can talk to any compliant voice sidecar without
-//! depending on heavyweight audio/whisper crates.
+//! These mirror `synaps-skills/local-voice-plugin/src/protocol.rs` so
+//! Synaps CLI core can talk to any compliant sidecar without depending
+//! on heavyweight modality-specific crates. The protocol is shared
+//! across all sidecar kinds (voice, OCR, agent, etc.) — every kind
+//! transports the same handshake / state / payload envelopes.
 //!
 //! Wire format: one JSON object per line on the sidecar's stdin/stdout.
-//! Synaps CLI sends `SidecarCommand` values; the sidecar replies with
-//! `SidecarEvent` values (interleaved with internally-generated events).
+//! Synaps CLI sends [`SidecarCommand`] values; the sidecar replies with
+//! [`SidecarEvent`] values (interleaved with internally-generated
+//! events).
+//!
+//! ## Naming note
+//!
+//! Several event/command variants still carry voice-shaped wire names
+//! (`final_transcript`, `voice_control_pressed`, `voice_command`, the
+//! `dictation`/`command`/`conversation` mode values). Those are
+//! historical and shared with the plugin; a coordinated cross-repo
+//! migration to modality-neutral names (`payload_final`, `trigger_pressed`,
+//! `intent`, free-form session strings) is planned for a future phase
+//! but is **out of scope for Phase 7**. The Rust enum names are
+//! modality-neutral; serde aliases preserve wire compatibility.
 
 use serde::{Deserialize, Serialize};
 
 /// Protocol version understood by this build.
-pub const VOICE_SIDECAR_PROTOCOL_VERSION: u16 = 1;
+pub const SIDECAR_PROTOCOL_VERSION: u16 = 1;
 
-/// Modes a sidecar may operate in. Toggle dictation is the only one we
-/// ship today; the others reserve namespace for future work.
+/// Backwards-compat alias for the protocol version constant. New code
+/// should reference [`SIDECAR_PROTOCOL_VERSION`] directly.
+#[deprecated(
+    since = "0.1.0-phase7",
+    note = "use SIDECAR_PROTOCOL_VERSION; the voice-prefixed alias will be removed in a future release"
+)]
+pub const VOICE_SIDECAR_PROTOCOL_VERSION: u16 = SIDECAR_PROTOCOL_VERSION;
+
+/// Session mode the sidecar should run in.
+///
+/// The variant *values* are wire-format strings shared with the plugin
+/// (`dictation`, `command`, `conversation`). Callers that need a mode
+/// not enumerated here should be served by a future free-form-string
+/// variant; for now these three cover every kind we ship.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum VoiceSidecarMode {
+pub enum SidecarSessionMode {
     Dictation,
     Command,
     Conversation,
 }
 
-/// Configuration sent in the `Init` handshake.
+/// Configuration sent in the [`SidecarCommand::Init`] handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarConfig {
-    pub mode: VoiceSidecarMode,
+    pub mode: SidecarSessionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub protocol_version: u16,
@@ -36,12 +62,26 @@ pub struct SidecarConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidecarCommand {
-    Init { config: SidecarConfig },
-    VoiceControlPressed,
-    VoiceControlReleased,
+    Init {
+        config: SidecarConfig,
+    },
+    /// User pressed the activation trigger (key, button, gesture, …).
+    /// Wire name kept as `voice_control_pressed` for plugin compat.
+    #[serde(rename = "voice_control_pressed")]
+    TriggerPressed,
+    /// User released the activation trigger.
+    /// Wire name kept as `voice_control_released` for plugin compat.
+    #[serde(rename = "voice_control_released")]
+    TriggerReleased,
     Shutdown,
 }
 
+/// Free-form capability tag advertised by a sidecar in its `Hello`
+/// frame. Values are plugin-defined strings; core does not enumerate.
+///
+/// (Pre-Phase-7 this was a closed enum of `stt`/`barge_in`. Kept as an
+/// enum-shape with two known variants plus a catch-all for forward
+/// compatibility.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidecarCapability {
@@ -61,6 +101,12 @@ pub enum SidecarProviderState {
 }
 
 /// Events emitted by the sidecar (one per line, JSON).
+///
+/// Several variants (`ListeningStarted`, `FinalTranscript`,
+/// `VoiceCommand`) carry voice-shaped wire names for backward
+/// compatibility with the local-voice plugin. A coordinated cross-repo
+/// migration to neutral names (`StateOpen`, `PayloadFinal`, `Intent`)
+/// is deferred to a future phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidecarEvent {
@@ -99,9 +145,9 @@ mod tests {
     fn command_round_trip_init() {
         let cmd = SidecarCommand::Init {
             config: SidecarConfig {
-                mode: VoiceSidecarMode::Dictation,
+                mode: SidecarSessionMode::Dictation,
                 language: Some("en".into()),
-                protocol_version: VOICE_SIDECAR_PROTOCOL_VERSION,
+                protocol_version: SIDECAR_PROTOCOL_VERSION,
             },
         };
         let json = serde_json::to_string(&cmd).unwrap();
@@ -114,14 +160,26 @@ mod tests {
     #[test]
     fn command_round_trip_press_release_shutdown() {
         for cmd in [
-            SidecarCommand::VoiceControlPressed,
-            SidecarCommand::VoiceControlReleased,
+            SidecarCommand::TriggerPressed,
+            SidecarCommand::TriggerReleased,
             SidecarCommand::Shutdown,
         ] {
             let json = serde_json::to_string(&cmd).unwrap();
             let parsed: SidecarCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, cmd);
         }
+    }
+
+    #[test]
+    fn trigger_commands_use_legacy_voice_wire_names() {
+        // Wire-format compat: existing local-voice plugin reads
+        // "voice_control_pressed"/"voice_control_released". The Rust
+        // type names are neutral but the JSON stays bit-identical so
+        // we don't break the plugin.
+        let pressed = serde_json::to_string(&SidecarCommand::TriggerPressed).unwrap();
+        let released = serde_json::to_string(&SidecarCommand::TriggerReleased).unwrap();
+        assert!(pressed.contains("\"voice_control_pressed\""), "got {pressed}");
+        assert!(released.contains("\"voice_control_released\""), "got {released}");
     }
 
     #[test]

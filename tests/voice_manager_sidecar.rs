@@ -1,4 +1,4 @@
-//! Integration test: `VoiceManager` drives a real sidecar binary in
+//! Integration test: `SidecarManager` drives a real sidecar binary in
 //! `--mock-transcript` mode and surfaces a `FinalTranscript` event.
 //!
 //! Skipped at runtime if the local-voice-plugin binary isn't built.
@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use synaps_cli::voice::manager::{VoiceManager, VoiceManagerEvent};
-use synaps_cli::voice::protocol::{SidecarConfig, VoiceSidecarMode, VOICE_SIDECAR_PROTOCOL_VERSION};
+use synaps_cli::sidecar::manager::{SidecarManager, SidecarLifecycleEvent};
+use synaps_cli::sidecar::protocol::{SidecarConfig, SidecarSessionMode, SIDECAR_PROTOCOL_VERSION};
 
 fn locate_sidecar() -> Option<PathBuf> {
     // Prefer an explicit env var (CI / Nix builds).
@@ -32,13 +32,13 @@ async fn manager_drives_sidecar_mock_transcript_end_to_end() {
         return;
     };
 
-    let mut manager = VoiceManager::spawn(
+    let mut manager = SidecarManager::spawn(
         &bin,
         &["--mock-transcript".into(), "hello from the sidecar".into()],
         SidecarConfig {
-            mode: VoiceSidecarMode::Dictation,
+            mode: SidecarSessionMode::Dictation,
             language: None,
-            protocol_version: VOICE_SIDECAR_PROTOCOL_VERSION,
+            protocol_version: SIDECAR_PROTOCOL_VERSION,
         },
     )
     .await
@@ -57,12 +57,12 @@ async fn manager_drives_sidecar_mock_transcript_end_to_end() {
         let timed = tokio::time::timeout(remaining, manager.next_event()).await;
         let Ok(Some(event)) = timed else { break };
         match event {
-            VoiceManagerEvent::ListeningStarted => got_listening = true,
-            VoiceManagerEvent::FinalTranscript(text) => {
+            SidecarLifecycleEvent::ListeningStarted => got_listening = true,
+            SidecarLifecycleEvent::FinalTranscript(text) => {
                 got_transcript = Some(text);
                 break;
             }
-            VoiceManagerEvent::Error(err) => panic!("unexpected sidecar error: {err}"),
+            SidecarLifecycleEvent::Error(err) => panic!("unexpected sidecar error: {err}"),
             _ => {}
         }
     }

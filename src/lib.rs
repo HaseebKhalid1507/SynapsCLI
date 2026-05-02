@@ -7,7 +7,7 @@ pub mod events;
 pub mod extensions;
 pub mod memory;
 pub mod help;
-pub mod voice;
+pub mod sidecar;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;

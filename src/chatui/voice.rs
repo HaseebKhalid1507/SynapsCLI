@@ -2,12 +2,12 @@
 //!
 //! Owns the `VoiceUiState` held on `App.voice` and provides helpers
 //! the slash-command dispatcher and event loop call into. The actual
-//! sidecar lifecycle lives in `crate::voice::manager::VoiceManager`.
+//! sidecar lifecycle lives in `crate::sidecar::manager::SidecarManager`.
 
-use synaps_cli::voice::discovery::{discover, DiscoveredVoiceSidecar};
-use synaps_cli::voice::manager::{VoiceManager, VoiceManagerError, VoiceManagerEvent};
-use synaps_cli::voice::protocol::{
-    SidecarConfig, SidecarProviderState, VoiceSidecarMode, VOICE_SIDECAR_PROTOCOL_VERSION,
+use synaps_cli::sidecar::discovery::{discover, DiscoveredSidecar};
+use synaps_cli::sidecar::manager::{SidecarManager, SidecarError, SidecarLifecycleEvent};
+use synaps_cli::sidecar::protocol::{
+    SidecarConfig, SidecarProviderState, SidecarSessionMode, SIDECAR_PROTOCOL_VERSION,
 };
 
 use super::app::{App, ChatMessage};
@@ -27,9 +27,9 @@ pub(crate) enum VoiceUiStatus {
 
 /// State held by the chatui while voice dictation is enabled.
 pub(crate) struct VoiceUiState {
-    pub manager: VoiceManager,
+    pub manager: SidecarManager,
     pub status: VoiceUiStatus,
-    pub sidecar: DiscoveredVoiceSidecar,
+    pub sidecar: DiscoveredSidecar,
     /// `true` once the user has issued `press()`. The sidecar is logically
     /// "armed" until the user toggles off — even when the VAD has just
     /// flushed an utterance and momentarily quiesced. Without this we'd
@@ -107,17 +107,17 @@ impl VoiceUiState {
             args.push(lang.to_string());
         }
 
-        let manager = VoiceManager::spawn(
+        let manager = SidecarManager::spawn(
             &sidecar.binary,
             &args,
             SidecarConfig {
-                mode: VoiceSidecarMode::Dictation,
+                mode: SidecarSessionMode::Dictation,
                 language,
-                protocol_version: VOICE_SIDECAR_PROTOCOL_VERSION,
+                protocol_version: SIDECAR_PROTOCOL_VERSION,
             },
         )
         .await
-        .map_err(|err: VoiceManagerError| format!("failed to start voice sidecar: {}", err))?;
+        .map_err(|err: SidecarError| format!("failed to start voice sidecar: {}", err))?;
 
         // Read the sidecar's compiled backend straight from the cached
         // `info.get` response (Phase 5). Falls back to None when the plugin
@@ -154,20 +154,20 @@ impl VoiceUiState {
     }
 }
 
-/// Apply a [`VoiceManagerEvent`] to the chatui state.
+/// Apply a [`SidecarLifecycleEvent`] to the chatui state.
 ///
 /// Final transcripts are inserted at the cursor position (with a
 /// leading space when the existing input doesn't already end in
 /// whitespace), so the user can keep dictating into the same line.
-pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
+pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
     let Some(v) = app.voice.as_mut() else {
         return;
     };
     match event {
-        VoiceManagerEvent::Ready { .. } => {
+        SidecarLifecycleEvent::Ready { .. } => {
             // Sidecar handshake is informational; we already pressed.
         }
-        VoiceManagerEvent::StateChanged(state) => match state {
+        SidecarLifecycleEvent::StateChanged(state) => match state {
             SidecarProviderState::Listening => v.status = VoiceUiStatus::Listening,
             SidecarProviderState::Transcribing => v.status = VoiceUiStatus::Transcribing,
             SidecarProviderState::Ready | SidecarProviderState::Stopped => {
@@ -183,10 +183,10 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             }
             SidecarProviderState::Speaking => {}
         },
-        VoiceManagerEvent::ListeningStarted => {
+        SidecarLifecycleEvent::ListeningStarted => {
             v.status = VoiceUiStatus::Listening;
         }
-        VoiceManagerEvent::ListeningStopped => {
+        SidecarLifecycleEvent::ListeningStopped => {
             // The STT provider emits ListeningStopped between VAD
             // utterances *and* on real shutdown. Only clear status if the
             // user has unarmed (toggled off).
@@ -194,13 +194,13 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
                 v.status = VoiceUiStatus::Idle;
             }
         }
-        VoiceManagerEvent::TranscribingStarted => {
+        SidecarLifecycleEvent::TranscribingStarted => {
             v.status = VoiceUiStatus::Transcribing;
         }
-        VoiceManagerEvent::PartialTranscript(_) => {
+        SidecarLifecycleEvent::PartialTranscript(_) => {
             // Reserved for V5+ — drop for now.
         }
-        VoiceManagerEvent::FinalTranscript(text) => {
+        SidecarLifecycleEvent::FinalTranscript(text) => {
             // Insert text but do NOT reset status: the VAD will keep
             // emitting more utterances until the user toggles off.
             let armed = v.armed;
@@ -213,14 +213,14 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
                 }
             }
         }
-        VoiceManagerEvent::Error(message) => {
+        SidecarLifecycleEvent::Error(message) => {
             v.status = VoiceUiStatus::Error(message.clone());
             app.push_msg(ChatMessage::Error(format!(
                 "voice sidecar error: {}",
                 message
             )));
         }
-        VoiceManagerEvent::Exited => {
+        SidecarLifecycleEvent::Exited => {
             app.push_msg(ChatMessage::System("voice sidecar exited".to_string()));
             app.voice = None;
         }
