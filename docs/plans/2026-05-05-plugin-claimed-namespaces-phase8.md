@@ -339,3 +339,57 @@ Slice 8A is the user-visible win. Slice 8B is the architectural win
 shipping it standalone before starting 8B; users get the cleaner
 single-sidecar UX immediately, and 8B can be designed against real
 usage feedback.
+
+---
+
+## Status (2026-05-05)
+
+**Slice 8A: shipped.** All 8 sub-slices landed (8A.1 through 8A.8) on
+branch `feat/path-b-phase7-and-8`. Lifecycle claims, ambiguity-aware
+`/sidecar`, hidden `Category::Sidecar`, virtual toggle-key field,
+display-name plumbing, qualified `/sidecar <plugin> ...`, and the
+startup migration for `sidecar_toggle_key` are all in.
+
+**Slice 8B: shipped (with one deferral).** `App.sidecars` is a HashMap
+keyed by plugin id; `CommandAction::SidecarToggle` / `SidecarStatus`
+carry `plugin_id: Option<String>`; multi-segment pill ordered by
+importance desc + alphabetical tiebreak; `KeybindCollision` recorded
+on the keybind registry; per-plugin keybind dispatch auto-targets the
+correct plugin. Step 8 — *drop the global `sidecar_toggle_key`
+setting* — is deferred to the next major version; the back-compat
+migration shim (8A.8) keeps existing user configs working.
+
+**Sibling repo: shipped.** `local-voice-plugin/.synaps-plugin/plugin.json`
+adopts the new shape (commit `d946848` on
+`feat/local-voice-plugin-commands-tasks`):
+
+- `provides.voice_sidecar` → `provides.sidecar` (canonical name)
+- `provides.sidecar.lifecycle = { command: "voice", settings_category: "voice", display_name: "Voice", importance: 50 }`
+- `keybinds = [{ key: "C-Space", action: "slash_command", command: "voice toggle", description: ... }]`
+
+Pinned by `tests::local_voice_plugin_json_parses_with_phase8_lifecycle_and_keybinds`
+in `src/skills/manifest.rs`.
+
+## Remaining follow-ups (not in scope for this PR)
+
+1. **`/extensions` UI surfacing of collisions.** The plumbing exists:
+   - `KeybindRegistry::collisions() -> &[KeybindCollision]`
+   - `CommandRegistry::lifecycle_claim_collisions() -> &[(String, String, String)]`
+   Today these are only logged via `tracing::warn!`. The `/extensions`
+   command should render both lists so users can see *why* their
+   keybind / lifecycle command isn't taking effect. Pure render work;
+   no schema or dispatch changes.
+
+2. **Next-major shim removal.** Drop in one batch when bumping the
+   plugin protocol major version:
+   - `LegacyVoiceCapability` + handler in `src/skills/capabilities.rs`
+   - `migrate_legacy_voice_config_keys()` (config startup)
+   - `migrate_legacy_sidecar_toggle_key()` (settings startup)
+   - `voice_toggle_key` fallback reads
+   - `/voice` builtin alias in `CommandRegistry::builtin_commands()`
+   - `#[deprecated] type VoiceSidecarManifest = SidecarManifest`
+   - `#[serde(alias = "voice_sidecar")]` on `PluginProvides.sidecar`
+   - The global `sidecar_toggle_key` setting (8B step 8)
+   Each shim has a `// TODO(next-major):` or `#[deprecated]` marker
+   already; `rg "next-major|TODO\(phase 8\)|TODO\(deprecated\)"`
+   should enumerate them.
