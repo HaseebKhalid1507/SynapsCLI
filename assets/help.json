@@ -345,6 +345,35 @@
     "related": ["/help sessions", "/help compact"]
   },
   {
+    "id": "extensions-audit-command",
+    "command": "/extensions audit",
+    "title": "/extensions audit",
+    "summary": "Inspect recent extension provider audit entries.",
+    "category": "Plugins",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["extensions", "extension audit", "audit", "provider activity", "trust", "security"],
+    "lines": [
+      "Review recent extension provider activity for diagnostics and trust checks.",
+      "",
+      "Use this when an extension behaves unexpectedly or before trusting a new integration."
+    ],
+    "usage": "/extensions audit [limit]",
+    "examples": [
+      {
+        "command": "/extensions audit",
+        "description": "Inspect recent provider audit entries."
+      },
+      {
+        "command": "/extensions audit 20",
+        "description": "Show up to 20 recent audit entries."
+      }
+    ],
+    "related": ["/help extensions", "/help trust", "/help doctor"]
+  },
+  {
     "id": "tools",
     "command": "/help tools",
     "title": "Tools",
