@@ -132,6 +132,7 @@ mod tests {
             }],
             config: vec![ExtensionConfigEntry {
                 key: "api_key".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,

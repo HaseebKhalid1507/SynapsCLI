@@ -90,6 +90,9 @@ pub async fn execute_plugin_command(
         RegisteredPluginCommandBackend::ExtensionTool { .. } => Err(crate::RuntimeError::Tool(
             "extension-backed plugin command requires execute_plugin_command_with_tools".to_string(),
         )),
+        RegisteredPluginCommandBackend::Interactive { .. } => Err(crate::RuntimeError::Tool(
+            "interactive plugin command requires ExtensionManager::invoke_command".to_string(),
+        )),
     }
 }
 

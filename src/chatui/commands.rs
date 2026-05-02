@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
+use synaps_cli::extensions::commands::CommandOutputEvent;
+use synaps_cli::extensions::runtime::InvokeCommandEvent;
 
 /// All recognized built-in slash commands. Source of truth for the
 /// built-in surface; the runtime merges this with discovered skills via
@@ -85,6 +87,10 @@ pub(super) enum CommandAction {
     ExtensionsAudit { tail: Option<usize> },
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
+    /// Toggle voice dictation on/off (`/voice` or `/voice toggle`).
+    VoiceToggle,
+    /// Show voice subsystem status (`/voice status`).
+    VoiceStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +139,83 @@ pub(super) async fn execute_command_action(
             }
         }
         _ => {}
+    }
+}
+
+
+pub(crate) async fn execute_interactive_plugin_command_events(
+    command: &synaps_cli::skills::registry::RegisteredPluginCommand,
+    arg: &str,
+    manager: &synaps_cli::extensions::manager::ExtensionManager,
+    app: &mut App,
+) {
+    let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive {
+        plugin_extension_id,
+    } = &command.backend else {
+        app.push_msg(ChatMessage::Error(
+            "plugin command is not interactive".to_string(),
+        ));
+        return;
+    };
+
+    let args: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
+    execute_interactive_plugin_command_by_parts(
+        plugin_extension_id,
+        &command.name,
+        args,
+        manager,
+        app,
+    ).await;
+}
+
+pub(crate) async fn execute_interactive_plugin_command_by_parts(
+    plugin_extension_id: &str,
+    command_name: &str,
+    args: Vec<String>,
+    manager: &synaps_cli::extensions::manager::ExtensionManager,
+    app: &mut App,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InvokeCommandEvent>();
+    let result = manager
+        .invoke_command(plugin_extension_id, command_name, args, &request_id, tx)
+        .await;
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            InvokeCommandEvent::Output(output) => {
+                if let Some(msg) = command_output_event_to_chat_message(output) {
+                    app.push_msg(msg);
+                }
+            }
+            InvokeCommandEvent::Task(task) => app.active_tasks.apply(task),
+        }
+    }
+
+    if let Err(err) = result {
+        app.push_msg(ChatMessage::Error(format!(
+            "interactive plugin command {}:{} failed: {}",
+            plugin_extension_id, command_name, err
+        )));
+    }
+}
+
+pub(crate) fn command_output_event_to_chat_message(event: CommandOutputEvent) -> Option<ChatMessage> {
+    match event {
+        CommandOutputEvent::Text { content } => Some(ChatMessage::Text(content)),
+        CommandOutputEvent::System { content } => Some(ChatMessage::System(content)),
+        CommandOutputEvent::Error { content } => Some(ChatMessage::Error(content)),
+        CommandOutputEvent::Table { headers, rows } => {
+            let mut lines = Vec::new();
+            if !headers.is_empty() {
+                lines.push(headers.join("  "));
+            }
+            for row in rows {
+                lines.push(row.join("  "));
+            }
+            Some(ChatMessage::System(lines.join("\n")))
+        }
+        CommandOutputEvent::Done => None,
     }
 }
 
@@ -574,6 +657,32 @@ pub(super) async fn handle_command(
         "ping" => {
             return CommandAction::Ping;
         }
+        "voice" => {
+            let trimmed = arg.trim();
+            // toggle / status remain in core (they drive the in-core sidecar
+            // manager + UI pill). Everything else is a plugin-owned subcommand
+            // exposed via the Phase 2 interactive command contract.
+            match trimmed {
+                "" | "toggle" => return CommandAction::VoiceToggle,
+                "status" => return CommandAction::VoiceStatus,
+                _ => {}
+            }
+            match registry.resolve("local-voice:voice") {
+                Resolution::PluginCommand(command) => {
+                    return CommandAction::PluginCommand {
+                        command,
+                        arg: trimmed.to_string(),
+                    };
+                }
+                _ => {
+                    app.push_msg(ChatMessage::Error(
+                        "no voice plugin installed; install local-voice from synaps-skills to use \
+                         /voice subcommands beyond toggle and status".to_string(),
+                    ));
+                    return CommandAction::None;
+                }
+            }
+        }
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
@@ -636,7 +745,10 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::{edit_distance, execute_command_action, execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::command_output_event_to_chat_message;
+    use crate::chatui::app::ChatMessage;
+    use synaps_cli::extensions::commands::CommandOutputEvent;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -691,6 +803,8 @@ mod tests {
                     compatibility: None,
                     extension: None,
                     help_entries: vec![],
+                    provides: None,
+                    settings: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),
@@ -770,6 +884,68 @@ mod tests {
             }
             _ => panic!("expected system message"),
         }
+    }
+
+
+    #[test]
+    fn command_output_event_text_becomes_chat_text() {
+        let msg = command_output_event_to_chat_message(CommandOutputEvent::Text {
+            content: "hello".to_string(),
+        }).expect("text event should produce chat message");
+        match msg {
+            ChatMessage::Text(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected text chat message"),
+        }
+    }
+
+    #[test]
+    fn command_output_event_table_becomes_plain_text_table() {
+        let msg = command_output_event_to_chat_message(CommandOutputEvent::Table {
+            headers: vec!["ID".into(), "Status".into()],
+            rows: vec![vec!["tiny".into(), "installed".into()]],
+        }).expect("table event should produce chat message");
+        match msg {
+            ChatMessage::System(text) => {
+                assert!(text.contains("ID"), "{text}");
+                assert!(text.contains("tiny"), "{text}");
+                assert!(text.contains("installed"), "{text}");
+            }
+            _ => panic!("expected system table message"),
+        }
+    }
+
+
+    #[tokio::test]
+    async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
+        let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
+        let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(bus);
+        let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            protocol_version: 1,
+            runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
+            permissions: vec!["tools.register".to_string()],
+            hooks: vec![],
+            config: vec![],
+        };
+        manager.load("demo-plugin", &manifest).await.unwrap();
+        let command = RegisteredPluginCommand {
+            plugin: "demo-plugin".to_string(),
+            name: "demo".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::Interactive {
+                plugin_extension_id: "demo-plugin".to_string(),
+            },
+            plugin_root: PathBuf::from("/tmp/demo"),
+        };
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+
+        execute_interactive_plugin_command_events(&command, "models", &manager, &mut app).await;
+
+        assert!(app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))));
+        assert!(app.active_tasks.get("demo-task").is_some());
+        assert!(app.active_tasks.get("demo-task").unwrap().done);
+        manager.shutdown_all().await;
     }
 
     // -- edit_distance tests --
@@ -1020,5 +1196,138 @@ mod tests {
             }
             _ => panic!("expected ExtensionsMemory(Recent) with limit=Some(5)"),
         }
+    }
+
+    async fn invoke_voice(arg: &str) -> CommandAction {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_command(
+            "voice",
+            arg,
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn parse_voice_empty_arg_is_toggle() {
+        match invoke_voice("").await {
+            CommandAction::VoiceToggle => {}
+            other => panic!("expected VoiceToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_toggle_subcommand() {
+        match invoke_voice("toggle").await {
+            CommandAction::VoiceToggle => {}
+            _ => panic!("expected VoiceToggle for `toggle` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_status_subcommand() {
+        match invoke_voice("status").await {
+            CommandAction::VoiceStatus => {}
+            _ => panic!("expected VoiceStatus for `status` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_unknown_subcommand_is_none() {
+        match invoke_voice("frobnicate").await {
+            CommandAction::None => {}
+            _ => panic!("expected CommandAction::None for unknown subcommand"),
+        }
+    }
+
+    #[test]
+    fn voice_is_in_builtin_commands() {
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
+    }
+
+
+    #[tokio::test]
+    async fn voice_models_routes_to_interactive_plugin_when_registered() {
+        let registry = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![synaps_cli::skills::Plugin {
+                name: "local-voice".to_string(),
+                root: PathBuf::from("/tmp/local-voice"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "local-voice".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::Interactive(
+                        synaps_cli::skills::manifest::ManifestInteractiveCommand {
+                            name: "voice".to_string(),
+                            description: None,
+                            interactive: true,
+                            subcommands: vec!["models".to_string()],
+                        },
+                    )],
+                    extension: None,
+                    help_entries: vec![],
+                    provides: None,
+                    settings: None,
+                }),
+            }],
+        );
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command(
+            "voice",
+            "models",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &Arc::new(registry),
+            &keybinds,
+        ).await {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!(command.plugin, "local-voice");
+                assert_eq!(command.name, "voice");
+                assert_eq!(arg, "models");
+            }
+            _ => panic!("expected interactive plugin command for /voice models"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_models_command_routes_to_plugin_when_no_plugin_pushes_error() {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "models",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no voice plugin installed")));
+        assert!(pushed_error, "expected a `no voice plugin installed` error message");
     }
 }

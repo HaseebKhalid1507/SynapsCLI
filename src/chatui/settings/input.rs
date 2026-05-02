@@ -7,6 +7,13 @@ pub(crate) enum InputOutcome {
     None,
     Close,
     Apply { key: &'static str, value: String },
+    /// Apply a plugin-declared settings field. Written to the plugin's
+    /// own namespaced config (`~/.synaps-cli/plugins/<id>/config`).
+    PluginApply { plugin_id: String, key: String, value: String },
+    /// User requested to open a plugin-declared custom editor.
+    /// The async upper layer calls `settings.editor.open` and installs
+    /// `ActiveEditor::PluginCustom` with the returned render payload.
+    PluginCustomOpen { plugin_id: String, category: String, key: String },
     SetProviderKey { provider_id: String, value: String },
     TogglePlugin { name: String, enabled: bool },
     PreviewTheme { name: String },
@@ -36,7 +43,7 @@ pub(crate) fn handle_event(
         }
         return handle_editor_key(state, key);
     }
-    if state.focus == Focus::Right {
+    if state.focus == Focus::Right && state.category_idx < CATEGORIES.len() {
         let cat = super::schema::CATEGORIES[state.category_idx];
         if cat == super::schema::Category::Providers {
             // 'p' key — ping all models from any row
@@ -132,6 +139,84 @@ pub(crate) fn handle_event(
             }
         }
     }
+    // Plugin-declared categories — right-pane handling. Path B Phase 4.
+    // Only handled when focus is on the right pane; Up/Down/Tab fall
+    // through to the generic match below so navigation is uniform.
+    if state.focus == Focus::Right && state.is_plugin_category(snap) {
+        if let Some(field) = state.current_plugin_field(snap).cloned() {
+            let plugin_id = state
+                .current_plugin_category(snap)
+                .map(|c| c.plugin.clone())
+                .unwrap_or_default();
+            use synaps_cli::skills::registry::PluginSettingsEditor as PE;
+            match (key.code, &field.editor) {
+                (KeyCode::Left | KeyCode::Right, PE::Cycler { options }) if !options.is_empty() => {
+                    let current = plugin_field_current_value(&plugin_id, &field);
+                    let idx = options.iter().position(|o| *o == current).unwrap_or(0);
+                    let new_idx = match key.code {
+                        KeyCode::Left => if idx > 0 { idx - 1 } else { idx },
+                        KeyCode::Right => if idx + 1 < options.len() { idx + 1 } else { idx },
+                        _ => idx,
+                    };
+                    if new_idx != idx {
+                        state.row_error = None;
+                        return InputOutcome::PluginApply {
+                            plugin_id,
+                            key: field.key.clone(),
+                            value: options[new_idx].clone(),
+                        };
+                    }
+                    return InputOutcome::None;
+                }
+                (KeyCode::Enter, PE::Text { numeric }) => {
+                    state.row_error = None;
+                    let buffer = plugin_field_current_value(&plugin_id, &field);
+                    state.edit_mode = Some(ActiveEditor::PluginText {
+                        plugin_id,
+                        key: field.key.clone(),
+                        buffer,
+                        numeric: *numeric,
+                        error: None,
+                    });
+                    return InputOutcome::None;
+                }
+                (KeyCode::Enter, PE::Picker) => {
+                    // Picker options are not declarable in the manifest
+                    // today (only Cycler carries inline options); show a
+                    // note rather than opening an empty picker.
+                    state.row_error = Some((
+                        field.key.clone(),
+                        "picker editor not yet wired".to_string(),
+                    ));
+                    return InputOutcome::None;
+                }
+                (KeyCode::Enter, PE::Cycler { options }) if !options.is_empty() => {
+                    // Same as Right: advance one step, wrapping at the end.
+                    let current = plugin_field_current_value(&plugin_id, &field);
+                    let idx = options.iter().position(|o| *o == current).unwrap_or(0);
+                    let new_idx = if idx + 1 < options.len() { idx + 1 } else { 0 };
+                    state.row_error = None;
+                    return InputOutcome::PluginApply {
+                        plugin_id,
+                        key: field.key.clone(),
+                        value: options[new_idx].clone(),
+                    };
+                }
+                (KeyCode::Enter, PE::Custom) => {
+                    let category = state
+                        .current_plugin_category(snap)
+                        .map(|c| c.id.clone())
+                        .unwrap_or_default();
+                    return InputOutcome::PluginCustomOpen {
+                        plugin_id,
+                        category,
+                        key: field.key.clone(),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => InputOutcome::Close,
         (KeyCode::Tab, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
@@ -160,7 +245,8 @@ pub(crate) fn handle_event(
         (KeyCode::Down, _) => {
             match state.focus {
                 Focus::Left => {
-                    if state.category_idx + 1 < CATEGORIES.len() {
+                    let total_categories = CATEGORIES.len() + snap.plugin_categories.len();
+                    if state.category_idx + 1 < total_categories {
                         state.category_idx += 1;
                         state.setting_idx = 0;
                     }
@@ -374,6 +460,33 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
+        ActiveEditor::PluginText { plugin_id, key: field_key, buffer, numeric, error } => {
+            match key.code {
+                KeyCode::Enter => {
+                    if *numeric && buffer.parse::<i64>().is_err() {
+                        *error = Some("must be a number".to_string());
+                        return InputOutcome::None;
+                    }
+                    InputOutcome::PluginApply {
+                        plugin_id: plugin_id.clone(),
+                        key: field_key.clone(),
+                        value: buffer.clone(),
+                    }
+                }
+                KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
+                KeyCode::Char(c) => {
+                    if *numeric && !(c.is_ascii_digit() || c == '-') {
+                        *error = Some("digits only".to_string());
+                        return InputOutcome::None;
+                    }
+                    buffer.push(c);
+                    *error = None;
+                    InputOutcome::None
+                }
+                _ => InputOutcome::None,
+            }
+        }
+        ActiveEditor::PluginCustom { .. } => InputOutcome::None,
     }
 }
 
@@ -381,11 +494,39 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
     match key {
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
+        "voice_toggle_key" => synaps_cli::config::read_config_value("voice_toggle_key")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "F8".to_string()),
         _ => String::new(),
     }
 }
 
+/// Read the current value for a plugin field. Falls back to the manifest
+/// `default` (when present) or the empty string. Path B Phase 4.
+pub(crate) fn plugin_field_current_value(
+    plugin_id: &str,
+    field: &synaps_cli::skills::registry::PluginSettingsField,
+) -> String {
+    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(plugin_id, &field.key) {
+        return v;
+    }
+    match &field.default {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
 fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
+    if state.is_plugin_category(snap) {
+        return state
+            .current_plugin_category(snap)
+            .map(|c| c.fields.len())
+            .unwrap_or(0);
+    }
     let cat = super::schema::CATEGORIES[state.category_idx];
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
@@ -431,6 +572,7 @@ mod tests {
             disabled_plugins: vec!["p2".into()],
             provider_keys: std::collections::BTreeMap::new(),
             model_health: std::collections::HashMap::new(),
+            plugin_categories: Vec::new(),
         }
     }
 
@@ -492,5 +634,155 @@ mod tests {
             }
             _ => panic!("expected TogglePlugin"),
         }
+    }
+
+    // ---- Path B Phase 4 — plugin-declared category wiring ----------------
+
+    use synaps_cli::skills::registry::{
+        PluginSettingsCategory, PluginSettingsEditor, PluginSettingsField,
+    };
+
+    fn plugin_field(key: &str, label: &str, editor: PluginSettingsEditor) -> PluginSettingsField {
+        PluginSettingsField {
+            key: key.to_string(),
+            label: label.to_string(),
+            editor,
+            help: None,
+            default: None,
+        }
+    }
+
+    fn snap_with_plugin_cats(cats: Vec<PluginSettingsCategory>) -> RuntimeSnapshot {
+        let mut s = snap();
+        s.plugin_categories = cats;
+        s
+    }
+
+    fn at_first_plugin_cat(s: &RuntimeSnapshot) -> SettingsState {
+        let mut state = SettingsState::new();
+        state.category_idx = super::super::schema::CATEGORIES.len();
+        state.focus = Focus::Right;
+        state.setting_idx = 0;
+        // sanity
+        assert!(state.is_plugin_category(s));
+        state
+    }
+
+    #[test]
+    fn plugin_categories_extend_left_pane_navigation() {
+        let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
+            plugin: "demo".into(),
+            id: "demo.main".into(),
+            label: "Demo".into(),
+            fields: vec![plugin_field(
+                "speed",
+                "Speed",
+                PluginSettingsEditor::Cycler { options: vec!["slow".into(), "fast".into()] },
+            )],
+        }]);
+        let mut state = SettingsState::new();
+        // Down across all built-ins, then once into plugin category.
+        for _ in 0..super::super::schema::CATEGORIES.len() {
+            handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+        }
+        assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
+        // One more Down should NOT advance past the last plugin category.
+        handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+        assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
+    }
+
+    #[test]
+    fn cycler_right_emits_plugin_apply_with_next_option() {
+        let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
+            plugin: "demo".into(),
+            id: "demo.main".into(),
+            label: "Demo".into(),
+            fields: vec![plugin_field(
+                "speed",
+                "Speed",
+                PluginSettingsEditor::Cycler {
+                    options: vec!["slow".into(), "fast".into()],
+                },
+            )],
+        }]);
+        let mut state = at_first_plugin_cat(&s);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &s);
+        match out {
+            InputOutcome::PluginApply { plugin_id, key, value } => {
+                assert_eq!(plugin_id, "demo");
+                assert_eq!(key, "speed");
+                assert_eq!(value, "fast");
+            }
+            _ => panic!("expected PluginApply, got something else"),
+        }
+    }
+
+    #[test]
+    fn enter_on_plugin_text_opens_editor_and_applies() {
+        let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
+            plugin: "demo".into(),
+            id: "demo.main".into(),
+            label: "Demo".into(),
+            fields: vec![plugin_field(
+                "label",
+                "Label",
+                PluginSettingsEditor::Text { numeric: false },
+            )],
+        }]);
+        let mut state = at_first_plugin_cat(&s);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        assert!(matches!(out, InputOutcome::None));
+        assert!(matches!(state.edit_mode, Some(ActiveEditor::PluginText { .. })));
+        // Type "hi" then Enter.
+        handle_event(&mut state, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &s);
+        handle_event(&mut state, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &s);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        match out {
+            InputOutcome::PluginApply { plugin_id, key, value } => {
+                assert_eq!(plugin_id, "demo");
+                assert_eq!(key, "label");
+                assert_eq!(value, "hi");
+            }
+            _ => panic!("expected PluginApply"),
+        }
+    }
+
+    #[test]
+    fn enter_on_plugin_custom_field_requests_plugin_editor_open() {
+        let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
+            plugin: "demo".into(),
+            id: "voice".into(),
+            label: "Demo".into(),
+            fields: vec![plugin_field("body", "Body", PluginSettingsEditor::Custom)],
+        }]);
+        let mut state = at_first_plugin_cat(&s);
+        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        match out {
+            InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                assert_eq!(plugin_id, "demo");
+                assert_eq!(category, "voice");
+                assert_eq!(key, "body");
+            }
+            other => panic!("expected PluginCustomOpen, got {:?}",
+                std::mem::discriminant(&other)),
+        }
+        assert!(state.edit_mode.is_none(), "async upper layer opens the editor after RPC returns");
+    }
+
+    #[test]
+    fn cycler_current_value_uses_plugin_default_when_unset() {
+        // Default is honoured before we've ever written a value.
+        let field = PluginSettingsField {
+            key: "speed".into(),
+            label: "Speed".into(),
+            editor: PluginSettingsEditor::Cycler {
+                options: vec!["slow".into(), "fast".into()],
+            },
+            help: None,
+            default: Some(serde_json::Value::String("fast".into())),
+        };
+        // Use a plugin id that does not exist on disk so read returns None.
+        let v = super::plugin_field_current_value("__nonexistent_plugin_xyz__", &field);
+        assert_eq!(v, "fast");
     }
 }

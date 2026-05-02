@@ -17,6 +17,7 @@ mod help_find;
 mod helpers;
 mod lifecycle;
 mod viewport;
+mod voice;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -111,6 +112,7 @@ pub async fn run(
             App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
         }
     };
+    app.keybinds = Some(keybind_registry.clone());
 
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
@@ -173,6 +175,16 @@ pub async fn run(
     );
     let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
+
+    // ═══ Phase 6 migration: legacy `voice_*` global keys → plugin namespace ═══
+    // One-shot copy of the deprecated whisper-specific config keys into the
+    // local-voice plugin's own config (`~/.synaps-cli/plugins/local-voice/config`).
+    // Only writes when the destination is empty; never overwrites a value the
+    // user has already set under the new namespace. Legacy keys remain in
+    // place so users on a multi-version setup don't lose them — they can be
+    // pruned manually after upgrade.
+    migrate_legacy_voice_config_keys();
+
     if !no_extensions {
         let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
@@ -246,6 +258,18 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                }
+            }
+
+            // ── Voice sidecar events — fires when the voice manager emits ──
+            voice_event = async {
+                match app.voice.as_mut() {
+                    Some(v) => v.manager.next_event().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(event) = voice_event {
+                    self::voice::handle_event(&mut app, event);
                 }
             }
 
@@ -443,7 +467,9 @@ pub async fn run(
                             continue;
                         }
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
+                        let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
+                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
+                        drop(kb_guard);
                         match action {
                             InputAction::None => {}
                             InputAction::HelpFindOutcome => {}
@@ -486,7 +512,11 @@ pub async fn run(
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &keybind_registry).await {
+                                let kb_snapshot = {
+                                    let g = keybind_registry.read().expect("keybind registry poisoned");
+                                    g.clone()
+                                };
+                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &kb_snapshot).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
@@ -585,11 +615,24 @@ pub async fn run(
                                         steer_tx = Some(s_tx);
                                     }
                                     CommandAction::PluginCommand { command, arg } => {
-                                        commands::execute_command_action(
-                                            CommandAction::PluginCommand { command, arg },
-                                            &mut app,
-                                            &runtime,
-                                        ).await;
+                                        if matches!(
+                                            command.backend,
+                                            synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
+                                        ) {
+                                            let manager = ext_mgr_shared.read().await;
+                                            commands::execute_interactive_plugin_command_events(
+                                                &command,
+                                                &arg,
+                                                &manager,
+                                                &mut app,
+                                            ).await;
+                                        } else {
+                                            commands::execute_command_action(
+                                                CommandAction::PluginCommand { command, arg },
+                                                &mut app,
+                                                &runtime,
+                                            ).await;
+                                        }
                                     }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).
@@ -881,7 +924,8 @@ pub async fn run(
                                                 let source_label = match &entry.source {
                                                     synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => format!("env override ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::SecretEnv(name) => format!("secret env ({})", name),
-                                                    synaps_cli::extensions::config::ConfigSource::ConfigKey(name) => format!("config key ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::PluginConfig => "plugin config".to_string(),
+                                                    synaps_cli::extensions::config::ConfigSource::LegacyConfigKey(name) => format!("legacy config key ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::Default => "default".to_string(),
                                                     synaps_cli::extensions::config::ConfigSource::Missing => "missing".to_string(),
                                                 };
@@ -1103,6 +1147,76 @@ pub async fn run(
                                             ).await;
                                         });
                                     }
+
+                                    CommandAction::VoiceToggle => {
+                                        // First toggle: spawn the sidecar and start listening.
+                                        if app.voice.is_none() {
+                                            let voice_plugin_info = {
+                                                let sidecar = synaps_cli::voice::discovery::discover();
+                                                if let Some(sidecar) = sidecar {
+                                                    let manager = ext_mgr_shared.read().await;
+                                                    manager.plugin_info(&sidecar.plugin_name).cloned()
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            match self::voice::VoiceUiState::spawn_default_with_plugin_info(voice_plugin_info.as_ref()).await {
+                                                Ok(state) => {
+                                                    app.voice = Some(state);
+                                                    app.push_msg(ChatMessage::System(
+                                                        "🎤 voice sidecar online — press the toggle again to stop and transcribe".to_string()
+                                                    ));
+                                                    if let Some(v) = app.voice.as_mut() {
+                                                        v.armed = true;
+                                                        if let Err(err) = v.manager.press().await {
+                                                            v.armed = false;
+                                                            v.status = self::voice::VoiceUiStatus::Error(err.to_string());
+                                                            app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    app.push_msg(ChatMessage::Error(format!("voice unavailable: {err}")));
+                                                }
+                                            }
+                                        } else {
+                                            // Subsequent toggle: arm flag is the source of truth.
+                                            // (status flaps between Listening/Idle as the VAD
+                                            // delivers utterances, so we can't key off it.)
+                                            let v = app.voice.as_mut().unwrap();
+                                            if v.armed {
+                                                v.armed = false;
+                                                if let Err(err) = v.manager.release().await {
+                                                    app.push_msg(ChatMessage::Error(format!("voice release failed: {err}")));
+                                                }
+                                                app.push_msg(ChatMessage::System(
+                                                    "voice: stopping — final transcript will be appended".to_string()
+                                                ));
+                                            } else {
+                                                v.armed = true;
+                                                if let Err(err) = v.manager.press().await {
+                                                    v.armed = false;
+                                                    app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    CommandAction::VoiceStatus => {
+                                        let line = match app.voice.as_ref() {
+                                            Some(v) => v.status_line(),
+                                            None => match synaps_cli::voice::discovery::discover() {
+                                                Some(s) => format!(
+                                                    "voice: not yet started — sidecar available from plugin '{}' at {}",
+                                                    s.plugin_name,
+                                                    s.binary.display()
+                                                ),
+                                                None => "voice: no plugin provides a voice sidecar (install local-voice from synaps-skills)".to_string(),
+                                            },
+                                        };
+                                        app.push_msg(ChatMessage::System(line));
+                                    }
+
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -1205,6 +1319,8 @@ pub async fn run(
                                         CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
+                                        CommandAction::VoiceToggle => {}
+                                        CommandAction::VoiceStatus => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -1309,6 +1425,118 @@ pub async fn run(
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
+                            }
+                            InputAction::PluginEditorOpen { plugin_id, category, field } => {
+                                let manager = ext_mgr_shared.read().await;
+                                match manager.settings_editor_open(&plugin_id, &category, &field).await
+                                    .and_then(settings::plugin_editor::render_from_open_result)
+                                {
+                                    Ok(render) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = None;
+                                            state.edit_mode = Some(settings::ActiveEditor::PluginCustom {
+                                                plugin_id: plugin_id.clone(),
+                                                category: category.clone(),
+                                                field: field.clone(),
+                                                render: settings::plugin_editor::PluginEditorSession {
+                                                    plugin_id,
+                                                    category,
+                                                    field,
+                                                    render,
+                                                },
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = Some((
+                                                format!("plugin.{}.{}", plugin_id, field),
+                                                err,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::PluginEditorKey { plugin_id, category, field, key } => {
+                                let wire_key = settings::plugin_editor::key_to_wire(key);
+                                if wire_key == "Enter" {
+                                    let selected = app.settings.as_ref().and_then(|state| {
+                                        match &state.edit_mode {
+                                            Some(settings::ActiveEditor::PluginCustom { render, .. }) => {
+                                                let cursor = render.render.cursor.unwrap_or(0);
+                                                render.render.rows.get(cursor).and_then(|r| r.data.clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    });
+                                    if let Some(value) = selected {
+                                        let manager = ext_mgr_shared.read().await;
+                                        match manager.settings_editor_commit(&plugin_id, &category, &field, value.clone()).await {
+                                            Ok(reply) => {
+                                                let effect = settings::plugin_editor::effect_from_commit_reply(
+                                                    &plugin_id,
+                                                    &field,
+                                                    reply,
+                                                );
+                                                match effect {
+                                                    settings::plugin_editor::PluginEditorEffect::None => {}
+                                                    settings::plugin_editor::PluginEditorEffect::ConfigWrite { plugin_id, key, value } => {
+                                                        match synaps_cli::extensions::config_store::write_plugin_config(&plugin_id, &key, &value) {
+                                                            Ok(()) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.edit_mode = None;
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), "saved".to_string()));
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), err.to_string()));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    settings::plugin_editor::PluginEditorEffect::InvokeCommand { plugin_id, command, args } => {
+                                                        if let Some(state) = app.settings.as_mut() {
+                                                            state.edit_mode = None;
+                                                            state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), "download started".to_string()));
+                                                        }
+                                                        commands::execute_interactive_plugin_command_by_parts(
+                                                            &plugin_id,
+                                                            &command,
+                                                            args,
+                                                            &manager,
+                                                            &mut app,
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                if let Some(state) = app.settings.as_mut() {
+                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let manager = ext_mgr_shared.read().await;
+                                    match manager.settings_editor_key(&plugin_id, &category, &field, &wire_key).await
+                                        .and_then(settings::plugin_editor::render_from_key_result)
+                                    {
+                                        Ok(Some(render)) => {
+                                            if let Some(settings::ActiveEditor::PluginCustom { render: session, .. }) =
+                                                app.settings.as_mut().and_then(|s| s.edit_mode.as_mut())
+                                            {
+                                                session.render = render;
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            if let Some(state) = app.settings.as_mut() {
+                                                state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             InputAction::PluginsOutcome(outcome) => {
                                 if let Some(state) = app.plugins.as_mut() {
@@ -1527,4 +1755,61 @@ pub async fn run(
     teardown_terminal(&mut terminal);
 
     Ok(())
+}
+
+/// One-time migration for Phase 6 (Path B / extension contracts).
+///
+/// Copies any value at the legacy global `voice_*` config keys into the
+/// `local-voice` plugin's namespaced config. Only writes when the
+/// destination is currently empty, so re-runs are idempotent and a user
+/// who has already migrated by hand keeps their values.
+///
+/// Returns silently on every failure path — config migration is
+/// best-effort; the runtime falls back to the legacy global keys via
+/// the deprecation shim in `chatui::voice` if this no-ops.
+fn migrate_legacy_voice_config_keys() {
+    const PLUGIN: &str = "local-voice";
+    // (legacy global key, plugin namespace key)
+    const PAIRS: &[(&str, &str)] = &[
+        ("voice_stt_model_path", "model_path"),
+        ("voice_stt_model", "model_path"),
+        ("voice_stt_backend", "backend"),
+        ("voice_language", "language"),
+    ];
+
+    for (legacy, plugin_key) in PAIRS {
+        let Some(legacy_value) = synaps_cli::config::read_config_value(legacy) else {
+            continue;
+        };
+        let trimmed = legacy_value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Don't overwrite a value the user has already set under the new key.
+        if synaps_cli::extensions::config_store::read_plugin_config(PLUGIN, plugin_key).is_some() {
+            continue;
+        }
+        match synaps_cli::extensions::config_store::write_plugin_config(
+            PLUGIN,
+            plugin_key,
+            trimmed,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    "voice migration: copied `{}` → `~/.synaps-cli/plugins/{}/config:{}` \
+                     (legacy global key still present; safe to delete after restart)",
+                    legacy,
+                    PLUGIN,
+                    plugin_key
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "voice migration: failed to write `{}` to plugin namespace: {}",
+                    plugin_key,
+                    err
+                );
+            }
+        }
+    }
 }

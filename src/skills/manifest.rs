@@ -19,6 +19,7 @@ pub enum ManifestCommand {
     Shell(ManifestShellCommand),
     ExtensionTool(ManifestExtensionToolCommand),
     SkillPrompt(ManifestSkillPromptCommand),
+    Interactive(ManifestInteractiveCommand),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -50,6 +51,17 @@ pub struct ManifestSkillPromptCommand {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestInteractiveCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Route this slash command to the plugin extension's `command.invoke` RPC.
+    pub interactive: bool,
+    #[serde(default)]
+    pub subcommands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -67,6 +79,117 @@ pub struct PluginManifest {
     pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
     #[serde(default, alias = "help")]
     pub help_entries: Vec<crate::help::HelpEntry>,
+    #[serde(default)]
+    pub provides: Option<PluginProvides>,
+    /// Plugin-declared Settings categories (Path B Phase 4). Each plugin
+    /// may contribute one or more categories to the `/settings` modal,
+    /// each with declarative `text`/`cycler`/`picker` fields or a
+    /// plugin-rendered `custom` editor (JSON-RPC `settings.editor.*`).
+    #[serde(default)]
+    pub settings: Option<ManifestSettings>,
+}
+
+/// Container for plugin-declared settings categories.
+///
+/// JSON shape:
+/// ```jsonc
+/// "settings": {
+///   "category": [
+///     { "id": "voice", "label": "Voice", "fields": [ ... ] }
+///   ]
+/// }
+/// ```
+/// The TOML equivalent (`[[settings.category]]`) deserializes through the
+/// `category` alias. The plural Rust field name is preferred internally.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettings {
+    #[serde(default, alias = "category")]
+    pub categories: Vec<ManifestSettingsCategory>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettingsCategory {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub fields: Vec<ManifestSettingsField>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestSettingsField {
+    pub key: String,
+    pub label: String,
+    pub editor: ManifestEditorKind,
+    /// Discrete options for `cycler` editors. Ignored otherwise.
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub help: Option<String>,
+    /// Optional default value seeded into the plugin's config namespace
+    /// when the field is first read. Type-erased JSON; consumer decides
+    /// how to interpret based on `editor`.
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    /// `true` for fields whose editor is `text` and accepts only numeric
+    /// input. Mirrors `EditorKind::Text { numeric }` in the core schema.
+    #[serde(default)]
+    pub numeric: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEditorKind {
+    /// Free-text input (optionally numeric — see `numeric`).
+    Text,
+    /// Discrete-option cycler — uses `options`.
+    Cycler,
+    /// Generic picker. Options are supplied by the plugin at editor-open
+    /// time via the `settings.editor.*` JSON-RPC contract.
+    Picker,
+    /// Plugin-rendered overlay using `settings.editor.open` /
+    /// `settings.editor.render` / `settings.editor.key` /
+    /// `settings.editor.commit`. See
+    /// `src/extensions/settings_editor.rs` for the typed payloads.
+    Custom,
+}
+
+/// Plugin-provided capabilities consumed by Synaps CLI core.
+///
+/// Currently only `voice_sidecar` is recognised. A plugin advertises a
+/// voice sidecar binary by setting `provides.voice_sidecar.command`; the
+/// integration layer in `src/voice/` discovers and supervises it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct PluginProvides {
+    #[serde(default)]
+    pub voice_sidecar: Option<VoiceSidecarManifest>,
+}
+
+/// Sidecar binary that Synaps CLI launches to provide voice dictation.
+///
+/// `command` is resolved relative to the plugin root unless absolute.
+/// `protocol_version` is matched against the line-JSON protocol version
+/// understood by `src/voice/protocol.rs` (currently `1`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VoiceSidecarManifest {
+    pub command: String,
+    #[serde(default)]
+    pub setup: Option<String>,
+    #[serde(default = "default_voice_protocol_version")]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub model: Option<VoiceSidecarModel>,
+}
+
+fn default_voice_protocol_version() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct VoiceSidecarModel {
+    #[serde(default)]
+    pub default_path: Option<String>,
+    #[serde(default)]
+    pub required_for_real_stt: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,6 +383,68 @@ mod tests {
     }
 
     #[test]
+    fn plugin_manifest_parses_provides_voice_sidecar() {
+        let json = r#"{
+            "name": "local-voice",
+            "provides": {
+                "voice_sidecar": {
+                    "command": "bin/synaps-voice-plugin",
+                    "setup": "scripts/setup.sh",
+                    "protocol_version": 1,
+                    "model": {
+                        "default_path": "~/.synaps-cli/models/whisper/ggml-base.en.bin",
+                        "required_for_real_stt": true
+                    }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let provides = m.provides.expect("provides should deserialize");
+        let sidecar = provides.voice_sidecar.expect("voice_sidecar should deserialize");
+        assert_eq!(sidecar.command, "bin/synaps-voice-plugin");
+        assert_eq!(sidecar.setup.as_deref(), Some("scripts/setup.sh"));
+        assert_eq!(sidecar.protocol_version, 1);
+        let model = sidecar.model.expect("model should deserialize");
+        assert_eq!(
+            model.default_path.as_deref(),
+            Some("~/.synaps-cli/models/whisper/ggml-base.en.bin")
+        );
+        assert!(model.required_for_real_stt);
+    }
+
+    #[test]
+    fn plugin_manifest_without_provides_is_ok() {
+        let json = r#"{"name":"plain"}"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.provides.is_none());
+    }
+
+
+    #[test]
+    fn plugin_manifest_parses_interactive_command() {
+        let json = r#"{
+            "name": "demo-plugin",
+            "commands": [
+                {
+                    "name": "demo",
+                    "description": "Run interactive demo",
+                    "interactive": true,
+                    "subcommands": ["models", "download"]
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        match &m.commands[0] {
+            ManifestCommand::Interactive(cmd) => {
+                assert_eq!(cmd.name, "demo");
+                assert_eq!(cmd.description.as_deref(), Some("Run interactive demo"));
+                assert_eq!(cmd.subcommands, vec!["models", "download"]);
+            }
+            other => panic!("expected interactive command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn plugin_manifest_parses_commands() {
         let json = r#"{
             "name": "dev-tools",
@@ -378,6 +563,124 @@ mod tests {
         let json = r#"{"name":"empty"}"#;
         let result: Result<MarketplaceManifest, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_manifest_parses_settings_categories_with_declarative_fields() {
+        let json = r#"{
+            "name": "demo",
+            "settings": {
+                "category": [
+                    {
+                        "id": "demo",
+                        "label": "Demo",
+                        "fields": [
+                            {
+                                "key": "backend",
+                                "label": "Backend",
+                                "editor": "cycler",
+                                "options": ["auto", "cpu", "cuda"]
+                            },
+                            {
+                                "key": "endpoint",
+                                "label": "API endpoint",
+                                "editor": "text",
+                                "help": "Base URL"
+                            },
+                            {
+                                "key": "max_tokens",
+                                "label": "Max tokens",
+                                "editor": "text",
+                                "numeric": true,
+                                "default": 2048
+                            },
+                            {
+                                "key": "model_path",
+                                "label": "Model",
+                                "editor": "custom"
+                            },
+                            {
+                                "key": "preset",
+                                "label": "Preset",
+                                "editor": "picker"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let s = m.settings.expect("settings should deserialize");
+        assert_eq!(s.categories.len(), 1);
+        let cat = &s.categories[0];
+        assert_eq!(cat.id, "demo");
+        assert_eq!(cat.label, "Demo");
+        assert_eq!(cat.fields.len(), 5);
+
+        assert_eq!(cat.fields[0].key, "backend");
+        assert_eq!(cat.fields[0].editor, ManifestEditorKind::Cycler);
+        assert_eq!(cat.fields[0].options, vec!["auto", "cpu", "cuda"]);
+
+        assert_eq!(cat.fields[1].editor, ManifestEditorKind::Text);
+        assert!(!cat.fields[1].numeric);
+        assert_eq!(cat.fields[1].help.as_deref(), Some("Base URL"));
+
+        assert_eq!(cat.fields[2].editor, ManifestEditorKind::Text);
+        assert!(cat.fields[2].numeric);
+        assert_eq!(cat.fields[2].default, Some(serde_json::json!(2048)));
+
+        assert_eq!(cat.fields[3].editor, ManifestEditorKind::Custom);
+        assert_eq!(cat.fields[4].editor, ManifestEditorKind::Picker);
+    }
+
+    #[test]
+    fn plugin_manifest_settings_default_to_none() {
+        let json = r#"{"name":"plain"}"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.settings.is_none());
+    }
+
+    #[test]
+    fn plugin_manifest_settings_unknown_editor_kind_fails() {
+        let json = r#"{
+            "name": "demo",
+            "settings": {
+                "category": [
+                    { "id": "x", "label": "X", "fields": [
+                        { "key": "k", "label": "L", "editor": "bogus" }
+                    ] }
+                ]
+            }
+        }"#;
+        let result: Result<PluginManifest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_manifest_settings_additive_with_help_entries_field() {
+        // Verifies the `settings` field (Phase 4) and the `help_entries`
+        // field (help-command series) coexist on PluginManifest.
+        let json = r#"{
+            "name": "merge-friendly",
+            "settings": {
+                "category": [
+                    { "id": "x", "label": "X", "fields": [] }
+                ]
+            },
+            "help_entries": [
+                {
+                    "id": "x-do",
+                    "command": "/x:do",
+                    "title": "Do",
+                    "summary": "do a thing"
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.settings.is_some());
+        assert_eq!(m.settings.unwrap().categories[0].id, "x");
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].command, "/x:do");
     }
 
     #[test]

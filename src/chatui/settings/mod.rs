@@ -5,6 +5,7 @@ pub(crate) mod defs;
 pub(crate) mod schema;
 pub(crate) mod draw;
 pub(crate) mod input;
+pub(crate) mod plugin_editor;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
@@ -58,6 +59,10 @@ pub(crate) struct RuntimeSnapshot {
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
     pub model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// Plugin-declared settings categories snapshotted from the registry
+    /// at modal-open time. Each entry contributes a category row in the
+    /// left pane and a list of fields in the right pane. Path B Phase 4.
+    pub plugin_categories: Vec<synaps_cli::skills::registry::PluginSettingsCategory>,
 }
 
 impl RuntimeSnapshot {
@@ -116,6 +121,7 @@ impl RuntimeSnapshot {
             disabled_plugins: config.disabled_plugins.clone(),
             provider_keys: config.provider_keys.clone(),
             model_health,
+            plugin_categories: registry.plugin_settings_categories(),
         }
     }
 }
@@ -131,6 +137,22 @@ pub(super) enum ActiveEditor {
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
     CustomModel { buffer: String, setting_key: &'static str },
     ApiKey { provider_id: String, buffer: String },
+    /// Text editor for a plugin-declared `text` field. Path B Phase 4.
+    /// Commits via `InputOutcome::PluginApply` to the plugin config namespace.
+    PluginText {
+        plugin_id: String,
+        key: String,
+        buffer: String,
+        numeric: bool,
+        error: Option<String>,
+    },
+    /// Plugin-owned custom editor render returned by `settings.editor.open`.
+    PluginCustom {
+        plugin_id: String,
+        category: String,
+        field: String,
+        render: crate::chatui::settings::plugin_editor::PluginEditorSession,
+    },
 }
 
 pub(super) struct SettingsState {
@@ -167,6 +189,35 @@ impl SettingsState {
 
     pub fn current_setting(&self) -> Option<&'static SettingDef> {
         self.current_settings().get(self.setting_idx).copied()
+    }
+
+    /// True iff `category_idx` points past the built-in categories at a
+    /// plugin-declared category from `snap.plugin_categories`.
+    pub fn is_plugin_category(&self, snap: &RuntimeSnapshot) -> bool {
+        let n_builtin = schema::CATEGORIES.len();
+        self.category_idx >= n_builtin
+            && self.category_idx - n_builtin < snap.plugin_categories.len()
+    }
+
+    /// Plugin-declared category at the current `category_idx`, or None
+    /// if the cursor is on a built-in category.
+    pub fn current_plugin_category<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsCategory> {
+        if !self.is_plugin_category(snap) {
+            return None;
+        }
+        snap.plugin_categories.get(self.category_idx - schema::CATEGORIES.len())
+    }
+
+    /// Plugin field at `setting_idx` within the current plugin category.
+    pub fn current_plugin_field<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsField> {
+        self.current_plugin_category(snap)
+            .and_then(|c| c.fields.get(self.setting_idx))
     }
 }
 

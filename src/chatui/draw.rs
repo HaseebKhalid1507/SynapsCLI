@@ -9,6 +9,94 @@ use ratatui::{
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation, Shader};
 
+/// Build the voice indicator pill rendered after the status span when
+/// the user has activated voice dictation. Returns `None` when voice
+/// is disabled — callers should skip rendering in that case.
+pub(crate) fn voice_pill_span(app: &super::app::App) -> Option<Span<'static>> {
+    let voice = app.voice.as_ref()?;
+    let (text, color) = match &voice.status {
+        super::voice::VoiceUiStatus::Idle => {
+            // Show armed-but-quiet (between VAD utterances) as listening
+            // — to the user the mic is still hot.
+            if voice.armed {
+                let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let base = match THEME.load().status_streaming {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (220, 80, 80),
+                };
+                let r = (base.0 as f64 * pulse) as u8;
+                let g = (base.1 as f64 * pulse) as u8;
+                let b = (base.2 as f64 * pulse) as u8;
+                (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+            } else {
+                (" \u{25cb} voice ", THEME.load().muted)
+            }
+        }
+        super::voice::VoiceUiStatus::Listening => {
+            // Pulse like the streaming indicator so the user sees we're live.
+            let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let base = match THEME.load().status_streaming {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (220, 80, 80),
+            };
+            let r = (base.0 as f64 * pulse) as u8;
+            let g = (base.1 as f64 * pulse) as u8;
+            let b = (base.2 as f64 * pulse) as u8;
+            (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+        }
+        super::voice::VoiceUiStatus::Transcribing => {
+            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
+            let frame = SPINNER_FRAMES[spinner_idx];
+            return Some(Span::styled(
+                format!(" {} transcribing ", frame),
+                Style::default().fg(THEME.load().status_streaming),
+            ));
+        }
+        super::voice::VoiceUiStatus::Error(_) => {
+            (" \u{26a0} voice error ", Color::Red)
+        }
+    };
+    Some(Span::styled(
+        text.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
+#[cfg(test)]
+mod voice_pill_tests {
+    use super::*;
+    use synaps_cli::Session;
+
+    fn fresh_app() -> super::super::app::App {
+        super::super::app::App::new(Session::new("test", "medium", None))
+    }
+
+    #[test]
+    fn pill_is_none_when_voice_inactive() {
+        let app = fresh_app();
+        assert!(voice_pill_span(&app).is_none());
+    }
+
+
+    #[test]
+    fn active_tasks_progress_line_renders_fraction() {
+        let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
+            id: "dl".into(),
+            label: "Download base".into(),
+            kind: synaps_cli::extensions::tasks::TaskKind::Download,
+        });
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Update {
+            id: "dl".into(),
+            current: Some(50),
+            total: Some(100),
+            message: Some("half".into()),
+        });
+        let _ = render_active_tasks_line(&tasks, 80);
+    }
+}
+
+
 use super::theme::THEME;
 use super::markdown::format_tokens;
 use super::app::{App, SPINNER_FRAMES};
@@ -81,6 +169,34 @@ pub(crate) fn quit_effect() -> Effect {
     ])
 }
 
+
+/// Render the first generic extension active task as a single sticky progress line.
+pub(crate) fn render_active_tasks_line<'a>(
+    tasks: &'a synaps_cli::extensions::active_tasks::ActiveTasks,
+    width: u16,
+) -> Paragraph<'a> {
+    let theme = THEME.load();
+    let Some(task) = tasks.iter().next() else {
+        return Paragraph::new(Line::from(""));
+    };
+    let pct = task.fraction().map(|f| (f * 100.0).round() as u32);
+    let bar_width = ((width as usize).saturating_sub(42)).clamp(8, 28);
+    let fill = task.fraction().map(|f| (f * bar_width as f32).round() as usize).unwrap_or(0).min(bar_width);
+    let bar = format!("{}{}", "█".repeat(fill), "░".repeat(bar_width - fill));
+    let status = if let Some(err) = &task.error {
+        format!("✘ {}: {}", task.label, err)
+    } else if task.done {
+        format!("✓ {}", task.label)
+    } else {
+        let pct_text = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?%".to_string());
+        match &task.message {
+            Some(msg) if !msg.is_empty() => format!("⟳ {} [{}] {}  {}", task.label, bar, pct_text, msg),
+            _ => format!("⟳ {} [{}] {}", task.label, bar, pct_text),
+        }
+    };
+    Paragraph::new(Line::from(Span::styled(status, Style::default().fg(theme.help_fg))))
+}
+
 pub(crate) fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -114,12 +230,17 @@ pub(crate) fn draw(
         let max_input_lines: u16 = 10;
         let input_height = (input_lines.min(max_input_lines)) + 2; // +2 for borders
 
+        // Generic active-task progress bar — 1 line above the input box when
+        // any plugin-published task is in flight. Hidden otherwise.
+        let download_height: u16 = if !app.active_tasks.is_empty() { 1 } else { 0 };
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),              // header
                 Constraint::Min(1),                 // messages
                 Constraint::Length(subagent_height), // subagent panel (0 when inactive)
+                Constraint::Length(download_height), // download progress bar (0 when idle)
                 Constraint::Length(input_height),   // input (expands with content)
                 Constraint::Length(1),              // footer
             ])
@@ -151,12 +272,19 @@ pub(crate) fn draw(
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-            status_span,
-        ]))
+        let header = Paragraph::new(Line::from({
+            let mut spans = vec![
+                Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
+                Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
+                status_span,
+            ];
+            if let Some(pill) = voice_pill_span(app) {
+                spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
+                spans.push(pill);
+            }
+            spans
+        }))
         .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(header, outer[0]);
 
@@ -595,13 +723,22 @@ pub(crate) fn draw(
         let input_widget = Paragraph::new(input_lines_vec)
         .scroll((input_scroll, 0))
         .block(input_block);
-        frame.render_widget(input_widget, outer[3]);
+        frame.render_widget(input_widget, outer[4]);
 
         // Cursor — position relative to scroll offset
         frame.set_cursor_position((
-            outer[3].x + 1 + cursor_col,
-            outer[3].y + 1 + cursor_row - input_scroll,
+            outer[4].x + 1 + cursor_col,
+            outer[4].y + 1 + cursor_row - input_scroll,
         ));
+
+        // -- Active task progress bar ----------------------------------------
+        // Renders a generic single-line widget above the input when any
+        // plugin-published task is in flight. Layout collapses to 0 height
+        // when the active-tasks set is empty.
+        if !app.active_tasks.is_empty() {
+            let bar = render_active_tasks_line(&app.active_tasks, outer[3].width);
+            frame.render_widget(bar, outer[3]);
+        }
 
         // -- Footer ----------------------------------------------------------
         let footer_chunks = Layout::default()
@@ -610,7 +747,7 @@ pub(crate) fn draw(
                 Constraint::Min(1),
                 Constraint::Length(model.len() as u16 + 75),
             ])
-            .split(outer[4]);
+            .split(outer[5]);
 
         let key_style = Style::default().fg(THEME.load().muted);
         let label_style = Style::default().fg(THEME.load().help_fg);

@@ -451,12 +451,18 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
+    synaps_cli::extensions::config_store::write_plugin_config(
+        "config-test",
+        "endpoint",
+        "http://localhost:1234",
+    )
+    .unwrap();
     fs::write(home.path().join("config"), "extension.config-test.endpoint = http://localhost:1234\n").unwrap();
     std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
 
     let fixture = std::env::current_dir()
         .unwrap()
-        .join("tests/fixtures/config_extension.py")
+        .join("tests/fixtures/config_seen_extension.py")
         .to_string_lossy()
         .to_string();
     let plugin_dir = tempfile::tempdir().unwrap();
@@ -476,6 +482,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         config: vec![
             ExtensionConfigEntry {
                 key: "endpoint".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -483,6 +490,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "mode".to_string(),
+                value_type: None,
                 description: None,
                 required: false,
                 default: Some(serde_json::json!("safe")),
@@ -490,6 +498,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "token".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -528,6 +537,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
         }],
         config: vec![ExtensionConfigEntry {
             key: "endpoint".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -566,6 +576,7 @@ async fn extension_provider_complete_routes_to_process() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -625,6 +636,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -1062,6 +1074,7 @@ async fn audit_log_records_disabled_route() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,

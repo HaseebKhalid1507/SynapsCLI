@@ -122,4 +122,34 @@ define_settings! {
     theme, "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
+
+    voice_toggle_key, "Voice toggle key", Voice,
+        EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
+        "Keybind that toggles voice dictation. Takes effect immediately.",
+        |_runtime, app, value| {
+            if let Some(kb) = app.keybinds.as_ref() {
+                match kb.write() {
+                    Ok(mut g) => {
+                        if let Err(e) = g.set_slash_command_key("voice toggle", value) {
+                            tracing::warn!("voice_toggle_key apply failed: {}", e);
+                        }
+                    }
+                    Err(_) => tracing::warn!("voice_toggle_key apply: registry poisoned"),
+                }
+            }
+        };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_toggle_key_setting_is_in_voice_category() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "voice_toggle_key")
+            .expect("voice_toggle_key setting should be defined");
+        assert_eq!(def.category, Category::Voice);
+    }
 }
