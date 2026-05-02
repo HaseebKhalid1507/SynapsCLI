@@ -456,7 +456,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
 
     let fixture = std::env::current_dir()
         .unwrap()
-        .join("tests/fixtures/config_extension.py")
+        .join("tests/fixtures/config_seen_extension.py")
         .to_string_lossy()
         .to_string();
     let plugin_dir = tempfile::tempdir().unwrap();

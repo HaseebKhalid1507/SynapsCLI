@@ -958,50 +958,63 @@ mod tests {
         std::env::remove_var("SYNAPS_DISABLE_PROJECT_PLUGINS");
     }
 
+    fn with_temp_base_dir<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let old_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+        crate::config::set_base_dir_for_tests(path.to_path_buf());
+        let out = f();
+        match old_base_dir {
+            Some(old) => std::env::set_var("SYNAPS_BASE_DIR", old),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        out
+    }
+
     #[test]
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
-        crate::config::set_base_dir_for_tests(dir.path().to_path_buf());
-        crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+        with_temp_base_dir(dir.path(), || {
+            crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+                .unwrap();
+            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+
+            let resolved = ExtensionManager::resolve_config(
+                "local-voice",
+                &[ExtensionConfigEntry {
+                    key: "backend".to_string(),
+                    value_type: None,
+                    description: None,
+                    required: true,
+                    default: None,
+                    secret_env: None,
+                }],
+            )
             .unwrap();
-        crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
 
-        let resolved = ExtensionManager::resolve_config(
-            "local-voice",
-            &[ExtensionConfigEntry {
-                key: "backend".to_string(),
-                value_type: None,
-                description: None,
-                required: true,
-                default: None,
-                secret_env: None,
-            }],
-        )
-        .unwrap();
-
-        assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+            assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+        });
     }
 
     #[test]
     fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        crate::config::set_base_dir_for_tests(dir.path().to_path_buf());
-        crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+        with_temp_base_dir(dir.path(), || {
+            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
 
-        let resolved = ExtensionManager::resolve_config(
-            "local-voice",
-            &[ExtensionConfigEntry {
-                key: "backend".to_string(),
-                value_type: None,
-                description: None,
-                required: true,
-                default: None,
-                secret_env: None,
-            }],
-        )
-        .unwrap();
+            let resolved = ExtensionManager::resolve_config(
+                "local-voice",
+                &[ExtensionConfigEntry {
+                    key: "backend".to_string(),
+                    value_type: None,
+                    description: None,
+                    required: true,
+                    default: None,
+                    secret_env: None,
+                }],
+            )
+            .unwrap();
 
-        assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
+            assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
+        });
     }
 
     #[tokio::test]
