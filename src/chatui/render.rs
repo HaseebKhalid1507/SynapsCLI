@@ -538,7 +538,10 @@ impl App {
                 }
 
                 ChatMessage::System(msg) => {
-                    if i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::System(_)) {
+                    if should_separate_system_messages(
+                        self.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
+                        &tmsg.msg,
+                    ) {
                         lines.push(Line::from(""));
                         lines.push(system_separator_line(m, width));
                         lines.push(Line::from(""));
@@ -599,6 +602,23 @@ impl App {
 
         lines
     }
+}
+
+fn should_separate_system_messages(prev: Option<&ChatMessage>, current: &ChatMessage) -> bool {
+    let Some(ChatMessage::System(prev)) = prev else {
+        return false;
+    };
+    let ChatMessage::System(current) = current else {
+        return false;
+    };
+    !is_grouped_system_continuation(prev, current)
+}
+
+fn is_grouped_system_continuation(prev: &str, current: &str) -> bool {
+    current.starts_with(' ')
+        || current.starts_with('\t')
+        || prev.trim_end().ends_with(':')
+        || prev.trim_end().ends_with('…')
 }
 
 fn system_separator_line(margin: &str, width: usize) -> Line<'static> {
