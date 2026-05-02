@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::skills::manifest::{SidecarManifest, SidecarModel};
+use crate::skills::manifest::{SidecarLifecycle, SidecarManifest, SidecarModel};
 use crate::skills::Plugin;
 
 /// A discovered sidecar, resolved against its plugin root and ready to
@@ -35,6 +35,12 @@ pub struct DiscoveredSidecar {
     pub setup_script: Option<PathBuf>,
     /// Optional model metadata (modality-specific; opaque to core).
     pub model: Option<SidecarModel>,
+    /// Optional plugin-claimed lifecycle UX (Phase 8). When `Some`,
+    /// core auto-registers `<lifecycle.command> toggle/status` and
+    /// uses `display_name` for the pill / status / errors. When
+    /// `None`, the plugin is reachable via the generic `/sidecar`
+    /// fallback only.
+    pub lifecycle: Option<SidecarLifecycle>,
 }
 
 impl DiscoveredSidecar {
@@ -51,12 +57,27 @@ impl DiscoveredSidecar {
             protocol_version: sidecar.protocol_version,
             setup_script,
             model: sidecar.model.clone(),
+            lifecycle: sidecar.lifecycle.clone(),
         }
     }
 }
 
 /// Discover the first sidecar declared by any plugin in `plugins`.
+///
+/// Phase 8 transition: this is a thin wrapper over [`discover_all_in`]
+/// that returns the first result. New code should prefer
+/// [`discover_all_in`] / [`discover_all`] which return every sidecar.
 pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredSidecar> {
+    discover_all_in(plugins).into_iter().next()
+}
+
+/// Discover every sidecar declared by any plugin in `plugins`.
+///
+/// Order matches the input plugin order — caller is responsible for
+/// sorting (e.g. by `lifecycle.importance`) if a deterministic display
+/// order is needed.
+pub fn discover_all_in(plugins: &[Plugin]) -> Vec<DiscoveredSidecar> {
+    let mut out = Vec::new();
     for plugin in plugins {
         let Some(manifest) = plugin.manifest.as_ref() else {
             continue;
@@ -67,17 +88,22 @@ pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredSidecar> {
         let Some(sidecar) = provides.sidecar.as_ref() else {
             continue;
         };
-        return Some(DiscoveredSidecar::from_plugin(plugin, sidecar));
+        out.push(DiscoveredSidecar::from_plugin(plugin, sidecar));
     }
-    None
+    out
 }
 
 /// Discover by walking the default plugin roots — a thin wrapper
 /// around [`crate::skills::loader::load_all`] for callers that don't
 /// already hold the plugin set.
 pub fn discover() -> Option<DiscoveredSidecar> {
+    discover_all().into_iter().next()
+}
+
+/// Discover every sidecar by walking the default plugin roots.
+pub fn discover_all() -> Vec<DiscoveredSidecar> {
     let (plugins, _) = crate::skills::loader::load_all(&crate::skills::loader::default_roots());
-    discover_in(&plugins)
+    discover_all_in(&plugins)
 }
 
 fn resolve_relative(root: &Path, candidate: &str) -> PathBuf {
@@ -224,5 +250,87 @@ mod tests {
         let sidecar = discover_in(&[plugin]).expect("canonical field should be discovered");
         assert_eq!(sidecar.plugin_name, "modality-neutral");
         assert_eq!(sidecar.binary, PathBuf::from("/opt/modality-neutral/bin/sidecar"));
+    }
+
+    // ---- Phase 8 slice 8A: lifecycle propagation + discover_all -------------
+
+    fn plugin_with_lifecycle(name: &str, lifecycle_command: &str, importance: i32) -> Plugin {
+        let manifest_json = format!(
+            r#"{{
+                "name": "{name}",
+                "provides": {{
+                    "sidecar": {{
+                        "command": "bin/{name}-sidecar",
+                        "protocol_version": 1,
+                        "lifecycle": {{
+                            "command": "{lifecycle_command}",
+                            "settings_category": "{lifecycle_command}",
+                            "display_name": "{lifecycle_command}-display",
+                            "importance": {importance}
+                        }}
+                    }}
+                }}
+            }}"#
+        );
+        let manifest: PluginManifest = serde_json::from_str(&manifest_json).unwrap();
+        Plugin {
+            name: name.into(),
+            root: PathBuf::from(format!("/opt/{name}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(manifest),
+        }
+    }
+
+    #[test]
+    fn discovered_propagates_lifecycle_when_present() {
+        let plugin = plugin_with_lifecycle("p", "voice", 50);
+        let s = discover_in(&[plugin]).expect("should discover");
+        let lc = s.lifecycle.expect("lifecycle should propagate");
+        assert_eq!(lc.command, "voice");
+        assert_eq!(lc.importance, 50);
+        assert_eq!(lc.effective_display_name(), "voice-display");
+    }
+
+    #[test]
+    fn discovered_lifecycle_is_none_when_absent() {
+        let plugins = vec![sidecar_plugin()];
+        let s = discover_in(&plugins).unwrap();
+        assert!(s.lifecycle.is_none(), "no lifecycle declared → should be None");
+    }
+
+    #[test]
+    fn discover_all_returns_every_sidecar_in_input_order() {
+        let plugins = vec![
+            plugin_with_lifecycle("a", "alpha", 10),
+            plain_plugin("no-sidecar-here"),
+            plugin_with_lifecycle("b", "beta", 90),
+            plugin_with_lifecycle("c", "gamma", -5),
+        ];
+        let all = discover_all_in(&plugins);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].plugin_name, "a");
+        assert_eq!(all[1].plugin_name, "b");
+        assert_eq!(all[2].plugin_name, "c");
+    }
+
+    #[test]
+    fn discover_all_returns_empty_when_no_sidecars() {
+        let plugins = vec![plain_plugin("x"), plain_plugin("y")];
+        assert!(discover_all_in(&plugins).is_empty());
+    }
+
+    #[test]
+    fn discover_in_matches_discover_all_in_first_for_compatibility() {
+        let plugins = vec![
+            plain_plugin("a"),
+            sidecar_plugin(),
+            plugin_with_lifecycle("b", "beta", 0),
+        ];
+        let single = discover_in(&plugins).unwrap();
+        let multi = discover_all_in(&plugins);
+        assert_eq!(single, multi[0]);
     }
 }

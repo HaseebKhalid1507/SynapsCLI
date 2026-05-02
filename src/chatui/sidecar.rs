@@ -280,6 +280,7 @@ mod tests {
                 default_path: Some(p.to_string()),
                 required_for_real_stt: false,
             }),
+            lifecycle: None,
         }
     }
 

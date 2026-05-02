@@ -189,6 +189,61 @@ pub struct SidecarManifest {
     pub protocol_version: u16,
     #[serde(default)]
     pub model: Option<SidecarModel>,
+    /// Optional plugin-claimed lifecycle UX. When set, core
+    /// auto-registers `<command> toggle` and `<command> status` and
+    /// uses `display_name` for the pill / status / errors. When
+    /// unset, the plugin is reachable via the generic `/sidecar`
+    /// fallback (ambiguity-aware: errors when 2+ unclaimed plugins
+    /// are loaded).
+    #[serde(default)]
+    pub lifecycle: Option<SidecarLifecycle>,
+}
+
+/// Plugin-claimed lifecycle UX for a sidecar. See [`SidecarManifest::lifecycle`].
+///
+/// The plugin chooses how its lifecycle commands and settings appear
+/// to the user. Core uses `display_name` for the pill, status line,
+/// and error messages; auto-registers `<command> toggle/status` as
+/// addressable slash commands; injects a virtual toggle-key field
+/// into `settings_category` (when given).
+///
+/// `importance` controls pill ordering when multiple sidecars are
+/// loaded simultaneously: higher = leftmost. Defaults to `0`. Cap at
+/// `-100..=100`; values outside that range are clamped at parse time.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SidecarLifecycle {
+    /// Slash-command name that owns this sidecar's lifecycle.
+    /// Together with `toggle`/`status` subcommands forms e.g.
+    /// `/voice toggle`.
+    pub command: String,
+    /// Settings category id (matches a `settings.categories[].id` in
+    /// the plugin manifest) that should host the virtual toggle-key
+    /// field. When `None`, no settings injection happens.
+    #[serde(default)]
+    pub settings_category: Option<String>,
+    /// Display name shown in the pill, status line, and `/extensions`
+    /// (e.g. "Voice", "OCR"). Defaults to `command` when `None`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Pill-ordering hint (-100..=100, default 0). Higher = leftmost.
+    #[serde(default, deserialize_with = "deserialize_clamped_importance")]
+    pub importance: i32,
+}
+
+impl SidecarLifecycle {
+    /// Resolved display name: `display_name` if set, else `command`.
+    pub fn effective_display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.command)
+    }
+}
+
+/// Clamp `importance` to the documented range `-100..=100`.
+fn deserialize_clamped_importance<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = i32::deserialize(d)?;
+    Ok(raw.clamp(-100, 100))
 }
 
 /// Backwards-compat type alias. New code should use [`SidecarManifest`].
@@ -476,6 +531,133 @@ mod tests {
         assert!(
             err.to_string().contains("duplicate field"),
             "expected duplicate-field error, got: {err}"
+        );
+    }
+
+    // ---- Phase 8 slice 8A: sidecar lifecycle parsing ----------------------
+
+    #[test]
+    fn sidecar_lifecycle_parses_full_block() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1,
+                    "lifecycle": {
+                        "command": "voice",
+                        "settings_category": "voice",
+                        "display_name": "Voice",
+                        "importance": 50
+                    }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = m
+            .provides
+            .unwrap()
+            .sidecar
+            .unwrap()
+            .lifecycle
+            .expect("lifecycle should deserialize");
+        assert_eq!(lc.command, "voice");
+        assert_eq!(lc.settings_category.as_deref(), Some("voice"));
+        assert_eq!(lc.display_name.as_deref(), Some("Voice"));
+        assert_eq!(lc.importance, 50);
+        assert_eq!(lc.effective_display_name(), "Voice");
+    }
+
+    #[test]
+    fn sidecar_lifecycle_is_optional() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": { "command": "bin/sidecar", "protocol_version": 1 }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(m.provides.unwrap().sidecar.unwrap().lifecycle.is_none());
+    }
+
+    #[test]
+    fn sidecar_lifecycle_minimal_only_command_required() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1,
+                    "lifecycle": { "command": "voice" }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = m
+            .provides
+            .unwrap()
+            .sidecar
+            .unwrap()
+            .lifecycle
+            .unwrap();
+        assert_eq!(lc.command, "voice");
+        assert!(lc.settings_category.is_none());
+        assert!(lc.display_name.is_none());
+        assert_eq!(lc.importance, 0);
+        // effective_display_name falls back to `command` when display_name absent.
+        assert_eq!(lc.effective_display_name(), "voice");
+    }
+
+    #[test]
+    fn sidecar_lifecycle_clamps_importance_above_100() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1,
+                    "lifecycle": { "command": "v", "importance": 9999 }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = m.provides.unwrap().sidecar.unwrap().lifecycle.unwrap();
+        assert_eq!(lc.importance, 100);
+    }
+
+    #[test]
+    fn sidecar_lifecycle_clamps_importance_below_negative_100() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1,
+                    "lifecycle": { "command": "v", "importance": -9999 }
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let lc = m.provides.unwrap().sidecar.unwrap().lifecycle.unwrap();
+        assert_eq!(lc.importance, -100);
+    }
+
+    #[test]
+    fn sidecar_lifecycle_missing_command_fails() {
+        let json = r#"{
+            "name": "p",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1,
+                    "lifecycle": { "display_name": "no command" }
+                }
+            }
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field `command`"),
+            "expected missing `command` error, got: {err}"
         );
     }
 
