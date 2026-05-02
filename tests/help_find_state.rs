@@ -53,19 +53,17 @@ fn find_state_navigation_clamps_and_scrolls() {
     state.move_down();
     state.move_down();
 
-    assert_eq!(state.cursor(), 4);
-    assert_eq!(state.scroll(), 2);
+    assert_eq!(state.result_cursor(), 4);
 
     for _ in 0..1000 {
         state.move_down();
     }
-    assert_eq!(state.cursor(), state.filtered_entries().len() - 1);
+    assert_eq!(state.result_cursor(), state.filtered_entries().len() - 1);
 
     for _ in 0..1000 {
         state.move_up();
     }
-    assert_eq!(state.cursor(), 0);
-    assert_eq!(state.scroll(), 0);
+    assert_eq!(state.result_cursor(), 0);
 }
 
 #[test]

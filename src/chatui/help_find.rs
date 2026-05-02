@@ -93,42 +93,65 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
 
     let visible_height = chunks[1].height as usize;
     state.set_visible_height(visible_height);
-    let filtered = state.filtered_entries();
-    let start = state.scroll().min(filtered.len());
-    let end = (start + visible_height).min(filtered.len());
-    let rows: Vec<Line<'static>> = if filtered.is_empty() {
+    let rows = state.filtered_rows();
+    let start = state.scroll().min(rows.len());
+    let end = (start + visible_height).min(rows.len());
+    let result_count = state.filtered_entries().len();
+    let lines: Vec<Line<'static>> = if rows.is_empty() {
         state
             .no_results_message()
             .lines()
             .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
             .collect()
     } else {
-        filtered[start..end]
+        rows[start..end]
             .iter()
             .enumerate()
-            .map(|(offset, entry)| {
+            .map(|(offset, row)| {
                 let idx = start + offset;
-                let selected = idx == state.cursor();
-                let marker = if selected { "›" } else { " " };
-                let style = if selected {
-                    Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(THEME.load().input_fg)
-                };
-                Line::from(vec![
-                    Span::styled(format!("{} {:<18}", marker, entry.command), style),
-                    Span::styled(entry.summary.clone(), Style::default().fg(THEME.load().muted)),
-                ])
+                match row {
+                    synaps_cli::help::HelpFindRow::Category(category) => Line::from(Span::styled(
+                        format!("  {}", category),
+                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
+                    )),
+                    synaps_cli::help::HelpFindRow::Entry(entry) => {
+                        let selected = idx == state.cursor();
+                        let marker = if selected { "›" } else { " " };
+                        let command_style = if selected {
+                            Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(THEME.load().input_fg)
+                        };
+                        let summary_style = Style::default().fg(THEME.load().muted);
+                        let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
+                        let mut spans = vec![Span::styled(marker.to_string(), command_style), Span::raw(" ")];
+                        spans.extend(highlighted_spans(
+                            &format!("{:<18}", entry.command),
+                            state.filter(),
+                            command_style,
+                            match_style,
+                        ));
+                        spans.extend(highlighted_spans(&entry.summary, state.filter(), summary_style, match_style));
+                        Line::from(spans)
+                    }
+                }
             })
             .collect()
     };
-    frame.render_widget(Paragraph::new(rows), chunks[1]);
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = format!("{} result{}  ↑↓ move  type filter  Esc close", filtered.len(), if filtered.len() == 1 { "" } else { "s" });
+    let footer = format!("{} result{}  ↑↓ move  Enter details  type filter  Esc close", result_count, if result_count == 1 { "" } else { "s" });
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(THEME.load().muted)))),
         chunks[2],
     );
+}
+
+fn highlighted_spans(text: &str, query: &str, base: Style, matched: Style) -> Vec<Span<'static>> {
+    synaps_cli::help::highlight_segments(text, query)
+        .into_iter()
+        .map(|segment| Span::styled(segment.text, if segment.matched { matched } else { base }))
+        .collect()
 }
 
 fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpEntry) {

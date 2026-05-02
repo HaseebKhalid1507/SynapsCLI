@@ -54,18 +54,50 @@ pub struct HelpFindState {
     scroll: usize,
     visible_height: usize,
     detail_idx: Option<usize>,
+    recently_opened: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpFindRow<'a> {
+    Category(&'a str),
+    Entry(&'a HelpEntry),
+}
+
+impl<'a> HelpFindRow<'a> {
+    pub fn category(&self) -> Option<&'a str> {
+        match self {
+            Self::Category(category) => Some(category),
+            Self::Entry(_) => None,
+        }
+    }
+
+    pub fn entry(&self) -> Option<&'a HelpEntry> {
+        match self {
+            Self::Category(_) => None,
+            Self::Entry(entry) => Some(entry),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightSegment {
+    pub text: String,
+    pub matched: bool,
 }
 
 impl HelpFindState {
     pub fn new(entries: Vec<HelpEntry>, query: &str) -> Self {
-        Self {
+        let mut state = Self {
             entries,
             filter: query.trim().to_string(),
             cursor: 0,
             scroll: 0,
             visible_height: 10,
             detail_idx: None,
-        }
+            recently_opened: Vec::new(),
+        };
+        state.reset_position();
+        state
     }
 
     pub fn filter(&self) -> &str {
@@ -74,6 +106,15 @@ impl HelpFindState {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    pub fn result_cursor(&self) -> usize {
+        self.filtered_rows()
+            .iter()
+            .take(self.cursor + 1)
+            .filter(|row| row.entry().is_some())
+            .count()
+            .saturating_sub(1)
     }
 
     pub fn scroll(&self) -> usize {
@@ -86,7 +127,25 @@ impl HelpFindState {
     }
 
     pub fn filtered_entries(&self) -> Vec<&HelpEntry> {
-        ranked_entries(&self.entries, &self.filter)
+        ranked_entries_with_mru(&self.entries, &self.filter, &self.recently_opened)
+    }
+
+    pub fn filtered_rows(&self) -> Vec<HelpFindRow<'_>> {
+        let entries = self.filtered_entries();
+        if !self.filter.trim().is_empty() {
+            return entries.into_iter().map(HelpFindRow::Entry).collect();
+        }
+
+        let mut rows = Vec::new();
+        let mut current_category: Option<&str> = None;
+        for entry in entries {
+            if current_category != Some(entry.category.as_str()) {
+                current_category = Some(entry.category.as_str());
+                rows.push(HelpFindRow::Category(entry.category.as_str()));
+            }
+            rows.push(HelpFindRow::Entry(entry));
+        }
+        rows
     }
 
     pub fn no_results_message(&self) -> String {
@@ -102,11 +161,14 @@ impl HelpFindState {
     }
 
     pub fn selected(&self) -> Option<&HelpEntry> {
-        self.filtered_entries().get(self.cursor).copied()
+        self.filtered_rows().get(self.cursor).and_then(HelpFindRow::entry)
     }
 
     pub fn open_selected(&mut self) {
         let selected_command = self.selected().map(|entry| entry.command.clone());
+        if let Some(command) = selected_command.as_ref() {
+            self.remember_opened(command);
+        }
         self.detail_idx = selected_command
             .and_then(|command| self.entries.iter().position(|entry| entry.command == command));
     }
@@ -120,18 +182,39 @@ impl HelpFindState {
     }
 
     pub fn move_down(&mut self) {
-        let len = self.filtered_entries().len();
-        if len == 0 {
+        let rows = self.filtered_rows();
+        if rows.is_empty() {
             self.cursor = 0;
             self.scroll = 0;
             return;
         }
-        self.cursor = (self.cursor + 1).min(len - 1);
+        let mut next = (self.cursor + 1).min(rows.len() - 1);
+        while next < rows.len() && rows[next].entry().is_none() {
+            if next == rows.len() - 1 {
+                break;
+            }
+            next += 1;
+        }
+        if rows[next].entry().is_some() {
+            self.cursor = next;
+        }
         self.scroll_to_cursor();
     }
 
     pub fn move_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        let rows = self.filtered_rows();
+        if rows.is_empty() {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        let mut next = self.cursor.saturating_sub(1);
+        while next > 0 && rows[next].entry().is_none() {
+            next = next.saturating_sub(1);
+        }
+        if rows[next].entry().is_some() {
+            self.cursor = next;
+        }
         self.scroll_to_cursor();
     }
 
@@ -151,8 +234,21 @@ impl HelpFindState {
     }
 
     fn reset_position(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.first_entry_row_index();
         self.scroll = 0;
+    }
+
+    fn first_entry_row_index(&self) -> usize {
+        self.filtered_rows()
+            .iter()
+            .position(|row| row.entry().is_some())
+            .unwrap_or(0)
+    }
+
+    fn remember_opened(&mut self, command: &str) {
+        self.recently_opened.retain(|existing| existing != command);
+        self.recently_opened.insert(0, command.to_string());
+        self.recently_opened.truncate(10);
     }
 
     fn scroll_to_cursor(&mut self) {
@@ -162,6 +258,11 @@ impl HelpFindState {
         let bottom = self.scroll + self.visible_height;
         if self.cursor >= bottom {
             self.scroll = self.cursor + 1 - self.visible_height;
+        }
+        let len = self.filtered_rows().len();
+        if self.cursor >= len {
+            self.cursor = self.first_entry_row_index();
+            self.scroll = 0;
         }
     }
 }
@@ -243,6 +344,22 @@ impl HelpRegistry {
             .or_else(|| self.branch(&normalized))
     }
 
+    pub fn command_prefix_match_count(&self, partial: &str) -> usize {
+        let needle = partial.trim().trim_start_matches('/').to_ascii_lowercase();
+        if needle.is_empty() {
+            return 0;
+        }
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.command.trim_start_matches('/').to_ascii_lowercase().starts_with(&needle)
+                    || entry.aliases.iter().any(|alias| {
+                        alias.trim_start_matches('/').to_ascii_lowercase().starts_with(&needle)
+                    })
+            })
+            .count()
+    }
+
     fn entry_by_command_exact(&self, command: &str) -> Option<&HelpEntry> {
         let needle = normalize_query_command(command);
         self.entries.iter().find(|entry| entry.command == needle)
@@ -251,6 +368,15 @@ impl HelpRegistry {
 
 pub fn builtin_entries() -> Vec<HelpEntry> {
     serde_json::from_str(BUILTIN_HELP_JSON).expect("assets/help.json must be valid help JSON")
+}
+
+pub fn prefilter_query_for_slash_command(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let partial = trimmed.strip_prefix('/')?.trim();
+    if partial.is_empty() {
+        return None;
+    }
+    Some(partial.to_string())
 }
 
 pub fn render_help(registry: &HelpRegistry, branch: Option<&str>) -> Option<String> {
@@ -480,6 +606,10 @@ fn protected_commands(entries: &[HelpEntry]) -> HashSet<String> {
 }
 
 fn ranked_entries<'a>(entries: &'a [HelpEntry], query: &str) -> Vec<&'a HelpEntry> {
+    ranked_entries_with_mru(entries, query, &[])
+}
+
+fn ranked_entries_with_mru<'a>(entries: &'a [HelpEntry], query: &str, recently_opened: &[String]) -> Vec<&'a HelpEntry> {
     let needle = query.trim().to_ascii_lowercase();
     let mut scored: Vec<(&HelpEntry, i32)> = entries
         .iter()
@@ -487,7 +617,7 @@ fn ranked_entries<'a>(entries: &'a [HelpEntry], query: &str) -> Vec<&'a HelpEntr
             if needle.is_empty() {
                 Some((entry, empty_query_score(entry)))
             } else {
-                match_score(entry, &needle).map(|score| (entry, score))
+                match_score(entry, &needle).map(|score| (entry, score + mru_bonus(entry, recently_opened)))
             }
         })
         .collect();
@@ -563,6 +693,41 @@ fn field_matches(value: &str, needle: &str) -> bool {
 
 fn common_bonus(entry: &HelpEntry) -> i32 {
     if entry.common { 100 } else { 0 }
+}
+
+fn mru_bonus(entry: &HelpEntry, recently_opened: &[String]) -> i32 {
+    recently_opened
+        .iter()
+        .position(|command| command == &entry.command)
+        .map(|idx| 50 - (idx as i32).min(49))
+        .unwrap_or(0)
+}
+
+pub fn highlight_segments(text: &str, query: &str) -> Vec<HighlightSegment> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return vec![HighlightSegment { text: text.to_string(), matched: false }];
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while let Some(relative) = lower[start..].find(&needle) {
+        let match_start = start + relative;
+        let match_end = match_start + needle.len();
+        if match_start > start {
+            segments.push(HighlightSegment { text: text[start..match_start].to_string(), matched: false });
+        }
+        segments.push(HighlightSegment { text: text[match_start..match_end].to_string(), matched: true });
+        start = match_end;
+    }
+    if start < text.len() {
+        segments.push(HighlightSegment { text: text[start..].to_string(), matched: false });
+    }
+    if segments.is_empty() {
+        segments.push(HighlightSegment { text: text.to_string(), matched: false });
+    }
+    segments
 }
 
 #[cfg(test)]

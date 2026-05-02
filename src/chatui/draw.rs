@@ -549,8 +549,16 @@ pub(crate) fn draw(
                         .collect();
                     if prefix_matches.len() == 1 {
                         Some(prefix_matches[0])
+                    } else if prefix_matches.len() > 1 {
+                        let ghost_style = Style::default()
+                            .fg(THEME.load().border)
+                            .add_modifier(Modifier::DIM);
+                        if let Some(last_row) = rows.last_mut() {
+                            last_row.push(Span::styled(format!("  {} matches · Tab search", prefix_matches.len()), ghost_style));
+                        }
+                        None
                     } else {
-                        super::commands::fuzzy_match(partial, &commands)
+                        None
                     }
                 };
                 if let Some(cmd) = hint {
