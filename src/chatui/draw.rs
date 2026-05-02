@@ -15,52 +15,75 @@ use tachyonfx::{fx, Effect, Interpolation, Shader};
 /// pill schema — see Phase 7 plan, deferred slice.)
 pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> {
     let sidecar = app.sidecar.as_ref()?;
-    let (text, color) = match &sidecar.status {
+    let label = sidecar.display_name.as_deref().unwrap_or("sidecar");
+    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, app.spinner_frame);
+    let color = match &sidecar.status {
         super::sidecar::SidecarUiStatus::Idle => {
-            // Show armed-but-quiet (between VAD utterances) as listening
-            // — to the user the mic is still hot.
             if sidecar.armed {
                 let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
                 let base = match THEME.load().status_streaming {
                     Color::Rgb(r, g, b) => (r, g, b),
                     _ => (220, 80, 80),
                 };
-                let r = (base.0 as f64 * pulse) as u8;
-                let g = (base.1 as f64 * pulse) as u8;
-                let b = (base.2 as f64 * pulse) as u8;
-                (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+                Color::Rgb(
+                    (base.0 as f64 * pulse) as u8,
+                    (base.1 as f64 * pulse) as u8,
+                    (base.2 as f64 * pulse) as u8,
+                )
             } else {
-                (" \u{25cb} sidecar ", THEME.load().muted)
+                THEME.load().muted
             }
         }
         super::sidecar::SidecarUiStatus::Listening => {
-            // Pulse like the streaming indicator so the user sees we're live.
             let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
             let base = match THEME.load().status_streaming {
                 Color::Rgb(r, g, b) => (r, g, b),
                 _ => (220, 80, 80),
             };
-            let r = (base.0 as f64 * pulse) as u8;
-            let g = (base.1 as f64 * pulse) as u8;
-            let b = (base.2 as f64 * pulse) as u8;
-            (" \u{1f3a4} listening ", Color::Rgb(r, g, b))
+            Color::Rgb(
+                (base.0 as f64 * pulse) as u8,
+                (base.1 as f64 * pulse) as u8,
+                (base.2 as f64 * pulse) as u8,
+            )
         }
-        super::sidecar::SidecarUiStatus::Transcribing => {
-            let spinner_idx = (app.spinner_frame / 3) % SPINNER_FRAMES.len();
-            let frame = SPINNER_FRAMES[spinner_idx];
-            return Some(Span::styled(
-                format!(" {} transcribing ", frame),
-                Style::default().fg(THEME.load().status_streaming),
-            ));
-        }
-        super::sidecar::SidecarUiStatus::Error(_) => {
-            (" \u{26a0} sidecar error ", Color::Red)
-        }
+        super::sidecar::SidecarUiStatus::Transcribing => THEME.load().status_streaming,
+        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
+    };
+    let modifier = match &sidecar.status {
+        super::sidecar::SidecarUiStatus::Transcribing => Modifier::empty(),
+        _ => Modifier::BOLD,
     };
     Some(Span::styled(
-        text.to_string(),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        text,
+        Style::default().fg(color).add_modifier(modifier),
     ))
+}
+
+/// Pure helper backing [`sidecar_pill_span`] — returns the rendered
+/// text only. Lives separately so tests can exercise the label logic
+/// without spawning a real sidecar process or mounting the full App.
+pub(crate) fn sidecar_pill_text(
+    label: &str,
+    status: &super::sidecar::SidecarUiStatus,
+    armed: bool,
+    spinner_frame: usize,
+) -> String {
+    match status {
+        super::sidecar::SidecarUiStatus::Idle => {
+            if armed {
+                " \u{1f3a4} listening ".to_string()
+            } else {
+                format!(" \u{25cb} {label} ")
+            }
+        }
+        super::sidecar::SidecarUiStatus::Listening => " \u{1f3a4} listening ".to_string(),
+        super::sidecar::SidecarUiStatus::Transcribing => {
+            let spinner_idx = (spinner_frame / 3) % SPINNER_FRAMES.len();
+            let frame = SPINNER_FRAMES[spinner_idx];
+            format!(" {} transcribing ", frame)
+        }
+        super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +101,54 @@ mod sidecar_pill_tests {
         assert!(sidecar_pill_span(&app).is_none());
     }
 
+    #[test]
+    fn pill_uses_display_name_when_set() {
+        // Idle, unarmed pill should show the display name.
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Idle,
+            false,
+            0,
+        );
+        assert!(text.contains("Voice"), "expected pill to contain 'Voice', got: {text:?}");
+        assert!(!text.contains("sidecar"), "expected no 'sidecar' fallback, got: {text:?}");
+    }
+
+    #[test]
+    fn pill_falls_back_to_sidecar_when_no_display_name() {
+        let text = sidecar_pill_text(
+            "sidecar",
+            &super::super::sidecar::SidecarUiStatus::Idle,
+            false,
+            0,
+        );
+        assert!(text.contains("sidecar"), "got: {text:?}");
+    }
+
+    #[test]
+    fn pill_error_state_uses_display_name() {
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Error("oops".into()),
+            false,
+            0,
+        );
+        assert!(text.contains("Voice error"), "got: {text:?}");
+    }
+
+    #[test]
+    fn pill_listening_state_is_modality_neutral() {
+        // Listening / transcribing don't get the display name suffix
+        // (per slice 8A.5 spec — keep it simple).
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Listening,
+            true,
+            0,
+        );
+        assert!(text.contains("listening"), "got: {text:?}");
+        assert!(!text.contains("Voice"), "got: {text:?}");
+    }
 
     #[test]
     fn active_tasks_progress_line_renders_fraction() {
