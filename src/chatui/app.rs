@@ -834,6 +834,33 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_system_messages_are_separated_by_a_blank_line() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("first".to_string()));
+        app.push_msg(ChatMessage::System("second".to_string()));
+
+        let lines = app.render_lines(80);
+        let first_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("first")))
+            .expect("first system message should render");
+        let second_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
+            .expect("second system message should render");
+
+        let has_blank_separator = lines[first_idx + 1..second_idx]
+            .iter()
+            .any(|line| line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty()));
+
+        assert!(
+            has_blank_separator,
+            "expected blank separator between consecutive system messages; got {:?}",
+            &lines[first_idx..=second_idx]
+        );
+    }
+
+    #[test]
     fn pasted_message_display_preserves_text_typed_after_paste() {
         let mut app = test_app();
         app.input_before_paste = Some("before".to_string());
