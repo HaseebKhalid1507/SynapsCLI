@@ -65,6 +65,8 @@ pub struct PluginManifest {
     pub commands: Vec<ManifestCommand>,
     #[serde(default)]
     pub extension: Option<crate::extensions::manifest::ExtensionManifest>,
+    #[serde(default)]
+    pub help_entries: Vec<crate::help::HelpEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +124,7 @@ mod tests {
         assert_eq!(m.version, None);
         assert_eq!(m.description, None);
         assert!(m.commands.is_empty());
+        assert!(m.help_entries.is_empty());
         assert!(m.compatibility.is_none());
     }
 
@@ -146,6 +149,29 @@ mod tests {
         assert_eq!(m.description.as_deref(), Some("Web tools"));
         assert_eq!(m.compatibility.as_ref().unwrap().synaps.as_deref(), Some(">=0.1.0"));
         assert_eq!(m.compatibility.as_ref().unwrap().extension_protocol.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn plugin_manifest_parses_help_entries() {
+        let json = r#"{
+            "name": "web-tools",
+            "help_entries": [
+                {
+                    "id": "web-search-help",
+                    "command": "/web:search",
+                    "title": "Web Search",
+                    "summary": "Search the web from a plugin.",
+                    "category": "Plugin",
+                    "topic": "Command",
+                    "protected": false,
+                    "common": false,
+                    "keywords": ["web", "search"]
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.help_entries.len(), 1);
+        assert_eq!(m.help_entries[0].command, "/web:search");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::skills::{LoadedSkill, Plugin};
+use crate::help::HelpEntry;
 
 #[derive(Debug, Clone)]
 pub struct PluginSummary {
@@ -44,6 +45,7 @@ struct Inner {
     skills: HashMap<String, Vec<Arc<LoadedSkill>>>, // unqualified name -> all matches
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
     plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>>, // "plugin:cmd" -> single
+    plugin_help_entries: Vec<HelpEntry>,
 }
 
 pub struct CommandRegistry {
@@ -63,6 +65,7 @@ impl CommandRegistry {
                 skills: HashMap::new(),
                 qualified: HashMap::new(),
                 plugin_commands: HashMap::new(),
+                plugin_help_entries: Vec::new(),
             }),
         };
         r.rebuild_with_plugins(skills, plugins);
@@ -81,8 +84,10 @@ impl CommandRegistry {
         let mut new_skills: HashMap<String, Vec<Arc<LoadedSkill>>> = HashMap::new();
         let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
         let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
+        let mut new_plugin_help_entries: Vec<HelpEntry> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
+                new_plugin_help_entries.extend(manifest.help_entries.clone());
                 for cmd in manifest.commands {
                     let (name, description, backend) = match cmd {
                         crate::skills::manifest::ManifestCommand::Shell(cmd) => (
@@ -135,6 +140,7 @@ impl CommandRegistry {
         w.skills = new_skills;
         w.qualified = new_qualified;
         w.plugin_commands = new_plugin_commands;
+        w.plugin_help_entries = new_plugin_help_entries;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
@@ -196,6 +202,10 @@ impl CommandRegistry {
             .collect()
     }
 
+    pub fn plugin_help_entries(&self) -> Vec<HelpEntry> {
+        self.inner.read().unwrap().plugin_help_entries.clone()
+    }
+
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
         let r = self.inner.read().unwrap();
         let mut seen: std::collections::HashSet<(Option<String>, String)> =
@@ -242,6 +252,7 @@ mod tests {
                     args: vec!["hi".to_string()],
                 })],
                 extension: None,
+                help_entries: vec![],
             }),
         }
     }
