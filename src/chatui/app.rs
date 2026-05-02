@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_system_messages_are_separated_by_a_blank_line() {
+    fn consecutive_system_messages_are_separated_by_a_center_rule() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("first".to_string()));
         app.push_msg(ChatMessage::System("second".to_string()));
@@ -849,13 +849,15 @@ mod tests {
             .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
             .expect("second system message should render");
 
-        let has_blank_separator = lines[first_idx + 1..second_idx]
+        let has_center_rule = lines[first_idx + 1..second_idx]
             .iter()
-            .any(|line| line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty()));
+            .any(|line| line.spans.iter().any(|span| {
+                span.content.contains("─ · ─") || span.content.contains("── · ──")
+            }));
 
         assert!(
-            has_blank_separator,
-            "expected blank separator between consecutive system messages; got {:?}",
+            has_center_rule,
+            "expected centered rule between consecutive system messages; got {:?}",
             &lines[first_idx..=second_idx]
         );
     }

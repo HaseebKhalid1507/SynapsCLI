@@ -539,7 +539,7 @@ impl App {
 
                 ChatMessage::System(msg) => {
                     if i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::System(_)) {
-                        lines.push(Line::from(""));
+                        lines.push(system_separator_line(m, width));
                     }
                     // Newline-aware AND wrap-aware: split on '\n' first so
                     // explicit line breaks always render as separate rows,
@@ -597,4 +597,15 @@ impl App {
 
         lines
     }
+}
+
+fn system_separator_line(margin: &str, width: usize) -> Line<'static> {
+    let rule_width = width.saturating_sub(margin.len()).min(34).max(9);
+    let side = "─".repeat(rule_width.saturating_sub(3) / 2);
+    let rule = format!("{} · {}", side, side);
+    let pad = width.saturating_sub(margin.len() + rule.chars().count()) / 2;
+    Line::from(vec![
+        Span::raw(format!("{}{}", margin, " ".repeat(pad))),
+        Span::styled(rule, Style::default().fg(THEME.load().separator).add_modifier(Modifier::DIM)),
+    ])
 }
