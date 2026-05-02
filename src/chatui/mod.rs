@@ -16,6 +16,7 @@ mod models;
 mod help_find;
 mod helpers;
 mod lifecycle;
+mod viewport;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};

@@ -91,6 +91,7 @@ pub(crate) fn draw(
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     secret_prompts: &synaps_cli::tools::SecretPromptQueue,
 ) -> io::Result<()> {
+    super::viewport::scrub_crossterm_terminal_edges(terminal, Style::default().bg(THEME.load().bg))?;
     let model = runtime.model();
     let thinking = runtime.thinking_level();
     // Don't draw while casino owns the terminal
