@@ -1444,6 +1444,80 @@ impl ProcessExtension {
         self.inbox.notification_sink.lock().await.take();
     }
 
+    /// Forward one notification frame received during `command.invoke`.
+    ///
+    /// Routes:
+    /// - `command.output` whose `request_id` matches → sink as `Output(event)`
+    ///   (other request_ids are ignored — concurrent invocations must use distinct ids
+    ///    and may overlap in the same `subscribe_notifications` channel; mismatched
+    ///    frames are dropped here intentionally).
+    /// - `task.start|update|log|done` → sink as `Task(event)` regardless of request_id.
+    /// - Anything else → logged at trace and dropped.
+    pub(crate) fn forward_invoke_command_frame(
+        extension_id: &str,
+        request_id: &str,
+        sink: &mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+        sink_open: &mut bool,
+        frame: NotificationFrame,
+    ) -> bool {
+        use crate::extensions::commands::parse_command_output;
+        use crate::extensions::tasks::{is_task_method, parse_task_event};
+        use crate::extensions::runtime::InvokeCommandEvent;
+
+        let mut saw_done = false;
+        if frame.method == "command.output" {
+            match parse_command_output(&frame.params) {
+                Ok(parsed) if parsed.request_id == request_id => {
+                    if matches!(parsed.event, crate::extensions::commands::CommandOutputEvent::Done) {
+                        saw_done = true;
+                    }
+                    if *sink_open && sink.send(InvokeCommandEvent::Output(parsed.event)).is_err() {
+                        *sink_open = false;
+                    }
+                }
+                Ok(_) => {
+                    // Different request_id — ignore (logged at trace for diagnostics).
+                    tracing::trace!(
+                        extension = %extension_id,
+                        "Ignoring command.output for unrelated request_id",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %extension_id,
+                        error = %error,
+                        params = %frame.params,
+                        "Skipping malformed command.output notification",
+                    );
+                }
+            }
+        } else if is_task_method(&frame.method) {
+            match parse_task_event(&frame.method, &frame.params) {
+                Ok(event) => {
+                    if *sink_open && sink.send(InvokeCommandEvent::Task(event)).is_err() {
+                        *sink_open = false;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %extension_id,
+                        method = %frame.method,
+                        error = %error,
+                        params = %frame.params,
+                        "Skipping malformed task notification",
+                    );
+                }
+            }
+        } else {
+            tracing::trace!(
+                extension = %extension_id,
+                method = %frame.method,
+                "Ignoring non-command/task notification during command.invoke",
+            );
+        }
+        saw_done
+    }
+
     /// Forward one notification frame received during `provider.stream`.
     ///
     /// - Frames whose method is not `provider.stream.event` are ignored (logged at trace).
@@ -1566,6 +1640,59 @@ impl ExtensionHandler for ProcessExtension {
         // NOTE: empty `content` is permitted for streaming — output may have
         // been delivered entirely via TextDelta notifications.
         Ok(result)
+    }
+
+    async fn invoke_command(
+        &self,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+    ) -> Result<Value, String> {
+        // Subscribe before issuing the request so we don't miss early events.
+        let mut rx = self.subscribe_notifications().await;
+        let params = serde_json::json!({
+            "command": command,
+            "args": args,
+            "request_id": request_id,
+        });
+
+        let extension_id = self.id.clone();
+        let request_id_owned = request_id.to_string();
+        let invoke_future = async {
+            let mut call_fut = Box::pin(self.call("command.invoke", params));
+            let mut sink_open = true;
+            let response = loop {
+                tokio::select! {
+                    response = &mut call_fut => break response,
+                    Some(frame) = rx.recv() => {
+                        let _ = Self::forward_invoke_command_frame(
+                            &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
+                        );
+                    }
+                }
+            };
+            // Drain any remaining buffered notifications after the response lands.
+            self.unsubscribe_notifications().await;
+            while let Some(frame) = rx.recv().await {
+                let _ = Self::forward_invoke_command_frame(
+                    &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
+                );
+            }
+            response
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            invoke_future,
+        )
+        .await;
+
+        // Belt-and-braces: ensure subscription is cleared on timeout too.
+        self.unsubscribe_notifications().await;
+
+        outcome
+            .map_err(|_| format!("Extension '{}' command.invoke timed out", self.id))?
     }
 
     async fn handle(&self, event: &HookEvent) -> HookResult {
@@ -1952,5 +2079,174 @@ mod voice_validator_tests {
         let perms = perms_with(&[]);
         let err = validate_voice_capability(&d, &perms).unwrap_err();
         assert!(err.contains("audio.input"), "got: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod invoke_command_dispatch_tests {
+    //! Phase B Phase 2/3 — exercise the notification dispatcher used by
+    //! `command.invoke`. Spawning a real subprocess is not required: we feed
+    //! `NotificationFrame`s directly through `forward_invoke_command_frame`
+    //! and assert the sink ordering.
+    use super::*;
+    use crate::extensions::commands::CommandOutputEvent;
+    use crate::extensions::runtime::InvokeCommandEvent;
+    use crate::extensions::tasks::{TaskEvent, TaskKind};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn frame(method: &str, params: serde_json::Value) -> NotificationFrame {
+        NotificationFrame {
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    #[test]
+    fn forwards_mixed_event_stream_in_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        let frames = vec![
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"text","content":"A"}}),
+            ),
+            frame(
+                "task.start",
+                json!({"id":"dl","label":"Downloading","kind":"download"}),
+            ),
+            frame(
+                "task.update",
+                json!({"id":"dl","current":50,"total":100}),
+            ),
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"system","content":"working"}}),
+            ),
+            frame("task.done", json!({"id":"dl"})),
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"done"}}),
+            ),
+        ];
+
+        let mut saw_done = false;
+        for f in frames {
+            saw_done |= ProcessExtension::forward_invoke_command_frame(
+                "ext-test", "r1", &tx, &mut open, f,
+            );
+        }
+        drop(tx);
+        assert!(saw_done, "should have observed the command Done marker");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events[0],
+            InvokeCommandEvent::Output(CommandOutputEvent::Text { content: "A".into() })
+        );
+        assert!(matches!(
+            events[1],
+            InvokeCommandEvent::Task(TaskEvent::Start { kind: TaskKind::Download, .. })
+        ));
+        assert!(matches!(
+            events[2],
+            InvokeCommandEvent::Task(TaskEvent::Update { .. })
+        ));
+        assert!(matches!(
+            events[3],
+            InvokeCommandEvent::Output(CommandOutputEvent::System { .. })
+        ));
+        assert!(matches!(
+            events[4],
+            InvokeCommandEvent::Task(TaskEvent::Done { error: None, .. })
+        ));
+        assert_eq!(events[5], InvokeCommandEvent::Output(CommandOutputEvent::Done));
+    }
+
+    #[test]
+    fn ignores_command_output_for_unrelated_request_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame(
+                "command.output",
+                json!({"request_id":"other","event":{"kind":"text","content":"x"}}),
+            ),
+        );
+        drop(tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn skips_malformed_command_output_without_aborting() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        // Missing 'kind'
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("command.output", json!({"request_id":"r1","event":{}})),
+        );
+        // Followed by a good event — must still be delivered.
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"done"}}),
+            ),
+        );
+        drop(tx);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev, InvokeCommandEvent::Output(CommandOutputEvent::Done));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn task_events_pass_through_regardless_of_request_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("task.log", json!({"id":"abc","line":"..."})),
+        );
+        drop(tx);
+        match rx.try_recv().unwrap() {
+            InvokeCommandEvent::Task(TaskEvent::Log { id, line }) => {
+                assert_eq!(id, "abc");
+                assert_eq!(line, "...");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_methods_are_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("provider.stream.event", json!({"type":"text","delta":"x"})),
+        );
+        drop(tx);
+        assert!(rx.try_recv().is_err());
     }
 }

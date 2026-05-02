@@ -476,6 +476,25 @@ impl ExtensionManager {
         self.plugin_info.get(id)
     }
 
+    /// Invoke an interactive plugin command on extension `id`. Streams
+    /// `command.output` (matching `request_id`) and `task.*` notifications
+    /// to `sink`. Returns the final JSON-RPC response value.
+    pub async fn invoke_command(
+        &self,
+        id: &str,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.invoke_command(command, args, request_id, sink).await
+    }
+
     /// Return all cached plugin info sorted by extension id.
     pub fn plugin_infos(&self) -> Vec<(&str, &PluginInfo)> {
         let mut entries: Vec<_> = self

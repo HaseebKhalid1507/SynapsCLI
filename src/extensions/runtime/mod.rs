@@ -10,6 +10,17 @@ use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent};
 use crate::extensions::info::PluginInfo;
+use crate::extensions::commands::CommandOutputEvent;
+use crate::extensions::tasks::TaskEvent;
+
+/// Streamed event delivered to a `command.invoke` caller.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InvokeCommandEvent {
+    /// Command output event matching the caller's `request_id`.
+    Output(CommandOutputEvent),
+    /// Spontaneous plugin task event (any `request_id`).
+    Task(TaskEvent),
+}
 
 /// Health state for an extension handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +103,19 @@ pub trait ExtensionHandler: Send + Sync {
         _sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         Err("provider.stream is not supported by this extension".to_string())
+    }
+
+    /// Invoke a plugin-registered interactive slash command. The handler must
+    /// forward `command.output` notifications matching `request_id` and any
+    /// `task.*` notifications to `sink`. Returns the final response value.
+    async fn invoke_command(
+        &self,
+        _command: &str,
+        _args: Vec<String>,
+        _request_id: &str,
+        _sink: tokio::sync::mpsc::UnboundedSender<InvokeCommandEvent>,
+    ) -> Result<Value, String> {
+        Err("extension runtime does not support command.invoke".to_string())
     }
 
     /// Fetch optional plugin capability/build/model information.
