@@ -333,6 +333,9 @@ impl HelpRegistry {
                 entry.protected = false;
             }
             entry.source = Some(plugin_source_label(entry.source.as_deref()));
+            if entry.category.trim().is_empty() || entry.category.eq_ignore_ascii_case("plugin") {
+                entry.category = extension_help_category(entry.source.as_deref());
+            }
             if seen.insert(entry.command.clone()) {
                 entries.push(entry);
             }
@@ -411,7 +414,13 @@ fn default_plugin_category() -> String {
 }
 
 fn category_sort_key(category: &str) -> u8 {
-    if category == "Help commands" { 1 } else { 0 }
+    if category == "Help commands" {
+        1
+    } else if is_extension_help_category(category) {
+        2
+    } else {
+        0
+    }
 }
 
 fn help_parent_sort_key(entry: &HelpEntry) -> usize {
@@ -680,6 +689,50 @@ fn plugin_source_label(source: Option<&str>) -> String {
         Some(source) if source.to_ascii_lowercase().starts_with("plugin ") => source.to_string(),
         Some(source) => format!("plugin {}", source),
     }
+}
+
+fn extension_help_category(source: Option<&str>) -> String {
+    let Some(source) = source.map(str::trim).filter(|source| !source.is_empty()) else {
+        return "Extensions".to_string();
+    };
+    let plugin_name = source
+        .strip_prefix("plugin ")
+        .unwrap_or(source)
+        .trim();
+    if plugin_name.is_empty() || plugin_name.eq_ignore_ascii_case("plugin") {
+        return "Extensions".to_string();
+    }
+    plugin_name
+        .split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case_word(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_ascii_lowercase(),
+    }
+}
+
+fn is_extension_help_category(category: &str) -> bool {
+    !category.is_empty()
+        && category != "Help commands"
+        && !matches!(
+            category,
+            "Advanced"
+                | "Core"
+                | "Diagnostics"
+                | "Extensions"
+                | "Models"
+                | "Plugins"
+                | "Sessions"
+                | "Settings"
+                | "Tools"
+        )
 }
 
 fn protected_commands(entries: &[HelpEntry]) -> HashSet<String> {

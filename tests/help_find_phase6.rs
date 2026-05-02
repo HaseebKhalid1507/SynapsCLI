@@ -20,6 +20,12 @@ fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpE
     }
 }
 
+fn plugin_entry(command: &str, title: &str, source: &str) -> HelpEntry {
+    let mut entry = test_entry(command, title, "Plugin", false);
+    entry.source = Some(source.to_string());
+    entry
+}
+
 #[test]
 fn help_find_places_help_commands_category_last_with_parent_command_first() {
     let registry = HelpRegistry::new(
@@ -38,6 +44,37 @@ fn help_find_places_help_commands_category_last_with_parent_command_first() {
     assert_eq!(help_header_index, rows.iter().rposition(|row| row.category().is_some()).unwrap());
     assert_eq!(rows[help_header_index + 1].entry().map(|entry| entry.command.as_str()), Some("/help"));
     assert_eq!(rows[help_header_index + 2].entry().map(|entry| entry.command.as_str()), Some("/help find"));
+}
+
+#[test]
+fn help_find_places_extension_sections_below_help_commands_in_source_alphabetical_order() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/help", "Help", "Core", true),
+            test_entry("/help find", "Find Help", "Core", true),
+            test_entry("/plugins", "Plugins Modal", "Plugins", true),
+        ],
+        vec![
+            plugin_entry("/zebra:demo", "Zebra Demo", "zebra-tools"),
+            plugin_entry("/acme:sync", "Acme Sync", "acme-tools"),
+            plugin_entry("/help acme", "Acme Help", "acme-tools"),
+        ],
+    );
+    let state = HelpFindState::new(registry.entries().to_vec(), "");
+
+    let categories = state
+        .filtered_rows()
+        .into_iter()
+        .filter_map(|row| row.category().map(str::to_string))
+        .collect::<Vec<_>>();
+
+    let help_index = categories.iter().position(|category| category == "Help commands").unwrap();
+    let acme_index = categories.iter().position(|category| category == "Acme Tools").unwrap();
+    let zebra_index = categories.iter().position(|category| category == "Zebra Tools").unwrap();
+
+    assert!(help_index < acme_index, "extension sections should load below Help commands: {categories:?}");
+    assert!(acme_index < zebra_index, "extension sections should be alphabetical: {categories:?}");
+    assert!(!categories.contains(&"Plugin".to_string()), "plugin entries should not use generic Plugin header: {categories:?}");
 }
 
 #[test]
