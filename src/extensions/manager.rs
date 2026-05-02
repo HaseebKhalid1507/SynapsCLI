@@ -970,6 +970,7 @@ mod tests {
             "local-voice",
             &[ExtensionConfigEntry {
                 key: "backend".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -991,6 +992,7 @@ mod tests {
             "local-voice",
             &[ExtensionConfigEntry {
                 key: "backend".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -1031,6 +1033,7 @@ mod tests {
             }],
             config: vec![crate::extensions::manifest::ExtensionConfigEntry {
                 key: "region".to_string(),
+                value_type: None,
                 description: Some("AWS region".to_string()),
                 required: false,
                 default: Some(serde_json::Value::String("us-east-1".to_string())),

@@ -167,6 +167,7 @@ mod tests {
     fn entry(key: &str) -> ExtensionConfigEntry {
         ExtensionConfigEntry {
             key: key.to_string(),
+            value_type: None,
             description: None,
             required: false,
             default: None,

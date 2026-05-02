@@ -476,6 +476,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         config: vec![
             ExtensionConfigEntry {
                 key: "endpoint".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -483,6 +484,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "mode".to_string(),
+                value_type: None,
                 description: None,
                 required: false,
                 default: Some(serde_json::json!("safe")),
@@ -490,6 +492,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "token".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -528,6 +531,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
         }],
         config: vec![ExtensionConfigEntry {
             key: "endpoint".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -566,6 +570,7 @@ async fn extension_provider_complete_routes_to_process() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -625,6 +630,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -1062,6 +1068,7 @@ async fn audit_log_records_disabled_route() {
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
