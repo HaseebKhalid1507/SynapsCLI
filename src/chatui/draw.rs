@@ -1034,17 +1034,8 @@ pub(crate) fn draw(
         }
 
         if let Some(ref state) = app.settings {
-            let mut snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
-            snap.voice_compiled_backend = app
-                .voice
-                .as_ref()
-                .and_then(|v| v.compiled_backend.clone())
-                .or_else(|| app.cached_voice_compiled_backend.clone());
-            let download = match (&app.download_filename, &app.download_progress) {
-                (Some(f), Some(p)) => Some((f.as_str(), p)),
-                _ => None,
-            };
-            super::settings::render(frame, frame.area(), state, &snap, download);
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            super::settings::render(frame, frame.area(), state, &snap);
         }
         if let Some(ref state) = app.models {
             super::models::render(frame, frame.area(), state, runtime.model());

@@ -43,18 +43,6 @@ pub(crate) enum EditorKind {
     Cycler(&'static [&'static str]),
     ModelPicker,
     ThemePicker,
-    /// Picks a whisper STT model (`*.bin`) from
-    /// `~/.synaps-cli/models/whisper/`. Persisted as `voice_stt_model_path`.
-    ///
-    /// Superseded by `ModelBrowser` — kept for back-compat with any
-    /// downstream definitions that haven't migrated yet.
-    #[allow(dead_code)]
-    WhisperModelPicker,
-    /// Browses the whisper.cpp catalog: shows installed status against
-    /// `~/.synaps-cli/models/whisper/`, lets the user select an installed
-    /// model OR trigger a download for an uninstalled one. Persists the
-    /// selected model's absolute path under `voice_stt_model_path`.
-    ModelBrowser,
     Text { numeric: bool },
 }
 
@@ -106,13 +94,13 @@ mod tests {
 
     #[test]
     fn voice_settings_belong_to_voice_category() {
-        let voice_keys = ["voice_toggle_key", "voice_language"];
+        let voice_keys = ["voice_toggle_key"];
         for def in ALL_SETTINGS {
             if voice_keys.contains(&def.key) {
                 assert_eq!(def.category, Category::Voice, "setting '{}' should be in Voice", def.key);
             }
         }
-        // Both keys must exist.
+        // voice_toggle_key must exist (it's the only generic voice setting kept in core).
         let keys: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
         for k in voice_keys {
             assert!(keys.contains(&k), "missing voice setting: {}", k);

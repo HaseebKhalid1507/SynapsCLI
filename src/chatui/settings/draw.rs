@@ -11,7 +11,6 @@ pub(crate) fn render(
     area: Rect,
     state: &SettingsState,
     snap: &RuntimeSnapshot,
-    download: Option<(&str, &synaps_cli::voice::download::DownloadProgress)>,
 ) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
     let h = (area.height.saturating_mul(7) / 10).max(20).min(area.height);
@@ -42,9 +41,6 @@ pub(crate) fn render(
     render_settings(frame, panes[1], state, snap);
     render_footer(frame, outer[1], state);
 
-    if let Some(ActiveEditor::ModelBrowser { cursor, rows }) = &state.edit_mode {
-        render_model_browser(frame, panes[1], rows, *cursor, download);
-    }
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
         render_plugin_custom_editor(frame, panes[1], render);
     }
@@ -137,48 +133,6 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         lines.push(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(format!("  {:<20} {}", def.label, value_display), style),
         ]));
-        // Voice backend annotation: show what's currently compiled in and
-        // whether it matches the selection. Appended below the cycler row.
-        if def.key == "voice_stt_backend" {
-            let compiled = snap
-                .voice_compiled_backend
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            let selected_concrete = {
-                let raw = synaps_cli::config::read_config_value("voice_stt_backend")
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "auto".to_string());
-                if raw == "auto" {
-                    synaps_cli::voice::discovery::detect_host_backend().to_string()
-                } else {
-                    raw
-                }
-            };
-            let mismatch = compiled != "unknown" && compiled != selected_concrete;
-            let (text, color) = if compiled == "unknown" {
-                (
-                    "    Current build: unknown".to_string(),
-                    THEME.load().help_fg,
-                )
-            } else if mismatch {
-                (
-                    format!(
-                        "    Current build: {}    ⚠ rebuild required (run `/voice rebuild`)",
-                        compiled
-                    ),
-                    THEME.load().error_color,
-                )
-            } else {
-                (
-                    format!("    Current build: {}", compiled),
-                    THEME.load().help_fg,
-                )
-            };
-            lines.push(ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(text, Style::default().fg(color)),
-            ]));
-        }
         if let Some((key, msg)) = &state.row_error {
             if selected_key == Some(key.as_str()) && i == state.setting_idx {
                 let is_note = msg.starts_with("saved");
@@ -545,91 +499,6 @@ fn render_plugin_custom_editor(
     }
 }
 
-fn render_model_browser(
-    frame: &mut Frame,
-    area: Rect,
-    rows: &[super::ModelBrowserRow],
-    cursor: usize,
-    download: Option<(&str, &synaps_cli::voice::download::DownloadProgress)>,
-) {
-    let footer_lines: u16 = if download.is_some() { 2 } else { 0 };
-    let w = area.width.saturating_sub(4).clamp(40, 100);
-    let needed = rows.len() as u16 + 2 + footer_lines;
-    let h = needed.clamp(3, area.height.saturating_sub(2).max(3));
-    let x = area.x + 2;
-    let y = area.y + 2;
-    let rect = Rect { x, y, width: w, height: h };
-    frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(" Whisper Models ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().border_active))
-        .style(Style::default().bg(THEME.load().bg));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    // Split inner into list area + optional footer.
-    let (list_area, footer_area) = if footer_lines > 0 {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(footer_lines)])
-            .split(inner);
-        (split[0], Some(split[1]))
-    } else {
-        (inner, None)
-    };
-
-    let visible_height = list_area.height as usize;
-    let scroll_offset = if cursor >= visible_height {
-        cursor - visible_height + 1
-    } else {
-        0
-    };
-
-    let mut lines = Vec::new();
-    for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(visible_height) {
-        let style = if i == cursor {
-            Style::default().fg(THEME.load().claude_label)
-        } else {
-            Style::default().fg(THEME.load().claude_text)
-        };
-        let installed_marker = if row.installed { "[●]" } else { "[ ]" };
-        let lang = if row.multilingual { "multi" } else { "en   " };
-        let trailing = if row.installed { "installed" } else { "[download]" };
-        let text = format!(
-            "{} {:<22} {:>5} MB  {}  {}",
-            installed_marker, row.id, row.size_mb, lang, trailing,
-        );
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(text, style),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), list_area);
-
-    if let (Some(area), Some((filename, progress))) = (footer_area, download) {
-        let pct = match progress.total {
-            Some(t) if t > 0 => ((progress.bytes as f64 / t as f64) * 100.0) as u32,
-            _ => 0,
-        };
-        let total_mb = progress.total.map(|t| t / 1_000_000).unwrap_or(0);
-        let cur_mb = progress.bytes / 1_000_000;
-        let line = if let Some(err) = progress.error.as_ref() {
-            format!("Download failed for {}: {}", filename, err)
-        } else if progress.done {
-            format!("Downloaded {} ({} MB)", filename, total_mb)
-        } else if progress.total.is_some() {
-            format!("Downloading {}: {}% ({}/{} MB)", filename, pct, cur_mb, total_mb)
-        } else {
-            format!("Downloading {}: {} MB", filename, cur_mb)
-        };
-        frame.render_widget(
-            Paragraph::new(line).style(Style::default().fg(THEME.load().help_fg)),
-            area,
-        );
-    }
-}
-
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
     let w = area.width.saturating_sub(4).clamp(20, 100);
     let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
@@ -707,26 +576,6 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
-        "voice_language" => synaps_cli::config::read_config_value("voice_language")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && v != "?")
-            .unwrap_or_else(|| "auto".to_string()),
-        "voice_stt_model" => synaps_cli::config::read_config_value("voice_stt_model_path")
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| "(default)".to_string()),
-        "voice_stt_backend" => {
-            let configured = synaps_cli::config::read_config_value("voice_stt_backend")
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "auto".to_string());
-            if configured == "auto" {
-                let detected = synaps_cli::voice::discovery::detect_host_backend();
-                format!("auto ({})", detected)
-            } else {
-                configured
-            }
-        }
         _ => "?".into(),
     }
 }

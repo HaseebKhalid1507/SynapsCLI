@@ -33,79 +33,6 @@ pub(crate) fn theme_options() -> Vec<String> {
     opts
 }
 
-/// List `*.bin` files in `~/.synaps-cli/models/whisper/`, sorted by name.
-/// Used by the WhisperModelPicker editor.
-pub(crate) fn whisper_model_options() -> Vec<String> {
-    let home = match std::env::var_os("HOME") {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
-    let dir = std::path::PathBuf::from(home).join(".synaps-cli/models/whisper");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut opts: Vec<String> = entries
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("bin") {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    opts.sort();
-    opts
-}
-
-/// One row in the whisper model browser — the catalog entry zipped with
-/// installed status against the local models directory.
-pub(crate) struct ModelBrowserRow {
-    /// Catalog id, e.g. "base.en".
-    pub id: String,
-    /// Filename, e.g. "ggml-base.en.bin".
-    pub filename: String,
-    /// Approximate on-disk size in megabytes.
-    pub size_mb: u32,
-    /// `false` for English-only `*.en` variants.
-    pub multilingual: bool,
-    /// True iff `models_dir.join(filename)` exists.
-    pub installed: bool,
-    /// Absolute path the row would be persisted to (whether installed or not).
-    pub absolute_path: std::path::PathBuf,
-}
-
-/// Build the browser rows by zipping the whisper catalog with installed
-/// status against `~/.synaps-cli/models/whisper/`.
-pub(crate) fn model_browser_rows() -> Vec<ModelBrowserRow> {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    let dir = std::path::PathBuf::from(home).join(".synaps-cli/models/whisper");
-    model_browser_rows_in(&dir)
-}
-
-/// Like [`model_browser_rows`] but takes an explicit models directory —
-/// used by tests so they don't have to mutate `$HOME`.
-pub(crate) fn model_browser_rows_in(dir: &std::path::Path) -> Vec<ModelBrowserRow> {
-    synaps_cli::voice::models::CATALOG
-        .iter()
-        .map(|e| {
-            let path = dir.join(e.filename);
-            ModelBrowserRow {
-                id: e.id.to_string(),
-                filename: e.filename.to_string(),
-                size_mb: e.size_mb,
-                multilingual: e.multilingual,
-                installed: path.exists(),
-                absolute_path: path,
-            }
-        })
-        .collect()
-}
-
 use schema::SettingDef;
 
 pub(crate) struct PluginRow {
@@ -214,10 +141,6 @@ pub(super) enum ActiveEditor {
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
     CustomModel { buffer: String, setting_key: &'static str },
     ApiKey { provider_id: String, buffer: String },
-    /// Whisper.cpp catalog browser. Cursor selects a row from `rows`.
-    /// Enter on installed → emits Apply for `voice_stt_model_path`.
-    /// Enter on uninstalled → emits StartModelDownload.
-    ModelBrowser { cursor: usize, rows: Vec<ModelBrowserRow> },
     /// Text editor for a plugin-declared `text` field. Path B Phase 4.
     /// Commits via `InputOutcome::PluginApply` to the plugin config namespace.
     PluginText {
@@ -302,39 +225,3 @@ impl SettingsState {
     }
 }
 
-
-#[cfg(test)]
-mod model_browser_tests {
-    use super::*;
-
-    #[test]
-    fn model_browser_rows_includes_all_catalog_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let rows = model_browser_rows_in(dir.path());
-        assert_eq!(rows.len(), synaps_cli::voice::models::CATALOG.len());
-        for (row, entry) in rows.iter().zip(synaps_cli::voice::models::CATALOG.iter()) {
-            assert_eq!(row.id, entry.id);
-            assert_eq!(row.filename, entry.filename);
-            assert_eq!(row.size_mb, entry.size_mb);
-            assert_eq!(row.multilingual, entry.multilingual);
-        }
-    }
-
-    #[test]
-    fn model_browser_rows_marks_installed_correctly() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pre-create the file for the "base" entry only.
-        let base = synaps_cli::voice::models::find_by_id("base").unwrap();
-        std::fs::write(dir.path().join(base.filename), b"fake").unwrap();
-
-        let rows = model_browser_rows_in(dir.path());
-        for row in &rows {
-            if row.id == "base" {
-                assert!(row.installed, "base should be marked installed");
-            } else {
-                assert!(!row.installed, "{} should NOT be installed", row.id);
-            }
-            assert_eq!(row.absolute_path, dir.path().join(&row.filename));
-        }
-    }
-}

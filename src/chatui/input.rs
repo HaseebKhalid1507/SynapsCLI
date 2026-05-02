@@ -32,8 +32,6 @@ pub(super) enum InputAction {
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
-    /// Settings model browser asked to start a whisper download.
-    StartModelDownload(String),
     /// Open a plugin-owned custom settings editor via `settings.editor.open`.
     PluginEditorOpen { plugin_id: String, category: String, field: String },
     /// Forward a keypress to the active plugin-owned custom settings editor.
@@ -190,9 +188,6 @@ pub(super) fn handle_event(
                 }
                 super::settings::InputOutcome::PingModels => {
                     return InputAction::PingModels;
-                }
-                super::settings::InputOutcome::StartModelDownload { id } => {
-                    return InputAction::StartModelDownload(id);
                 }
             }
         }
