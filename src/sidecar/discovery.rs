@@ -7,16 +7,16 @@
 //! The `command` field from the manifest is resolved to an absolute
 //! path: relative paths are joined to the plugin root.
 //!
-//! ## Manifest schema note
+//! ## Manifest schema
 //!
-//! The JSON manifest field is still named `provides.voice_sidecar` for
-//! plugin compatibility — renaming it requires a coordinated change in
-//! the synaps-skills plugins and is deferred. The Rust types here are
-//! modality-neutral; the wire shape is unchanged.
+//! Plugins declare a sidecar via `provides.sidecar` in their plugin
+//! manifest. The legacy spelling `provides.voice_sidecar` is still
+//! accepted via a serde alias for one release (see
+//! [`crate::skills::manifest::PluginProvides`]).
 
 use std::path::{Path, PathBuf};
 
-use crate::skills::manifest::{VoiceSidecarManifest, VoiceSidecarModel};
+use crate::skills::manifest::{SidecarManifest, SidecarModel};
 use crate::skills::Plugin;
 
 /// A discovered sidecar, resolved against its plugin root and ready to
@@ -34,11 +34,11 @@ pub struct DiscoveredSidecar {
     /// Optional setup script path (resolved against plugin root).
     pub setup_script: Option<PathBuf>,
     /// Optional model metadata (modality-specific; opaque to core).
-    pub model: Option<VoiceSidecarModel>,
+    pub model: Option<SidecarModel>,
 }
 
 impl DiscoveredSidecar {
-    fn from_plugin(plugin: &Plugin, sidecar: &VoiceSidecarManifest) -> Self {
+    fn from_plugin(plugin: &Plugin, sidecar: &SidecarManifest) -> Self {
         let binary = resolve_relative(&plugin.root, &sidecar.command);
         let setup_script = sidecar
             .setup
@@ -64,7 +64,7 @@ pub fn discover_in(plugins: &[Plugin]) -> Option<DiscoveredSidecar> {
         let Some(provides) = manifest.provides.as_ref() else {
             continue;
         };
-        let Some(sidecar) = provides.voice_sidecar.as_ref() else {
+        let Some(sidecar) = provides.sidecar.as_ref() else {
             continue;
         };
         return Some(DiscoveredSidecar::from_plugin(plugin, sidecar));
@@ -96,6 +96,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn sidecar_plugin() -> Plugin {
+        // Uses the legacy `voice_sidecar` field name to assert that the
+        // serde alias keeps Phase-6-era plugin manifests deserializing.
+        // Canonical-name coverage lives in
+        // `discover_accepts_canonical_sidecar_field`.
         let manifest_json = r#"{
             "name": "local-voice",
             "provides": {
@@ -191,5 +195,34 @@ mod tests {
         let plugins = vec![plain_plugin("zzz"), sidecar_plugin(), plain_plugin("aaa")];
         let sidecar = discover_in(&plugins).expect("should find sidecar plugin");
         assert_eq!(sidecar.plugin_name, "local-voice");
+    }
+
+    #[test]
+    fn discover_accepts_canonical_sidecar_field() {
+        // Phase 7 slice G: new plugins should declare `provides.sidecar`
+        // (no voice prefix). This test guards the canonical wire shape
+        // independently of the back-compat alias.
+        let plugin_json = r#"{
+            "name": "modality-neutral",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/sidecar",
+                    "protocol_version": 1
+                }
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(plugin_json).unwrap();
+        let plugin = Plugin {
+            name: "modality-neutral".into(),
+            root: PathBuf::from("/opt/modality-neutral"),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(manifest),
+        };
+        let sidecar = discover_in(&[plugin]).expect("canonical field should be discovered");
+        assert_eq!(sidecar.plugin_name, "modality-neutral");
+        assert_eq!(sidecar.binary, PathBuf::from("/opt/modality-neutral/bin/sidecar"));
     }
 }

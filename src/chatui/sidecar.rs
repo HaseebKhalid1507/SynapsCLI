@@ -269,14 +269,14 @@ mod tests {
     // ---- build_spawn_args tests ---------------------------------------
 
     fn discovered(default_model: Option<&str>) -> DiscoveredSidecar {
-        use synaps_cli::skills::manifest::VoiceSidecarModel;
+        use synaps_cli::skills::manifest::SidecarModel;
         DiscoveredSidecar {
             plugin_name: "anything".into(),
             plugin_root: std::path::PathBuf::from("/opt/anything"),
             binary: std::path::PathBuf::from("/opt/anything/bin/sidecar"),
             protocol_version: 1,
             setup_script: None,
-            model: default_model.map(|p| VoiceSidecarModel {
+            model: default_model.map(|p| SidecarModel {
                 default_path: Some(p.to_string()),
                 required_for_real_stt: false,
             }),

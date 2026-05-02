@@ -155,42 +155,67 @@ pub enum ManifestEditorKind {
 
 /// Plugin-provided capabilities consumed by Synaps CLI core.
 ///
-/// Currently only `voice_sidecar` is recognised. A plugin advertises a
-/// voice sidecar binary by setting `provides.voice_sidecar.command`; the
-/// integration layer in `src/voice/` discovers and supervises it.
+/// Currently only one slot is recognised: `sidecar`. A plugin
+/// advertises a long-running sidecar binary by setting
+/// `provides.sidecar.command`; the integration layer in
+/// `src/sidecar/` discovers and supervises it.
+///
+/// ## Wire compatibility
+///
+/// Older plugin manifests use the field name `voice_sidecar`. That
+/// spelling is still accepted via a serde alias for one release so
+/// existing plugins keep working unchanged. New plugins should use
+/// `sidecar`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct PluginProvides {
-    #[serde(default)]
-    pub voice_sidecar: Option<VoiceSidecarManifest>,
+    #[serde(default, alias = "voice_sidecar")]
+    pub sidecar: Option<SidecarManifest>,
 }
 
-/// Sidecar binary that Synaps CLI launches to provide voice dictation.
+/// Sidecar binary that Synaps CLI launches as a long-running plugin
+/// process. Modality-agnostic: a plugin can use this for voice STT,
+/// OCR, agent runners, EEG dictation, or anything that fits the
+/// "trigger-driven streaming source" shape.
 ///
 /// `command` is resolved relative to the plugin root unless absolute.
 /// `protocol_version` is matched against the line-JSON protocol version
-/// understood by `src/voice/protocol.rs` (currently `1`).
+/// understood by `src/sidecar/protocol.rs` (currently `1`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct VoiceSidecarManifest {
+pub struct SidecarManifest {
     pub command: String,
     #[serde(default)]
     pub setup: Option<String>,
-    #[serde(default = "default_voice_protocol_version")]
+    #[serde(default = "default_sidecar_protocol_version")]
     pub protocol_version: u16,
     #[serde(default)]
-    pub model: Option<VoiceSidecarModel>,
+    pub model: Option<SidecarModel>,
 }
 
-fn default_voice_protocol_version() -> u16 {
+/// Backwards-compat type alias. New code should use [`SidecarManifest`].
+#[deprecated(
+    since = "0.1.0-phase7",
+    note = "use SidecarManifest; the voice-prefixed alias will be removed in a future release"
+)]
+pub type VoiceSidecarManifest = SidecarManifest;
+
+fn default_sidecar_protocol_version() -> u16 {
     1
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct VoiceSidecarModel {
+pub struct SidecarModel {
     #[serde(default)]
     pub default_path: Option<String>,
     #[serde(default)]
     pub required_for_real_stt: bool,
 }
+
+/// Backwards-compat type alias. New code should use [`SidecarModel`].
+#[deprecated(
+    since = "0.1.0-phase7",
+    note = "use SidecarModel; the voice-prefixed alias will be removed in a future release"
+)]
+pub type VoiceSidecarModel = SidecarModel;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceManifest {
@@ -400,7 +425,7 @@ mod tests {
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         let provides = m.provides.expect("provides should deserialize");
-        let sidecar = provides.voice_sidecar.expect("voice_sidecar should deserialize");
+        let sidecar = provides.sidecar.expect("sidecar should deserialize via voice_sidecar alias");
         assert_eq!(sidecar.command, "bin/synaps-voice-plugin");
         assert_eq!(sidecar.setup.as_deref(), Some("scripts/setup.sh"));
         assert_eq!(sidecar.protocol_version, 1);
@@ -410,6 +435,48 @@ mod tests {
             Some("~/.synaps-cli/models/whisper/ggml-base.en.bin")
         );
         assert!(model.required_for_real_stt);
+    }
+
+    #[test]
+    fn plugin_manifest_parses_provides_sidecar_canonical() {
+        // Phase 7 slice G: the canonical field name is `sidecar`. Older
+        // plugins keep working via the `voice_sidecar` serde alias (above);
+        // new plugins should write `sidecar` directly.
+        let json = r#"{
+            "name": "local-ocr",
+            "provides": {
+                "sidecar": {
+                    "command": "bin/ocr-sidecar",
+                    "protocol_version": 1
+                }
+            }
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        let provides = m.provides.expect("provides should deserialize");
+        let sidecar = provides.sidecar.expect("canonical `sidecar` field should deserialize");
+        assert_eq!(sidecar.command, "bin/ocr-sidecar");
+        assert_eq!(sidecar.protocol_version, 1);
+    }
+
+    #[test]
+    fn plugin_manifest_rejects_both_sidecar_fields_present() {
+        // serde treats fields and their aliases as the same slot, so
+        // declaring both `sidecar` and `voice_sidecar` is a duplicate-
+        // field error. This is *safer* than last-wins because it
+        // catches accidental double-declaration during the migration
+        // window. Pinned to notice future serde-version regressions.
+        let json = r#"{
+            "name": "x",
+            "provides": {
+                "voice_sidecar": {"command": "old", "protocol_version": 1},
+                "sidecar":       {"command": "new", "protocol_version": 1}
+            }
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected duplicate-field error, got: {err}"
+        );
     }
 
     #[test]

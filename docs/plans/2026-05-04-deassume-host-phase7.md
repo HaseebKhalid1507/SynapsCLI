@@ -33,9 +33,11 @@ modalities its guests are allowed to be.
   declares `subscribes` / `emits`" reframing is the right long-term
   shape but is its own design exercise. Phase 7 only de-names what
   exists; it does not redesign the wiring.
-- **Plugin manifest field renames** (`provides.voice_sidecar` etc.).
-  Touching the manifest schema is a synaps-skills change too and
-  belongs in a coordinated Phase 8.
+- ~~**Plugin manifest field renames** (`provides.voice_sidecar` etc.).~~
+  **DONE in slice G** — `provides.sidecar` is the canonical name with
+  a `voice_sidecar` serde alias for one-release back-compat. Plugins
+  may migrate at their own pace; the synaps-skills coordination is a
+  manifest-only change with zero behavior impact.
 
 ## Objective
 
@@ -231,6 +233,39 @@ new key is absent.
 **Scope:** S
 
 ---
+
+### Slice F — Plugin self-config RPC (was deferred)
+
+Replace `chatui/sidecar.rs::read_local_voice_setting()` with a generic
+RPC asking the plugin to supply its own spawn args. Removes the last
+hardcoded plugin name (`"local-voice"`) from core.
+
+**Acceptance:**
+- [x] New `SidecarSpawnArgs` type at `src/sidecar/spawn.rs`
+- [x] `ExtensionHandler::sidecar_spawn_args()` trait method
+- [x] `ExtensionManager::sidecar_spawn_args(id)` wrapper
+- [x] `chatui/sidecar.rs::spawn_with(spawn_args, plugin_info)` replaces
+      the old `spawn_default_with_plugin_info` and `read_local_voice_setting`
+- [x] Pre-RPC plugins still work via manifest-default fallback
+- [x] Tests: 7 unit (build_spawn_args), 5 unit (serde), 5 integration
+
+**Status:** done — commit pending
+
+### Slice G — Manifest field rename `voice_sidecar` → `sidecar` (was deferred)
+
+Rename `PluginProvides.voice_sidecar` to `.sidecar`, type
+`VoiceSidecarManifest` to `SidecarManifest`, and `VoiceSidecarModel` to
+`SidecarModel`. Keep `#[deprecated]` type aliases and a `#[serde(alias = "voice_sidecar")]`
+so existing plugin manifests deserialize unchanged.
+
+**Acceptance:**
+- [x] Canonical `sidecar` field works
+- [x] Legacy `voice_sidecar` field works (alias)
+- [x] Both fields in same manifest is a duplicate-field error
+- [x] `VoiceSidecarManifest`, `VoiceSidecarModel` remain as deprecated aliases
+- [x] Existing local-voice-plugin manifest still deserializes (no plugin change required)
+
+**Status:** done — commit pending
 
 ### Slice E — Sweep + smoke
 
