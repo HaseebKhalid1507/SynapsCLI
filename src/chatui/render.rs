@@ -606,6 +606,6 @@ fn system_separator_line(margin: &str, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(margin.len() + rule.chars().count()) / 2;
     Line::from(vec![
         Span::raw(format!("{}{}", margin, " ".repeat(pad))),
-        Span::styled(rule, Style::default().fg(THEME.load().separator).add_modifier(Modifier::DIM)),
+        Span::styled(rule, Style::default().fg(THEME.load().muted)),
     ])
 }
