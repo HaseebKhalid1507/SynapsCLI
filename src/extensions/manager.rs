@@ -315,6 +315,10 @@ impl ExtensionManager {
                     continue;
                 }
             }
+            if let Some(value) = crate::extensions::config_store::read_plugin_config(id, key) {
+                out.insert(key.to_string(), Value::String(value));
+                continue;
+            }
             if let Some(value) = crate::config::read_config_value(&config_key) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
@@ -950,6 +954,50 @@ mod tests {
             assert!(!project_plugins_disabled());
         }
         std::env::remove_var("SYNAPS_DISABLE_PROJECT_PLUGINS");
+    }
+
+    #[test]
+    fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::set_base_dir_for_tests(dir.path().to_path_buf());
+        crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+            .unwrap();
+        crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+
+        let resolved = ExtensionManager::resolve_config(
+            "local-voice",
+            &[ExtensionConfigEntry {
+                key: "backend".to_string(),
+                description: None,
+                required: true,
+                default: None,
+                secret_env: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::set_base_dir_for_tests(dir.path().to_path_buf());
+        crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+
+        let resolved = ExtensionManager::resolve_config(
+            "local-voice",
+            &[ExtensionConfigEntry {
+                key: "backend".to_string(),
+                description: None,
+                required: true,
+                default: None,
+                secret_env: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
     }
 
     #[tokio::test]
