@@ -49,6 +49,21 @@ fn find_state_navigation_clamps_and_scrolls() {
 }
 
 #[test]
+fn find_state_enter_opens_detail_and_escape_returns_to_list() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let mut state = HelpFindState::new(registry.entries().to_vec(), "plugins");
+
+    assert!(state.detail_entry().is_none());
+    while state.selected().map(|entry| entry.command.as_str()) != Some("/help plugins") {
+        state.move_down();
+    }
+    state.open_selected();
+    assert_eq!(state.detail_entry().map(|entry| entry.command.as_str()), Some("/help plugins"));
+    state.close_detail();
+    assert!(state.detail_entry().is_none());
+}
+
+#[test]
 fn find_state_enter_selects_current_entry_and_esc_closes() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let mut state = HelpFindState::new(registry.entries().to_vec(), "models");

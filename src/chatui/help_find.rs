@@ -15,8 +15,22 @@ pub(crate) enum HelpFindAction {
 }
 
 pub(crate) fn handle_event(state: &mut synaps_cli::help::HelpFindState, key: KeyEvent) -> HelpFindAction {
+    if state.detail_entry().is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                state.close_detail();
+                return HelpFindAction::None;
+            }
+            _ => return HelpFindAction::None,
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => HelpFindAction::Close,
+        (KeyCode::Enter, _) => {
+            state.open_selected();
+            HelpFindAction::None
+        }
         (KeyCode::Up, _) => {
             state.move_up();
             HelpFindAction::None
@@ -56,6 +70,11 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         .border_style(Style::default().fg(THEME.load().border_active));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
+
+    if let Some(entry) = state.detail_entry().cloned() {
+        render_detail(frame, modal, &entry);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -106,4 +125,32 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(THEME.load().muted)))),
         chunks[2],
     );
+}
+
+fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpEntry) {
+    let block = Block::default()
+        .title(format!(" {} ", entry.command))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.load().border_active));
+    let inner = block.inner(modal);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(block, modal);
+
+    let mut lines = vec![
+        Line::from(Span::styled(entry.title.clone(), Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled(entry.summary.clone(), Style::default().fg(THEME.load().input_fg))),
+        Line::from(""),
+    ];
+    lines.extend(entry.lines.iter().map(|line| Line::from(Span::raw(line.clone()))));
+    lines.push(Line::from(""));
+    if !entry.related.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Related: {}", entry.related.join(", ")),
+            Style::default().fg(THEME.load().muted),
+        )));
+    }
+    lines.push(Line::from(Span::styled("Esc back", Style::default().fg(THEME.load().muted))));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
