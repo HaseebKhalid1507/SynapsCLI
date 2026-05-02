@@ -13,6 +13,19 @@ fn base_help_is_brief_and_points_to_find() {
 }
 
 #[test]
+fn base_help_uses_polished_intro_copy() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let rendered = render_help(&registry, None).expect("base help should render");
+    let root = registry.entry_by_command("/help").expect("root help entry exists");
+
+    assert_eq!(root.title, "SynapsCLI Help");
+    assert_eq!(root.summary, "Fast paths for finding commands, settings, plugins, models, and diagnostics.");
+    assert!(rendered.contains("Start here. Pick a path or search everything."), "missing polished intro:\n{}", rendered);
+    assert!(!rendered.contains("Beautiful brief guide"), "placeholder copy leaked into rendered help:\n{}", rendered);
+    assert!(!root.summary.contains("Beautiful brief guide"), "placeholder summary leaked into metadata");
+}
+
+#[test]
 fn branch_help_renders_specific_topic() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let rendered = render_help(&registry, Some("plugins")).expect("plugins help should render");

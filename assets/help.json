@@ -2,8 +2,8 @@
   {
     "id": "root",
     "command": "/help",
-    "title": "Help",
-    "summary": "Beautiful brief guide to SynapsCLI.",
+    "title": "SynapsCLI Help",
+    "summary": "Fast paths for finding commands, settings, plugins, models, and diagnostics.",
     "category": "Core",
     "topic": "Branch",
     "protected": true,
@@ -11,7 +11,7 @@
     "aliases": [],
     "keywords": ["help", "start", "commands"],
     "lines": [
-      "What would you like to do?",
+      "Start here. Pick a path or search everything.",
       "",
       "Common commands",
       "  /help find   Search every help topic",
