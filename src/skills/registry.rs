@@ -63,6 +63,34 @@ pub struct RegisteredPluginCommand {
     pub plugin_root: std::path::PathBuf,
 }
 
+/// A plugin's claim on a top-level lifecycle command namespace, derived
+/// from `provides.sidecar.lifecycle` in plugin.json. Phase 8 slice 8A.
+///
+/// When a plugin declares a lifecycle claim, the command registry
+/// auto-registers `/<command> toggle` and `/<command> status` (and any
+/// future lifecycle verbs) so the plugin's own UX namespace —
+/// e.g. `/voice` for a voice plugin — drives sidecar lifecycle instead
+/// of the modality-laden `/sidecar` builtin.
+///
+/// Multiple plugins may register lifecycle claims; in Phase 8 slice 8A
+/// the host still hosts at most one active sidecar so all claims share
+/// a single backing `App.sidecar` slot. Slice 8B widens this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleClaim {
+    /// Plugin (manifest) name that owns this claim.
+    pub plugin: String,
+    /// Top-level command word the plugin claims, e.g. `"voice"`.
+    pub command: String,
+    /// Optional settings-category id that the host should inject
+    /// per-plugin lifecycle keys (e.g. toggle keybind) into.
+    pub settings_category: Option<String>,
+    /// Human-readable label for pills, error messages, status lines.
+    pub display_name: String,
+    /// Sort key for pill ordering (higher = earlier). Range `-100..=100`,
+    /// already clamped during manifest deserialisation.
+    pub importance: i32,
+}
+
 pub enum Resolution {
     /// A built-in command (dispatched via existing handle_command).
     Builtin,
@@ -84,6 +112,14 @@ struct Inner {
     /// Plugin-declared settings categories, in plugin discovery order.
     /// Path B Phase 4. The settings UI snapshots this on each open.
     plugin_settings_categories: Vec<PluginSettingsCategory>,
+    /// Plugin-declared lifecycle claims (Phase 8 slice 8A). Indexed by
+    /// the claimed command word (e.g. `"voice"`). At most one claim per
+    /// command word; first-loaded plugin wins on collision.
+    lifecycle_claims: HashMap<String, LifecycleClaim>,
+    /// Plugins that lost a lifecycle-claim collision, recorded so the
+    /// `/extensions` view can surface a warning. Each entry is
+    /// `(losing_plugin, command, winning_plugin)`.
+    lifecycle_claim_collisions: Vec<(String, String, String)>,
 }
 
 pub struct CommandRegistry {
@@ -105,6 +141,8 @@ impl CommandRegistry {
                 plugin_commands: HashMap::new(),
                 plugin_help_entries: Vec::new(),
                 plugin_settings_categories: Vec::new(),
+                lifecycle_claims: HashMap::new(),
+                lifecycle_claim_collisions: Vec::new(),
             }),
         };
         r.rebuild_with_plugins(skills, plugins);
@@ -125,12 +163,44 @@ impl CommandRegistry {
         let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
         let mut new_plugin_help_entries: Vec<HelpEntry> = Vec::new();
         let mut new_plugin_settings_categories: Vec<PluginSettingsCategory> = Vec::new();
+        let mut new_lifecycle_claims: HashMap<String, LifecycleClaim> = HashMap::new();
+        let mut new_lifecycle_collisions: Vec<(String, String, String)> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
                 new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(|mut entry| {
                     entry.source = Some(manifest.name.clone());
                     entry
                 }));
+                // Phase 8 slice 8A: harvest lifecycle claims from
+                // provides.sidecar.lifecycle. First-loaded wins on
+                // collision; the loser is recorded for surfacing in
+                // /extensions and the chat log.
+                if let Some(ref provides) = manifest.provides {
+                    if let Some(ref sidecar) = provides.sidecar {
+                        if let Some(ref lc) = sidecar.lifecycle {
+                            let claim = LifecycleClaim {
+                                plugin: manifest.name.clone(),
+                                command: lc.command.clone(),
+                                settings_category: lc.settings_category.clone(),
+                                display_name: lc.effective_display_name().to_string(),
+                                importance: lc.importance,
+                            };
+                            if let Some(existing) = new_lifecycle_claims.get(&claim.command) {
+                                new_lifecycle_collisions.push((
+                                    claim.plugin.clone(),
+                                    claim.command.clone(),
+                                    existing.plugin.clone(),
+                                ));
+                                tracing::warn!(
+                                    "lifecycle command '{}' claimed by both '{}' and '{}'; first-loaded wins",
+                                    claim.command, existing.plugin, claim.plugin,
+                                );
+                            } else {
+                                new_lifecycle_claims.insert(claim.command.clone(), claim);
+                            }
+                        }
+                    }
+                }
                 if let Some(ref settings) = manifest.settings {
                     for cat in &settings.categories {
                         let fields = cat
@@ -237,6 +307,8 @@ impl CommandRegistry {
         w.plugin_commands = new_plugin_commands;
         w.plugin_help_entries = new_plugin_help_entries;
         w.plugin_settings_categories = new_plugin_settings_categories;
+        w.lifecycle_claims = new_lifecycle_claims;
+        w.lifecycle_claim_collisions = new_lifecycle_collisions;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
@@ -286,9 +358,34 @@ impl CommandRegistry {
         let mut v: Vec<String> = self.builtins.iter().map(|s| s.to_string()).collect();
         v.extend(r.skills.keys().cloned());
         v.extend(r.plugin_commands.keys().cloned());
+        // Phase 8 slice 8A: plugin-claimed lifecycle commands surface
+        // as top-level commands too (e.g. `/voice`).
+        v.extend(r.lifecycle_claims.keys().cloned());
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Look up the lifecycle claim for a top-level command word, if any.
+    /// Phase 8 slice 8A. Returns the claim regardless of arg/subcommand —
+    /// callers (the dispatcher) decide what to do with `toggle` / `status`.
+    pub fn lifecycle_for_command(&self, cmd: &str) -> Option<LifecycleClaim> {
+        let r = self.inner.read().unwrap();
+        r.lifecycle_claims.get(cmd).cloned()
+    }
+
+    /// Snapshot of every claimed lifecycle command, in arbitrary order.
+    /// Used by `/extensions` to render the active claims and by the
+    /// pill renderer to enumerate sidecars.
+    pub fn lifecycle_claims(&self) -> Vec<LifecycleClaim> {
+        self.inner.read().unwrap().lifecycle_claims.values().cloned().collect()
+    }
+
+    /// Plugins that lost a lifecycle-claim collision during the most
+    /// recent rebuild. Each entry is `(losing_plugin, command,
+    /// winning_plugin)`. Surfaced in `/extensions`.
+    pub fn lifecycle_claim_collisions(&self) -> Vec<(String, String, String)> {
+        self.inner.read().unwrap().lifecycle_claim_collisions.clone()
     }
 
     pub fn plugins(&self) -> Vec<PluginSummary> {
@@ -752,5 +849,155 @@ mod tests {
             f.editor,
             PluginSettingsEditor::Text { .. }
         )));
+    }
+
+    // ---- Phase 8 slice 8A: lifecycle claims ----
+
+    fn mk_plugin_with_lifecycle(
+        plugin: &str,
+        command: &str,
+        display: Option<&str>,
+        importance: i32,
+        settings_category: Option<&str>,
+    ) -> Plugin {
+        use crate::skills::manifest::{
+            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: settings_category.map(str::to_string),
+                            display_name: display.map(str::to_string),
+                            importance,
+                        }),
+                    }),
+                }),
+                settings: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn lifecycle_claim_registers_under_command_word() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle(
+                "local-voice",
+                "voice",
+                Some("Voice"),
+                50,
+                Some("voice"),
+            )],
+        );
+        let claim = reg
+            .lifecycle_for_command("voice")
+            .expect("voice lifecycle claim should be registered");
+        assert_eq!(claim.plugin, "local-voice");
+        assert_eq!(claim.command, "voice");
+        assert_eq!(claim.display_name, "Voice");
+        assert_eq!(claim.importance, 50);
+        assert_eq!(claim.settings_category.as_deref(), Some("voice"));
+    }
+
+    #[test]
+    fn lifecycle_claim_display_name_falls_back_to_command() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("p", "ocr", None, 0, None)],
+        );
+        let claim = reg.lifecycle_for_command("ocr").unwrap();
+        assert_eq!(claim.display_name, "ocr");
+    }
+
+    #[test]
+    fn lifecycle_claim_surfaces_in_all_commands() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+        );
+        assert!(reg.all_commands().contains(&"voice".to_string()));
+    }
+
+    #[test]
+    fn lifecycle_claim_collision_first_loaded_wins() {
+        // Two plugins both claim "voice"; first in the discovery
+        // order (the vec we pass) should win.
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_with_lifecycle("alpha-voice", "voice", Some("Alpha"), 10, None),
+                mk_plugin_with_lifecycle("beta-voice", "voice", Some("Beta"), 90, None),
+            ],
+        );
+        let claim = reg.lifecycle_for_command("voice").unwrap();
+        assert_eq!(claim.plugin, "alpha-voice");
+        let collisions = reg.lifecycle_claim_collisions();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0], (
+            "beta-voice".to_string(),
+            "voice".to_string(),
+            "alpha-voice".to_string(),
+        ));
+    }
+
+    #[test]
+    fn lifecycle_claims_returns_all_unique_command_words() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_with_lifecycle("local-voice", "voice", None, 50, None),
+                mk_plugin_with_lifecycle("ocr-plugin", "ocr", None, 30, None),
+            ],
+        );
+        let claims = reg.lifecycle_claims();
+        let mut names: Vec<_> = claims.iter().map(|c| c.command.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["ocr", "voice"]);
+    }
+
+    #[test]
+    fn lifecycle_for_command_returns_none_when_no_claim() {
+        let reg = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
+        assert!(reg.lifecycle_for_command("voice").is_none());
+    }
+
+    #[test]
+    fn rebuild_replaces_lifecycle_claims_atomically() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+        );
+        assert!(reg.lifecycle_for_command("voice").is_some());
+        // Rebuild without the plugin: the claim must vanish.
+        reg.rebuild_with_plugins(vec![], vec![]);
+        assert!(reg.lifecycle_for_command("voice").is_none());
+        assert!(reg.lifecycle_claim_collisions().is_empty());
     }
 }

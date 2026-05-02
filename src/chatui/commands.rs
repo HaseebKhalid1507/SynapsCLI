@@ -303,6 +303,39 @@ pub(super) async fn handle_command(
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {
     use synaps_cli::skills::registry::Resolution;
+    // Phase 8 slice 8A: plugin-claimed lifecycle commands take precedence
+    // over builtins. If a plugin's manifest claims `/voice` (or any other
+    // top-level word) via `provides.sidecar.lifecycle`, route
+    // `<word> toggle` and `<word> status` to the generic sidecar
+    // lifecycle actions. Other subcommands (e.g. `/voice models`) fall
+    // through to the normal plugin-command resolver below.
+    if let Some(claim) = registry.lifecycle_for_command(cmd) {
+        let trimmed = arg.trim();
+        match trimmed {
+            "" | "toggle" => return CommandAction::SidecarToggle,
+            "status" => return CommandAction::SidecarStatus,
+            _ => {
+                // Fall through to the plugin-command resolver: the
+                // plugin can define `<command> <other-sub>` (e.g.
+                // `/voice models`) as a normal interactive command.
+                if let Some(command) =
+                    registry.find_plugin_command_unqualified(&claim.command)
+                {
+                    return CommandAction::PluginCommand {
+                        command,
+                        arg: trimmed.to_string(),
+                    };
+                }
+                // No plugin command; surface a usage hint scoped to
+                // the claimed display name.
+                app.push_msg(ChatMessage::Error(format!(
+                    "unknown /{} subcommand: `{}` (try: toggle, status)",
+                    claim.command, trimmed,
+                )));
+                return CommandAction::None;
+            }
+        }
+    }
     match cmd {
         "clear" => {
             app.save_session().await;
@@ -1356,5 +1389,171 @@ mod tests {
         assert!(matches!(action, CommandAction::None));
         let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
         assert!(pushed_error, "expected a `no plugin owns /voice` error message");
+    }
+
+    // ---- Phase 8 slice 8A: lifecycle-claim dispatcher ----
+
+    fn lifecycle_plugin(plugin: &str, command: &str) -> synaps_cli::skills::Plugin {
+        use synaps_cli::skills::manifest::{
+            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
+        };
+        synaps_cli::skills::Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: None,
+                            display_name: None,
+                            importance: 0,
+                        }),
+                    }),
+                }),
+                settings: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_toggle_to_sidecar_toggle() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "toggle",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::SidecarToggle));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_bare_command_to_toggle() {
+        // `/voice` (no arg) is treated as `/voice toggle`.
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::SidecarToggle));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_status_to_sidecar_status() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "status",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::SidecarStatus));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_takes_precedence_over_voice_builtin_alias() {
+        // When a plugin declares the `voice` lifecycle, the dispatcher
+        // routes via the lifecycle path — NOT the legacy `"voice"`
+        // builtin alias — so the lifecycle answer is reached even if
+        // the alias would error out (no plugin command registered).
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "toggle",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        // No "no plugin owns /voice" error pushed — lifecycle path won.
+        let pushed_legacy_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
+        assert!(!pushed_legacy_error);
+        assert!(matches!(action, CommandAction::SidecarToggle));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_unknown_subcommand_pushes_error() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "bogus",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown /voice subcommand")));
+        assert!(pushed);
     }
 }
