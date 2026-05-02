@@ -751,6 +751,9 @@ pub(crate) fn draw(
         if let Some(ref state) = app.plugins {
             super::plugins::render(frame, frame.area(), state);
         }
+        if let Some(ref mut state) = app.help_find {
+            super::help_find::render(frame, frame.area(), state);
+        }
     })?;
     Ok(())
 }

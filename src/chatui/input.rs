@@ -29,6 +29,8 @@ pub(super) enum InputAction {
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
     PluginsOutcome(super::plugins::InputOutcome),
+    /// /help find lightbox emitted an outcome.
+    HelpFindOutcome,
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
@@ -43,6 +45,20 @@ pub(super) fn handle_event(
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
+    // Route events to /help find while it's open.
+    if let Some(state) = app.help_find.as_mut() {
+        if let Event::Key(key) = event {
+            let outcome = super::help_find::handle_event(state, key);
+            return match outcome {
+                super::help_find::HelpFindAction::Close => {
+                    app.help_find = None;
+                    InputAction::None
+                }
+                super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+            };
+        }
+        return InputAction::None;
+    }
     // Route events to the models modal while it's open.
     if let Some(state) = app.models.as_mut() {
         if let Event::Key(key) = event {
