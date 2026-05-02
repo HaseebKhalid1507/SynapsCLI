@@ -743,6 +743,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use crate::chatui::theme::THEME;
     use super::*;
 
     fn test_app() -> App {
@@ -849,10 +850,12 @@ mod tests {
             .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
             .expect("second system message should render");
 
-        let has_center_rule = lines[first_idx + 1..second_idx]
+    let has_center_rule = lines[first_idx + 1..second_idx]
             .iter()
             .any(|line| line.spans.iter().any(|span| {
-                span.content.contains("─ · ─") || span.content.contains("── · ──")
+                span.content.contains("─ · ─")
+                    && span.style.fg == Some(THEME.load().muted)
+                    && !span.style.add_modifier.contains(ratatui::style::Modifier::DIM)
             }));
 
         assert!(
