@@ -693,16 +693,107 @@ pub(super) async fn handle_command(
             return CommandAction::Ping;
         }
         "sidecar" => {
+            // Phase 8 8A.6 / 8A.7: ambiguity-aware dispatcher.
+            //
+            // Two surface forms:
+            //   * unqualified — `/sidecar [toggle|status]` — back-compat
+            //     for the single-sidecar slot. With ≥2 claims we refuse
+            //     to dispatch and force disambiguation.
+            //   * qualified   — `/sidecar <plugin-id> <subcommand>` —
+            //     selects a specific claimed sidecar. (In slice 8A the
+            //     action variants don't carry a plugin-id payload yet;
+            //     we just validate the plugin-id against the loaded
+            //     lifecycle claims and dispatch the bare action.)
+            //
+            // TODO(phase 8 8B): plumb plugin_id into SidecarToggle /
+            //                   SidecarStatus so multi-sidecar hosting
+            //                   can route to a specific instance.
             let trimmed = arg.trim();
-            match trimmed {
-                "" | "toggle" => return CommandAction::SidecarToggle,
-                "status" => return CommandAction::SidecarStatus,
-                other => {
+            let mut tokens = trimmed.split_whitespace();
+            let first = tokens.next().unwrap_or("");
+            let rest: String = tokens.collect::<Vec<_>>().join(" ");
+
+            if rest.is_empty() {
+                // Unqualified form.
+                let claims = registry.lifecycle_claims();
+                let render_disambig = |verb: &str, claims: &[synaps_cli::skills::registry::LifecycleClaim]| -> String {
+                    let mut sorted: Vec<_> = claims.iter().collect();
+                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+                    let plugins = sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ");
+                    let cmds = sorted.iter().map(|c| format!("/{}", c.command)).collect::<Vec<_>>().join(", ");
+                    format!(
+                        "multiple sidecars loaded: {}; use /sidecar <plugin-id> {} or one of the per-plugin commands ({})",
+                        plugins, verb, cmds
+                    )
+                };
+                match first {
+                    "" | "toggle" => match claims.len() {
+                        0 => return CommandAction::SidecarToggle,
+                        1 => {
+                            let c = &claims[0];
+                            app.push_msg(ChatMessage::System(format!(
+                                "hint: this sidecar is claimed by /{} — try /{} toggle",
+                                c.command, c.command
+                            )));
+                            return CommandAction::SidecarToggle;
+                        }
+                        _ => {
+                            app.push_msg(ChatMessage::Error(render_disambig("toggle", &claims)));
+                            return CommandAction::None;
+                        }
+                    },
+                    "status" => match claims.len() {
+                        0 => return CommandAction::SidecarStatus,
+                        1 => {
+                            let c = &claims[0];
+                            app.push_msg(ChatMessage::System(format!(
+                                "hint: this sidecar is claimed by /{} — try /{} status",
+                                c.command, c.command
+                            )));
+                            return CommandAction::SidecarStatus;
+                        }
+                        _ => {
+                            app.push_msg(ChatMessage::Error(render_disambig("status", &claims)));
+                            return CommandAction::None;
+                        }
+                    },
+                    other => {
+                        app.push_msg(ChatMessage::Error(format!(
+                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
+                            other
+                        )));
+                        return CommandAction::None;
+                    }
+                }
+            } else {
+                // Qualified form: first = plugin-id, rest = subcommand.
+                let plugin_id = first;
+                let claims = registry.lifecycle_claims();
+                if !claims.iter().any(|c| c.plugin == plugin_id) {
+                    let mut sorted: Vec<_> = claims.iter().collect();
+                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+                    let list = if sorted.is_empty() {
+                        "none".to_string()
+                    } else {
+                        sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ")
+                    };
                     app.push_msg(ChatMessage::Error(format!(
-                        "unknown /sidecar subcommand: `{}` (try: toggle, status)",
-                        other
+                        "unknown sidecar plugin: '{}' (loaded: {})",
+                        plugin_id, list
                     )));
                     return CommandAction::None;
+                }
+                // TODO(phase 8 8B): plumb plugin_id into SidecarToggle / SidecarStatus.
+                match rest.as_str() {
+                    "toggle" => return CommandAction::SidecarToggle,
+                    "status" => return CommandAction::SidecarStatus,
+                    other => {
+                        app.push_msg(ChatMessage::Error(format!(
+                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
+                            other
+                        )));
+                        return CommandAction::None;
+                    }
                 }
             }
         }
@@ -1555,5 +1646,113 @@ mod tests {
         assert!(matches!(action, CommandAction::None));
         let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown /voice subcommand")));
         assert!(pushed);
+    }
+
+    // ---- Phase 8 slices 8A.6 / 8A.7 — `/sidecar` ambiguity-aware dispatcher ----
+
+    async fn invoke_sidecar_with_plugins(
+        arg: &str,
+        plugins: Vec<synaps_cli::skills::Plugin>,
+    ) -> (CommandAction, crate::chatui::app::App) {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], plugins));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "sidecar",
+            arg,
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        (action, app)
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_works_when_zero_claims_loaded() {
+        let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
+        assert!(matches!(action, CommandAction::SidecarToggle));
+        let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
+        assert!(!pushed_err, "no errors expected for zero-claim back-compat");
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_with_one_claim_dispatches_with_hint() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "toggle",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarToggle));
+        let pushed_hint = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::System(s) if s.contains("try /voice toggle")));
+        assert!(pushed_hint, "expected a System hint mentioning `try /voice toggle`");
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_with_two_claims_errors_with_disambiguation() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "toggle",
+            vec![
+                lifecycle_plugin("local-voice", "voice"),
+                lifecycle_plugin("local-ocr", "ocr"),
+            ],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().find_map(|m| match &m.msg {
+            crate::chatui::app::ChatMessage::Error(s) => Some(s.clone()),
+            _ => None,
+        });
+        let s = pushed.expect("expected an Error message");
+        assert!(s.contains("local-voice"), "error should list local-voice; got: {s}");
+        assert!(s.contains("local-ocr"), "error should list local-ocr; got: {s}");
+        assert!(s.contains("/voice"), "error should mention /voice; got: {s}");
+        assert!(s.contains("/ocr"), "error should mention /ocr; got: {s}");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_toggle_works() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "local-voice toggle",
+            vec![
+                lifecycle_plugin("local-voice", "voice"),
+                lifecycle_plugin("local-ocr", "ocr"),
+            ],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarToggle));
+        let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
+        assert!(!pushed_err, "no errors expected for valid qualified form");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_unknown_plugin_id_errors() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "nonexistent toggle",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
+        assert!(pushed, "expected `unknown sidecar plugin` error");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_status() {
+        let (action, _app) = invoke_sidecar_with_plugins(
+            "local-voice status",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarStatus));
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_unknown_subcommand_errors() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "local-voice bogus",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
+        assert!(pushed, "expected `unknown /sidecar subcommand` error");
     }
 }
