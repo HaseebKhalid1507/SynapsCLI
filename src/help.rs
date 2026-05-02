@@ -461,11 +461,31 @@ pub fn render_entry(entry: &HelpEntry) -> String {
 
     if !entry.lines.is_empty() {
         lines.push(String::new());
-        lines.extend(entry.lines.clone());
+        lines.extend(body_lines_without_structured_related(entry));
     }
 
     append_usage_examples_related(&mut lines, entry);
     lines.join("\n")
+}
+
+fn body_lines_without_structured_related(entry: &HelpEntry) -> Vec<String> {
+    if entry.related.is_empty() {
+        return entry.lines.clone();
+    }
+    let mut lines = entry.lines.clone();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines
+        .last()
+        .is_some_and(|line| line.trim_start().starts_with("Related:"))
+    {
+        lines.pop();
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+    }
+    lines
 }
 
 fn render_topics(registry: &HelpRegistry) -> String {
