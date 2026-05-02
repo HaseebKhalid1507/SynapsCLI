@@ -185,12 +185,6 @@ pub async fn run(
                 failure.concise_message()
             )));
         }
-        if let Some(sidecar) = synaps_cli::voice::discovery::discover() {
-            let manager = ext_mgr_shared.read().await;
-            app.cached_voice_compiled_backend = app::probe_compiled_backend_with_plugin_info(
-                manager.plugin_info(&sidecar.plugin_name),
-            );
-        }
     }
 
     // ═══ HOOK: on_session_start ═══
@@ -251,45 +245,6 @@ pub async fn run(
                 if let Some((provider_key, models_result)) = result {
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
-                    }
-                }
-            }
-
-            // ── Whisper model download progress — fires when the active
-            //    download publishes a new progress snapshot, or completes
-            //    (sender dropped → `changed()` returns Err). ──
-            download_change = async {
-                match app.download_rx.as_mut() {
-                    Some(rx) => rx.changed().await.map(|_| rx.borrow().clone()),
-                    None => std::future::pending().await,
-                }
-            } => {
-                match download_change {
-                    Ok(progress) => {
-                        let done = progress.done;
-                        let error = progress.error.clone();
-                        app.on_download_progress(progress);
-                        if done {
-                            let filename = app.download_filename.clone().unwrap_or_default();
-                            if let Some(err) = error {
-                                app.push_msg(ChatMessage::Error(format!(
-                                    "Download failed: {}", err
-                                )));
-                            } else {
-                                app.push_msg(ChatMessage::System(format!(
-                                    "✓ Downloaded {}. Now available in the model browser.",
-                                    filename
-                                )));
-                            }
-                            app.on_download_complete();
-                        }
-                    }
-                    Err(_) => {
-                        // Sender dropped without a final progress event —
-                        // this should be rare (the downloader always emits
-                        // done=true on success or error). Treat as silent
-                        // completion to avoid hanging UI state.
-                        app.on_download_complete();
                     }
                 }
             }

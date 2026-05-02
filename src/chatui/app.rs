@@ -133,53 +133,11 @@ pub(crate) struct App {
     pub(crate) voice: Option<super::voice::VoiceUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
-    /// True while a `/voice download <id>` is in flight; second requests
-    /// are rejected with a system message.
-    pub(crate) voice_download_in_flight: bool,
-    /// Active whisper model download — None when idle. Updated by the
-    /// settings model browser when the user picks an uninstalled row.
-    pub(crate) download_progress: Option<synaps_cli::voice::download::DownloadProgress>,
-    /// Filename of the in-flight download (None when idle). Used to render
-    /// the progress footer and to refuse a second concurrent download.
-    pub(crate) download_filename: Option<String>,
-    /// Watch receiver for the in-flight download — polled in the main
-    /// event loop to update `download_progress`. Closed when the download
-    /// completes or is cancelled.
-    pub(crate) download_rx: Option<tokio::sync::watch::Receiver<synaps_cli::voice::download::DownloadProgress>>,
-    /// Cursor position remembered between openings of the model browser.
-    /// Reset to 0 on first open.
-    #[allow(dead_code)]
-    pub(crate) model_browser_selected: usize,
     /// Live keybind registry — held so /settings can hot-swap voice toggle.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
-    /// Compiled-backend probe of the local-voice plugin's sidecar binary,
-    /// populated lazily/eagerly via `voice::discovery::read_build_info`. Used
-    /// by Settings → Voice → "Current build: <backend>" annotation when no
-    /// live `voice` session exists yet (pre-first-toggle). `None` means the
-    /// plugin is missing OR the probe failed; UI shows "unknown" in that case.
-    pub(crate) cached_voice_compiled_backend: Option<String>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Best-effort one-shot probe of the local-voice plugin's compiled backend.
-/// Runs synchronously at App construction; returns `None` quickly if no
-/// plugin is installed or the binary is older than `--print-build-info`.
-fn probe_compiled_backend_at_startup() -> Option<String> {
-    let sidecar = synaps_cli::voice::discovery::discover()?;
-    synaps_cli::voice::discovery::read_build_info(&sidecar.binary).map(|i| i.backend)
-}
-
-/// Best-effort one-shot probe that prefers extension `info.get` cache when the
-/// extension manager is already loaded, then falls back to the legacy
-/// `--print-build-info` sidecar shim.
-pub(crate) fn probe_compiled_backend_with_plugin_info(
-    plugin_info: Option<&synaps_cli::extensions::info::PluginInfo>,
-) -> Option<String> {
-    let sidecar = synaps_cli::voice::discovery::discover()?;
-    synaps_cli::voice::discovery::read_build_info_with_plugin(&sidecar.binary, plugin_info)
-        .map(|i| i.backend)
-}
 
 
 #[derive(Clone)]
@@ -254,13 +212,7 @@ impl App {
             suppress_paste_until: None,
             voice: None,
             active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
-            voice_download_in_flight: false,
-            download_progress: None,
-            download_filename: None,
-            download_rx: None,
-            model_browser_selected: 0,
             keybinds: None,
-            cached_voice_compiled_backend: probe_compiled_backend_at_startup(),
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
@@ -795,41 +747,6 @@ impl App {
         }
     }
 
-    /// Begin tracking a whisper model download. Returns `true` if state
-    /// was successfully set; `false` if a download is already in flight.
-    /// Caller is responsible for spawning the actual download task with
-    /// the matching `tokio::sync::watch::Sender`.
-    pub(crate) fn start_download(
-        &mut self,
-        filename: String,
-        rx: tokio::sync::watch::Receiver<synaps_cli::voice::download::DownloadProgress>,
-    ) -> bool {
-        if self.voice_download_in_flight || self.download_rx.is_some() {
-            return false;
-        }
-        self.voice_download_in_flight = true;
-        self.download_filename = Some(filename);
-        self.download_rx = Some(rx);
-        self.download_progress = Some(synaps_cli::voice::download::DownloadProgress::default());
-        true
-    }
-
-    /// Update progress state from a watch tick.
-    pub(crate) fn on_download_progress(
-        &mut self,
-        progress: synaps_cli::voice::download::DownloadProgress,
-    ) {
-        self.download_progress = Some(progress);
-    }
-
-    /// Clear download state — called when the watch sender is closed.
-    pub(crate) fn on_download_complete(&mut self) {
-        self.voice_download_in_flight = false;
-        self.download_filename = None;
-        self.download_rx = None;
-        self.download_progress = None;
-    }
-
 }
 
 #[cfg(test)]
@@ -933,58 +850,5 @@ mod tests {
         let display = app.user_display_text_for_submission("beforePASTED after");
 
         assert_eq!(display, "before [Pasted 6 chars] after");
-    }
-
-    #[test]
-    fn download_state_transitions() {
-        let mut app = test_app();
-        assert!(!app.voice_download_in_flight);
-        assert!(app.download_progress.is_none());
-        assert!(app.download_filename.is_none());
-        assert!(app.download_rx.is_none());
-
-        let (tx, rx) = tokio::sync::watch::channel(
-            synaps_cli::voice::download::DownloadProgress::default(),
-        );
-        assert!(app.start_download("ggml-base.bin".to_string(), rx));
-        assert!(app.voice_download_in_flight);
-        assert_eq!(app.download_filename.as_deref(), Some("ggml-base.bin"));
-        assert!(app.download_rx.is_some());
-        assert!(app.download_progress.is_some());
-
-        let mut p = synaps_cli::voice::download::DownloadProgress::default();
-        p.bytes = 1024;
-        p.total = Some(2048);
-        app.on_download_progress(p);
-        assert_eq!(app.download_progress.as_ref().unwrap().bytes, 1024);
-
-        let mut done = synaps_cli::voice::download::DownloadProgress::default();
-        done.bytes = 2048;
-        done.total = Some(2048);
-        done.done = true;
-        app.on_download_progress(done);
-        // Sender stays alive until we drop it; complete clears state.
-        drop(tx);
-        app.on_download_complete();
-        assert!(!app.voice_download_in_flight);
-        assert!(app.download_progress.is_none());
-        assert!(app.download_filename.is_none());
-        assert!(app.download_rx.is_none());
-    }
-
-    #[test]
-    fn second_download_rejected_while_in_flight() {
-        let mut app = test_app();
-        let (_tx1, rx1) = tokio::sync::watch::channel(
-            synaps_cli::voice::download::DownloadProgress::default(),
-        );
-        assert!(app.start_download("ggml-base.bin".to_string(), rx1));
-
-        let (_tx2, rx2) = tokio::sync::watch::channel(
-            synaps_cli::voice::download::DownloadProgress::default(),
-        );
-        // Second start must be refused.
-        assert!(!app.start_download("ggml-tiny.bin".to_string(), rx2));
-        assert_eq!(app.download_filename.as_deref(), Some("ggml-base.bin"));
     }
 }

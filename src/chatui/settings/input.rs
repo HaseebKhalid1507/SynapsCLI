@@ -572,7 +572,6 @@ mod tests {
             disabled_plugins: vec!["p2".into()],
             provider_keys: std::collections::BTreeMap::new(),
             model_health: std::collections::HashMap::new(),
-            voice_compiled_backend: None,
             plugin_categories: Vec::new(),
         }
     }

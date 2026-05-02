@@ -59,9 +59,6 @@ pub(crate) struct RuntimeSnapshot {
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
     pub model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
-    /// Cached `compiled_backend` from the live voice sidecar (if spawned).
-    /// Populated by callers from `app.voice.as_ref().and_then(...)`.
-    pub voice_compiled_backend: Option<String>,
     /// Plugin-declared settings categories snapshotted from the registry
     /// at modal-open time. Each entry contributes a category row in the
     /// left pane and a list of fields in the right pane. Path B Phase 4.
@@ -124,7 +121,6 @@ impl RuntimeSnapshot {
             disabled_plugins: config.disabled_plugins.clone(),
             provider_keys: config.provider_keys.clone(),
             model_health,
-            voice_compiled_backend: None,
             plugin_categories: registry.plugin_settings_categories(),
         }
     }
