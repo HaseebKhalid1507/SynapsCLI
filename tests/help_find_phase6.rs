@@ -21,6 +21,50 @@ fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpE
 }
 
 #[test]
+fn help_find_empty_query_groups_each_category_once_even_when_ranking_interleaves_categories() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/core-common", "Core Common", "Core", true),
+            test_entry("/plugin-common", "Plugin Common", "Plugins", true),
+            test_entry("/core-rare", "Core Rare", "Core", false),
+            test_entry("/plugin-rare", "Plugin Rare", "Plugins", false),
+        ],
+        Vec::new(),
+    );
+    let state = HelpFindState::new(registry.entries().to_vec(), "");
+
+    let categories = state
+        .filtered_rows()
+        .into_iter()
+        .filter_map(|row| row.category().map(str::to_string))
+        .collect::<Vec<_>>();
+
+    assert_eq!(categories, vec!["Core", "Plugins"]);
+}
+
+#[test]
+fn help_find_help_command_state_lists_only_help_commands() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/help", "Help", "Core", true),
+            test_entry("/help plugins", "Plugins", "Plugins", true),
+            test_entry("/plugins", "Plugins Modal", "Plugins", true),
+            test_entry("/model", "Model", "Models", true),
+        ],
+        Vec::new(),
+    );
+    let state = HelpFindState::new_help_commands(registry.entries().to_vec(), "");
+
+    let commands = state
+        .filtered_entries()
+        .into_iter()
+        .map(|entry| entry.command.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(commands, vec!["/help", "/help plugins"]);
+}
+
+#[test]
 fn help_find_sections_group_empty_query_by_category_with_header_rows() {
     let registry = HelpRegistry::new(
         vec![
