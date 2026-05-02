@@ -264,6 +264,22 @@ impl CommandRegistry {
         }
     }
 
+    /// Look up a plugin command by its unqualified name. Returns the
+    /// only match, or None if zero or multiple plugins claim the name.
+    /// Used when a builtin command has the same identifier as a
+    /// plugin-owned command (e.g. `/voice` is both a deprecation alias
+    /// builtin and a plugin command name) and we need to bypass the
+    /// builtin check to reach the plugin.
+    pub fn find_plugin_command_unqualified(&self, name: &str) -> Option<Arc<RegisteredPluginCommand>> {
+        let r = self.inner.read().unwrap();
+        let mut matches = r.plugin_commands.values().filter(|c| c.name == name);
+        let first = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None; // ambiguous
+        }
+        Some(first)
+    }
+
     /// All commands for autocomplete/help: builtins + unique unqualified skill names, sorted.
     pub fn all_commands(&self) -> Vec<String> {
         let r = self.inner.read().unwrap();

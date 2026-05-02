@@ -130,10 +130,7 @@ define_settings! {
             if let Some(kb) = app.keybinds.as_ref() {
                 match kb.write() {
                     Ok(mut g) => {
-                        // TODO Phase 7 deferred: target should be the active
-                        // sidecar plugin's declared toggle command, not a
-                        // hardcoded "voice toggle" literal.
-                        if let Err(e) = g.set_slash_command_key("voice toggle", value) {
+                        if let Err(e) = g.set_slash_command_key("sidecar toggle", value) {
                             tracing::warn!("sidecar_toggle_key apply failed: {}", e);
                         }
                     }

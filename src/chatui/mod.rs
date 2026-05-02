@@ -1149,7 +1149,7 @@ pub async fn run(
                                         });
                                     }
 
-                                    CommandAction::VoiceToggle => {
+                                    CommandAction::SidecarToggle => {
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.sidecar.is_none() {
                                             let voice_plugin_info = {
@@ -1203,7 +1203,7 @@ pub async fn run(
                                         }
                                     }
 
-                                    CommandAction::VoiceStatus => {
+                                    CommandAction::SidecarStatus => {
                                         let line = match app.sidecar.as_ref() {
                                             Some(v) => v.status_line(),
                                             None => match synaps_cli::sidecar::discovery::discover() {
@@ -1320,8 +1320,8 @@ pub async fn run(
                                         CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
-                                        CommandAction::VoiceToggle => {}
-                                        CommandAction::VoiceStatus => {}
+                                        CommandAction::SidecarToggle => {}
+                                        CommandAction::SidecarStatus => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue

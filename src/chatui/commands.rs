@@ -87,10 +87,12 @@ pub(super) enum CommandAction {
     ExtensionsAudit { tail: Option<usize> },
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
-    /// Toggle voice dictation on/off (`/voice` or `/voice toggle`).
-    VoiceToggle,
-    /// Show voice subsystem status (`/voice status`).
-    VoiceStatus,
+    /// Toggle the active sidecar plugin on/off (`/sidecar` or `/sidecar toggle`).
+    /// Also reachable via `/voice toggle` for one-release back-compat.
+    SidecarToggle,
+    /// Show sidecar subsystem status (`/sidecar status`). Also reachable
+    /// via `/voice status` for one-release back-compat.
+    SidecarStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -657,27 +659,49 @@ pub(super) async fn handle_command(
         "ping" => {
             return CommandAction::Ping;
         }
-        "voice" => {
+        "sidecar" => {
             let trimmed = arg.trim();
-            // toggle / status remain in core (they drive the in-core sidecar
-            // manager + UI pill). Everything else is a plugin-owned subcommand
-            // exposed via the Phase 2 interactive command contract.
             match trimmed {
-                "" | "toggle" => return CommandAction::VoiceToggle,
-                "status" => return CommandAction::VoiceStatus,
+                "" | "toggle" => return CommandAction::SidecarToggle,
+                "status" => return CommandAction::SidecarStatus,
+                other => {
+                    app.push_msg(ChatMessage::Error(format!(
+                        "unknown /sidecar subcommand: `{}` (try: toggle, status)",
+                        other
+                    )));
+                    return CommandAction::None;
+                }
+            }
+        }
+        "voice" => {
+            // One-release deprecation alias. `/voice toggle` and
+            // `/voice status` are core-generic operations and route to
+            // `/sidecar`. Other `/voice <sub>` calls resolve via the
+            // plugin command registry like any other plugin command —
+            // no hardcoded plugin name.
+            let trimmed = arg.trim();
+            match trimmed {
+                "" | "toggle" => return CommandAction::SidecarToggle,
+                "status" => return CommandAction::SidecarStatus,
                 _ => {}
             }
-            match registry.resolve("local-voice:voice") {
-                Resolution::PluginCommand(command) => {
+            // Fall through: let the plugin registry resolve `/voice <sub>`
+            // as a normal plugin command. The plugin that owns `/voice`
+            // (whoever it is) handles the rest. We bypass the builtin
+            // check (since "voice" is itself a builtin alias) and look
+            // up the unqualified plugin command directly.
+            match registry.find_plugin_command_unqualified("voice") {
+                Some(command) => {
                     return CommandAction::PluginCommand {
                         command,
                         arg: trimmed.to_string(),
                     };
                 }
-                _ => {
+                None => {
                     app.push_msg(ChatMessage::Error(
-                        "no voice plugin installed; install local-voice from synaps-skills to use \
-                         /voice subcommands beyond toggle and status".to_string(),
+                        "no plugin owns /voice; install one (e.g. local-voice from \
+                         synaps-skills) or use /sidecar toggle for the generic core \
+                         command".to_string(),
                     ));
                     return CommandAction::None;
                 }
@@ -1218,24 +1242,24 @@ mod tests {
     #[tokio::test]
     async fn parse_voice_empty_arg_is_toggle() {
         match invoke_voice("").await {
-            CommandAction::VoiceToggle => {}
-            other => panic!("expected VoiceToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
+            CommandAction::SidecarToggle => {}
+            other => panic!("expected SidecarToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
         }
     }
 
     #[tokio::test]
     async fn parse_voice_toggle_subcommand() {
         match invoke_voice("toggle").await {
-            CommandAction::VoiceToggle => {}
-            _ => panic!("expected VoiceToggle for `toggle` subcommand"),
+            CommandAction::SidecarToggle => {}
+            _ => panic!("expected SidecarToggle for `toggle` subcommand"),
         }
     }
 
     #[tokio::test]
     async fn parse_voice_status_subcommand() {
         match invoke_voice("status").await {
-            CommandAction::VoiceStatus => {}
-            _ => panic!("expected VoiceStatus for `status` subcommand"),
+            CommandAction::SidecarStatus => {}
+            _ => panic!("expected SidecarStatus for `status` subcommand"),
         }
     }
 
@@ -1248,7 +1272,10 @@ mod tests {
     }
 
     #[test]
-    fn voice_is_in_builtin_commands() {
+    fn sidecar_and_voice_are_in_builtin_commands() {
+        // `/sidecar` is the canonical generic toggle command.
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"sidecar"));
+        // `/voice` retained for one-release deprecation aliasing.
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
     }
 
@@ -1327,7 +1354,7 @@ mod tests {
         )
         .await;
         assert!(matches!(action, CommandAction::None));
-        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no voice plugin installed")));
-        assert!(pushed_error, "expected a `no voice plugin installed` error message");
+        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
+        assert!(pushed_error, "expected a `no plugin owns /voice` error message");
     }
 }
