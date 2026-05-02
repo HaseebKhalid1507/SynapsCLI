@@ -924,20 +924,47 @@ pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: us
     start
 }
 
-pub fn wrap_help_find_summary_lines(prefix: &str, summary: &str, width: usize) -> Vec<String> {
-    let prefix_width = prefix.chars().count();
-    let available = width.saturating_sub(prefix_width).max(8);
-    let summary_indent = " ".repeat(prefix_width);
-    wrap_help_text(summary, available)
-        .into_iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            if idx == 0 {
-                format!("{}{}", prefix, line)
+pub fn wrap_help_find_entry_lines(command: &str, summary: &str, selected: bool, width: usize) -> Vec<(String, String)> {
+    let marker = if selected { "›" } else { " " };
+    let command_width = 18usize;
+    let continuation_indent = 4usize;
+    let min_summary_width = 12usize;
+    let command_column_width = command_width.min(width.saturating_sub(min_summary_width + 2)).max(8);
+    let command_lines = wrap_help_find_token(command, command_column_width);
+    let summary_width = width.saturating_sub(2 + command_column_width).max(min_summary_width);
+    let summary_lines = wrap_help_text(summary, summary_width);
+    let total = command_lines.len().max(summary_lines.len()).max(1);
+
+    (0..total)
+        .map(|idx| {
+            let left = if idx == 0 {
+                let command_part = command_lines.get(idx).cloned().unwrap_or_default();
+                format!("{} {:<width$}", marker, command_part, width = command_column_width)
             } else {
-                format!("{}{}", summary_indent, line.trim_start())
-            }
+                let command_part = command_lines.get(idx).cloned().unwrap_or_default();
+                format!("  {}{}", " ".repeat(continuation_indent), command_part)
+            };
+            let right = if idx == 0 {
+                summary_lines.get(idx).cloned().unwrap_or_default()
+            } else {
+                summary_lines
+                    .get(idx)
+                    .map(|line| format!("  {}", line.trim_start()))
+                    .unwrap_or_default()
+            };
+            (left, right)
         })
+        .collect()
+}
+
+fn wrap_help_find_token(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.chars().count() <= width {
+        return vec![text.to_string()];
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect::<String>())
         .collect()
 }
 
@@ -983,15 +1010,17 @@ mod tests {
     }
 
     #[test]
-    fn wrap_help_find_summary_continuations_align_for_selected_and_unselected_rows() {
-        let summary = "description wraps onto a second visual line";
+    fn wrap_help_find_entry_lines_wraps_commands_and_indents_wrapped_descriptions_lightly() {
+        let lines = wrap_help_find_entry_lines(
+            "/extension-showcase:very-long-demo-command",
+            "description wraps onto a second visual line",
+            false,
+            34,
+        );
 
-        let selected = wrap_help_find_summary_lines("› /demo             ", summary, 24);
-        let unselected = wrap_help_find_summary_lines("  /demo             ", summary, 24);
-
-        assert!(selected[1].starts_with("                    "));
-        assert!(unselected[1].starts_with("                    "));
-        assert_eq!(selected[1].chars().take_while(|ch| ch.is_whitespace()).count(), 20);
-        assert_eq!(unselected[1].chars().take_while(|ch| ch.is_whitespace()).count(), 20);
+        assert!(lines.len() > 1);
+        assert_eq!(lines[0].0, "  /extension-showcas");
+        assert!(lines[1].0.starts_with("      e:very"), "wrapped command should indent slightly: {:?}", lines);
+        assert!(lines[1].1.starts_with("  "), "wrapped description should indent slightly: {:?}", lines);
     }
 }
