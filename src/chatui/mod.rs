@@ -526,7 +526,7 @@ pub async fn run(
                                             synaps_cli::help::builtin_entries(),
                                             registry.plugin_help_entries(),
                                         );
-                                        app.help_find = Some(synaps_cli::help::HelpFindState::new_help_commands(
+                                        app.help_find = Some(synaps_cli::help::HelpFindState::new(
                                             registry.entries().to_vec(),
                                             &query,
                                         ));

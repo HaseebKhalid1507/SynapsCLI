@@ -21,6 +21,51 @@ fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpE
 }
 
 #[test]
+fn help_find_default_state_includes_help_topics_and_real_commands() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/help", "Help", "Core", true),
+            test_entry("/help plugins", "Plugins Help", "Plugins", true),
+            test_entry("/plugins", "Plugins Modal", "Plugins", true),
+            test_entry("/model", "Model", "Models", true),
+        ],
+        Vec::new(),
+    );
+    let state = HelpFindState::new(registry.entries().to_vec(), "");
+
+    let commands = state
+        .filtered_entries()
+        .into_iter()
+        .map(|entry| entry.command.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(commands.contains(&"/help"));
+    assert!(commands.contains(&"/help plugins"));
+    assert!(commands.contains(&"/plugins"));
+    assert!(commands.contains(&"/model"));
+}
+
+#[test]
+fn help_find_groups_help_topics_under_help_commands_and_real_commands_under_their_theme() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/help plugins", "Plugins Help", "Plugins", true),
+            test_entry("/plugins", "Plugins Modal", "Plugins", true),
+            test_entry("/model", "Model", "Models", true),
+        ],
+        Vec::new(),
+    );
+    let state = HelpFindState::new(registry.entries().to_vec(), "");
+
+    let rows = state.filtered_rows();
+    let help_header_index = rows.iter().position(|row| row.category() == Some("Help commands")).unwrap();
+    let plugins_header_index = rows.iter().position(|row| row.category() == Some("Plugins")).unwrap();
+
+    assert!(rows[help_header_index + 1].entry().is_some_and(|entry| entry.command == "/help plugins"));
+    assert!(rows[plugins_header_index + 1].entry().is_some_and(|entry| entry.command == "/plugins"));
+}
+
+#[test]
 fn help_find_empty_query_groups_each_category_once_even_when_ranking_interleaves_categories() {
     let registry = HelpRegistry::new(
         vec![
@@ -43,7 +88,7 @@ fn help_find_empty_query_groups_each_category_once_even_when_ranking_interleaves
 }
 
 #[test]
-fn help_find_help_command_state_lists_only_help_commands() {
+fn help_find_can_scope_to_help_commands_for_explicit_help_only_views() {
     let registry = HelpRegistry::new(
         vec![
             test_entry("/help", "Help", "Core", true),

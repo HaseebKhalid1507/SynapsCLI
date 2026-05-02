@@ -149,7 +149,7 @@ impl HelpFindState {
             return entries.into_iter().map(HelpFindRow::Entry).collect();
         }
 
-        let mut category_names: Vec<&str> = entries.iter().map(|entry| entry.category.as_str()).collect();
+        let mut category_names: Vec<&str> = entries.iter().map(|entry| display_category(entry)).collect();
         category_names.sort_by(|a, b| {
             category_best_score(&entries, b)
                 .cmp(&category_best_score(&entries, a))
@@ -164,7 +164,7 @@ impl HelpFindState {
                 entries
                     .iter()
                     .copied()
-                    .filter(|entry| entry.category == category)
+                    .filter(|entry| display_category(entry) == category)
                     .map(HelpFindRow::Entry),
             );
         }
@@ -393,10 +393,18 @@ pub fn builtin_entries() -> Vec<HelpEntry> {
     serde_json::from_str(BUILTIN_HELP_JSON).expect("assets/help.json must be valid help JSON")
 }
 
+fn display_category(entry: &HelpEntry) -> &str {
+    if is_help_command(entry) {
+        "Help commands"
+    } else {
+        entry.category.as_str()
+    }
+}
+
 fn category_best_score(entries: &[&HelpEntry], category: &str) -> i32 {
     entries
         .iter()
-        .filter(|entry| entry.category == category)
+        .filter(|entry| display_category(entry) == category)
         .map(|entry| empty_query_score(entry))
         .max()
         .unwrap_or(0)
