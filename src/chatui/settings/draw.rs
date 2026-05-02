@@ -38,7 +38,7 @@ pub(crate) fn render(
         .constraints([Constraint::Length(20), Constraint::Min(1)])
         .split(outer[0]);
 
-    render_categories(frame, panes[0], state);
+    render_categories(frame, panes[0], state, snap);
     render_settings(frame, panes[1], state, snap);
     render_footer(frame, outer[1], state);
 
@@ -47,8 +47,9 @@ pub(crate) fn render(
     }
 }
 
-fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
+fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let mut lines = Vec::new();
+    let n_builtin = CATEGORIES.len();
     for (i, cat) in CATEGORIES.iter().enumerate() {
         let marker = if i == state.category_idx { "▸ " } else { "  " };
         let style = if i == state.category_idx && state.focus == Focus::Left {
@@ -62,10 +63,32 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState) {
             ratatui::text::Span::styled(format!("{}{}", marker, cat.label()), style),
         ]));
     }
+    for (i, pcat) in snap.plugin_categories.iter().enumerate() {
+        let abs = n_builtin + i;
+        let marker = if abs == state.category_idx { "▸ " } else { "  " };
+        let style = if abs == state.category_idx && state.focus == Focus::Left {
+            Style::default().fg(THEME.load().claude_label)
+        } else if abs == state.category_idx {
+            Style::default().fg(THEME.load().claude_text)
+        } else {
+            Style::default().fg(THEME.load().help_fg)
+        };
+        // Source label: "<Label> (<plugin>)" so users can tell who owns it.
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(
+                format!("{}{} ({})", marker, pcat.label, pcat.plugin),
+                style,
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+    if state.is_plugin_category(snap) {
+        render_plugin_category(frame, area, state, snap);
+        return;
+    }
     let current_cat = super::schema::CATEGORIES[state.category_idx];
     if current_cat == super::schema::Category::Plugins {
         render_plugins_list(frame, area, state, snap);
@@ -168,6 +191,70 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
     if let Some(ActiveEditor::Picker { options, cursor, .. }) = &state.edit_mode {
         render_picker(frame, area, options, *cursor);
     }
+}
+
+fn render_plugin_category(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+) {
+    use super::input::plugin_field_current_value;
+    let cat = match state.current_plugin_category(snap) {
+        Some(c) => c,
+        None => return,
+    };
+    let mut lines: Vec<ratatui::text::Line> = Vec::new();
+    // Header — makes the source explicit so users can audit.
+    lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+        format!("  Plugin: {}", cat.plugin),
+        Style::default().fg(THEME.load().help_fg),
+    )]));
+    for (i, field) in cat.fields.iter().enumerate() {
+        let selected = i == state.setting_idx && state.focus == Focus::Right;
+        let style = if selected {
+            Style::default().fg(THEME.load().claude_label)
+        } else {
+            Style::default().fg(THEME.load().claude_text)
+        };
+        let current = plugin_field_current_value(&cat.plugin, field);
+        use synaps_cli::skills::registry::PluginSettingsEditor as PE;
+        let display = if selected {
+            match (&state.edit_mode, &field.editor) {
+                (Some(super::ActiveEditor::PluginText { plugin_id, key, buffer, error, .. }), _)
+                    if *plugin_id == cat.plugin && *key == field.key =>
+                {
+                    let mut s = format!("[{}_]", buffer);
+                    if let Some(err) = error {
+                        s.push_str(&format!("  ! {}", err));
+                    }
+                    s
+                }
+                (None, PE::Cycler { .. }) => format!("◀ {} ▶", current),
+                (_, PE::Custom) => "(custom — not yet editable)".to_string(),
+                _ => current.clone(),
+            }
+        } else if matches!(field.editor, PE::Custom) {
+            "(custom)".to_string()
+        } else {
+            current.clone()
+        };
+        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+            format!("  {:<20} {}", field.label, display),
+            style,
+        )]));
+        if let Some((rk, msg)) = &state.row_error {
+            let want = format!("plugin.{}.{}", cat.plugin, field.key);
+            if selected && rk == &want {
+                let is_note = msg.starts_with("saved");
+                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                lines.push(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
+                ]));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {

@@ -134,6 +134,10 @@ pub(crate) struct RuntimeSnapshot {
     /// Cached `compiled_backend` from the live voice sidecar (if spawned).
     /// Populated by callers from `app.voice.as_ref().and_then(...)`.
     pub voice_compiled_backend: Option<String>,
+    /// Plugin-declared settings categories snapshotted from the registry
+    /// at modal-open time. Each entry contributes a category row in the
+    /// left pane and a list of fields in the right pane. Path B Phase 4.
+    pub plugin_categories: Vec<synaps_cli::skills::registry::PluginSettingsCategory>,
 }
 
 impl RuntimeSnapshot {
@@ -193,6 +197,7 @@ impl RuntimeSnapshot {
             provider_keys: config.provider_keys.clone(),
             model_health,
             voice_compiled_backend: None,
+            plugin_categories: registry.plugin_settings_categories(),
         }
     }
 }
@@ -212,6 +217,25 @@ pub(super) enum ActiveEditor {
     /// Enter on installed → emits Apply for `voice_stt_model_path`.
     /// Enter on uninstalled → emits StartModelDownload.
     ModelBrowser { cursor: usize, rows: Vec<ModelBrowserRow> },
+    /// Text editor for a plugin-declared `text` field. Path B Phase 4.
+    /// Commits via `InputOutcome::PluginApply` to the plugin config namespace.
+    PluginText {
+        plugin_id: String,
+        key: String,
+        buffer: String,
+        numeric: bool,
+        error: Option<String>,
+    },
+    /// Picker editor for a plugin-declared `picker` field. Options are
+    /// taken from the manifest declaration; selection commits via
+    /// `InputOutcome::PluginApply`.
+    #[allow(dead_code)] // wired by render path in a follow-up
+    PluginPicker {
+        plugin_id: String,
+        key: String,
+        options: Vec<String>,
+        cursor: usize,
+    },
 }
 
 pub(super) struct SettingsState {
@@ -248,6 +272,35 @@ impl SettingsState {
 
     pub fn current_setting(&self) -> Option<&'static SettingDef> {
         self.current_settings().get(self.setting_idx).copied()
+    }
+
+    /// True iff `category_idx` points past the built-in categories at a
+    /// plugin-declared category from `snap.plugin_categories`.
+    pub fn is_plugin_category(&self, snap: &RuntimeSnapshot) -> bool {
+        let n_builtin = schema::CATEGORIES.len();
+        self.category_idx >= n_builtin
+            && self.category_idx - n_builtin < snap.plugin_categories.len()
+    }
+
+    /// Plugin-declared category at the current `category_idx`, or None
+    /// if the cursor is on a built-in category.
+    pub fn current_plugin_category<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsCategory> {
+        if !self.is_plugin_category(snap) {
+            return None;
+        }
+        snap.plugin_categories.get(self.category_idx - schema::CATEGORIES.len())
+    }
+
+    /// Plugin field at `setting_idx` within the current plugin category.
+    pub fn current_plugin_field<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsField> {
+        self.current_plugin_category(snap)
+            .and_then(|c| c.fields.get(self.setting_idx))
     }
 }
 

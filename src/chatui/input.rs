@@ -111,6 +111,27 @@ pub(super) fn handle_event(
                 super::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
+                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
+                    let row_key = format!("plugin.{}.{}", plugin_id, key);
+                    match synaps_cli::extensions::config_store::write_plugin_config(
+                        &plugin_id, &key, &value,
+                    ) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((row_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((row_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PluginCustomNotImplemented { plugin_id, key } => {
+                    let row_key = format!("plugin.{}.{}", plugin_id, key);
+                    state.row_error = Some((
+                        row_key,
+                        "custom editor not yet implemented in this build".to_string(),
+                    ));
+                }
                 super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
                     let cfg_key = format!("provider.{}", provider_id);
                     match synaps_cli::config::write_config_value(&cfg_key, &value) {
