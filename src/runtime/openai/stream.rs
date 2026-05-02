@@ -191,7 +191,7 @@ pub(crate) async fn call_codex_stream_inner(
         "model": cfg.model,
         "store": false,
         "stream": true,
-        "instructions": system_prompt.clone().unwrap_or_default(),
+        "instructions": codex_instructions(system_prompt),
         "input": codex_input_messages(oai_messages),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -267,6 +267,17 @@ pub(crate) async fn call_codex_stream_inner(
         "role": "assistant",
         "content": content,
     }))
+}
+
+const CODEX_AUTONOMOUS_LOOP_POLICY: &str = "\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]";
+
+fn codex_instructions(system_prompt: &Option<String>) -> String {
+    let mut instructions = system_prompt.clone().unwrap_or_default();
+    if instructions.contains("[Synaps autonomous harness policy]") {
+        return instructions;
+    }
+    instructions.push_str(CODEX_AUTONOMOUS_LOOP_POLICY);
+    instructions
 }
 
 fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
@@ -583,6 +594,15 @@ mod codex_input_messages_tests {
                 arguments: r#"{"command":"ls"}"#.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn codex_instructions_appends_autonomous_loop_policy() {
+        let instructions = codex_instructions(&Some("Project-specific rules.".to_string()));
+        assert!(instructions.contains("Project-specific rules."));
+        assert!(instructions.contains("Do not stop at phase boundaries"));
+        assert!(instructions.contains("Do not ask the user whether to continue"));
+        assert!(instructions.contains("continue autonomously until the full requested job is complete"));
     }
 
     #[test]
