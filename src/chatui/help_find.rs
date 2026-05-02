@@ -145,8 +145,15 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
         Line::from(Span::styled(entry.title.clone(), Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from(Span::styled(entry.summary.clone(), Style::default().fg(THEME.load().input_fg))),
-        Line::from(""),
     ];
+    if let Some(source) = synaps_cli::help::source_display(entry) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Source: {}", source),
+            Style::default().fg(THEME.load().muted),
+        )));
+    }
+    lines.push(Line::from(""));
     lines.extend(entry.lines.iter().map(|line| Line::from(Span::raw(line.clone()))));
     if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
         lines.push(Line::from(""));

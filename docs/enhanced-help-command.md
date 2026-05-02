@@ -16,6 +16,39 @@ Make SynapsCLI help beautiful, brief, discoverable, JSON-driven, and extensible 
 
 Built-in help content is generated from JSON lists. Code owns rendering, validation, protected namespace enforcement, and dispatch behavior; JSON owns copy, sections, commands, aliases, keywords, and branch membership.
 
+Plugin manifests may include a `help_entries` array with the same shape as built-in `HelpEntry` JSON. Rich plugin help supports optional `usage` and `examples` fields:
+
+```json
+{
+  "name": "acme-tools",
+  "help_entries": [
+    {
+      "id": "acme-sync",
+      "command": "/acme:sync",
+      "title": "Acme Sync",
+      "summary": "Sync Acme workspace state.",
+      "category": "Plugin",
+      "topic": "Command",
+      "protected": false,
+      "common": false,
+      "aliases": ["/acme:pull"],
+      "keywords": ["acme", "sync", "workspace"],
+      "lines": ["Keeps the local Acme cache up to date."],
+      "usage": "/acme:sync [workspace]",
+      "examples": [
+        {
+          "command": "/acme:sync docs",
+          "description": "Sync the docs workspace."
+        }
+      ],
+      "related": ["/help plugins"]
+    }
+  ]
+}
+```
+
+Plugin help sources are assigned from the manifest name and shown in `/help find` detail as `Source: plugin <name>` (or `Source: plugin` when no name is available).
+
 ## Extension behavior
 
 Plugins/extensions may contribute help entries for their own commands or topics. They may not replace, shadow, or claim protected internal help entries. Protected internal paths include `/help`, `/help find`, `/settings`, `/plugins`, `/models`, `/login`, `/status`, `/ping`, `/extensions`, and all built-in slash command names.

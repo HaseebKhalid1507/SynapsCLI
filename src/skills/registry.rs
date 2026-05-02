@@ -87,7 +87,10 @@ impl CommandRegistry {
         let mut new_plugin_help_entries: Vec<HelpEntry> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
-                new_plugin_help_entries.extend(manifest.help_entries.clone());
+                new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(|mut entry| {
+                    entry.source = Some(manifest.name.clone());
+                    entry
+                }));
                 for cmd in manifest.commands {
                     let (name, description, backend) = match cmd {
                         crate::skills::manifest::ManifestCommand::Shell(cmd) => (
@@ -266,6 +269,41 @@ mod tests {
             base_dir: PathBuf::from("/"),
             source_path: PathBuf::from("/SKILL.md"),
         }
+    }
+
+
+    #[test]
+    fn plugin_help_entries_are_tagged_with_manifest_name() {
+        let root = PathBuf::from("/tmp/plugin-root");
+        let mut plugin = mk_cmd("acme-tools", "sync", root);
+        plugin.manifest.as_mut().unwrap().help_entries.push(HelpEntry {
+            id: "acme-sync".to_string(),
+            command: "/acme:sync".to_string(),
+            title: "Acme Sync".to_string(),
+            summary: "Sync Acme workspace state.".to_string(),
+            category: "Plugin".to_string(),
+            topic: crate::help::HelpTopicKind::Command,
+            protected: false,
+            common: false,
+            aliases: vec![],
+            keywords: vec![],
+            lines: vec![],
+            usage: Some("/acme:sync [workspace]".to_string()),
+            examples: vec![crate::help::HelpExample {
+                command: "/acme:sync docs".to_string(),
+                description: "Sync docs.".to_string(),
+            }],
+            related: vec![],
+            source: None,
+        });
+
+        let registry = CommandRegistry::new_with_plugins(&[], vec![], vec![plugin]);
+        let entries = registry.plugin_help_entries();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source.as_deref(), Some("acme-tools"));
+        assert_eq!(entries[0].usage.as_deref(), Some("/acme:sync [workspace]"));
+        assert_eq!(entries[0].examples[0].command, "/acme:sync docs");
     }
 
     #[test]
