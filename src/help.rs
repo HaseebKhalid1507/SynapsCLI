@@ -926,35 +926,32 @@ pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: us
 
 pub fn wrap_help_find_entry_lines(command: &str, summary: &str, selected: bool, width: usize) -> Vec<(String, String)> {
     let marker = if selected { "›" } else { " " };
-    let command_width = 18usize;
-    let continuation_indent = 4usize;
-    let min_summary_width = 12usize;
-    let command_column_width = command_width.min(width.saturating_sub(min_summary_width + 2)).max(8);
-    let command_lines = wrap_help_find_token(command, command_column_width);
-    let summary_width = width.saturating_sub(2 + command_column_width).max(min_summary_width);
-    let summary_lines = wrap_help_text(summary, summary_width);
-    let total = command_lines.len().max(summary_lines.len()).max(1);
+    let first_prefix = format!("{} ", marker);
+    let continuation_prefix = "    ";
+    let first_command_width = width.saturating_sub(first_prefix.chars().count()).min(22).max(8);
+    let command_lines = wrap_help_find_token(command, first_command_width);
+    let mut lines = Vec::new();
 
-    (0..total)
-        .map(|idx| {
-            let left = if idx == 0 {
-                let command_part = command_lines.get(idx).cloned().unwrap_or_default();
-                format!("{} {:<width$}", marker, command_part, width = command_column_width)
-            } else {
-                let command_part = command_lines.get(idx).cloned().unwrap_or_default();
-                format!("  {}{}", " ".repeat(continuation_indent), command_part)
-            };
-            let right = if idx == 0 {
-                summary_lines.get(idx).cloned().unwrap_or_default()
-            } else {
-                summary_lines
-                    .get(idx)
-                    .map(|line| format!("  {}", line.trim_start()))
-                    .unwrap_or_default()
-            };
-            (left, right)
-        })
-        .collect()
+    for (idx, command_part) in command_lines.iter().enumerate() {
+        if idx == 0 {
+            lines.push((format!("{}{}", first_prefix, command_part), String::new()));
+        } else {
+            lines.push((format!("{}{}", continuation_prefix, command_part), String::new()));
+        }
+    }
+
+    let summary_indent = "    ";
+    let summary_width = width.saturating_sub(summary_indent.len()).max(8);
+    let summary_lines = wrap_help_text(summary, summary_width);
+    for line in summary_lines {
+        lines.push((summary_indent.to_string(), line.trim_start().to_string()));
+    }
+
+    if lines.is_empty() {
+        vec![(first_prefix, String::new())]
+    } else {
+        lines
+    }
 }
 
 fn wrap_help_find_token(text: &str, width: usize) -> Vec<String> {
@@ -962,10 +959,23 @@ fn wrap_help_find_token(text: &str, width: usize) -> Vec<String> {
         return vec![text.to_string()];
     }
     let chars = text.chars().collect::<Vec<_>>();
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect()
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(split) = chars[start..end]
+                .iter()
+                .rposition(|ch| matches!(ch, ':' | '-' | '_' | '/'))
+                .filter(|split| *split > 0)
+            {
+                end = start + split + 1;
+            }
+        }
+        lines.push(chars[start..end].iter().collect::<String>());
+        start = end;
+    }
+    lines
 }
 
 fn visual_height_between(row_heights: &[usize], start: usize, end_inclusive: usize) -> usize {
@@ -1019,8 +1029,11 @@ mod tests {
         );
 
         assert!(lines.len() > 1);
-        assert_eq!(lines[0].0, "  /extension-showcas");
-        assert!(lines[1].0.starts_with("      e:very"), "wrapped command should indent slightly: {:?}", lines);
-        assert!(lines[1].1.starts_with("  "), "wrapped description should indent slightly: {:?}", lines);
+        assert_eq!(lines[0].0, "  /extension-showcase:");
+        assert!(lines[1].0.starts_with("    very-long-demo"), "wrapped command should indent slightly: {:?}", lines);
+        assert_eq!(lines[2].0, "    ", "description should start on its own lightly indented line: {:?}", lines);
+        assert_eq!(lines[2].1, "description wraps onto a");
+        assert_eq!(lines[3].0, "    ", "wrapped description should keep small indent: {:?}", lines);
+        assert_eq!(lines[3].1, "second visual line");
     }
 }

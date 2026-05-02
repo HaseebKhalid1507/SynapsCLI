@@ -191,7 +191,9 @@ fn wrapped_entry_lines(
         .map(|(command_part, summary)| {
             let mut spans = highlighted_spans(&command_part, query, command_style, match_style);
             if !summary.is_empty() {
-                spans.push(Span::raw("  "));
+                if !command_part.trim().is_empty() {
+                    spans.push(Span::raw("  "));
+                }
                 spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
             }
             Line::from(spans)
