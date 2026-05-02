@@ -9,18 +9,17 @@ use ratatui::{
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation, Shader};
 
-/// Build the sidecar indicator pill rendered after the status span when
-/// a sidecar plugin is active. Returns `None` when no sidecar is bound.
-/// (Display labels here are placeholders pending a plugin-provided
-/// pill schema — see Phase 7 plan, deferred slice.)
-pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> {
-    let sidecar = app.sidecar.as_ref()?;
+/// Build a single sidecar pill segment for one `SidecarUiState`.
+fn sidecar_pill_segment(
+    sidecar: &super::sidecar::SidecarUiState,
+    spinner_frame: usize,
+) -> Span<'static> {
     let label = sidecar.display_name.as_deref().unwrap_or("sidecar");
-    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, app.spinner_frame);
+    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, spinner_frame);
     let color = match &sidecar.status {
         super::sidecar::SidecarUiStatus::Idle => {
             if sidecar.armed {
-                let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
                 let base = match THEME.load().status_streaming {
                     Color::Rgb(r, g, b) => (r, g, b),
                     _ => (220, 80, 80),
@@ -35,7 +34,7 @@ pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> 
             }
         }
         super::sidecar::SidecarUiStatus::Listening => {
-            let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
             let base = match THEME.load().status_streaming {
                 Color::Rgb(r, g, b) => (r, g, b),
                 _ => (220, 80, 80),
@@ -53,10 +52,61 @@ pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> 
         super::sidecar::SidecarUiStatus::Transcribing => Modifier::empty(),
         _ => Modifier::BOLD,
     };
-    Some(Span::styled(
-        text,
-        Style::default().fg(color).add_modifier(modifier),
-    ))
+    Span::styled(text, Style::default().fg(color).add_modifier(modifier))
+}
+
+/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// pairs and the registry's lifecycle claims, return the plugin ids in
+/// display order: importance desc, then display_name alphabetical, then
+/// plugin id. Pulled out so the ordering can be unit-tested without
+/// constructing a full `SidecarUiState` (which owns a child process).
+pub(crate) fn order_sidecar_pills(
+    sidecars: &[(String, Option<String>)],
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Vec<String> {
+    let importance_for = |pid: &str| -> i32 {
+        claims.iter().find(|c| c.plugin == pid).map(|c| c.importance).unwrap_or(0)
+    };
+    let mut keys: Vec<&(String, Option<String>)> = sidecars.iter().collect();
+    keys.sort_by(|a, b| {
+        let imp_a = importance_for(&a.0);
+        let imp_b = importance_for(&b.0);
+        imp_b.cmp(&imp_a)
+            .then_with(|| {
+                let an = a.1.as_deref().unwrap_or(a.0.as_str());
+                let bn = b.1.as_deref().unwrap_or(b.0.as_str());
+                an.cmp(bn)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    keys.into_iter().map(|(p, _)| p.clone()).collect()
+}
+
+/// Build sidecar pill spans for all active sidecars, ordered by
+/// importance (desc) then display_name alphabetical (Phase 8 8B.3).
+///
+/// Each segment is preceded by a vertical separator so the caller can
+/// concatenate the result onto a status line. Returns an empty vec
+/// when no sidecars are active.
+pub(crate) fn sidecar_pill_spans(
+    app: &super::app::App,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+) -> Vec<Span<'static>> {
+    if app.sidecars.is_empty() {
+        return Vec::new();
+    }
+    let claims = registry.lifecycle_claims();
+    let inputs: Vec<(String, Option<String>)> = app.sidecars.iter()
+        .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
+        .collect();
+    let order = order_sidecar_pills(&inputs, &claims);
+    let mut spans = Vec::with_capacity(order.len() * 2);
+    for pid in &order {
+        let Some(state) = app.sidecars.get(pid) else { continue; };
+        spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
+        spans.push(sidecar_pill_segment(state, app.spinner_frame));
+    }
+    spans
 }
 
 /// Pure helper backing [`sidecar_pill_span`] — returns the rendered
@@ -95,10 +145,16 @@ mod sidecar_pill_tests {
         super::super::app::App::new(Session::new("test", "medium", None))
     }
 
+    fn empty_registry() -> std::sync::Arc<synaps_cli::skills::registry::CommandRegistry> {
+        std::sync::Arc::new(synaps_cli::skills::registry::CommandRegistry::new_with_plugins(
+            &[], vec![], vec![],
+        ))
+    }
+
     #[test]
-    fn pill_is_none_when_sidecar_inactive() {
+    fn pill_returns_empty_when_no_sidecars() {
         let app = fresh_app();
-        assert!(sidecar_pill_span(&app).is_none());
+        assert!(sidecar_pill_spans(&app, &empty_registry()).is_empty());
     }
 
     #[test]
@@ -150,7 +206,41 @@ mod sidecar_pill_tests {
         assert!(!text.contains("Voice"), "got: {text:?}");
     }
 
+    fn claim(plugin: &str, command: &str, importance: i32) -> synaps_cli::skills::registry::LifecycleClaim {
+        synaps_cli::skills::registry::LifecycleClaim {
+            plugin: plugin.into(),
+            command: command.into(),
+            settings_category: None,
+            display_name: command.into(),
+            importance,
+        }
+    }
+
     #[test]
+    fn multi_segment_pill_orders_by_importance_desc() {
+        // alpha @ 10, beta @ 90 — beta should come first.
+        let claims = vec![claim("alpha", "alpha", 10), claim("beta", "beta", 90)];
+        let inputs = vec![
+            ("alpha".to_string(), Some("Alpha".to_string())),
+            ("beta".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["beta".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn multi_segment_pill_tiebreaks_alphabetical_by_display_name() {
+        // Both importance 50 — Alpha before Beta by display name.
+        let claims = vec![claim("p2", "p2", 50), claim("p1", "p1", 50)];
+        let inputs = vec![
+            ("p2".to_string(), Some("Alpha".to_string())),
+            ("p1".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["p2".to_string(), "p1".to_string()]);
+    }
+
+        #[test]
     fn active_tasks_progress_line_renders_fraction() {
         let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
         tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
@@ -351,9 +441,8 @@ pub(crate) fn draw(
                 Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
                 status_span,
             ];
-            if let Some(pill) = sidecar_pill_span(app) {
-                spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
-                spans.push(pill);
+            for span in sidecar_pill_spans(app, registry) {
+                spans.push(span);
             }
             spans
         }))

@@ -89,10 +89,13 @@ pub(super) enum CommandAction {
     ExtensionsMemory(ExtensionsMemoryAction),
     /// Toggle the active sidecar plugin on/off (`/sidecar` or `/sidecar toggle`).
     /// Also reachable via `/voice toggle` for one-release back-compat.
-    SidecarToggle,
+    ///
+    /// `plugin_id = Some(pid)` selects a specific claimed sidecar (Phase 8 8B).
+    /// `plugin_id = None` falls back to the legacy single-sidecar slot.
+    SidecarToggle { plugin_id: Option<String> },
     /// Show sidecar subsystem status (`/sidecar status`). Also reachable
     /// via `/voice status` for one-release back-compat.
-    SidecarStatus,
+    SidecarStatus { plugin_id: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -312,8 +315,8 @@ pub(super) async fn handle_command(
     if let Some(claim) = registry.lifecycle_for_command(cmd) {
         let trimmed = arg.trim();
         match trimmed {
-            "" | "toggle" => return CommandAction::SidecarToggle,
-            "status" => return CommandAction::SidecarStatus,
+            "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(claim.plugin.clone()) },
+            "status" => return CommandAction::SidecarStatus { plugin_id: Some(claim.plugin.clone()) },
             _ => {
                 // Fall through to the plugin-command resolver: the
                 // plugin can define `<command> <other-sub>` (e.g.
@@ -728,14 +731,14 @@ pub(super) async fn handle_command(
                 };
                 match first {
                     "" | "toggle" => match claims.len() {
-                        0 => return CommandAction::SidecarToggle,
+                        0 => return CommandAction::SidecarToggle { plugin_id: None },
                         1 => {
                             let c = &claims[0];
                             app.push_msg(ChatMessage::System(format!(
                                 "hint: this sidecar is claimed by /{} — try /{} toggle",
                                 c.command, c.command
                             )));
-                            return CommandAction::SidecarToggle;
+                            return CommandAction::SidecarToggle { plugin_id: Some(c.plugin.clone()) };
                         }
                         _ => {
                             app.push_msg(ChatMessage::Error(render_disambig("toggle", &claims)));
@@ -743,14 +746,14 @@ pub(super) async fn handle_command(
                         }
                     },
                     "status" => match claims.len() {
-                        0 => return CommandAction::SidecarStatus,
+                        0 => return CommandAction::SidecarStatus { plugin_id: None },
                         1 => {
                             let c = &claims[0];
                             app.push_msg(ChatMessage::System(format!(
                                 "hint: this sidecar is claimed by /{} — try /{} status",
                                 c.command, c.command
                             )));
-                            return CommandAction::SidecarStatus;
+                            return CommandAction::SidecarStatus { plugin_id: Some(c.plugin.clone()) };
                         }
                         _ => {
                             app.push_msg(ChatMessage::Error(render_disambig("status", &claims)));
@@ -783,10 +786,9 @@ pub(super) async fn handle_command(
                     )));
                     return CommandAction::None;
                 }
-                // TODO(phase 8 8B): plumb plugin_id into SidecarToggle / SidecarStatus.
                 match rest.as_str() {
-                    "toggle" => return CommandAction::SidecarToggle,
-                    "status" => return CommandAction::SidecarStatus,
+                    "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(plugin_id.to_string()) },
+                    "status" => return CommandAction::SidecarStatus { plugin_id: Some(plugin_id.to_string()) },
                     other => {
                         app.push_msg(ChatMessage::Error(format!(
                             "unknown /sidecar subcommand: `{}` (try: toggle, status)",
@@ -805,8 +807,8 @@ pub(super) async fn handle_command(
             // no hardcoded plugin name.
             let trimmed = arg.trim();
             match trimmed {
-                "" | "toggle" => return CommandAction::SidecarToggle,
-                "status" => return CommandAction::SidecarStatus,
+                "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: None },
+                "status" => return CommandAction::SidecarStatus { plugin_id: None },
                 _ => {}
             }
             // Fall through: let the plugin registry resolve `/voice <sub>`
@@ -1366,7 +1368,7 @@ mod tests {
     #[tokio::test]
     async fn parse_voice_empty_arg_is_toggle() {
         match invoke_voice("").await {
-            CommandAction::SidecarToggle => {}
+            CommandAction::SidecarToggle { .. } => {}
             other => panic!("expected SidecarToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
         }
     }
@@ -1374,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn parse_voice_toggle_subcommand() {
         match invoke_voice("toggle").await {
-            CommandAction::SidecarToggle => {}
+            CommandAction::SidecarToggle { .. } => {}
             _ => panic!("expected SidecarToggle for `toggle` subcommand"),
         }
     }
@@ -1382,7 +1384,7 @@ mod tests {
     #[tokio::test]
     async fn parse_voice_status_subcommand() {
         match invoke_voice("status").await {
-            CommandAction::SidecarStatus => {}
+            CommandAction::SidecarStatus { .. } => {}
             _ => panic!("expected SidecarStatus for `status` subcommand"),
         }
     }
@@ -1543,7 +1545,12 @@ mod tests {
             &keybinds,
         )
         .await;
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        match action {
+            CommandAction::SidecarToggle { plugin_id } => {
+                assert_eq!(plugin_id.as_deref(), Some("local-voice"));
+            }
+            other => panic!("expected SidecarToggle with plugin_id, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[tokio::test]
@@ -1567,7 +1574,7 @@ mod tests {
             &keybinds,
         )
         .await;
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
     }
 
     #[tokio::test]
@@ -1590,7 +1597,12 @@ mod tests {
             &keybinds,
         )
         .await;
-        assert!(matches!(action, CommandAction::SidecarStatus));
+        match action {
+            CommandAction::SidecarStatus { plugin_id } => {
+                assert_eq!(plugin_id.as_deref(), Some("local-voice"));
+            }
+            other => panic!("expected SidecarStatus with plugin_id, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[tokio::test]
@@ -1620,7 +1632,7 @@ mod tests {
         // No "no plugin owns /voice" error pushed — lifecycle path won.
         let pushed_legacy_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
         assert!(!pushed_legacy_error);
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
     }
 
     #[tokio::test]
@@ -1674,7 +1686,7 @@ mod tests {
     #[tokio::test]
     async fn sidecar_toggle_works_when_zero_claims_loaded() {
         let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
         let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for zero-claim back-compat");
     }
@@ -1685,7 +1697,7 @@ mod tests {
             "toggle",
             vec![lifecycle_plugin("local-voice", "voice")],
         ).await;
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
         let pushed_hint = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::System(s) if s.contains("try /voice toggle")));
         assert!(pushed_hint, "expected a System hint mentioning `try /voice toggle`");
     }
@@ -1720,7 +1732,7 @@ mod tests {
                 lifecycle_plugin("local-ocr", "ocr"),
             ],
         ).await;
-        assert!(matches!(action, CommandAction::SidecarToggle));
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
         let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for valid qualified form");
     }
@@ -1742,7 +1754,7 @@ mod tests {
             "local-voice status",
             vec![lifecycle_plugin("local-voice", "voice")],
         ).await;
-        assert!(matches!(action, CommandAction::SidecarStatus));
+        assert!(matches!(action, CommandAction::SidecarStatus { .. }));
     }
 
     #[tokio::test]
