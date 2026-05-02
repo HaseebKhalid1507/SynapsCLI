@@ -97,7 +97,7 @@ pub fn parse_task_event(method: &str, params: &Value) -> Result<TaskEvent, Strin
                 None => TaskKind::Generic,
                 Some("download") => TaskKind::Download,
                 Some("rebuild") => TaskKind::Rebuild,
-                Some("generic") => TaskKind::Generic,
+                Some("generic") | Some("other") => TaskKind::Generic,
                 Some(other) => return Err(format!("task.start unknown kind '{other}'")),
             };
             Ok(TaskEvent::Start { id, label, kind })

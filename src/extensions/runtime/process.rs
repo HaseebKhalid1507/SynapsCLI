@@ -1672,9 +1672,11 @@ impl ExtensionHandler for ProcessExtension {
                     }
                 }
             };
-            // Drain any remaining buffered notifications after the response lands.
+            // Drain any notifications already buffered after the response lands, but
+            // do not wait for the subscriber channel to close (that would deadlock
+            // while this invocation still owns `rx`).
             self.unsubscribe_notifications().await;
-            while let Some(frame) = rx.recv().await {
+            while let Ok(frame) = rx.try_recv() {
                 let _ = Self::forward_invoke_command_frame(
                     &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
                 );

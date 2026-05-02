@@ -19,6 +19,7 @@ pub enum ManifestCommand {
     Shell(ManifestShellCommand),
     ExtensionTool(ManifestExtensionToolCommand),
     SkillPrompt(ManifestSkillPromptCommand),
+    Interactive(ManifestInteractiveCommand),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -48,6 +49,17 @@ pub struct ManifestSkillPromptCommand {
     pub description: Option<String>,
     pub skill: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ManifestInteractiveCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Route this slash command to the plugin extension's `command.invoke` RPC.
+    pub interactive: bool,
+    #[serde(default)]
+    pub subcommands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +236,31 @@ mod tests {
         let json = r#"{"name":"plain"}"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert!(m.provides.is_none());
+    }
+
+
+    #[test]
+    fn plugin_manifest_parses_interactive_command() {
+        let json = r#"{
+            "name": "demo-plugin",
+            "commands": [
+                {
+                    "name": "demo",
+                    "description": "Run interactive demo",
+                    "interactive": true,
+                    "subcommands": ["models", "download"]
+                }
+            ]
+        }"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        match &m.commands[0] {
+            ManifestCommand::Interactive(cmd) => {
+                assert_eq!(cmd.name, "demo");
+                assert_eq!(cmd.description.as_deref(), Some("Run interactive demo"));
+                assert_eq!(cmd.subcommands, vec!["models", "download"]);
+            }
+            other => panic!("expected interactive command, got {other:?}"),
+        }
     }
 
     #[test]

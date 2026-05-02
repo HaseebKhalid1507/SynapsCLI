@@ -77,6 +77,24 @@ mod voice_pill_tests {
         assert!(voice_pill_span(&app).is_none());
     }
 
+
+    #[test]
+    fn active_tasks_progress_line_renders_fraction() {
+        let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
+            id: "dl".into(),
+            label: "Download base".into(),
+            kind: synaps_cli::extensions::tasks::TaskKind::Download,
+        });
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Update {
+            id: "dl".into(),
+            current: Some(50),
+            total: Some(100),
+            message: Some("half".into()),
+        });
+        let _ = render_active_tasks_line(&tasks, 80);
+    }
+
     #[test]
     fn download_progress_line_renders_filled_bar() {
         use synaps_cli::voice::download::DownloadProgress;
@@ -202,6 +220,34 @@ pub(crate) fn quit_effect() -> Effect {
             fx::fade_to_fg(Color::Black, (650, Interpolation::QuadIn)),
         ]),
     ])
+}
+
+
+/// Render the first generic extension active task as a single sticky progress line.
+pub(crate) fn render_active_tasks_line<'a>(
+    tasks: &'a synaps_cli::extensions::active_tasks::ActiveTasks,
+    width: u16,
+) -> Paragraph<'a> {
+    let theme = THEME.load();
+    let Some(task) = tasks.iter().next() else {
+        return Paragraph::new(Line::from(""));
+    };
+    let pct = task.fraction().map(|f| (f * 100.0).round() as u32);
+    let bar_width = ((width as usize).saturating_sub(42)).clamp(8, 28);
+    let fill = task.fraction().map(|f| (f * bar_width as f32).round() as usize).unwrap_or(0).min(bar_width);
+    let bar = format!("{}{}", "█".repeat(fill), "░".repeat(bar_width - fill));
+    let status = if let Some(err) = &task.error {
+        format!("✘ {}: {}", task.label, err)
+    } else if task.done {
+        format!("✓ {}", task.label)
+    } else {
+        let pct_text = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?%".to_string());
+        match &task.message {
+            Some(msg) if !msg.is_empty() => format!("⟳ {} [{}] {}  {}", task.label, bar, pct_text, msg),
+            _ => format!("⟳ {} [{}] {}", task.label, bar, pct_text),
+        }
+    };
+    Paragraph::new(Line::from(Span::styled(status, Style::default().fg(theme.help_fg))))
 }
 
 /// Render a tqdm-style single-line download progress widget.
@@ -333,7 +379,7 @@ pub(crate) fn draw(
 
         // Download progress bar — 1 line above the input box when a whisper
         // model download is in flight. Hidden otherwise.
-        let download_height: u16 = if app.download_progress.is_some() { 1 } else { 0 };
+        let download_height: u16 = if app.download_progress.is_some() || !app.active_tasks.is_empty() { 1 } else { 0 };
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -828,7 +874,10 @@ pub(crate) fn draw(
         // Renders a tqdm-style line above the input box when a whisper model
         // download is in flight. Cleared automatically when `download_progress`
         // is None (the layout collapses to 0 height in that case).
-        if let Some(progress) = &app.download_progress {
+        if !app.active_tasks.is_empty() {
+            let bar = render_active_tasks_line(&app.active_tasks, outer[3].width);
+            frame.render_widget(bar, outer[3]);
+        } else if let Some(progress) = &app.download_progress {
             let bar = render_download_progress_line(
                 app.download_filename.as_deref().unwrap_or("(model)"),
                 progress,

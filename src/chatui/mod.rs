@@ -637,11 +637,24 @@ pub async fn run(
                                         steer_tx = Some(s_tx);
                                     }
                                     CommandAction::PluginCommand { command, arg } => {
-                                        commands::execute_command_action(
-                                            CommandAction::PluginCommand { command, arg },
-                                            &mut app,
-                                            &runtime,
-                                        ).await;
+                                        if matches!(
+                                            command.backend,
+                                            synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
+                                        ) {
+                                            let manager = ext_mgr_shared.read().await;
+                                            commands::execute_interactive_plugin_command_events(
+                                                &command,
+                                                &arg,
+                                                &manager,
+                                                &mut app,
+                                            ).await;
+                                        } else {
+                                            commands::execute_command_action(
+                                                CommandAction::PluginCommand { command, arg },
+                                                &mut app,
+                                                &runtime,
+                                            ).await;
+                                        }
                                     }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).

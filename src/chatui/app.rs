@@ -131,6 +131,8 @@ pub(crate) struct App {
     /// Holds the sidecar manager + UI status; the event loop drains its
     /// event stream and updates `status` accordingly.
     pub(crate) voice: Option<super::voice::VoiceUiState>,
+    /// Generic extension-provided active tasks rendered in the sticky progress area.
+    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
     /// True while a `/voice download <id>` is in flight; second requests
     /// are rejected with a system message.
     pub(crate) voice_download_in_flight: bool,
@@ -251,6 +253,7 @@ impl App {
             visible_line_range: None,
             suppress_paste_until: None,
             voice: None,
+            active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             voice_download_in_flight: false,
             download_progress: None,
             download_filename: None,

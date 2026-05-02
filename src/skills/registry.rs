@@ -15,6 +15,7 @@ pub enum RegisteredPluginCommandBackend {
     Shell { command: String, args: Vec<String> },
     ExtensionTool { tool: String, input: serde_json::Value },
     SkillPrompt { skill: String, prompt: String },
+    Interactive { plugin_extension_id: String },
 }
 
 /// Resolution outcome for a typed slash command.
@@ -100,6 +101,22 @@ impl CommandRegistry {
                             cmd.description,
                             RegisteredPluginCommandBackend::SkillPrompt { skill: cmd.skill, prompt: cmd.prompt },
                         ),
+                        crate::skills::manifest::ManifestCommand::Interactive(cmd) => {
+                            if !cmd.interactive {
+                                continue;
+                            }
+                            (
+                                cmd.name,
+                                cmd.description,
+                                RegisteredPluginCommandBackend::Interactive {
+                                    plugin_extension_id: manifest
+                                        .extension
+                                        .as_ref()
+                                        .map(|_| plugin.name.clone())
+                                        .unwrap_or_else(|| plugin.name.clone()),
+                                },
+                            )
+                        },
                     };
                     let q = format!("{}:{}", manifest.name, name);
                     new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
@@ -244,6 +261,53 @@ mod tests {
                 extension: None,
                 provides: None,
             }),
+        }
+    }
+
+
+    fn mk_interactive_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
+        Plugin {
+            name: plugin.to_string(),
+            root,
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(crate::skills::manifest::PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![ManifestCommand::Interactive(crate::skills::manifest::ManifestInteractiveCommand {
+                    name: name.to_string(),
+                    description: Some("interactive desc".to_string()),
+                    interactive: true,
+                    subcommands: vec!["help".to_string()],
+                })],
+                extension: None,
+                provides: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn registers_interactive_plugin_command_backend() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_interactive_cmd("demo-plugin", "demo", PathBuf::from("/tmp/demo"))],
+        );
+
+        match reg.resolve("demo-plugin:demo") {
+            Resolution::PluginCommand(cmd) => match &cmd.backend {
+                RegisteredPluginCommandBackend::Interactive { plugin_extension_id } => {
+                    assert_eq!(plugin_extension_id, "demo-plugin");
+                    assert_eq!(cmd.name, "demo");
+                }
+                other => panic!("expected interactive backend, got {other:?}"),
+            },
+            _ => panic!("expected plugin command resolution"),
         }
     }
 
