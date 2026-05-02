@@ -58,7 +58,9 @@ fn find_state_enter_opens_detail_and_escape_returns_to_list() {
         state.move_down();
     }
     state.open_selected();
-    assert_eq!(state.detail_entry().map(|entry| entry.command.as_str()), Some("/help plugins"));
+    let detail = state.detail_entry().expect("plugins detail should open");
+    assert_eq!(detail.command.as_str(), "/help plugins");
+    assert!(detail.examples.iter().any(|example| example.command == "/plugins"));
     state.close_detail();
     assert!(state.detail_entry().is_none());
 }

@@ -10,6 +10,12 @@ pub enum HelpTopicKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelpExample {
+    pub command: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelpEntry {
     pub id: String,
     pub command: String,
@@ -25,6 +31,10 @@ pub struct HelpEntry {
     pub keywords: Vec<String>,
     #[serde(default)]
     pub lines: Vec<String>,
+    #[serde(default)]
+    pub usage: Option<String>,
+    #[serde(default)]
+    pub examples: Vec<HelpExample>,
     #[serde(default)]
     pub related: Vec<String>,
     #[serde(default)]
@@ -246,19 +256,40 @@ pub fn render_help(registry: &HelpRegistry, branch: Option<&str>) -> Option<Stri
 }
 
 pub fn render_entry(entry: &HelpEntry) -> String {
+    let mut lines = vec![entry.title.clone(), String::new(), entry.summary.clone()];
+
     if !entry.lines.is_empty() {
-        let mut lines = vec![format!("{}", entry.title)];
         lines.push(String::new());
         lines.extend(entry.lines.clone());
-        return lines.join("\n");
     }
 
-    let mut lines = vec![format!("{} — {}", entry.title, entry.summary)];
+    append_usage_examples_related(&mut lines, entry);
+    lines.join("\n")
+}
+
+fn append_usage_examples_related(lines: &mut Vec<String>, entry: &HelpEntry) {
+    if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
+        lines.push(String::new());
+        lines.push("Usage".to_string());
+        lines.push(format!("  {}", usage));
+    }
+
+    if !entry.examples.is_empty() {
+        lines.push(String::new());
+        lines.push("Examples".to_string());
+        for example in &entry.examples {
+            if example.description.trim().is_empty() {
+                lines.push(format!("  {}", example.command));
+            } else {
+                lines.push(format!("  {:<16} {}", example.command, example.description));
+            }
+        }
+    }
+
     if !entry.related.is_empty() {
         lines.push(String::new());
         lines.push(format!("Related: {}", entry.related.join(", ")));
     }
-    lines.join("\n")
 }
 
 fn normalize_command(entry: &mut HelpEntry) {
@@ -307,6 +338,16 @@ fn searchable_text(entry: &HelpEntry) -> String {
     for line in &entry.lines {
         text.push(' ');
         text.push_str(line);
+    }
+    if let Some(usage) = &entry.usage {
+        text.push(' ');
+        text.push_str(usage);
+    }
+    for example in &entry.examples {
+        text.push(' ');
+        text.push_str(&example.command);
+        text.push(' ');
+        text.push_str(&example.description);
     }
     text.to_ascii_lowercase()
 }

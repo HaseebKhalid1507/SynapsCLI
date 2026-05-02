@@ -96,6 +96,66 @@ fn phase_one_command_entries_render_directly() {
 }
 
 #[test]
+fn help_entry_deserializes_when_usage_and_examples_are_omitted() {
+    let json = r#"{
+        "id": "minimal",
+        "command": "/minimal",
+        "title": "Minimal",
+        "summary": "A minimal legacy help entry.",
+        "category": "Core",
+        "topic": "Command",
+        "protected": false,
+        "common": false
+    }"#;
+
+    let entry: HelpEntry = serde_json::from_str(json).expect("legacy help JSON should still deserialize");
+
+    assert_eq!(entry.usage, None);
+    assert!(entry.examples.is_empty());
+}
+
+#[test]
+fn render_entry_includes_usage_and_examples_when_present() {
+    let entry = HelpEntry {
+        id: "example-rich".to_string(),
+        command: "/example".to_string(),
+        title: "/example".to_string(),
+        summary: "Run the example command.".to_string(),
+        category: "Core".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common: false,
+        aliases: vec![],
+        keywords: vec![],
+        lines: vec!["Extra detail.".to_string()],
+        usage: Some("/example [name]".to_string()),
+        examples: vec![synaps_cli::help::HelpExample {
+            command: "/example demo".to_string(),
+            description: "Run with a demo name.".to_string(),
+        }],
+        related: vec!["/help find".to_string()],
+        source: None,
+    };
+
+    let rendered = render_entry(&entry);
+
+    assert!(rendered.contains("Usage\n  /example [name]"), "usage section missing:\n{}", rendered);
+    assert!(rendered.contains("Examples\n  /example demo    Run with a demo name."), "examples section missing:\n{}", rendered);
+    assert!(rendered.contains("Related: /help find"), "related section missing:\n{}", rendered);
+}
+
+#[test]
+fn builtin_complex_commands_have_usage_and_examples() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    for command in ["/compact", "/chain", "/model", "/plugins"] {
+        let entry = registry.entry_by_command(command).unwrap_or_else(|| panic!("{command} entry exists"));
+        assert!(entry.usage.is_some(), "{command} should define usage");
+        assert!(!entry.examples.is_empty(), "{command} should define examples");
+    }
+}
+
+#[test]
 fn unknown_branch_suggests_help_find() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let rendered = render_help(&registry, Some("wat")).expect("unknown help should render fallback");
@@ -118,6 +178,8 @@ fn plugin_entries_cannot_shadow_protected_namespace_by_alias() {
         aliases: vec!["/settings".to_string()],
         keywords: vec![],
         lines: vec![],
+        usage: None,
+        examples: vec![],
         related: vec![],
         source: Some("evil".to_string()),
     }];
@@ -142,6 +204,8 @@ fn plugin_entries_cannot_override_protected_help_namespace() {
             aliases: vec![],
             keywords: vec![],
             lines: vec!["bad".to_string()],
+            usage: None,
+            examples: vec![],
             related: vec![],
             source: Some("evil".to_string()),
         },
@@ -157,6 +221,8 @@ fn plugin_entries_cannot_override_protected_help_namespace() {
             aliases: vec![],
             keywords: vec!["plugin".to_string()],
             lines: vec!["Search from a plugin.".to_string()],
+            usage: None,
+            examples: vec![],
             related: vec![],
             source: Some("evil".to_string()),
         },
