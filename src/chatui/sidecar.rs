@@ -53,6 +53,12 @@ pub(crate) struct SidecarUiState {
     /// spawn via `discovery::read_build_info()`. `None` when the probe
     /// failed (e.g. older sidecar without `--print-build-info`).
     pub compiled_backend: Option<String>,
+    /// Human-readable name from the plugin's lifecycle claim
+    /// (`provides.sidecar.lifecycle.display_name`). Used to label the
+    /// header pill, status line, and error/info messages. `None` when
+    /// no plugin has claimed lifecycle for this sidecar (legacy
+    /// fallback) — display strings then say "sidecar".
+    pub display_name: Option<String>,
 }
 
 impl SidecarUiState {
@@ -127,25 +133,54 @@ impl SidecarUiState {
             sidecar,
             armed: false,
             compiled_backend,
+            display_name: None,
         })
+    }
+
+    /// Set the human-readable display name (from the plugin's
+    /// `provides.sidecar.lifecycle.display_name`). Called by the
+    /// chatui dispatcher after spawn when a lifecycle claim is known.
+    #[allow(dead_code)]
+    pub fn set_display_name(&mut self, name: Option<String>) {
+        self.display_name = name;
     }
 
     /// Render a human-readable status line for `/sidecar status`.
     pub fn status_line(&self) -> String {
-        let state = match &self.status {
-            SidecarUiStatus::Idle => "idle",
-            SidecarUiStatus::Listening => "listening",
-            SidecarUiStatus::Transcribing => "transcribing",
-            SidecarUiStatus::Error(msg) => return format!("sidecar: error — {}", msg),
-        };
-        format!(
-            "sidecar: {} ({}) — process: {} | backend: {}",
-            state,
-            self.sidecar.plugin_name,
-            self.sidecar.binary.display(),
-            self.compiled_backend.as_deref().unwrap_or("unknown")
+        format_status_line(
+            self.display_name.as_deref(),
+            &self.status,
+            &self.sidecar.plugin_name,
+            &self.sidecar.binary.display().to_string(),
+            self.compiled_backend.as_deref(),
         )
     }
+}
+
+/// Pure helper backing [`SidecarUiState::status_line`]. Keeps the
+/// formatting unit-testable without spawning a real sidecar process.
+fn format_status_line(
+    display_name: Option<&str>,
+    status: &SidecarUiStatus,
+    plugin_name: &str,
+    binary_path: &str,
+    backend: Option<&str>,
+) -> String {
+    let label = display_name.unwrap_or("sidecar");
+    let state = match status {
+        SidecarUiStatus::Idle => "idle",
+        SidecarUiStatus::Listening => "listening",
+        SidecarUiStatus::Transcribing => "transcribing",
+        SidecarUiStatus::Error(msg) => return format!("{label}: error — {msg}"),
+    };
+    format!(
+        "{}: {} ({}) — process: {} | backend: {}",
+        label,
+        state,
+        plugin_name,
+        binary_path,
+        backend.unwrap_or("unknown"),
+    )
 }
 
 /// Apply a [`SidecarLifecycleEvent`] to the chatui state.
@@ -406,6 +441,44 @@ mod tests {
         app.cursor_pos = 5;
         insert_transcript_into_input(&mut app, "beautiful");
         assert_eq!(app.input, "hello beautiful world");
+    }
+
+    // ---- status_line label tests --------------------------------------
+
+    #[test]
+    fn status_line_uses_display_name_when_set() {
+        let line = format_status_line(
+            Some("Voice"),
+            &SidecarUiStatus::Idle,
+            "local-voice",
+            "/opt/local-voice/bin/sidecar",
+            Some("metal"),
+        );
+        assert!(line.starts_with("Voice:"), "got: {line}");
+    }
+
+    #[test]
+    fn status_line_falls_back_to_sidecar_when_no_display_name() {
+        let line = format_status_line(
+            None,
+            &SidecarUiStatus::Idle,
+            "local-voice",
+            "/opt/local-voice/bin/sidecar",
+            Some("metal"),
+        );
+        assert!(line.starts_with("sidecar:"), "got: {line}");
+    }
+
+    #[test]
+    fn status_line_uses_display_name_for_error_state() {
+        let line = format_status_line(
+            Some("Voice"),
+            &SidecarUiStatus::Error("oops".into()),
+            "local-voice",
+            "/opt/local-voice/bin/sidecar",
+            None,
+        );
+        assert_eq!(line, "Voice: error — oops");
     }
 }
 
