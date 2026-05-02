@@ -1193,7 +1193,16 @@ pub async fn run(
                                                 }
                                             };
                                             match self::sidecar::SidecarUiState::spawn_with(sidecar_spawn_args, sidecar_plugin_info.as_ref()).await {
-                                                Ok(state) => {
+                                                Ok(mut state) => {
+                                                    // Populate display_name from the matching
+                                                    // lifecycle claim, if any. Falls back to
+                                                    // None (i.e. plain "sidecar") otherwise.
+                                                    let claims = registry.lifecycle_claims();
+                                                    let display = pick_display_name_for_plugin(
+                                                        &state.sidecar.plugin_name,
+                                                        &claims,
+                                                    );
+                                                    state.set_display_name(display);
                                                     app.sidecar = Some(state);
                                                     let label = app.sidecar.as_ref()
                                                         .and_then(|s| s.display_name.as_deref())
@@ -1934,6 +1943,21 @@ fn migrate_sidecar_toggle_key_to_claimed_plugins(
     }
 }
 
+/// Look up the display name for a sidecar's owning plugin from the
+/// lifecycle-claim snapshot. Returns `None` if no claim matches.
+///
+/// Phase 8 8A.5 follow-up: used post-spawn to populate
+/// [`SidecarUiState::display_name`] from the registry claim.
+fn pick_display_name_for_plugin(
+    plugin_name: &str,
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Option<String> {
+    claims
+        .iter()
+        .find(|c| c.plugin == plugin_name)
+        .map(|c| c.display_name.clone())
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -2062,5 +2086,41 @@ mod migration_tests {
                 Some("C-V")
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod display_name_helper_tests {
+    use super::pick_display_name_for_plugin;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn claim(plugin: &str, display: &str) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: plugin.into(),
+            command: "voice".into(),
+            settings_category: None,
+            display_name: display.into(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_match() {
+        let claims = vec![claim("local-voice", "Voice")];
+        assert_eq!(
+            pick_display_name_for_plugin("local-voice", &claims),
+            Some("Voice".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_none_for_unmatched() {
+        let claims = vec![claim("local-voice", "Voice")];
+        assert_eq!(pick_display_name_for_plugin("unknown", &claims), None);
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_none_with_empty_claims() {
+        assert_eq!(pick_display_name_for_plugin("local-voice", &[]), None);
     }
 }
