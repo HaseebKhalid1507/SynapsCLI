@@ -257,6 +257,8 @@ pub fn render_help(registry: &HelpRegistry, branch: Option<&str>) -> Option<Stri
     match branch.map(str::trim).filter(|s| !s.is_empty()) {
         None => registry.entry_by_command("/help").map(render_entry),
         Some("find") => registry.entry_by_command("/help find").map(render_entry),
+        Some("topics") => Some(render_topics(registry)),
+        Some("reference") => Some(render_reference(registry)),
         Some(topic) => registry
             .entry_for_help_topic(topic)
             .map(render_entry)
@@ -273,6 +275,51 @@ pub fn render_entry(entry: &HelpEntry) -> String {
     }
 
     append_usage_examples_related(&mut lines, entry);
+    lines.join("\n")
+}
+
+fn render_topics(registry: &HelpRegistry) -> String {
+    let mut entries: Vec<&HelpEntry> = registry
+        .entries()
+        .iter()
+        .filter(|entry| entry.topic == HelpTopicKind::Branch)
+        .collect();
+    entries.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.command.cmp(&b.command)));
+
+    let mut lines = vec![
+        "Help topics".to_string(),
+        String::new(),
+        "Conceptual guides and discovery paths. Use /help <topic> for details.".to_string(),
+        String::new(),
+    ];
+
+    for entry in entries {
+        lines.push(format!("  {} — {}", entry.command, entry.summary));
+    }
+
+    lines.join("\n")
+}
+
+fn render_reference(registry: &HelpRegistry) -> String {
+    let mut entries: Vec<&HelpEntry> = registry.entries().iter().collect();
+    entries.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.command.cmp(&b.command)));
+
+    let mut lines = vec![
+        "Help reference".to_string(),
+        String::new(),
+        "All help entries grouped by category.".to_string(),
+    ];
+    let mut current_category: Option<&str> = None;
+
+    for entry in entries {
+        if current_category != Some(entry.category.as_str()) {
+            current_category = Some(entry.category.as_str());
+            lines.push(String::new());
+            lines.push(entry.category.clone());
+        }
+        lines.push(format!("  {} — {}", entry.command, entry.summary));
+    }
+
     lines.join("\n")
 }
 
