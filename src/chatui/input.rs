@@ -32,6 +32,8 @@ pub(super) enum InputAction {
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
+    /// Settings model browser asked to start a whisper download.
+    StartModelDownload(String),
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -97,7 +99,8 @@ pub(super) fn handle_event(
             return InputAction::None;
         }
         if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            let mut snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            snap.voice_compiled_backend = app.voice.as_ref().and_then(|v| v.compiled_backend.clone());
             match super::settings::handle_event(state, key, &snap) {
                 super::settings::InputOutcome::Close => { app.settings = None; }
                 super::settings::InputOutcome::None => {}
@@ -143,6 +146,9 @@ pub(super) fn handle_event(
                 }
                 super::settings::InputOutcome::PingModels => {
                     return InputAction::PingModels;
+                }
+                super::settings::InputOutcome::StartModelDownload { id } => {
+                    return InputAction::StartModelDownload(id);
                 }
             }
         }

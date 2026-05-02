@@ -249,6 +249,45 @@ pub async fn run(
                 }
             }
 
+            // ── Whisper model download progress — fires when the active
+            //    download publishes a new progress snapshot, or completes
+            //    (sender dropped → `changed()` returns Err). ──
+            download_change = async {
+                match app.download_rx.as_mut() {
+                    Some(rx) => rx.changed().await.map(|_| rx.borrow().clone()),
+                    None => std::future::pending().await,
+                }
+            } => {
+                match download_change {
+                    Ok(progress) => {
+                        let done = progress.done;
+                        let error = progress.error.clone();
+                        app.on_download_progress(progress);
+                        if done {
+                            let filename = app.download_filename.clone().unwrap_or_default();
+                            if let Some(err) = error {
+                                app.push_msg(ChatMessage::Error(format!(
+                                    "Download failed: {}", err
+                                )));
+                            } else {
+                                app.push_msg(ChatMessage::System(format!(
+                                    "✓ Downloaded {}. Now available in the model browser.",
+                                    filename
+                                )));
+                            }
+                            app.on_download_complete();
+                        }
+                    }
+                    Err(_) => {
+                        // Sender dropped without a final progress event —
+                        // this should be rare (the downloader always emits
+                        // done=true on success or error). Treat as silent
+                        // completion to avoid hanging UI state.
+                        app.on_download_complete();
+                    }
+                }
+            }
+
             // ── Voice sidecar events — fires when the voice manager emits ──
             voice_event = async {
                 match app.voice.as_mut() {
@@ -1237,6 +1276,91 @@ pub async fn run(
                                             }
                                         }
                                     }
+
+                                    CommandAction::VoiceRebuild { backend } => {
+                                        // Resolve target backend: explicit arg > configured setting > auto.
+                                        let configured = backend.unwrap_or_else(|| {
+                                            synaps_cli::config::read_config_value("voice_stt_backend")
+                                                .map(|v| v.trim().to_string())
+                                                .filter(|v| !v.is_empty())
+                                                .unwrap_or_else(|| "auto".to_string())
+                                        });
+                                        let target = synaps_cli::voice::rebuild::resolve_backend(&configured);
+
+                                        let sidecar = synaps_cli::voice::discovery::discover();
+                                        let Some(sidecar) = sidecar else {
+                                            app.push_msg(ChatMessage::Error(
+                                                "no voice plugin installed; cannot rebuild".to_string(),
+                                            ));
+                                            continue;
+                                        };
+
+                                        app.push_msg(ChatMessage::System(format!(
+                                            "voice: rebuilding sidecar with backend '{}' (selected '{}')…",
+                                            target, configured
+                                        )));
+
+                                        let plugin_root = sidecar.plugin_root.clone();
+                                        let binary = sidecar.binary.clone();
+                                        let target_clone = target.clone();
+                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                                            synaps_cli::voice::rebuild::RebuildEvent,
+                                        >(64);
+
+                                        tokio::spawn(async move {
+                                            synaps_cli::voice::rebuild::rebuild_with_backend(
+                                                plugin_root,
+                                                binary,
+                                                target_clone,
+                                                tx,
+                                            )
+                                            .await;
+                                        });
+
+                                        // Drain events synchronously so output appears in chronological
+                                        // order (the rebuild blocks the UI; richer streaming is a follow-up).
+                                        while let Some(evt) = rx.recv().await {
+                                            match evt {
+                                                synaps_cli::voice::rebuild::RebuildEvent::Output(o) => {
+                                                    let prefix = if o.from_stderr { "stderr" } else { "stdout" };
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "[rebuild:{}] {}",
+                                                        prefix, o.line
+                                                    )));
+                                                }
+                                                synaps_cli::voice::rebuild::RebuildEvent::Done {
+                                                    exit_code,
+                                                    new_backend,
+                                                } => {
+                                                    let backend_str = new_backend
+                                                        .as_deref()
+                                                        .unwrap_or("(unknown — reprobe failed)");
+                                                    if exit_code == 0 {
+                                                        if let Some(v) = app.voice.as_mut() {
+                                                            v.compiled_backend = new_backend.clone();
+                                                        }
+                                                        app.push_msg(ChatMessage::System(format!(
+                                                            "✓ voice rebuild complete (exit 0). Backend now: {}",
+                                                            backend_str
+                                                        )));
+                                                    } else {
+                                                        app.push_msg(ChatMessage::Error(format!(
+                                                            "voice rebuild exited with code {}. Backend reported: {}",
+                                                            exit_code, backend_str
+                                                        )));
+                                                    }
+                                                    break;
+                                                }
+                                                synaps_cli::voice::rebuild::RebuildEvent::Failed(msg) => {
+                                                    app.push_msg(ChatMessage::Error(format!(
+                                                        "voice rebuild failed: {}",
+                                                        msg
+                                                    )));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -1343,6 +1467,7 @@ pub async fn run(
                                         CommandAction::VoiceModels => {}
                                         CommandAction::VoiceDownload { .. } => {}
                                         CommandAction::VoiceHelp => {}
+                                        CommandAction::VoiceRebuild { .. } => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -1447,6 +1572,51 @@ pub async fn run(
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
+                            }
+                            InputAction::StartModelDownload(id) => {
+                                let entry_opt = synaps_cli::voice::models::find_by_id(&id);
+                                let entry = match entry_opt {
+                                    Some(e) => e,
+                                    None => {
+                                        app.push_msg(ChatMessage::Error(format!(
+                                            "unknown model id '{}'", id
+                                        )));
+                                        continue;
+                                    }
+                                };
+                                if app.voice_download_in_flight || app.download_rx.is_some() {
+                                    app.push_msg(ChatMessage::System(
+                                        "A model download is already in progress.".to_string(),
+                                    ));
+                                    continue;
+                                }
+                                let (tx, rx) = tokio::sync::watch::channel(
+                                    synaps_cli::voice::download::DownloadProgress::default(),
+                                );
+                                let filename = entry.filename.to_string();
+                                let size_mb = entry.size_mb;
+                                let started = app.start_download(filename.clone(), rx);
+                                debug_assert!(started);
+                                let models_dir = commands::voice_models_dir();
+                                let entry_static = entry;
+                                tokio::spawn(async move {
+                                    let _ = synaps_cli::voice::download::download_model(
+                                        entry_static,
+                                        &models_dir,
+                                        tx,
+                                        false,
+                                    )
+                                    .await;
+                                    // The downloader publishes a terminal
+                                    // progress (done=true, with optional error)
+                                    // before returning. Dropping the sender
+                                    // here causes `rx.changed()` in the host
+                                    // loop to error, which triggers cleanup.
+                                });
+                                app.push_msg(ChatMessage::System(format!(
+                                    "Downloading {} ({} MB) from huggingface.co...",
+                                    filename, size_mb
+                                )));
                             }
                             InputAction::PluginsOutcome(outcome) => {
                                 if let Some(state) = app.plugins.as_mut() {

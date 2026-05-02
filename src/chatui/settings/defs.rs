@@ -150,4 +150,36 @@ define_settings! {
         EditorKind::WhisperModelPicker,
         "Whisper model used for transcription. Lists ~/.synaps-cli/models/whisper/*.bin.",
         |_runtime, _app, _value| { /* read by VoiceUiState::spawn_default via voice_stt_model_path */ };
+
+    voice_stt_backend, "Voice STT backend", Voice,
+        EditorKind::Cycler(&["auto", "cpu", "cuda", "metal", "vulkan", "openblas"]),
+        "Whisper compute backend. Selecting a different backend stages a \
+         rebuild — run `/voice rebuild` to apply. 'auto' picks based on \
+         detected hardware.",
+        |_runtime, _app, _value| { /* effect deferred to rebuild action — see voice/rebuild.rs */ };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_backend_setting_in_voice_category() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "voice_stt_backend")
+            .expect("voice_stt_backend setting should be defined");
+        assert_eq!(def.category, Category::Voice);
+        match def.editor {
+            EditorKind::Cycler(opts) => {
+                assert!(opts.contains(&"auto"));
+                assert!(opts.contains(&"cpu"));
+                assert!(opts.contains(&"cuda"));
+                assert!(opts.contains(&"metal"));
+                assert!(opts.contains(&"vulkan"));
+                assert!(opts.contains(&"openblas"));
+            }
+            _ => panic!("expected Cycler editor for voice_stt_backend"),
+        }
+    }
 }

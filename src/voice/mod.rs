@@ -17,3 +17,4 @@ pub mod download;
 pub mod manager;
 pub mod models;
 pub mod protocol;
+pub mod rebuild;

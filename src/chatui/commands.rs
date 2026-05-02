@@ -93,6 +93,9 @@ pub(super) enum CommandAction {
     VoiceDownload { id: String },
     /// Print `/voice` subcommand help (`/voice help`).
     VoiceHelp,
+    /// Trigger a rebuild of the voice sidecar with the given backend
+    /// (None → use the configured `voice_stt_backend`, resolving auto).
+    VoiceRebuild { backend: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -616,6 +619,17 @@ pub(super) async fn handle_command(
                 "status" => CommandAction::VoiceStatus,
                 "models" => CommandAction::VoiceModels,
                 "help" => CommandAction::VoiceHelp,
+                "rebuild" => CommandAction::VoiceRebuild { backend: None },
+                other if other.starts_with("rebuild ") => {
+                    let backend = other["rebuild ".len()..].trim();
+                    if backend.is_empty() {
+                        CommandAction::VoiceRebuild { backend: None }
+                    } else {
+                        CommandAction::VoiceRebuild {
+                            backend: Some(backend.to_string()),
+                        }
+                    }
+                }
                 "download" => {
                     app.push_msg(ChatMessage::Error(
                         "usage: /voice download <id> (run `/voice models` to list)".to_string(),
@@ -635,7 +649,7 @@ pub(super) async fn handle_command(
                 }
                 other => {
                     app.push_msg(ChatMessage::Error(format!(
-                        "unknown /voice subcommand: '{}' (expected toggle | status | models | download <id> | help — try `/voice help`)",
+                        "unknown /voice subcommand: '{}' (expected toggle | status | models | download <id> | rebuild [backend] | help — try `/voice help`)",
                         other
                     )));
                     CommandAction::None
@@ -767,6 +781,7 @@ pub(crate) fn voice_help_text() -> String {
     s.push_str("  /voice status         — show voice subsystem status\n");
     s.push_str("  /voice models         — list whisper.cpp model catalog and installed status\n");
     s.push_str("  /voice download <id>  — download a model from HuggingFace\n");
+    s.push_str("  /voice rebuild [back] — rebuild sidecar with the configured (or given) backend\n");
     s.push_str("  /voice help           — show this help\n\n");
     s.push_str("Toggle key configurable in /settings → Voice.");
     s
@@ -1267,6 +1282,22 @@ mod tests {
         match invoke_voice("download   base.en").await {
             CommandAction::VoiceDownload { id } => assert_eq!(id, "base.en"),
             _ => panic!("expected VoiceDownload for whitespace-padded id"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_rebuild_no_arg_parses() {
+        match invoke_voice("rebuild").await {
+            CommandAction::VoiceRebuild { backend: None } => {}
+            other => panic!("expected VoiceRebuild{{None}}, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_rebuild_with_backend_parses() {
+        match invoke_voice("rebuild cuda").await {
+            CommandAction::VoiceRebuild { backend: Some(b) } => assert_eq!(b, "cuda"),
+            other => panic!("expected VoiceRebuild{{Some(\"cuda\")}}, got {:?}", std::mem::discriminant(&other)),
         }
     }
 

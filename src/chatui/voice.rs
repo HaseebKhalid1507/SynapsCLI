@@ -36,6 +36,10 @@ pub(crate) struct VoiceUiState {
     /// flap back to `Idle` after every utterance and the next toggle would
     /// (incorrectly) issue another press.
     pub armed: bool,
+    /// Cached sidecar build-info backend — populated lazily on first
+    /// spawn via `discovery::read_build_info()`. `None` when the probe
+    /// failed (e.g. older sidecar without `--print-build-info`).
+    pub compiled_backend: Option<String>,
 }
 
 impl VoiceUiState {
@@ -103,11 +107,21 @@ impl VoiceUiState {
         .await
         .map_err(|err: VoiceManagerError| format!("failed to start voice sidecar: {}", err))?;
 
+        // Best-effort: read compiled backend info from the sidecar. This is
+        // a one-shot cheap call (`--print-build-info`); failures are logged
+        // and ignored so we never block voice startup on it.
+        // TODO(D3 wiring): expose a "[Rebuild now]" button in /settings →
+        //   Voice that invokes `crate::voice::rebuild::rebuild_with_backend`
+        //   when the selected backend differs from `compiled_backend`.
+        let compiled_backend =
+            synaps_cli::voice::discovery::read_build_info(&sidecar.binary).map(|i| i.backend);
+
         Ok(Self {
             manager,
             status: VoiceUiStatus::Idle,
             sidecar,
             armed: false,
+            compiled_backend,
         })
     }
 
@@ -120,10 +134,11 @@ impl VoiceUiState {
             VoiceUiStatus::Error(msg) => return format!("voice: error — {}", msg),
         };
         format!(
-            "voice: {} ({}) — sidecar: {}",
+            "voice: {} ({}) — sidecar: {} | backend: {}",
             state,
             self.sidecar.plugin_name,
-            self.sidecar.binary.display()
+            self.sidecar.binary.display(),
+            self.compiled_backend.as_deref().unwrap_or("unknown")
         )
     }
 }
