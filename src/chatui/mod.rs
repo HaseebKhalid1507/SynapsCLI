@@ -17,7 +17,7 @@ mod help_find;
 mod helpers;
 mod lifecycle;
 mod viewport;
-mod voice;
+mod sidecar;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -263,13 +263,13 @@ pub async fn run(
 
             // ── Voice sidecar events — fires when the voice manager emits ──
             voice_event = async {
-                match app.voice.as_mut() {
+                match app.sidecar.as_mut() {
                     Some(v) => v.manager.next_event().await,
                     None => std::future::pending().await,
                 }
             } => {
                 if let Some(event) = voice_event {
-                    self::voice::handle_event(&mut app, event);
+                    self::sidecar::handle_event(&mut app, event);
                 }
             }
 
@@ -1150,7 +1150,7 @@ pub async fn run(
 
                                     CommandAction::VoiceToggle => {
                                         // First toggle: spawn the sidecar and start listening.
-                                        if app.voice.is_none() {
+                                        if app.sidecar.is_none() {
                                             let voice_plugin_info = {
                                                 let sidecar = synaps_cli::sidecar::discovery::discover();
                                                 if let Some(sidecar) = sidecar {
@@ -1160,17 +1160,17 @@ pub async fn run(
                                                     None
                                                 }
                                             };
-                                            match self::voice::VoiceUiState::spawn_default_with_plugin_info(voice_plugin_info.as_ref()).await {
+                                            match self::sidecar::SidecarUiState::spawn_default_with_plugin_info(voice_plugin_info.as_ref()).await {
                                                 Ok(state) => {
-                                                    app.voice = Some(state);
+                                                    app.sidecar = Some(state);
                                                     app.push_msg(ChatMessage::System(
                                                         "🎤 voice sidecar online — press the toggle again to stop and transcribe".to_string()
                                                     ));
-                                                    if let Some(v) = app.voice.as_mut() {
+                                                    if let Some(v) = app.sidecar.as_mut() {
                                                         v.armed = true;
                                                         if let Err(err) = v.manager.press().await {
                                                             v.armed = false;
-                                                            v.status = self::voice::VoiceUiStatus::Error(err.to_string());
+                                                            v.status = self::sidecar::SidecarUiStatus::Error(err.to_string());
                                                             app.push_msg(ChatMessage::Error(format!("voice press failed: {err}")));
                                                         }
                                                     }
@@ -1183,7 +1183,7 @@ pub async fn run(
                                             // Subsequent toggle: arm flag is the source of truth.
                                             // (status flaps between Listening/Idle as the VAD
                                             // delivers utterances, so we can't key off it.)
-                                            let v = app.voice.as_mut().unwrap();
+                                            let v = app.sidecar.as_mut().unwrap();
                                             if v.armed {
                                                 v.armed = false;
                                                 if let Err(err) = v.manager.release().await {
@@ -1203,7 +1203,7 @@ pub async fn run(
                                     }
 
                                     CommandAction::VoiceStatus => {
-                                        let line = match app.voice.as_ref() {
+                                        let line = match app.sidecar.as_ref() {
                                             Some(v) => v.status_line(),
                                             None => match synaps_cli::sidecar::discovery::discover() {
                                                 Some(s) => format!(
@@ -1766,7 +1766,7 @@ pub async fn run(
 ///
 /// Returns silently on every failure path — config migration is
 /// best-effort; the runtime falls back to the legacy global keys via
-/// the deprecation shim in `chatui::voice` if this no-ops.
+/// the deprecation shim in `chatui::sidecar` if this no-ops.
 fn migrate_legacy_voice_config_keys() {
     const PLUGIN: &str = "local-voice";
     // (legacy global key, plugin namespace key)

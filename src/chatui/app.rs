@@ -153,7 +153,7 @@ pub(crate) struct App {
     /// Active voice dictation state (Some after the first /voice toggle).
     /// Holds the sidecar manager + UI status; the event loop drains its
     /// event stream and updates `status` accordingly.
-    pub(crate) voice: Option<super::voice::VoiceUiState>,
+    pub(crate) sidecar: Option<super::sidecar::SidecarUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
     /// Live keybind registry — held so /settings can hot-swap voice toggle.
@@ -235,7 +235,7 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
-            voice: None,
+            sidecar: None,
             active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             keybinds: None,
         }

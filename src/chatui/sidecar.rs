@@ -1,8 +1,14 @@
-//! Chatui-side glue for the voice subsystem.
+//! Chatui-side glue for the sidecar subsystem.
 //!
-//! Owns the `VoiceUiState` held on `App.voice` and provides helpers
+//! Owns the `SidecarUiState` held on `App.sidecar` and provides helpers
 //! the slash-command dispatcher and event loop call into. The actual
 //! sidecar lifecycle lives in `crate::sidecar::manager::SidecarManager`.
+//!
+//! NOTE (Phase 7 deferred): the bootstrap code here still reads
+//! `local-voice` plugin-namespace config keys directly. That's a known
+//! leakage; the next slice will replace it with an RPC asking the
+//! plugin to self-configure, removing all plugin-name knowledge from
+//! core.
 
 use synaps_cli::sidecar::discovery::{discover, DiscoveredSidecar};
 use synaps_cli::sidecar::manager::{SidecarManager, SidecarError, SidecarLifecycleEvent};
@@ -14,7 +20,7 @@ use super::app::{App, ChatMessage};
 
 /// What the chatui currently shows for the voice indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum VoiceUiStatus {
+pub(crate) enum SidecarUiStatus {
     /// Manager is alive but not currently capturing audio.
     Idle,
     /// Sidecar reported `ListeningStarted`.
@@ -26,9 +32,9 @@ pub(crate) enum VoiceUiStatus {
 }
 
 /// State held by the chatui while voice dictation is enabled.
-pub(crate) struct VoiceUiState {
+pub(crate) struct SidecarUiState {
     pub manager: SidecarManager,
-    pub status: VoiceUiStatus,
+    pub status: SidecarUiStatus,
     pub sidecar: DiscoveredSidecar,
     /// `true` once the user has issued `press()`. The sidecar is logically
     /// "armed" until the user toggles off — even when the VAD has just
@@ -42,7 +48,7 @@ pub(crate) struct VoiceUiState {
     pub compiled_backend: Option<String>,
 }
 
-impl VoiceUiState {
+impl SidecarUiState {
     /// Discover a sidecar from loaded plugins and spawn its manager
     /// with a default dictation-mode handshake.
     ///
@@ -129,7 +135,7 @@ impl VoiceUiState {
 
         Ok(Self {
             manager,
-            status: VoiceUiStatus::Idle,
+            status: SidecarUiStatus::Idle,
             sidecar,
             armed: false,
             compiled_backend,
@@ -139,10 +145,10 @@ impl VoiceUiState {
     /// Render a human-readable status line for `/voice status`.
     pub fn status_line(&self) -> String {
         let state = match &self.status {
-            VoiceUiStatus::Idle => "idle",
-            VoiceUiStatus::Listening => "listening",
-            VoiceUiStatus::Transcribing => "transcribing",
-            VoiceUiStatus::Error(msg) => return format!("voice: error — {}", msg),
+            SidecarUiStatus::Idle => "idle",
+            SidecarUiStatus::Listening => "listening",
+            SidecarUiStatus::Transcribing => "transcribing",
+            SidecarUiStatus::Error(msg) => return format!("voice: error — {}", msg),
         };
         format!(
             "voice: {} ({}) — sidecar: {} | backend: {}",
@@ -160,7 +166,7 @@ impl VoiceUiState {
 /// leading space when the existing input doesn't already end in
 /// whitespace), so the user can keep dictating into the same line.
 pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
-    let Some(v) = app.voice.as_mut() else {
+    let Some(v) = app.sidecar.as_mut() else {
         return;
     };
     match event {
@@ -168,34 +174,34 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
             // Sidecar handshake is informational; we already pressed.
         }
         SidecarLifecycleEvent::StateChanged(state) => match state {
-            SidecarProviderState::Listening => v.status = VoiceUiStatus::Listening,
-            SidecarProviderState::Transcribing => v.status = VoiceUiStatus::Transcribing,
+            SidecarProviderState::Listening => v.status = SidecarUiStatus::Listening,
+            SidecarProviderState::Transcribing => v.status = SidecarUiStatus::Transcribing,
             SidecarProviderState::Ready | SidecarProviderState::Stopped => {
                 // Only fall back to Idle when the user has actually
                 // released. Otherwise the VAD is just between utterances
                 // and the sidecar is still armed.
                 if !v.armed {
-                    v.status = VoiceUiStatus::Idle;
+                    v.status = SidecarUiStatus::Idle;
                 }
             }
             SidecarProviderState::Error => {
-                v.status = VoiceUiStatus::Error("sidecar reported error state".into())
+                v.status = SidecarUiStatus::Error("sidecar reported error state".into())
             }
             SidecarProviderState::Speaking => {}
         },
         SidecarLifecycleEvent::ListeningStarted => {
-            v.status = VoiceUiStatus::Listening;
+            v.status = SidecarUiStatus::Listening;
         }
         SidecarLifecycleEvent::ListeningStopped => {
             // The STT provider emits ListeningStopped between VAD
             // utterances *and* on real shutdown. Only clear status if the
             // user has unarmed (toggled off).
             if !v.armed {
-                v.status = VoiceUiStatus::Idle;
+                v.status = SidecarUiStatus::Idle;
             }
         }
         SidecarLifecycleEvent::TranscribingStarted => {
-            v.status = VoiceUiStatus::Transcribing;
+            v.status = SidecarUiStatus::Transcribing;
         }
         SidecarLifecycleEvent::PartialTranscript(_) => {
             // Reserved for V5+ — drop for now.
@@ -208,13 +214,13 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
             if !armed {
                 // Re-borrow because insert_transcript_into_input took
                 // a mutable borrow of `app`.
-                if let Some(v) = app.voice.as_mut() {
-                    v.status = VoiceUiStatus::Idle;
+                if let Some(v) = app.sidecar.as_mut() {
+                    v.status = SidecarUiStatus::Idle;
                 }
             }
         }
         SidecarLifecycleEvent::Error(message) => {
-            v.status = VoiceUiStatus::Error(message.clone());
+            v.status = SidecarUiStatus::Error(message.clone());
             app.push_msg(ChatMessage::Error(format!(
                 "voice sidecar error: {}",
                 message
@@ -222,7 +228,7 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
         }
         SidecarLifecycleEvent::Exited => {
             app.push_msg(ChatMessage::System("voice sidecar exited".to_string()));
-            app.voice = None;
+            app.sidecar = None;
         }
     }
 }
