@@ -195,7 +195,7 @@ impl KeybindRegistry {
     ///
     /// Removes every existing user/plugin bind whose action is the same
     /// slash command, then registers `new_key → /slash_command` as a User
-    /// bind. Used by /settings to hot-swap the voice toggle key without
+    /// bind. Used by /settings to hot-swap the sidecar toggle key without
     /// requiring a restart.
     pub fn set_slash_command_key(&mut self, slash_command: &str, new_key: &str) -> Result<(), String> {
         let combo = parse_key(new_key)?;
@@ -603,30 +603,30 @@ mod tests {
     }
 
     #[test]
-    fn set_slash_command_key_replaces_existing_voice_toggle() {
+    fn set_slash_command_key_replaces_existing_sidecar_toggle() {
         let mut reg = KeybindRegistry::new();
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("F8".to_string(), "/voice toggle".to_string());
+        overrides.insert("F8".to_string(), "/sidecar toggle".to_string());
         reg.register_user(&overrides);
         let f8 = parse_key("F8").unwrap();
         assert!(reg.match_key(f8.code, f8.modifiers).is_some());
 
-        // Move voice toggle from F8 → C-G
-        reg.set_slash_command_key("voice toggle", "C-G").unwrap();
+        // Move sidecar toggle from F8 → C-G
+        reg.set_slash_command_key("sidecar toggle", "C-G").unwrap();
 
         // F8 no longer fires
         assert!(reg.match_key(f8.code, f8.modifiers).is_none());
         // C-G now does
         let cg = parse_key("C-G").unwrap();
         let bind = reg.match_key(cg.code, cg.modifiers).expect("C-G bind missing");
-        assert!(matches!(&bind.action, KeybindAction::SlashCommand(c) if c == "voice toggle"));
+        assert!(matches!(&bind.action, KeybindAction::SlashCommand(c) if c == "sidecar toggle"));
     }
 
     #[test]
     fn set_slash_command_key_rejects_core_chord() {
         let mut reg = KeybindRegistry::new();
         // Esc is reserved core
-        let err = reg.set_slash_command_key("voice toggle", "Esc").unwrap_err();
+        let err = reg.set_slash_command_key("sidecar toggle", "Esc").unwrap_err();
         assert!(err.contains("reserved"), "expected reserved error, got: {err}");
     }
 }
