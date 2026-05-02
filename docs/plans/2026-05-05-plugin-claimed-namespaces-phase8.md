@@ -116,31 +116,38 @@ plugin's namespace. Multi-sidecar comes in 8B.
 
 **Steps:**
 
-1. Extend `SidecarManifest` with optional `lifecycle: Option<SidecarLifecycle>`
-   carrying `command`, `settings_category`, `display_name`, `importance`.
-2. At extension load time, when a plugin declares `provides.sidecar.lifecycle`:
-   - Dynamically register `<command> toggle` and `<command> status` as
-     plugin-aliased lifecycle commands. Internally they dispatch to
-     the existing `CommandAction::SidecarToggle` / `SidecarStatus`.
-   - Inject a virtual setting field (toggle-key) into the named
-     `settings_category`. The field is owned by core but rendered
-     under the plugin's panel.
-3. Settings UI: hide `Category::Sidecar` when at least one plugin
-   has claimed a category. (Strict: hide always once any plugin
-   claims; if zero plugins claim, show the legacy panel.)
-4. Pill / status line / error messages use the plugin's `display_name`
-   when known; fall back to `"sidecar"` only when no claim exists.
-5. `/sidecar toggle` becomes an ambiguity-aware fallback:
-   - 0 unclaimed plugins: command hidden from palette, errors with
-     "no sidecar to toggle".
-   - 1 unclaimed plugin: command toggles it.
-   - 2+ unclaimed plugins: command errors with "multiple unclaimed
-     sidecars: <list>; use `/sidecar <plugin-id> toggle`".
-6. Add `/sidecar <plugin-id> toggle/status` qualified form.
-7. Migration: keep `Category::Sidecar` and `sidecar_toggle_key` as
-   one-release fallback. Add a startup migration that copies
-   `sidecar_toggle_key` into the active claimed plugin's namespace
-   when one exists.
+1. ✅ **8A.1 (`66e2fee`)** — Extend `SidecarManifest` with
+   `lifecycle: Option<SidecarLifecycle>` (`command`, `settings_category`,
+   `display_name`, `importance` clamped `-100..=100`); add
+   `discover_all_in()` that returns every sidecar (keeps `discover_in()`
+   wrapping `.first()`).
+2. ✅ **8A.2 (`44cc80a`)** — Plugin lifecycle claims registered in the
+   `CommandRegistry` keyed by command word; first-loaded wins on
+   collision (collisions exposed via `lifecycle_claim_collisions()`).
+   Dispatcher in `chatui/commands.rs` intercepts claimed commands
+   *before* the builtin match arm, routing
+   `<word>` / `<word> toggle` → `SidecarToggle`,
+   `<word> status` → `SidecarStatus`, and falling through to the
+   plugin-command resolver for any other subcommand. Claimed command
+   words appear in `all_commands()` for autocomplete.
+3. ⏳ **8A.3** — Inject a virtual setting field (toggle-key) into the
+   plugin-named `settings_category`. Owned by core, rendered in plugin
+   panel.
+4. ⏳ **8A.4** — Settings UI: hide `Category::Sidecar` when at least
+   one plugin has claimed a category. Strict: hide always once any
+   plugin claims; if zero plugins claim, show the legacy panel.
+5. ⏳ **8A.5** — Pill / status line / error messages use the plugin's
+   `display_name` when known; fall back to `"sidecar"` only when no
+   claim exists.
+6. ⏳ **8A.6** — `/sidecar toggle` becomes ambiguity-aware:
+   - 0 unclaimed plugins: errors with "no sidecar to toggle"
+   - 1 unclaimed plugin: command toggles it
+   - 2+ unclaimed plugins: errors with disambiguation hint
+7. ⏳ **8A.7** — Add `/sidecar <plugin-id> toggle/status` qualified form.
+8. ⏳ **8A.8** — Migration: keep `Category::Sidecar` and
+   `sidecar_toggle_key` as one-release fallback. Startup migration
+   copies `sidecar_toggle_key` into the active claimed plugin's
+   namespace when one exists.
 
 **Tests:**
 - Manifest deserialization: `lifecycle` parses with all fields, with
