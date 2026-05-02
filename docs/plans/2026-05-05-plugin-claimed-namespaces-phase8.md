@@ -192,32 +192,38 @@ plugin's namespace. Multi-sidecar comes in 8B.
 
 **Steps:**
 
-1. `discovery::discover_all() -> Vec<DiscoveredSidecar>`. Keep
-   `discover()` as `discover_all().first()` for one release.
-2. `App.sidecar: Option<SidecarUiState>` → `App.sidecars: HashMap<String, SidecarUiState>`
-   keyed by plugin id.
-3. `CommandAction::SidecarToggle` / `SidecarStatus` carry an
-   `Option<String>` plugin-id payload. The dispatcher uses it to pick
-   the target sidecar; `None` means "the unique unclaimed one" (slice 8A).
-4. Plugin-claimed lifecycle commands (from 8A) auto-bind to the right
-   plugin id at registration time — no ambiguity.
-5. Pill renderer iterates `App.sidecars` sorted by:
-   1. `importance` descending (default 0)
-   2. `display_name` alphabetical
-6. Each `SidecarLifecycleEvent` carries the originating plugin id so
-   the chatui routes it to the right `SidecarUiState`.
-7. Per-plugin keybinds (declared in plugin manifest's `keybinds`):
-   - Loaded into the keybind registry on plugin load.
-   - **Overlap rule:** if a key is already bound, the second plugin's
-     binding is rejected. A `tracing::warn!` is logged, a warning is
-     surfaced in `/extensions` (one-line indicator next to the
-     conflicting plugin), and the chat log gets a one-time system
-     message at startup. The user can re-bind via the keybind editor
-     to resolve. **No silent overrides.**
-8. Drop the global `sidecar_toggle_key` setting. Migration: at
-   startup, if found and there's exactly one plugin with a claimed
-   lifecycle, write it into that plugin's namespace and delete the
-   global key.
+1. ✅ **8B.1 (`91d4763`)** — `App.sidecar: Option<SidecarUiState>` →
+   `App.sidecars: HashMap<String, SidecarUiState>` keyed by plugin id.
+   `discover_all_in()` already exists (8A.1); chatui spawn handler
+   targets one entry per plugin lazily. New
+   `SidecarUiState::spawn_for(discovered, ...)` lets the dispatcher pick
+   a specific plugin instead of always picking `discover()[0]`.
+2. ✅ **8B "payload"** (`4a4e5fd`) —
+   `CommandAction::SidecarToggle { plugin_id: Option<String> }` /
+   `SidecarStatus { plugin_id: Option<String> }`. Lifecycle-claim arm
+   passes `Some(claim.plugin)`; qualified `/sidecar <pid> ...` passes
+   `Some(pid)`; bare `/sidecar` (0 claims) and the deprecated `/voice`
+   alias pass `None` (back-compat for legacy single-sidecar).
+3. ✅ **8B.3 + 8B.4** (`91d4763`,`f8fcbe4`) — pill renderer iterates
+   `App.sidecars` sorted by `importance` desc then `display_name`
+   alphabetical. Pure helper `order_sidecar_pills(inputs, claims)`
+   extracted for testability. Event loop uses
+   `futures::future::select_all` over `app.sidecars.iter_mut()`,
+   tagging each `next_event()` with its plugin id;
+   `chatui::sidecar::handle_event(app, &plugin_id, event)` routes by
+   key. `Exited` events remove a single entry, not the whole map.
+4. ✅ **8B.5** (covered by 8A.1) — `discover_all_in` already returns
+   every sidecar.
+5. ✅ **8B step 7** (`31f74ef` — already merged) — `KeybindRegistry`
+   records `KeybindCollision { losing_plugin, key, winning_owner,
+   reason }`. First-loaded wins. The new `SidecarToggle { plugin_id:
+   Some(claim.plugin) }` payload flows through the keybind→slash-command
+   path, so `keybinds[]` entries pointing at `<command> toggle` correctly
+   target their own plugin's sidecar.
+6. ⏳ **8B step 8** (deferred, one-release back-compat window) —
+   drop the global `sidecar_toggle_key` setting. Migration is already
+   in place (8A.8 copies into plugin namespace); the actual deletion of
+   the legacy key is left for the next major version.
 
 **Tests:**
 - Two plugins with sidecars → both discovered, both in `App.sidecars`.
