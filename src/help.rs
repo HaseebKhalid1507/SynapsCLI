@@ -151,8 +151,12 @@ impl HelpFindState {
 
         let mut category_names: Vec<&str> = entries.iter().map(|entry| display_category(entry)).collect();
         category_names.sort_by(|a, b| {
-            category_best_score(&entries, b)
-                .cmp(&category_best_score(&entries, a))
+            category_sort_key(a)
+                .cmp(&category_sort_key(b))
+                .then_with(|| {
+                    category_best_score(&entries, b)
+                        .cmp(&category_best_score(&entries, a))
+                })
                 .then_with(|| a.cmp(b))
         });
         category_names.dedup();
@@ -160,13 +164,17 @@ impl HelpFindState {
         let mut rows = Vec::new();
         for category in category_names {
             rows.push(HelpFindRow::Category(category));
-            rows.extend(
-                entries
-                    .iter()
-                    .copied()
-                    .filter(|entry| display_category(entry) == category)
-                    .map(HelpFindRow::Entry),
-            );
+            let mut category_entries = entries
+                .iter()
+                .copied()
+                .filter(|entry| display_category(entry) == category)
+                .collect::<Vec<_>>();
+            category_entries.sort_by(|a, b| {
+                help_parent_sort_key(a)
+                    .cmp(&help_parent_sort_key(b))
+                    .then_with(|| a.command.cmp(&b.command))
+            });
+            rows.extend(category_entries.into_iter().map(HelpFindRow::Entry));
         }
         rows
     }
@@ -391,6 +399,18 @@ impl HelpRegistry {
 
 pub fn builtin_entries() -> Vec<HelpEntry> {
     serde_json::from_str(BUILTIN_HELP_JSON).expect("assets/help.json must be valid help JSON")
+}
+
+fn category_sort_key(category: &str) -> u8 {
+    if category == "Help commands" { 1 } else { 0 }
+}
+
+fn help_parent_sort_key(entry: &HelpEntry) -> usize {
+    if is_help_command(entry) {
+        entry.command.matches(' ').count()
+    } else {
+        0
+    }
 }
 
 fn display_category(entry: &HelpEntry) -> &str {

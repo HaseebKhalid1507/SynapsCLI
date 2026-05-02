@@ -21,6 +21,26 @@ fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpE
 }
 
 #[test]
+fn help_find_places_help_commands_category_last_with_parent_command_first() {
+    let registry = HelpRegistry::new(
+        vec![
+            test_entry("/help find", "Find Help", "Core", true),
+            test_entry("/help", "Help", "Core", true),
+            test_entry("/plugins", "Plugins Modal", "Plugins", true),
+            test_entry("/model", "Model", "Models", true),
+        ],
+        Vec::new(),
+    );
+    let state = HelpFindState::new(registry.entries().to_vec(), "");
+
+    let rows = state.filtered_rows();
+    let help_header_index = rows.iter().position(|row| row.category() == Some("Help commands")).unwrap();
+    assert_eq!(help_header_index, rows.iter().rposition(|row| row.category().is_some()).unwrap());
+    assert_eq!(rows[help_header_index + 1].entry().map(|entry| entry.command.as_str()), Some("/help"));
+    assert_eq!(rows[help_header_index + 2].entry().map(|entry| entry.command.as_str()), Some("/help find"));
+}
+
+#[test]
 fn help_find_default_state_includes_help_topics_and_real_commands() {
     let registry = HelpRegistry::new(
         vec![
