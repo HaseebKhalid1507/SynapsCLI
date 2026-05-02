@@ -130,24 +130,39 @@ plugin's namespace. Multi-sidecar comes in 8B.
    `<word> status` → `SidecarStatus`, and falling through to the
    plugin-command resolver for any other subcommand. Claimed command
    words appear in `all_commands()` for autocomplete.
-3. ⏳ **8A.3** — Inject a virtual setting field (toggle-key) into the
-   plugin-named `settings_category`. Owned by core, rendered in plugin
-   panel.
-4. ⏳ **8A.4** — Settings UI: hide `Category::Sidecar` when at least
-   one plugin has claimed a category. Strict: hide always once any
-   plugin claims; if zero plugins claim, show the legacy panel.
-5. ⏳ **8A.5** — Pill / status line / error messages use the plugin's
-   `display_name` when known; fall back to `"sidecar"` only when no
-   claim exists.
-6. ⏳ **8A.6** — `/sidecar toggle` becomes ambiguity-aware:
-   - 0 unclaimed plugins: errors with "no sidecar to toggle"
-   - 1 unclaimed plugin: command toggles it
-   - 2+ unclaimed plugins: errors with disambiguation hint
-7. ⏳ **8A.7** — Add `/sidecar <plugin-id> toggle/status` qualified form.
-8. ⏳ **8A.8** — Migration: keep `Category::Sidecar` and
-   `sidecar_toggle_key` as one-release fallback. Startup migration
-   copies `sidecar_toggle_key` into the active claimed plugin's
-   namespace when one exists.
+3. ✅ **8A.3 (`e81f7e5`)** — Registry's `plugin_settings_categories()`
+   injects a synthetic `_lifecycle_toggle_key` field at the front of
+   the claimed plugin's settings category. Cycler over
+   `["F8","F2","F12","C-V","C-G"]`. No-op (with `tracing::warn!`) when
+   `lifecycle.settings_category` references a non-existent category.
+4. ✅ **8A.4 (`6ad8469`)** — `schema::visible_categories(claims)`
+   returns `CATEGORIES` minus `Category::Sidecar` if any claim has
+   `settings_category.is_some()`. Static `Category::Sidecar` and
+   `sidecar_toggle_key` setting kept for back-compat. (Wire-up of
+   `visible_categories` in `draw.rs` deferred — TODO comment in
+   `schema.rs`.)
+5. ✅ **8A.5 (`74120ce`,`8001c99`,`03197da`)** —
+   `SidecarUiState.display_name: Option<String>` field + setter;
+   `status_line()` uses display name; `sidecar_pill_span` idle/error
+   pills carry display name (listening/transcribing stay
+   modality-neutral); chatui handler messages (`"X online"`,
+   `"X press failed"`, etc.) resolve display name with `"sidecar"`
+   fallback. The setter is wired but unused — slice 8B's dispatcher
+   will call it post-spawn.
+6. ✅ **8A.6 + 8A.7 (`d3f8945`)** — `/sidecar` dispatcher arm rewritten:
+   - Unqualified (0 claims): dispatches as before (back-compat).
+   - Unqualified (1 claim): dispatches + System hint to use
+     `/<command> toggle`.
+   - Unqualified (2+ claims): Error with disambiguation listing plugin
+     ids and per-plugin commands; returns `None`.
+   - Qualified `/sidecar <plugin-id> <toggle|status>`: looks up claim
+     by plugin id; unknown id errors with the loaded list. Subcommand
+     `toggle`/`status` dispatches no-payload variant (TODO for 8B
+     plugin-id payload).
+7. ✅ **8A.8 (`d864f1b`)** — `migrate_sidecar_toggle_key_to_claimed_plugins()`
+   runs at startup. For each claim with a `settings_category`, copies
+   `sidecar_toggle_key` into `plugins.{plugin}.{cat}._lifecycle_toggle_key`
+   when the new key isn't already set. Idempotent.
 
 **Tests:**
 - Manifest deserialization: `lifecycle` parses with all fields, with
