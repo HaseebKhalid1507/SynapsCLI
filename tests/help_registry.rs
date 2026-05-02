@@ -177,6 +177,35 @@ fn help_entry_deserializes_when_usage_and_examples_are_omitted() {
 }
 
 #[test]
+fn render_entry_does_not_duplicate_related_from_body_lines() {
+    let entry = HelpEntry {
+        id: "settings".to_string(),
+        command: "/help settings".to_string(),
+        title: "Settings".to_string(),
+        summary: "Configure SynapsCLI.".to_string(),
+        category: "Settings".to_string(),
+        topic: HelpTopicKind::Branch,
+        protected: true,
+        common: true,
+        aliases: vec![],
+        keywords: vec![],
+        lines: vec![
+            "Use settings for preferences.".to_string(),
+            "".to_string(),
+            "Related: /help models, /help plugins".to_string(),
+        ],
+        usage: None,
+        examples: vec![],
+        related: vec!["/help models".to_string(), "/help plugins".to_string()],
+        source: None,
+    };
+
+    let rendered = render_entry(&entry);
+
+    assert_eq!(rendered.matches("Related:").count(), 1);
+}
+
+#[test]
 fn render_entry_includes_usage_and_examples_when_present() {
     let entry = HelpEntry {
         id: "example-rich".to_string(),
