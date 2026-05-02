@@ -574,6 +574,7 @@ mod tests {
             provider_keys: std::collections::BTreeMap::new(),
             model_health: std::collections::HashMap::new(),
             plugin_categories: Vec::new(),
+            lifecycle_claims: Vec::new(),
         }
     }
 
