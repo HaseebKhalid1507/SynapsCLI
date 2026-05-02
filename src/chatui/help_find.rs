@@ -68,7 +68,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(THEME.load().border_active));
-    let inner = block.inner(modal);
+    let inner = padded_rect(block.inner(modal), 2, 1);
     frame.render_widget(block, modal);
 
     if let Some(entry) = state.detail_entry().cloned() {
@@ -107,13 +107,13 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         rows[start..end]
             .iter()
             .enumerate()
-            .map(|(offset, row)| {
+            .flat_map(|(offset, row)| {
                 let idx = start + offset;
                 match row {
-                    synaps_cli::help::HelpFindRow::Category(category) => Line::from(Span::styled(
-                        format!("  {}", category),
+                    synaps_cli::help::HelpFindRow::Category(category) => vec![Line::from(Span::styled(
+                        category.to_string(),
                         Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
-                    )),
+                    ))],
                     synaps_cli::help::HelpFindRow::Entry(entry) => {
                         let selected = idx == state.cursor();
                         let marker = if selected { "›" } else { " " };
@@ -124,15 +124,15 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
                         };
                         let summary_style = Style::default().fg(THEME.load().muted);
                         let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
-                        let mut spans = vec![Span::styled(marker.to_string(), command_style), Span::raw(" ")];
-                        spans.extend(highlighted_spans(
-                            &format!("{:<18}", entry.command),
+                        wrapped_entry_lines(
+                            marker,
+                            entry,
                             state.filter(),
+                            chunks[1].width as usize,
                             command_style,
+                            summary_style,
                             match_style,
-                        ));
-                        spans.extend(highlighted_spans(&entry.summary, state.filter(), summary_style, match_style));
-                        Line::from(spans)
+                        )
                     }
                 }
             })
@@ -154,21 +154,72 @@ fn highlighted_spans(text: &str, query: &str, base: Style, matched: Style) -> Ve
         .collect()
 }
 
+fn wrapped_entry_lines(
+    marker: &str,
+    entry: &synaps_cli::help::HelpEntry,
+    query: &str,
+    width: usize,
+    command_style: Style,
+    summary_style: Style,
+    match_style: Style,
+) -> Vec<Line<'static>> {
+    let prefix = format!("{} {:<18}", marker, entry.command);
+    let available = width.saturating_sub(prefix.len()).max(8);
+    let summary_lines = synaps_cli::help::wrap_help_text(&entry.summary, available);
+    summary_lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, summary)| {
+            let line_prefix = if idx == 0 {
+                prefix.clone()
+            } else {
+                " ".repeat(prefix.len())
+            };
+            let mut spans = highlighted_spans(&line_prefix, query, command_style, match_style);
+            spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn padded_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(horizontal),
+        area.y.saturating_add(vertical),
+        area.width.saturating_sub(horizontal.saturating_mul(2)),
+        area.height.saturating_sub(vertical.saturating_mul(2)),
+    )
+}
+
+fn wrapped_raw_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    synaps_cli::help::wrap_help_text(text, width)
+        .into_iter()
+        .map(|line| Line::from(Span::raw(line)))
+        .collect()
+}
+
+fn wrapped_styled_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    synaps_cli::help::wrap_help_text(text, width)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect()
+}
+
 fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpEntry) {
     let block = Block::default()
         .title(format!(" {} ", entry.command))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(THEME.load().border_active));
-    let inner = block.inner(modal);
+    let inner = padded_rect(block.inner(modal), 2, 1);
     frame.render_widget(Clear, modal);
     frame.render_widget(block, modal);
 
     let mut lines = vec![
         Line::from(Span::styled(entry.title.clone(), Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(Span::styled(entry.summary.clone(), Style::default().fg(THEME.load().input_fg))),
     ];
+    lines.extend(wrapped_styled_lines(&entry.summary, inner.width as usize, Style::default().fg(THEME.load().input_fg)));
     if let Some(source) = synaps_cli::help::source_display(entry) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -177,11 +228,13 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
         )));
     }
     lines.push(Line::from(""));
-    lines.extend(entry.lines.iter().map(|line| Line::from(Span::raw(line.clone()))));
+    lines.extend(entry.lines.iter().flat_map(|line| {
+        wrapped_raw_lines(line, inner.width as usize)
+    }));
     if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Usage", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(Span::raw(format!("  {}", usage))));
+        lines.extend(wrapped_raw_lines(&format!("  {}", usage), inner.width as usize));
     }
     if !entry.examples.is_empty() {
         lines.push(Line::from(""));
@@ -192,15 +245,16 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
             } else {
                 format!("  {:<16} {}", example.command, example.description)
             };
-            lines.push(Line::from(Span::raw(rendered)));
+            lines.extend(wrapped_raw_lines(&rendered, inner.width as usize));
         }
     }
     lines.push(Line::from(""));
     if !entry.related.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("Related: {}", entry.related.join(", ")),
+        lines.extend(wrapped_styled_lines(
+            &format!("Related: {}", entry.related.join(", ")),
+            inner.width as usize,
             Style::default().fg(THEME.load().muted),
-        )));
+        ));
     }
     lines.push(Line::from(Span::styled("Esc back", Style::default().fg(THEME.load().muted))));
     frame.render_widget(Paragraph::new(lines), inner);

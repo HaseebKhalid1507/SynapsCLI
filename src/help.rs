@@ -876,6 +876,42 @@ pub fn highlight_segments(text: &str, query: &str) -> Vec<HighlightSegment> {
     segments
 }
 
+pub fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.len() <= width {
+        return vec![text.to_string()];
+    }
+
+    let indent: String = text.chars().take_while(|ch| ch.is_whitespace()).collect();
+    let content = text.trim_start();
+    if content.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = indent.clone();
+    for word in content.split_whitespace() {
+        let separator = if current.trim().is_empty() { "" } else { " " };
+        let candidate_len = current.len() + separator.len() + word.len();
+        if candidate_len > width && current.trim().len() > 0 {
+            lines.push(current);
+            current = format!("{}{}", indent, word);
+        } else {
+            if !separator.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.trim().is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        vec![text.to_string()]
+    } else {
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,5 +921,20 @@ mod tests {
         let entries = builtin_entries();
         assert!(entries.iter().any(|entry| entry.command == "/help"));
         assert!(entries.iter().any(|entry| entry.command == "/help find"));
+    }
+
+    #[test]
+    fn wrap_help_text_wraps_words_to_width_and_preserves_indent() {
+        let lines = wrap_help_text("  summary text should wrap neatly", 18);
+
+        assert_eq!(lines, vec!["  summary text", "  should wrap", "  neatly"]);
+        assert!(lines.iter().all(|line| line.len() <= 18));
+    }
+
+    #[test]
+    fn wrap_help_text_returns_original_line_when_width_is_too_small() {
+        let lines = wrap_help_text("abc def", 0);
+
+        assert_eq!(lines, vec!["abc def"]);
     }
 }
