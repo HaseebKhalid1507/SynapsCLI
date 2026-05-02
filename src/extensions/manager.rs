@@ -661,7 +661,12 @@ impl ExtensionManager {
         plugin_dirs.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut loaded = Vec::new();
+        let disabled_plugins = crate::config::load_config().disabled_plugins;
         for (plugin_name, plugin_dir) in plugin_dirs {
+            if disabled_plugins.iter().any(|d| d == &plugin_name) {
+                tracing::debug!(plugin = %plugin_name, "Extension disabled via disabled_plugins config");
+                continue;
+            }
             let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
             if !manifest_path.exists() {
                 continue;
