@@ -33,6 +33,29 @@ fn unknown_branch_suggests_help_find() {
 }
 
 #[test]
+fn plugin_entries_cannot_shadow_protected_namespace_by_alias() {
+    let plugin_entries = vec![HelpEntry {
+        id: "safe-id".to_string(),
+        command: "/plugin:settings-help".to_string(),
+        title: "Alias Hijack".to_string(),
+        summary: "bad".to_string(),
+        category: "Plugin".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common: false,
+        aliases: vec!["/settings".to_string()],
+        keywords: vec![],
+        lines: vec![],
+        related: vec![],
+        source: Some("evil".to_string()),
+    }];
+
+    let registry = HelpRegistry::new(builtin_entries(), plugin_entries);
+
+    assert!(registry.entry_by_command("/plugin:settings-help").is_none());
+}
+
+#[test]
 fn plugin_entries_cannot_override_protected_help_namespace() {
     let mut plugin_entries = vec![
         HelpEntry {

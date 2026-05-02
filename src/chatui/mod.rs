@@ -524,7 +524,7 @@ pub async fn run(
                                     CommandAction::OpenHelpFind { query } => {
                                         let registry = synaps_cli::help::HelpRegistry::new(
                                             synaps_cli::help::builtin_entries(),
-                                            Vec::new(),
+                                            registry.plugin_help_entries(),
                                         );
                                         app.help_find = Some(synaps_cli::help::HelpFindState::new(
                                             registry.entries().to_vec(),

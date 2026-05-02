@@ -166,7 +166,15 @@ impl HelpRegistry {
 
         for mut entry in plugin_entries {
             normalize_command(&mut entry);
-            if protected.contains(&entry.command) || protected.contains(&entry.id) {
+            if protected.contains(&entry.command)
+                || protected.contains(&entry.id)
+                || entry.aliases.iter().any(|alias| protected.contains(alias))
+            {
+                tracing::warn!(
+                    command = %entry.command,
+                    id = %entry.id,
+                    "plugin help entry conflicts with protected namespace; ignoring"
+                );
                 continue;
             }
             if entry.protected {

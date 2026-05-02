@@ -381,7 +381,7 @@ pub(super) async fn handle_command(
 
             let registry = synaps_cli::help::HelpRegistry::new(
                 synaps_cli::help::builtin_entries(),
-                Vec::new(),
+                registry.plugin_help_entries(),
             );
             if let Some(rendered) = synaps_cli::help::render_help(
                 &registry,
@@ -690,6 +690,7 @@ mod tests {
                     keybinds: vec![],
                     compatibility: None,
                     extension: None,
+                    help_entries: vec![],
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),
