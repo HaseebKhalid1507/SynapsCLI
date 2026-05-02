@@ -36,6 +36,105 @@ pub struct HelpRegistry {
     entries: Vec<HelpEntry>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HelpFindState {
+    entries: Vec<HelpEntry>,
+    filter: String,
+    cursor: usize,
+    scroll: usize,
+    visible_height: usize,
+}
+
+impl HelpFindState {
+    pub fn new(entries: Vec<HelpEntry>, query: &str) -> Self {
+        Self {
+            entries,
+            filter: query.trim().to_string(),
+            cursor: 0,
+            scroll: 0,
+            visible_height: 10,
+        }
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    pub fn set_visible_height(&mut self, height: usize) {
+        self.visible_height = height.max(1);
+        self.scroll_to_cursor();
+    }
+
+    pub fn filtered_entries(&self) -> Vec<&HelpEntry> {
+        let needle = self.filter.to_ascii_lowercase();
+        if needle.trim().is_empty() {
+            return self.entries.iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|entry| searchable_text(entry).contains(&needle))
+            .collect()
+    }
+
+    pub fn selected(&self) -> Option<&HelpEntry> {
+        self.filtered_entries().get(self.cursor).copied()
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.filtered_entries().len();
+        if len == 0 {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.cursor = (self.cursor + 1).min(len - 1);
+        self.scroll_to_cursor();
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+        self.scroll_to_cursor();
+    }
+
+    pub fn push_char(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.reset_position();
+    }
+
+    pub fn backspace(&mut self) {
+        self.filter.pop();
+        self.reset_position();
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.reset_position();
+    }
+
+    fn reset_position(&mut self) {
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    fn scroll_to_cursor(&mut self) {
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        }
+        let bottom = self.scroll + self.visible_height;
+        if self.cursor >= bottom {
+            self.scroll = self.cursor + 1 - self.visible_height;
+        }
+    }
+}
+
 impl HelpRegistry {
     pub fn new(core_entries: Vec<HelpEntry>, plugin_entries: Vec<HelpEntry>) -> Self {
         let protected = protected_commands(&core_entries);
