@@ -27,7 +27,7 @@
       "",
       "Tip: type /help find and start typing."
     ],
-    "related": ["/help find", "/help models", "/help plugins", "/help sessions", "/help settings", "/help doctor"]
+    "related": []
   },
   {
     "id": "find",
@@ -88,9 +88,18 @@
       "  /extensions status       Show loaded extension health",
       "  /extensions config [id]  Show config diagnostics",
       "",
-      "Plugin help may be added by extensions, but protected internal help cannot be replaced.",
-      "",
-      "Related: /help doctor, /help settings, /help find"
+      "Plugin help may be added by extensions, but protected internal help cannot be replaced."
+    ],
+    "usage": "/plugins",
+    "examples": [
+      {
+        "command": "/plugins",
+        "description": "Open marketplace and installed plugin management."
+      },
+      {
+        "command": "/plugins reload",
+        "description": "Reload installed plugins after manifest changes."
+      }
     ],
     "related": ["/help doctor", "/help settings", "/help find"]
   },
@@ -233,9 +242,18 @@
       "  /extensions audit [N]    Inspect recent provider audit entries",
       "  /plugins                 Open plugin manager",
       "",
-      "Extension help appears in /help find, but protected core help cannot be replaced.",
-      "",
-      "Related: /help plugins, /help trust, /help doctor, /help find"
+      "Extension help appears in /help find, but protected core help cannot be replaced."
+    ],
+    "usage": "/help extensions",
+    "examples": [
+      {
+        "command": "/extensions status",
+        "description": "Show loaded extension health."
+      },
+      {
+        "command": "/extensions audit 20",
+        "description": "Inspect recent provider audit entries."
+      }
     ],
     "related": ["/help plugins", "/help trust", "/help doctor", "/help find"]
   },
@@ -259,9 +277,18 @@
       "  • Use /extensions config [id] for configuration diagnostics",
       "  • Use /extensions audit [N] to inspect recent provider activity",
       "",
-      "Plugins may add help entries, but they cannot shadow protected internal commands like /help, /settings, or /plugins.",
-      "",
-      "Related: /help extensions, /help plugins, /help doctor"
+      "Plugins may add help entries, but they cannot shadow protected internal commands like /help, /settings, or /plugins."
+    ],
+    "usage": "/help trust",
+    "examples": [
+      {
+        "command": "/extensions audit",
+        "description": "Inspect recent provider activity."
+      },
+      {
+        "command": "/extensions config acme-tools",
+        "description": "Check configuration diagnostics for one extension."
+      }
     ],
     "related": ["/help extensions", "/help plugins", "/help doctor"]
   },
@@ -277,16 +304,18 @@
     "aliases": ["/help compact"],
     "keywords": ["compact", "summarize history", "summary", "context", "conversation history", "session"],
     "lines": [
-      "Summarize and compact the current conversation so the session can continue with less context.",
-      "",
-      "Usage",
-      "  /compact [focus]",
-      "",
-      "Examples",
-      "  /compact",
-      "  /compact keep the auth debugging context",
-      "",
-      "Related: /help sessions, /help chain"
+      "Summarize and compact the current conversation so the session can continue with less context."
+    ],
+    "usage": "/compact [focus]",
+    "examples": [
+      {
+        "command": "/compact",
+        "description": "Compact the current conversation."
+      },
+      {
+        "command": "/compact keep the auth debugging context",
+        "description": "Compact while preserving an important focus."
+      }
     ],
     "related": ["/help sessions", "/help chain"]
   },
@@ -304,12 +333,14 @@
     "lines": [
       "Show the compaction chain for the current session, including previous summaries created by /compact.",
       "",
-      "Usage",
-      "  /chain",
-      "",
-      "Use this when you need to understand what context was preserved across compactions.",
-      "",
-      "Related: /help sessions, /help compact"
+      "Use this when you need to understand what context was preserved across compactions."
+    ],
+    "usage": "/chain",
+    "examples": [
+      {
+        "command": "/chain",
+        "description": "Show compaction history for the current session."
+      }
     ],
     "related": ["/help sessions", "/help compact"]
   },
@@ -353,6 +384,17 @@
     "aliases": ["/models"],
     "keywords": ["model", "models", "provider"],
     "lines": ["/model opens the model router. /model <name> switches directly."],
+    "usage": "/model [name]",
+    "examples": [
+      {
+        "command": "/model",
+        "description": "Open the model picker."
+      },
+      {
+        "command": "/model claude-sonnet-4",
+        "description": "Switch directly when the model is configured."
+      }
+    ],
     "related": ["/help models"]
   },
   {
@@ -381,6 +423,13 @@
     "aliases": [],
     "keywords": ["plugins", "extensions"],
     "lines": ["/plugins opens marketplace and installed plugin management."],
+    "usage": "/plugins",
+    "examples": [
+      {
+        "command": "/plugins",
+        "description": "Open the plugin manager."
+      }
+    ],
     "related": ["/help plugins"]
   },
   {

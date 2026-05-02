@@ -144,6 +144,23 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
         Line::from(""),
     ];
     lines.extend(entry.lines.iter().map(|line| Line::from(Span::raw(line.clone()))));
+    if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Usage", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::raw(format!("  {}", usage))));
+    }
+    if !entry.examples.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Examples", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
+        for example in &entry.examples {
+            let rendered = if example.description.trim().is_empty() {
+                format!("  {}", example.command)
+            } else {
+                format!("  {:<16} {}", example.command, example.description)
+            };
+            lines.push(Line::from(Span::raw(rendered)));
+        }
+    }
     lines.push(Line::from(""));
     if !entry.related.is_empty() {
         lines.push(Line::from(Span::styled(
