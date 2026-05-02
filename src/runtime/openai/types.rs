@@ -220,6 +220,7 @@ pub enum OaiEvent {
     },
     ToolCallArgumentsDelta {
         index: u32,
+        id: String,
         delta: String,
     },
     ToolCallsComplete {

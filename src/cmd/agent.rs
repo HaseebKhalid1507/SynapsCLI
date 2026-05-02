@@ -342,7 +342,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                         }));
                     }
                 }
-                StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
+                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                     total_tool_calls += 1;
                     tool_call_num += 1;
                     log(agent_name, &format!("tool: {}", name));
@@ -453,7 +453,7 @@ pub async fn run(config_path: String, trigger_context: String) {
             tokio::select! {
                 event = stream.next() => {
                     match event {
-                        Some(StreamEvent::Llm(LlmEvent::ToolUseStart(name))) if name == "watcher_exit" => {
+                        Some(StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. })) if name == "watcher_exit" => {
                             watcher_exit_called = true;
                         }
                         Some(StreamEvent::Session(SessionEvent::Done)) | None => break,
