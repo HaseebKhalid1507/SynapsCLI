@@ -850,19 +850,20 @@ mod tests {
             .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
             .expect("second system message should render");
 
-        let has_center_rule = lines[first_idx + 1..second_idx]
+        let between = &lines[first_idx + 1..second_idx];
+        let rule_idx = between
             .iter()
-            .any(|line| line.spans.iter().any(|span| {
+            .position(|line| line.spans.iter().any(|span| {
                 span.content.contains("─ · ─")
                     && span.style.fg == Some(THEME.load().muted)
                     && !span.style.add_modifier.contains(ratatui::style::Modifier::DIM)
-            }));
-
-        assert!(
-            has_center_rule,
-            "expected centered rule between consecutive system messages; got {:?}",
-            &lines[first_idx..=second_idx]
-        );
+            }))
+            .expect("expected centered rule between consecutive system messages");
+        let is_blank = |line: &ratatui::text::Line| {
+            line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
+        };
+        assert!(rule_idx > 0 && is_blank(&between[rule_idx - 1]), "expected blank line before centered rule; got {:?}", between);
+        assert!(rule_idx + 1 < between.len() && is_blank(&between[rule_idx + 1]), "expected blank line after centered rule; got {:?}", between);
     }
 
     #[test]
