@@ -185,24 +185,18 @@ fn wrapped_entry_lines(
     summary_style: Style,
     match_style: Style,
 ) -> Vec<Line<'static>> {
-    let prefix = format!("{} {:<18}", marker, entry.command);
-    synaps_cli::help::wrap_help_find_summary_lines(&prefix, &entry.summary, width)
+    let selected = marker == "›";
+    synaps_cli::help::wrap_help_find_entry_lines(&entry.command, &entry.summary, selected, width)
         .into_iter()
-        .map(|line| {
-            let split_at = byte_index_after_n_chars(&line, prefix.chars().count());
-            let (line_prefix, summary) = line.split_at(split_at.min(line.len()));
-            let mut spans = highlighted_spans(line_prefix, query, command_style, match_style);
-            spans.extend(highlighted_spans(summary, query, summary_style, match_style));
+        .map(|(command_part, summary)| {
+            let mut spans = highlighted_spans(&command_part, query, command_style, match_style);
+            if !summary.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
+            }
             Line::from(spans)
         })
         .collect()
-}
-
-fn byte_index_after_n_chars(text: &str, n: usize) -> usize {
-    text.char_indices()
-        .nth(n)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len())
 }
 
 fn padded_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
