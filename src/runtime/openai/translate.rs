@@ -279,11 +279,17 @@ pub fn messages_to_oai(
 pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
     match event {
         OaiEvent::TextDelta(t) => Some(StreamEvent::Llm(LlmEvent::Text(t.clone()))),
-        OaiEvent::ToolCallStart { name, .. } => {
-            Some(StreamEvent::Llm(LlmEvent::ToolUseStart(name.clone())))
+        OaiEvent::ToolCallStart { name, id, .. } => {
+            Some(StreamEvent::Llm(LlmEvent::ToolUseStart {
+                tool_name: name.clone(),
+                tool_id: id.clone(),
+            }))
         }
-        OaiEvent::ToolCallArgumentsDelta { delta, .. } => {
-            Some(StreamEvent::Llm(LlmEvent::ToolUseDelta(delta.clone())))
+        OaiEvent::ToolCallArgumentsDelta { delta, id, .. } => {
+            Some(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                tool_id: id.clone(),
+                delta: delta.clone(),
+            }))
         }
         OaiEvent::Usage { prompt_tokens, completion_tokens } => {
             Some(StreamEvent::Session(SessionEvent::Usage {

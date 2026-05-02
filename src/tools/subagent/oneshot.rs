@@ -166,7 +166,7 @@ impl Tool for SubagentTool {
                                 crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                     final_text.push_str(&text);
                                 }
-                                crate::StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
+                                crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                                     tool_count += 1;
                                     if let Some(ref tx) = tx_events_inner {
                                         let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {

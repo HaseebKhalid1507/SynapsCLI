@@ -58,12 +58,12 @@ pub async fn run() -> Result<()> {
                     print!("{}", text);
                     flush_stdout();
                 }
-                StreamEvent::Llm(LlmEvent::ToolUseStart(tool_name)) => {
+                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
                     if in_thinking { println!(); in_thinking = false; }
                     print!("⚙️  Using tool: {} (args: ", tool_name);
                     flush_stdout();
                 }
-                StreamEvent::Llm(LlmEvent::ToolUseDelta(delta)) => {
+                StreamEvent::Llm(LlmEvent::ToolUseDelta { delta, .. }) => {
                     print!("{}", delta);
                     flush_stdout();
                 }

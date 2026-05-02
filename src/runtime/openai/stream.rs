@@ -412,8 +412,12 @@ impl CodexSseDecoder {
                 if !delta.is_empty() {
                     let tool = self.ensure_tool(idx);
                     tool.arguments.push_str(delta);
+                    let tool_id = tool.id.clone();
                     let _ = tx.send(StreamEvent::Llm(
-                        crate::runtime::types::LlmEvent::ToolUseDelta(delta.to_string()),
+                        crate::runtime::types::LlmEvent::ToolUseDelta {
+                            tool_id,
+                            delta: delta.to_string(),
+                        },
                     ));
                 }
             }
@@ -461,7 +465,10 @@ impl CodexSseDecoder {
         if !tool.started && !tool.name.is_empty() {
             tool.started = true;
             let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUseStart(tool.name.clone()),
+                crate::runtime::types::LlmEvent::ToolUseStart {
+                    tool_name: tool.name.clone(),
+                    tool_id: tool.id.clone(),
+                },
             ));
         }
     }
@@ -492,7 +499,10 @@ impl CodexSseDecoder {
         if !tool.started && !tool.name.is_empty() {
             tool.started = true;
             let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUseStart(tool.name.clone()),
+                crate::runtime::types::LlmEvent::ToolUseStart {
+                    tool_name: tool.name.clone(),
+                    tool_id: tool.id.clone(),
+                },
             ));
         }
         let completed = if !tool.id.is_empty() && !tool.name.is_empty() {
@@ -765,21 +775,33 @@ mod codex_decoder_tests {
         let starts: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => Some(name.as_str()),
+                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
+                    Some((tool_name.as_str(), tool_id.as_str()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(starts, vec!["bash"], "exactly one ToolUseStart");
+        assert_eq!(
+            starts,
+            vec![("bash", "call_abc")],
+            "exactly one ToolUseStart with correct tool_id"
+        );
 
-        // Two argument deltas streamed.
+        // Two argument deltas streamed (each carrying the tool_id so
+        // parallel calls can be routed correctly by the chat UI).
         let deltas: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUseDelta(d)) => Some(d.as_str()),
+                StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
+                    Some((tool_id.as_str(), delta.as_str()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas, vec![r#"{"cmd""#, r#":"ls"}"#]);
+        assert_eq!(
+            deltas,
+            vec![("call_abc", r#"{"cmd""#), ("call_abc", r#":"ls"}"#)]
+        );
     }
 
     #[test]
