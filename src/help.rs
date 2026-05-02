@@ -55,6 +55,7 @@ pub struct HelpFindState {
     visible_height: usize,
     detail_idx: Option<usize>,
     recently_opened: Vec<String>,
+    help_commands_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,14 @@ pub struct HighlightSegment {
 
 impl HelpFindState {
     pub fn new(entries: Vec<HelpEntry>, query: &str) -> Self {
+        Self::new_with_scope(entries, query, false)
+    }
+
+    pub fn new_help_commands(entries: Vec<HelpEntry>, query: &str) -> Self {
+        Self::new_with_scope(entries, query, true)
+    }
+
+    fn new_with_scope(entries: Vec<HelpEntry>, query: &str, help_commands_only: bool) -> Self {
         let mut state = Self {
             entries,
             filter: query.trim().to_string(),
@@ -95,6 +104,7 @@ impl HelpFindState {
             visible_height: 10,
             detail_idx: None,
             recently_opened: Vec::new(),
+            help_commands_only,
         };
         state.reset_position();
         state
@@ -128,6 +138,9 @@ impl HelpFindState {
 
     pub fn filtered_entries(&self) -> Vec<&HelpEntry> {
         ranked_entries_with_mru(&self.entries, &self.filter, &self.recently_opened)
+            .into_iter()
+            .filter(|entry| !self.help_commands_only || is_help_command(entry))
+            .collect()
     }
 
     pub fn filtered_rows(&self) -> Vec<HelpFindRow<'_>> {
@@ -136,14 +149,24 @@ impl HelpFindState {
             return entries.into_iter().map(HelpFindRow::Entry).collect();
         }
 
+        let mut category_names: Vec<&str> = entries.iter().map(|entry| entry.category.as_str()).collect();
+        category_names.sort_by(|a, b| {
+            category_best_score(&entries, b)
+                .cmp(&category_best_score(&entries, a))
+                .then_with(|| a.cmp(b))
+        });
+        category_names.dedup();
+
         let mut rows = Vec::new();
-        let mut current_category: Option<&str> = None;
-        for entry in entries {
-            if current_category != Some(entry.category.as_str()) {
-                current_category = Some(entry.category.as_str());
-                rows.push(HelpFindRow::Category(entry.category.as_str()));
-            }
-            rows.push(HelpFindRow::Entry(entry));
+        for category in category_names {
+            rows.push(HelpFindRow::Category(category));
+            rows.extend(
+                entries
+                    .iter()
+                    .copied()
+                    .filter(|entry| entry.category == category)
+                    .map(HelpFindRow::Entry),
+            );
         }
         rows
     }
@@ -368,6 +391,19 @@ impl HelpRegistry {
 
 pub fn builtin_entries() -> Vec<HelpEntry> {
     serde_json::from_str(BUILTIN_HELP_JSON).expect("assets/help.json must be valid help JSON")
+}
+
+fn category_best_score(entries: &[&HelpEntry], category: &str) -> i32 {
+    entries
+        .iter()
+        .filter(|entry| entry.category == category)
+        .map(|entry| empty_query_score(entry))
+        .max()
+        .unwrap_or(0)
+}
+
+fn is_help_command(entry: &HelpEntry) -> bool {
+    entry.command == "/help" || entry.command.starts_with("/help ")
 }
 
 pub fn prefilter_query_for_slash_command(input: &str) -> Option<String> {
