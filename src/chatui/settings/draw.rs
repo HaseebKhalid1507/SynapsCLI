@@ -572,7 +572,8 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
         "bash_timeout" => format!("{}s", snap.bash_timeout),
         "bash_max_timeout" => format!("{}s", snap.bash_max_timeout),
         "theme" => snap.theme_name.clone(),
-        "voice_toggle_key" => synaps_cli::config::read_config_value("voice_toggle_key")
+        "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
+            .or_else(|| synaps_cli::config::read_config_value("voice_toggle_key"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),

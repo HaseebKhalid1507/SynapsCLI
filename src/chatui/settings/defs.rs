@@ -123,18 +123,21 @@ define_settings! {
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
 
-    voice_toggle_key, "Voice toggle key", Voice,
+    sidecar_toggle_key, "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
-        "Keybind that toggles voice dictation. Takes effect immediately.",
+        "Keybind that toggles the active sidecar plugin (e.g. voice dictation). Takes effect immediately.",
         |_runtime, app, value| {
             if let Some(kb) = app.keybinds.as_ref() {
                 match kb.write() {
                     Ok(mut g) => {
+                        // TODO Phase 7 deferred: target should be the active
+                        // sidecar plugin's declared toggle command, not a
+                        // hardcoded "voice toggle" literal.
                         if let Err(e) = g.set_slash_command_key("voice toggle", value) {
-                            tracing::warn!("voice_toggle_key apply failed: {}", e);
+                            tracing::warn!("sidecar_toggle_key apply failed: {}", e);
                         }
                     }
-                    Err(_) => tracing::warn!("voice_toggle_key apply: registry poisoned"),
+                    Err(_) => tracing::warn!("sidecar_toggle_key apply: registry poisoned"),
                 }
             }
         };
@@ -145,11 +148,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn voice_toggle_key_setting_is_in_voice_category() {
+    fn sidecar_toggle_key_setting_is_in_sidecar_category() {
         let def = ALL_SETTINGS
             .iter()
-            .find(|d| d.key == "voice_toggle_key")
-            .expect("voice_toggle_key setting should be defined");
-        assert_eq!(def.category, Category::Voice);
+            .find(|d| d.key == "sidecar_toggle_key")
+            .expect("sidecar_toggle_key setting should be defined");
+        assert_eq!(def.category, Category::Sidecar);
     }
 }

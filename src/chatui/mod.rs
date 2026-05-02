@@ -184,6 +184,7 @@ pub async fn run(
     // place so users on a multi-version setup don't lose them — they can be
     // pruned manually after upgrade.
     migrate_legacy_voice_config_keys();
+    migrate_legacy_sidecar_toggle_key();
 
     if !no_extensions {
         let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
@@ -1811,5 +1812,41 @@ fn migrate_legacy_voice_config_keys() {
                 );
             }
         }
+    }
+}
+
+/// Phase 7 migration: copy `voice_toggle_key` → `sidecar_toggle_key`.
+///
+/// The toggle key is a generic sidecar setting, not a voice-specific
+/// one. The new key is read first; the legacy key is read as a
+/// fallback for one release. This migration writes the new key when
+/// only the legacy key is present, then leaves both in place (the
+/// legacy key remains as a passive copy until the user removes it).
+fn migrate_legacy_sidecar_toggle_key() {
+    const LEGACY: &str = "voice_toggle_key";
+    const NEW: &str = "sidecar_toggle_key";
+    if synaps_cli::config::read_config_value(NEW).is_some() {
+        return;
+    }
+    let Some(legacy_value) = synaps_cli::config::read_config_value(LEGACY) else {
+        return;
+    };
+    let trimmed = legacy_value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Err(err) = synaps_cli::config::write_config_value(NEW, trimmed) {
+        tracing::warn!(
+            "sidecar migration: failed to copy `{}` → `{}`: {}",
+            LEGACY,
+            NEW,
+            err
+        );
+    } else {
+        tracing::info!(
+            "sidecar migration: copied global `{}` → `{}` (legacy key still present; safe to delete)",
+            LEGACY,
+            NEW
+        );
     }
 }

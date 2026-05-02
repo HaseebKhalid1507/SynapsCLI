@@ -97,17 +97,22 @@ pub async fn register(
         kb_registry.register_user(&config.keybinds);
     }
 
-    // Synthesize the voice toggle keybind. The selected key in
-    // `voice_toggle_key` is the *only* active voice toggle binding —
+    // Synthesize the sidecar toggle keybind. The selected key in
+    // `sidecar_toggle_key` is the *only* active sidecar toggle binding —
     // there's no plugin-level F8 anymore, so picking a value in
-    // /settings → Voice fully replaces the previous chord. Defaults to
+    // /settings → Sidecar fully replaces the previous chord. Defaults to
     // F8 when no value has been chosen.
-    let voice_key = crate::config::read_config_value("voice_toggle_key")
+    //
+    // Back-compat: legacy `voice_toggle_key` is read if the new key is
+    // absent. (Phase 7 deferred slice: replace `/voice toggle` literal
+    // with the active sidecar plugin's declared toggle command.)
+    let sidecar_key = crate::config::read_config_value("sidecar_toggle_key")
+        .or_else(|| crate::config::read_config_value("voice_toggle_key"))
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "F8".to_string());
     let mut overrides = std::collections::HashMap::new();
-    overrides.insert(voice_key, "/voice toggle".to_string());
+    overrides.insert(sidecar_key, "/voice toggle".to_string());
     kb_registry.register_user(&overrides);
 
     let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));

@@ -12,7 +12,7 @@ pub(crate) enum Category {
     ToolLimits,
     Appearance,
     Plugins,
-    Voice,
+    Sidecar,
 }
 
 impl Category {
@@ -24,7 +24,7 @@ impl Category {
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
             Category::Plugins => "Plugins",
-            Category::Voice => "Voice",
+            Category::Sidecar => "Sidecar",
         }
     }
 }
@@ -36,7 +36,7 @@ pub(crate) const CATEGORIES: [Category; 7] = [
     Category::ToolLimits,
     Category::Appearance,
     Category::Plugins,
-    Category::Voice,
+    Category::Sidecar,
 ];
 
 pub(crate) enum EditorKind {
@@ -83,27 +83,27 @@ mod tests {
     }
 
     #[test]
-    fn voice_category_is_present() {
-        assert!(CATEGORIES.contains(&Category::Voice));
+    fn sidecar_category_is_present() {
+        assert!(CATEGORIES.contains(&Category::Sidecar));
     }
 
     #[test]
-    fn voice_category_label() {
-        assert_eq!(Category::Voice.label(), "Voice");
+    fn sidecar_category_label() {
+        assert_eq!(Category::Sidecar.label(), "Sidecar");
     }
 
     #[test]
-    fn voice_settings_belong_to_voice_category() {
-        let voice_keys = ["voice_toggle_key"];
+    fn sidecar_settings_belong_to_sidecar_category() {
+        let sidecar_keys = ["sidecar_toggle_key"];
         for def in ALL_SETTINGS {
-            if voice_keys.contains(&def.key) {
-                assert_eq!(def.category, Category::Voice, "setting '{}' should be in Voice", def.key);
+            if sidecar_keys.contains(&def.key) {
+                assert_eq!(def.category, Category::Sidecar, "setting '{}' should be in Sidecar", def.key);
             }
         }
-        // voice_toggle_key must exist (it's the only generic voice setting kept in core).
+        // sidecar_toggle_key must exist (it's the only generic sidecar setting kept in core).
         let keys: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
-        for k in voice_keys {
-            assert!(keys.contains(&k), "missing voice setting: {}", k);
+        for k in sidecar_keys {
+            assert!(keys.contains(&k), "missing sidecar setting: {}", k);
         }
     }
 }
