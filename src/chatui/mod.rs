@@ -1162,7 +1162,7 @@ pub async fn run(
                                         });
                                     }
 
-                                    CommandAction::SidecarToggle => {
+                                    CommandAction::SidecarToggle { plugin_id: _toggle_plugin_id } => {
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.sidecar.is_none() {
                                             // Discover the plugin once, then ask the
@@ -1251,7 +1251,7 @@ pub async fn run(
                                         }
                                     }
 
-                                    CommandAction::SidecarStatus => {
+                                    CommandAction::SidecarStatus { plugin_id: _status_plugin_id } => {
                                         let line = match app.sidecar.as_ref() {
                                             Some(v) => v.status_line(),
                                             None => match synaps_cli::sidecar::discovery::discover() {
@@ -1368,8 +1368,8 @@ pub async fn run(
                                         CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
-                                        CommandAction::SidecarToggle => {}
-                                        CommandAction::SidecarStatus => {}
+                                        CommandAction::SidecarToggle { .. } => {}
+                                        CommandAction::SidecarStatus { .. } => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
