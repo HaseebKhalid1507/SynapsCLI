@@ -236,6 +236,8 @@ pub fn render_help(registry: &HelpRegistry, branch: Option<&str>) -> Option<Stri
         Some(topic) => registry
             .branch(topic)
             .map(render_entry)
+            .or_else(|| registry.entry_by_command(&format!("/help {}", topic)).map(render_entry))
+            .or_else(|| registry.entry_by_command(&format!("/{}", topic.trim_start_matches('/'))).map(render_entry))
             .or_else(|| Some(format!(
                 "No help topic for '{}'.\n\nTry /help find to search every topic.",
                 topic
