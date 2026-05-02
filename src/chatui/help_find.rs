@@ -186,22 +186,23 @@ fn wrapped_entry_lines(
     match_style: Style,
 ) -> Vec<Line<'static>> {
     let prefix = format!("{} {:<18}", marker, entry.command);
-    let available = width.saturating_sub(prefix.len()).max(8);
-    let summary_lines = synaps_cli::help::wrap_help_text(&entry.summary, available);
-    summary_lines
+    synaps_cli::help::wrap_help_find_summary_lines(&prefix, &entry.summary, width)
         .into_iter()
-        .enumerate()
-        .map(|(idx, summary)| {
-            let line_prefix = if idx == 0 {
-                prefix.clone()
-            } else {
-                " ".repeat(prefix.len())
-            };
-            let mut spans = highlighted_spans(&line_prefix, query, command_style, match_style);
-            spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
+        .map(|line| {
+            let split_at = byte_index_after_n_chars(&line, prefix.chars().count());
+            let (line_prefix, summary) = line.split_at(split_at.min(line.len()));
+            let mut spans = highlighted_spans(line_prefix, query, command_style, match_style);
+            spans.extend(highlighted_spans(summary, query, summary_style, match_style));
             Line::from(spans)
         })
         .collect()
+}
+
+fn byte_index_after_n_chars(text: &str, n: usize) -> usize {
+    text.char_indices()
+        .nth(n)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
 }
 
 fn padded_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
