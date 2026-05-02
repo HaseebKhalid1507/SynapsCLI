@@ -188,7 +188,7 @@ impl App {
                     }
                 }
 
-                ChatMessage::ToolUseStart(tool_name, partial_input) => {
+                ChatMessage::ToolUseStart { tool_name, partial_input, .. } => {
                     // Breathing room before tool block
                     lines.push(Line::from(""));
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
@@ -260,7 +260,7 @@ impl App {
                     }
                 }
 
-                ChatMessage::ToolUse { tool_name, input } => {
+                ChatMessage::ToolUse { tool_name, input, .. } => {
                     // Breathing room before tool block
                     lines.push(Line::from(""));
                     // Compact tool header
@@ -374,7 +374,7 @@ impl App {
                     }
                 }
 
-                ChatMessage::ToolResult { ref content, elapsed_ms } => {
+                ChatMessage::ToolResult { ref content, elapsed_ms, .. } => {
                     let result = content;
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");

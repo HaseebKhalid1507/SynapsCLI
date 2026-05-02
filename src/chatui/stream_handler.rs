@@ -42,54 +42,24 @@ pub(super) async fn handle_stream_event(
         StreamEvent::Llm(LlmEvent::Text(text)) => {
             app.append_or_update_text(&text);
         }
-        StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
-            app.tool_start_time = Some(std::time::Instant::now());
-            app.push_msg(ChatMessage::ToolUseStart(name, String::new()));
+        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
+            app.on_tool_use_start(tool_id, tool_name);
         }
-        StreamEvent::Llm(LlmEvent::ToolUseDelta(delta)) => {
-            if let Some(last) = app.messages.last_mut() {
-                if let ChatMessage::ToolUseStart(_, ref mut partial) = last.msg {
-                    partial.push_str(&delta);
-                    app.invalidate();
-                }
-            }
+        StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
+            app.on_tool_use_delta(&tool_id, &delta);
         }
-        StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. }) => {
-            app.tool_start_time = Some(std::time::Instant::now());
+        StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
             let input_str = serde_json::to_string(&input).unwrap_or_default();
-            if let Some(last) = app.messages.last_mut() {
-                if let ChatMessage::ToolUseStart(name, _) = &last.msg {
-                    if name == &tool_name {
-                        last.msg = ChatMessage::ToolUse { tool_name, input: input_str };
-                        app.invalidate();
-                        return StreamAction::Continue;
-                    }
-                }
-            }
-            app.push_msg(ChatMessage::ToolUse { tool_name, input: input_str });
+            app.on_tool_use_finalized(tool_id, tool_name, input_str);
+            return StreamAction::Continue;
         }
-        StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, .. }) => {
-            if let Some(last) = app.messages.last_mut() {
-                if let ChatMessage::ToolResult { ref mut content, .. } = last.msg {
-                    content.push_str(&delta);
-                    app.invalidate();
-                    return StreamAction::Continue;
-                }
-            }
-            app.push_msg(ChatMessage::ToolResult { content: delta, elapsed_ms: None });
+        StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
+            app.on_tool_result_delta(tool_id, delta);
+            return StreamAction::Continue;
         }
-        StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-            let elapsed = app.tool_start_time.take()
-                .map(|t| t.elapsed().as_millis() as u64);
-            if let Some(last) = app.messages.last_mut() {
-                if let ChatMessage::ToolResult { ref mut content, elapsed_ms: ref mut el, .. } = last.msg {
-                    *content = result;
-                    *el = elapsed;
-                    app.invalidate();
-                    return StreamAction::Continue;
-                }
-            }
-            app.push_msg(ChatMessage::ToolResult { content: result, elapsed_ms: elapsed });
+        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+            app.on_tool_result(tool_id, result);
+            return StreamAction::Continue;
         }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             app.api_messages = history;
