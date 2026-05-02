@@ -1191,15 +1191,19 @@ pub async fn run(
                                             match self::sidecar::SidecarUiState::spawn_with(sidecar_spawn_args, sidecar_plugin_info.as_ref()).await {
                                                 Ok(state) => {
                                                     app.sidecar = Some(state);
+                                                    let label = app.sidecar.as_ref()
+                                                        .and_then(|s| s.display_name.as_deref())
+                                                        .unwrap_or("sidecar")
+                                                        .to_string();
                                                     app.push_msg(ChatMessage::System(
-                                                        "🎤 sidecar online — press the toggle again to stop and transcribe".to_string()
+                                                        format!("🎤 {label} online — press the toggle again to stop and transcribe")
                                                     ));
                                                     if let Some(v) = app.sidecar.as_mut() {
                                                         v.armed = true;
                                                         if let Err(err) = v.manager.press().await {
                                                             v.armed = false;
                                                             v.status = self::sidecar::SidecarUiStatus::Error(err.to_string());
-                                                            app.push_msg(ChatMessage::Error(format!("sidecar press failed: {err}")));
+                                                            app.push_msg(ChatMessage::Error(format!("{label} press failed: {err}")));
                                                         }
                                                     }
                                                 }
@@ -1211,20 +1215,24 @@ pub async fn run(
                                             // Subsequent toggle: arm flag is the source of truth.
                                             // (status flaps between Listening/Idle as the VAD
                                             // delivers utterances, so we can't key off it.)
+                                            let label = app.sidecar.as_ref()
+                                                .and_then(|s| s.display_name.as_deref())
+                                                .unwrap_or("sidecar")
+                                                .to_string();
                                             let v = app.sidecar.as_mut().unwrap();
                                             if v.armed {
                                                 v.armed = false;
                                                 if let Err(err) = v.manager.release().await {
-                                                    app.push_msg(ChatMessage::Error(format!("sidecar release failed: {err}")));
+                                                    app.push_msg(ChatMessage::Error(format!("{label} release failed: {err}")));
                                                 }
                                                 app.push_msg(ChatMessage::System(
-                                                    "sidecar: stopping — final transcript will be appended".to_string()
+                                                    format!("{label}: stopping — final transcript will be appended")
                                                 ));
                                             } else {
                                                 v.armed = true;
                                                 if let Err(err) = v.manager.press().await {
                                                     v.armed = false;
-                                                    app.push_msg(ChatMessage::Error(format!("sidecar press failed: {err}")));
+                                                    app.push_msg(ChatMessage::Error(format!("{label} press failed: {err}")));
                                                 }
                                             }
                                         }
