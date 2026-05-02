@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{CATEGORIES, EditorKind};
+use super::schema::{CATEGORIES, EditorKind, visible_categories};
 use super::draw::current_value_for;
 
 pub(crate) enum InputOutcome {
@@ -43,8 +43,9 @@ pub(crate) fn handle_event(
         }
         return handle_editor_key(state, key);
     }
-    if state.focus == Focus::Right && state.category_idx < CATEGORIES.len() {
-        let cat = super::schema::CATEGORIES[state.category_idx];
+    let visible = visible_categories(&snap.lifecycle_claims);
+    if state.focus == Focus::Right && state.category_idx < visible.len() {
+        let cat = visible[state.category_idx];
         if cat == super::schema::Category::Providers {
             // 'p' key — ping all models from any row
             if matches!(key.code, KeyCode::Char('p')) && state.edit_mode.is_none() {
@@ -245,7 +246,7 @@ pub(crate) fn handle_event(
         (KeyCode::Down, _) => {
             match state.focus {
                 Focus::Left => {
-                    let total_categories = CATEGORIES.len() + snap.plugin_categories.len();
+                    let total_categories = visible_categories(&snap.lifecycle_claims).len() + snap.plugin_categories.len();
                     if state.category_idx + 1 < total_categories {
                         state.category_idx += 1;
                         state.setting_idx = 0;
@@ -528,7 +529,8 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
             .map(|c| c.fields.len())
             .unwrap_or(0);
     }
-    let cat = super::schema::CATEGORIES[state.category_idx];
+    let visible = visible_categories(&snap.lifecycle_claims);
+    let cat = visible[state.category_idx];
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
     } else if cat == super::schema::Category::Providers {
