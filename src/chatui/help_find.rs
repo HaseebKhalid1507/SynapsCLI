@@ -97,7 +97,11 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
     let start = state.scroll().min(filtered.len());
     let end = (start + visible_height).min(filtered.len());
     let rows: Vec<Line<'static>> = if filtered.is_empty() {
-        vec![Line::from(Span::styled("No matches", Style::default().fg(THEME.load().muted)))]
+        state
+            .no_results_message()
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
+            .collect()
     } else {
         filtered[start..end]
             .iter()
