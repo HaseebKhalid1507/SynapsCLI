@@ -231,6 +231,24 @@ impl HelpRegistry {
     pub fn search(&self, query: &str) -> Vec<&HelpEntry> {
         ranked_entries(&self.entries, query)
     }
+
+    pub fn entry_for_help_topic(&self, topic: &str) -> Option<&HelpEntry> {
+        let normalized = normalize_help_topic(topic);
+        if normalized.is_empty() {
+            return None;
+        }
+
+        self.entry_by_command_exact(&format!("/help {}", normalized))
+            .or_else(|| self.entry_by_command_exact(&normalized))
+            .or_else(|| self.entry_by_command_exact(&format!("/{}", normalized)))
+            .or_else(|| self.entry_by_command(&format!("/{}", normalized)))
+            .or_else(|| self.branch(&normalized))
+    }
+
+    fn entry_by_command_exact(&self, command: &str) -> Option<&HelpEntry> {
+        let needle = normalize_query_command(command);
+        self.entries.iter().find(|entry| entry.command == needle)
+    }
 }
 
 pub fn builtin_entries() -> Vec<HelpEntry> {
@@ -242,14 +260,9 @@ pub fn render_help(registry: &HelpRegistry, branch: Option<&str>) -> Option<Stri
         None => registry.entry_by_command("/help").map(render_entry),
         Some("find") => registry.entry_by_command("/help find").map(render_entry),
         Some(topic) => registry
-            .branch(topic)
+            .entry_for_help_topic(topic)
             .map(render_entry)
-            .or_else(|| registry.entry_by_command(&format!("/help {}", topic)).map(render_entry))
-            .or_else(|| registry.entry_by_command(&format!("/{}", topic.trim_start_matches('/'))).map(render_entry))
-            .or_else(|| Some(format!(
-                "No help topic for '{}'.\n\nTry /help find to search every topic.",
-                topic
-            ))),
+            .or_else(|| Some(render_unknown_topic(registry, topic))),
     }
 }
 
@@ -302,6 +315,91 @@ fn normalize_query_command(command: &str) -> String {
     } else {
         format!("/{}", trimmed)
     }
+}
+
+fn normalize_help_topic(topic: &str) -> String {
+    let mut normalized = topic.trim();
+    if let Some(rest) = normalized.strip_prefix("/help") {
+        normalized = rest.trim();
+    }
+    normalized.trim_start_matches('/').trim().to_ascii_lowercase()
+}
+
+fn render_unknown_topic(registry: &HelpRegistry, topic: &str) -> String {
+    let mut lines = vec![
+        format!("No help topic for '{}'.", topic),
+        String::new(),
+        "Try /help find to search every topic.".to_string(),
+    ];
+    let suggestions = closest_help_matches(registry, topic, 3);
+    if !suggestions.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Closest matches: {}", suggestions.join(", ")));
+    }
+    lines.join("\n")
+}
+
+fn closest_help_matches(registry: &HelpRegistry, topic: &str, limit: usize) -> Vec<String> {
+    let needle = normalize_help_topic(topic);
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(&HelpEntry, usize)> = registry
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            suggestion_distance(entry, &needle)
+                .filter(|distance| *distance <= 3)
+                .map(|distance| (entry, distance))
+        })
+        .collect();
+
+    scored.sort_by(|(entry_a, distance_a), (entry_b, distance_b)| {
+        distance_a
+            .cmp(distance_b)
+            .then_with(|| entry_b.common.cmp(&entry_a.common))
+            .then_with(|| entry_a.command.len().cmp(&entry_b.command.len()))
+            .then_with(|| entry_a.command.cmp(&entry_b.command))
+    });
+    scored
+        .into_iter()
+        .map(|(entry, _)| entry.command.clone())
+        .take(limit)
+        .collect()
+}
+
+fn suggestion_distance(entry: &HelpEntry, needle: &str) -> Option<usize> {
+    entry
+        .aliases
+        .iter()
+        .map(|alias| normalize_help_topic(alias))
+        .chain(std::iter::once(normalize_help_topic(&entry.command)))
+        .chain(std::iter::once(entry.id.to_ascii_lowercase()))
+        .chain(std::iter::once(entry.title.to_ascii_lowercase()))
+        .map(|candidate| levenshtein(needle, candidate.trim_start_matches("help ")))
+        .min()
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut costs: Vec<usize> = (0..=b_chars.len()).collect();
+
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = costs[0];
+        costs[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let current = costs[j + 1];
+            costs[j + 1] = if ca == *cb {
+                previous
+            } else {
+                1 + previous.min(current).min(costs[j])
+            };
+            previous = current;
+        }
+    }
+
+    costs[b_chars.len()]
 }
 
 fn protected_commands(entries: &[HelpEntry]) -> HashSet<String> {

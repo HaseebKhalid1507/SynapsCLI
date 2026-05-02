@@ -176,6 +176,41 @@ fn builtin_complex_commands_have_usage_and_examples() {
 }
 
 #[test]
+fn help_drill_down_normalizes_command_topics_before_branch_fallback() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    for topic in ["model", "/model"] {
+        let rendered = render_help(&registry, Some(topic))
+            .unwrap_or_else(|| panic!("{topic} help should render"));
+        assert!(rendered.starts_with("Model router"), "{topic} should render /model command help:\n{}", rendered);
+        assert!(rendered.contains("Usage\n  /model [name]"), "{topic} should include /model usage:\n{}", rendered);
+        assert!(!rendered.starts_with("Models"), "{topic} should prefer exact command over models branch:\n{}", rendered);
+    }
+}
+
+#[test]
+fn help_drill_down_prefers_exact_subcommand_before_branch_fallback() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let rendered = render_help(&registry, Some("extensions audit"))
+        .expect("extensions audit help should render");
+
+    assert!(rendered.starts_with("/extensions audit"), "should render exact command entry:\n{}", rendered);
+    assert!(rendered.contains("Usage\n  /extensions audit [limit]"), "should include audit usage:\n{}", rendered);
+    assert!(!rendered.starts_with("Extensions"), "should not fall back to extensions branch:\n{}", rendered);
+}
+
+#[test]
+fn unknown_help_topic_can_include_closest_suggestions() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let rendered = render_help(&registry, Some("modle")).expect("unknown help should render fallback");
+
+    assert!(rendered.contains("No help topic"), "missing unknown-topic message:\n{}", rendered);
+    assert!(rendered.contains("/help find"), "missing find suggestion:\n{}", rendered);
+    assert!(rendered.contains("Closest matches"), "missing closest suggestions:\n{}", rendered);
+    assert!(rendered.contains("/model"), "missing likely /model suggestion:\n{}", rendered);
+}
+
+#[test]
 fn unknown_branch_suggests_help_find() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let rendered = render_help(&registry, Some("wat")).expect("unknown help should render fallback");
