@@ -173,6 +173,16 @@ pub async fn run(
     );
     let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
+
+    // ═══ Phase 6 migration: legacy `voice_*` global keys → plugin namespace ═══
+    // One-shot copy of the deprecated whisper-specific config keys into the
+    // local-voice plugin's own config (`~/.synaps-cli/plugins/local-voice/config`).
+    // Only writes when the destination is empty; never overwrites a value the
+    // user has already set under the new namespace. Legacy keys remain in
+    // place so users on a multi-version setup don't lose them — they can be
+    // pruned manually after upgrade.
+    migrate_legacy_voice_config_keys();
+
     if !no_extensions {
         let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
         let handler_count = runtime.hook_bus().handler_count().await;
@@ -1731,4 +1741,61 @@ pub async fn run(
     teardown_terminal(&mut terminal);
 
     Ok(())
+}
+
+/// One-time migration for Phase 6 (Path B / extension contracts).
+///
+/// Copies any value at the legacy global `voice_*` config keys into the
+/// `local-voice` plugin's namespaced config. Only writes when the
+/// destination is currently empty, so re-runs are idempotent and a user
+/// who has already migrated by hand keeps their values.
+///
+/// Returns silently on every failure path — config migration is
+/// best-effort; the runtime falls back to the legacy global keys via
+/// the deprecation shim in `chatui::voice` if this no-ops.
+fn migrate_legacy_voice_config_keys() {
+    const PLUGIN: &str = "local-voice";
+    // (legacy global key, plugin namespace key)
+    const PAIRS: &[(&str, &str)] = &[
+        ("voice_stt_model_path", "model_path"),
+        ("voice_stt_model", "model_path"),
+        ("voice_stt_backend", "backend"),
+        ("voice_language", "language"),
+    ];
+
+    for (legacy, plugin_key) in PAIRS {
+        let Some(legacy_value) = synaps_cli::config::read_config_value(legacy) else {
+            continue;
+        };
+        let trimmed = legacy_value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Don't overwrite a value the user has already set under the new key.
+        if synaps_cli::extensions::config_store::read_plugin_config(PLUGIN, plugin_key).is_some() {
+            continue;
+        }
+        match synaps_cli::extensions::config_store::write_plugin_config(
+            PLUGIN,
+            plugin_key,
+            trimmed,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    "voice migration: copied `{}` → `~/.synaps-cli/plugins/{}/config:{}` \
+                     (legacy global key still present; safe to delete after restart)",
+                    legacy,
+                    PLUGIN,
+                    plugin_key
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "voice migration: failed to write `{}` to plugin namespace: {}",
+                    plugin_key,
+                    err
+                );
+            }
+        }
+    }
 }

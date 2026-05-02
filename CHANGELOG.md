@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Recent (Dev Branch)
+- **Path B Phase 6 — The Big Move (extension contracts)** — synaps-cli core no longer contains whisper-specific code; the local-voice plugin owns it
+  - Deleted `src/voice/{models,download,rebuild}.rs` (whisper.cpp catalog, HuggingFace downloader, cmake-rebuild orchestrator)
+  - Slimmed `src/voice/discovery.rs` from ~400 LOC to ~190: only `discover()` / `discover_in()` / `DiscoveredVoiceSidecar` remain; `read_build_info`, `detect_host_backend`, `probe_*` are gone (callers use the Phase 5 `info.get` cache instead)
+  - Deleted in-core `/voice models|help|download|rebuild` action arms and parsers — those subcommands now route through the plugin via the Phase 2 interactive command contract; missing-plugin case errors with a clear message
+  - Deleted in-core whisper download UI: `App.{download_progress, download_filename, download_rx, voice_download_in_flight, model_browser_selected, cached_voice_compiled_backend}` plus `start_download` / `on_download_progress` / `on_download_complete` and the `download_change` event-loop arm; the sticky progress widget now exclusively renders generic `extensions::active_tasks::ActiveTasks` (Phase 3)
+  - Deleted `EditorKind::{ModelBrowser, WhisperModelPicker}`, `ActiveEditor::ModelBrowser`, `ModelBrowserRow`, `model_browser_rows`, `whisper_model_options`, `render_model_browser`, `render_download_progress_line`, plus the `voice_stt_model` / `voice_stt_backend` / `voice_language` setting definitions — the plugin replaces them via the Phase 4 settings categories contract
+  - **Migration shim:** on first launch, legacy global voice config keys (`voice_stt_model_path`, `voice_stt_model`, `voice_stt_backend`, `voice_language`) are copied into the plugin namespace `~/.synaps-cli/plugins/local-voice/config` if the destination is empty; legacy keys remain in place for safety. Reads at runtime prefer the plugin namespace and fall back to the legacy global key with a deprecation warning.
+  - Net change: `~−2,400` LOC removed from synaps-cli core; behaviour preserved when the local-voice plugin is installed
 - **Phase 2 — Extensions Capability Platform** — extensions are now first-class citizens
   - Slash command extension contract (`commands` in plugin manifest)
   - Settings panel extension contract (`settings` in plugin manifest)
