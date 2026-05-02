@@ -28,6 +28,10 @@ pub enum Permission {
     MemoryRead,
     /// Can append to the local memory store via `memory.append`.
     MemoryWrite,
+    /// Can read/write its own plugin-namespaced config via `config.get`/`config.set`.
+    ConfigWrite,
+    /// Can subscribe to hot-reload notifications for its own plugin config.
+    ConfigSubscribe,
     /// Can capture audio (microphone) for voice STT/wake-word capabilities.
     AudioInput,
     /// Can produce audio output (speakers) for voice TTS capabilities.
@@ -46,6 +50,8 @@ impl Permission {
             Self::ProvidersRegister => "providers.register",
             Self::MemoryRead => "memory.read",
             Self::MemoryWrite => "memory.write",
+            Self::ConfigWrite => "config.write",
+            Self::ConfigSubscribe => "config.subscribe",
             Self::AudioInput => "audio.input",
             Self::AudioOutput => "audio.output",
         }
@@ -62,6 +68,8 @@ impl Permission {
             "providers.register" => Some(Self::ProvidersRegister),
             "memory.read" => Some(Self::MemoryRead),
             "memory.write" => Some(Self::MemoryWrite),
+            "config.write" => Some(Self::ConfigWrite),
+            "config.subscribe" => Some(Self::ConfigSubscribe),
             "audio.input" => Some(Self::AudioInput),
             "audio.output" => Some(Self::AudioOutput),
             _ => None,

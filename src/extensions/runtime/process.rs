@@ -988,6 +988,28 @@ impl ProcessExtension {
                 let records = store::query(&namespace, &q).map_err(|e| (-32000, e.to_string()))?;
                 Ok(serde_json::json!({"records": records}))
             }
+            "config.get" => {
+                let key = Self::param_str(&params, "key")?;
+                Self::validate_config_key(&key)?;
+                let value = crate::extensions::config_store::read_plugin_config(&inbox.extension_id, &key);
+                Ok(serde_json::json!({"value": value}))
+            }
+            "config.set" => {
+                Self::require_permission(inbox, Permission::ConfigWrite, "config.write").await?;
+                let key = Self::param_str(&params, "key")?;
+                Self::validate_config_key(&key)?;
+                let value = Self::param_str(&params, "value")?;
+                crate::extensions::config_store::write_plugin_config(&inbox.extension_id, &key, &value)
+                    .map_err(|e| (-32000, e.to_string()))?;
+                Ok(serde_json::json!({"ok": true}))
+            }
+            "config.subscribe" => {
+                Self::require_permission(inbox, Permission::ConfigSubscribe, "config.subscribe").await?;
+                // The long-lived watcher-to-notification bridge is wired at the manager/UI layer.
+                // This phase exposes the authorized protocol ACK so plugins can opt in without
+                // blocking initialize; direct store watchers are unit-tested in config_store.
+                Ok(serde_json::json!({"ok": true}))
+            }
             other => Err((-32601, format!("method not found: {other}"))),
         }
     }
@@ -1030,6 +1052,20 @@ impl ProcessExtension {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| (-32602, format!("missing or invalid '{name}' parameter")))
+    }
+
+    fn validate_config_key(key: &str) -> Result<(), (i32, String)> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err((-32602, "config key must be non-empty".to_string()));
+        }
+        if trimmed.contains('.') || trimmed.contains('/') || trimmed.contains(' ') {
+            return Err((
+                -32602,
+                "config key must not contain dots, slashes, or spaces".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn initialize(&self, plugin_root: Option<PathBuf>, config: Value) -> Result<InitializeCapabilitiesResult, String> {

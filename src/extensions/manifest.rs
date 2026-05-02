@@ -75,6 +75,7 @@ impl ExtensionManifest {
             matches!(
                 permission.as_str(),
                 "tools.register" | "providers.register" | "memory.read" | "memory.write"
+                    | "config.write" | "config.subscribe" | "audio.input" | "audio.output"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {
