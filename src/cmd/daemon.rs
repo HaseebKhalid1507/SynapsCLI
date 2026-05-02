@@ -236,7 +236,7 @@ pub async fn run(
                                 eprint!("{}", text);
                             }
                         }
-                        StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
+                        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                             log(&format!("  tool: {}", name));
                         }
                         StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {

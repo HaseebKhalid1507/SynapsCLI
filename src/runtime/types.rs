@@ -13,8 +13,22 @@ pub enum StreamEvent {
 pub enum LlmEvent {
     Thinking(String),
     Text(String),
-    ToolUseStart(String),
-    ToolUseDelta(String),
+    /// A tool-use block has begun streaming. `tool_id` is the call id the
+    /// model will reference in its eventual `tool_use` content block —
+    /// chat UIs use it to route subsequent `ToolUseDelta` chunks and the
+    /// final `ToolUse` finalize event to the correct on-screen block when
+    /// multiple tools run in parallel.
+    ToolUseStart {
+        tool_name: String,
+        tool_id: String,
+    },
+    /// Streaming chunk of a tool's input JSON. `tool_id` matches the
+    /// `ToolUseStart` it belongs to; with parallel tool calls the model
+    /// may interleave deltas from different tools.
+    ToolUseDelta {
+        tool_id: String,
+        delta: String,
+    },
     ToolUse {
         tool_name: String,
         tool_id: String,
