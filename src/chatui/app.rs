@@ -150,6 +150,15 @@ pub(crate) struct App {
     /// immediately after MouseDown(Right). We suppress only within a short TTL
     /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
     pub(crate) suppress_paste_until: Option<std::time::Instant>,
+    /// Active sidecar instances keyed by plugin id (manifest name).
+    ///
+    /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
+    /// multiple plugin-claimed sidecars can be hosted concurrently.
+    pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
+    /// Generic extension-provided active tasks rendered in the sticky progress area.
+    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Live keybind registry — held so /settings can hot-swap voice toggle.
+    pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -227,6 +236,9 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
+            sidecars: std::collections::HashMap::new(),
+            active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
+            keybinds: None,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.

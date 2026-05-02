@@ -5,6 +5,7 @@ pub(crate) mod defs;
 pub(crate) mod schema;
 pub(crate) mod draw;
 pub(crate) mod input;
+pub(crate) mod plugin_editor;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
@@ -58,6 +59,14 @@ pub(crate) struct RuntimeSnapshot {
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
     pub model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    /// Plugin-declared settings categories snapshotted from the registry
+    /// at modal-open time. Each entry contributes a category row in the
+    /// left pane and a list of fields in the right pane. Path B Phase 4.
+    pub plugin_categories: Vec<synaps_cli::skills::registry::PluginSettingsCategory>,
+    /// Phase 8 8A.4: lifecycle claims used by `schema::visible_categories`
+    /// to hide the legacy global `Sidecar` page when a plugin has staked a
+    /// claim with a `settings_category`.
+    pub lifecycle_claims: Vec<synaps_cli::skills::registry::LifecycleClaim>,
 }
 
 impl RuntimeSnapshot {
@@ -116,6 +125,8 @@ impl RuntimeSnapshot {
             disabled_plugins: config.disabled_plugins.clone(),
             provider_keys: config.provider_keys.clone(),
             model_health,
+            plugin_categories: registry.plugin_settings_categories(),
+            lifecycle_claims: registry.lifecycle_claims(),
         }
     }
 }
@@ -131,6 +142,22 @@ pub(super) enum ActiveEditor {
     Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
     CustomModel { buffer: String, setting_key: &'static str },
     ApiKey { provider_id: String, buffer: String },
+    /// Text editor for a plugin-declared `text` field. Path B Phase 4.
+    /// Commits via `InputOutcome::PluginApply` to the plugin config namespace.
+    PluginText {
+        plugin_id: String,
+        key: String,
+        buffer: String,
+        numeric: bool,
+        error: Option<String>,
+    },
+    /// Plugin-owned custom editor render returned by `settings.editor.open`.
+    PluginCustom {
+        plugin_id: String,
+        category: String,
+        field: String,
+        render: crate::chatui::settings::plugin_editor::PluginEditorSession,
+    },
 }
 
 pub(super) struct SettingsState {
@@ -167,6 +194,90 @@ impl SettingsState {
 
     pub fn current_setting(&self) -> Option<&'static SettingDef> {
         self.current_settings().get(self.setting_idx).copied()
+    }
+
+    /// True iff `category_idx` points past the built-in categories at a
+    /// plugin-declared category from `snap.plugin_categories`.
+    pub fn is_plugin_category(&self, snap: &RuntimeSnapshot) -> bool {
+        let n_builtin = schema::visible_categories(&snap.lifecycle_claims).len();
+        self.category_idx >= n_builtin
+            && self.category_idx - n_builtin < snap.plugin_categories.len()
+    }
+
+    /// Plugin-declared category at the current `category_idx`, or None
+    /// if the cursor is on a built-in category.
+    pub fn current_plugin_category<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsCategory> {
+        if !self.is_plugin_category(snap) {
+            return None;
+        }
+        snap.plugin_categories.get(self.category_idx - schema::visible_categories(&snap.lifecycle_claims).len())
+    }
+
+    /// Plugin field at `setting_idx` within the current plugin category.
+    pub fn current_plugin_field<'a>(
+        &self,
+        snap: &'a RuntimeSnapshot,
+    ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsField> {
+        self.current_plugin_category(snap)
+            .and_then(|c| c.fields.get(self.setting_idx))
+    }
+}
+
+#[cfg(test)]
+mod wireup_tests {
+    use super::*;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn snap_with_claims(claims: Vec<LifecycleClaim>) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            model: "m".into(),
+            thinking: "medium".into(),
+            context_window: "auto".into(),
+            compaction_model: "m".into(),
+            max_tool_output: 0,
+            bash_timeout: 0,
+            bash_max_timeout: 0,
+            subagent_timeout: 0,
+            api_retries: 0,
+            theme_name: "t".into(),
+            plugins: Vec::new(),
+            disabled_plugins: Vec::new(),
+            provider_keys: std::collections::BTreeMap::new(),
+            model_health: std::collections::HashMap::new(),
+            plugin_categories: Vec::new(),
+            lifecycle_claims: claims,
+        }
+    }
+
+    fn claim(settings_category: Option<&str>) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: "p".into(),
+            command: "voice".into(),
+            settings_category: settings_category.map(|s| s.into()),
+            display_name: "Voice".into(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn visible_categories_excludes_sidecar_when_claim_present() {
+        let snap = snap_with_claims(vec![claim(Some("voice"))]);
+        let v = schema::visible_categories(&snap.lifecycle_claims);
+        assert!(!v.contains(&schema::Category::Sidecar));
+    }
+
+    #[test]
+    fn visible_categories_includes_sidecar_when_no_claim_settings_category() {
+        let snap_empty = snap_with_claims(Vec::new());
+        assert!(schema::visible_categories(&snap_empty.lifecycle_claims)
+            .contains(&schema::Category::Sidecar));
+
+        let snap_no_cat = snap_with_claims(vec![claim(None)]);
+        assert!(schema::visible_categories(&snap_no_cat.lifecycle_claims)
+            .contains(&schema::Category::Sidecar));
     }
 }
 

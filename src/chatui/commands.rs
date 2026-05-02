@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
+use synaps_cli::extensions::commands::CommandOutputEvent;
+use synaps_cli::extensions::runtime::InvokeCommandEvent;
 
 /// All recognized built-in slash commands. Source of truth for the
 /// built-in surface; the runtime merges this with discovered skills via
@@ -85,6 +87,15 @@ pub(super) enum CommandAction {
     ExtensionsAudit { tail: Option<usize> },
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
+    /// Toggle the active sidecar plugin on/off (`/sidecar` or `/sidecar toggle`).
+    /// Also reachable via `/voice toggle` for one-release back-compat.
+    ///
+    /// `plugin_id = Some(pid)` selects a specific claimed sidecar (Phase 8 8B).
+    /// `plugin_id = None` falls back to the legacy single-sidecar slot.
+    SidecarToggle { plugin_id: Option<String> },
+    /// Show sidecar subsystem status (`/sidecar status`). Also reachable
+    /// via `/voice status` for one-release back-compat.
+    SidecarStatus { plugin_id: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +144,83 @@ pub(super) async fn execute_command_action(
             }
         }
         _ => {}
+    }
+}
+
+
+pub(crate) async fn execute_interactive_plugin_command_events(
+    command: &synaps_cli::skills::registry::RegisteredPluginCommand,
+    arg: &str,
+    manager: &synaps_cli::extensions::manager::ExtensionManager,
+    app: &mut App,
+) {
+    let synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive {
+        plugin_extension_id,
+    } = &command.backend else {
+        app.push_msg(ChatMessage::Error(
+            "plugin command is not interactive".to_string(),
+        ));
+        return;
+    };
+
+    let args: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
+    execute_interactive_plugin_command_by_parts(
+        plugin_extension_id,
+        &command.name,
+        args,
+        manager,
+        app,
+    ).await;
+}
+
+pub(crate) async fn execute_interactive_plugin_command_by_parts(
+    plugin_extension_id: &str,
+    command_name: &str,
+    args: Vec<String>,
+    manager: &synaps_cli::extensions::manager::ExtensionManager,
+    app: &mut App,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InvokeCommandEvent>();
+    let result = manager
+        .invoke_command(plugin_extension_id, command_name, args, &request_id, tx)
+        .await;
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            InvokeCommandEvent::Output(output) => {
+                if let Some(msg) = command_output_event_to_chat_message(output) {
+                    app.push_msg(msg);
+                }
+            }
+            InvokeCommandEvent::Task(task) => app.active_tasks.apply(task),
+        }
+    }
+
+    if let Err(err) = result {
+        app.push_msg(ChatMessage::Error(format!(
+            "interactive plugin command {}:{} failed: {}",
+            plugin_extension_id, command_name, err
+        )));
+    }
+}
+
+pub(crate) fn command_output_event_to_chat_message(event: CommandOutputEvent) -> Option<ChatMessage> {
+    match event {
+        CommandOutputEvent::Text { content } => Some(ChatMessage::Text(content)),
+        CommandOutputEvent::System { content } => Some(ChatMessage::System(content)),
+        CommandOutputEvent::Error { content } => Some(ChatMessage::Error(content)),
+        CommandOutputEvent::Table { headers, rows } => {
+            let mut lines = Vec::new();
+            if !headers.is_empty() {
+                lines.push(headers.join("  "));
+            }
+            for row in rows {
+                lines.push(row.join("  "));
+            }
+            Some(ChatMessage::System(lines.join("\n")))
+        }
+        CommandOutputEvent::Done => None,
     }
 }
 
@@ -218,6 +306,39 @@ pub(super) async fn handle_command(
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {
     use synaps_cli::skills::registry::Resolution;
+    // Phase 8 slice 8A: plugin-claimed lifecycle commands take precedence
+    // over builtins. If a plugin's manifest claims `/voice` (or any other
+    // top-level word) via `provides.sidecar.lifecycle`, route
+    // `<word> toggle` and `<word> status` to the generic sidecar
+    // lifecycle actions. Other subcommands (e.g. `/voice models`) fall
+    // through to the normal plugin-command resolver below.
+    if let Some(claim) = registry.lifecycle_for_command(cmd) {
+        let trimmed = arg.trim();
+        match trimmed {
+            "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(claim.plugin.clone()) },
+            "status" => return CommandAction::SidecarStatus { plugin_id: Some(claim.plugin.clone()) },
+            _ => {
+                // Fall through to the plugin-command resolver: the
+                // plugin can define `<command> <other-sub>` (e.g.
+                // `/voice models`) as a normal interactive command.
+                if let Some(command) =
+                    registry.find_plugin_command_unqualified(&claim.command)
+                {
+                    return CommandAction::PluginCommand {
+                        command,
+                        arg: trimmed.to_string(),
+                    };
+                }
+                // No plugin command; surface a usage hint scoped to
+                // the claimed display name.
+                app.push_msg(ChatMessage::Error(format!(
+                    "unknown /{} subcommand: `{}` (try: toggle, status)",
+                    claim.command, trimmed,
+                )));
+                return CommandAction::None;
+            }
+        }
+    }
     match cmd {
         "clear" => {
             app.save_session().await;
@@ -574,6 +695,144 @@ pub(super) async fn handle_command(
         "ping" => {
             return CommandAction::Ping;
         }
+        "sidecar" => {
+            // Phase 8 8A.6 / 8A.7: ambiguity-aware dispatcher.
+            //
+            // Two surface forms:
+            //   * unqualified — `/sidecar [toggle|status]` — back-compat
+            //     for the single-sidecar slot. With ≥2 claims we refuse
+            //     to dispatch and force disambiguation.
+            //   * qualified   — `/sidecar <plugin-id> <subcommand>` —
+            //     selects a specific claimed sidecar. (In slice 8A the
+            //     action variants don't carry a plugin-id payload yet;
+            //     we just validate the plugin-id against the loaded
+            //     lifecycle claims and dispatch the bare action.)
+            //
+            // TODO(phase 8 8B): plumb plugin_id into SidecarToggle /
+            //                   SidecarStatus so multi-sidecar hosting
+            //                   can route to a specific instance.
+            let trimmed = arg.trim();
+            let mut tokens = trimmed.split_whitespace();
+            let first = tokens.next().unwrap_or("");
+            let rest: String = tokens.collect::<Vec<_>>().join(" ");
+
+            if rest.is_empty() {
+                // Unqualified form.
+                let claims = registry.lifecycle_claims();
+                let render_disambig = |verb: &str, claims: &[synaps_cli::skills::registry::LifecycleClaim]| -> String {
+                    let mut sorted: Vec<_> = claims.iter().collect();
+                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+                    let plugins = sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ");
+                    let cmds = sorted.iter().map(|c| format!("/{}", c.command)).collect::<Vec<_>>().join(", ");
+                    format!(
+                        "multiple sidecars loaded: {}; use /sidecar <plugin-id> {} or one of the per-plugin commands ({})",
+                        plugins, verb, cmds
+                    )
+                };
+                match first {
+                    "" | "toggle" => match claims.len() {
+                        0 => return CommandAction::SidecarToggle { plugin_id: None },
+                        1 => {
+                            let c = &claims[0];
+                            app.push_msg(ChatMessage::System(format!(
+                                "hint: this sidecar is claimed by /{} — try /{} toggle",
+                                c.command, c.command
+                            )));
+                            return CommandAction::SidecarToggle { plugin_id: Some(c.plugin.clone()) };
+                        }
+                        _ => {
+                            app.push_msg(ChatMessage::Error(render_disambig("toggle", &claims)));
+                            return CommandAction::None;
+                        }
+                    },
+                    "status" => match claims.len() {
+                        0 => return CommandAction::SidecarStatus { plugin_id: None },
+                        1 => {
+                            let c = &claims[0];
+                            app.push_msg(ChatMessage::System(format!(
+                                "hint: this sidecar is claimed by /{} — try /{} status",
+                                c.command, c.command
+                            )));
+                            return CommandAction::SidecarStatus { plugin_id: Some(c.plugin.clone()) };
+                        }
+                        _ => {
+                            app.push_msg(ChatMessage::Error(render_disambig("status", &claims)));
+                            return CommandAction::None;
+                        }
+                    },
+                    other => {
+                        app.push_msg(ChatMessage::Error(format!(
+                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
+                            other
+                        )));
+                        return CommandAction::None;
+                    }
+                }
+            } else {
+                // Qualified form: first = plugin-id, rest = subcommand.
+                let plugin_id = first;
+                let claims = registry.lifecycle_claims();
+                if !claims.iter().any(|c| c.plugin == plugin_id) {
+                    let mut sorted: Vec<_> = claims.iter().collect();
+                    sorted.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+                    let list = if sorted.is_empty() {
+                        "none".to_string()
+                    } else {
+                        sorted.iter().map(|c| c.plugin.clone()).collect::<Vec<_>>().join(", ")
+                    };
+                    app.push_msg(ChatMessage::Error(format!(
+                        "unknown sidecar plugin: '{}' (loaded: {})",
+                        plugin_id, list
+                    )));
+                    return CommandAction::None;
+                }
+                match rest.as_str() {
+                    "toggle" => return CommandAction::SidecarToggle { plugin_id: Some(plugin_id.to_string()) },
+                    "status" => return CommandAction::SidecarStatus { plugin_id: Some(plugin_id.to_string()) },
+                    other => {
+                        app.push_msg(ChatMessage::Error(format!(
+                            "unknown /sidecar subcommand: `{}` (try: toggle, status)",
+                            other
+                        )));
+                        return CommandAction::None;
+                    }
+                }
+            }
+        }
+        "voice" => {
+            // One-release deprecation alias. `/voice toggle` and
+            // `/voice status` are core-generic operations and route to
+            // `/sidecar`. Other `/voice <sub>` calls resolve via the
+            // plugin command registry like any other plugin command —
+            // no hardcoded plugin name.
+            let trimmed = arg.trim();
+            match trimmed {
+                "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: None },
+                "status" => return CommandAction::SidecarStatus { plugin_id: None },
+                _ => {}
+            }
+            // Fall through: let the plugin registry resolve `/voice <sub>`
+            // as a normal plugin command. The plugin that owns `/voice`
+            // (whoever it is) handles the rest. We bypass the builtin
+            // check (since "voice" is itself a builtin alias) and look
+            // up the unqualified plugin command directly.
+            match registry.find_plugin_command_unqualified("voice") {
+                Some(command) => {
+                    return CommandAction::PluginCommand {
+                        command,
+                        arg: trimmed.to_string(),
+                    };
+                }
+                None => {
+                    app.push_msg(ChatMessage::Error(
+                        "no plugin owns /voice; install one (e.g. local-voice from \
+                         synaps-skills) or use /sidecar toggle for the generic core \
+                         command".to_string(),
+                    ));
+                    return CommandAction::None;
+                }
+            }
+        }
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
@@ -636,7 +895,10 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::{edit_distance, execute_command_action, execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::command_output_event_to_chat_message;
+    use crate::chatui::app::ChatMessage;
+    use synaps_cli::extensions::commands::CommandOutputEvent;
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -691,6 +953,8 @@ mod tests {
                     compatibility: None,
                     extension: None,
                     help_entries: vec![],
+                    provides: None,
+                    settings: None,
                     commands: vec![synaps_cli::skills::manifest::ManifestCommand::SkillPrompt(
                         ManifestSkillPromptCommand {
                             name: command.name.clone(),
@@ -770,6 +1034,68 @@ mod tests {
             }
             _ => panic!("expected system message"),
         }
+    }
+
+
+    #[test]
+    fn command_output_event_text_becomes_chat_text() {
+        let msg = command_output_event_to_chat_message(CommandOutputEvent::Text {
+            content: "hello".to_string(),
+        }).expect("text event should produce chat message");
+        match msg {
+            ChatMessage::Text(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected text chat message"),
+        }
+    }
+
+    #[test]
+    fn command_output_event_table_becomes_plain_text_table() {
+        let msg = command_output_event_to_chat_message(CommandOutputEvent::Table {
+            headers: vec!["ID".into(), "Status".into()],
+            rows: vec![vec!["tiny".into(), "installed".into()]],
+        }).expect("table event should produce chat message");
+        match msg {
+            ChatMessage::System(text) => {
+                assert!(text.contains("ID"), "{text}");
+                assert!(text.contains("tiny"), "{text}");
+                assert!(text.contains("installed"), "{text}");
+            }
+            _ => panic!("expected system table message"),
+        }
+    }
+
+
+    #[tokio::test]
+    async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
+        let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
+        let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(bus);
+        let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            protocol_version: 1,
+            runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
+            permissions: vec!["tools.register".to_string()],
+            hooks: vec![],
+            config: vec![],
+        };
+        manager.load("demo-plugin", &manifest).await.unwrap();
+        let command = RegisteredPluginCommand {
+            plugin: "demo-plugin".to_string(),
+            name: "demo".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::Interactive {
+                plugin_extension_id: "demo-plugin".to_string(),
+            },
+            plugin_root: PathBuf::from("/tmp/demo"),
+        };
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+
+        execute_interactive_plugin_command_events(&command, "models", &manager, &mut app).await;
+
+        assert!(app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))));
+        assert!(app.active_tasks.get("demo-task").is_some());
+        assert!(app.active_tasks.get("demo-task").unwrap().done);
+        manager.shutdown_all().await;
     }
 
     // -- edit_distance tests --
@@ -1020,5 +1346,425 @@ mod tests {
             }
             _ => panic!("expected ExtensionsMemory(Recent) with limit=Some(5)"),
         }
+    }
+
+    async fn invoke_voice(arg: &str) -> CommandAction {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        handle_command(
+            "voice",
+            arg,
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        ).await
+    }
+
+    #[tokio::test]
+    async fn parse_voice_empty_arg_is_toggle() {
+        match invoke_voice("").await {
+            CommandAction::SidecarToggle { .. } => {}
+            other => panic!("expected SidecarToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_toggle_subcommand() {
+        match invoke_voice("toggle").await {
+            CommandAction::SidecarToggle { .. } => {}
+            _ => panic!("expected SidecarToggle for `toggle` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_status_subcommand() {
+        match invoke_voice("status").await {
+            CommandAction::SidecarStatus { .. } => {}
+            _ => panic!("expected SidecarStatus for `status` subcommand"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_voice_unknown_subcommand_is_none() {
+        match invoke_voice("frobnicate").await {
+            CommandAction::None => {}
+            _ => panic!("expected CommandAction::None for unknown subcommand"),
+        }
+    }
+
+    #[test]
+    fn sidecar_and_voice_are_in_builtin_commands() {
+        // `/sidecar` is the canonical generic toggle command.
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"sidecar"));
+        // `/voice` retained for one-release deprecation aliasing.
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
+    }
+
+
+    #[tokio::test]
+    async fn voice_models_routes_to_interactive_plugin_when_registered() {
+        let registry = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![synaps_cli::skills::Plugin {
+                name: "local-voice".to_string(),
+                root: PathBuf::from("/tmp/local-voice"),
+                marketplace: None,
+                version: None,
+                description: None,
+                extension: None,
+                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
+                    name: "local-voice".to_string(),
+                    version: None,
+                    description: None,
+                    keybinds: vec![],
+                    compatibility: None,
+                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::Interactive(
+                        synaps_cli::skills::manifest::ManifestInteractiveCommand {
+                            name: "voice".to_string(),
+                            description: None,
+                            interactive: true,
+                            subcommands: vec!["models".to_string()],
+                        },
+                    )],
+                    extension: None,
+                    help_entries: vec![],
+                    provides: None,
+                    settings: None,
+                }),
+            }],
+        );
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        match handle_command(
+            "voice",
+            "models",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &Arc::new(registry),
+            &keybinds,
+        ).await {
+            CommandAction::PluginCommand { command, arg } => {
+                assert_eq!(command.plugin, "local-voice");
+                assert_eq!(command.name, "voice");
+                assert_eq!(arg, "models");
+            }
+            _ => panic!("expected interactive plugin command for /voice models"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_models_command_routes_to_plugin_when_no_plugin_pushes_error() {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "models",
+            &mut app,
+            &mut runtime,
+            &system_prompt_path,
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
+        assert!(pushed_error, "expected a `no plugin owns /voice` error message");
+    }
+
+    // ---- Phase 8 slice 8A: lifecycle-claim dispatcher ----
+
+    fn lifecycle_plugin(plugin: &str, command: &str) -> synaps_cli::skills::Plugin {
+        use synaps_cli::skills::manifest::{
+            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
+        };
+        synaps_cli::skills::Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: None,
+                            display_name: None,
+                            importance: 0,
+                        }),
+                    }),
+                }),
+                settings: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_toggle_to_sidecar_toggle() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "toggle",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        match action {
+            CommandAction::SidecarToggle { plugin_id } => {
+                assert_eq!(plugin_id.as_deref(), Some("local-voice"));
+            }
+            other => panic!("expected SidecarToggle with plugin_id, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_bare_command_to_toggle() {
+        // `/voice` (no arg) is treated as `/voice toggle`.
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_routes_status_to_sidecar_status() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "status",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        match action {
+            CommandAction::SidecarStatus { plugin_id } => {
+                assert_eq!(plugin_id.as_deref(), Some("local-voice"));
+            }
+            other => panic!("expected SidecarStatus with plugin_id, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_takes_precedence_over_voice_builtin_alias() {
+        // When a plugin declares the `voice` lifecycle, the dispatcher
+        // routes via the lifecycle path — NOT the legacy `"voice"`
+        // builtin alias — so the lifecycle answer is reached even if
+        // the alias would error out (no plugin command registered).
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "toggle",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        // No "no plugin owns /voice" error pushed — lifecycle path won.
+        let pushed_legacy_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
+        assert!(!pushed_legacy_error);
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_claim_unknown_subcommand_pushes_error() {
+        let registry = Arc::new(CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ));
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "voice",
+            "bogus",
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown /voice subcommand")));
+        assert!(pushed);
+    }
+
+    // ---- Phase 8 slices 8A.6 / 8A.7 — `/sidecar` ambiguity-aware dispatcher ----
+
+    async fn invoke_sidecar_with_plugins(
+        arg: &str,
+        plugins: Vec<synaps_cli::skills::Plugin>,
+    ) -> (CommandAction, crate::chatui::app::App) {
+        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], plugins));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let action = handle_command(
+            "sidecar",
+            arg,
+            &mut app,
+            &mut runtime,
+            &PathBuf::from("/tmp/sp"),
+            &registry,
+            &keybinds,
+        )
+        .await;
+        (action, app)
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_works_when_zero_claims_loaded() {
+        let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
+        let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
+        assert!(!pushed_err, "no errors expected for zero-claim back-compat");
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_with_one_claim_dispatches_with_hint() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "toggle",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
+        let pushed_hint = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::System(s) if s.contains("try /voice toggle")));
+        assert!(pushed_hint, "expected a System hint mentioning `try /voice toggle`");
+    }
+
+    #[tokio::test]
+    async fn sidecar_toggle_with_two_claims_errors_with_disambiguation() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "toggle",
+            vec![
+                lifecycle_plugin("local-voice", "voice"),
+                lifecycle_plugin("local-ocr", "ocr"),
+            ],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().find_map(|m| match &m.msg {
+            crate::chatui::app::ChatMessage::Error(s) => Some(s.clone()),
+            _ => None,
+        });
+        let s = pushed.expect("expected an Error message");
+        assert!(s.contains("local-voice"), "error should list local-voice; got: {s}");
+        assert!(s.contains("local-ocr"), "error should list local-ocr; got: {s}");
+        assert!(s.contains("/voice"), "error should mention /voice; got: {s}");
+        assert!(s.contains("/ocr"), "error should mention /ocr; got: {s}");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_toggle_works() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "local-voice toggle",
+            vec![
+                lifecycle_plugin("local-voice", "voice"),
+                lifecycle_plugin("local-ocr", "ocr"),
+            ],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarToggle { .. }));
+        let pushed_err = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(_)));
+        assert!(!pushed_err, "no errors expected for valid qualified form");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_unknown_plugin_id_errors() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "nonexistent toggle",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
+        assert!(pushed, "expected `unknown sidecar plugin` error");
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_status() {
+        let (action, _app) = invoke_sidecar_with_plugins(
+            "local-voice status",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::SidecarStatus { .. }));
+    }
+
+    #[tokio::test]
+    async fn sidecar_qualified_plugin_id_unknown_subcommand_errors() {
+        let (action, app) = invoke_sidecar_with_plugins(
+            "local-voice bogus",
+            vec![lifecycle_plugin("local-voice", "voice")],
+        ).await;
+        assert!(matches!(action, CommandAction::None));
+        let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
+        assert!(pushed, "expected `unknown /sidecar subcommand` error");
     }
 }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
+use super::info::PluginInfo;
 use super::hooks::HookBus;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
@@ -80,8 +81,12 @@ pub struct ExtensionManager {
     /// Declared manifest config entries per loaded extension, kept so we can
     /// produce diagnostics without re-reading the manifest.
     manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
-    /// Voice capability declarations per loaded extension. Populated on load.
-    voice_capabilities: HashMap<String, crate::extensions::runtime::process::VoiceCapabilityDeclaration>,
+    /// Capability declarations per loaded extension. Each plugin may
+    /// declare zero or more capabilities (kind is plugin-defined; core
+    /// does not enumerate). Populated on load.
+    capabilities: HashMap<String, Vec<crate::extensions::runtime::process::CapabilityDeclaration>>,
+    /// Optional plugin-reported info from the `info.get` RPC.
+    plugin_info: HashMap<String, PluginInfo>,
 }
 
 impl ExtensionManager {
@@ -93,7 +98,8 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
-            voice_capabilities: HashMap::new(),
+            capabilities: HashMap::new(),
+            plugin_info: HashMap::new(),
         }
     }
 
@@ -108,7 +114,8 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
-            voice_capabilities: HashMap::new(),
+            capabilities: HashMap::new(),
+            plugin_info: HashMap::new(),
         }
     }
 
@@ -165,7 +172,10 @@ impl ExtensionManager {
         };
         let registered_tools = capabilities.tools;
         let registered_providers = capabilities.providers;
-        let voice_declaration = capabilities.voice;
+        let capability_declarations = capabilities.capabilities;
+        let should_probe_info = !registered_tools.is_empty()
+            || !registered_providers.is_empty()
+            || !capability_declarations.is_empty();
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
         if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
             handler.shutdown().await;
@@ -181,12 +191,12 @@ impl ExtensionManager {
                 id
             ));
         }
-        if let Some(voice) = &voice_declaration {
-            if let Err(err) = crate::extensions::runtime::process::validate_voice_capability(voice, &permissions) {
+        for decl in &capability_declarations {
+            if let Err(err) = crate::extensions::runtime::process::validate_capability(decl, &permissions) {
                 handler.shutdown().await;
                 return Err(format!(
-                    "Extension '{}' voice capability invalid: {}",
-                    id, err
+                    "Extension '{}' capability '{}' invalid: {}",
+                    id, decl.kind, err
                 ));
             }
         }
@@ -241,6 +251,35 @@ impl ExtensionManager {
             }
         }
 
+        // Do not probe optional info.get for legacy hook-only extensions. The
+        // best-effort call can race with simple fixtures that exit after
+        // shutdown/EOF and is only needed for richer extension-capability
+        // surfaces (providers/tools/voice).
+        let info = if should_probe_info {
+            match handler.get_info().await {
+                Ok(info) => Some(info),
+                Err(error) => {
+                    if error.contains("method not found") || error.contains("unknown method") {
+                        tracing::debug!(
+                            extension = %id,
+                            error = %error,
+                            "Extension did not provide optional info.get metadata",
+                        );
+                        None
+                    } else {
+                        tracing::warn!(
+                            extension = %id,
+                            error = %error,
+                            "Ignoring invalid optional info.get metadata",
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         // Register hook subscriptions
         for (kind, tool_filter, matcher) in subscriptions {
             self.hook_bus
@@ -251,8 +290,12 @@ impl ExtensionManager {
         self.extensions.insert(id.to_string(), handler);
         self.manifest_configs
             .insert(id.to_string(), manifest.config.clone());
-        if let Some(voice) = voice_declaration {
-            self.voice_capabilities.insert(id.to_string(), voice);
+        if !capability_declarations.is_empty() {
+            self.capabilities
+                .insert(id.to_string(), capability_declarations);
+        }
+        if let Some(info) = info {
+            self.plugin_info.insert(id.to_string(), info);
         }
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
@@ -315,6 +358,10 @@ impl ExtensionManager {
                     continue;
                 }
             }
+            if let Some(value) = crate::extensions::config_store::read_plugin_config(id, key) {
+                out.insert(key.to_string(), Value::String(value));
+                continue;
+            }
             if let Some(value) = crate::config::read_config_value(&config_key) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
@@ -335,16 +382,16 @@ impl ExtensionManager {
         Ok(Value::Object(out))
     }
 
-    /// Test-only seeder: synthetically insert a voice capability declaration
-    /// for an extension id. Used to exercise capability snapshot rendering
-    /// without spinning up a real plugin process.
+    /// Test-only seeder: synthetically insert capability declarations
+    /// for an extension id. Used to exercise capability snapshot
+    /// rendering without spinning up a real plugin process.
     #[cfg(test)]
-    pub(crate) fn test_seed_voice_capability(
+    pub(crate) fn test_seed_capabilities(
         &mut self,
         id: &str,
-        decl: crate::extensions::runtime::process::VoiceCapabilityDeclaration,
+        decls: Vec<crate::extensions::runtime::process::CapabilityDeclaration>,
     ) {
-        self.voice_capabilities.insert(id.to_string(), decl);
+        self.capabilities.insert(id.to_string(), decls);
     }
 
     /// Unload an extension — unsubscribe hooks and shut down the process.
@@ -357,7 +404,8 @@ impl ExtensionManager {
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
         self.manifest_configs.remove(id);
-        self.voice_capabilities.remove(id);
+        self.capabilities.remove(id);
+        self.plugin_info.remove(id);
         handler.shutdown().await;
 
         tracing::info!(extension = %id, "Extension unloaded");
@@ -427,6 +475,101 @@ impl ExtensionManager {
         self.providers.get(runtime_id)
     }
 
+    /// Return optional cached plugin info reported by `info.get`.
+    pub fn plugin_info(&self, id: &str) -> Option<&PluginInfo> {
+        self.plugin_info.get(id)
+    }
+
+    /// Ask a plugin for its sidecar spawn arguments. Best-effort —
+    /// plugins that don't host a sidecar (or pre-Phase-7 plugins that
+    /// haven't implemented the RPC yet) return `Err`. Callers are
+    /// expected to treat that as "no overrides; use manifest defaults".
+    pub async fn sidecar_spawn_args(
+        &self,
+        id: &str,
+    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.sidecar_spawn_args().await
+    }
+
+    /// Invoke an interactive plugin command on extension `id`. Streams
+    /// `command.output` (matching `request_id`) and `task.*` notifications
+    /// to `sink`. Returns the final JSON-RPC response value.
+    pub async fn invoke_command(
+        &self,
+        id: &str,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.invoke_command(command, args, request_id, sink).await
+    }
+
+    pub async fn settings_editor_open(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_open(category, field).await
+    }
+
+    pub async fn settings_editor_key(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_key(category, field, key).await
+    }
+
+    pub async fn settings_editor_commit(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_commit(category, field, value).await
+    }
+
+    /// Return all cached plugin info sorted by extension id.
+    pub fn plugin_infos(&self) -> Vec<(&str, &PluginInfo)> {
+        let mut entries: Vec<_> = self
+            .plugin_info
+            .iter()
+            .map(|(id, info)| (id.as_str(), info))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
+    }
+
     /// Return provider status summaries sorted by provider runtime id.
     pub fn provider_summaries(&self) -> Vec<RegisteredProviderSummary> {
         self.providers.summaries()
@@ -490,14 +633,14 @@ impl ExtensionManager {
                 .collect();
 
             let future: Vec<FutureCapabilityEntry> = self
-                .voice_capabilities
+                .capabilities
                 .get(&id)
-                .map(|decl| {
-                    decl.modes
+                .map(|decls| {
+                    decls
                         .iter()
-                        .map(|mode| FutureCapabilityEntry {
-                            kind: "voice".to_string(),
-                            name: format!("{} ({})", decl.name, mode),
+                        .map(|d| FutureCapabilityEntry {
+                            kind: d.kind.clone(),
+                            name: d.name.clone(),
                         })
                         .collect()
                 })
@@ -582,14 +725,16 @@ impl ExtensionManager {
         provider_required.sort_by(|a, b| a.0.cmp(&b.0));
 
         let env_lookup = |name: &str| std::env::var(name).ok();
-        let config_lookup = |key: &str| crate::config::read_config_value(key);
+        let plugin_config_lookup = |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
+        let legacy_config_lookup = |key: &str| crate::config::read_config_value(key);
 
         Some(diagnose_extension_config(
             id,
             manifest_config,
             &provider_required,
             &env_lookup,
-            &config_lookup,
+            &plugin_config_lookup,
+            &legacy_config_lookup,
         ))
     }
 
@@ -823,7 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capability_snapshot_surfaces_seeded_voice_capability() {
+    async fn capability_snapshot_surfaces_seeded_capabilities() {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
@@ -833,7 +978,7 @@ mod tests {
             args: vec![
                 "tests/fixtures/process_extension.py".to_string(),
                 "normal".to_string(),
-                "/tmp/synaps-capability-voice-test.log".to_string(),
+                "/tmp/synaps-capability-snapshot-test.log".to_string(),
             ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
@@ -844,28 +989,45 @@ mod tests {
             config: vec![],
         };
 
-        mgr.load("voice-cap", &manifest).await.unwrap();
+        mgr.load("multi-cap", &manifest).await.unwrap();
 
-        mgr.test_seed_voice_capability(
-            "voice-cap",
-            crate::extensions::runtime::process::VoiceCapabilityDeclaration {
-                name: "Local Whisper STT".to_string(),
-                modes: vec!["stt".to_string(), "tts".to_string()],
-                endpoint: Some("http://127.0.0.1:8723".to_string()),
-            },
+        // Seed two capabilities of *different* kinds — proves the
+        // snapshot rendering iterates a generic list and uses the
+        // plugin-supplied `kind` rather than hardcoding any modality.
+        mgr.test_seed_capabilities(
+            "multi-cap",
+            vec![
+                crate::extensions::runtime::process::CapabilityDeclaration {
+                    kind: "voice".to_string(),
+                    name: "Local Whisper STT".to_string(),
+                    permissions: vec!["audio.input".to_string()],
+                    params: serde_json::Value::Null,
+                },
+                crate::extensions::runtime::process::CapabilityDeclaration {
+                    kind: "ocr".to_string(),
+                    name: "Tesseract".to_string(),
+                    permissions: vec![],
+                    params: serde_json::Value::Null,
+                },
+            ],
         );
 
         let snaps = mgr.capability_snapshots().await;
-        let snap = snaps.iter().find(|s| s.id == "voice-cap").expect("voice-cap snapshot");
+        let snap = snaps
+            .iter()
+            .find(|s| s.id == "multi-cap")
+            .expect("multi-cap snapshot");
         assert_eq!(snap.future.len(), 2);
-        assert!(snap.future.iter().all(|e| e.kind == "voice"));
+        let kinds: Vec<&str> = snap.future.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"voice"), "got kinds {:?}", kinds);
+        assert!(kinds.contains(&"ocr"), "got kinds {:?}", kinds);
         let names: Vec<&str> = snap.future.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Local Whisper STT (stt)"), "got {:?}", names);
-        assert!(names.contains(&"Local Whisper STT (tts)"), "got {:?}", names);
+        assert!(names.contains(&"Local Whisper STT"), "got {:?}", names);
+        assert!(names.contains(&"Tesseract"), "got {:?}", names);
 
-        mgr.unload("voice-cap").await.unwrap();
+        mgr.unload("multi-cap").await.unwrap();
         let snaps = mgr.capability_snapshots().await;
-        assert!(snaps.iter().all(|s| s.id != "voice-cap"));
+        assert!(snaps.iter().all(|s| s.id != "multi-cap"));
 
         mgr.shutdown_all().await;
     }
@@ -957,6 +1119,65 @@ mod tests {
         std::env::remove_var("SYNAPS_DISABLE_PROJECT_PLUGINS");
     }
 
+    fn with_temp_base_dir<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let old_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+        crate::config::set_base_dir_for_tests(path.to_path_buf());
+        let out = f();
+        match old_base_dir {
+            Some(old) => std::env::set_var("SYNAPS_BASE_DIR", old),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        out
+    }
+
+    #[test]
+    fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
+        let dir = tempfile::tempdir().unwrap();
+        with_temp_base_dir(dir.path(), || {
+            crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+                .unwrap();
+            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+
+            let resolved = ExtensionManager::resolve_config(
+                "local-voice",
+                &[ExtensionConfigEntry {
+                    key: "backend".to_string(),
+                    value_type: None,
+                    description: None,
+                    required: true,
+                    default: None,
+                    secret_env: None,
+                }],
+            )
+            .unwrap();
+
+            assert_eq!(resolved["backend"], serde_json::Value::String("cpu".to_string()));
+        });
+    }
+
+    #[test]
+    fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        with_temp_base_dir(dir.path(), || {
+            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+
+            let resolved = ExtensionManager::resolve_config(
+                "local-voice",
+                &[ExtensionConfigEntry {
+                    key: "backend".to_string(),
+                    value_type: None,
+                    description: None,
+                    required: true,
+                    default: None,
+                    secret_env: None,
+                }],
+            )
+            .unwrap();
+
+            assert_eq!(resolved["backend"], serde_json::Value::String("auto".to_string()));
+        });
+    }
+
     #[tokio::test]
     async fn config_diagnostics_returns_none_for_unknown_extension() {
         let bus = Arc::new(HookBus::new());
@@ -986,6 +1207,7 @@ mod tests {
             }],
             config: vec![crate::extensions::manifest::ExtensionConfigEntry {
                 key: "region".to_string(),
+                value_type: None,
                 description: Some("AWS region".to_string()),
                 required: false,
                 default: Some(serde_json::Value::String("us-east-1".to_string())),

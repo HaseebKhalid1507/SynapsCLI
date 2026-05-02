@@ -46,10 +46,29 @@ pub struct Keybind {
     pub source: KeybindSource,
 }
 
+/// A keybind that was rejected during plugin registration because the
+/// key was already taken. Phase 8 slice 8B.2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeybindCollision {
+    /// Plugin whose keybind was rejected.
+    pub losing_plugin: String,
+    /// Notation of the key (e.g. "ctrl+space"), as written in the manifest.
+    pub key: String,
+    /// What already owned this key — either another plugin name (string)
+    /// or the literal "core" if `reserved.contains(&combo)`.
+    pub winning_owner: String,
+    /// Optional reason: "invalid notation: …" for parse errors,
+    /// "conflicts with core" for reserved keys, "already registered"
+    /// for plugin-vs-plugin collisions.
+    pub reason: String,
+}
+
 /// Registry of all keybinds with conflict resolution.
+#[derive(Debug, Clone)]
 pub struct KeybindRegistry {
     binds: Vec<Keybind>,
     reserved: HashSet<KeyCombo>,
+    collisions: Vec<KeybindCollision>,
 }
 
 impl KeybindRegistry {
@@ -57,9 +76,20 @@ impl KeybindRegistry {
         let mut registry = Self {
             binds: Vec::new(),
             reserved: HashSet::new(),
+            collisions: Vec::new(),
         };
         registry.register_core();
         registry
+    }
+
+    /// Plugin keybinds that were rejected due to collisions. Phase 8 slice 8B.2.
+    pub fn collisions(&self) -> &[KeybindCollision] {
+        &self.collisions
+    }
+
+    /// Reset the recorded collision list (e.g. before a registry rebuild).
+    pub fn clear_collisions(&mut self) {
+        self.collisions.clear();
     }
 
     /// Register core keybinds that can never be overridden.
@@ -107,6 +137,12 @@ impl KeybindRegistry {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("plugin '{}': invalid keybind '{}': {}", plugin_name, kb.key, e);
+                    self.collisions.push(KeybindCollision {
+                        losing_plugin: plugin_name.to_string(),
+                        key: kb.key.clone(),
+                        winning_owner: "n/a".to_string(),
+                        reason: format!("invalid notation: {}", e),
+                    });
                     continue;
                 }
             };
@@ -114,12 +150,33 @@ impl KeybindRegistry {
             // Skip if reserved (core)
             if self.reserved.contains(&combo) {
                 tracing::warn!("plugin '{}': keybind '{}' conflicts with core — skipped", plugin_name, kb.key);
+                self.collisions.push(KeybindCollision {
+                    losing_plugin: plugin_name.to_string(),
+                    key: kb.key.clone(),
+                    winning_owner: "core".to_string(),
+                    reason: "conflicts with core".to_string(),
+                });
                 continue;
             }
 
             // Skip if already registered by another plugin
-            if self.binds.iter().any(|b| b.key == combo && b.source != KeybindSource::Core) {
+            if let Some(existing) = self
+                .binds
+                .iter()
+                .find(|b| b.key == combo && b.source != KeybindSource::Core)
+            {
+                let winning_owner = match &existing.source {
+                    KeybindSource::Plugin(name) => name.clone(),
+                    KeybindSource::User => "user".to_string(),
+                    KeybindSource::Core => "core".to_string(),
+                };
                 tracing::warn!("plugin '{}': keybind '{}' already registered — skipped", plugin_name, kb.key);
+                self.collisions.push(KeybindCollision {
+                    losing_plugin: plugin_name.to_string(),
+                    key: kb.key.clone(),
+                    winning_owner,
+                    reason: "already registered".to_string(),
+                });
                 continue;
             }
 
@@ -188,6 +245,34 @@ impl KeybindRegistry {
                 source: KeybindSource::User,
             });
         }
+    }
+
+    /// Live-replace the keybind that fires `slash_command`.
+    ///
+    /// Removes every existing user/plugin bind whose action is the same
+    /// slash command, then registers `new_key → /slash_command` as a User
+    /// bind. Used by /settings to hot-swap the sidecar toggle key without
+    /// requiring a restart.
+    pub fn set_slash_command_key(&mut self, slash_command: &str, new_key: &str) -> Result<(), String> {
+        let combo = parse_key(new_key)?;
+        if self.reserved.contains(&combo) {
+            return Err(format!("'{}' is reserved by core — cannot rebind", new_key));
+        }
+        // Drop any existing bind for this exact command (any source ≠ Core).
+        self.binds.retain(|b| {
+            if b.source == KeybindSource::Core { return true; }
+            !matches!(&b.action, KeybindAction::SlashCommand(c) if c == slash_command)
+        });
+        // Drop any existing non-core bind sitting on the new key (avoid
+        // collision with another plugin bind).
+        self.binds.retain(|b| b.key != combo || b.source == KeybindSource::Core);
+        self.binds.push(Keybind {
+            key: combo,
+            action: KeybindAction::SlashCommand(slash_command.to_string()),
+            description: format!("User: /{}", slash_command),
+            source: KeybindSource::User,
+        });
+        Ok(())
     }
 
     /// Match a key event against registered keybinds.
@@ -571,5 +656,115 @@ mod tests {
         let reg = KeybindRegistry::new();
         let custom = reg.custom_binds();
         assert!(custom.is_empty()); // No plugins registered = no custom binds
+    }
+
+    #[test]
+    fn set_slash_command_key_replaces_existing_sidecar_toggle() {
+        let mut reg = KeybindRegistry::new();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("F8".to_string(), "/sidecar toggle".to_string());
+        reg.register_user(&overrides);
+        let f8 = parse_key("F8").unwrap();
+        assert!(reg.match_key(f8.code, f8.modifiers).is_some());
+
+        // Move sidecar toggle from F8 → C-G
+        reg.set_slash_command_key("sidecar toggle", "C-G").unwrap();
+
+        // F8 no longer fires
+        assert!(reg.match_key(f8.code, f8.modifiers).is_none());
+        // C-G now does
+        let cg = parse_key("C-G").unwrap();
+        let bind = reg.match_key(cg.code, cg.modifiers).expect("C-G bind missing");
+        assert!(matches!(&bind.action, KeybindAction::SlashCommand(c) if c == "sidecar toggle"));
+    }
+
+    #[test]
+    fn set_slash_command_key_rejects_core_chord() {
+        let mut reg = KeybindRegistry::new();
+        // Esc is reserved core
+        let err = reg.set_slash_command_key("sidecar toggle", "Esc").unwrap_err();
+        assert!(err.contains("reserved"), "expected reserved error, got: {err}");
+    }
+
+    // ── collision recording (Phase 8 slice 8B.2) ──
+
+    fn mk_kb(key: &str, cmd: &str) -> ManifestKeybind {
+        ManifestKeybind {
+            key: key.to_string(),
+            action: "slash_command".to_string(),
+            command: Some(cmd.to_string()),
+            skill: None,
+            prompt: None,
+            script: None,
+            description: Some(cmd.to_string()),
+        }
+    }
+
+    #[test]
+    fn register_plugin_records_core_collision() {
+        let mut reg = KeybindRegistry::new();
+        // C-c is reserved by core (Quit).
+        reg.register_plugin("evil", &[mk_kb("C-c", "hack")], std::path::Path::new("/tmp"));
+        assert_eq!(reg.collisions().len(), 1);
+        let c = &reg.collisions()[0];
+        assert_eq!(c.losing_plugin, "evil");
+        assert_eq!(c.winning_owner, "core");
+        assert_eq!(c.reason, "conflicts with core");
+        assert_eq!(c.key, "C-c");
+    }
+
+    #[test]
+    fn register_plugin_records_plugin_vs_plugin_collision() {
+        let mut reg = KeybindRegistry::new();
+        // C-Space is not reserved by core.
+        reg.register_plugin("A", &[mk_kb("C-Space", "alpha")], std::path::Path::new("/tmp"));
+        reg.register_plugin("B", &[mk_kb("C-Space", "beta")], std::path::Path::new("/tmp"));
+        assert_eq!(reg.collisions().len(), 1);
+        let c = &reg.collisions()[0];
+        assert_eq!(c.losing_plugin, "B");
+        assert_eq!(c.winning_owner, "A");
+        assert_eq!(c.reason, "already registered");
+    }
+
+    #[test]
+    fn register_plugin_records_invalid_key_notation() {
+        let mut reg = KeybindRegistry::new();
+        reg.register_plugin(
+            "weird",
+            &[mk_kb("this is not a key", "noop")],
+            std::path::Path::new("/tmp"),
+        );
+        assert_eq!(reg.collisions().len(), 1);
+        let c = &reg.collisions()[0];
+        assert_eq!(c.losing_plugin, "weird");
+        assert_eq!(c.winning_owner, "n/a");
+        assert!(
+            c.reason.starts_with("invalid notation"),
+            "reason should start with 'invalid notation', got: {}",
+            c.reason
+        );
+    }
+
+    #[test]
+    fn collisions_is_empty_when_no_conflicts() {
+        let mut reg = KeybindRegistry::new();
+        reg.register_plugin("solo", &[mk_kb("F7", "solo")], std::path::Path::new("/tmp"));
+        assert!(reg.collisions().is_empty());
+    }
+
+    #[test]
+    fn multiple_collisions_are_all_recorded() {
+        let mut reg = KeybindRegistry::new();
+        reg.register_plugin("A", &[mk_kb("C-Space", "alpha")], std::path::Path::new("/tmp"));
+        // Two more plugins each colliding on the same key.
+        reg.register_plugin("B", &[mk_kb("C-Space", "beta")], std::path::Path::new("/tmp"));
+        reg.register_plugin("C", &[mk_kb("C-Space", "gamma")], std::path::Path::new("/tmp"));
+        assert_eq!(reg.collisions().len(), 2);
+        assert_eq!(reg.collisions()[0].losing_plugin, "B");
+        assert_eq!(reg.collisions()[1].losing_plugin, "C");
+        for c in reg.collisions() {
+            assert_eq!(c.winning_owner, "A");
+            assert_eq!(c.reason, "already registered");
+        }
     }
 }
