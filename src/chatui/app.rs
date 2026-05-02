@@ -168,6 +168,17 @@ fn probe_compiled_backend_at_startup() -> Option<String> {
     synaps_cli::voice::discovery::read_build_info(&sidecar.binary).map(|i| i.backend)
 }
 
+/// Best-effort one-shot probe that prefers extension `info.get` cache when the
+/// extension manager is already loaded, then falls back to the legacy
+/// `--print-build-info` sidecar shim.
+pub(crate) fn probe_compiled_backend_with_plugin_info(
+    plugin_info: Option<&synaps_cli::extensions::info::PluginInfo>,
+) -> Option<String> {
+    let sidecar = synaps_cli::voice::discovery::discover()?;
+    synaps_cli::voice::discovery::read_build_info_with_plugin(&sidecar.binary, plugin_info)
+        .map(|i| i.backend)
+}
+
 
 #[derive(Clone)]
 pub(crate) struct SubagentState {

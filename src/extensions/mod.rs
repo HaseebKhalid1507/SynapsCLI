@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod manager;
 pub mod config;
 pub mod config_store;
+pub mod info;
 pub mod providers;
 pub mod trust;
 pub mod audit;

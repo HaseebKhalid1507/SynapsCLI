@@ -1608,6 +1608,17 @@ impl ExtensionHandler for ProcessExtension {
         }
     }
 
+    async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("info.get", Value::Null),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' info.get timed out", self.id))??;
+        serde_json::from_value(value)
+            .map_err(|e| format!("Invalid info.get response from extension '{}': {}", self.id, e))
+    }
+
     async fn shutdown(&self) {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),

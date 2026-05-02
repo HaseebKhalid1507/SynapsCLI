@@ -48,7 +48,17 @@ impl VoiceUiState {
     ///
     /// Returns `Err` with a user-facing message if no plugin provides
     /// a voice sidecar or the spawn itself fails.
+    #[allow(dead_code)]
     pub async fn spawn_default() -> Result<Self, String> {
+        Self::spawn_default_with_plugin_info(None).await
+    }
+
+    /// Same as [`Self::spawn_default`], but lets callers pass cached extension
+    /// `info.get` metadata so build-info probing avoids the legacy sidecar shim
+    /// when possible.
+    pub async fn spawn_default_with_plugin_info(
+        plugin_info: Option<&synaps_cli::extensions::info::PluginInfo>,
+    ) -> Result<Self, String> {
         let sidecar = discover().ok_or_else(|| {
             "no plugin provides a voice sidecar; install the local-voice plugin from synaps-skills"
                 .to_string()
@@ -114,7 +124,8 @@ impl VoiceUiState {
         //   Voice that invokes `crate::voice::rebuild::rebuild_with_backend`
         //   when the selected backend differs from `compiled_backend`.
         let compiled_backend =
-            synaps_cli::voice::discovery::read_build_info(&sidecar.binary).map(|i| i.backend);
+            synaps_cli::voice::discovery::read_build_info_with_plugin(&sidecar.binary, plugin_info)
+                .map(|i| i.backend);
 
         Ok(Self {
             manager,

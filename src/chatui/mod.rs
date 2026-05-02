@@ -185,6 +185,12 @@ pub async fn run(
                 failure.concise_message()
             )));
         }
+        if let Some(sidecar) = synaps_cli::voice::discovery::discover() {
+            let manager = ext_mgr_shared.read().await;
+            app.cached_voice_compiled_backend = app::probe_compiled_backend_with_plugin_info(
+                manager.plugin_info(&sidecar.plugin_name),
+            );
+        }
     }
 
     // ═══ HOOK: on_session_start ═══
@@ -1154,7 +1160,16 @@ pub async fn run(
                                     CommandAction::VoiceToggle => {
                                         // First toggle: spawn the sidecar and start listening.
                                         if app.voice.is_none() {
-                                            match self::voice::VoiceUiState::spawn_default().await {
+                                            let voice_plugin_info = {
+                                                let sidecar = synaps_cli::voice::discovery::discover();
+                                                if let Some(sidecar) = sidecar {
+                                                    let manager = ext_mgr_shared.read().await;
+                                                    manager.plugin_info(&sidecar.plugin_name).cloned()
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            match self::voice::VoiceUiState::spawn_default_with_plugin_info(voice_plugin_info.as_ref()).await {
                                                 Ok(state) => {
                                                     app.voice = Some(state);
                                                     app.push_msg(ChatMessage::System(

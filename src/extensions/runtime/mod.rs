@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
 use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent};
+use crate::extensions::info::PluginInfo;
 
 /// Health state for an extension handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,11 @@ pub trait ExtensionHandler: Send + Sync {
         _sink: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         Err("provider.stream is not supported by this extension".to_string())
+    }
+
+    /// Fetch optional plugin capability/build/model information.
+    async fn get_info(&self) -> Result<PluginInfo, String> {
+        Err("extension runtime does not support info.get".to_string())
     }
 
     /// Gracefully shut down the extension.

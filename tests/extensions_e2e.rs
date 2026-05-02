@@ -451,6 +451,12 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
+    synaps_cli::extensions::config_store::write_plugin_config(
+        "config-test",
+        "endpoint",
+        "http://localhost:1234",
+    )
+    .unwrap();
     fs::write(home.path().join("config"), "extension.config-test.endpoint = http://localhost:1234\n").unwrap();
     std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
 

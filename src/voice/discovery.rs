@@ -101,6 +101,23 @@ struct RawBuildInfo {
 /// the binary is missing, exits nonzero, or emits unparseable output. Logs a
 /// warning via `tracing::warn!` on failure but never panics.
 pub fn read_build_info(binary: &Path) -> Option<SidecarBuildInfo> {
+    read_build_info_with_plugin(binary, None)
+}
+
+/// Return plugin-advertised build info when available, otherwise fall back to
+/// spawning the sidecar with `--print-build-info`.
+pub fn read_build_info_with_plugin(
+    binary: &Path,
+    plugin_info: Option<&crate::extensions::info::PluginInfo>,
+) -> Option<SidecarBuildInfo> {
+    if let Some(build) = plugin_info.and_then(|info| info.build.as_ref()) {
+        return Some(SidecarBuildInfo {
+            backend: build.backend.clone(),
+            features: build.features.clone(),
+            version: build.version.clone(),
+        });
+    }
+
     let output = match std::process::Command::new(binary)
         .arg("--print-build-info")
         .output()
@@ -200,6 +217,7 @@ fn resolve_relative(root: &Path, candidate: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::info::{PluginBuildInfo, PluginInfo};
     use crate::skills::manifest::PluginManifest;
     use std::path::PathBuf;
 
@@ -342,6 +360,25 @@ mod tests {
         assert_eq!(info.backend, "cuda");
         assert_eq!(info.features, vec!["cuda".to_string()]);
         assert_eq!(info.version, "0.1.0");
+    }
+
+    #[test]
+    fn read_build_info_prefers_plugin_info_over_legacy_sidecar_spawn() {
+        let missing_binary = PathBuf::from("/definitely/missing/synaps-voice-plugin");
+        let plugin_info = PluginInfo {
+            build: Some(PluginBuildInfo {
+                backend: "cuda".to_string(),
+                features: vec!["local-stt".to_string(), "cuda".to_string()],
+                version: "0.2.0".to_string(),
+            }),
+            ..PluginInfo::default()
+        };
+
+        let info = read_build_info_with_plugin(&missing_binary, Some(&plugin_info))
+            .expect("plugin build info should avoid sidecar spawn fallback");
+        assert_eq!(info.backend, "cuda");
+        assert_eq!(info.features, vec!["local-stt", "cuda"]);
+        assert_eq!(info.version, "0.2.0");
     }
 
     #[cfg(unix)]

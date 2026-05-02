@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::config::{diagnose_extension_config, ExtensionConfigDiagnostics};
+use super::info::PluginInfo;
 use super::hooks::HookBus;
 use super::manifest::{ExtensionConfigEntry, ExtensionManifest};
 use super::providers::{ProviderRegistry, RegisteredProvider, RegisteredProviderSummary};
@@ -82,6 +83,8 @@ pub struct ExtensionManager {
     manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
     /// Voice capability declarations per loaded extension. Populated on load.
     voice_capabilities: HashMap<String, crate::extensions::runtime::process::VoiceCapabilityDeclaration>,
+    /// Optional plugin-reported info from the `info.get` RPC.
+    plugin_info: HashMap<String, PluginInfo>,
 }
 
 impl ExtensionManager {
@@ -94,6 +97,7 @@ impl ExtensionManager {
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
             voice_capabilities: HashMap::new(),
+            plugin_info: HashMap::new(),
         }
     }
 
@@ -109,6 +113,7 @@ impl ExtensionManager {
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
             voice_capabilities: HashMap::new(),
+            plugin_info: HashMap::new(),
         }
     }
 
@@ -166,6 +171,8 @@ impl ExtensionManager {
         let registered_tools = capabilities.tools;
         let registered_providers = capabilities.providers;
         let voice_declaration = capabilities.voice;
+        let should_probe_info =
+            !registered_tools.is_empty() || !registered_providers.is_empty() || voice_declaration.is_some();
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
         if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
             handler.shutdown().await;
@@ -241,6 +248,35 @@ impl ExtensionManager {
             }
         }
 
+        // Do not probe optional info.get for legacy hook-only extensions. The
+        // best-effort call can race with simple fixtures that exit after
+        // shutdown/EOF and is only needed for richer extension-capability
+        // surfaces (providers/tools/voice).
+        let info = if should_probe_info {
+            match handler.get_info().await {
+                Ok(info) => Some(info),
+                Err(error) => {
+                    if error.contains("method not found") || error.contains("unknown method") {
+                        tracing::debug!(
+                            extension = %id,
+                            error = %error,
+                            "Extension did not provide optional info.get metadata",
+                        );
+                        None
+                    } else {
+                        tracing::warn!(
+                            extension = %id,
+                            error = %error,
+                            "Ignoring invalid optional info.get metadata",
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         // Register hook subscriptions
         for (kind, tool_filter, matcher) in subscriptions {
             self.hook_bus
@@ -253,6 +289,9 @@ impl ExtensionManager {
             .insert(id.to_string(), manifest.config.clone());
         if let Some(voice) = voice_declaration {
             self.voice_capabilities.insert(id.to_string(), voice);
+        }
+        if let Some(info) = info {
+            self.plugin_info.insert(id.to_string(), info);
         }
         tracing::info!(extension = %id, hooks = manifest.hooks.len(), "Extension loaded");
         Ok(())
@@ -362,6 +401,7 @@ impl ExtensionManager {
         self.providers.unregister_plugin(id);
         self.manifest_configs.remove(id);
         self.voice_capabilities.remove(id);
+        self.plugin_info.remove(id);
         handler.shutdown().await;
 
         tracing::info!(extension = %id, "Extension unloaded");
@@ -429,6 +469,22 @@ impl ExtensionManager {
     /// Return registered provider metadata by runtime id.
     pub fn provider(&self, runtime_id: &str) -> Option<&RegisteredProvider> {
         self.providers.get(runtime_id)
+    }
+
+    /// Return optional cached plugin info reported by `info.get`.
+    pub fn plugin_info(&self, id: &str) -> Option<&PluginInfo> {
+        self.plugin_info.get(id)
+    }
+
+    /// Return all cached plugin info sorted by extension id.
+    pub fn plugin_infos(&self) -> Vec<(&str, &PluginInfo)> {
+        let mut entries: Vec<_> = self
+            .plugin_info
+            .iter()
+            .map(|(id, info)| (id.as_str(), info))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
     }
 
     /// Return provider status summaries sorted by provider runtime id.
