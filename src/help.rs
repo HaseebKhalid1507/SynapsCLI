@@ -924,6 +924,23 @@ pub fn visible_help_find_window(row_heights: &[usize], cursor: usize, scroll: us
     start
 }
 
+pub fn wrap_help_find_summary_lines(prefix: &str, summary: &str, width: usize) -> Vec<String> {
+    let prefix_width = prefix.chars().count();
+    let available = width.saturating_sub(prefix_width).max(8);
+    let summary_indent = " ".repeat(prefix_width);
+    wrap_help_text(summary, available)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if idx == 0 {
+                format!("{}{}", prefix, line)
+            } else {
+                format!("{}{}", summary_indent, line.trim_start())
+            }
+        })
+        .collect()
+}
+
 fn visual_height_between(row_heights: &[usize], start: usize, end_inclusive: usize) -> usize {
     row_heights[start..=end_inclusive]
         .iter()
@@ -963,5 +980,18 @@ mod tests {
 
         assert_eq!(visible_help_find_window(&heights, 2, 0, 3), 2);
         assert_eq!(visible_help_find_window(&heights, 4, 2, 4), 3);
+    }
+
+    #[test]
+    fn wrap_help_find_summary_continuations_align_for_selected_and_unselected_rows() {
+        let summary = "description wraps onto a second visual line";
+
+        let selected = wrap_help_find_summary_lines("› /demo             ", summary, 24);
+        let unselected = wrap_help_find_summary_lines("  /demo             ", summary, 24);
+
+        assert!(selected[1].starts_with("                    "));
+        assert!(unselected[1].starts_with("                    "));
+        assert_eq!(selected[1].chars().take_while(|ch| ch.is_whitespace()).count(), 20);
+        assert_eq!(unselected[1].chars().take_while(|ch| ch.is_whitespace()).count(), 20);
     }
 }
