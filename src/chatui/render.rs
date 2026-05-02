@@ -539,7 +539,9 @@ impl App {
 
                 ChatMessage::System(msg) => {
                     if i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::System(_)) {
+                        lines.push(Line::from(""));
                         lines.push(system_separator_line(m, width));
+                        lines.push(Line::from(""));
                     }
                     // Newline-aware AND wrap-aware: split on '\n' first so
                     // explicit line breaks always render as separate rows,
