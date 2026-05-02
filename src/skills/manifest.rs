@@ -319,6 +319,42 @@ pub struct MarketplacePluginEntry {
 mod tests {
     use super::*;
 
+    /// Sibling-repo manifest pin: the live `local-voice` plugin manifest
+    /// in `synaps-skills` must round-trip through this crate's parser
+    /// with the Phase 8 lifecycle block + keybinds wired in. If this
+    /// test fails because the file moved, update or delete the path —
+    /// don't loosen the assertions.
+    #[test]
+    fn local_voice_plugin_json_parses_with_phase8_lifecycle_and_keybinds() {
+        let path = "/home/jr/Projects/Maha-Media/.worktrees/\
+            synaps-skills-local-voice-plugin-commands-tasks/local-voice-plugin/\
+            .synaps-plugin/plugin.json";
+        let Ok(json) = std::fs::read_to_string(path) else {
+            // Sibling worktree absent — skip rather than fail in CI/other
+            // environments. The pin is best-effort local-dev guard.
+            eprintln!("skip: {path} not found");
+            return;
+        };
+        let m: PluginManifest =
+            serde_json::from_str(&json).expect("local-voice manifest must deserialize");
+        assert_eq!(m.name, "local-voice");
+
+        let provides = m.provides.expect("provides present");
+        let sidecar = provides.sidecar.expect("sidecar present");
+        assert_eq!(sidecar.command, "bin/synaps-voice-plugin");
+        let lc = sidecar.lifecycle.expect("lifecycle present");
+        assert_eq!(lc.command, "voice");
+        assert_eq!(lc.settings_category.as_deref(), Some("voice"));
+        assert_eq!(lc.effective_display_name(), "Voice");
+        assert_eq!(lc.importance, 50);
+
+        assert_eq!(m.keybinds.len(), 1);
+        let kb = &m.keybinds[0];
+        assert_eq!(kb.key, "C-Space");
+        assert_eq!(kb.action, "slash_command");
+        assert_eq!(kb.command.as_deref(), Some("voice toggle"));
+    }
+
     #[test]
     fn plugin_manifest_minimal() {
         let json = r#"{"name":"web-tools"}"#;
