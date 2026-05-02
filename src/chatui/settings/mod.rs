@@ -63,6 +63,10 @@ pub(crate) struct RuntimeSnapshot {
     /// at modal-open time. Each entry contributes a category row in the
     /// left pane and a list of fields in the right pane. Path B Phase 4.
     pub plugin_categories: Vec<synaps_cli::skills::registry::PluginSettingsCategory>,
+    /// Phase 8 8A.4: lifecycle claims used by `schema::visible_categories`
+    /// to hide the legacy global `Sidecar` page when a plugin has staked a
+    /// claim with a `settings_category`.
+    pub lifecycle_claims: Vec<synaps_cli::skills::registry::LifecycleClaim>,
 }
 
 impl RuntimeSnapshot {
@@ -122,6 +126,7 @@ impl RuntimeSnapshot {
             provider_keys: config.provider_keys.clone(),
             model_health,
             plugin_categories: registry.plugin_settings_categories(),
+            lifecycle_claims: registry.lifecycle_claims(),
         }
     }
 }
@@ -194,7 +199,7 @@ impl SettingsState {
     /// True iff `category_idx` points past the built-in categories at a
     /// plugin-declared category from `snap.plugin_categories`.
     pub fn is_plugin_category(&self, snap: &RuntimeSnapshot) -> bool {
-        let n_builtin = schema::CATEGORIES.len();
+        let n_builtin = schema::visible_categories(&snap.lifecycle_claims).len();
         self.category_idx >= n_builtin
             && self.category_idx - n_builtin < snap.plugin_categories.len()
     }
@@ -208,7 +213,7 @@ impl SettingsState {
         if !self.is_plugin_category(snap) {
             return None;
         }
-        snap.plugin_categories.get(self.category_idx - schema::CATEGORIES.len())
+        snap.plugin_categories.get(self.category_idx - schema::visible_categories(&snap.lifecycle_claims).len())
     }
 
     /// Plugin field at `setting_idx` within the current plugin category.
@@ -218,6 +223,61 @@ impl SettingsState {
     ) -> Option<&'a synaps_cli::skills::registry::PluginSettingsField> {
         self.current_plugin_category(snap)
             .and_then(|c| c.fields.get(self.setting_idx))
+    }
+}
+
+#[cfg(test)]
+mod wireup_tests {
+    use super::*;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn snap_with_claims(claims: Vec<LifecycleClaim>) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            model: "m".into(),
+            thinking: "medium".into(),
+            context_window: "auto".into(),
+            compaction_model: "m".into(),
+            max_tool_output: 0,
+            bash_timeout: 0,
+            bash_max_timeout: 0,
+            subagent_timeout: 0,
+            api_retries: 0,
+            theme_name: "t".into(),
+            plugins: Vec::new(),
+            disabled_plugins: Vec::new(),
+            provider_keys: std::collections::BTreeMap::new(),
+            model_health: std::collections::HashMap::new(),
+            plugin_categories: Vec::new(),
+            lifecycle_claims: claims,
+        }
+    }
+
+    fn claim(settings_category: Option<&str>) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: "p".into(),
+            command: "voice".into(),
+            settings_category: settings_category.map(|s| s.into()),
+            display_name: "Voice".into(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn visible_categories_excludes_sidecar_when_claim_present() {
+        let snap = snap_with_claims(vec![claim(Some("voice"))]);
+        let v = schema::visible_categories(&snap.lifecycle_claims);
+        assert!(!v.contains(&schema::Category::Sidecar));
+    }
+
+    #[test]
+    fn visible_categories_includes_sidecar_when_no_claim_settings_category() {
+        let snap_empty = snap_with_claims(Vec::new());
+        assert!(schema::visible_categories(&snap_empty.lifecycle_claims)
+            .contains(&schema::Category::Sidecar));
+
+        let snap_no_cat = snap_with_claims(vec![claim(None)]);
+        assert!(schema::visible_categories(&snap_no_cat.lifecycle_claims)
+            .contains(&schema::Category::Sidecar));
     }
 }
 

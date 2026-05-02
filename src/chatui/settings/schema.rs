@@ -45,10 +45,6 @@ pub(crate) const CATEGORIES: [Category; 7] = [
 /// (rendered with an injected `_lifecycle_toggle_key` field) replaces
 /// the global Sidecar settings page. When no plugin has claimed a
 /// settings category, fall back to the static legacy list verbatim.
-///
-// TODO(phase 8 8A.4): wire visible_categories(claims) at the settings
-// draw call site (settings/mod.rs / draw.rs) once that scope is
-// unlocked. The function is exercised by tests in this file.
 pub(crate) fn visible_categories(
     claims: &[synaps_cli::skills::registry::LifecycleClaim],
 ) -> Vec<Category> {

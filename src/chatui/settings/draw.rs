@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{CATEGORIES, SettingDef, EditorKind};
+use super::schema::{SettingDef, EditorKind, visible_categories};
 use super::super::theme::THEME;
 
 pub(crate) fn render(
@@ -39,7 +39,7 @@ pub(crate) fn render(
 
     render_categories(frame, panes[0], state, snap);
     render_settings(frame, panes[1], state, snap);
-    render_footer(frame, outer[1], state);
+    render_footer(frame, outer[1], state, snap);
 
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
         render_plugin_custom_editor(frame, panes[1], render);
@@ -48,8 +48,9 @@ pub(crate) fn render(
 
 fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let mut lines = Vec::new();
-    let n_builtin = CATEGORIES.len();
-    for (i, cat) in CATEGORIES.iter().enumerate() {
+    let cats = visible_categories(&snap.lifecycle_claims);
+    let n_builtin = cats.len();
+    for (i, cat) in cats.iter().enumerate() {
         let marker = if i == state.category_idx { "▸ " } else { "  " };
         let style = if i == state.category_idx && state.focus == Focus::Left {
             Style::default().fg(THEME.load().claude_label)
@@ -88,7 +89,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_plugin_category(frame, area, state, snap);
         return;
     }
-    let current_cat = super::schema::CATEGORIES[state.category_idx];
+    let current_cat = visible_categories(&snap.lifecycle_claims)[state.category_idx];
     if current_cat == super::schema::Category::Plugins {
         render_plugins_list(frame, area, state, snap);
         return;
@@ -536,8 +537,9 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState) {
-    let cat = CATEGORIES[state.category_idx];
+fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+    let cats = visible_categories(&snap.lifecycle_claims);
+    let cat = cats.get(state.category_idx).copied().unwrap_or(super::schema::Category::Plugins);
     let on_plugins_right = cat == super::schema::Category::Plugins
         && state.focus == Focus::Right;
     let on_providers_right = cat == super::schema::Category::Providers
