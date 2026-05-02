@@ -71,9 +71,10 @@ impl VoiceUiState {
             ));
         }
 
-        // Read voice_language; ignore placeholder values like "?", "auto",
-        // and "(auto)" which mean "let whisper auto-detect".
-        let language = synaps_cli::config::read_config_value("voice_language")
+        // Read voice language. Source of truth: the local-voice plugin's
+        // own config namespace (`local-voice.language`); legacy global
+        // `voice_language` keys are still read for one-release back-compat.
+        let language = read_local_voice_setting("language", "voice_language")
             .map(|s| s.trim().to_string())
             .filter(|s| {
                 !s.is_empty()
@@ -82,11 +83,12 @@ impl VoiceUiState {
                     && s != "(auto)"
             });
 
-        // Build sidecar args: prefer `voice_stt_model_path` from config, else
+        // Build sidecar args: prefer `local-voice.model_path` from the plugin
+        // config (legacy fallback `voice_stt_model_path` global key), else
         // fall back to the manifest's `provides.voice_sidecar.model.default_path`.
         // Tilde-expand and verify the file exists before passing it.
         let mut args: Vec<String> = Vec::new();
-        let model_override = synaps_cli::config::read_config_value("voice_stt_model_path")
+        let model_override = read_local_voice_setting("model_path", "voice_stt_model_path")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let model_default = sidecar
@@ -185,7 +187,7 @@ pub(crate) fn handle_event(app: &mut App, event: VoiceManagerEvent) {
             v.status = VoiceUiStatus::Listening;
         }
         VoiceManagerEvent::ListeningStopped => {
-            // The whisper provider emits ListeningStopped between VAD
+            // The STT provider emits ListeningStopped between VAD
             // utterances *and* on real shutdown. Only clear status if the
             // user has unarmed (toggled off).
             if !v.armed {
@@ -325,4 +327,27 @@ fn expand_tilde(path: String) -> String {
         }
     }
     path
+}
+
+/// Resolve a local-voice setting value: prefer the plugin's own namespaced
+/// config (`~/.synaps-cli/plugins/local-voice/config`), fall back to the
+/// legacy global key one release for back-compat. Logs a deprecation hint
+/// when the legacy key is used.
+fn read_local_voice_setting(plugin_key: &str, legacy_global_key: &str) -> Option<String> {
+    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(
+        "local-voice",
+        plugin_key,
+    ) {
+        return Some(v);
+    }
+    if let Some(v) = synaps_cli::config::read_config_value(legacy_global_key) {
+        tracing::warn!(
+            "voice: legacy global config key `{}` is deprecated; \
+             move it under `~/.synaps-cli/plugins/local-voice/config` as `{} = ...`",
+            legacy_global_key,
+            plugin_key
+        );
+        return Some(v);
+    }
+    None
 }
