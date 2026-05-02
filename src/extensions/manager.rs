@@ -81,8 +81,10 @@ pub struct ExtensionManager {
     /// Declared manifest config entries per loaded extension, kept so we can
     /// produce diagnostics without re-reading the manifest.
     manifest_configs: HashMap<String, Vec<ExtensionConfigEntry>>,
-    /// Voice capability declarations per loaded extension. Populated on load.
-    voice_capabilities: HashMap<String, crate::extensions::runtime::process::VoiceCapabilityDeclaration>,
+    /// Capability declarations per loaded extension. Each plugin may
+    /// declare zero or more capabilities (kind is plugin-defined; core
+    /// does not enumerate). Populated on load.
+    capabilities: HashMap<String, Vec<crate::extensions::runtime::process::CapabilityDeclaration>>,
     /// Optional plugin-reported info from the `info.get` RPC.
     plugin_info: HashMap<String, PluginInfo>,
 }
@@ -96,7 +98,7 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
-            voice_capabilities: HashMap::new(),
+            capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
         }
     }
@@ -112,7 +114,7 @@ impl ExtensionManager {
             providers: ProviderRegistry::new(),
             extensions: HashMap::new(),
             manifest_configs: HashMap::new(),
-            voice_capabilities: HashMap::new(),
+            capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
         }
     }
@@ -170,9 +172,10 @@ impl ExtensionManager {
         };
         let registered_tools = capabilities.tools;
         let registered_providers = capabilities.providers;
-        let voice_declaration = capabilities.voice;
-        let should_probe_info =
-            !registered_tools.is_empty() || !registered_providers.is_empty() || voice_declaration.is_some();
+        let capability_declarations = capabilities.capabilities;
+        let should_probe_info = !registered_tools.is_empty()
+            || !registered_providers.is_empty()
+            || !capability_declarations.is_empty();
         let handler: Arc<dyn ExtensionHandler> = Arc::new(process);
         if !registered_tools.is_empty() && !permissions.has(crate::extensions::permissions::Permission::ToolsRegister) {
             handler.shutdown().await;
@@ -188,12 +191,12 @@ impl ExtensionManager {
                 id
             ));
         }
-        if let Some(voice) = &voice_declaration {
-            if let Err(err) = crate::extensions::runtime::process::validate_voice_capability(voice, &permissions) {
+        for decl in &capability_declarations {
+            if let Err(err) = crate::extensions::runtime::process::validate_capability(decl, &permissions) {
                 handler.shutdown().await;
                 return Err(format!(
-                    "Extension '{}' voice capability invalid: {}",
-                    id, err
+                    "Extension '{}' capability '{}' invalid: {}",
+                    id, decl.kind, err
                 ));
             }
         }
@@ -287,8 +290,9 @@ impl ExtensionManager {
         self.extensions.insert(id.to_string(), handler);
         self.manifest_configs
             .insert(id.to_string(), manifest.config.clone());
-        if let Some(voice) = voice_declaration {
-            self.voice_capabilities.insert(id.to_string(), voice);
+        if !capability_declarations.is_empty() {
+            self.capabilities
+                .insert(id.to_string(), capability_declarations);
         }
         if let Some(info) = info {
             self.plugin_info.insert(id.to_string(), info);
@@ -378,16 +382,16 @@ impl ExtensionManager {
         Ok(Value::Object(out))
     }
 
-    /// Test-only seeder: synthetically insert a voice capability declaration
-    /// for an extension id. Used to exercise capability snapshot rendering
-    /// without spinning up a real plugin process.
+    /// Test-only seeder: synthetically insert capability declarations
+    /// for an extension id. Used to exercise capability snapshot
+    /// rendering without spinning up a real plugin process.
     #[cfg(test)]
-    pub(crate) fn test_seed_voice_capability(
+    pub(crate) fn test_seed_capabilities(
         &mut self,
         id: &str,
-        decl: crate::extensions::runtime::process::VoiceCapabilityDeclaration,
+        decls: Vec<crate::extensions::runtime::process::CapabilityDeclaration>,
     ) {
-        self.voice_capabilities.insert(id.to_string(), decl);
+        self.capabilities.insert(id.to_string(), decls);
     }
 
     /// Unload an extension — unsubscribe hooks and shut down the process.
@@ -400,7 +404,7 @@ impl ExtensionManager {
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
         self.manifest_configs.remove(id);
-        self.voice_capabilities.remove(id);
+        self.capabilities.remove(id);
         self.plugin_info.remove(id);
         handler.shutdown().await;
 
@@ -613,14 +617,14 @@ impl ExtensionManager {
                 .collect();
 
             let future: Vec<FutureCapabilityEntry> = self
-                .voice_capabilities
+                .capabilities
                 .get(&id)
-                .map(|decl| {
-                    decl.modes
+                .map(|decls| {
+                    decls
                         .iter()
-                        .map(|mode| FutureCapabilityEntry {
-                            kind: "voice".to_string(),
-                            name: format!("{} ({})", decl.name, mode),
+                        .map(|d| FutureCapabilityEntry {
+                            kind: d.kind.clone(),
+                            name: d.name.clone(),
                         })
                         .collect()
                 })
@@ -948,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capability_snapshot_surfaces_seeded_voice_capability() {
+    async fn capability_snapshot_surfaces_seeded_capabilities() {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
@@ -958,7 +962,7 @@ mod tests {
             args: vec![
                 "tests/fixtures/process_extension.py".to_string(),
                 "normal".to_string(),
-                "/tmp/synaps-capability-voice-test.log".to_string(),
+                "/tmp/synaps-capability-snapshot-test.log".to_string(),
             ],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
@@ -969,28 +973,45 @@ mod tests {
             config: vec![],
         };
 
-        mgr.load("voice-cap", &manifest).await.unwrap();
+        mgr.load("multi-cap", &manifest).await.unwrap();
 
-        mgr.test_seed_voice_capability(
-            "voice-cap",
-            crate::extensions::runtime::process::VoiceCapabilityDeclaration {
-                name: "Local Whisper STT".to_string(),
-                modes: vec!["stt".to_string(), "tts".to_string()],
-                endpoint: Some("http://127.0.0.1:8723".to_string()),
-            },
+        // Seed two capabilities of *different* kinds — proves the
+        // snapshot rendering iterates a generic list and uses the
+        // plugin-supplied `kind` rather than hardcoding any modality.
+        mgr.test_seed_capabilities(
+            "multi-cap",
+            vec![
+                crate::extensions::runtime::process::CapabilityDeclaration {
+                    kind: "voice".to_string(),
+                    name: "Local Whisper STT".to_string(),
+                    permissions: vec!["audio.input".to_string()],
+                    params: serde_json::Value::Null,
+                },
+                crate::extensions::runtime::process::CapabilityDeclaration {
+                    kind: "ocr".to_string(),
+                    name: "Tesseract".to_string(),
+                    permissions: vec![],
+                    params: serde_json::Value::Null,
+                },
+            ],
         );
 
         let snaps = mgr.capability_snapshots().await;
-        let snap = snaps.iter().find(|s| s.id == "voice-cap").expect("voice-cap snapshot");
+        let snap = snaps
+            .iter()
+            .find(|s| s.id == "multi-cap")
+            .expect("multi-cap snapshot");
         assert_eq!(snap.future.len(), 2);
-        assert!(snap.future.iter().all(|e| e.kind == "voice"));
+        let kinds: Vec<&str> = snap.future.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"voice"), "got kinds {:?}", kinds);
+        assert!(kinds.contains(&"ocr"), "got kinds {:?}", kinds);
         let names: Vec<&str> = snap.future.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Local Whisper STT (stt)"), "got {:?}", names);
-        assert!(names.contains(&"Local Whisper STT (tts)"), "got {:?}", names);
+        assert!(names.contains(&"Local Whisper STT"), "got {:?}", names);
+        assert!(names.contains(&"Tesseract"), "got {:?}", names);
 
-        mgr.unload("voice-cap").await.unwrap();
+        mgr.unload("multi-cap").await.unwrap();
         let snaps = mgr.capability_snapshots().await;
-        assert!(snaps.iter().all(|s| s.id != "voice-cap"));
+        assert!(snaps.iter().all(|s| s.id != "multi-cap"));
 
         mgr.shutdown_all().await;
     }

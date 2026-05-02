@@ -381,68 +381,80 @@ pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolU
 pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
     pub providers: Vec<RegisteredProviderSpec>,
-    pub voice: Option<VoiceCapabilityDeclaration>,
+    /// Generic, plugin-defined capabilities. Each entry's `kind` is a
+    /// free-form string the plugin author picks (e.g. `"voice"`,
+    /// `"ocr"`, `"agent"`, `"foot_pedal"`); core does not enumerate or
+    /// branch on it. Permissions are gated by the declared
+    /// [`CapabilityDeclaration::permissions`] list.
+    pub capabilities: Vec<CapabilityDeclaration>,
 }
 
-/// Declaration of a voice capability provided by an extension.
+/// Generic capability declaration returned by an extension's
+/// `initialize` response.
 ///
-/// The actual sidecar implementation lives in the plugin (see
-/// `synaps-skills/`); core only tracks the metadata so it can surface
-/// the capability in `/extensions status` and gate the corresponding
-/// audio permissions.
+/// Core does not interpret `kind` or `params` — those are contracts
+/// between the plugin and whatever consumer (chatui glue, another
+/// plugin, an external watcher) cares about that capability kind. The
+/// host only enforces that the plugin holds every permission it
+/// declares it needs.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct VoiceCapabilityDeclaration {
-    /// Display name, e.g. "Local Whisper STT".
+pub struct CapabilityDeclaration {
+    /// Free-form capability kind tag chosen by the plugin author.
+    /// Examples: `"voice"`, `"ocr"`, `"agent"`, `"clipboard_mirror"`.
+    /// Must be non-empty; otherwise opaque to core.
+    pub kind: String,
+    /// Human-readable display name shown in `/extensions status` and
+    /// similar surfaces. Must be non-empty.
     pub name: String,
-    /// Modes supported: subset of ["stt", "tts", "wake_word"].
-    pub modes: Vec<String>,
-    /// Optional sidecar endpoint (e.g. "http://127.0.0.1:8723"). Informational.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
+    /// Permission names this capability needs at runtime, e.g.
+    /// `["audio.input"]`. Every entry must parse to a known
+    /// [`crate::extensions::permissions::Permission`] *and* be present
+    /// in the extension's granted permission set.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// Free-form metadata. Core stores and forwards but never
+    /// interprets. Plugins use this for endpoint URLs, mode lists,
+    /// version tags, anything that doesn't fit the typed slots.
+    #[serde(default, skip_serializing_if = "is_null_value")]
+    pub params: serde_json::Value,
 }
 
-/// Validate a [`VoiceCapabilityDeclaration`] against the granted permission set.
+fn is_null_value(v: &serde_json::Value) -> bool {
+    v.is_null()
+}
+
+/// Validate a [`CapabilityDeclaration`] against the granted permission
+/// set.
 ///
-/// Rules:
+/// Rules — generic, no enumeration of capability kinds:
+/// - `kind` must be non-empty.
 /// - `name` must be non-empty.
-/// - `modes` must be non-empty and only contain `stt`, `tts`, or `wake_word`.
-/// - `stt` or `wake_word` modes require the `audio.input` permission.
-/// - `tts` mode requires the `audio.output` permission.
-pub fn validate_voice_capability(
-    decl: &VoiceCapabilityDeclaration,
-    permissions: &crate::extensions::permissions::PermissionSet,
+/// - Every string in `permissions` must parse to a known
+///   [`crate::extensions::permissions::Permission`].
+/// - Every parsed permission must be present in `granted`.
+pub fn validate_capability(
+    decl: &CapabilityDeclaration,
+    granted: &crate::extensions::permissions::PermissionSet,
 ) -> Result<(), String> {
     use crate::extensions::permissions::Permission;
+    if decl.kind.trim().is_empty() {
+        return Err("capability 'kind' must be non-empty".to_string());
+    }
     if decl.name.trim().is_empty() {
-        return Err("voice capability 'name' must be non-empty".to_string());
+        return Err("capability 'name' must be non-empty".to_string());
     }
-    if decl.modes.is_empty() {
-        return Err("voice capability 'modes' must be non-empty".to_string());
-    }
-    for mode in &decl.modes {
-        match mode.as_str() {
-            "stt" | "wake_word" => {
-                if !permissions.has(Permission::AudioInput) {
-                    return Err(format!(
-                        "voice capability mode '{}' requires permission 'audio.input'",
-                        mode
-                    ));
-                }
-            }
-            "tts" => {
-                if !permissions.has(Permission::AudioOutput) {
-                    return Err(
-                        "voice capability mode 'tts' requires permission 'audio.output'"
-                            .to_string(),
-                    );
-                }
-            }
-            other => {
-                return Err(format!(
-                    "voice capability declares unknown mode '{}' (expected one of 'stt', 'tts', 'wake_word')",
-                    other
-                ));
-            }
+    for perm_name in &decl.permissions {
+        let parsed = Permission::parse(perm_name).ok_or_else(|| {
+            format!(
+                "capability '{}' declares unknown permission '{}'",
+                decl.kind, perm_name
+            )
+        })?;
+        if !granted.has(parsed) {
+            return Err(format!(
+                "capability '{}' requires permission '{}' but it is not granted",
+                decl.kind, perm_name
+            ));
         }
     }
     Ok(())
@@ -461,8 +473,77 @@ struct InitializeCapabilities {
     tools: Vec<RegisteredExtensionToolSpec>,
     #[serde(default)]
     providers: Vec<RegisteredProviderSpec>,
+    /// Canonical generic capability list.
     #[serde(default)]
-    voice: Option<VoiceCapabilityDeclaration>,
+    capabilities: Vec<CapabilityDeclaration>,
+    /// Legacy alias accepted for one release: a plugin sending the old
+    /// `voice: { name, modes, endpoint }` shape gets translated into a
+    /// generic `CapabilityDeclaration` with `kind = "voice"`, with
+    /// permissions derived from the legacy `modes` enumeration. Remove
+    /// this field after the deprecation window.
+    #[serde(default)]
+    voice: Option<LegacyVoiceCapability>,
+}
+
+/// One-release back-compat shim. Mirrors the pre-Phase-7
+/// `VoiceCapabilityDeclaration` wire shape so existing plugins keep
+/// loading unchanged. New plugins should send `capabilities: [...]`.
+#[derive(Deserialize)]
+struct LegacyVoiceCapability {
+    name: String,
+    #[serde(default)]
+    modes: Vec<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+impl LegacyVoiceCapability {
+    /// Translate the legacy shape into a generic
+    /// [`CapabilityDeclaration`]. Modes map to permissions:
+    /// `stt`/`wake_word` → `audio.input`, `tts` → `audio.output`.
+    /// Unknown modes are preserved in `params` but contribute no
+    /// permission requirement (so unknown-mode plugins fail later in
+    /// `validate_capability` only if they explicitly list a permission
+    /// the user did not grant).
+    fn into_capability(self) -> CapabilityDeclaration {
+        let mut permissions: Vec<String> = Vec::new();
+        for mode in &self.modes {
+            match mode.as_str() {
+                "stt" | "wake_word" => {
+                    let p = "audio.input".to_string();
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                "tts" => {
+                    let p = "audio.output".to_string();
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "modes".to_string(),
+            serde_json::Value::Array(
+                self.modes
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        if let Some(ep) = self.endpoint {
+            params.insert("endpoint".to_string(), serde_json::Value::String(ep));
+        }
+        CapabilityDeclaration {
+            kind: "voice".to_string(),
+            name: self.name,
+            permissions,
+            params: serde_json::Value::Object(params),
+        }
+    }
 }
 
 /// A JSON-RPC notification frame received from an extension (no `id`).
@@ -1093,10 +1174,18 @@ impl ProcessExtension {
         }
         Self::validate_registered_tool_specs(id, &result.capabilities.tools)?;
         Self::validate_registered_provider_specs(id, &result.capabilities.providers)?;
+        // Merge canonical `capabilities: [...]` with the one-release
+        // legacy `voice: {...}` shim. Legacy entries are appended after
+        // canonical ones so a plugin sending both (during its own
+        // migration) gets a deterministic, deduplicable list.
+        let mut capabilities = result.capabilities.capabilities;
+        if let Some(legacy) = result.capabilities.voice {
+            capabilities.push(legacy.into_capability());
+        }
         Ok(InitializeCapabilitiesResult {
             tools: result.capabilities.tools,
             providers: result.capabilities.providers,
-            voice: result.capabilities.voice,
+            capabilities,
         })
     }
 
@@ -2056,74 +2145,181 @@ mod voice_validator_tests {
         p
     }
 
-    fn decl(name: &str, modes: &[&str]) -> VoiceCapabilityDeclaration {
-        VoiceCapabilityDeclaration {
+    fn cap(kind: &str, name: &str, perms: &[&str]) -> CapabilityDeclaration {
+        CapabilityDeclaration {
+            kind: kind.to_string(),
             name: name.to_string(),
-            modes: modes.iter().map(|m| m.to_string()).collect(),
-            endpoint: None,
+            permissions: perms.iter().map(|p| p.to_string()).collect(),
+            params: serde_json::Value::Null,
         }
     }
 
     #[test]
-    fn voice_validator_rejects_empty_name() {
-        let d = decl("   ", &["stt"]);
+    fn capability_validator_rejects_empty_kind() {
+        let d = cap("   ", "Whisper", &["audio.input"]);
         let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("kind"), "got: {}", err);
+    }
+
+    #[test]
+    fn capability_validator_rejects_empty_name() {
+        let d = cap("voice", "   ", &["audio.input"]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        let err = validate_capability(&d, &perms).unwrap_err();
         assert!(err.contains("name"), "got: {}", err);
     }
 
     #[test]
-    fn voice_validator_rejects_empty_modes() {
-        let d = decl("Whisper", &[]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("modes"), "got: {}", err);
-    }
-
-    #[test]
-    fn voice_validator_rejects_unknown_mode() {
-        let d = decl("Whisper", &["humming"]);
+    fn capability_validator_rejects_unknown_permission_string() {
+        let d = cap("voice", "Whisper", &["audio.telepathy"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("unknown mode"), "got: {}", err);
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(
+            err.contains("unknown permission") && err.contains("audio.telepathy"),
+            "got: {}",
+            err,
+        );
     }
 
     #[test]
-    fn voice_validator_requires_audio_input_for_stt() {
-        let d = decl("Whisper", &["stt"]);
+    fn capability_validator_requires_every_declared_permission() {
+        let d = cap("voice", "Whisper", &["audio.input"]);
         let perms = perms_with(&[]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.input"), "got: {}", err);
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(
+            err.contains("audio.input") && err.contains("not granted"),
+            "got: {}",
+            err,
+        );
     }
 
     #[test]
-    fn voice_validator_requires_audio_output_for_tts() {
-        let d = decl("Piper", &["tts"]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.output"), "got: {}", err);
-    }
-
-    #[test]
-    fn voice_validator_accepts_valid_stt_with_permission() {
-        let d = decl("Whisper", &["stt"]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        validate_voice_capability(&d, &perms).expect("should validate");
-    }
-
-    #[test]
-    fn voice_validator_accepts_combined_modes_with_both_permissions() {
-        let d = decl("Voice", &["stt", "tts", "wake_word"]);
+    fn capability_validator_accepts_when_all_permissions_granted() {
+        let d = cap("voice", "Whisper", &["audio.input", "audio.output"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
-        validate_voice_capability(&d, &perms).expect("should validate");
+        validate_capability(&d, &perms).expect("should validate");
     }
 
     #[test]
-    fn voice_validator_wake_word_requires_audio_input() {
-        let d = decl("Porcupine", &["wake_word"]);
+    fn capability_validator_accepts_no_permissions() {
+        // Capabilities that genuinely don't need any permission (e.g. a
+        // pure-CPU OCR sidecar that takes images via stdin) should
+        // validate cleanly with an empty permission list.
+        let d = cap("ocr", "Tesseract", &[]);
         let perms = perms_with(&[]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.input"), "got: {}", err);
+        validate_capability(&d, &perms).expect("should validate");
+    }
+
+    #[test]
+    fn capability_validator_does_not_branch_on_kind() {
+        // Two capabilities with identical permission requirements but
+        // different `kind` values both validate identically — proves
+        // the validator does not enumerate kinds.
+        let perms = perms_with(&[Permission::AudioInput]);
+        for kind in ["voice", "ocr", "agent", "foot_pedal", "eeg"] {
+            let d = cap(kind, "Anything", &["audio.input"]);
+            validate_capability(&d, &perms).expect("should validate");
+        }
+    }
+
+    #[test]
+    fn legacy_voice_payload_is_translated_into_generic_capability() {
+        // Existing local-voice plugin sends `{ "voice": { "name": ...,
+        // "modes": ["stt"] } }`. After Phase 7 core synthesizes a
+        // generic `CapabilityDeclaration { kind: "voice", ... }` with
+        // permissions derived from the legacy mode list.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Local Whisper STT",
+                    "modes": ["stt"],
+                    "endpoint": "stdio"
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-test", value)
+            .expect("parses");
+        assert_eq!(result.capabilities.len(), 1);
+        let cap = &result.capabilities[0];
+        assert_eq!(cap.kind, "voice");
+        assert_eq!(cap.name, "Local Whisper STT");
+        assert_eq!(cap.permissions, vec!["audio.input"]);
+        assert_eq!(
+            cap.params.get("modes").and_then(|m| m.as_array()).unwrap().len(),
+            1,
+        );
+        assert_eq!(
+            cap.params.get("endpoint").and_then(|e| e.as_str()),
+            Some("stdio"),
+        );
+    }
+
+    #[test]
+    fn legacy_voice_payload_with_tts_mode_maps_to_audio_output() {
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Piper",
+                    "modes": ["tts"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-tts", value)
+            .expect("parses");
+        assert_eq!(result.capabilities[0].permissions, vec!["audio.output"]);
+    }
+
+    #[test]
+    fn legacy_voice_payload_with_combined_modes_dedupes_permissions() {
+        // stt + wake_word both map to audio.input; tts maps to
+        // audio.output. The legacy translator must not produce
+        // duplicates.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Combined",
+                    "modes": ["stt", "wake_word", "tts"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-combined", value)
+            .expect("parses");
+        let perms = &result.capabilities[0].permissions;
+        assert_eq!(perms.len(), 2);
+        assert!(perms.contains(&"audio.input".to_string()));
+        assert!(perms.contains(&"audio.output".to_string()));
+    }
+
+    #[test]
+    fn canonical_capabilities_list_is_preserved_alongside_legacy_voice_field() {
+        // A plugin in the middle of migrating may send both shapes
+        // simultaneously. Canonical entries come first, legacy
+        // translation appended.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "capabilities": [
+                    {
+                        "kind": "ocr",
+                        "name": "Tesseract",
+                        "permissions": []
+                    }
+                ],
+                "voice": {
+                    "name": "Whisper",
+                    "modes": ["stt"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("dual", value)
+            .expect("parses");
+        assert_eq!(result.capabilities.len(), 2);
+        assert_eq!(result.capabilities[0].kind, "ocr");
+        assert_eq!(result.capabilities[1].kind, "voice");
     }
 }
 

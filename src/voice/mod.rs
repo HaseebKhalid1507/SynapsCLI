@@ -9,8 +9,8 @@
 //!   listening indicator (forthcoming `state` module).
 //!
 //! Voice metadata (display name, modes, endpoint) is declared via the
-//! Phase 2 extension contract — see
-//! `crate::extensions::runtime::process::VoiceCapabilityDeclaration`.
+//! generic Phase 7 capability contract — see
+//! `crate::extensions::runtime::process::CapabilityDeclaration`.
 
 pub mod discovery;
 pub mod manager;
