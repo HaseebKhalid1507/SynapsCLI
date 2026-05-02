@@ -97,7 +97,17 @@ impl SidecarUiState {
             "no plugin provides a sidecar binary; install a sidecar-providing plugin from synaps-skills"
                 .to_string()
         })?;
+        Self::spawn_for(sidecar, spawn_args, plugin_info).await
+    }
 
+    /// Spawn a [`SidecarUiState`] for a specific [`DiscoveredSidecar`]
+    /// — used by the multi-sidecar host (Phase 8 8B) which discovers
+    /// every sidecar and keys instances by plugin id.
+    pub async fn spawn_for(
+        sidecar: DiscoveredSidecar,
+        spawn_args: Option<SidecarSpawnArgs>,
+        plugin_info: Option<&synaps_cli::extensions::info::PluginInfo>,
+    ) -> Result<Self, String> {
         if !sidecar.binary.is_file() {
             return Err(format!(
                 "sidecar binary not found at {} — run the plugin's setup.sh first",
@@ -188,8 +198,8 @@ fn format_status_line(
 /// Final transcripts are inserted at the cursor position (with a
 /// leading space when the existing input doesn't already end in
 /// whitespace), so the user can keep dictating into the same line.
-pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
-    let Some(v) = app.sidecar.as_mut() else {
+pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecycleEvent) {
+    let Some(v) = app.sidecars.get_mut(plugin_id) else {
         return;
     };
     match event {
@@ -237,7 +247,7 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
             if !armed {
                 // Re-borrow because insert_transcript_into_input took
                 // a mutable borrow of `app`.
-                if let Some(v) = app.sidecar.as_mut() {
+                if let Some(v) = app.sidecars.get_mut(plugin_id) {
                     v.status = SidecarUiStatus::Idle;
                 }
             }
@@ -250,8 +260,13 @@ pub(crate) fn handle_event(app: &mut App, event: SidecarLifecycleEvent) {
             )));
         }
         SidecarLifecycleEvent::Exited => {
-            app.push_msg(ChatMessage::System("sidecar exited".to_string()));
-            app.sidecar = None;
+            let label = app
+                .sidecars
+                .get(plugin_id)
+                .and_then(|s| s.display_name.clone())
+                .unwrap_or_else(|| "sidecar".to_string());
+            app.push_msg(ChatMessage::System(format!("{label} exited")));
+            app.sidecars.remove(plugin_id);
         }
     }
 }

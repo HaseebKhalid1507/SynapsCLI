@@ -150,10 +150,11 @@ pub(crate) struct App {
     /// immediately after MouseDown(Right). We suppress only within a short TTL
     /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
     pub(crate) suppress_paste_until: Option<std::time::Instant>,
-    /// Active voice dictation state (Some after the first /voice toggle).
-    /// Holds the sidecar manager + UI status; the event loop drains its
-    /// event stream and updates `status` accordingly.
-    pub(crate) sidecar: Option<super::sidecar::SidecarUiState>,
+    /// Active sidecar instances keyed by plugin id (manifest name).
+    ///
+    /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
+    /// multiple plugin-claimed sidecars can be hosted concurrently.
+    pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
     /// Live keybind registry — held so /settings can hot-swap voice toggle.
@@ -235,7 +236,7 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
-            sidecar: None,
+            sidecars: std::collections::HashMap::new(),
             active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             keybinds: None,
         }

@@ -9,18 +9,17 @@ use ratatui::{
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation, Shader};
 
-/// Build the sidecar indicator pill rendered after the status span when
-/// a sidecar plugin is active. Returns `None` when no sidecar is bound.
-/// (Display labels here are placeholders pending a plugin-provided
-/// pill schema — see Phase 7 plan, deferred slice.)
-pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> {
-    let sidecar = app.sidecar.as_ref()?;
+/// Build a single sidecar pill segment for one `SidecarUiState`.
+fn sidecar_pill_segment(
+    sidecar: &super::sidecar::SidecarUiState,
+    spinner_frame: usize,
+) -> Span<'static> {
     let label = sidecar.display_name.as_deref().unwrap_or("sidecar");
-    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, app.spinner_frame);
+    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, spinner_frame);
     let color = match &sidecar.status {
         super::sidecar::SidecarUiStatus::Idle => {
             if sidecar.armed {
-                let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
                 let base = match THEME.load().status_streaming {
                     Color::Rgb(r, g, b) => (r, g, b),
                     _ => (220, 80, 80),
@@ -35,7 +34,7 @@ pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> 
             }
         }
         super::sidecar::SidecarUiStatus::Listening => {
-            let pulse = ((app.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
             let base = match THEME.load().status_streaming {
                 Color::Rgb(r, g, b) => (r, g, b),
                 _ => (220, 80, 80),
@@ -53,10 +52,46 @@ pub(crate) fn sidecar_pill_span(app: &super::app::App) -> Option<Span<'static>> 
         super::sidecar::SidecarUiStatus::Transcribing => Modifier::empty(),
         _ => Modifier::BOLD,
     };
-    Some(Span::styled(
-        text,
-        Style::default().fg(color).add_modifier(modifier),
-    ))
+    Span::styled(text, Style::default().fg(color).add_modifier(modifier))
+}
+
+/// Build sidecar pill spans for all active sidecars, ordered by
+/// importance (desc) then display_name alphabetical (Phase 8 8B.3).
+///
+/// Each segment is preceded by a vertical separator so the caller can
+/// concatenate the result onto a status line. Returns an empty vec
+/// when no sidecars are active.
+pub(crate) fn sidecar_pill_spans(
+    app: &super::app::App,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+) -> Vec<Span<'static>> {
+    if app.sidecars.is_empty() {
+        return Vec::new();
+    }
+    let claims = registry.lifecycle_claims();
+    let importance_for = |pid: &str| -> i32 {
+        claims.iter().find(|c| c.plugin == pid).map(|c| c.importance).unwrap_or(0)
+    };
+    let mut entries: Vec<(&String, &super::sidecar::SidecarUiState)> =
+        app.sidecars.iter().collect();
+    entries.sort_by(|a, b| {
+        let imp_a = importance_for(a.0);
+        let imp_b = importance_for(b.0);
+        // Higher importance first; tiebreak alphabetical by display name then plugin id.
+        imp_b.cmp(&imp_a)
+            .then_with(|| {
+                let an = a.1.display_name.as_deref().unwrap_or(a.0.as_str());
+                let bn = b.1.display_name.as_deref().unwrap_or(b.0.as_str());
+                an.cmp(bn)
+            })
+            .then_with(|| a.0.cmp(b.0))
+    });
+    let mut spans = Vec::with_capacity(entries.len() * 2);
+    for (_pid, state) in entries {
+        spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
+        spans.push(sidecar_pill_segment(state, app.spinner_frame));
+    }
+    spans
 }
 
 /// Pure helper backing [`sidecar_pill_span`] — returns the rendered
@@ -95,10 +130,16 @@ mod sidecar_pill_tests {
         super::super::app::App::new(Session::new("test", "medium", None))
     }
 
+    fn empty_registry() -> std::sync::Arc<synaps_cli::skills::registry::CommandRegistry> {
+        std::sync::Arc::new(synaps_cli::skills::registry::CommandRegistry::new_with_plugins(
+            &[], vec![], vec![],
+        ))
+    }
+
     #[test]
-    fn pill_is_none_when_sidecar_inactive() {
+    fn pill_returns_empty_when_no_sidecars() {
         let app = fresh_app();
-        assert!(sidecar_pill_span(&app).is_none());
+        assert!(sidecar_pill_spans(&app, &empty_registry()).is_empty());
     }
 
     #[test]
@@ -351,9 +392,8 @@ pub(crate) fn draw(
                 Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
                 status_span,
             ];
-            if let Some(pill) = sidecar_pill_span(app) {
-                spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
-                spans.push(pill);
+            for span in sidecar_pill_spans(app, registry) {
+                spans.push(span);
             }
             spans
         }))
