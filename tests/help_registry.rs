@@ -177,6 +177,16 @@ fn help_entry_deserializes_when_usage_and_examples_are_omitted() {
 }
 
 #[test]
+fn command_categories_group_common_core_and_session_commands() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    assert_eq!(registry.entry_by_command("/model").map(|entry| entry.category.as_str()), Some("Core"));
+    assert_eq!(registry.entry_by_command("/settings").map(|entry| entry.category.as_str()), Some("Core"));
+    assert_eq!(registry.entry_by_command("/clear").map(|entry| entry.category.as_str()), Some("Core"));
+    assert_eq!(registry.entry_by_command("/sessions").map(|entry| entry.category.as_str()), Some("Sessions"));
+}
+
+#[test]
 fn render_entry_does_not_duplicate_related_from_body_lines() {
     let entry = HelpEntry {
         id: "settings".to_string(),
