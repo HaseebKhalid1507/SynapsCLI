@@ -117,15 +117,13 @@ impl VoiceUiState {
         .await
         .map_err(|err: VoiceManagerError| format!("failed to start voice sidecar: {}", err))?;
 
-        // Best-effort: read compiled backend info from the sidecar. This is
-        // a one-shot cheap call (`--print-build-info`); failures are logged
-        // and ignored so we never block voice startup on it.
-        // TODO(D3 wiring): expose a "[Rebuild now]" button in /settings →
-        //   Voice that invokes `crate::voice::rebuild::rebuild_with_backend`
-        //   when the selected backend differs from `compiled_backend`.
-        let compiled_backend =
-            synaps_cli::voice::discovery::read_build_info_with_plugin(&sidecar.binary, plugin_info)
-                .map(|i| i.backend);
+        // Read the sidecar's compiled backend straight from the cached
+        // `info.get` response (Phase 5). Falls back to None when the plugin
+        // hasn't advertised build info yet — the value is only used for the
+        // human-readable status line.
+        let compiled_backend = plugin_info
+            .and_then(|info| info.build.as_ref())
+            .map(|b| b.backend.clone());
 
         Ok(Self {
             manager,

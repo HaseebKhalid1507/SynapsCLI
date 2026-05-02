@@ -73,138 +73,6 @@ pub fn discover() -> Option<DiscoveredVoiceSidecar> {
     discover_in(&plugins)
 }
 
-/// Build-info reported by the sidecar via `--print-build-info`.
-///
-/// One JSON line on stdout looking like:
-/// ```json
-/// {"backend":"cpu","features":["local-stt"],"version":"0.1.0"}
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidecarBuildInfo {
-    /// "cpu" | "cuda" | "metal" | "vulkan" | "openblas" (best-effort).
-    pub backend: String,
-    pub features: Vec<String>,
-    pub version: String,
-}
-
-#[derive(serde::Deserialize)]
-struct RawBuildInfo {
-    backend: String,
-    #[serde(default)]
-    features: Vec<String>,
-    #[serde(default)]
-    version: String,
-}
-
-/// Spawn the sidecar binary with `--print-build-info`, parse its single-line
-/// JSON response, and return the compiled backend info. Returns `None` if
-/// the binary is missing, exits nonzero, or emits unparseable output. Logs a
-/// warning via `tracing::warn!` on failure but never panics.
-pub fn read_build_info(binary: &Path) -> Option<SidecarBuildInfo> {
-    read_build_info_with_plugin(binary, None)
-}
-
-/// Return plugin-advertised build info when available, otherwise fall back to
-/// spawning the sidecar with `--print-build-info`.
-pub fn read_build_info_with_plugin(
-    binary: &Path,
-    plugin_info: Option<&crate::extensions::info::PluginInfo>,
-) -> Option<SidecarBuildInfo> {
-    if let Some(build) = plugin_info.and_then(|info| info.build.as_ref()) {
-        return Some(SidecarBuildInfo {
-            backend: build.backend.clone(),
-            features: build.features.clone(),
-            version: build.version.clone(),
-        });
-    }
-
-    let output = match std::process::Command::new(binary)
-        .arg("--print-build-info")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!(
-                "voice: read_build_info: failed to spawn {}: {}",
-                binary.display(),
-                e
-            );
-            return None;
-        }
-    };
-    if !output.status.success() {
-        tracing::warn!(
-            "voice: read_build_info: {} exited with {:?}",
-            binary.display(),
-            output.status.code()
-        );
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().find(|l| !l.trim().is_empty())?;
-    match serde_json::from_str::<RawBuildInfo>(line.trim()) {
-        Ok(raw) => Some(SidecarBuildInfo {
-            backend: raw.backend,
-            features: raw.features,
-            version: raw.version,
-        }),
-        Err(e) => {
-            tracing::warn!(
-                "voice: read_build_info: failed to parse JSON from {}: {} (line was {:?})",
-                binary.display(),
-                e,
-                line
-            );
-            None
-        }
-    }
-}
-
-/// Best-effort detection of the most-capable accelerator the host could
-/// support. Order: cuda > metal > vulkan > openblas > cpu.
-///
-/// All probes are non-panicking and short-circuit fast.
-pub fn detect_host_backend() -> &'static str {
-    if probe_cuda() {
-        return "cuda";
-    }
-    if cfg!(target_os = "macos") {
-        return "metal";
-    }
-    if probe_command_ok("vulkaninfo", &[]) {
-        return "vulkan";
-    }
-    if probe_command_ok("pkg-config", &["--exists", "openblas"]) {
-        return "openblas";
-    }
-    "cpu"
-}
-
-fn probe_cuda() -> bool {
-    if Path::new("/usr/local/cuda").exists() {
-        return true;
-    }
-    if probe_command_ok("nvcc", &["--version"]) {
-        return true;
-    }
-    if probe_command_ok("nvidia-smi", &[]) {
-        return true;
-    }
-    false
-}
-
-fn probe_command_ok(cmd: &str, args: &[&str]) -> bool {
-    let mut command = std::process::Command::new(cmd);
-    command.args(args);
-    command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
-    command.stdin(std::process::Stdio::null());
-    match command.status() {
-        Ok(s) => s.success(),
-        Err(_) => false,
-    }
-}
-
 fn resolve_relative(root: &Path, candidate: &str) -> PathBuf {
     let path = PathBuf::from(candidate);
     if path.is_absolute() {
@@ -217,7 +85,6 @@ fn resolve_relative(root: &Path, candidate: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::info::{PluginBuildInfo, PluginInfo};
     use crate::skills::manifest::PluginManifest;
     use std::path::PathBuf;
 
@@ -285,12 +152,6 @@ mod tests {
             .as_deref()
         );
         assert_eq!(sidecar.protocol_version, 1);
-        let model = sidecar.model.as_ref().unwrap();
-        assert!(model.required_for_real_stt);
-        assert_eq!(
-            model.default_path.as_deref(),
-            Some("~/.synaps-cli/models/whisper/ggml-base.en.bin")
-        );
     }
 
     #[test]
@@ -323,75 +184,5 @@ mod tests {
         let plugins = vec![plain_plugin("zzz"), voice_plugin(), plain_plugin("aaa")];
         let sidecar = discover_in(&plugins).expect("should find voice plugin");
         assert_eq!(sidecar.plugin_name, "local-voice");
-    }
-
-    #[test]
-    fn detect_host_backend_returns_known_string() {
-        let b = detect_host_backend();
-        assert!(
-            matches!(b, "cpu" | "cuda" | "metal" | "vulkan" | "openblas"),
-            "unexpected backend: {}",
-            b
-        );
-    }
-
-    #[test]
-    fn read_build_info_returns_none_on_missing_binary() {
-        let p = PathBuf::from("/nonexistent/path/to/synaps-voice-plugin-xyz");
-        assert!(read_build_info(&p).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_build_info_parses_single_line_json() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            f,
-            "#!/bin/sh\necho '{{\"backend\":\"cuda\",\"features\":[\"cuda\"],\"version\":\"0.1.0\"}}'"
-        )
-        .unwrap();
-        let path = f.into_temp_path();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        let info = read_build_info(path.as_ref()).expect("should parse");
-        assert_eq!(info.backend, "cuda");
-        assert_eq!(info.features, vec!["cuda".to_string()]);
-        assert_eq!(info.version, "0.1.0");
-    }
-
-    #[test]
-    fn read_build_info_prefers_plugin_info_over_legacy_sidecar_spawn() {
-        let missing_binary = PathBuf::from("/definitely/missing/synaps-voice-plugin");
-        let plugin_info = PluginInfo {
-            build: Some(PluginBuildInfo {
-                backend: "cuda".to_string(),
-                features: vec!["local-stt".to_string(), "cuda".to_string()],
-                version: "0.2.0".to_string(),
-            }),
-            ..PluginInfo::default()
-        };
-
-        let info = read_build_info_with_plugin(&missing_binary, Some(&plugin_info))
-            .expect("plugin build info should avoid sidecar spawn fallback");
-        assert_eq!(info.backend, "cuda");
-        assert_eq!(info.features, vec!["local-stt", "cuda"]);
-        assert_eq!(info.version, "0.2.0");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_build_info_returns_none_on_garbage_output() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "#!/bin/sh\necho 'not json at all'").unwrap();
-        let path = f.into_temp_path();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        assert!(read_build_info(path.as_ref()).is_none());
     }
 }

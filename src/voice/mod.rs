@@ -13,8 +13,5 @@
 //! `crate::extensions::runtime::process::VoiceCapabilityDeclaration`.
 
 pub mod discovery;
-pub mod download;
 pub mod manager;
-pub mod models;
 pub mod protocol;
-pub mod rebuild;
