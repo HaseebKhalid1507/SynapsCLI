@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_manifest_parses_help_entries() {
+    fn plugin_manifest_parses_help_entries_with_usage_examples() {
         let json = r#"{
             "name": "web-tools",
             "help_entries": [
@@ -165,13 +165,22 @@ mod tests {
                     "topic": "Command",
                     "protected": false,
                     "common": false,
-                    "keywords": ["web", "search"]
+                    "keywords": ["web", "search"],
+                    "usage": "/web:search <query>",
+                    "examples": [
+                        {
+                            "command": "/web:search rust serde",
+                            "description": "Search for Rust serde resources."
+                        }
+                    ]
                 }
             ]
         }"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.help_entries.len(), 1);
         assert_eq!(m.help_entries[0].command, "/web:search");
+        assert_eq!(m.help_entries[0].usage.as_deref(), Some("/web:search <query>"));
+        assert_eq!(m.help_entries[0].examples[0].command, "/web:search rust serde");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use synaps_cli::help::{builtin_entries, render_entry, render_help, HelpEntry, HelpRegistry, HelpTopicKind};
+use synaps_cli::help::{builtin_entries, render_entry, render_help, source_display, HelpEntry, HelpExample, HelpRegistry, HelpTopicKind};
 
 fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpEntry {
     HelpEntry {
@@ -377,4 +377,71 @@ fn empty_search_orders_common_then_core_then_category_and_command() {
         .collect::<Vec<_>>();
 
     assert_eq!(commands, ["/model", "/settings", "/alpha", "/beta", "/zeta"]);
+}
+
+#[test]
+fn plugin_help_entry_with_usage_examples_loads_searches_and_forces_plugin_source() {
+    let plugin_entries = vec![HelpEntry {
+        id: "acme-sync".to_string(),
+        command: "/acme:sync".to_string(),
+        title: "Acme Sync".to_string(),
+        summary: "Sync Acme workspace state.".to_string(),
+        category: "Plugin".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: true,
+        common: false,
+        aliases: vec!["/acme:pull".to_string()],
+        keywords: vec!["workspace".to_string(), "sync".to_string()],
+        lines: vec!["Keeps the local Acme cache up to date.".to_string()],
+        usage: Some("/acme:sync [workspace]".to_string()),
+        examples: vec![HelpExample {
+            command: "/acme:sync docs".to_string(),
+            description: "Sync the docs workspace.".to_string(),
+        }],
+        related: vec!["/help plugins".to_string()],
+        source: Some("acme-tools".to_string()),
+    }];
+
+    let registry = HelpRegistry::new(builtin_entries(), plugin_entries);
+    let entry = registry.entry_by_command("/acme:sync").expect("plugin help entry should load");
+
+    assert!(!entry.protected, "plugin help entries must not remain protected");
+    assert_eq!(entry.usage.as_deref(), Some("/acme:sync [workspace]"));
+    assert_eq!(entry.examples[0].command, "/acme:sync docs");
+    assert_eq!(entry.source.as_deref(), Some("plugin acme-tools"));
+    assert_eq!(source_display(entry).as_deref(), Some("plugin acme-tools"));
+
+    let matches = registry.search("docs workspace");
+    assert!(
+        matches.iter().any(|entry| entry.command == "/acme:sync"),
+        "plugin help should be searchable by examples/keywords; got {:?}",
+        matches.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn plugin_help_entry_without_source_displays_generic_plugin_source() {
+    let plugin_entries = vec![HelpEntry {
+        id: "acme-status".to_string(),
+        command: "/acme:status".to_string(),
+        title: "Acme Status".to_string(),
+        summary: "Show Acme status.".to_string(),
+        category: "Plugin".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common: false,
+        aliases: vec![],
+        keywords: vec!["acme".to_string()],
+        lines: vec![],
+        usage: None,
+        examples: vec![],
+        related: vec![],
+        source: None,
+    }];
+
+    let registry = HelpRegistry::new(builtin_entries(), plugin_entries);
+    let entry = registry.entry_by_command("/acme:status").expect("plugin help entry should load");
+
+    assert_eq!(entry.source.as_deref(), Some("plugin"));
+    assert_eq!(source_display(entry).as_deref(), Some("plugin"));
 }

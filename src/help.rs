@@ -195,9 +195,7 @@ impl HelpRegistry {
             if entry.protected {
                 entry.protected = false;
             }
-            if entry.source.is_none() {
-                entry.source = Some("plugin".to_string());
-            }
+            entry.source = Some(plugin_source_label(entry.source.as_deref()));
             if seen.insert(entry.command.clone()) {
                 entries.push(entry);
             }
@@ -276,6 +274,13 @@ pub fn render_entry(entry: &HelpEntry) -> String {
 
     append_usage_examples_related(&mut lines, entry);
     lines.join("\n")
+}
+
+pub fn source_display(entry: &HelpEntry) -> Option<String> {
+    match entry.source.as_deref() {
+        Some(source) if !source.trim().is_empty() => Some(plugin_source_label(Some(source))),
+        _ => None,
+    }
 }
 
 fn append_usage_examples_related(lines: &mut Vec<String>, entry: &HelpEntry) {
@@ -400,6 +405,15 @@ fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     costs[b_chars.len()]
+}
+
+fn plugin_source_label(source: Option<&str>) -> String {
+    match source.map(str::trim).filter(|source| !source.is_empty()) {
+        None => "plugin".to_string(),
+        Some(source) if source.eq_ignore_ascii_case("plugin") => "plugin".to_string(),
+        Some(source) if source.to_ascii_lowercase().starts_with("plugin ") => source.to_string(),
+        Some(source) => format!("plugin {}", source),
+    }
 }
 
 fn protected_commands(entries: &[HelpEntry]) -> HashSet<String> {

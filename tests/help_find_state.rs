@@ -1,4 +1,4 @@
-use synaps_cli::help::{builtin_entries, HelpEntry, HelpFindState, HelpRegistry, HelpTopicKind};
+use synaps_cli::help::{builtin_entries, source_display, HelpEntry, HelpExample, HelpFindState, HelpRegistry, HelpTopicKind};
 
 fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpEntry {
     HelpEntry {
@@ -165,4 +165,44 @@ fn find_state_no_results_message_suggests_stable_queries() {
     let message = state.no_results_message();
     assert!(message.contains("No help matches for 'zzzz-no-match'."));
     assert!(message.contains("Try: model, settings, plugins, sessions, doctor"));
+}
+
+#[test]
+fn find_state_plugin_help_detail_preserves_usage_examples_and_source() {
+    let plugin_entries = vec![HelpEntry {
+        id: "acme-sync".to_string(),
+        command: "/acme:sync".to_string(),
+        title: "Acme Sync".to_string(),
+        summary: "Sync Acme workspace state.".to_string(),
+        category: "Plugin".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common: false,
+        aliases: vec!["/acme:pull".to_string()],
+        keywords: vec!["workspace".to_string()],
+        lines: vec![],
+        usage: Some("/acme:sync [workspace]".to_string()),
+        examples: vec![HelpExample {
+            command: "/acme:sync docs".to_string(),
+            description: "Sync the docs workspace.".to_string(),
+        }],
+        related: vec![],
+        source: Some("acme-tools".to_string()),
+    }];
+    let registry = HelpRegistry::new(builtin_entries(), plugin_entries);
+    let mut state = HelpFindState::new(registry.entries().to_vec(), "docs workspace");
+
+    assert!(
+        state.filtered_entries().iter().any(|entry| entry.command == "/acme:sync"),
+        "plugin entry should be searchable by example/details"
+    );
+    while state.selected().map(|entry| entry.command.as_str()) != Some("/acme:sync") {
+        state.move_down();
+    }
+    state.open_selected();
+    let detail = state.detail_entry().expect("plugin detail should open");
+
+    assert_eq!(detail.usage.as_deref(), Some("/acme:sync [workspace]"));
+    assert!(detail.examples.iter().any(|example| example.command == "/acme:sync docs"));
+    assert_eq!(source_display(detail).as_deref(), Some("plugin acme-tools"));
 }
