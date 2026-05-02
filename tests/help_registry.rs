@@ -21,6 +21,48 @@ fn test_entry(command: &str, title: &str, category: &str, common: bool) -> HelpE
 }
 
 #[test]
+fn help_topics_lists_branch_help_and_excludes_command_entries() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let rendered = render_help(&registry, Some("topics")).expect("topics help should render");
+
+    assert!(rendered.starts_with("Help topics"), "topics heading missing:\n{}", rendered);
+    assert!(rendered.contains("/help plugins"), "topics should include branch help:\n{}", rendered);
+    assert!(rendered.contains("/help sessions"), "topics should include conceptual branch help:\n{}", rendered);
+    assert!(rendered.contains("/help trust"), "topics should include conceptual trust branch help:\n{}", rendered);
+    assert!(!rendered.contains("/compact"), "topics should exclude command entries:\n{}", rendered);
+}
+
+#[test]
+fn help_reference_groups_all_entries_including_commands_and_plugins() {
+    let plugin_entries = vec![HelpEntry {
+        id: "acme-sync".to_string(),
+        command: "/acme:sync".to_string(),
+        title: "Acme Sync".to_string(),
+        summary: "Sync Acme workspace state.".to_string(),
+        category: "Plugin".to_string(),
+        topic: HelpTopicKind::Command,
+        protected: false,
+        common: false,
+        aliases: vec![],
+        keywords: vec![],
+        lines: vec![],
+        usage: None,
+        examples: vec![],
+        related: vec![],
+        source: Some("acme-tools".to_string()),
+    }];
+    let registry = HelpRegistry::new(builtin_entries(), plugin_entries);
+    let rendered = render_help(&registry, Some("reference")).expect("reference help should render");
+
+    assert!(rendered.starts_with("Help reference"), "reference heading missing:\n{}", rendered);
+    assert!(rendered.contains("Core"), "reference should group by category:\n{}", rendered);
+    assert!(rendered.contains("  /help — Fast paths for finding commands"), "reference should include root summary:\n{}", rendered);
+    assert!(rendered.contains("  /compact —"), "reference should include command entries:\n{}", rendered);
+    assert!(rendered.contains("Plugin"), "reference should include plugin category:\n{}", rendered);
+    assert!(rendered.contains("  /acme:sync — Sync Acme workspace state."), "reference should include plugin entries:\n{}", rendered);
+}
+
+#[test]
 fn base_help_is_brief_and_points_to_find() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let rendered = render_help(&registry, None).expect("base help should render");
