@@ -586,14 +586,16 @@ impl ExtensionManager {
         provider_required.sort_by(|a, b| a.0.cmp(&b.0));
 
         let env_lookup = |name: &str| std::env::var(name).ok();
-        let config_lookup = |key: &str| crate::config::read_config_value(key);
+        let plugin_config_lookup = |key: &str| crate::extensions::config_store::read_plugin_config(id, key);
+        let legacy_config_lookup = |key: &str| crate::config::read_config_value(key);
 
         Some(diagnose_extension_config(
             id,
             manifest_config,
             &provider_required,
             &env_lookup,
-            &config_lookup,
+            &plugin_config_lookup,
+            &legacy_config_lookup,
         ))
     }
 

@@ -927,7 +927,8 @@ pub async fn run(
                                                 let source_label = match &entry.source {
                                                     synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => format!("env override ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::SecretEnv(name) => format!("secret env ({})", name),
-                                                    synaps_cli::extensions::config::ConfigSource::ConfigKey(name) => format!("config key ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::PluginConfig => "plugin config".to_string(),
+                                                    synaps_cli::extensions::config::ConfigSource::LegacyConfigKey(name) => format!("legacy config key ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::Default => "default".to_string(),
                                                     synaps_cli::extensions::config::ConfigSource::Missing => "missing".to_string(),
                                                 };
