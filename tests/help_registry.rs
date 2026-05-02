@@ -1,4 +1,4 @@
-use synaps_cli::help::{builtin_entries, render_help, HelpEntry, HelpRegistry, HelpTopicKind};
+use synaps_cli::help::{builtin_entries, render_entry, render_help, HelpEntry, HelpRegistry, HelpTopicKind};
 
 #[test]
 fn base_help_is_brief_and_points_to_find() {
@@ -26,6 +26,18 @@ fn base_help_uses_polished_intro_copy() {
 }
 
 #[test]
+fn root_help_uses_common_paths_and_guides() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+    let rendered = render_help(&registry, None).expect("base help should render");
+
+    assert!(rendered.contains("Common paths"), "root should group fast paths:\n{}", rendered);
+    assert!(rendered.contains("Guides"), "root should include guide links:\n{}", rendered);
+    assert!(rendered.contains("/doctor"), "root should include diagnostics path:\n{}", rendered);
+    assert!(rendered.contains("/help sessions"), "root should link sessions guide:\n{}", rendered);
+    assert!(!rendered.contains("Common commands"), "phase 1 root should use common paths wording:\n{}", rendered);
+}
+
+#[test]
 fn branch_help_renders_specific_topic() {
     let registry = HelpRegistry::new(builtin_entries(), Vec::new());
     let rendered = render_help(&registry, Some("plugins")).expect("plugins help should render");
@@ -34,6 +46,53 @@ fn branch_help_renders_specific_topic() {
     assert!(rendered.contains("/plugins"), "plugins command missing:\n{}", rendered);
     assert!(rendered.contains("/help find"), "related discovery missing:\n{}", rendered);
     assert!(!rendered.contains("What would you like to do?"), "branch should not duplicate base help:\n{}", rendered);
+}
+
+#[test]
+fn phase_one_topics_render_from_help() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    for topic in ["sessions", "extensions", "trust", "compact", "chain"] {
+        let rendered = render_help(&registry, Some(topic))
+            .unwrap_or_else(|| panic!("{topic} help should render"));
+        assert!(
+            !rendered.contains("No help topic"),
+            "{topic} should be a concrete help entry:\n{}",
+            rendered
+        );
+        assert!(rendered.lines().count() >= 3, "{topic} help should have useful detail:\n{}", rendered);
+    }
+}
+
+#[test]
+fn phase_one_topics_are_searchable_by_keywords() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    for (query, command) in [
+        ("resume", "/help sessions"),
+        ("extension audit", "/help extensions"),
+        ("protected namespace", "/help trust"),
+        ("summarize history", "/compact"),
+        ("compaction history", "/chain"),
+    ] {
+        let matches = registry.search(query);
+        assert!(
+            matches.iter().any(|entry| entry.command == command),
+            "query {query:?} should find {command}; got {:?}",
+            matches.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn phase_one_command_entries_render_directly() {
+    let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+
+    for command in ["/compact", "/chain"] {
+        let entry = registry.entry_by_command(command).unwrap_or_else(|| panic!("{command} entry exists"));
+        let rendered = render_entry(entry);
+        assert!(rendered.contains(command), "{command} detail should show command usage:\n{}", rendered);
+    }
 }
 
 #[test]
