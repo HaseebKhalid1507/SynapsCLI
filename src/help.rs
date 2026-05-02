@@ -3,9 +3,10 @@ use std::collections::HashSet;
 
 const BUILTIN_HELP_JSON: &str = include_str!("../assets/help.json");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HelpTopicKind {
     Branch,
+    #[default]
     Command,
 }
 
@@ -21,9 +22,13 @@ pub struct HelpEntry {
     pub command: String,
     pub title: String,
     pub summary: String,
+    #[serde(default = "default_plugin_category")]
     pub category: String,
+    #[serde(default)]
     pub topic: HelpTopicKind,
+    #[serde(default)]
     pub protected: bool,
+    #[serde(default)]
     pub common: bool,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -399,6 +404,10 @@ impl HelpRegistry {
 
 pub fn builtin_entries() -> Vec<HelpEntry> {
     serde_json::from_str(BUILTIN_HELP_JSON).expect("assets/help.json must be valid help JSON")
+}
+
+fn default_plugin_category() -> String {
+    "Plugin".to_string()
 }
 
 fn category_sort_key(category: &str) -> u8 {

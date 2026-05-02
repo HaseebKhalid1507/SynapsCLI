@@ -16,36 +16,51 @@ Make SynapsCLI help beautiful, brief, discoverable, JSON-driven, and extensible 
 
 Built-in help content is generated from JSON lists. Code owns rendering, validation, protected namespace enforcement, and dispatch behavior; JSON owns copy, sections, commands, aliases, keywords, and branch membership.
 
-Plugin manifests may include a `help_entries` array with the same shape as built-in `HelpEntry` JSON. Rich plugin help supports optional `usage` and `examples` fields:
+Plugin manifests may include a `help` (or legacy `help_entries`) array. Each entry uses the same shape as built-in `HelpEntry` JSON, but author boilerplate is intentionally small: `category` defaults to `"Plugin"`, `topic` defaults to `"Command"`, and `protected` / `common` default to `false`. Rich plugin help supports optional `usage` and `examples` fields:
 
 ```json
 {
   "name": "acme-tools",
-  "help_entries": [
+  "commands": [
+    {
+      "name": "sync",
+      "description": "Sync Acme workspace state.",
+      "command": "acme-sync",
+      "args": []
+    }
+  ],
+  "help": [
     {
       "id": "acme-sync",
-      "command": "/acme:sync",
+      "command": "/acme-tools:sync",
       "title": "Acme Sync",
       "summary": "Sync Acme workspace state.",
-      "category": "Plugin",
-      "topic": "Command",
-      "protected": false,
-      "common": false,
       "aliases": ["/acme:pull"],
       "keywords": ["acme", "sync", "workspace"],
       "lines": ["Keeps the local Acme cache up to date."],
-      "usage": "/acme:sync [workspace]",
+      "usage": "/acme-tools:sync [workspace]",
       "examples": [
         {
-          "command": "/acme:sync docs",
+          "command": "/acme-tools:sync docs",
           "description": "Sync the docs workspace."
         }
       ],
       "related": ["/help plugins"]
+    },
+    {
+      "id": "acme-help",
+      "command": "/help acme",
+      "title": "Acme Tools",
+      "summary": "Commands and workflows from the Acme extension.",
+      "topic": "Branch",
+      "lines": ["Use /acme-tools:sync to refresh workspace data."],
+      "related": ["/acme-tools:sync", "/help find"]
     }
   ]
 }
 ```
+
+`/help <plugin-topic>` works for plugin entries such as `/help acme`, and all plugin help entries appear in `/help find` automatically. `help_entries` remains accepted for compatibility.
 
 Plugin help sources are assigned from the manifest name and shown in `/help find` detail as `Source: plugin <name>` (or `Source: plugin` when no name is available).
 
