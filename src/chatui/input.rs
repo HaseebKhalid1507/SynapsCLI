@@ -390,6 +390,9 @@ fn handle_key(
             return process_streaming_submit(app);
         }
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
+            if open_help_find_for_ambiguous_slash(app, registry) {
+                return InputAction::HelpFindOutcome;
+            }
             handle_tab_complete(app, registry);
             // Skip the tab_cycle reset below — we just set it.
             return InputAction::None;
@@ -499,6 +502,24 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
+    let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
+        return false;
+    };
+    let help_registry = synaps_cli::help::HelpRegistry::new(
+        synaps_cli::help::builtin_entries(),
+        registry.plugin_help_entries(),
+    );
+    if help_registry.command_prefix_match_count(&query) < 2 {
+        return false;
+    }
+    app.help_find = Some(synaps_cli::help::HelpFindState::new(
+        help_registry.entries().to_vec(),
+        &query,
+    ));
+    true
 }
 
 /// Tab completion for slash commands. First Tab completes to the longest
