@@ -43,6 +43,7 @@ pub struct HelpFindState {
     cursor: usize,
     scroll: usize,
     visible_height: usize,
+    detail_idx: Option<usize>,
 }
 
 impl HelpFindState {
@@ -53,6 +54,7 @@ impl HelpFindState {
             cursor: 0,
             scroll: 0,
             visible_height: 10,
+            detail_idx: None,
         }
     }
 
@@ -86,6 +88,20 @@ impl HelpFindState {
 
     pub fn selected(&self) -> Option<&HelpEntry> {
         self.filtered_entries().get(self.cursor).copied()
+    }
+
+    pub fn open_selected(&mut self) {
+        let selected_command = self.selected().map(|entry| entry.command.clone());
+        self.detail_idx = selected_command
+            .and_then(|command| self.entries.iter().position(|entry| entry.command == command));
+    }
+
+    pub fn close_detail(&mut self) {
+        self.detail_idx = None;
+    }
+
+    pub fn detail_entry(&self) -> Option<&HelpEntry> {
+        self.detail_idx.and_then(|idx| self.entries.get(idx))
     }
 
     pub fn move_down(&mut self) {
