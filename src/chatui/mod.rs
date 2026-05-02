@@ -1600,6 +1600,118 @@ pub async fn run(
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
                             }
+                            InputAction::PluginEditorOpen { plugin_id, category, field } => {
+                                let manager = ext_mgr_shared.read().await;
+                                match manager.settings_editor_open(&plugin_id, &category, &field).await
+                                    .and_then(settings::plugin_editor::render_from_open_result)
+                                {
+                                    Ok(render) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = None;
+                                            state.edit_mode = Some(settings::ActiveEditor::PluginCustom {
+                                                plugin_id: plugin_id.clone(),
+                                                category: category.clone(),
+                                                field: field.clone(),
+                                                render: settings::plugin_editor::PluginEditorSession {
+                                                    plugin_id,
+                                                    category,
+                                                    field,
+                                                    render,
+                                                },
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = Some((
+                                                format!("plugin.{}.{}", plugin_id, field),
+                                                err,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::PluginEditorKey { plugin_id, category, field, key } => {
+                                let wire_key = settings::plugin_editor::key_to_wire(key);
+                                if wire_key == "Enter" {
+                                    let selected = app.settings.as_ref().and_then(|state| {
+                                        match &state.edit_mode {
+                                            Some(settings::ActiveEditor::PluginCustom { render, .. }) => {
+                                                let cursor = render.render.cursor.unwrap_or(0);
+                                                render.render.rows.get(cursor).and_then(|r| r.data.clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    });
+                                    if let Some(value) = selected {
+                                        let manager = ext_mgr_shared.read().await;
+                                        match manager.settings_editor_commit(&plugin_id, &category, &field, value.clone()).await {
+                                            Ok(reply) => {
+                                                let effect = settings::plugin_editor::effect_from_commit_reply(
+                                                    &plugin_id,
+                                                    &field,
+                                                    reply,
+                                                );
+                                                match effect {
+                                                    settings::plugin_editor::PluginEditorEffect::None => {}
+                                                    settings::plugin_editor::PluginEditorEffect::ConfigWrite { plugin_id, key, value } => {
+                                                        match synaps_cli::extensions::config_store::write_plugin_config(&plugin_id, &key, &value) {
+                                                            Ok(()) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.edit_mode = None;
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), "saved".to_string()));
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), err.to_string()));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    settings::plugin_editor::PluginEditorEffect::InvokeCommand { plugin_id, command, args } => {
+                                                        if let Some(state) = app.settings.as_mut() {
+                                                            state.edit_mode = None;
+                                                            state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), "download started".to_string()));
+                                                        }
+                                                        commands::execute_interactive_plugin_command_by_parts(
+                                                            &plugin_id,
+                                                            &command,
+                                                            args,
+                                                            &manager,
+                                                            &mut app,
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                if let Some(state) = app.settings.as_mut() {
+                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let manager = ext_mgr_shared.read().await;
+                                    match manager.settings_editor_key(&plugin_id, &category, &field, &wire_key).await
+                                        .and_then(settings::plugin_editor::render_from_key_result)
+                                    {
+                                        Ok(Some(render)) => {
+                                            if let Some(settings::ActiveEditor::PluginCustom { render: session, .. }) =
+                                                app.settings.as_mut().and_then(|s| s.edit_mode.as_mut())
+                                            {
+                                                session.render = render;
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            if let Some(state) = app.settings.as_mut() {
+                                                state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             InputAction::StartModelDownload(id) => {
                                 let entry_opt = synaps_cli::voice::models::find_by_id(&id);
                                 let entry = match entry_opt {

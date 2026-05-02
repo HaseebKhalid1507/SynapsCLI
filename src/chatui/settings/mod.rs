@@ -5,6 +5,7 @@ pub(crate) mod defs;
 pub(crate) mod schema;
 pub(crate) mod draw;
 pub(crate) mod input;
+pub(crate) mod plugin_editor;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
@@ -226,15 +227,12 @@ pub(super) enum ActiveEditor {
         numeric: bool,
         error: Option<String>,
     },
-    /// Picker editor for a plugin-declared `picker` field. Options are
-    /// taken from the manifest declaration; selection commits via
-    /// `InputOutcome::PluginApply`.
-    #[allow(dead_code)] // wired by render path in a follow-up
-    PluginPicker {
+    /// Plugin-owned custom editor render returned by `settings.editor.open`.
+    PluginCustom {
         plugin_id: String,
-        key: String,
-        options: Vec<String>,
-        cursor: usize,
+        category: String,
+        field: String,
+        render: crate::chatui::settings::plugin_editor::PluginEditorSession,
     },
 }
 

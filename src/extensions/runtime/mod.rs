@@ -123,6 +123,21 @@ pub trait ExtensionHandler: Send + Sync {
         Err("extension runtime does not support info.get".to_string())
     }
 
+    /// Open a plugin-owned custom settings editor and return its initial render payload.
+    async fn settings_editor_open(&self, _category: &str, _field: &str) -> Result<Value, String> {
+        Err("extension runtime does not support settings.editor.open".to_string())
+    }
+
+    /// Forward a keypress to the active plugin-owned custom settings editor.
+    async fn settings_editor_key(&self, _category: &str, _field: &str, _key: &str) -> Result<Value, String> {
+        Err("extension runtime does not support settings.editor.key".to_string())
+    }
+
+    /// Ask the plugin to commit a custom editor value selected by the UI.
+    async fn settings_editor_commit(&self, _category: &str, _field: &str, _value: Value) -> Result<Value, String> {
+        Err("extension runtime does not support settings.editor.commit".to_string())
+    }
+
     /// Gracefully shut down the extension.
     async fn shutdown(&self);
 

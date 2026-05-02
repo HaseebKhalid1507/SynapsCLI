@@ -495,6 +495,50 @@ impl ExtensionManager {
         handler.invoke_command(command, args, request_id, sink).await
     }
 
+    pub async fn settings_editor_open(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_open(category, field).await
+    }
+
+    pub async fn settings_editor_key(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_key(category, field, key).await
+    }
+
+    pub async fn settings_editor_commit(
+        &self,
+        id: &str,
+        category: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let handler = self
+            .extensions
+            .get(id)
+            .ok_or_else(|| format!("unknown extension '{}'", id))?
+            .clone();
+        handler.settings_editor_commit(category, field, value).await
+    }
+
     /// Return all cached plugin info sorted by extension id.
     pub fn plugin_infos(&self) -> Vec<(&str, &PluginInfo)> {
         let mut entries: Vec<_> = self

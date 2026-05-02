@@ -165,11 +165,27 @@ pub(crate) async fn execute_interactive_plugin_command_events(
         return;
     };
 
-    let request_id = uuid::Uuid::new_v4().to_string();
     let args: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
+    execute_interactive_plugin_command_by_parts(
+        plugin_extension_id,
+        &command.name,
+        args,
+        manager,
+        app,
+    ).await;
+}
+
+pub(crate) async fn execute_interactive_plugin_command_by_parts(
+    plugin_extension_id: &str,
+    command_name: &str,
+    args: Vec<String>,
+    manager: &synaps_cli::extensions::manager::ExtensionManager,
+    app: &mut App,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InvokeCommandEvent>();
     let result = manager
-        .invoke_command(plugin_extension_id, &command.name, args, &request_id, tx)
+        .invoke_command(plugin_extension_id, command_name, args, &request_id, tx)
         .await;
 
     while let Ok(event) = rx.try_recv() {
@@ -185,8 +201,8 @@ pub(crate) async fn execute_interactive_plugin_command_events(
 
     if let Err(err) = result {
         app.push_msg(ChatMessage::Error(format!(
-            "interactive plugin command /{}:{} failed: {}",
-            command.plugin, command.name, err
+            "interactive plugin command {}:{} failed: {}",
+            plugin_extension_id, command_name, err
         )));
     }
 }

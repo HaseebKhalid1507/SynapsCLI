@@ -1748,6 +1748,49 @@ impl ExtensionHandler for ProcessExtension {
             .map_err(|e| format!("Invalid info.get response from extension '{}': {}", self.id, e))
     }
 
+    async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {
+        let params = crate::extensions::settings_editor::SettingsEditorOpenParams {
+            category: category.to_string(),
+            field: field.to_string(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.open", serde_json::to_value(params).map_err(|e| e.to_string())?),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.open timed out", self.id))?
+    }
+
+    async fn settings_editor_key(&self, category: &str, field: &str, key: &str) -> Result<Value, String> {
+        let mut params = serde_json::to_value(crate::extensions::settings_editor::SettingsEditorKeyParams {
+            key: key.to_string(),
+        }).map_err(|e| e.to_string())?;
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("category".to_string(), Value::String(category.to_string()));
+            obj.insert("field".to_string(), Value::String(field.to_string()));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.key", params),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.key timed out", self.id))?
+    }
+
+    async fn settings_editor_commit(&self, category: &str, field: &str, value: Value) -> Result<Value, String> {
+        let params = serde_json::json!({
+            "category": category,
+            "field": field,
+            "value": value,
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.commit", params),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.commit timed out", self.id))?
+    }
+
     async fn shutdown(&self) {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),

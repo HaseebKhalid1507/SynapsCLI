@@ -45,6 +45,9 @@ pub(crate) fn render(
     if let Some(ActiveEditor::ModelBrowser { cursor, rows }) = &state.edit_mode {
         render_model_browser(frame, panes[1], rows, *cursor, download);
     }
+    if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
+        render_plugin_custom_editor(frame, panes[1], render);
+    }
 }
 
 fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
@@ -231,7 +234,12 @@ fn render_plugin_category(
                     s
                 }
                 (None, PE::Cycler { .. }) => format!("◀ {} ▶", current),
-                (_, PE::Custom) => "(custom — not yet editable)".to_string(),
+                (Some(super::ActiveEditor::PluginCustom { plugin_id, field: active_field, .. }), PE::Custom)
+                    if *plugin_id == cat.plugin && *active_field == field.key =>
+                {
+                    "(custom editor open)".to_string()
+                }
+                (_, PE::Custom) => "(custom — Enter to edit)".to_string(),
                 _ => current.clone(),
             }
         } else if matches!(field.editor, PE::Custom) {
@@ -476,6 +484,65 @@ fn mask_key(key: &str) -> String {
     let n = key.len();
     if n <= 8 { return "*".repeat(n); }
     format!("***...{}", &key[n - 4..])
+}
+
+
+fn render_plugin_custom_editor(
+    frame: &mut Frame,
+    area: Rect,
+    session: &super::plugin_editor::PluginEditorSession,
+) {
+    let rows = &session.render.rows;
+    let cursor = session.render.cursor.unwrap_or(0);
+    let footer_lines: u16 = if session.render.footer.is_some() { 1 } else { 0 };
+    let w = area.width.saturating_sub(4).clamp(40, 100);
+    let needed = rows.len() as u16 + 2 + footer_lines;
+    let h = needed.clamp(3, area.height.saturating_sub(2).max(3));
+    let rect = Rect { x: area.x + 2, y: area.y + 2, width: w, height: h };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(format!(" {} · {} ", session.plugin_id, session.field))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.load().border_active))
+        .style(Style::default().bg(THEME.load().bg));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let (list_area, footer_area) = if footer_lines > 0 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(footer_lines)])
+            .split(inner);
+        (split[0], Some(split[1]))
+    } else {
+        (inner, None)
+    };
+
+    let visible_height = list_area.height as usize;
+    let scroll_offset = if cursor >= visible_height { cursor - visible_height + 1 } else { 0 };
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(visible_height) {
+        let mut style = if i == cursor {
+            Style::default().fg(THEME.load().claude_label)
+        } else {
+            Style::default().fg(THEME.load().claude_text)
+        };
+        if !row.selectable {
+            style = Style::default().fg(THEME.load().help_fg);
+        }
+        let marker = row.marker.as_deref().unwrap_or(" ");
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(format!("{}  {}", marker, row.label), style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
+    if let (Some(area), Some(footer)) = (footer_area, &session.render.footer) {
+        frame.render_widget(
+            Paragraph::new(footer.clone()).style(Style::default().fg(THEME.load().help_fg)),
+            area,
+        );
+    }
 }
 
 fn render_model_browser(

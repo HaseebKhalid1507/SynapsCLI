@@ -11,10 +11,10 @@ pub(crate) enum InputOutcome {
     /// Apply a plugin-declared settings field. Written to the plugin's
     /// own namespaced config (`~/.synaps-cli/plugins/<id>/config`).
     PluginApply { plugin_id: String, key: String, value: String },
-    /// User attempted to open a `custom` plugin field — the editor
-    /// overlay is not implemented yet, so the upper layer should show
-    /// a friendly note. Path B Phase 4.
-    PluginCustomNotImplemented { plugin_id: String, key: String },
+    /// User requested to open a plugin-declared custom editor.
+    /// The async upper layer calls `settings.editor.open` and installs
+    /// `ActiveEditor::PluginCustom` with the returned render payload.
+    PluginCustomOpen { plugin_id: String, category: String, key: String },
     SetProviderKey { provider_id: String, value: String },
     TogglePlugin { name: String, enabled: bool },
     PreviewTheme { name: String },
@@ -209,8 +209,13 @@ pub(crate) fn handle_event(
                     };
                 }
                 (KeyCode::Enter, PE::Custom) => {
-                    return InputOutcome::PluginCustomNotImplemented {
+                    let category = state
+                        .current_plugin_category(snap)
+                        .map(|c| c.id.clone())
+                        .unwrap_or_default();
+                    return InputOutcome::PluginCustomOpen {
                         plugin_id,
+                        category,
                         key: field.key.clone(),
                     };
                 }
@@ -569,24 +574,7 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
-        ActiveEditor::PluginPicker { plugin_id, key: field_key, options, cursor } => {
-            match key.code {
-                KeyCode::Up => {
-                    if *cursor > 0 { *cursor -= 1; }
-                    InputOutcome::None
-                }
-                KeyCode::Down => {
-                    if *cursor + 1 < options.len() { *cursor += 1; }
-                    InputOutcome::None
-                }
-                KeyCode::Enter => InputOutcome::PluginApply {
-                    plugin_id: plugin_id.clone(),
-                    key: field_key.clone(),
-                    value: options[*cursor].clone(),
-                },
-                _ => InputOutcome::None,
-            }
-        }
+        ActiveEditor::PluginCustom { .. } => InputOutcome::None,
     }
 }
 
@@ -857,24 +845,25 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_plugin_custom_field_does_not_open_editor() {
+    fn enter_on_plugin_custom_field_requests_plugin_editor_open() {
         let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
             plugin: "demo".into(),
-            id: "demo.main".into(),
+            id: "voice".into(),
             label: "Demo".into(),
             fields: vec![plugin_field("body", "Body", PluginSettingsEditor::Custom)],
         }]);
         let mut state = at_first_plugin_cat(&s);
         let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
         match out {
-            InputOutcome::PluginCustomNotImplemented { plugin_id, key } => {
+            InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
                 assert_eq!(plugin_id, "demo");
+                assert_eq!(category, "voice");
                 assert_eq!(key, "body");
             }
-            other => panic!("expected PluginCustomNotImplemented, got {:?}",
+            other => panic!("expected PluginCustomOpen, got {:?}",
                 std::mem::discriminant(&other)),
         }
-        assert!(state.edit_mode.is_none(), "must not open an editor for custom");
+        assert!(state.edit_mode.is_none(), "async upper layer opens the editor after RPC returns");
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub(super) enum InputAction {
     PingModels,
     /// Settings model browser asked to start a whisper download.
     StartModelDownload(String),
+    /// Open a plugin-owned custom settings editor via `settings.editor.open`.
+    PluginEditorOpen { plugin_id: String, category: String, field: String },
+    /// Forward a keypress to the active plugin-owned custom settings editor.
+    PluginEditorKey { plugin_id: String, category: String, field: String, key: crossterm::event::KeyEvent },
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -82,6 +86,21 @@ pub(super) fn handle_event(
     }
     // Route events to the settings modal while it's open.
     if let Some(state) = app.settings.as_mut() {
+        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
+            if let Event::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    state.edit_mode = None;
+                    return InputAction::None;
+                }
+                return InputAction::PluginEditorKey {
+                    plugin_id: plugin_id.clone(),
+                    category: category.clone(),
+                    field: field.clone(),
+                    key,
+                };
+            }
+            return InputAction::None;
+        }
         // Handle paste into active editors (API key, text, custom model)
         if let Event::Paste(text) = event {
             match &mut state.edit_mode {
@@ -125,12 +144,12 @@ pub(super) fn handle_event(
                         }
                     }
                 }
-                super::settings::InputOutcome::PluginCustomNotImplemented { plugin_id, key } => {
-                    let row_key = format!("plugin.{}.{}", plugin_id, key);
-                    state.row_error = Some((
-                        row_key,
-                        "custom editor not yet implemented in this build".to_string(),
-                    ));
+                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                    return InputAction::PluginEditorOpen {
+                        plugin_id,
+                        category,
+                        field: key,
+                    };
                 }
                 super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
                     let cfg_key = format!("provider.{}", provider_id);
