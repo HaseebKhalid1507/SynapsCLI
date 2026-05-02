@@ -100,7 +100,11 @@ pub(super) fn handle_event(
         }
         if let Event::Key(key) = event {
             let mut snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
-            snap.voice_compiled_backend = app.voice.as_ref().and_then(|v| v.compiled_backend.clone());
+            snap.voice_compiled_backend = app
+                .voice
+                .as_ref()
+                .and_then(|v| v.compiled_backend.clone())
+                .or_else(|| app.cached_voice_compiled_backend.clone());
             match super::settings::handle_event(state, key, &snap) {
                 super::settings::InputOutcome::Close => { app.settings = None; }
                 super::settings::InputOutcome::None => {}

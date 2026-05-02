@@ -150,9 +150,23 @@ pub(crate) struct App {
     pub(crate) model_browser_selected: usize,
     /// Live keybind registry — held so /settings can hot-swap voice toggle.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Compiled-backend probe of the local-voice plugin's sidecar binary,
+    /// populated lazily/eagerly via `voice::discovery::read_build_info`. Used
+    /// by Settings → Voice → "Current build: <backend>" annotation when no
+    /// live `voice` session exists yet (pre-first-toggle). `None` means the
+    /// plugin is missing OR the probe failed; UI shows "unknown" in that case.
+    pub(crate) cached_voice_compiled_backend: Option<String>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Best-effort one-shot probe of the local-voice plugin's compiled backend.
+/// Runs synchronously at App construction; returns `None` quickly if no
+/// plugin is installed or the binary is older than `--print-build-info`.
+fn probe_compiled_backend_at_startup() -> Option<String> {
+    let sidecar = synaps_cli::voice::discovery::discover()?;
+    synaps_cli::voice::discovery::read_build_info(&sidecar.binary).map(|i| i.backend)
+}
 
 
 #[derive(Clone)]
@@ -232,6 +246,7 @@ impl App {
             download_rx: None,
             model_browser_selected: 0,
             keybinds: None,
+            cached_voice_compiled_backend: probe_compiled_backend_at_startup(),
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.

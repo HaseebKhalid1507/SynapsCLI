@@ -1233,45 +1233,39 @@ pub async fn run(
                                                 )));
                                             }
                                             Some(entry) => {
-                                                if app.voice_download_in_flight {
+                                                if app.voice_download_in_flight || app.download_rx.is_some() {
                                                     app.push_msg(ChatMessage::System(
                                                         "A model download is already in progress.".to_string(),
                                                     ));
                                                 } else {
-                                                    app.voice_download_in_flight = true;
-                                                    let models_dir = commands::voice_models_dir();
-                                                    let filename = entry.filename.to_string();
-                                                    let size_mb = entry.size_mb;
-                                                    // Pragmatic shortcut: await the download inline. The
-                                                    // start + completion lines are emitted as one combined
-                                                    // system message at the end (UI is unresponsive during
-                                                    // the transfer; richer per-chunk progress is C2's job).
-                                                    let (tx, _rx) = tokio::sync::watch::channel(
+                                                    // Non-blocking: spawn the download on a worker
+                                                    // task and let the main event loop's
+                                                    // `download_change` arm consume progress
+                                                    // ticks. The chat area renders a sticky
+                                                    // tqdm-style progress bar above the input
+                                                    // box while in flight.
+                                                    let (tx, rx) = tokio::sync::watch::channel(
                                                         synaps_cli::voice::download::DownloadProgress::default(),
                                                     );
+                                                    let filename = entry.filename.to_string();
+                                                    let size_mb = entry.size_mb;
+                                                    let started = app.start_download(filename.clone(), rx);
+                                                    debug_assert!(started);
+                                                    let models_dir = commands::voice_models_dir();
                                                     let entry_static = entry;
-                                                    let result = synaps_cli::voice::download::download_model(
-                                                        entry_static,
-                                                        &models_dir,
-                                                        tx,
-                                                        false,
-                                                    )
-                                                    .await;
-                                                    app.voice_download_in_flight = false;
-                                                    match result {
-                                                        Ok(_path) => {
-                                                            app.push_msg(ChatMessage::System(format!(
-                                                                "Downloading {} ({} MB) from huggingface.co...\n✓ Downloaded {} ({} MB). Switch via /settings → Voice → STT model.",
-                                                                filename, size_mb, filename, size_mb
-                                                            )));
-                                                        }
-                                                        Err(err) => {
-                                                            app.push_msg(ChatMessage::Error(format!(
-                                                                "voice model download failed ({}): {}",
-                                                                filename, err
-                                                            )));
-                                                        }
-                                                    }
+                                                    tokio::spawn(async move {
+                                                        let _ = synaps_cli::voice::download::download_model(
+                                                            entry_static,
+                                                            &models_dir,
+                                                            tx,
+                                                            false,
+                                                        )
+                                                        .await;
+                                                    });
+                                                    app.push_msg(ChatMessage::System(format!(
+                                                        "Downloading {} ({} MB) from huggingface.co…",
+                                                        filename, size_mb
+                                                    )));
                                                 }
                                             }
                                         }
@@ -1339,6 +1333,10 @@ pub async fn run(
                                                         if let Some(v) = app.voice.as_mut() {
                                                             v.compiled_backend = new_backend.clone();
                                                         }
+                                                        // Also update the eager cache so /settings
+                                                        // reflects the new backend immediately even
+                                                        // when no live voice session exists.
+                                                        app.cached_voice_compiled_backend = new_backend.clone();
                                                         app.push_msg(ChatMessage::System(format!(
                                                             "✓ voice rebuild complete (exit 0). Backend now: {}",
                                                             backend_str

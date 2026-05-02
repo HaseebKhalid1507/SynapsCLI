@@ -83,6 +83,69 @@ pub async fn rebuild_with_backend(
         return;
     }
 
+    // Step 1: Clean stale whisper-rs-sys build artifacts. Switching backends
+    // (e.g. cuda → cpu) leaves a CMake cache with `GGML_CUDA:BOOL=ON` etc.
+    // that breaks subsequent builds because cmake refuses to switch the
+    // toggle in-place. `cargo clean -p whisper-rs-sys` purges that build
+    // directory so the next `cargo build` reconfigures cmake from scratch.
+    // Best-effort: a clean failure (e.g. no Cargo.lock yet) is logged but
+    // never aborts the rebuild.
+    let _ = tx
+        .send(RebuildEvent::Output(RebuildOutput {
+            line: "→ cleaning stale whisper-rs-sys build cache (cargo clean -p whisper-rs-sys)…"
+                .to_string(),
+            from_stderr: false,
+        }))
+        .await;
+    let clean_status = Command::new("cargo")
+        .arg("clean")
+        .arg("-p")
+        .arg("whisper-rs-sys")
+        .current_dir(&plugin_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    match clean_status {
+        Ok(out) if out.status.success() => {
+            let _ = tx
+                .send(RebuildEvent::Output(RebuildOutput {
+                    line: "  cleaned.".to_string(),
+                    from_stderr: false,
+                }))
+                .await;
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            for line in stderr.lines() {
+                let _ = tx
+                    .send(RebuildEvent::Output(RebuildOutput {
+                        line: format!("  cargo-clean: {}", line),
+                        from_stderr: true,
+                    }))
+                    .await;
+            }
+            let _ = tx
+                .send(RebuildEvent::Output(RebuildOutput {
+                    line: format!(
+                        "  cargo clean exited with code {} — continuing anyway.",
+                        out.status.code().unwrap_or(-1)
+                    ),
+                    from_stderr: true,
+                }))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(RebuildEvent::Output(RebuildOutput {
+                    line: format!("  cargo clean failed to spawn ({}) — continuing anyway.", e),
+                    from_stderr: true,
+                }))
+                .await;
+        }
+    }
+
     let features = resolve_features_for_backend(&backend);
     let mut cmd = Command::new("bash");
     cmd.arg(&setup)

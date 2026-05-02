@@ -76,6 +76,59 @@ mod voice_pill_tests {
         let app = fresh_app();
         assert!(voice_pill_span(&app).is_none());
     }
+
+    #[test]
+    fn download_progress_line_renders_filled_bar() {
+        use synaps_cli::voice::download::DownloadProgress;
+        let progress = DownloadProgress {
+            bytes: 50 * 1024 * 1024,
+            total: Some(100 * 1024 * 1024),
+            done: false,
+            error: None,
+        };
+        // Smoke: just confirm it doesn't panic at small/medium widths.
+        let _ = render_download_progress_line("ggml-base.bin", &progress, 80);
+        let _ = render_download_progress_line("ggml-base.bin", &progress, 40);
+        let _ = render_download_progress_line("ggml-base.bin", &progress, 200);
+    }
+
+    #[test]
+    fn download_progress_line_handles_unknown_total() {
+        use synaps_cli::voice::download::DownloadProgress;
+        let progress = DownloadProgress {
+            bytes: 12345,
+            total: None,
+            done: false,
+            error: None,
+        };
+        let _ = render_download_progress_line("ggml-tiny.en.bin", &progress, 80);
+    }
+
+    #[test]
+    fn download_progress_line_handles_error_state() {
+        use synaps_cli::voice::download::DownloadProgress;
+        let progress = DownloadProgress {
+            bytes: 0,
+            total: None,
+            done: true,
+            error: Some("network refused".to_string()),
+        };
+        let _ = render_download_progress_line("ggml-base.bin", &progress, 80);
+    }
+
+    #[test]
+    fn download_progress_line_truncates_long_filename() {
+        use synaps_cli::voice::download::DownloadProgress;
+        let progress = DownloadProgress {
+            bytes: 0,
+            total: Some(1),
+            done: false,
+            error: None,
+        };
+        let long = "ggml-large-v3-some-extremely-long-suffix-name.bin";
+        // Smoke: no panic; truncation logic kicks in.
+        let _ = render_download_progress_line(long, &progress, 80);
+    }
 }
 
 
@@ -151,6 +204,101 @@ pub(crate) fn quit_effect() -> Effect {
     ])
 }
 
+/// Render a tqdm-style single-line download progress widget.
+///
+/// Format: `↓ ggml-base.bin  [████████░░░░░░] 57%  82.4 / 142.0 MB`
+///
+/// When `total` is unknown (HEAD without Content-Length), shows `?%`
+/// instead of a percentage. Truncates the filename to 28 chars to keep
+/// the bar visible in narrow terminals.
+pub(crate) fn render_download_progress_line<'a>(
+    filename: &'a str,
+    progress: &'a synaps_cli::voice::download::DownloadProgress,
+    width: u16,
+) -> Paragraph<'a> {
+    let theme = THEME.load();
+    let bytes = progress.bytes;
+    let total = progress.total;
+
+    let pct_text = match total {
+        Some(t) if t > 0 => {
+            let pct = ((bytes as f64 / t as f64) * 100.0).clamp(0.0, 100.0);
+            format!("{:>3.0}%", pct)
+        }
+        _ => "  ?%".to_string(),
+    };
+
+    let size_text = match total {
+        Some(t) => format!(
+            "{:>6.1} / {:>6.1} MB",
+            bytes as f64 / 1_048_576.0,
+            t as f64 / 1_048_576.0
+        ),
+        None => format!("{:>6.1} MB", bytes as f64 / 1_048_576.0),
+    };
+
+    let display_name: String = if filename.chars().count() > 28 {
+        let mut s: String = filename.chars().take(25).collect();
+        s.push_str("…");
+        s
+    } else {
+        filename.to_string()
+    };
+
+    let prefix_len = 2 + display_name.chars().count() + 2; // "↓ "+name+"  "
+    let suffix_len = 1 + pct_text.chars().count() + 2 + size_text.chars().count() + 1;
+    let bracket_overhead = 2;
+    let bar_width: usize = (width as usize)
+        .saturating_sub(prefix_len + suffix_len + bracket_overhead)
+        .max(8);
+
+    let filled = match total {
+        Some(t) if t > 0 => {
+            ((bytes as f64 / t as f64) * bar_width as f64).clamp(0.0, bar_width as f64) as usize
+        }
+        _ => 0,
+    };
+    let empty = bar_width.saturating_sub(filled);
+    let bar_fill: String = "█".repeat(filled);
+    let bar_rest: String = "░".repeat(empty);
+
+    let style_chrome = Style::default().fg(theme.muted);
+    let style_filename = Style::default()
+        .fg(theme.header_fg)
+        .add_modifier(Modifier::BOLD);
+    let style_filled = Style::default().fg(theme.status_streaming);
+    let style_empty = Style::default().fg(theme.muted);
+    let style_pct = Style::default()
+        .fg(theme.status_ready)
+        .add_modifier(Modifier::BOLD);
+    let style_size = Style::default().fg(theme.help_fg);
+    let style_err = Style::default().fg(Color::Rgb(220, 80, 80));
+
+    if let Some(err) = &progress.error {
+        let line = Line::from(vec![
+            Span::styled("✘ ", style_err),
+            Span::styled(display_name.clone(), style_filename),
+            Span::styled("  ", style_chrome),
+            Span::styled(err.clone(), style_err),
+        ]);
+        return Paragraph::new(line);
+    }
+
+    let arrow = if progress.done { "✓ " } else { "↓ " };
+    let line = Line::from(vec![
+        Span::styled(arrow, style_chrome),
+        Span::styled(display_name, style_filename),
+        Span::styled("  [", style_chrome),
+        Span::styled(bar_fill, style_filled),
+        Span::styled(bar_rest, style_empty),
+        Span::styled("] ", style_chrome),
+        Span::styled(pct_text, style_pct),
+        Span::styled("  ", style_chrome),
+        Span::styled(size_text, style_size),
+    ]);
+    Paragraph::new(line)
+}
+
 pub(crate) fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -183,12 +331,17 @@ pub(crate) fn draw(
         let max_input_lines: u16 = 10;
         let input_height = (input_lines.min(max_input_lines)) + 2; // +2 for borders
 
+        // Download progress bar — 1 line above the input box when a whisper
+        // model download is in flight. Hidden otherwise.
+        let download_height: u16 = if app.download_progress.is_some() { 1 } else { 0 };
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),              // header
                 Constraint::Min(1),                 // messages
                 Constraint::Length(subagent_height), // subagent panel (0 when inactive)
+                Constraint::Length(download_height), // download progress bar (0 when idle)
                 Constraint::Length(input_height),   // input (expands with content)
                 Constraint::Length(1),              // footer
             ])
@@ -663,13 +816,26 @@ pub(crate) fn draw(
         let input_widget = Paragraph::new(input_lines_vec)
         .scroll((input_scroll, 0))
         .block(input_block);
-        frame.render_widget(input_widget, outer[3]);
+        frame.render_widget(input_widget, outer[4]);
 
         // Cursor — position relative to scroll offset
         frame.set_cursor_position((
-            outer[3].x + 1 + cursor_col,
-            outer[3].y + 1 + cursor_row - input_scroll,
+            outer[4].x + 1 + cursor_col,
+            outer[4].y + 1 + cursor_row - input_scroll,
         ));
+
+        // -- Download progress bar ------------------------------------------
+        // Renders a tqdm-style line above the input box when a whisper model
+        // download is in flight. Cleared automatically when `download_progress`
+        // is None (the layout collapses to 0 height in that case).
+        if let Some(progress) = &app.download_progress {
+            let bar = render_download_progress_line(
+                app.download_filename.as_deref().unwrap_or("(model)"),
+                progress,
+                outer[3].width,
+            );
+            frame.render_widget(bar, outer[3]);
+        }
 
         // -- Footer ----------------------------------------------------------
         let footer_chunks = Layout::default()
@@ -678,7 +844,7 @@ pub(crate) fn draw(
                 Constraint::Min(1),
                 Constraint::Length(model.len() as u16 + 75),
             ])
-            .split(outer[4]);
+            .split(outer[5]);
 
         let key_style = Style::default().fg(THEME.load().muted);
         let label_style = Style::default().fg(THEME.load().help_fg);
@@ -820,7 +986,11 @@ pub(crate) fn draw(
 
         if let Some(ref state) = app.settings {
             let mut snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
-            snap.voice_compiled_backend = app.voice.as_ref().and_then(|v| v.compiled_backend.clone());
+            snap.voice_compiled_backend = app
+                .voice
+                .as_ref()
+                .and_then(|v| v.compiled_backend.clone())
+                .or_else(|| app.cached_voice_compiled_backend.clone());
             let download = match (&app.download_filename, &app.download_progress) {
                 (Some(f), Some(p)) => Some((f.as_str(), p)),
                 _ => None,
