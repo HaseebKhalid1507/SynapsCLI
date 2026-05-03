@@ -1312,6 +1312,9 @@ impl ProcessExtension {
             self.inbox.clone(),
         ).await?);
         self.initialize_locked(state).await?;
+        // Reset counter on successful restart so transient failures hours apart
+        // don't accumulate toward the permanent disable threshold.
+        self.restart_count.store(0, Ordering::Relaxed);
         Ok(())
     }
 
