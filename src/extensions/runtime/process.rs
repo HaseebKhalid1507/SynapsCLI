@@ -623,6 +623,8 @@ impl ProcessExtension {
             }
         }
 
+        cmd.kill_on_drop(true);
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn extension '{}': {}", id, e))?;
