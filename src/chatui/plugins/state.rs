@@ -126,11 +126,39 @@ impl PluginsModalState {
 
     /// True if the background clone task has finished and is ready to be
     /// awaited / reaped. Cheap — just queries the JoinHandle.
+    ///
+    /// This intentionally does *not* gate on the min-display timer; use
+    /// [`install_ready_to_reap`](Self::install_ready_to_reap) for that.
     pub fn install_task_finished(&self) -> bool {
         self.pending_install
             .as_ref()
             .map(|p| p.join.is_finished())
             .unwrap_or(false)
+    }
+
+    /// Minimum time the "Installing…" overlay stays on screen after the
+    /// clone completes, so a fast (cached) clone doesn't visibly flash by.
+    /// Tunable via the `SYNAPS_INSTALL_MIN_DISPLAY_MS` env var (testing).
+    const MIN_INSTALL_DISPLAY_MS: u64 = 500;
+
+    fn min_install_display_ms() -> u64 {
+        std::env::var("SYNAPS_INSTALL_MIN_DISPLAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Self::MIN_INSTALL_DISPLAY_MS)
+    }
+
+    /// True iff the background clone is finished AND the overlay has been
+    /// visible for at least `MIN_INSTALL_DISPLAY_MS`. Used by the main
+    /// loop tick to decide when to actually reap the JoinHandle and
+    /// transition out of the Installing overlay.
+    pub fn install_ready_to_reap(&self) -> bool {
+        let Some(p) = self.pending_install.as_ref() else { return false };
+        if !p.join.is_finished() {
+            return false;
+        }
+        let Ok(prog) = p.progress.lock() else { return true };
+        prog.started_at.elapsed().as_millis() as u64 >= Self::min_install_display_ms()
     }
 
     /// Advance the spinner frame on the in-flight install (no-op if none).
@@ -318,5 +346,47 @@ mod tests {
         let st = PluginsModalState::new_from_settings(file);
         // Rows are [Installed, AddMarketplace]; index 1 is the AddMarketplace row.
         assert_eq!(st.selected_left, 1);
+    }
+
+    /// Regression: a fast (cached) clone shouldn't make the "Installing…"
+    /// overlay flash by — `install_ready_to_reap` must hold the overlay
+    /// open until at least `MIN_INSTALL_DISPLAY_MS` has elapsed even if
+    /// the JoinHandle is already done.
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_ready_to_reap_holds_until_min_display_elapsed() {
+        // Override to 200ms so the test stays fast but still meaningful.
+        std::env::set_var("SYNAPS_INSTALL_MIN_DISPLAY_MS", "200");
+        let mut s = mk_state();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chatui::plugins::progress::InstallProgress::new("test"),
+        ));
+        // Spawn a task that finishes immediately.
+        let join = tokio::task::spawn_blocking(|| -> Result<(String, std::path::PathBuf), String> {
+            Ok(("sha".into(), std::path::PathBuf::from("/tmp/x")))
+        });
+        s.pending_install = Some(PendingInstallTask {
+            join,
+            progress: progress.clone(),
+            plugin_name: "p".into(),
+            source_url: "u".into(),
+            subdir: None,
+            marketplace_name: None,
+            expected_checksum: None,
+            final_dir: std::path::PathBuf::from("/tmp/p"),
+        });
+        // Wait for the join to finish but well before 200ms.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(s.install_task_finished(), "join should be done by now");
+        assert!(
+            !s.install_ready_to_reap(),
+            "must not reap before MIN_INSTALL_DISPLAY_MS elapses"
+        );
+        // Wait past the threshold.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            s.install_ready_to_reap(),
+            "should reap once min-display window has passed"
+        );
+        std::env::remove_var("SYNAPS_INSTALL_MIN_DISPLAY_MS");
     }
 }

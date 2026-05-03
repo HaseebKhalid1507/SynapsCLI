@@ -343,7 +343,7 @@ pub async fn run(
                     if plugins_state.is_install_active() {
                         plugins_state.tick_install_spinner();
                         install_did_work = true;
-                        if plugins_state.install_task_finished() {
+                        if plugins_state.install_ready_to_reap() {
                             install_finished = true;
                         }
                     }
