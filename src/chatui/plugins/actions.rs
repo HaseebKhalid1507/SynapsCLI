@@ -441,6 +441,20 @@ async fn run_post_install_setup_for_dir(
         return Ok(None);
     }
 
+    // Slice E: try a per-host prebuilt download before falling back to
+    // the (potentially slow) source build. Only `NoMatchingAsset`
+    // falls through to setup — any other error (checksum mismatch,
+    // network failure, extract failure) surfaces immediately so we
+    // never silently mask a security or infrastructure problem with
+    // an opaque rebuild.
+    match post_install::try_install_from_prebuilt(&manifest, final_dir).await {
+        Ok(_resolved) => return Ok(None),
+        Err(post_install::PrebuiltError::NoMatchingAsset) => {}
+        Err(e) => {
+            return Err(format!("prebuilt asset install failed: {e}"));
+        }
+    }
+
     let resolved =
         post_install::resolve_setup_script(&manifest, final_dir).map_err(|e| e.to_string())?;
     let Some(script) = resolved else {
@@ -1373,7 +1387,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn install_from_index_entry_uses_pending_install_and_reinspects_manifest() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1453,7 +1467,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn update_rejects_index_checksum_mismatch_before_preview() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1488,7 +1502,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn update_preview_uses_refreshed_index_checksum_and_shows_manifest_diff() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare, work) = fixture_plugin_repo_with_work();
@@ -1560,7 +1574,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_extension_install_can_be_cancelled_without_touching_real_state() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1604,7 +1618,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_extension_install_confirm_moves_temp_and_records_plugin() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1658,7 +1672,7 @@ mod tests {
     /// fixture just to assert the hook fires.
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_runs_declared_script() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1689,7 +1703,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_returns_ok_none_when_no_setup_declared() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1710,7 +1724,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_propagates_non_zero_exit() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1738,7 +1752,7 @@ mod tests {
     /// or reinstalls where the artifact survived in place).
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_skipped_when_extension_binary_already_present() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1779,7 +1793,7 @@ mod tests {
     /// error instead of silently proceeding with a broken install.
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_fails_when_setup_does_not_produce_extension_binary() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1810,7 +1824,7 @@ mod tests {
     /// missing → must error (don't silently accept a broken install).
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_fails_when_no_setup_and_extension_binary_missing() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1824,5 +1838,103 @@ mod tests {
         let res = run_post_install_setup_for_dir("no-setup-no-bin", plugin_dir.path()).await;
         let err = res.expect_err("missing binary with no setup must error");
         assert!(err.contains("verification failed"), "expected verify msg: {err}");
+    }
+
+    /// Slice E: when a prebuilt asset matches the host, the install
+    /// uses it and skips the setup script entirely — the setup script
+    /// in this test would write a marker, and we assert it doesn't.
+    #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_uses_prebuilt_asset_when_host_triple_matches_and_skips_setup() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        // Allow file:// asset URLs for this test (production rejects them).
+        std::env::set_var("SYNAPS_ALLOW_FILE_PREBUILT", "1");
+        struct AllowFileGuard;
+        impl Drop for AllowFileGuard {
+            fn drop(&mut self) { std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT"); }
+        }
+        let _allow = AllowFileGuard;
+
+        // Stage a tarball containing bin/ext.
+        let staging = tempfile::tempdir().unwrap();
+        let work = staging.path().join("staging");
+        std::fs::create_dir_all(work.join("bin")).unwrap();
+        std::fs::write(work.join("bin/ext"), "#!/bin/sh\necho prebuilt\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            work.join("bin/ext"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let archive = staging.path().join("ext.tar.gz");
+        let out = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&work)
+            .arg("bin/ext")
+            .output()
+            .expect("system tar must be present");
+        assert!(out.status.success());
+        let bytes = std::fs::read(&archive).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let sha: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let triple = synaps_cli::skills::post_install::host_triple()
+            .expect("supported test host");
+
+        // Plugin dir with a manifest that declares both prebuilt AND
+        // setup — prebuilt wins, setup must NOT run.
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_plugin_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_plugin_dir).unwrap();
+        let manifest_json = format!(
+            r#"{{
+                "name":"prebuilt-test",
+                "extension":{{
+                    "runtime":"process",
+                    "command":"bin/ext",
+                    "setup":"scripts/setup.sh",
+                    "prebuilt":{{
+                        "{triple}":{{
+                            "url":"file://{archive}",
+                            "sha256":"{sha}"
+                        }}
+                    }}
+                }}
+            }}"#,
+            triple = triple,
+            archive = archive.display(),
+            sha = sha,
+        );
+        std::fs::write(synaps_plugin_dir.join("plugin.json"), &manifest_json).unwrap();
+        // Setup script that would create a marker if invoked.
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let marker = plugin_dir.path().join("setup-ran.marker");
+        std::fs::write(
+            scripts.join("setup.sh"),
+            format!("#!/bin/bash\ntouch {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let res = run_post_install_setup_for_dir("prebuilt-test", plugin_dir.path()).await;
+        match res {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) (prebuilt path), got {other:?}"),
+        }
+        assert!(
+            plugin_dir.path().join("bin/ext").exists(),
+            "prebuilt binary should be extracted at bin/ext"
+        );
+        assert!(
+            !marker.exists(),
+            "setup script must NOT have run when prebuilt succeeded"
+        );
     }
 }

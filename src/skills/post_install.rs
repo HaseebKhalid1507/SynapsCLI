@@ -248,6 +248,245 @@ pub fn verify_extension_command(
     Ok(Some(resolved))
 }
 
+/// Why a prebuilt-binary install attempt failed. Variants distinguish
+/// "no asset for this host" (caller falls back to the setup script)
+/// from "asset matched but couldn't be installed" (caller surfaces
+/// the error — security failures and network issues should not
+/// silently trigger a build).
+#[derive(Debug, thiserror::Error)]
+pub enum PrebuiltError {
+    /// Host triple has no entry in `extension.prebuilt`. Caller should
+    /// fall back to the setup script. Not really an error — just a
+    /// signal that there's nothing to try.
+    #[error("no prebuilt asset declared for this host")]
+    NoMatchingAsset,
+
+    /// Network / HTTP problem fetching the URL.
+    #[error("download failed: {0}")]
+    Download(String),
+
+    /// Downloaded bytes don't match the declared SHA-256. Treated as a
+    /// hard failure (don't fall back to setup) since this could
+    /// indicate tampering, mirror corruption, or a stale manifest.
+    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+
+    /// `tar` / `unzip` exited non-zero or wasn't on PATH.
+    #[error("archive extraction failed: {0}")]
+    Extract(String),
+
+    /// The archive doesn't end in a recognized suffix (we support
+    /// `.tar.gz` / `.tgz` / `.tar.xz` / `.tar.bz2` / `.zip`).
+    #[error("unsupported archive type for url '{url}'")]
+    UnsupportedArchive { url: String },
+
+    /// Asset URL must be `https://` (or `file://` in tests).
+    #[error("refusing non-https prebuilt url '{url}'")]
+    UnsafeUrl { url: String },
+
+    /// I/O setting up the temp file or moving extracted artifacts.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Asset extracted but the manifest's `extension.command` still
+    /// doesn't resolve. The archive layout is wrong.
+    #[error("prebuilt extracted but extension command not found: {0}")]
+    Verify(#[from] CommandVerifyError),
+}
+
+/// Lower-case hex encode of arbitrary bytes. Inlined to avoid pulling
+/// in a `hex` crate just for this one site.
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit((*b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((*b & 0x0f) as u32, 16).unwrap());
+    }
+    out
+}
+
+/// Try to install the extension binary from
+/// [`crate::extensions::manifest::ExtensionManifest::prebuilt`] for
+/// the current host. Lookup is by [`host_triple`].
+///
+/// On success: downloads the URL, verifies the SHA-256, extracts
+/// the archive into `plugin_dir`, then runs
+/// [`verify_extension_command`] to confirm the layout was correct.
+/// Returns `Ok(Some(path))` pointing at the resolved binary.
+///
+/// On `Err(PrebuiltError::NoMatchingAsset)`: no entry for this host
+/// — caller should fall back to the setup script.
+///
+/// On any other `Err`: surface to the user; do **not** silently fall
+/// back to the setup script (a checksum failure could mean tampering;
+/// a network failure means the user wanted prebuilt and should know).
+pub async fn try_install_from_prebuilt(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> Result<PathBuf, PrebuiltError> {
+    let Some(ext) = manifest.extension.as_ref() else {
+        return Err(PrebuiltError::NoMatchingAsset);
+    };
+    let Some(triple) = host_triple() else {
+        return Err(PrebuiltError::NoMatchingAsset);
+    };
+    let Some(asset) = ext.prebuilt.get(triple) else {
+        return Err(PrebuiltError::NoMatchingAsset);
+    };
+
+    // URL safety: https only, with an env-var carve-out
+    // (`SYNAPS_ALLOW_FILE_PREBUILT=1`) so tests and local-dev mirrors
+    // can use `file://` without weakening production behavior.
+    let allow_file_scheme = std::env::var("SYNAPS_ALLOW_FILE_PREBUILT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !asset.url.starts_with("https://")
+        && !(allow_file_scheme && asset.url.starts_with("file://"))
+    {
+        return Err(PrebuiltError::UnsafeUrl {
+            url: asset.url.clone(),
+        });
+    }
+
+    // Download into a temp file inside plugin_dir so cleanup is
+    // automatic if extraction fails.
+    let tmp_archive = plugin_dir.join(format!(
+        ".prebuilt-{}-download",
+        triple,
+    ));
+    let _ = std::fs::remove_file(&tmp_archive);
+
+    let bytes = if let Some(path) = asset.url.strip_prefix("file://") {
+        // Test path: read directly from disk.
+        std::fs::read(path).map_err(|e| PrebuiltError::Download(format!("file read {path}: {e}")))?
+    } else {
+        // Real path: HTTP GET.
+        let response = reqwest::get(&asset.url)
+            .await
+            .map_err(|e| PrebuiltError::Download(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PrebuiltError::Download(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|e| PrebuiltError::Download(e.to_string()))?
+            .to_vec()
+    };
+
+    // Checksum the bytes before touching disk.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual = hex_encode_lower(&hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&asset.sha256) {
+        return Err(PrebuiltError::ChecksumMismatch {
+            expected: asset.sha256.clone(),
+            actual,
+        });
+    }
+
+    std::fs::write(&tmp_archive, &bytes)?;
+    let extract_res = extract_archive(&tmp_archive, plugin_dir, &asset.url);
+    let _ = std::fs::remove_file(&tmp_archive);
+    extract_res?;
+
+    // Post-condition: the binary the manifest promised must now resolve.
+    let resolved = verify_extension_command(manifest, plugin_dir)?
+        .ok_or_else(|| {
+            PrebuiltError::Verify(CommandVerifyError::Missing {
+                path: ext.command.clone(),
+                resolved: plugin_dir.join(&ext.command),
+            })
+        })?;
+    Ok(resolved)
+}
+
+/// Shell out to `tar` or `unzip` to extract `archive` into `dest_dir`.
+/// Suffix detection from the URL (which is more reliable than the
+/// temp-file name we picked).
+fn extract_archive(
+    archive: &Path,
+    dest_dir: &Path,
+    url_for_suffix: &str,
+) -> Result<(), PrebuiltError> {
+    use std::process::Command;
+    // Strip query / fragment for suffix detection.
+    let url_clean = url_for_suffix
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url_for_suffix)
+        .to_ascii_lowercase();
+
+    let (program, args): (&str, Vec<String>) = if url_clean.ends_with(".tar.gz")
+        || url_clean.ends_with(".tgz")
+    {
+        (
+            "tar",
+            vec![
+                "-xzf".into(),
+                archive.to_string_lossy().into_owned(),
+                "-C".into(),
+                dest_dir.to_string_lossy().into_owned(),
+            ],
+        )
+    } else if url_clean.ends_with(".tar.xz") {
+        (
+            "tar",
+            vec![
+                "-xJf".into(),
+                archive.to_string_lossy().into_owned(),
+                "-C".into(),
+                dest_dir.to_string_lossy().into_owned(),
+            ],
+        )
+    } else if url_clean.ends_with(".tar.bz2") {
+        (
+            "tar",
+            vec![
+                "-xjf".into(),
+                archive.to_string_lossy().into_owned(),
+                "-C".into(),
+                dest_dir.to_string_lossy().into_owned(),
+            ],
+        )
+    } else if url_clean.ends_with(".zip") {
+        (
+            "unzip",
+            vec![
+                "-q".into(),
+                "-o".into(),
+                archive.to_string_lossy().into_owned(),
+                "-d".into(),
+                dest_dir.to_string_lossy().into_owned(),
+            ],
+        )
+    } else {
+        return Err(PrebuiltError::UnsupportedArchive {
+            url: url_for_suffix.to_string(),
+        });
+    };
+
+    let out = Command::new(program).args(&args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            PrebuiltError::Extract(format!("'{program}' not found on PATH"))
+        } else {
+            PrebuiltError::Extract(format!("spawn {program}: {e}"))
+        }
+    })?;
+    if !out.status.success() {
+        return Err(PrebuiltError::Extract(format!(
+            "{program} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the manifest-declared setup script to an absolute path
 /// inside `plugin_dir`, or return `Ok(None)` if no setup is declared.
 ///
@@ -894,5 +1133,203 @@ mod tests {
             matches!(err, CommandVerifyError::EscapesPluginDir { .. }),
             "got: {err:?}"
         );
+    }
+
+    // ---- try_install_from_prebuilt tests (slice E) ----
+
+    /// All prebuilt tests mutate the `SYNAPS_ALLOW_FILE_PREBUILT` env
+    /// var, so they must serialize on this lock to avoid stomping on
+    /// each other when run in parallel.
+    static PREBUILT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `SYNAPS_ALLOW_FILE_PREBUILT=1` for this test scope so we can
+    /// exercise the file:// path. Reset on drop. Holds
+    /// `PREBUILT_ENV_LOCK` for the duration so parallel tests don't
+    /// race on the env var.
+    struct AllowFileGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl AllowFileGuard {
+        fn enable() -> Self {
+            let lock = PREBUILT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("SYNAPS_ALLOW_FILE_PREBUILT", "1");
+            Self { _lock: lock }
+        }
+    }
+    impl Drop for AllowFileGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT");
+        }
+    }
+
+    fn manifest_with_prebuilt(
+        command: &str,
+        triple: &str,
+        url: &str,
+        sha256: &str,
+    ) -> PluginManifest {
+        let mut prebuilt = std::collections::HashMap::new();
+        prebuilt.insert(
+            triple.to_string(),
+            crate::extensions::manifest::PrebuiltAsset {
+                url: url.to_string(),
+                sha256: sha256.to_string(),
+            },
+        );
+        PluginManifest {
+            name: "test-plugin".to_string(),
+            version: None,
+            description: None,
+            keybinds: vec![],
+            compatibility: None,
+            commands: vec![],
+            extension: Some(ExtensionManifest {
+                protocol_version: 1,
+                runtime: ExtensionRuntime::Process,
+                command: command.to_string(),
+                setup: None,
+                prebuilt,
+                args: vec![],
+                permissions: vec![],
+                hooks: vec![],
+                config: vec![],
+            }),
+            help_entries: vec![],
+            provides: None,
+            settings: None,
+        }
+    }
+
+    /// Helper: create a tar.gz archive containing one executable file at
+    /// the given relative path inside the archive. Returns the archive
+    /// path and its SHA-256.
+    fn mk_tarball(staging: &Path, archive_name: &str, inner_path: &str) -> (PathBuf, String) {
+        let work = staging.join("staging");
+        fs::create_dir_all(&work).unwrap();
+        let payload = work.join(inner_path);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, "#!/bin/sh\necho prebuilt-bin\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&payload, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = staging.join(archive_name);
+        let out = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&work)
+            .arg(inner_path)
+            .output()
+            .expect("system tar must be present");
+        assert!(out.status.success(), "tar failed: {:?}", out);
+        let bytes = fs::read(&archive).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let sha = hex_encode_lower(&h.finalize());
+        (archive, sha)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_returns_no_matching_asset_when_triple_missing() {
+        let _lock = PREBUILT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT");
+        let dir = tempfile::tempdir().unwrap();
+        // Asset under a deliberately wrong host triple.
+        let m = manifest_with_prebuilt("bin/ext", "fake-triple-9999", "https://x", "00");
+        let err = try_install_from_prebuilt(&m, dir.path()).await.unwrap_err();
+        assert!(matches!(err, PrebuiltError::NoMatchingAsset), "got: {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_rejects_non_https_url_in_production_builds() {
+        // file:// is allow-listed only via env var; http:// is blocked
+        // even when the env var is on.
+        let _lock = PREBUILT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SYNAPS_ALLOW_FILE_PREBUILT", "1");
+        struct Cleanup;
+        impl Drop for Cleanup { fn drop(&mut self) { std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT"); } }
+        let _c = Cleanup;
+        let dir = tempfile::tempdir().unwrap();
+        let triple = host_triple().expect("supported host");
+        let m = manifest_with_prebuilt("bin/ext", triple, "http://example.com/x.tar.gz", "00");
+        let err = try_install_from_prebuilt(&m, dir.path()).await.unwrap_err();
+        assert!(matches!(err, PrebuiltError::UnsafeUrl { .. }), "got: {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_succeeds_with_valid_tarball_and_checksum() {
+        let _allow = AllowFileGuard::enable();
+        let staging = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
+        let url = format!("file://{}", archive.display());
+        let triple = host_triple().expect("supported host");
+        let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
+        let resolved = try_install_from_prebuilt(&m, plugin.path()).await.unwrap();
+        assert!(resolved.exists(), "extracted binary should exist at {}", resolved.display());
+        // Also confirm the temp download file was cleaned up.
+        let leftover = plugin.path().join(format!(".prebuilt-{}-download", triple));
+        assert!(!leftover.exists(), "temp archive should be removed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_aborts_on_checksum_mismatch_without_extracting() {
+        let _allow = AllowFileGuard::enable();
+        let staging = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        let (archive, _real_sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
+        let url = format!("file://{}", archive.display());
+        let triple = host_triple().expect("supported host");
+        let bad_sha = "0".repeat(64);
+        let m = manifest_with_prebuilt("bin/ext", triple, &url, &bad_sha);
+        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
+        match err {
+            PrebuiltError::ChecksumMismatch { expected, actual } => {
+                assert_eq!(expected, bad_sha);
+                assert_eq!(actual.len(), 64, "actual sha should be lowercase hex");
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        // No artifact should have been written.
+        assert!(!plugin.path().join("bin/ext").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_rejects_unsupported_archive_suffix() {
+        let _allow = AllowFileGuard::enable();
+        let staging = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        // Make a .rar-named file (we only support tar/zip variants).
+        let archive = staging.path().join("ext.rar");
+        fs::write(&archive, b"not really a rar").unwrap();
+        let bytes = fs::read(&archive).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let sha = hex_encode_lower(&h.finalize());
+        let url = format!("file://{}", archive.display());
+        let triple = host_triple().expect("supported host");
+        let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
+        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
+        assert!(matches!(err, PrebuiltError::UnsupportedArchive { .. }), "got: {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prebuilt_fails_verify_when_archive_does_not_contain_declared_command() {
+        let _allow = AllowFileGuard::enable();
+        let staging = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        // Archive ships at bin/wrong-name but manifest declares bin/ext.
+        let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/wrong-name");
+        let url = format!("file://{}", archive.display());
+        let triple = host_triple().expect("supported host");
+        let m = manifest_with_prebuilt("bin/ext", triple, &url, &sha);
+        let err = try_install_from_prebuilt(&m, plugin.path()).await.unwrap_err();
+        assert!(matches!(err, PrebuiltError::Verify(_)), "got: {err:?}");
     }
 }
