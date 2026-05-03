@@ -153,7 +153,7 @@ impl App {
                         lines.push(Line::from(""));
                     }
                     // Header
-                    let label = format!("{}\u{25c8} agent", m);
+                    let label = format!("{}\u{25c8} {}", m, self.agent_name);
                     let ts_str = format!("{} ", ts);
                     let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                     // Pulse the agent label when streaming (same sin-wave as header dot)

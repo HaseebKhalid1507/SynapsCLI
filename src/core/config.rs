@@ -104,6 +104,7 @@ pub struct SynapsConfig {
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
     pub theme: Option<String>,
+    pub agent_name: Option<String>,
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
@@ -125,6 +126,7 @@ impl Default for SynapsConfig {
             subagent_timeout: 300,
             api_retries: 3,
             theme: None,
+            agent_name: None,
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
@@ -281,6 +283,7 @@ pub fn load_config() -> SynapsConfig {
                 }
             }
             "theme" => config.theme = Some(val.to_string()),
+            "agent_name" => config.agent_name = Some(val.to_string()),
             "disabled_plugins" => {
                 config.disabled_plugins = parse_comma_list(val);
             }
