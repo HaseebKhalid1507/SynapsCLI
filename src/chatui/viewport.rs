@@ -64,9 +64,9 @@ where
 
 /// Crossterm-specific physical edge scrub used by the real chat UI terminal.
 ///
-/// Test backends cannot accept crossterm commands, so this is split from the
-/// buffer reset above. The public chat path calls this version; tests exercise
-/// the generic buffer behavior separately.
+/// Only scrubs edge columns for the message content area (which has no side
+/// borders). Skips the header, input box, status bar, and subagent panel rows
+/// which use Borders::ALL and would lose their side border characters.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn scrub_crossterm_terminal_edges<W>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
@@ -76,7 +76,16 @@ where
     W: Write,
 {
     let size = terminal.size()?;
-    let area = Rect::new(0, 0, size.width, size.height);
+    // Only scrub the interior rows, skip first 2 rows (header + top border)
+    // and last 4 rows (input box borders + status bar). This preserves
+    // border characters on widgets that use Borders::ALL.
+    let skip_top = 2u16;
+    let skip_bottom = 4u16;
+    let safe_height = size.height.saturating_sub(skip_top + skip_bottom);
+    if safe_height == 0 {
+        return Ok(());
+    }
+    let area = Rect::new(0, skip_top, size.width, safe_height);
     let backend = terminal.backend_mut();
     for (x, y) in edge_scrub_positions(area) {
         backend.queue(MoveTo(x, y))?;
