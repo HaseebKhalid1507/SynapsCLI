@@ -82,6 +82,10 @@ pub(crate) fn save_trust_state_to(base: &Path, state: &ProviderTrustState) -> Re
     std::fs::write(tmp.path(), serialized.as_bytes()).map_err(|e| {
         format!("failed to write {}: {}", tmp.path().display(), e)
     })?;
+    // fsync before rename so data is durable on power loss
+    std::fs::File::open(tmp.path())
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("failed to fsync {}: {}", tmp.path().display(), e))?;
     tmp.persist(&path).map_err(|e| {
         format!(
             "failed to rename {} -> {}: {}",

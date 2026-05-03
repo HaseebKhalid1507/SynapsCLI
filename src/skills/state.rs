@@ -112,6 +112,8 @@ impl PluginsState {
         let parent = path.parent().unwrap_or(Path::new("."));
         let tmp = tempfile::NamedTempFile::new_in(parent)?;
         std::fs::write(tmp.path(), json)?;
+        // fsync before rename so data is durable on power loss
+        std::fs::File::open(tmp.path()).and_then(|f| f.sync_all())?;
         tmp.persist(path).map_err(|e| e.error).map(|_| ())
     }
 
