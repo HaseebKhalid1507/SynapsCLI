@@ -230,6 +230,7 @@ pub enum OaiEvent {
     Usage {
         prompt_tokens: u32,
         completion_tokens: u32,
+        cached_tokens: u32,
     },
     Warning(String),
     Done,
