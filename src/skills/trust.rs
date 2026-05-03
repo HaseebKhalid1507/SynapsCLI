@@ -5,6 +5,7 @@ use crate::skills::Plugin;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPermissionSummary {
     pub has_executable_extension: bool,
+    pub has_setup_script: bool,
     pub permissions: Vec<String>,
     pub hooks: Vec<String>,
     pub config_keys: Vec<String>,
@@ -14,6 +15,7 @@ pub struct PluginPermissionSummary {
 impl PluginPermissionSummary {
     pub fn is_empty(&self) -> bool {
         !self.has_executable_extension
+            && !self.has_setup_script
             && self.permissions.is_empty()
             && self.hooks.is_empty()
             && self.config_keys.is_empty()
@@ -28,6 +30,9 @@ impl PluginPermissionSummary {
         let mut lines = Vec::new();
         if self.has_executable_extension {
             lines.push("executable extension: yes".to_string());
+        }
+        if self.has_setup_script {
+            lines.push("⚠ runs setup script on install".to_string());
         }
         if let Some(command) = &self.command {
             lines.push(format!("command: {}", command));
@@ -48,9 +53,16 @@ impl PluginPermissionSummary {
 }
 
 pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary {
+    let has_setup_script = plugin.manifest.as_ref()
+        .and_then(|m| m.provides.as_ref())
+        .and_then(|p| p.sidecar.as_ref())
+        .and_then(|s| s.setup.as_ref())
+        .is_some();
+
     let Some(extension) = &plugin.extension else {
         return PluginPermissionSummary {
             has_executable_extension: false,
+            has_setup_script,
             permissions: Vec::new(),
             hooks: Vec::new(),
             config_keys: Vec::new(),
@@ -85,6 +97,7 @@ pub fn summarize_plugin_permissions(plugin: &Plugin) -> PluginPermissionSummary 
 
     PluginPermissionSummary {
         has_executable_extension: true,
+        has_setup_script,
         permissions,
         hooks,
         config_keys,
