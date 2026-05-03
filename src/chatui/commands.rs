@@ -88,13 +88,11 @@ pub(super) enum CommandAction {
     /// Inspect local memory store (namespaces, recent records).
     ExtensionsMemory(ExtensionsMemoryAction),
     /// Toggle the active sidecar plugin on/off (`/sidecar` or `/sidecar toggle`).
-    /// Also reachable via `/voice toggle` for one-release back-compat.
     ///
     /// `plugin_id = Some(pid)` selects a specific claimed sidecar (Phase 8 8B).
     /// `plugin_id = None` falls back to the legacy single-sidecar slot.
     SidecarToggle { plugin_id: Option<String> },
-    /// Show sidecar subsystem status (`/sidecar status`). Also reachable
-    /// via `/voice status` for one-release back-compat.
+    /// Show sidecar subsystem status (`/sidecar status`).
     SidecarStatus { plugin_id: Option<String> },
 }
 
@@ -799,40 +797,6 @@ pub(super) async fn handle_command(
                 }
             }
         }
-        "voice" => {
-            // One-release deprecation alias. `/voice toggle` and
-            // `/voice status` are core-generic operations and route to
-            // `/sidecar`. Other `/voice <sub>` calls resolve via the
-            // plugin command registry like any other plugin command —
-            // no hardcoded plugin name.
-            let trimmed = arg.trim();
-            match trimmed {
-                "" | "toggle" => return CommandAction::SidecarToggle { plugin_id: None },
-                "status" => return CommandAction::SidecarStatus { plugin_id: None },
-                _ => {}
-            }
-            // Fall through: let the plugin registry resolve `/voice <sub>`
-            // as a normal plugin command. The plugin that owns `/voice`
-            // (whoever it is) handles the rest. We bypass the builtin
-            // check (since "voice" is itself a builtin alias) and look
-            // up the unqualified plugin command directly.
-            match registry.find_plugin_command_unqualified("voice") {
-                Some(command) => {
-                    return CommandAction::PluginCommand {
-                        command,
-                        arg: trimmed.to_string(),
-                    };
-                }
-                None => {
-                    app.push_msg(ChatMessage::Error(
-                        "no plugin owns /voice; install one (e.g. local-voice from \
-                         synaps-skills) or use /sidecar toggle for the generic core \
-                         command".to_string(),
-                    ));
-                    return CommandAction::None;
-                }
-            }
-        }
         "keybinds" => {
             let custom = keybind_registry.custom_binds();
             if custom.is_empty() {
@@ -1348,140 +1312,10 @@ mod tests {
         }
     }
 
-    async fn invoke_voice(arg: &str) -> CommandAction {
-        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
-        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
-        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        handle_command(
-            "voice",
-            arg,
-            &mut app,
-            &mut runtime,
-            &system_prompt_path,
-            &registry,
-            &keybinds,
-        ).await
-    }
-
-    #[tokio::test]
-    async fn parse_voice_empty_arg_is_toggle() {
-        match invoke_voice("").await {
-            CommandAction::SidecarToggle { .. } => {}
-            other => panic!("expected SidecarToggle for empty arg, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_voice_toggle_subcommand() {
-        match invoke_voice("toggle").await {
-            CommandAction::SidecarToggle { .. } => {}
-            _ => panic!("expected SidecarToggle for `toggle` subcommand"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_voice_status_subcommand() {
-        match invoke_voice("status").await {
-            CommandAction::SidecarStatus { .. } => {}
-            _ => panic!("expected SidecarStatus for `status` subcommand"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_voice_unknown_subcommand_is_none() {
-        match invoke_voice("frobnicate").await {
-            CommandAction::None => {}
-            _ => panic!("expected CommandAction::None for unknown subcommand"),
-        }
-    }
-
     #[test]
-    fn sidecar_and_voice_are_in_builtin_commands() {
-        // `/sidecar` is the canonical generic toggle command.
+    fn sidecar_is_in_builtin_commands_and_voice_is_plugin_owned() {
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"sidecar"));
-        // `/voice` retained for one-release deprecation aliasing.
-        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
-    }
-
-
-    #[tokio::test]
-    async fn voice_models_routes_to_interactive_plugin_when_registered() {
-        let registry = CommandRegistry::new_with_plugins(
-            &[],
-            vec![],
-            vec![synaps_cli::skills::Plugin {
-                name: "local-voice".to_string(),
-                root: PathBuf::from("/tmp/local-voice"),
-                marketplace: None,
-                version: None,
-                description: None,
-                extension: None,
-                manifest: Some(synaps_cli::skills::manifest::PluginManifest {
-                    name: "local-voice".to_string(),
-                    version: None,
-                    description: None,
-                    keybinds: vec![],
-                    compatibility: None,
-                    commands: vec![synaps_cli::skills::manifest::ManifestCommand::Interactive(
-                        synaps_cli::skills::manifest::ManifestInteractiveCommand {
-                            name: "voice".to_string(),
-                            description: None,
-                            interactive: true,
-                            subcommands: vec!["models".to_string()],
-                        },
-                    )],
-                    extension: None,
-                    help_entries: vec![],
-                    provides: None,
-                    settings: None,
-                }),
-            }],
-        );
-        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
-        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-
-        match handle_command(
-            "voice",
-            "models",
-            &mut app,
-            &mut runtime,
-            &system_prompt_path,
-            &Arc::new(registry),
-            &keybinds,
-        ).await {
-            CommandAction::PluginCommand { command, arg } => {
-                assert_eq!(command.plugin, "local-voice");
-                assert_eq!(command.name, "voice");
-                assert_eq!(arg, "models");
-            }
-            _ => panic!("expected interactive plugin command for /voice models"),
-        }
-    }
-
-    #[tokio::test]
-    async fn voice_models_command_routes_to_plugin_when_no_plugin_pushes_error() {
-        let mut app = crate::chatui::app::App::new(synaps_cli::Session::new("test", "medium", None));
-        let mut runtime = synaps_cli::Runtime::new().await.unwrap();
-        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
-        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
-        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
-        let action = handle_command(
-            "voice",
-            "models",
-            &mut app,
-            &mut runtime,
-            &system_prompt_path,
-            &registry,
-            &keybinds,
-        )
-        .await;
-        assert!(matches!(action, CommandAction::None));
-        let pushed_error = app.messages.iter().any(|m| matches!(&m.msg, crate::chatui::app::ChatMessage::Error(s) if s.contains("no plugin owns /voice")));
-        assert!(pushed_error, "expected a `no plugin owns /voice` error message");
+        assert!(!synaps_cli::skills::BUILTIN_COMMANDS.contains(&"voice"));
     }
 
     // ---- Phase 8 slice 8A: lifecycle-claim dispatcher ----

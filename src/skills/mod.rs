@@ -60,10 +60,6 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
     "settings", "plugins", "extensions", "status", "ping", "keybinds",
     "sidecar",
-    // `voice` retained for one-release deprecation aliasing in
-    // chatui::commands::handle_command. Will be removed once users
-    // have migrated to `/sidecar` for toggle/status.
-    "voice",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,
