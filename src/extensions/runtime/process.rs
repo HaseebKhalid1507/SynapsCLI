@@ -611,6 +611,18 @@ impl ProcessExtension {
             cmd.current_dir(cwd);
         }
 
+        // Clear the inherited environment so extensions cannot read secrets from
+        // the parent process (e.g. ANTHROPIC_API_KEY, SSH_AUTH_SOCK, AWS_*).
+        // Only forward a minimal set of safe, non-sensitive variables.
+        // TODO: forward the extension's declared `secret_env` values here once
+        //       secret_env is resolved at spawn time rather than config time.
+        cmd.env_clear();
+        for var in &["PATH", "HOME", "LANG", "TERM", "XDG_RUNTIME_DIR"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn extension '{}': {}", id, e))?;
