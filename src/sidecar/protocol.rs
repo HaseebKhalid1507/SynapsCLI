@@ -27,14 +27,6 @@ use serde::{Deserialize, Serialize};
 /// Protocol version understood by this build.
 pub const SIDECAR_PROTOCOL_VERSION: u16 = 1;
 
-/// Backwards-compat alias for the protocol version constant. New code
-/// should reference [`SIDECAR_PROTOCOL_VERSION`] directly.
-#[deprecated(
-    since = "0.1.0-phase7",
-    note = "use SIDECAR_PROTOCOL_VERSION; the voice-prefixed alias will be removed in a future release"
-)]
-pub const VOICE_SIDECAR_PROTOCOL_VERSION: u16 = SIDECAR_PROTOCOL_VERSION;
-
 /// Session mode the sidecar should run in.
 ///
 /// The variant *values* are wire-format strings shared with the plugin
