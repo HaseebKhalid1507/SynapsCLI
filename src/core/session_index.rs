@@ -81,10 +81,11 @@ fn append_record_to_path(path: &std::path::Path, record: &SessionIndexRecord) ->
         .append(true)
         .open(path)
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("open session index: {err}")))?;
-    serde_json::to_writer(&mut file, record)
+    let mut line = serde_json::to_string(record)
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}")))?;
+    line.push('\n');
     use std::io::Write;
-    file.write_all(b"\n")
+    file.write_all(line.as_bytes())
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("write session index record: {err}")))?;
     Ok(())
 }
