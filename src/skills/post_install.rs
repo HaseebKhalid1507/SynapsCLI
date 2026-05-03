@@ -304,6 +304,7 @@ mod tests {
                 runtime: ExtensionRuntime::Process,
                 command: "bin/ext".to_string(),
                 setup: setup.map(|s| s.to_string()),
+                prebuilt: ::std::collections::HashMap::new(),
                 args: vec![],
                 permissions: vec![],
                 hooks: vec![],

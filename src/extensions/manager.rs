@@ -975,6 +975,7 @@ mod tests {
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![
                 "tests/fixtures/process_extension.py".to_string(),
                 "normal".to_string(),
@@ -1014,6 +1015,7 @@ mod tests {
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![
                 "tests/fixtures/process_extension.py".to_string(),
                 "normal".to_string(),
@@ -1096,6 +1098,7 @@ mod tests {
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-test.log".to_string()],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
@@ -1125,6 +1128,7 @@ mod tests {
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/process_extension.py".to_string(), "normal".to_string(), "/tmp/synaps-reload-failure-test.log".to_string()],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![crate::extensions::manifest::HookSubscription {
@@ -1137,6 +1141,7 @@ mod tests {
         let bad = ExtensionManifest {
             command: "/definitely/not/a/real/extension-binary".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             ..good.clone()
         };
 
@@ -1237,6 +1242,7 @@ mod tests {
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![
                 "tests/fixtures/process_extension.py".to_string(),
                 "normal".to_string(),
