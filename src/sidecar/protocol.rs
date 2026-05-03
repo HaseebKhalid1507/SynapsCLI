@@ -1,9 +1,8 @@
 //! Sidecar protocol types — line-JSON over stdio.
 //!
 //! The host treats sidecars as lego-block processes: it starts them, sends
-//! generic trigger frames, and consumes generic status/text frames. A sidecar
-//! may implement speech, OCR, gestures, automation, telemetry, or anything
-//! else; modality semantics live entirely in the plugin.
+//! generic trigger frames, and consumes generic status/text frames. Plugin
+//! semantics live entirely outside core.
 //!
 //! Wire format: one JSON object per line on the sidecar's stdin/stdout.
 

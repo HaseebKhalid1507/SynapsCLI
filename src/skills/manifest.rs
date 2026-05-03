@@ -256,7 +256,7 @@ pub struct SidecarModel {
     #[serde(default)]
     pub default_path: Option<String>,
     #[serde(default)]
-    pub required_for_real_stt: bool,
+    pub required: bool,
 }
 
 /// Backwards-compat type alias. New code should use [`SidecarModel`].

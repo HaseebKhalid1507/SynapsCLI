@@ -1,10 +1,9 @@
 //! Sidecar plugin support: long-running plugin processes that stream
 //! events into the host over a JSONL line protocol.
 //!
-//! This module is **modality-agnostic**. It hosts whatever a plugin
-//! declares itself to be: voice STT, OCR, agent runner, foot-pedal
-//! trigger, EEG dictation, clipboard mirror, anything that fits the
-//! "trigger-driven streaming source" shape.
+//! This module is **plugin-agnostic**. It hosts whatever a plugin
+//! declares itself to be, as long as that plugin fits the sidecar
+//! line-protocol contract.
 //!
 //! It owns:
 //! - The line-JSON sidecar protocol types (see [`protocol`]).

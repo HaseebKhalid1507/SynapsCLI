@@ -59,7 +59,7 @@ pub(crate) struct SidecarUiState {
 
 impl SidecarUiState {
     /// Discover a sidecar from loaded plugins and spawn its manager
-    /// with a default dictation-mode handshake.
+    /// with a default protocol handshake.
     ///
     /// Returns `Err` with a user-facing message if no plugin provides
     /// a sidecar binary or the spawn itself fails.
@@ -185,9 +185,9 @@ fn format_status_line(
 
 /// Apply a [`SidecarLifecycleEvent`] to the chatui state.
 ///
-/// Final transcripts are inserted at the cursor position (with a
+/// InsertText payloads are inserted at the cursor position (with a
 /// leading space when the existing input doesn't already end in
-/// whitespace), so the user can keep dictating into the same line.
+/// whitespace), so consecutive payloads compose naturally in one line.
 pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecycleEvent) {
     let Some(v) = app.sidecars.get_mut(plugin_id) else {
         return;
@@ -214,7 +214,7 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
             }
             InsertTextMode::Final | InsertTextMode::Replace => {
                 let armed = v.armed;
-                insert_transcript_into_input(app, &text);
+                insert_text_into_input(app, &text);
                 if !armed {
                     if let Some(v) = app.sidecars.get_mut(plugin_id) {
                         v.status = SidecarUiStatus::Idle;
@@ -241,11 +241,11 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
     }
 }
 
-/// Insert a transcript at the current cursor position with sensible
-/// whitespace handling. Pure function over `App` so it's unit-testable
-/// without any sidecar plumbing.
-pub(crate) fn insert_transcript_into_input(app: &mut App, transcript: &str) {
-    let trimmed = transcript.trim();
+/// Insert text at the current cursor position with sensible whitespace
+/// handling. Pure function over `App` so it's unit-testable without any
+/// sidecar plumbing.
+pub(crate) fn insert_text_into_input(app: &mut App, text: &str) {
+    let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
@@ -279,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn insert_transcript_into_empty_input() {
+    fn insert_text_into_empty_input() {
         let mut app = fresh_app();
-        insert_transcript_into_input(&mut app, "hello world");
+        insert_text_into_input(&mut app, "hello world");
         assert_eq!(app.input, "hello world");
         assert_eq!(app.cursor_pos, "hello world".chars().count());
     }
@@ -298,7 +298,7 @@ mod tests {
             setup_script: None,
             model: default_model.map(|p| SidecarModel {
                 default_path: Some(p.to_string()),
-                required_for_real_stt: false,
+                required: false,
             }),
             lifecycle: None,
         }
@@ -365,50 +365,50 @@ mod tests {
         assert_eq!(out_args[0], "--model-path");
     }
 
-    // ---- existing insert_transcript tests -----------------------------
+    // ---- existing insert_text tests -----------------------------
 
     #[test]
-    fn insert_transcript_appends_with_leading_space() {
+    fn insert_text_appends_with_leading_space() {
         let mut app = fresh_app();
         app.input = "first".to_string();
         app.cursor_pos = "first".chars().count();
-        insert_transcript_into_input(&mut app, "second sentence");
+        insert_text_into_input(&mut app, "second sentence");
         assert_eq!(app.input, "first second sentence");
         assert_eq!(app.cursor_pos, "first second sentence".chars().count());
     }
 
     #[test]
-    fn insert_transcript_no_double_space_when_input_ends_with_space() {
+    fn insert_text_no_double_space_when_input_ends_with_space() {
         let mut app = fresh_app();
         app.input = "first ".to_string();
         app.cursor_pos = "first ".chars().count();
-        insert_transcript_into_input(&mut app, "second");
+        insert_text_into_input(&mut app, "second");
         assert_eq!(app.input, "first second");
     }
 
     #[test]
-    fn insert_transcript_trims_whitespace_from_payload() {
+    fn insert_text_trims_whitespace_from_payload() {
         let mut app = fresh_app();
-        insert_transcript_into_input(&mut app, "  spaced text  ");
+        insert_text_into_input(&mut app, "  spaced text  ");
         assert_eq!(app.input, "spaced text");
     }
 
     #[test]
-    fn insert_transcript_ignores_empty_or_whitespace_only() {
+    fn insert_text_ignores_empty_or_whitespace_only() {
         let mut app = fresh_app();
-        insert_transcript_into_input(&mut app, "");
-        insert_transcript_into_input(&mut app, "   ");
+        insert_text_into_input(&mut app, "");
+        insert_text_into_input(&mut app, "   ");
         assert_eq!(app.input, "");
         assert_eq!(app.cursor_pos, 0);
     }
 
     #[test]
-    fn insert_transcript_inserts_at_cursor_not_end() {
+    fn insert_text_inserts_at_cursor_not_end() {
         let mut app = fresh_app();
         app.input = "hello world".to_string();
         // Place cursor between "hello" and " world" (after "hello")
         app.cursor_pos = 5;
-        insert_transcript_into_input(&mut app, "beautiful");
+        insert_text_into_input(&mut app, "beautiful");
         assert_eq!(app.input, "hello beautiful world");
     }
 
@@ -417,13 +417,13 @@ mod tests {
     #[test]
     fn status_line_uses_display_name_when_set() {
         let line = format_status_line(
-            Some("Voice"),
+            Some("Sensor"),
             &SidecarUiStatus::Idle,
-            "local-voice",
-            "/opt/local-voice/bin/sidecar",
+            "sample-sidecar",
+            "/opt/sample-sidecar/bin/sidecar",
             Some("metal"),
         );
-        assert!(line.starts_with("Voice:"), "got: {line}");
+        assert!(line.starts_with("Sensor:"), "got: {line}");
     }
 
     #[test]
@@ -431,8 +431,8 @@ mod tests {
         let line = format_status_line(
             None,
             &SidecarUiStatus::Idle,
-            "local-voice",
-            "/opt/local-voice/bin/sidecar",
+            "sample-sidecar",
+            "/opt/sample-sidecar/bin/sidecar",
             Some("metal"),
         );
         assert!(line.starts_with("sidecar:"), "got: {line}");
@@ -441,13 +441,13 @@ mod tests {
     #[test]
     fn status_line_uses_display_name_for_error_state() {
         let line = format_status_line(
-            Some("Voice"),
+            Some("Sensor"),
             &SidecarUiStatus::Error("oops".into()),
-            "local-voice",
-            "/opt/local-voice/bin/sidecar",
+            "sample-sidecar",
+            "/opt/sample-sidecar/bin/sidecar",
             None,
         );
-        assert_eq!(line, "Voice: error — oops");
+        assert_eq!(line, "Sensor: error — oops");
     }
 }
 
