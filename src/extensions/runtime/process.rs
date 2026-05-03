@@ -1150,6 +1150,10 @@ impl ProcessExtension {
                         "Extension '{}' registered tool '{}' with invalid tool name: must not contain whitespace",
                         id, name
                     ),
+                    IdValidationError::ContainsControl { ch } => format!(
+                        "Extension '{}' registered tool '{}' with invalid tool name: contains control character U+{:04X}",
+                        id, name, ch as u32
+                    ),
                 });
             }
             if !names.insert(name.to_string()) {
@@ -1235,6 +1239,10 @@ impl ProcessExtension {
                         IdValidationError::ContainsWhitespace => format!(
                             "Extension '{}' registered provider '{}' with invalid model id '{}': must not contain whitespace",
                             id, provider_id, model_id
+                        ),
+                        IdValidationError::ContainsControl { ch } => format!(
+                            "Extension '{}' registered provider '{}' with invalid model id '{}': contains control character U+{:04X}",
+                            id, provider_id, model_id, ch as u32
                         ),
                     });
                 }
