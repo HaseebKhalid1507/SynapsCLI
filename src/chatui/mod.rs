@@ -333,8 +333,31 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 secret_prompts.poll_requests(&secret_prompt_rx);
+                // Tick the in-flight plugin install spinner and reap the
+                // background clone task once it finishes.
+                let mut install_did_work = false;
+                let mut install_finished = false;
+                if let Some(plugins_state) = app.plugins.as_mut() {
+                    if plugins_state.is_install_active() {
+                        plugins_state.tick_install_spinner();
+                        install_did_work = true;
+                        if plugins_state.install_task_finished() {
+                            install_finished = true;
+                        }
+                    }
+                }
+                if install_finished {
+                    if let Some(plugins_state) = app.plugins.as_mut() {
+                        self::plugins::actions::complete_pending_install_clone(
+                            plugins_state, &registry, &config,
+                        ).await;
+                    }
+                }
+                if install_did_work || install_finished {
+                    app.invalidate();
+                }
                 let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
                 if message_animation_needs_clear {
                     if let Ok(size) = terminal.size() {

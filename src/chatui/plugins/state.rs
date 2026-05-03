@@ -1,7 +1,12 @@
 // Task 14/15 will use these variants/fields; keep them declared now for API stability.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use synaps_cli::skills::state::{PluginsState, InstalledPlugin, CachedPlugin};
+
+use super::progress::{InstallProgress, InstallProgressHandle};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LeftRow {
@@ -24,6 +29,9 @@ pub enum RightMode {
     AddMarketplaceEditor { buffer: String, error: Option<String> },
     TrustPrompt { plugin_name: String, host: String, pending_source: String, summary: Vec<String> },
     Confirm { prompt: String, on_yes: ConfirmAction, summary: Vec<String> },
+    /// Background `git clone --progress` is running. The handle points at
+    /// the same `InstallProgress` the worker thread is updating.
+    Installing { progress: InstallProgressHandle },
     PendingInstallConfirm {
         plugin_name: String,
         source_url: String,
@@ -52,6 +60,36 @@ pub enum ConfirmAction {
     RemoveMarketplace(String),
 }
 
+/// Bookkeeping for a background `git clone` started by [`crate::chatui::plugins::actions::run_install_flow`].
+/// The main loop's tick branch polls [`PluginsModalState::install_task_finished`]
+/// and, when it returns true, calls
+/// [`crate::chatui::plugins::actions::complete_pending_install_clone`] which
+/// reaps `join`, drains the result, and finishes the install pipeline
+/// (executable-extension confirm prompt, finalize, post-install setup).
+pub struct PendingInstallTask {
+    pub join: tokio::task::JoinHandle<Result<(String, PathBuf), String>>,
+    pub progress: InstallProgressHandle,
+    pub plugin_name: String,
+    pub source_url: String,
+    pub subdir: Option<String>,
+    pub marketplace_name: Option<String>,
+    pub expected_checksum: Option<(String, String)>,
+    pub final_dir: PathBuf,
+}
+
+impl std::fmt::Debug for PendingInstallTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInstallTask")
+            .field("plugin_name", &self.plugin_name)
+            .field("source_url", &self.source_url)
+            .field("subdir", &self.subdir)
+            .field("marketplace_name", &self.marketplace_name)
+            .field("final_dir", &self.final_dir)
+            .field("join_finished", &self.join.is_finished())
+            .finish()
+    }
+}
+
 pub struct PluginsModalState {
     pub file: PluginsState,
     pub selected_left: usize,
@@ -59,6 +97,11 @@ pub struct PluginsModalState {
     pub focus: Focus,
     pub mode: RightMode,
     pub row_error: Option<String>,
+    /// Background install task (spawned by `run_install_flow`); `Some` while
+    /// a `git clone --progress` is in flight. The main loop's animation tick
+    /// polls this to know when to render the spinner and when to reap the
+    /// task and finish the install.
+    pub pending_install: Option<PendingInstallTask>,
 }
 
 impl PluginsModalState {
@@ -70,6 +113,33 @@ impl PluginsModalState {
             focus: Focus::Left,
             mode: RightMode::List,
             row_error: None,
+            pending_install: None,
+        }
+    }
+
+    /// True while a background `git clone --progress` is in flight. Used by
+    /// the main loop to (a) keep the animation tick firing so the spinner
+    /// updates and (b) gate the polling that reaps the JoinHandle.
+    pub fn is_install_active(&self) -> bool {
+        self.pending_install.is_some()
+    }
+
+    /// True if the background clone task has finished and is ready to be
+    /// awaited / reaped. Cheap — just queries the JoinHandle.
+    pub fn install_task_finished(&self) -> bool {
+        self.pending_install
+            .as_ref()
+            .map(|p| p.join.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Advance the spinner frame on the in-flight install (no-op if none).
+    /// Called from the UI tick at ~60fps.
+    pub fn tick_install_spinner(&mut self) {
+        if let Some(p) = &self.pending_install {
+            if let Ok(mut prog) = p.progress.lock() {
+                prog.tick_spinner();
+            }
         }
     }
 

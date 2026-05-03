@@ -30,6 +30,7 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         RightMode::Confirm { .. } => return confirm_key(state, key),
         RightMode::PendingInstallConfirm { .. } => return pending_install_key(key),
         RightMode::PendingUpdateConfirm { .. } => return pending_update_key(key),
+        RightMode::Installing { .. } => return InputOutcome::None,
         RightMode::Detail { .. } => return detail_key(state, key),
         RightMode::List => {}
     }

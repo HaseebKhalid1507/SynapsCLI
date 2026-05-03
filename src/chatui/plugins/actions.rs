@@ -7,7 +7,7 @@
 //! field for `AddMarketplace`).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use synaps_cli::skills::{
     install,
@@ -27,7 +27,8 @@ use synaps_cli::skills::{
     update_diff::diff_plugin_manifests,
 };
 
-use super::state::{PluginsModalState, RightMode};
+use super::progress::{parse_progress_line, InstallProgress, InstallProgressHandle};
+use super::state::{PendingInstallTask, PluginsModalState, RightMode};
 
 /// Persist plugins state to its canonical path. Helper used by every mutator.
 fn commit_plugins_state(file: &PluginsState) -> std::io::Result<()> {
@@ -212,7 +213,7 @@ pub(crate) async fn apply_install(
     run_install_flow(
         state, plugin_name, effective_source, subdir, Some(marketplace_name), None,
         registry, config,
-    ).await;
+    );
 }
 
 fn plugin_index_entry_from_cached(
@@ -316,7 +317,7 @@ pub(crate) async fn apply_install_from_index_entry(
         checksum,
         registry,
         config,
-    ).await;
+    );
 }
 
 /// Trust the host, then install. Used for `TrustAndInstall` outcome.
@@ -346,7 +347,7 @@ pub(crate) async fn apply_trust_and_install(
             break;
         }
     }
-    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config).await;
+    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config);
 }
 
 /// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
@@ -357,13 +358,34 @@ fn install_plugin_to_temp_with_checksum(
     final_dest: &std::path::Path,
     expected_checksum: Option<(String, String)>,
 ) -> Result<(String, PathBuf), String> {
+    install_plugin_to_temp_with_progress(
+        plugin_name,
+        source_url,
+        subdir,
+        final_dest,
+        expected_checksum,
+        |_| {},
+    )
+}
+
+/// Same as [`install_plugin_to_temp_with_checksum`] but forwards every
+/// chunk of `git clone --progress` stderr to `on_chunk` so the chatui
+/// modal can drive a live progress gauge.
+fn install_plugin_to_temp_with_progress(
+    plugin_name: &str,
+    source_url: &str,
+    subdir: Option<String>,
+    final_dest: &std::path::Path,
+    expected_checksum: Option<(String, String)>,
+    on_chunk: impl FnMut(&str),
+) -> Result<(String, PathBuf), String> {
     let parent = final_dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     let tmp = parent.join(format!(".{}-pending-install", plugin_name));
     let _ = std::fs::remove_dir_all(&tmp);
     let sha = match subdir {
-        Some(s) => install::install_plugin_from_subdir(source_url, &s, &tmp),
-        None => install::install_plugin(source_url, &tmp),
+        Some(s) => install::install_plugin_from_subdir_with_progress(source_url, &s, &tmp, on_chunk),
+        None => install::install_plugin_with_progress(source_url, &tmp, on_chunk),
     }?;
     if let Some((algorithm, expected)) = expected_checksum {
         if let Err(e) = install::verify_plugin_dir_checksum(&tmp, &algorithm, &expected) {
@@ -484,15 +506,26 @@ fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -
         .map(|index| (index.checksum_algorithm.clone(), index.checksum_value.clone()))
 }
 
-async fn run_install_flow(
+/// Kick off a background `git clone --progress` for `plugin_name` and
+/// return immediately. The actual install is finished later by
+/// [`complete_pending_install_clone`] which is polled from the main loop's
+/// animation tick when [`PluginsModalState::install_task_finished`]
+/// returns true.
+///
+/// While the task runs:
+/// - `state.mode` is set to `RightMode::Installing { progress }`, so the
+///   modal renders an animated gauge.
+/// - `state.pending_install` holds the JoinHandle and the metadata we
+///   need to resume the install pipeline once the clone finishes.
+fn run_install_flow(
     state: &mut PluginsModalState,
     plugin_name: String,
     source_url: String,
     subdir: Option<String>,
     marketplace_name: Option<String>,
     expected_checksum: Option<(String, String)>,
-    registry: &Arc<CommandRegistry>,
-    config: &synaps_cli::SynapsConfig,
+    _registry: &Arc<CommandRegistry>,
+    _config: &synaps_cli::SynapsConfig,
 ) {
     let dest = match install_dir_for(&plugin_name) {
         Ok(d) => d,
@@ -501,23 +534,89 @@ async fn run_install_flow(
             return;
         }
     };
-    // Run git on a blocking thread into a temp directory first. If the plugin has
-    // an executable extension, show the inspected permissions before finalizing.
+    // Don't kick off a second clone if one is already running — the modal
+    // gates 'i' while in Installing mode, but defend in depth.
+    if state.pending_install.is_some() {
+        return;
+    }
+
+    let progress: InstallProgressHandle =
+        Arc::new(Mutex::new(InstallProgress::new(plugin_name.clone())));
+    let progress_for_task = Arc::clone(&progress);
+
     let src = source_url.clone();
     let dest_clone = dest.clone();
     let subdir_for_install = subdir.clone();
     let plugin_name_for_task = plugin_name.clone();
-    let expected_checksum_for_task = expected_checksum.clone();
-    let install_res = tokio::task::spawn_blocking(move || {
-        install_plugin_to_temp_with_checksum(
+    let expected_for_task = expected_checksum.clone();
+
+    let join = tokio::task::spawn_blocking(move || {
+        install_plugin_to_temp_with_progress(
             &plugin_name_for_task,
             &src,
             subdir_for_install,
             &dest_clone,
-            expected_checksum_for_task,
+            expected_for_task,
+            |chunk| {
+                if let Some(snap) = parse_progress_line(chunk) {
+                    if let Ok(mut p) = progress_for_task.lock() {
+                        p.apply(snap);
+                    }
+                }
+            },
         )
-    })
-    .await;
+    });
+
+    state.mode = RightMode::Installing {
+        progress: Arc::clone(&progress),
+    };
+    state.pending_install = Some(PendingInstallTask {
+        join,
+        progress,
+        plugin_name,
+        source_url,
+        subdir,
+        marketplace_name,
+        expected_checksum,
+        final_dir: dest,
+    });
+    state.row_error = None;
+}
+
+/// Reap a finished background install task and run the post-clone half of
+/// the install pipeline (executable-extension confirm prompt, finalize,
+/// post-install setup, persist). Called from the main loop's animation
+/// tick once [`PluginsModalState::install_task_finished`] returns true.
+///
+/// Safe to call when no install is in flight — returns immediately.
+pub(crate) async fn complete_pending_install_clone(
+    state: &mut PluginsModalState,
+    registry: &Arc<CommandRegistry>,
+    config: &synaps_cli::SynapsConfig,
+) {
+    let Some(task) = state.pending_install.take() else {
+        return;
+    };
+    // Drop the Installing overlay before we render the next frame — the
+    // PendingInstallConfirm / List transitions below will set the right mode.
+    state.mode = RightMode::List;
+
+    let PendingInstallTask {
+        join,
+        progress,
+        plugin_name,
+        source_url,
+        subdir,
+        marketplace_name,
+        expected_checksum,
+        final_dir: dest,
+    } = task;
+
+    let install_res = join.await;
+    // Drop progress handle so the worker's clone is the only outstanding ref;
+    // it'll be released when the task's stack unwinds.
+    drop(progress);
+
     let (sha, temp_dir) = match install_res {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
@@ -530,7 +629,8 @@ async fn run_install_flow(
         }
     };
     let summary = summarize_plugin_dir(&temp_dir);
-    let has_executable_extension = summary.iter().any(|line| line == "executable extension: yes");
+    let has_executable_extension =
+        summary.iter().any(|line| line == "executable extension: yes");
     if has_executable_extension {
         state.mode = RightMode::PendingInstallConfirm {
             plugin_name,
@@ -539,8 +639,12 @@ async fn run_install_flow(
             marketplace_name,
             summary,
             installed_commit: sha,
-            checksum_algorithm: expected_checksum.as_ref().map(|(algorithm, _)| algorithm.clone()),
-            checksum_value: expected_checksum.as_ref().map(|(_, value)| value.clone()),
+            checksum_algorithm: expected_checksum
+                .as_ref()
+                .map(|(algorithm, _)| algorithm.clone()),
+            checksum_value: expected_checksum
+                .as_ref()
+                .map(|(_, value)| value.clone()),
             temp_dir,
             final_dir: dest,
         };
@@ -1293,6 +1397,8 @@ mod tests {
             &config,
         )
         .await;
+        // Background clone now runs to completion; drain it before asserting.
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let RightMode::PendingInstallConfirm {
             source_url,
@@ -1438,8 +1544,8 @@ mod tests {
             None,
             &registry,
             &config,
-        )
-        .await;
+        );
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
             RightMode::PendingInstallConfirm { temp_dir, final_dir, summary, .. } => {
@@ -1482,8 +1588,8 @@ mod tests {
             None,
             &registry,
             &config,
-        )
-        .await;
+        );
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
             RightMode::PendingInstallConfirm { temp_dir, final_dir, .. } => {

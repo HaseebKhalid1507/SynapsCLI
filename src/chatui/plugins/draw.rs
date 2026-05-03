@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 use super::PluginsModalState;
+use super::progress::{ClonePhase, InstallProgressHandle};
 use super::state::{Focus, LeftRow, RightMode, RightRow};
 use super::super::theme::THEME;
 
@@ -123,6 +124,7 @@ fn render_right(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     render_right_list(frame, area, state);
     match &state.mode {
         RightMode::List => {}
+        RightMode::Installing { progress } => render_installing(frame, area, progress),
         RightMode::Detail { row_idx } => render_right_detail(frame, area, state, *row_idx),
         RightMode::AddMarketplaceEditor { buffer, error } => {
             render_add_editor(frame, area, buffer, error.as_deref())
@@ -488,6 +490,123 @@ fn render_confirm(frame: &mut Frame, area: Rect, prompt: &str, summary: &[String
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Animated frames for the spinner shown next to "Downloading…" while the
+/// background `git clone` is in flight. Braille frames give a smooth feel
+/// at 60fps without competing with the gauge for attention.
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHandle) {
+    // Snapshot the shared state under a short-lived lock; never hold the
+    // lock across rendering calls.
+    let snap = match progress.lock() {
+        Ok(p) => (
+            p.plugin_name.clone(),
+            p.phase,
+            p.percent,
+            p.counts,
+            p.throughput.clone(),
+            p.spinner_frame as usize,
+            p.started_at,
+            p.last_raw_line.clone(),
+        ),
+        Err(_) => return,
+    };
+    let (plugin_name, phase, percent, counts, throughput, spinner_frame, started_at, last_raw) =
+        snap;
+
+    let elapsed = started_at.elapsed();
+    let elapsed_str = format!("{:>2}.{:02}s", elapsed.as_secs(), elapsed.subsec_millis() / 10);
+
+    // Layout: title + blank + gauge (1 row) + status line + (optional error line)
+    // Content rows fixed at 5 + optional error line; +2 borders.
+    let has_error = matches!(phase, ClonePhase::Failed) && last_raw.is_some();
+    let needed = 5 + if has_error { 1 } else { 0 } + 2;
+    let height = (needed as u16).max(OVERLAY_HEIGHT).min(area.height.max(1));
+    let inner = centered_overlay_with_height(frame, area, " Installing ", height);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // gauge
+            Constraint::Length(1), // status line
+            Constraint::Min(0),    // error / spacer
+        ])
+        .split(inner);
+
+    let spinner_ch = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+    let title_line = Line::from(vec![
+        Span::styled(
+            format!("{} ", spinner_ch),
+            Style::default()
+                .fg(THEME.load().claude_label)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("Downloading {}", plugin_name),
+            Style::default().fg(THEME.load().claude_text),
+        ),
+        Span::styled(
+            format!("   {}", elapsed_str),
+            Style::default().fg(THEME.load().help_fg),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title_line), layout[0]);
+
+    // Gauge — show indeterminate spinner-style fill while connecting,
+    // real percentage once we have one.
+    let pct = percent.unwrap_or(0).min(100);
+    let pct_ratio = (pct as f64) / 100.0;
+    let gauge_label = match (phase, counts) {
+        (ClonePhase::Connecting, _) => "connecting…".to_string(),
+        (ClonePhase::SetupRunning, _) => "running setup script…".to_string(),
+        (ClonePhase::Done, _) => "complete".to_string(),
+        (ClonePhase::Failed, _) => "failed".to_string(),
+        (_, Some((a, b))) => format!("{:>3}%  ({}/{})", pct, a, b),
+        (_, None) => format!("{:>3}%", pct),
+    };
+    let gauge = Gauge::default()
+        .gauge_style(
+            Style::default()
+                .fg(if matches!(phase, ClonePhase::Failed) {
+                    THEME.load().error_color
+                } else {
+                    THEME.load().claude_label
+                })
+                .bg(THEME.load().bg),
+        )
+        .ratio(pct_ratio)
+        .label(gauge_label);
+    frame.render_widget(gauge, layout[2]);
+
+    // Status line: phase label + throughput
+    let mut status_spans = vec![Span::styled(
+        phase.label(),
+        Style::default().fg(THEME.load().help_fg),
+    )];
+    if let Some(tp) = throughput {
+        status_spans.push(Span::styled(
+            format!("    {}", tp),
+            Style::default().fg(THEME.load().help_fg),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(status_spans)), layout[3]);
+
+    if has_error {
+        if let Some(msg) = last_raw {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("! {}", msg),
+                    Style::default().fg(THEME.load().error_color),
+                )))
+                .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+        }
+    }
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let hint = match (&state.focus, &state.mode) {
         (_, RightMode::Detail { .. }) => "Esc back  i install  u update  U uninstall",
@@ -496,6 +615,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
         (_, RightMode::Confirm { .. }) => "y yes  n no  Esc cancel",
         (_, RightMode::PendingInstallConfirm { .. }) => "y install  n cancel  Esc cancel",
         (_, RightMode::PendingUpdateConfirm { .. }) => "y update  n cancel  Esc cancel",
+        (_, RightMode::Installing { .. }) => "downloading…  please wait",
         (Focus::Left, RightMode::List) => {
             "↑↓ nav  Tab switch  Enter select  r refresh  R remove  Esc close"
         }
