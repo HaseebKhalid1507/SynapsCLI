@@ -102,10 +102,13 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
         if line.trim().is_empty() {
             continue;
         }
-        records.push(
-            serde_json::from_str::<SessionIndexRecord>(line)
-                .map_err(|err| crate::core::error::RuntimeError::Session(format!("parse session index record: {err}")))?,
-        );
+        match serde_json::from_str::<SessionIndexRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                tracing::warn!("skipping malformed session index line: {err}");
+                continue;
+            }
+        }
     }
     records.reverse();
     Ok(records)
