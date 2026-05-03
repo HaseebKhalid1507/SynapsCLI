@@ -20,6 +20,7 @@ use synaps_cli::skills::{
         PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
         PluginIndexTrust,
     },
+    post_install,
     reload_registry,
     registry::CommandRegistry,
     state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState},
@@ -386,6 +387,47 @@ fn cancel_pending_temp(temp_dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+/// If the manifest at `final_dir/.synaps-plugin/plugin.json` declares
+/// `provides.sidecar.setup`, run it. Returns:
+/// - `Ok(None)` if no setup is declared (nothing to do)
+/// - `Ok(Some(log_path))` if setup ran successfully (caller may surface
+///   the log path as informational)
+/// - `Err(message)` describing the failure plus a pointer to the log
+///   file. The caller should set `state.row_error = Some(message)` but
+///   still proceed to record the install (source is on disk; user can
+///   rerun setup manually).
+async fn run_post_install_setup_for_dir(
+    plugin_name: &str,
+    final_dir: &std::path::Path,
+) -> Result<Option<PathBuf>, String> {
+    let manifest = match read_plugin_manifest(final_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(format!(
+                "installed but could not read manifest to check for setup script: {e}"
+            ));
+        }
+    };
+    let resolved =
+        post_install::resolve_setup_script(&manifest, final_dir).map_err(|e| e.to_string())?;
+    let Some(script) = resolved else {
+        return Ok(None);
+    };
+    let logs_root = synaps_cli::config::resolve_write_path("logs");
+    let log_path = post_install::install_log_path(&logs_root, plugin_name, &now_rfc3339());
+    match post_install::run_setup_script(
+        &script,
+        final_dir,
+        &log_path,
+        post_install::SETUP_TIMEOUT,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Some(outcome.log_path)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn read_plugin_manifest(path: &std::path::Path) -> Result<PluginManifest, String> {
     let manifest_path = path.join(".synaps-plugin/plugin.json");
     let body = std::fs::read_to_string(&manifest_path)
@@ -509,6 +551,7 @@ async fn run_install_flow(
         state.row_error = Some(e);
         return;
     }
+    let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &dest).await;
     let plugin_name_for_msg = plugin_name.clone();
     record_installed_plugin(
         state,
@@ -528,7 +571,12 @@ async fn run_install_flow(
     }
     reload_registry(registry, config);
     state.mode = RightMode::List;
-    state.row_error = None;
+    state.row_error = match setup_outcome {
+        Ok(_) => None,
+        Err(msg) => Some(format!(
+            "installed '{plugin_name_for_msg}' but setup script failed: {msg}"
+        )),
+    };
 }
 
 pub(crate) async fn apply_confirm_pending_install(
@@ -568,6 +616,8 @@ pub(crate) async fn apply_confirm_pending_install(
         }
     }
 
+    let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &final_dir).await;
+
     record_installed_plugin(
         state,
         plugin_name.clone(),
@@ -585,7 +635,12 @@ pub(crate) async fn apply_confirm_pending_install(
         return;
     }
     reload_registry(registry, config);
-    state.row_error = None;
+    state.row_error = match setup_outcome {
+        Ok(_) => None,
+        Err(msg) => Some(format!(
+            "installed '{plugin_name}' but setup script failed: {msg}"
+        )),
+    };
 }
 
 pub(crate) fn apply_cancel_pending_install(state: &mut PluginsModalState) {
@@ -1454,5 +1509,86 @@ mod tests {
         let saved = PluginsState::load_from(&home.path().join("plugins.json")).unwrap();
         assert_eq!(saved.installed.len(), 1);
         assert_eq!(saved.installed[0].name, "policy-test");
+    }
+
+    /// Slice B: post-install setup hook runs the manifest's
+    /// `provides.sidecar.setup` script after `finalize_pending_install`.
+    /// Test it via the helper directly (`run_post_install_setup_for_dir`)
+    /// so we don't have to spin up a whole install flow with a real git
+    /// fixture just to assert the hook fires.
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_runs_declared_script() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"hook-test","provides":{"sidecar":{"command":"bin/x","setup":"scripts/setup.sh","protocol_version":1}}}"#,
+        ).unwrap();
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let setup = scripts.join("setup.sh");
+        let marker = plugin_dir.path().join("ran.marker");
+        std::fs::write(
+            &setup,
+            format!("#!/bin/bash\ntouch {}\necho ok\n", marker.display()),
+        ).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("hook-test", plugin_dir.path()).await;
+        assert!(res.is_ok(), "got {res:?}");
+        let log = res.unwrap().expect("setup was declared so log should be Some");
+        assert!(marker.exists(), "setup script should have created the marker");
+        assert!(log.starts_with(home.path().join("logs/install")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_returns_ok_none_when_no_setup_declared() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"no-setup-test"}"#,
+        ).unwrap();
+
+        let res = run_post_install_setup_for_dir("no-setup-test", plugin_dir.path()).await;
+        match res {
+            Ok(None) => {}
+            other => panic!("expected Ok(None), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_propagates_non_zero_exit() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"fail-test","provides":{"sidecar":{"command":"bin/x","setup":"fail.sh","protocol_version":1}}}"#,
+        ).unwrap();
+        let setup = plugin_dir.path().join("fail.sh");
+        std::fs::write(&setup, "#!/bin/bash\necho boom\nexit 13\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("fail-test", plugin_dir.path()).await;
+        let err = res.expect_err("non-zero exit should propagate");
+        assert!(err.contains("13"), "error should mention exit code 13: {err}");
+        assert!(err.contains(".log"), "error should point at log path: {err}");
     }
 }
