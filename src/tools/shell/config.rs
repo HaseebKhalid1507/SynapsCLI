@@ -59,6 +59,7 @@ fn default_prompt_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use crate::core::config::load_config;
 
     #[test]
@@ -74,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_shell_config_from_file() {
         // These tests must run sequentially since they mutate HOME env var.
         // Combined into one test to avoid parallel races.

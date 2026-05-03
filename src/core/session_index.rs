@@ -114,6 +114,7 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use serde_json::Value;
     use std::sync::Mutex;
 
@@ -149,6 +150,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn append_record_creates_jsonl_under_base_dir() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("creates-jsonl");
@@ -169,6 +171,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn append_start_and_end_are_valid_json_lines() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("start-end-lines");
@@ -185,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_returns_newest_records_in_chronological_order() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("read-recent");
@@ -203,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_missing_index_returns_empty() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("missing-index");
@@ -212,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_limit_zero_returns_empty() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("limit-zero");
