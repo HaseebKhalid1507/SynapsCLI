@@ -73,17 +73,21 @@ pub(crate) fn save_trust_state_to(base: &Path, state: &ProviderTrustState) -> Re
     let serialized = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize trust state: {}", e))?;
 
-    // Atomic write: write to a sibling temp file then rename over the target.
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, serialized.as_bytes()).map_err(|e| {
-        format!("failed to write {}: {}", tmp_path.display(), e)
+    // Atomic write: write to a unique temp file in the same directory then rename.
+    // Using tempfile::NamedTempFile avoids trampling when concurrent writers hit
+    // the same target path.
+    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        format!("failed to create temp file in {}: {}", parent.display(), e)
     })?;
-    std::fs::rename(&tmp_path, &path).map_err(|e| {
+    std::fs::write(tmp.path(), serialized.as_bytes()).map_err(|e| {
+        format!("failed to write {}: {}", tmp.path().display(), e)
+    })?;
+    tmp.persist(&path).map_err(|e| {
         format!(
             "failed to rename {} -> {}: {}",
-            tmp_path.display(),
+            e.file.path().display(),
             path.display(),
-            e
+            e.error,
         )
     })?;
     Ok(())
