@@ -10,9 +10,7 @@
 //! ## Manifest schema
 //!
 //! Plugins declare a sidecar via `provides.sidecar` in their plugin
-//! manifest. The legacy spelling `provides.voice_sidecar` is still
-//! accepted via a serde alias for one release (see
-//! [`crate::skills::manifest::PluginProvides`]).
+//! manifest.
 
 use std::path::{Path, PathBuf};
 
@@ -122,14 +120,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn sidecar_plugin() -> Plugin {
-        // Uses the legacy `voice_sidecar` field name to assert that the
-        // serde alias keeps Phase-6-era plugin manifests deserializing.
-        // Canonical-name coverage lives in
-        // `discover_accepts_canonical_sidecar_field`.
+        // Canonical `provides.sidecar` fixture.
         let manifest_json = r#"{
             "name": "local-voice",
             "provides": {
-                "voice_sidecar": {
+                "sidecar": {
                     "command": "bin/synaps-voice-plugin",
                     "setup": "scripts/setup.sh",
                     "protocol_version": 1,
@@ -196,7 +191,7 @@ mod tests {
         let plugin_json = r#"{
             "name": "abs-sidecar",
             "provides": {
-                "voice_sidecar": {
+                "sidecar": {
                     "command": "/usr/local/bin/sidecar",
                     "protocol_version": 1
                 }
