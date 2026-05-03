@@ -1327,12 +1327,18 @@ impl ProcessExtension {
             config: Value::Object(Default::default()),
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let value = self.call_once_locked(
-            state.as_mut().expect("state should exist for initialize"),
-            "initialize",
-            serde_json::to_value(params).map_err(|e| e.to_string())?,
-            id,
-        ).await?;
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.call_once_locked(
+                state.as_mut().expect("state should exist for initialize"),
+                "initialize",
+                serde_json::to_value(params).map_err(|e| e.to_string())?,
+                id,
+            ),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' initialize timed out after 10s", self.id))?
+        ?;
         Self::parse_initialize_result(&self.id, value).map(|_| ())
     }
 
@@ -1408,6 +1414,26 @@ impl ProcessExtension {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let timeout_secs = if method == "tool.call" { 120 } else { 30 };
+        let id_str = self.id.clone();
+        let method_str = method.to_string();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.call_inner(method, params),
+        )
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(format!(
+                "Extension '{}' method '{}' timed out after {}s",
+                id_str, method_str, timeout_secs
+            )),
+        }
+    }
+
+    async fn call_inner(&self, method: &str, params: Value) -> Result<Value, String> {
         let _call_guard = self.call_lock.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut state_guard = self.state.lock().await;
