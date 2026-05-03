@@ -34,8 +34,10 @@ pub enum ConfigSource {
     EnvOverride(String),
     /// Resolved from the manifest-declared `secret_env` variable.
     SecretEnv(String),
-    /// Resolved from the persisted config key `extension.<id>.<key>`.
-    ConfigKey(String),
+    /// Resolved from the plugin-owned config file `plugins/<id>/config`.
+    PluginConfig,
+    /// Resolved from the deprecated persisted config key `extension.<id>.<key>`.
+    LegacyConfigKey(String),
     /// Resolved from the manifest-declared default value.
     Default,
     /// No value available from any source.
@@ -59,25 +61,30 @@ pub fn classify_config_entry(
     extension_id: &str,
     entry: &ExtensionConfigEntry,
     env_lookup: &impl Fn(&str) -> Option<String>,
-    config_lookup: &impl Fn(&str) -> Option<String>,
+    plugin_config_lookup: &impl Fn(&str) -> Option<String>,
+    legacy_config_lookup: &impl Fn(&str) -> Option<String>,
 ) -> ConfigEntryStatus {
     let env_var = extension_env_var(extension_id, &entry.key);
-    let config_key = format!("extension.{}.{}", extension_id, entry.key);
+    let legacy_config_key = format!("extension.{}.{}", extension_id, entry.key);
 
     let source = if env_lookup(&env_var).is_some() {
         ConfigSource::EnvOverride(env_var)
     } else if let Some(secret_env) = entry.secret_env.as_ref() {
         if env_lookup(secret_env).is_some() {
             ConfigSource::SecretEnv(secret_env.clone())
-        } else if config_lookup(&config_key).is_some() {
-            ConfigSource::ConfigKey(config_key)
+        } else if plugin_config_lookup(&entry.key).is_some() {
+            ConfigSource::PluginConfig
+        } else if legacy_config_lookup(&legacy_config_key).is_some() {
+            ConfigSource::LegacyConfigKey(legacy_config_key)
         } else if entry.default.is_some() {
             ConfigSource::Default
         } else {
             ConfigSource::Missing
         }
-    } else if config_lookup(&config_key).is_some() {
-        ConfigSource::ConfigKey(config_key)
+    } else if plugin_config_lookup(&entry.key).is_some() {
+        ConfigSource::PluginConfig
+    } else if legacy_config_lookup(&legacy_config_key).is_some() {
+        ConfigSource::LegacyConfigKey(legacy_config_key)
     } else if entry.default.is_some() {
         ConfigSource::Default
     } else {
@@ -113,11 +120,20 @@ pub fn diagnose_extension_config(
     manifest_config: &[ExtensionConfigEntry],
     provider_required: &[(String, Vec<String>)],
     env_lookup: &impl Fn(&str) -> Option<String>,
-    config_lookup: &impl Fn(&str) -> Option<String>,
+    plugin_config_lookup: &impl Fn(&str) -> Option<String>,
+    legacy_config_lookup: &impl Fn(&str) -> Option<String>,
 ) -> ExtensionConfigDiagnostics {
     let entries: Vec<ConfigEntryStatus> = manifest_config
         .iter()
-        .map(|entry| classify_config_entry(extension_id, entry, env_lookup, config_lookup))
+        .map(|entry| {
+            classify_config_entry(
+                extension_id,
+                entry,
+                env_lookup,
+                plugin_config_lookup,
+                legacy_config_lookup,
+            )
+        })
         .collect();
 
     let mut provider_missing: Vec<(String, String)> = Vec::new();
@@ -151,6 +167,7 @@ mod tests {
     fn entry(key: &str) -> ExtensionConfigEntry {
         ExtensionConfigEntry {
             key: key.to_string(),
+            value_type: None,
             description: None,
             required: false,
             default: None,
@@ -206,7 +223,7 @@ mod tests {
                 None
             }
         };
-        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup);
+        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup, &empty_lookup);
         assert_eq!(
             status.source,
             ConfigSource::EnvOverride("SYNAPS_EXTENSION_MY_EXT_API_KEY".to_string())
@@ -225,11 +242,22 @@ mod tests {
                 None
             }
         };
-        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup);
+        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup, &empty_lookup);
         assert_eq!(
             status.source,
             ConfigSource::SecretEnv("MY_PROVIDER_KEY".to_string())
         );
+        assert!(status.has_value);
+    }
+
+    #[test]
+    fn classify_plugin_config() {
+        let e = entry("api-key");
+        let plugin = |k: &str| {
+            if k == "api-key" { Some("v".to_string()) } else { None }
+        };
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &plugin, &empty_lookup);
+        assert_eq!(status.source, ConfigSource::PluginConfig);
         assert!(status.has_value);
     }
 
@@ -243,10 +271,10 @@ mod tests {
                 None
             }
         };
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &cfg);
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &cfg);
         assert_eq!(
             status.source,
-            ConfigSource::ConfigKey("extension.my-ext.api-key".to_string())
+            ConfigSource::LegacyConfigKey("extension.my-ext.api-key".to_string())
         );
         assert!(status.has_value);
     }
@@ -255,7 +283,7 @@ mod tests {
     fn classify_default() {
         let mut e = entry("region");
         e.default = Some(Value::String("us-east-1".to_string()));
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup);
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Default);
         assert!(status.has_value);
     }
@@ -264,7 +292,7 @@ mod tests {
     fn classify_missing() {
         let mut e = entry("api-key");
         e.required = true;
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup);
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Missing);
         assert!(!status.has_value);
         assert!(status.required);
@@ -277,7 +305,7 @@ mod tests {
         e.default = Some(Value::String("d".to_string()));
         let env = |k: &str| Some(format!("env-{}", k));
         let cfg = |_: &str| Some("cfg".to_string());
-        let status = classify_config_entry("my-ext", &e, &env, &cfg);
+        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup, &cfg);
         assert!(matches!(status.source, ConfigSource::EnvOverride(_)));
     }
 
@@ -294,7 +322,7 @@ mod tests {
             }
         };
         let cfg = |_: &str| Some("cfg".to_string());
-        let status = classify_config_entry("my-ext", &e, &env, &cfg);
+        let status = classify_config_entry("my-ext", &e, &env, &empty_lookup, &cfg);
         assert_eq!(
             status.source,
             ConfigSource::SecretEnv("MY_PROVIDER_KEY".to_string())
@@ -312,15 +340,15 @@ mod tests {
                 None
             }
         };
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &cfg);
-        assert!(matches!(status.source, ConfigSource::ConfigKey(_)));
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &cfg);
+        assert!(matches!(status.source, ConfigSource::LegacyConfigKey(_)));
     }
 
     #[test]
     fn default_only_when_no_env_or_config() {
         let mut e = entry("region");
         e.default = Some(Value::String("us-east-1".to_string()));
-        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup);
+        let status = classify_config_entry("my-ext", &e, &empty_lookup, &empty_lookup, &empty_lookup);
         assert_eq!(status.source, ConfigSource::Default);
     }
 
@@ -330,6 +358,7 @@ mod tests {
             "my-ext",
             &[],
             &[],
+            &empty_lookup,
             &empty_lookup,
             &empty_lookup,
         );
@@ -348,6 +377,7 @@ mod tests {
             &[],
             &empty_lookup,
             &empty_lookup,
+            &empty_lookup,
         );
         assert_eq!(diag.entries.len(), 1);
         assert_eq!(diag.entries[0].source, ConfigSource::Default);
@@ -361,6 +391,7 @@ mod tests {
             "my-ext",
             &[],
             &[("p".to_string(), vec!["api-key".to_string()])],
+            &empty_lookup,
             &empty_lookup,
             &empty_lookup,
         );
@@ -387,6 +418,7 @@ mod tests {
             &[("p".to_string(), vec!["api-key".to_string()])],
             &env,
             &empty_lookup,
+            &empty_lookup,
         );
         assert!(diag.entries[0].has_value);
         assert!(diag.provider_missing.is_empty());
@@ -400,6 +432,7 @@ mod tests {
             "my-ext",
             std::slice::from_ref(&e),
             &[("p".to_string(), vec!["api-key".to_string()])],
+            &empty_lookup,
             &empty_lookup,
             &empty_lookup,
         );

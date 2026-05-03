@@ -9,6 +9,256 @@ use ratatui::{
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation, Shader};
 
+/// Build a single sidecar pill segment for one `SidecarUiState`.
+fn sidecar_pill_segment(
+    sidecar: &super::sidecar::SidecarUiState,
+    spinner_frame: usize,
+) -> Span<'static> {
+    let label = sidecar.display_name.as_deref().unwrap_or("sidecar");
+    let text = sidecar_pill_text(label, &sidecar.status, sidecar.armed, spinner_frame);
+    let color = match &sidecar.status {
+        super::sidecar::SidecarUiStatus::Idle => {
+            if sidecar.armed {
+                let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                let base = match THEME.load().status_streaming {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (220, 80, 80),
+                };
+                Color::Rgb(
+                    (base.0 as f64 * pulse) as u8,
+                    (base.1 as f64 * pulse) as u8,
+                    (base.2 as f64 * pulse) as u8,
+                )
+            } else {
+                THEME.load().muted
+            }
+        }
+        super::sidecar::SidecarUiStatus::Listening => {
+            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+            let base = match THEME.load().status_streaming {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => (220, 80, 80),
+            };
+            Color::Rgb(
+                (base.0 as f64 * pulse) as u8,
+                (base.1 as f64 * pulse) as u8,
+                (base.2 as f64 * pulse) as u8,
+            )
+        }
+        super::sidecar::SidecarUiStatus::Transcribing => THEME.load().status_streaming,
+        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
+    };
+    let modifier = match &sidecar.status {
+        super::sidecar::SidecarUiStatus::Transcribing => Modifier::empty(),
+        _ => Modifier::BOLD,
+    };
+    Span::styled(text, Style::default().fg(color).add_modifier(modifier))
+}
+
+/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// pairs and the registry's lifecycle claims, return the plugin ids in
+/// display order: importance desc, then display_name alphabetical, then
+/// plugin id. Pulled out so the ordering can be unit-tested without
+/// constructing a full `SidecarUiState` (which owns a child process).
+pub(crate) fn order_sidecar_pills(
+    sidecars: &[(String, Option<String>)],
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Vec<String> {
+    let importance_for = |pid: &str| -> i32 {
+        claims.iter().find(|c| c.plugin == pid).map(|c| c.importance).unwrap_or(0)
+    };
+    let mut keys: Vec<&(String, Option<String>)> = sidecars.iter().collect();
+    keys.sort_by(|a, b| {
+        let imp_a = importance_for(&a.0);
+        let imp_b = importance_for(&b.0);
+        imp_b.cmp(&imp_a)
+            .then_with(|| {
+                let an = a.1.as_deref().unwrap_or(a.0.as_str());
+                let bn = b.1.as_deref().unwrap_or(b.0.as_str());
+                an.cmp(bn)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    keys.into_iter().map(|(p, _)| p.clone()).collect()
+}
+
+/// Build sidecar pill spans for all active sidecars, ordered by
+/// importance (desc) then display_name alphabetical (Phase 8 8B.3).
+///
+/// Each segment is preceded by a vertical separator so the caller can
+/// concatenate the result onto a status line. Returns an empty vec
+/// when no sidecars are active.
+pub(crate) fn sidecar_pill_spans(
+    app: &super::app::App,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+) -> Vec<Span<'static>> {
+    if app.sidecars.is_empty() {
+        return Vec::new();
+    }
+    let claims = registry.lifecycle_claims();
+    let inputs: Vec<(String, Option<String>)> = app.sidecars.iter()
+        .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
+        .collect();
+    let order = order_sidecar_pills(&inputs, &claims);
+    let mut spans = Vec::with_capacity(order.len() * 2);
+    for pid in &order {
+        let Some(state) = app.sidecars.get(pid) else { continue; };
+        spans.push(Span::styled("\u{2502}", Style::default().fg(THEME.load().border)));
+        spans.push(sidecar_pill_segment(state, app.spinner_frame));
+    }
+    spans
+}
+
+/// Pure helper backing [`sidecar_pill_span`] — returns the rendered
+/// text only. Lives separately so tests can exercise the label logic
+/// without spawning a real sidecar process or mounting the full App.
+pub(crate) fn sidecar_pill_text(
+    label: &str,
+    status: &super::sidecar::SidecarUiStatus,
+    armed: bool,
+    spinner_frame: usize,
+) -> String {
+    match status {
+        super::sidecar::SidecarUiStatus::Idle => {
+            if armed {
+                " \u{1f3a4} listening ".to_string()
+            } else {
+                format!(" \u{25cb} {label} ")
+            }
+        }
+        super::sidecar::SidecarUiStatus::Listening => " \u{1f3a4} listening ".to_string(),
+        super::sidecar::SidecarUiStatus::Transcribing => {
+            let spinner_idx = (spinner_frame / 3) % SPINNER_FRAMES.len();
+            let frame = SPINNER_FRAMES[spinner_idx];
+            format!(" {} transcribing ", frame)
+        }
+        super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
+    }
+}
+
+#[cfg(test)]
+mod sidecar_pill_tests {
+    use super::*;
+    use synaps_cli::Session;
+
+    fn fresh_app() -> super::super::app::App {
+        super::super::app::App::new(Session::new("test", "medium", None))
+    }
+
+    fn empty_registry() -> std::sync::Arc<synaps_cli::skills::registry::CommandRegistry> {
+        std::sync::Arc::new(synaps_cli::skills::registry::CommandRegistry::new_with_plugins(
+            &[], vec![], vec![],
+        ))
+    }
+
+    #[test]
+    fn pill_returns_empty_when_no_sidecars() {
+        let app = fresh_app();
+        assert!(sidecar_pill_spans(&app, &empty_registry()).is_empty());
+    }
+
+    #[test]
+    fn pill_uses_display_name_when_set() {
+        // Idle, unarmed pill should show the display name.
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Idle,
+            false,
+            0,
+        );
+        assert!(text.contains("Voice"), "expected pill to contain 'Voice', got: {text:?}");
+        assert!(!text.contains("sidecar"), "expected no 'sidecar' fallback, got: {text:?}");
+    }
+
+    #[test]
+    fn pill_falls_back_to_sidecar_when_no_display_name() {
+        let text = sidecar_pill_text(
+            "sidecar",
+            &super::super::sidecar::SidecarUiStatus::Idle,
+            false,
+            0,
+        );
+        assert!(text.contains("sidecar"), "got: {text:?}");
+    }
+
+    #[test]
+    fn pill_error_state_uses_display_name() {
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Error("oops".into()),
+            false,
+            0,
+        );
+        assert!(text.contains("Voice error"), "got: {text:?}");
+    }
+
+    #[test]
+    fn pill_listening_state_is_modality_neutral() {
+        // Listening / transcribing don't get the display name suffix
+        // (per slice 8A.5 spec — keep it simple).
+        let text = sidecar_pill_text(
+            "Voice",
+            &super::super::sidecar::SidecarUiStatus::Listening,
+            true,
+            0,
+        );
+        assert!(text.contains("listening"), "got: {text:?}");
+        assert!(!text.contains("Voice"), "got: {text:?}");
+    }
+
+    fn claim(plugin: &str, command: &str, importance: i32) -> synaps_cli::skills::registry::LifecycleClaim {
+        synaps_cli::skills::registry::LifecycleClaim {
+            plugin: plugin.into(),
+            command: command.into(),
+            settings_category: None,
+            display_name: command.into(),
+            importance,
+        }
+    }
+
+    #[test]
+    fn multi_segment_pill_orders_by_importance_desc() {
+        // alpha @ 10, beta @ 90 — beta should come first.
+        let claims = vec![claim("alpha", "alpha", 10), claim("beta", "beta", 90)];
+        let inputs = vec![
+            ("alpha".to_string(), Some("Alpha".to_string())),
+            ("beta".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["beta".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn multi_segment_pill_tiebreaks_alphabetical_by_display_name() {
+        // Both importance 50 — Alpha before Beta by display name.
+        let claims = vec![claim("p2", "p2", 50), claim("p1", "p1", 50)];
+        let inputs = vec![
+            ("p2".to_string(), Some("Alpha".to_string())),
+            ("p1".to_string(), Some("Beta".to_string())),
+        ];
+        let order = super::order_sidecar_pills(&inputs, &claims);
+        assert_eq!(order, vec!["p2".to_string(), "p1".to_string()]);
+    }
+
+        #[test]
+    fn active_tasks_progress_line_renders_fraction() {
+        let mut tasks = synaps_cli::extensions::active_tasks::ActiveTasks::new();
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Start {
+            id: "dl".into(),
+            label: "Download base".into(),
+            kind: synaps_cli::extensions::tasks::TaskKind::Download,
+        });
+        tasks.apply(synaps_cli::extensions::tasks::TaskEvent::Update {
+            id: "dl".into(),
+            current: Some(50),
+            total: Some(100),
+            message: Some("half".into()),
+        });
+        let _ = render_active_tasks_line(&tasks, 80);
+    }
+}
+
+
 use super::theme::THEME;
 use super::markdown::format_tokens;
 use super::app::{App, SPINNER_FRAMES};
@@ -81,6 +331,34 @@ pub(crate) fn quit_effect() -> Effect {
     ])
 }
 
+
+/// Render the first generic extension active task as a single sticky progress line.
+pub(crate) fn render_active_tasks_line<'a>(
+    tasks: &'a synaps_cli::extensions::active_tasks::ActiveTasks,
+    width: u16,
+) -> Paragraph<'a> {
+    let theme = THEME.load();
+    let Some(task) = tasks.iter().next() else {
+        return Paragraph::new(Line::from(""));
+    };
+    let pct = task.fraction().map(|f| (f * 100.0).round() as u32);
+    let bar_width = ((width as usize).saturating_sub(42)).clamp(8, 28);
+    let fill = task.fraction().map(|f| (f * bar_width as f32).round() as usize).unwrap_or(0).min(bar_width);
+    let bar = format!("{}{}", "█".repeat(fill), "░".repeat(bar_width - fill));
+    let status = if let Some(err) = &task.error {
+        format!("✘ {}: {}", task.label, err)
+    } else if task.done {
+        format!("✓ {}", task.label)
+    } else {
+        let pct_text = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "?%".to_string());
+        match &task.message {
+            Some(msg) if !msg.is_empty() => format!("⟳ {} [{}] {}  {}", task.label, bar, pct_text, msg),
+            _ => format!("⟳ {} [{}] {}", task.label, bar, pct_text),
+        }
+    };
+    Paragraph::new(Line::from(Span::styled(status, Style::default().fg(theme.help_fg))))
+}
+
 pub(crate) fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -114,12 +392,17 @@ pub(crate) fn draw(
         let max_input_lines: u16 = 10;
         let input_height = (input_lines.min(max_input_lines)) + 2; // +2 for borders
 
+        // Generic active-task progress bar — 1 line above the input box when
+        // any plugin-published task is in flight. Hidden otherwise.
+        let download_height: u16 = if !app.active_tasks.is_empty() { 1 } else { 0 };
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),              // header
                 Constraint::Min(1),                 // messages
                 Constraint::Length(subagent_height), // subagent panel (0 when inactive)
+                Constraint::Length(download_height), // download progress bar (0 when idle)
                 Constraint::Length(input_height),   // input (expands with content)
                 Constraint::Length(1),              // footer
             ])
@@ -151,12 +434,18 @@ pub(crate) fn draw(
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-            status_span,
-        ]))
+        let header = Paragraph::new(Line::from({
+            let mut spans = vec![
+                Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
+                Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
+                status_span,
+            ];
+            for span in sidecar_pill_spans(app, registry) {
+                spans.push(span);
+            }
+            spans
+        }))
         .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(header, outer[0]);
 
@@ -595,13 +884,22 @@ pub(crate) fn draw(
         let input_widget = Paragraph::new(input_lines_vec)
         .scroll((input_scroll, 0))
         .block(input_block);
-        frame.render_widget(input_widget, outer[3]);
+        frame.render_widget(input_widget, outer[4]);
 
         // Cursor — position relative to scroll offset
         frame.set_cursor_position((
-            outer[3].x + 1 + cursor_col,
-            outer[3].y + 1 + cursor_row - input_scroll,
+            outer[4].x + 1 + cursor_col,
+            outer[4].y + 1 + cursor_row - input_scroll,
         ));
+
+        // -- Active task progress bar ----------------------------------------
+        // Renders a generic single-line widget above the input when any
+        // plugin-published task is in flight. Layout collapses to 0 height
+        // when the active-tasks set is empty.
+        if !app.active_tasks.is_empty() {
+            let bar = render_active_tasks_line(&app.active_tasks, outer[3].width);
+            frame.render_widget(bar, outer[3]);
+        }
 
         // -- Footer ----------------------------------------------------------
         let footer_chunks = Layout::default()
@@ -610,7 +908,7 @@ pub(crate) fn draw(
                 Constraint::Min(1),
                 Constraint::Length(model.len() as u16 + 75),
             ])
-            .split(outer[4]);
+            .split(outer[5]);
 
         let key_style = Style::default().fg(THEME.load().muted);
         let label_style = Style::default().fg(THEME.load().help_fg);

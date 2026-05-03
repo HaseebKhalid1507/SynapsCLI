@@ -7,6 +7,7 @@ use std::io;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -31,6 +32,18 @@ pub(super) fn setup_terminal() -> synaps_cli::Result<Term> {
     .map_err(|e| {
         synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e))
     })?;
+    // Best-effort: enable the kitty keyboard protocol so modifier-heavy
+    // chords (Ctrl+Alt+V, Ctrl+Shift+letter, etc.) report correctly on
+    // terminals that support it (kitty, wezterm, foot, iterm2, alacritty).
+    // Terminals that don't support it ignore the escape sequence, so we
+    // swallow any error.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend).map_err(|e| {
         synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e))
@@ -42,6 +55,7 @@ pub(super) fn setup_terminal() -> synaps_cli::Result<Term> {
 /// Best-effort — errors are swallowed (we are usually exiting anyway).
 pub(super) fn teardown_terminal(terminal: &mut Term) {
     disable_raw_mode().ok();
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,

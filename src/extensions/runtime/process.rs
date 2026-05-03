@@ -381,68 +381,80 @@ pub fn extract_provider_tool_uses(content: &[Value]) -> Result<Vec<ProviderToolU
 pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
     pub providers: Vec<RegisteredProviderSpec>,
-    pub voice: Option<VoiceCapabilityDeclaration>,
+    /// Generic, plugin-defined capabilities. Each entry's `kind` is a
+    /// free-form string the plugin author picks (e.g. `"voice"`,
+    /// `"ocr"`, `"agent"`, `"foot_pedal"`); core does not enumerate or
+    /// branch on it. Permissions are gated by the declared
+    /// [`CapabilityDeclaration::permissions`] list.
+    pub capabilities: Vec<CapabilityDeclaration>,
 }
 
-/// Declaration of a voice capability provided by an extension.
+/// Generic capability declaration returned by an extension's
+/// `initialize` response.
 ///
-/// The actual sidecar implementation lives in the plugin (see
-/// `synaps-skills/`); core only tracks the metadata so it can surface
-/// the capability in `/extensions status` and gate the corresponding
-/// audio permissions.
+/// Core does not interpret `kind` or `params` — those are contracts
+/// between the plugin and whatever consumer (chatui glue, another
+/// plugin, an external watcher) cares about that capability kind. The
+/// host only enforces that the plugin holds every permission it
+/// declares it needs.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct VoiceCapabilityDeclaration {
-    /// Display name, e.g. "Local Whisper STT".
+pub struct CapabilityDeclaration {
+    /// Free-form capability kind tag chosen by the plugin author.
+    /// Examples: `"voice"`, `"ocr"`, `"agent"`, `"clipboard_mirror"`.
+    /// Must be non-empty; otherwise opaque to core.
+    pub kind: String,
+    /// Human-readable display name shown in `/extensions status` and
+    /// similar surfaces. Must be non-empty.
     pub name: String,
-    /// Modes supported: subset of ["stt", "tts", "wake_word"].
-    pub modes: Vec<String>,
-    /// Optional sidecar endpoint (e.g. "http://127.0.0.1:8723"). Informational.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
+    /// Permission names this capability needs at runtime, e.g.
+    /// `["audio.input"]`. Every entry must parse to a known
+    /// [`crate::extensions::permissions::Permission`] *and* be present
+    /// in the extension's granted permission set.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// Free-form metadata. Core stores and forwards but never
+    /// interprets. Plugins use this for endpoint URLs, mode lists,
+    /// version tags, anything that doesn't fit the typed slots.
+    #[serde(default, skip_serializing_if = "is_null_value")]
+    pub params: serde_json::Value,
 }
 
-/// Validate a [`VoiceCapabilityDeclaration`] against the granted permission set.
+fn is_null_value(v: &serde_json::Value) -> bool {
+    v.is_null()
+}
+
+/// Validate a [`CapabilityDeclaration`] against the granted permission
+/// set.
 ///
-/// Rules:
+/// Rules — generic, no enumeration of capability kinds:
+/// - `kind` must be non-empty.
 /// - `name` must be non-empty.
-/// - `modes` must be non-empty and only contain `stt`, `tts`, or `wake_word`.
-/// - `stt` or `wake_word` modes require the `audio.input` permission.
-/// - `tts` mode requires the `audio.output` permission.
-pub fn validate_voice_capability(
-    decl: &VoiceCapabilityDeclaration,
-    permissions: &crate::extensions::permissions::PermissionSet,
+/// - Every string in `permissions` must parse to a known
+///   [`crate::extensions::permissions::Permission`].
+/// - Every parsed permission must be present in `granted`.
+pub fn validate_capability(
+    decl: &CapabilityDeclaration,
+    granted: &crate::extensions::permissions::PermissionSet,
 ) -> Result<(), String> {
     use crate::extensions::permissions::Permission;
+    if decl.kind.trim().is_empty() {
+        return Err("capability 'kind' must be non-empty".to_string());
+    }
     if decl.name.trim().is_empty() {
-        return Err("voice capability 'name' must be non-empty".to_string());
+        return Err("capability 'name' must be non-empty".to_string());
     }
-    if decl.modes.is_empty() {
-        return Err("voice capability 'modes' must be non-empty".to_string());
-    }
-    for mode in &decl.modes {
-        match mode.as_str() {
-            "stt" | "wake_word" => {
-                if !permissions.has(Permission::AudioInput) {
-                    return Err(format!(
-                        "voice capability mode '{}' requires permission 'audio.input'",
-                        mode
-                    ));
-                }
-            }
-            "tts" => {
-                if !permissions.has(Permission::AudioOutput) {
-                    return Err(
-                        "voice capability mode 'tts' requires permission 'audio.output'"
-                            .to_string(),
-                    );
-                }
-            }
-            other => {
-                return Err(format!(
-                    "voice capability declares unknown mode '{}' (expected one of 'stt', 'tts', 'wake_word')",
-                    other
-                ));
-            }
+    for perm_name in &decl.permissions {
+        let parsed = Permission::parse(perm_name).ok_or_else(|| {
+            format!(
+                "capability '{}' declares unknown permission '{}'",
+                decl.kind, perm_name
+            )
+        })?;
+        if !granted.has(parsed) {
+            return Err(format!(
+                "capability '{}' requires permission '{}' but it is not granted",
+                decl.kind, perm_name
+            ));
         }
     }
     Ok(())
@@ -461,8 +473,77 @@ struct InitializeCapabilities {
     tools: Vec<RegisteredExtensionToolSpec>,
     #[serde(default)]
     providers: Vec<RegisteredProviderSpec>,
+    /// Canonical generic capability list.
     #[serde(default)]
-    voice: Option<VoiceCapabilityDeclaration>,
+    capabilities: Vec<CapabilityDeclaration>,
+    /// Legacy alias accepted for one release: a plugin sending the old
+    /// `voice: { name, modes, endpoint }` shape gets translated into a
+    /// generic `CapabilityDeclaration` with `kind = "voice"`, with
+    /// permissions derived from the legacy `modes` enumeration. Remove
+    /// this field after the deprecation window.
+    #[serde(default)]
+    voice: Option<LegacyVoiceCapability>,
+}
+
+/// One-release back-compat shim. Mirrors the pre-Phase-7
+/// `VoiceCapabilityDeclaration` wire shape so existing plugins keep
+/// loading unchanged. New plugins should send `capabilities: [...]`.
+#[derive(Deserialize)]
+struct LegacyVoiceCapability {
+    name: String,
+    #[serde(default)]
+    modes: Vec<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+impl LegacyVoiceCapability {
+    /// Translate the legacy shape into a generic
+    /// [`CapabilityDeclaration`]. Modes map to permissions:
+    /// `stt`/`wake_word` → `audio.input`, `tts` → `audio.output`.
+    /// Unknown modes are preserved in `params` but contribute no
+    /// permission requirement (so unknown-mode plugins fail later in
+    /// `validate_capability` only if they explicitly list a permission
+    /// the user did not grant).
+    fn into_capability(self) -> CapabilityDeclaration {
+        let mut permissions: Vec<String> = Vec::new();
+        for mode in &self.modes {
+            match mode.as_str() {
+                "stt" | "wake_word" => {
+                    let p = "audio.input".to_string();
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                "tts" => {
+                    let p = "audio.output".to_string();
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "modes".to_string(),
+            serde_json::Value::Array(
+                self.modes
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        if let Some(ep) = self.endpoint {
+            params.insert("endpoint".to_string(), serde_json::Value::String(ep));
+        }
+        CapabilityDeclaration {
+            kind: "voice".to_string(),
+            name: self.name,
+            permissions,
+            params: serde_json::Value::Object(params),
+        }
+    }
 }
 
 /// A JSON-RPC notification frame received from an extension (no `id`).
@@ -988,6 +1069,28 @@ impl ProcessExtension {
                 let records = store::query(&namespace, &q).map_err(|e| (-32000, e.to_string()))?;
                 Ok(serde_json::json!({"records": records}))
             }
+            "config.get" => {
+                let key = Self::param_str(&params, "key")?;
+                Self::validate_config_key(&key)?;
+                let value = crate::extensions::config_store::read_plugin_config(&inbox.extension_id, &key);
+                Ok(serde_json::json!({"value": value}))
+            }
+            "config.set" => {
+                Self::require_permission(inbox, Permission::ConfigWrite, "config.write").await?;
+                let key = Self::param_str(&params, "key")?;
+                Self::validate_config_key(&key)?;
+                let value = Self::param_str(&params, "value")?;
+                crate::extensions::config_store::write_plugin_config(&inbox.extension_id, &key, &value)
+                    .map_err(|e| (-32000, e.to_string()))?;
+                Ok(serde_json::json!({"ok": true}))
+            }
+            "config.subscribe" => {
+                Self::require_permission(inbox, Permission::ConfigSubscribe, "config.subscribe").await?;
+                // The long-lived watcher-to-notification bridge is wired at the manager/UI layer.
+                // This phase exposes the authorized protocol ACK so plugins can opt in without
+                // blocking initialize; direct store watchers are unit-tested in config_store.
+                Ok(serde_json::json!({"ok": true}))
+            }
             other => Err((-32601, format!("method not found: {other}"))),
         }
     }
@@ -1032,6 +1135,20 @@ impl ProcessExtension {
             .ok_or_else(|| (-32602, format!("missing or invalid '{name}' parameter")))
     }
 
+    fn validate_config_key(key: &str) -> Result<(), (i32, String)> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err((-32602, "config key must be non-empty".to_string()));
+        }
+        if trimmed.contains('.') || trimmed.contains('/') || trimmed.contains(' ') {
+            return Err((
+                -32602,
+                "config key must not contain dots, slashes, or spaces".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn initialize(&self, plugin_root: Option<PathBuf>, config: Value) -> Result<InitializeCapabilitiesResult, String> {
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
@@ -1057,10 +1174,18 @@ impl ProcessExtension {
         }
         Self::validate_registered_tool_specs(id, &result.capabilities.tools)?;
         Self::validate_registered_provider_specs(id, &result.capabilities.providers)?;
+        // Merge canonical `capabilities: [...]` with the one-release
+        // legacy `voice: {...}` shim. Legacy entries are appended after
+        // canonical ones so a plugin sending both (during its own
+        // migration) gets a deterministic, deduplicable list.
+        let mut capabilities = result.capabilities.capabilities;
+        if let Some(legacy) = result.capabilities.voice {
+            capabilities.push(legacy.into_capability());
+        }
         Ok(InitializeCapabilitiesResult {
             tools: result.capabilities.tools,
             providers: result.capabilities.providers,
-            voice: result.capabilities.voice,
+            capabilities,
         })
     }
 
@@ -1408,6 +1533,80 @@ impl ProcessExtension {
         self.inbox.notification_sink.lock().await.take();
     }
 
+    /// Forward one notification frame received during `command.invoke`.
+    ///
+    /// Routes:
+    /// - `command.output` whose `request_id` matches → sink as `Output(event)`
+    ///   (other request_ids are ignored — concurrent invocations must use distinct ids
+    ///    and may overlap in the same `subscribe_notifications` channel; mismatched
+    ///    frames are dropped here intentionally).
+    /// - `task.start|update|log|done` → sink as `Task(event)` regardless of request_id.
+    /// - Anything else → logged at trace and dropped.
+    pub(crate) fn forward_invoke_command_frame(
+        extension_id: &str,
+        request_id: &str,
+        sink: &mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+        sink_open: &mut bool,
+        frame: NotificationFrame,
+    ) -> bool {
+        use crate::extensions::commands::parse_command_output;
+        use crate::extensions::tasks::{is_task_method, parse_task_event};
+        use crate::extensions::runtime::InvokeCommandEvent;
+
+        let mut saw_done = false;
+        if frame.method == "command.output" {
+            match parse_command_output(&frame.params) {
+                Ok(parsed) if parsed.request_id == request_id => {
+                    if matches!(parsed.event, crate::extensions::commands::CommandOutputEvent::Done) {
+                        saw_done = true;
+                    }
+                    if *sink_open && sink.send(InvokeCommandEvent::Output(parsed.event)).is_err() {
+                        *sink_open = false;
+                    }
+                }
+                Ok(_) => {
+                    // Different request_id — ignore (logged at trace for diagnostics).
+                    tracing::trace!(
+                        extension = %extension_id,
+                        "Ignoring command.output for unrelated request_id",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %extension_id,
+                        error = %error,
+                        params = %frame.params,
+                        "Skipping malformed command.output notification",
+                    );
+                }
+            }
+        } else if is_task_method(&frame.method) {
+            match parse_task_event(&frame.method, &frame.params) {
+                Ok(event) => {
+                    if *sink_open && sink.send(InvokeCommandEvent::Task(event)).is_err() {
+                        *sink_open = false;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %extension_id,
+                        method = %frame.method,
+                        error = %error,
+                        params = %frame.params,
+                        "Skipping malformed task notification",
+                    );
+                }
+            }
+        } else {
+            tracing::trace!(
+                extension = %extension_id,
+                method = %frame.method,
+                "Ignoring non-command/task notification during command.invoke",
+            );
+        }
+        saw_done
+    }
+
     /// Forward one notification frame received during `provider.stream`.
     ///
     /// - Frames whose method is not `provider.stream.event` are ignored (logged at trace).
@@ -1532,6 +1731,61 @@ impl ExtensionHandler for ProcessExtension {
         Ok(result)
     }
 
+    async fn invoke_command(
+        &self,
+        command: &str,
+        args: Vec<String>,
+        request_id: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
+    ) -> Result<Value, String> {
+        // Subscribe before issuing the request so we don't miss early events.
+        let mut rx = self.subscribe_notifications().await;
+        let params = serde_json::json!({
+            "command": command,
+            "args": args,
+            "request_id": request_id,
+        });
+
+        let extension_id = self.id.clone();
+        let request_id_owned = request_id.to_string();
+        let invoke_future = async {
+            let mut call_fut = Box::pin(self.call("command.invoke", params));
+            let mut sink_open = true;
+            let response = loop {
+                tokio::select! {
+                    response = &mut call_fut => break response,
+                    Some(frame) = rx.recv() => {
+                        let _ = Self::forward_invoke_command_frame(
+                            &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
+                        );
+                    }
+                }
+            };
+            // Drain any notifications already buffered after the response lands, but
+            // do not wait for the subscriber channel to close (that would deadlock
+            // while this invocation still owns `rx`).
+            self.unsubscribe_notifications().await;
+            while let Ok(frame) = rx.try_recv() {
+                let _ = Self::forward_invoke_command_frame(
+                    &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
+                );
+            }
+            response
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            invoke_future,
+        )
+        .await;
+
+        // Belt-and-braces: ensure subscription is cleared on timeout too.
+        self.unsubscribe_notifications().await;
+
+        outcome
+            .map_err(|_| format!("Extension '{}' command.invoke timed out", self.id))?
+    }
+
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {
@@ -1570,6 +1824,77 @@ impl ExtensionHandler for ProcessExtension {
                 HookResult::Continue
             }
         }
+    }
+
+    async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("info.get", Value::Null),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' info.get timed out", self.id))??;
+        serde_json::from_value(value)
+            .map_err(|e| format!("Invalid info.get response from extension '{}': {}", self.id, e))
+    }
+
+    async fn sidecar_spawn_args(
+        &self,
+    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("sidecar.spawn_args", Value::Null),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' sidecar.spawn_args timed out", self.id))??;
+        serde_json::from_value(value).map_err(|e| {
+            format!(
+                "Invalid sidecar.spawn_args response from extension '{}': {}",
+                self.id, e
+            )
+        })
+    }
+
+    async fn settings_editor_open(&self, category: &str, field: &str) -> Result<Value, String> {
+        let params = crate::extensions::settings_editor::SettingsEditorOpenParams {
+            category: category.to_string(),
+            field: field.to_string(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.open", serde_json::to_value(params).map_err(|e| e.to_string())?),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.open timed out", self.id))?
+    }
+
+    async fn settings_editor_key(&self, category: &str, field: &str, key: &str) -> Result<Value, String> {
+        let mut params = serde_json::to_value(crate::extensions::settings_editor::SettingsEditorKeyParams {
+            key: key.to_string(),
+        }).map_err(|e| e.to_string())?;
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("category".to_string(), Value::String(category.to_string()));
+            obj.insert("field".to_string(), Value::String(field.to_string()));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.key", params),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.key timed out", self.id))?
+    }
+
+    async fn settings_editor_commit(&self, category: &str, field: &str, value: Value) -> Result<Value, String> {
+        let params = serde_json::json!({
+            "category": category,
+            "field": field,
+            "value": value,
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("settings.editor.commit", params),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' settings.editor.commit timed out", self.id))?
     }
 
     async fn shutdown(&self) {
@@ -1837,73 +2162,349 @@ mod voice_validator_tests {
         p
     }
 
-    fn decl(name: &str, modes: &[&str]) -> VoiceCapabilityDeclaration {
-        VoiceCapabilityDeclaration {
+    fn cap(kind: &str, name: &str, perms: &[&str]) -> CapabilityDeclaration {
+        CapabilityDeclaration {
+            kind: kind.to_string(),
             name: name.to_string(),
-            modes: modes.iter().map(|m| m.to_string()).collect(),
-            endpoint: None,
+            permissions: perms.iter().map(|p| p.to_string()).collect(),
+            params: serde_json::Value::Null,
         }
     }
 
     #[test]
-    fn voice_validator_rejects_empty_name() {
-        let d = decl("   ", &["stt"]);
+    fn capability_validator_rejects_empty_kind() {
+        let d = cap("   ", "Whisper", &["audio.input"]);
         let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(err.contains("kind"), "got: {}", err);
+    }
+
+    #[test]
+    fn capability_validator_rejects_empty_name() {
+        let d = cap("voice", "   ", &["audio.input"]);
+        let perms = perms_with(&[Permission::AudioInput]);
+        let err = validate_capability(&d, &perms).unwrap_err();
         assert!(err.contains("name"), "got: {}", err);
     }
 
     #[test]
-    fn voice_validator_rejects_empty_modes() {
-        let d = decl("Whisper", &[]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("modes"), "got: {}", err);
-    }
-
-    #[test]
-    fn voice_validator_rejects_unknown_mode() {
-        let d = decl("Whisper", &["humming"]);
+    fn capability_validator_rejects_unknown_permission_string() {
+        let d = cap("voice", "Whisper", &["audio.telepathy"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("unknown mode"), "got: {}", err);
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(
+            err.contains("unknown permission") && err.contains("audio.telepathy"),
+            "got: {}",
+            err,
+        );
     }
 
     #[test]
-    fn voice_validator_requires_audio_input_for_stt() {
-        let d = decl("Whisper", &["stt"]);
+    fn capability_validator_requires_every_declared_permission() {
+        let d = cap("voice", "Whisper", &["audio.input"]);
         let perms = perms_with(&[]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.input"), "got: {}", err);
+        let err = validate_capability(&d, &perms).unwrap_err();
+        assert!(
+            err.contains("audio.input") && err.contains("not granted"),
+            "got: {}",
+            err,
+        );
     }
 
     #[test]
-    fn voice_validator_requires_audio_output_for_tts() {
-        let d = decl("Piper", &["tts"]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.output"), "got: {}", err);
-    }
-
-    #[test]
-    fn voice_validator_accepts_valid_stt_with_permission() {
-        let d = decl("Whisper", &["stt"]);
-        let perms = perms_with(&[Permission::AudioInput]);
-        validate_voice_capability(&d, &perms).expect("should validate");
-    }
-
-    #[test]
-    fn voice_validator_accepts_combined_modes_with_both_permissions() {
-        let d = decl("Voice", &["stt", "tts", "wake_word"]);
+    fn capability_validator_accepts_when_all_permissions_granted() {
+        let d = cap("voice", "Whisper", &["audio.input", "audio.output"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
-        validate_voice_capability(&d, &perms).expect("should validate");
+        validate_capability(&d, &perms).expect("should validate");
     }
 
     #[test]
-    fn voice_validator_wake_word_requires_audio_input() {
-        let d = decl("Porcupine", &["wake_word"]);
+    fn capability_validator_accepts_no_permissions() {
+        // Capabilities that genuinely don't need any permission (e.g. a
+        // pure-CPU OCR sidecar that takes images via stdin) should
+        // validate cleanly with an empty permission list.
+        let d = cap("ocr", "Tesseract", &[]);
         let perms = perms_with(&[]);
-        let err = validate_voice_capability(&d, &perms).unwrap_err();
-        assert!(err.contains("audio.input"), "got: {}", err);
+        validate_capability(&d, &perms).expect("should validate");
+    }
+
+    #[test]
+    fn capability_validator_does_not_branch_on_kind() {
+        // Two capabilities with identical permission requirements but
+        // different `kind` values both validate identically — proves
+        // the validator does not enumerate kinds.
+        let perms = perms_with(&[Permission::AudioInput]);
+        for kind in ["voice", "ocr", "agent", "foot_pedal", "eeg"] {
+            let d = cap(kind, "Anything", &["audio.input"]);
+            validate_capability(&d, &perms).expect("should validate");
+        }
+    }
+
+    #[test]
+    fn legacy_voice_payload_is_translated_into_generic_capability() {
+        // Existing local-voice plugin sends `{ "voice": { "name": ...,
+        // "modes": ["stt"] } }`. After Phase 7 core synthesizes a
+        // generic `CapabilityDeclaration { kind: "voice", ... }` with
+        // permissions derived from the legacy mode list.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Local Whisper STT",
+                    "modes": ["stt"],
+                    "endpoint": "stdio"
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-test", value)
+            .expect("parses");
+        assert_eq!(result.capabilities.len(), 1);
+        let cap = &result.capabilities[0];
+        assert_eq!(cap.kind, "voice");
+        assert_eq!(cap.name, "Local Whisper STT");
+        assert_eq!(cap.permissions, vec!["audio.input"]);
+        assert_eq!(
+            cap.params.get("modes").and_then(|m| m.as_array()).unwrap().len(),
+            1,
+        );
+        assert_eq!(
+            cap.params.get("endpoint").and_then(|e| e.as_str()),
+            Some("stdio"),
+        );
+    }
+
+    #[test]
+    fn legacy_voice_payload_with_tts_mode_maps_to_audio_output() {
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Piper",
+                    "modes": ["tts"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-tts", value)
+            .expect("parses");
+        assert_eq!(result.capabilities[0].permissions, vec!["audio.output"]);
+    }
+
+    #[test]
+    fn legacy_voice_payload_with_combined_modes_dedupes_permissions() {
+        // stt + wake_word both map to audio.input; tts maps to
+        // audio.output. The legacy translator must not produce
+        // duplicates.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "voice": {
+                    "name": "Combined",
+                    "modes": ["stt", "wake_word", "tts"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("legacy-combined", value)
+            .expect("parses");
+        let perms = &result.capabilities[0].permissions;
+        assert_eq!(perms.len(), 2);
+        assert!(perms.contains(&"audio.input".to_string()));
+        assert!(perms.contains(&"audio.output".to_string()));
+    }
+
+    #[test]
+    fn canonical_capabilities_list_is_preserved_alongside_legacy_voice_field() {
+        // A plugin in the middle of migrating may send both shapes
+        // simultaneously. Canonical entries come first, legacy
+        // translation appended.
+        let value = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {
+                "capabilities": [
+                    {
+                        "kind": "ocr",
+                        "name": "Tesseract",
+                        "permissions": []
+                    }
+                ],
+                "voice": {
+                    "name": "Whisper",
+                    "modes": ["stt"]
+                }
+            }
+        });
+        let result = ProcessExtension::parse_initialize_result("dual", value)
+            .expect("parses");
+        assert_eq!(result.capabilities.len(), 2);
+        assert_eq!(result.capabilities[0].kind, "ocr");
+        assert_eq!(result.capabilities[1].kind, "voice");
+    }
+}
+
+#[cfg(test)]
+mod invoke_command_dispatch_tests {
+    //! Phase B Phase 2/3 — exercise the notification dispatcher used by
+    //! `command.invoke`. Spawning a real subprocess is not required: we feed
+    //! `NotificationFrame`s directly through `forward_invoke_command_frame`
+    //! and assert the sink ordering.
+    use super::*;
+    use crate::extensions::commands::CommandOutputEvent;
+    use crate::extensions::runtime::InvokeCommandEvent;
+    use crate::extensions::tasks::{TaskEvent, TaskKind};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn frame(method: &str, params: serde_json::Value) -> NotificationFrame {
+        NotificationFrame {
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    #[test]
+    fn forwards_mixed_event_stream_in_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        let frames = vec![
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"text","content":"A"}}),
+            ),
+            frame(
+                "task.start",
+                json!({"id":"dl","label":"Downloading","kind":"download"}),
+            ),
+            frame(
+                "task.update",
+                json!({"id":"dl","current":50,"total":100}),
+            ),
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"system","content":"working"}}),
+            ),
+            frame("task.done", json!({"id":"dl"})),
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"done"}}),
+            ),
+        ];
+
+        let mut saw_done = false;
+        for f in frames {
+            saw_done |= ProcessExtension::forward_invoke_command_frame(
+                "ext-test", "r1", &tx, &mut open, f,
+            );
+        }
+        drop(tx);
+        assert!(saw_done, "should have observed the command Done marker");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events[0],
+            InvokeCommandEvent::Output(CommandOutputEvent::Text { content: "A".into() })
+        );
+        assert!(matches!(
+            events[1],
+            InvokeCommandEvent::Task(TaskEvent::Start { kind: TaskKind::Download, .. })
+        ));
+        assert!(matches!(
+            events[2],
+            InvokeCommandEvent::Task(TaskEvent::Update { .. })
+        ));
+        assert!(matches!(
+            events[3],
+            InvokeCommandEvent::Output(CommandOutputEvent::System { .. })
+        ));
+        assert!(matches!(
+            events[4],
+            InvokeCommandEvent::Task(TaskEvent::Done { error: None, .. })
+        ));
+        assert_eq!(events[5], InvokeCommandEvent::Output(CommandOutputEvent::Done));
+    }
+
+    #[test]
+    fn ignores_command_output_for_unrelated_request_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame(
+                "command.output",
+                json!({"request_id":"other","event":{"kind":"text","content":"x"}}),
+            ),
+        );
+        drop(tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn skips_malformed_command_output_without_aborting() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        // Missing 'kind'
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("command.output", json!({"request_id":"r1","event":{}})),
+        );
+        // Followed by a good event — must still be delivered.
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame(
+                "command.output",
+                json!({"request_id":"r1","event":{"kind":"done"}}),
+            ),
+        );
+        drop(tx);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev, InvokeCommandEvent::Output(CommandOutputEvent::Done));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn task_events_pass_through_regardless_of_request_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("task.log", json!({"id":"abc","line":"..."})),
+        );
+        drop(tx);
+        match rx.try_recv().unwrap() {
+            InvokeCommandEvent::Task(TaskEvent::Log { id, line }) => {
+                assert_eq!(id, "abc");
+                assert_eq!(line, "...");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_methods_are_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<InvokeCommandEvent>();
+        let mut open = true;
+        ProcessExtension::forward_invoke_command_frame(
+            "ext",
+            "r1",
+            &tx,
+            &mut open,
+            frame("provider.stream.event", json!({"type":"text","delta":"x"})),
+        );
+        drop(tx);
+        assert!(rx.try_recv().is_err());
     }
 }

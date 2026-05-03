@@ -16,6 +16,41 @@ pub enum RegisteredPluginCommandBackend {
     Shell { command: String, args: Vec<String> },
     ExtensionTool { tool: String, input: serde_json::Value },
     SkillPrompt { skill: String, prompt: String },
+    Interactive { plugin_extension_id: String },
+}
+
+/// Editor kind for a plugin-declared settings field, normalised from the
+/// manifest into a form the settings UI can consume directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginSettingsEditor {
+    Text { numeric: bool },
+    Cycler { options: Vec<String> },
+    Picker,
+    /// Editor body rendered by the plugin via the
+    /// `settings.editor.*` JSON-RPC contract.
+    Custom,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginSettingsField {
+    pub key: String,
+    pub label: String,
+    pub editor: PluginSettingsEditor,
+    pub help: Option<String>,
+    pub default: Option<serde_json::Value>,
+}
+
+/// A plugin-declared category contributed to the `/settings` modal.
+///
+/// The owning plugin is recorded in `plugin` so that the settings UI can
+/// scope reads/writes to that plugin's config namespace and dispatch
+/// custom-editor JSON-RPC events to the right extension.
+#[derive(Clone, Debug)]
+pub struct PluginSettingsCategory {
+    pub plugin: String,
+    pub id: String,
+    pub label: String,
+    pub fields: Vec<PluginSettingsField>,
 }
 
 /// Resolution outcome for a typed slash command.
@@ -26,6 +61,34 @@ pub struct RegisteredPluginCommand {
     pub description: Option<String>,
     pub backend: RegisteredPluginCommandBackend,
     pub plugin_root: std::path::PathBuf,
+}
+
+/// A plugin's claim on a top-level lifecycle command namespace, derived
+/// from `provides.sidecar.lifecycle` in plugin.json. Phase 8 slice 8A.
+///
+/// When a plugin declares a lifecycle claim, the command registry
+/// auto-registers `/<command> toggle` and `/<command> status` (and any
+/// future lifecycle verbs) so the plugin's own UX namespace —
+/// e.g. `/voice` for a voice plugin — drives sidecar lifecycle instead
+/// of the modality-laden `/sidecar` builtin.
+///
+/// Multiple plugins may register lifecycle claims; in Phase 8 slice 8A
+/// the host still hosts at most one active sidecar so all claims share
+/// a single backing `App.sidecar` slot. Slice 8B widens this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleClaim {
+    /// Plugin (manifest) name that owns this claim.
+    pub plugin: String,
+    /// Top-level command word the plugin claims, e.g. `"voice"`.
+    pub command: String,
+    /// Optional settings-category id that the host should inject
+    /// per-plugin lifecycle keys (e.g. toggle keybind) into.
+    pub settings_category: Option<String>,
+    /// Human-readable label for pills, error messages, status lines.
+    pub display_name: String,
+    /// Sort key for pill ordering (higher = earlier). Range `-100..=100`,
+    /// already clamped during manifest deserialisation.
+    pub importance: i32,
 }
 
 pub enum Resolution {
@@ -46,6 +109,17 @@ struct Inner {
     qualified: HashMap<String, Arc<LoadedSkill>>,   // "plugin:skill" -> single
     plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>>, // "plugin:cmd" -> single
     plugin_help_entries: Vec<HelpEntry>,
+    /// Plugin-declared settings categories, in plugin discovery order.
+    /// Path B Phase 4. The settings UI snapshots this on each open.
+    plugin_settings_categories: Vec<PluginSettingsCategory>,
+    /// Plugin-declared lifecycle claims (Phase 8 slice 8A). Indexed by
+    /// the claimed command word (e.g. `"voice"`). At most one claim per
+    /// command word; first-loaded plugin wins on collision.
+    lifecycle_claims: HashMap<String, LifecycleClaim>,
+    /// Plugins that lost a lifecycle-claim collision, recorded so the
+    /// `/extensions` view can surface a warning. Each entry is
+    /// `(losing_plugin, command, winning_plugin)`.
+    lifecycle_claim_collisions: Vec<(String, String, String)>,
 }
 
 pub struct CommandRegistry {
@@ -66,6 +140,9 @@ impl CommandRegistry {
                 qualified: HashMap::new(),
                 plugin_commands: HashMap::new(),
                 plugin_help_entries: Vec::new(),
+                plugin_settings_categories: Vec::new(),
+                lifecycle_claims: HashMap::new(),
+                lifecycle_claim_collisions: Vec::new(),
             }),
         };
         r.rebuild_with_plugins(skills, plugins);
@@ -85,12 +162,81 @@ impl CommandRegistry {
         let mut new_qualified: HashMap<String, Arc<LoadedSkill>> = HashMap::new();
         let mut new_plugin_commands: HashMap<String, Arc<RegisteredPluginCommand>> = HashMap::new();
         let mut new_plugin_help_entries: Vec<HelpEntry> = Vec::new();
+        let mut new_plugin_settings_categories: Vec<PluginSettingsCategory> = Vec::new();
+        let mut new_lifecycle_claims: HashMap<String, LifecycleClaim> = HashMap::new();
+        let mut new_lifecycle_collisions: Vec<(String, String, String)> = Vec::new();
         for plugin in plugins {
             if let Some(manifest) = plugin.manifest {
                 new_plugin_help_entries.extend(manifest.help_entries.iter().cloned().map(|mut entry| {
                     entry.source = Some(manifest.name.clone());
                     entry
                 }));
+                // Phase 8 slice 8A: harvest lifecycle claims from
+                // provides.sidecar.lifecycle. First-loaded wins on
+                // collision; the loser is recorded for surfacing in
+                // /extensions and the chat log.
+                if let Some(ref provides) = manifest.provides {
+                    if let Some(ref sidecar) = provides.sidecar {
+                        if let Some(ref lc) = sidecar.lifecycle {
+                            let claim = LifecycleClaim {
+                                plugin: manifest.name.clone(),
+                                command: lc.command.clone(),
+                                settings_category: lc.settings_category.clone(),
+                                display_name: lc.effective_display_name().to_string(),
+                                importance: lc.importance,
+                            };
+                            if let Some(existing) = new_lifecycle_claims.get(&claim.command) {
+                                new_lifecycle_collisions.push((
+                                    claim.plugin.clone(),
+                                    claim.command.clone(),
+                                    existing.plugin.clone(),
+                                ));
+                                tracing::warn!(
+                                    "lifecycle command '{}' claimed by both '{}' and '{}'; first-loaded wins",
+                                    claim.command, existing.plugin, claim.plugin,
+                                );
+                            } else {
+                                new_lifecycle_claims.insert(claim.command.clone(), claim);
+                            }
+                        }
+                    }
+                }
+                if let Some(ref settings) = manifest.settings {
+                    for cat in &settings.categories {
+                        let fields = cat
+                            .fields
+                            .iter()
+                            .map(|f| PluginSettingsField {
+                                key: f.key.clone(),
+                                label: f.label.clone(),
+                                editor: match f.editor {
+                                    crate::skills::manifest::ManifestEditorKind::Text => {
+                                        PluginSettingsEditor::Text { numeric: f.numeric }
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Cycler => {
+                                        PluginSettingsEditor::Cycler {
+                                            options: f.options.clone(),
+                                        }
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Picker => {
+                                        PluginSettingsEditor::Picker
+                                    }
+                                    crate::skills::manifest::ManifestEditorKind::Custom => {
+                                        PluginSettingsEditor::Custom
+                                    }
+                                },
+                                help: f.help.clone(),
+                                default: f.default.clone(),
+                            })
+                            .collect();
+                        new_plugin_settings_categories.push(PluginSettingsCategory {
+                            plugin: manifest.name.clone(),
+                            id: cat.id.clone(),
+                            label: cat.label.clone(),
+                            fields,
+                        });
+                    }
+                }
                 for cmd in manifest.commands {
                     let (name, description, backend) = match cmd {
                         crate::skills::manifest::ManifestCommand::Shell(cmd) => (
@@ -108,6 +254,22 @@ impl CommandRegistry {
                             cmd.description,
                             RegisteredPluginCommandBackend::SkillPrompt { skill: cmd.skill, prompt: cmd.prompt },
                         ),
+                        crate::skills::manifest::ManifestCommand::Interactive(cmd) => {
+                            if !cmd.interactive {
+                                continue;
+                            }
+                            (
+                                cmd.name,
+                                cmd.description,
+                                RegisteredPluginCommandBackend::Interactive {
+                                    plugin_extension_id: manifest
+                                        .extension
+                                        .as_ref()
+                                        .map(|_| plugin.name.clone())
+                                        .unwrap_or_else(|| plugin.name.clone()),
+                                },
+                            )
+                        },
                     };
                     let q = format!("{}:{}", manifest.name, name);
                     new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
@@ -139,11 +301,53 @@ impl CommandRegistry {
                 new_qualified.insert(q, arc.clone());
             }
         }
+        // Phase 8 slice 8A.3: for each lifecycle claim with a
+        // settings_category, inject a synthetic `_lifecycle_toggle_key`
+        // field at the front of the matching plugin-declared category.
+        // No-op (with a warn) if the named category doesn't exist.
+        for claim in new_lifecycle_claims.values() {
+            let Some(ref cat_id) = claim.settings_category else {
+                continue;
+            };
+            let pos = new_plugin_settings_categories
+                .iter()
+                .position(|c| c.plugin == claim.plugin && &c.id == cat_id);
+            match pos {
+                Some(idx) => {
+                    let injected = PluginSettingsField {
+                        key: "_lifecycle_toggle_key".to_string(),
+                        label: "Toggle key".to_string(),
+                        editor: PluginSettingsEditor::Cycler {
+                            options: ["F8", "F2", "F12", "C-V", "C-G"]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
+                        },
+                        help: Some("Keybind that toggles this sidecar.".to_string()),
+                        default: None,
+                    };
+                    new_plugin_settings_categories[idx]
+                        .fields
+                        .insert(0, injected);
+                }
+                None => {
+                    tracing::warn!(
+                        "lifecycle claim for plugin '{}' references settings_category '{}' but no such category was declared; skipping toggle-key injection",
+                        claim.plugin,
+                        cat_id,
+                    );
+                }
+            }
+        }
+
         let mut w = self.inner.write().unwrap();
         w.skills = new_skills;
         w.qualified = new_qualified;
         w.plugin_commands = new_plugin_commands;
         w.plugin_help_entries = new_plugin_help_entries;
+        w.plugin_settings_categories = new_plugin_settings_categories;
+        w.lifecycle_claims = new_lifecycle_claims;
+        w.lifecycle_claim_collisions = new_lifecycle_collisions;
     }
 
     pub fn resolve(&self, cmd: &str) -> Resolution {
@@ -171,15 +375,56 @@ impl CommandRegistry {
         }
     }
 
+    /// Look up a plugin command by its unqualified name. Returns the
+    /// only match, or None if zero or multiple plugins claim the name.
+    /// Used when a builtin command has the same identifier as a
+    /// plugin-owned command (e.g. `/voice` is both a deprecation alias
+    /// builtin and a plugin command name) and we need to bypass the
+    /// builtin check to reach the plugin.
+    pub fn find_plugin_command_unqualified(&self, name: &str) -> Option<Arc<RegisteredPluginCommand>> {
+        let r = self.inner.read().unwrap();
+        let mut matches = r.plugin_commands.values().filter(|c| c.name == name);
+        let first = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None; // ambiguous
+        }
+        Some(first)
+    }
+
     /// All commands for autocomplete/help: builtins + unique unqualified skill names, sorted.
     pub fn all_commands(&self) -> Vec<String> {
         let r = self.inner.read().unwrap();
         let mut v: Vec<String> = self.builtins.iter().map(|s| s.to_string()).collect();
         v.extend(r.skills.keys().cloned());
         v.extend(r.plugin_commands.keys().cloned());
+        // Phase 8 slice 8A: plugin-claimed lifecycle commands surface
+        // as top-level commands too (e.g. `/voice`).
+        v.extend(r.lifecycle_claims.keys().cloned());
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Look up the lifecycle claim for a top-level command word, if any.
+    /// Phase 8 slice 8A. Returns the claim regardless of arg/subcommand —
+    /// callers (the dispatcher) decide what to do with `toggle` / `status`.
+    pub fn lifecycle_for_command(&self, cmd: &str) -> Option<LifecycleClaim> {
+        let r = self.inner.read().unwrap();
+        r.lifecycle_claims.get(cmd).cloned()
+    }
+
+    /// Snapshot of every claimed lifecycle command, in arbitrary order.
+    /// Used by `/extensions` to render the active claims and by the
+    /// pill renderer to enumerate sidecars.
+    pub fn lifecycle_claims(&self) -> Vec<LifecycleClaim> {
+        self.inner.read().unwrap().lifecycle_claims.values().cloned().collect()
+    }
+
+    /// Plugins that lost a lifecycle-claim collision during the most
+    /// recent rebuild. Each entry is `(losing_plugin, command,
+    /// winning_plugin)`. Surfaced in `/extensions`.
+    pub fn lifecycle_claim_collisions(&self) -> Vec<(String, String, String)> {
+        self.inner.read().unwrap().lifecycle_claim_collisions.clone()
     }
 
     pub fn plugins(&self) -> Vec<PluginSummary> {
@@ -207,6 +452,13 @@ impl CommandRegistry {
 
     pub fn plugin_help_entries(&self) -> Vec<HelpEntry> {
         self.inner.read().unwrap().plugin_help_entries.clone()
+    }
+
+    /// Snapshot of every plugin-declared settings category, preserving
+    /// plugin discovery order. The settings UI calls this on each open
+    /// to merge plugin categories with the built-in ones.
+    pub fn plugin_settings_categories(&self) -> Vec<PluginSettingsCategory> {
+        self.inner.read().unwrap().plugin_settings_categories.clone()
     }
 
     pub fn all_skills(&self) -> Vec<Arc<LoadedSkill>> {
@@ -256,7 +508,58 @@ mod tests {
                 })],
                 extension: None,
                 help_entries: vec![],
+                provides: None,
+                settings: None,
             }),
+        }
+    }
+
+
+    fn mk_interactive_cmd(plugin: &str, name: &str, root: PathBuf) -> Plugin {
+        Plugin {
+            name: plugin.to_string(),
+            root,
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(crate::skills::manifest::PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![ManifestCommand::Interactive(crate::skills::manifest::ManifestInteractiveCommand {
+                    name: name.to_string(),
+                    description: Some("interactive desc".to_string()),
+                    interactive: true,
+                    subcommands: vec!["help".to_string()],
+                })],
+                extension: None,
+                help_entries: vec![],
+                provides: None,
+                settings: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn registers_interactive_plugin_command_backend() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_interactive_cmd("demo-plugin", "demo", PathBuf::from("/tmp/demo"))],
+        );
+
+        match reg.resolve("demo-plugin:demo") {
+            Resolution::PluginCommand(cmd) => match &cmd.backend {
+                RegisteredPluginCommandBackend::Interactive { plugin_extension_id } => {
+                    assert_eq!(plugin_extension_id, "demo-plugin");
+                    assert_eq!(cmd.name, "demo");
+                }
+                other => panic!("expected interactive backend, got {other:?}"),
+            },
+            _ => panic!("expected plugin command resolution"),
         }
     }
 
@@ -461,5 +764,440 @@ mod tests {
         assert_eq!(plugins[0].skill_count, 2);
         assert_eq!(plugins[1].name, "p2");
         assert_eq!(plugins[1].skill_count, 1);
+    }
+
+    fn mk_plugin_with_settings(plugin: &str, root: PathBuf) -> Plugin {
+        use crate::skills::manifest::{
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
+            ManifestSettingsField,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root,
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(crate::skills::manifest::PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: None,
+                settings: Some(ManifestSettings {
+                    categories: vec![ManifestSettingsCategory {
+                        id: "demo".to_string(),
+                        label: "Demo".to_string(),
+                        fields: vec![
+                            ManifestSettingsField {
+                                key: "backend".to_string(),
+                                label: "Backend".to_string(),
+                                editor: ManifestEditorKind::Cycler,
+                                options: vec!["a".to_string(), "b".to_string()],
+                                help: None,
+                                default: None,
+                                numeric: false,
+                            },
+                            ManifestSettingsField {
+                                key: "endpoint".to_string(),
+                                label: "Endpoint".to_string(),
+                                editor: ManifestEditorKind::Text,
+                                options: vec![],
+                                help: Some("URL".to_string()),
+                                default: None,
+                                numeric: false,
+                            },
+                        ],
+                    }],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn plugin_settings_categories_exposed_after_rebuild() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+        );
+        let cats = r.plugin_settings_categories();
+        assert_eq!(cats.len(), 1, "expected one plugin settings category");
+        let cat = &cats[0];
+        assert_eq!(cat.plugin, "demo-plugin");
+        assert_eq!(cat.id, "demo");
+        assert_eq!(cat.label, "Demo");
+        assert_eq!(cat.fields.len(), 2);
+
+        match &cat.fields[0].editor {
+            PluginSettingsEditor::Cycler { options } => {
+                assert_eq!(options, &vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected cycler, got {other:?}"),
+        }
+        assert!(matches!(
+            cat.fields[1].editor,
+            PluginSettingsEditor::Text { numeric: false }
+        ));
+        assert_eq!(cat.fields[1].help.as_deref(), Some("URL"));
+    }
+
+    #[test]
+    fn plugin_settings_categories_empty_without_settings_block() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))],
+        );
+        assert!(r.plugin_settings_categories().is_empty());
+    }
+
+    #[test]
+    fn plugin_settings_categories_replaced_on_rebuild() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("demo-plugin", PathBuf::from("/tmp/demo"))],
+        );
+        assert_eq!(r.plugin_settings_categories().len(), 1);
+        r.rebuild_with_plugins(vec![], vec![]);
+        assert!(r.plugin_settings_categories().is_empty());
+    }
+
+    #[test]
+    fn plugin_settings_categories_does_not_hardcode_voice() {
+        // Acceptance: declarative cycler/text fields are represented in
+        // core data without any voice-specific knowledge.
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_settings("totally-unrelated", PathBuf::from("/tmp/x"))],
+        );
+        let cats = r.plugin_settings_categories();
+        assert_eq!(cats[0].plugin, "totally-unrelated");
+        assert_eq!(cats[0].id, "demo");
+        assert!(cats[0].fields.iter().any(|f| matches!(
+            f.editor,
+            PluginSettingsEditor::Cycler { .. }
+        )));
+        assert!(cats[0].fields.iter().any(|f| matches!(
+            f.editor,
+            PluginSettingsEditor::Text { .. }
+        )));
+    }
+
+    // ---- Phase 8 slice 8A: lifecycle claims ----
+
+    fn mk_plugin_with_lifecycle(
+        plugin: &str,
+        command: &str,
+        display: Option<&str>,
+        importance: i32,
+        settings_category: Option<&str>,
+    ) -> Plugin {
+        use crate::skills::manifest::{
+            PluginManifest, PluginProvides, SidecarLifecycle, SidecarManifest,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: settings_category.map(str::to_string),
+                            display_name: display.map(str::to_string),
+                            importance,
+                        }),
+                    }),
+                }),
+                settings: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn lifecycle_claim_registers_under_command_word() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle(
+                "local-voice",
+                "voice",
+                Some("Voice"),
+                50,
+                Some("voice"),
+            )],
+        );
+        let claim = reg
+            .lifecycle_for_command("voice")
+            .expect("voice lifecycle claim should be registered");
+        assert_eq!(claim.plugin, "local-voice");
+        assert_eq!(claim.command, "voice");
+        assert_eq!(claim.display_name, "Voice");
+        assert_eq!(claim.importance, 50);
+        assert_eq!(claim.settings_category.as_deref(), Some("voice"));
+    }
+
+    #[test]
+    fn lifecycle_claim_display_name_falls_back_to_command() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("p", "ocr", None, 0, None)],
+        );
+        let claim = reg.lifecycle_for_command("ocr").unwrap();
+        assert_eq!(claim.display_name, "ocr");
+    }
+
+    #[test]
+    fn lifecycle_claim_surfaces_in_all_commands() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+        );
+        assert!(reg.all_commands().contains(&"voice".to_string()));
+    }
+
+    #[test]
+    fn lifecycle_claim_collision_first_loaded_wins() {
+        // Two plugins both claim "voice"; first in the discovery
+        // order (the vec we pass) should win.
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_with_lifecycle("alpha-voice", "voice", Some("Alpha"), 10, None),
+                mk_plugin_with_lifecycle("beta-voice", "voice", Some("Beta"), 90, None),
+            ],
+        );
+        let claim = reg.lifecycle_for_command("voice").unwrap();
+        assert_eq!(claim.plugin, "alpha-voice");
+        let collisions = reg.lifecycle_claim_collisions();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0], (
+            "beta-voice".to_string(),
+            "voice".to_string(),
+            "alpha-voice".to_string(),
+        ));
+    }
+
+    #[test]
+    fn lifecycle_claims_returns_all_unique_command_words() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_with_lifecycle("local-voice", "voice", None, 50, None),
+                mk_plugin_with_lifecycle("ocr-plugin", "ocr", None, 30, None),
+            ],
+        );
+        let claims = reg.lifecycle_claims();
+        let mut names: Vec<_> = claims.iter().map(|c| c.command.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["ocr", "voice"]);
+    }
+
+    #[test]
+    fn lifecycle_for_command_returns_none_when_no_claim() {
+        let reg = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
+        assert!(reg.lifecycle_for_command("voice").is_none());
+    }
+
+    #[test]
+    fn rebuild_replaces_lifecycle_claims_atomically() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+        );
+        assert!(reg.lifecycle_for_command("voice").is_some());
+        // Rebuild without the plugin: the claim must vanish.
+        reg.rebuild_with_plugins(vec![], vec![]);
+        assert!(reg.lifecycle_for_command("voice").is_none());
+        assert!(reg.lifecycle_claim_collisions().is_empty());
+    }
+
+    // ---- Phase 8 slice 8A.3: virtual toggle-key field injection ----
+
+    fn mk_plugin_lifecycle_plus_settings(
+        plugin: &str,
+        command: &str,
+        lifecycle_settings_category: Option<&str>,
+        category_ids: &[&str],
+    ) -> Plugin {
+        use crate::skills::manifest::{
+            ManifestEditorKind, ManifestSettings, ManifestSettingsCategory,
+            ManifestSettingsField, PluginManifest, PluginProvides, SidecarLifecycle,
+            SidecarManifest,
+        };
+        Plugin {
+            name: plugin.to_string(),
+            root: PathBuf::from(format!("/tmp/{plugin}")),
+            marketplace: None,
+            version: None,
+            description: None,
+            extension: None,
+            manifest: Some(PluginManifest {
+                name: plugin.to_string(),
+                version: None,
+                description: None,
+                keybinds: vec![],
+                compatibility: None,
+                commands: vec![],
+                extension: None,
+                help_entries: vec![],
+                provides: Some(PluginProvides {
+                    sidecar: Some(SidecarManifest {
+                        command: "bin/run".to_string(),
+                        setup: None,
+                        protocol_version: 1,
+                        model: None,
+                        lifecycle: Some(SidecarLifecycle {
+                            command: command.to_string(),
+                            settings_category: lifecycle_settings_category.map(str::to_string),
+                            display_name: None,
+                            importance: 0,
+                        }),
+                    }),
+                }),
+                settings: Some(ManifestSettings {
+                    categories: category_ids
+                        .iter()
+                        .map(|id| ManifestSettingsCategory {
+                            id: id.to_string(),
+                            label: id.to_string(),
+                            fields: vec![ManifestSettingsField {
+                                key: "existing".to_string(),
+                                label: "Existing".to_string(),
+                                editor: ManifestEditorKind::Text,
+                                options: vec![],
+                                help: None,
+                                default: None,
+                                numeric: false,
+                            }],
+                        })
+                        .collect(),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn lifecycle_injects_virtual_toggle_key_into_matching_category() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings(
+                "local-voice",
+                "voice",
+                Some("voice"),
+                &["voice"],
+            )],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats
+            .iter()
+            .find(|c| c.id == "voice" && c.plugin == "local-voice")
+            .expect("voice category present");
+        assert!(!voice.fields.is_empty());
+        let first = &voice.fields[0];
+        assert_eq!(first.key, "_lifecycle_toggle_key");
+        assert_eq!(first.label, "Toggle key");
+        match &first.editor {
+            PluginSettingsEditor::Cycler { options } => {
+                assert_eq!(
+                    options,
+                    &vec![
+                        "F8".to_string(),
+                        "F2".to_string(),
+                        "F12".to_string(),
+                        "C-V".to_string(),
+                        "C-G".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected cycler, got {other:?}"),
+        }
+        assert_eq!(voice.fields[1].key, "existing");
+    }
+
+    #[test]
+    fn lifecycle_no_injection_when_settings_category_is_none() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings("p", "ocr", None, &["voice"])],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats.iter().find(|c| c.id == "voice").expect("category");
+        assert!(voice.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+    }
+
+    #[test]
+    fn lifecycle_no_injection_when_category_does_not_exist() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_plugin_lifecycle_plus_settings(
+                "p",
+                "voice",
+                Some("nonexistent"),
+                &["voice"],
+            )],
+        );
+        let cats = reg.plugin_settings_categories();
+        for c in &cats {
+            assert!(c.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+        }
+    }
+
+    #[test]
+    fn lifecycle_two_plugins_each_get_injection_in_their_own_category() {
+        let reg = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_plugin_lifecycle_plus_settings(
+                    "voice-plugin",
+                    "voice",
+                    Some("voice"),
+                    &["voice"],
+                ),
+                mk_plugin_lifecycle_plus_settings(
+                    "ocr-plugin",
+                    "ocr",
+                    Some("ocr"),
+                    &["ocr"],
+                ),
+            ],
+        );
+        let cats = reg.plugin_settings_categories();
+        let voice = cats.iter().find(|c| c.plugin == "voice-plugin").unwrap();
+        let ocr = cats.iter().find(|c| c.plugin == "ocr-plugin").unwrap();
+        assert_eq!(voice.fields[0].key, "_lifecycle_toggle_key");
+        assert_eq!(ocr.fields[0].key, "_lifecycle_toggle_key");
     }
 }

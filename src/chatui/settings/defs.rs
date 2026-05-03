@@ -122,4 +122,55 @@ define_settings! {
     theme, "Theme", Appearance, EditorKind::ThemePicker,
         "Color theme (restart required).",
         |_runtime, _app, _value| { /* handled after write_config_value in apply_setting() */ };
+
+    sidecar_toggle_key, "Sidecar toggle key", Sidecar,
+        EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
+        "Keybind that toggles the active sidecar plugin (e.g. voice dictation). Takes effect immediately.",
+        |_runtime, app, value| {
+            if let Some(kb) = app.keybinds.as_ref() {
+                match kb.write() {
+                    Ok(mut g) => {
+                        if let Err(e) = g.set_slash_command_key("sidecar toggle", value) {
+                            tracing::warn!("sidecar_toggle_key apply failed: {}", e);
+                        }
+                    }
+                    Err(_) => tracing::warn!("sidecar_toggle_key apply: registry poisoned"),
+                }
+            }
+        };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_toggle_key_setting_is_in_sidecar_category() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "sidecar_toggle_key")
+            .expect("sidecar_toggle_key setting should be defined");
+        assert_eq!(def.category, Category::Sidecar);
+    }
+
+    #[test]
+    fn sidecar_toggle_key_static_setting_still_defined_for_backward_compat() {
+        // Phase 8 slice 8A.4: even after `visible_categories(claims)`
+        // hides the global Sidecar page when a plugin claims its own
+        // settings_category, the static def stays in ALL_SETTINGS so
+        // legacy users without claimed plugins keep a working toggle
+        // and config round-trips remain stable.
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "sidecar_toggle_key")
+            .expect("sidecar_toggle_key setting must remain in ALL_SETTINGS for back-compat");
+        assert_eq!(def.category, Category::Sidecar);
+        match def.editor {
+            EditorKind::Cycler(opts) => {
+                assert!(opts.contains(&"F8"));
+                assert!(opts.contains(&"C-V"));
+            }
+            _ => panic!("expected Cycler editor for sidecar_toggle_key"),
+        }
+    }
 }

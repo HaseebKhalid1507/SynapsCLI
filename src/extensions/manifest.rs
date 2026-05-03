@@ -38,8 +38,18 @@ pub struct ExtensionManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionConfigValueKind {
+    String,
+    Bool,
+    Number,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionConfigEntry {
     pub key: String,
+    #[serde(default, rename = "type")]
+    pub value_type: Option<ExtensionConfigValueKind>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -75,6 +85,7 @@ impl ExtensionManifest {
             matches!(
                 permission.as_str(),
                 "tools.register" | "providers.register" | "memory.read" | "memory.write"
+                    | "config.write" | "config.subscribe" | "audio.input" | "audio.output"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {
@@ -210,6 +221,31 @@ mod tests {
         assert!(m.args.is_empty(), "args should default to []");
         assert!(m.permissions.is_empty(), "permissions should default to []");
         assert!(m.hooks.is_empty(), "hooks should default to []");
+    }
+
+    #[test]
+    fn extension_config_entry_deserializes_optional_type() {
+        let json = r#"{
+            "key": "backend",
+            "type": "string",
+            "description": "Backend selector",
+            "default": "auto"
+        }"#;
+
+        let entry: ExtensionConfigEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.key, "backend");
+        assert_eq!(entry.value_type, Some(ExtensionConfigValueKind::String));
+        assert_eq!(entry.description.as_deref(), Some("Backend selector"));
+        assert_eq!(entry.default, Some(serde_json::Value::String("auto".to_string())));
+    }
+
+    #[test]
+    fn extension_config_entry_omitted_type_is_none() {
+        let json = r#"{"key": "backend"}"#;
+
+        let entry: ExtensionConfigEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.key, "backend");
+        assert_eq!(entry.value_type, None);
     }
 
     #[test]

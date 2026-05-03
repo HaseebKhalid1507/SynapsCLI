@@ -12,6 +12,7 @@ pub(crate) enum Category {
     ToolLimits,
     Appearance,
     Plugins,
+    Sidecar,
 }
 
 impl Category {
@@ -23,18 +24,37 @@ impl Category {
             Category::ToolLimits => "Tool Limits",
             Category::Appearance => "Appearance",
             Category::Plugins => "Plugins",
+            Category::Sidecar => "Sidecar",
         }
     }
 }
 
-pub(crate) const CATEGORIES: [Category; 6] = [
+pub(crate) const CATEGORIES: [Category; 7] = [
     Category::Model,
     Category::Providers,
     Category::Agent,
     Category::ToolLimits,
     Category::Appearance,
     Category::Plugins,
+    Category::Sidecar,
 ];
+
+/// Phase 8 slice 8A.4: hide the legacy global `Sidecar` page when at
+/// least one loaded plugin has staked a lifecycle claim that names a
+/// `settings_category`. In that case the plugin's namespaced category
+/// (rendered with an injected `_lifecycle_toggle_key` field) replaces
+/// the global Sidecar settings page. When no plugin has claimed a
+/// settings category, fall back to the static legacy list verbatim.
+pub(crate) fn visible_categories(
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Vec<Category> {
+    let any_namespaced = claims.iter().any(|c| c.settings_category.is_some());
+    CATEGORIES
+        .iter()
+        .copied()
+        .filter(|c| !(any_namespaced && *c == Category::Sidecar))
+        .collect()
+}
 
 pub(crate) enum EditorKind {
     Cycler(&'static [&'static str]),
@@ -77,5 +97,67 @@ mod tests {
     #[test]
     fn plugins_category_label() {
         assert_eq!(Category::Plugins.label(), "Plugins");
+    }
+
+    #[test]
+    fn sidecar_category_is_present() {
+        assert!(CATEGORIES.contains(&Category::Sidecar));
+    }
+
+    #[test]
+    fn sidecar_category_label() {
+        assert_eq!(Category::Sidecar.label(), "Sidecar");
+    }
+
+    #[test]
+    fn sidecar_settings_belong_to_sidecar_category() {
+        let sidecar_keys = ["sidecar_toggle_key"];
+        for def in ALL_SETTINGS {
+            if sidecar_keys.contains(&def.key) {
+                assert_eq!(def.category, Category::Sidecar, "setting '{}' should be in Sidecar", def.key);
+            }
+        }
+        // sidecar_toggle_key must exist (it's the only generic sidecar setting kept in core).
+        let keys: Vec<&str> = ALL_SETTINGS.iter().map(|d| d.key).collect();
+        for k in sidecar_keys {
+            assert!(keys.contains(&k), "missing sidecar setting: {}", k);
+        }
+    }
+
+    // ---- Phase 8 slice 8A.4: visible_categories ----
+
+    fn mk_claim(plugin: &str, command: &str, cat: Option<&str>) -> synaps_cli::skills::registry::LifecycleClaim {
+        synaps_cli::skills::registry::LifecycleClaim {
+            plugin: plugin.to_string(),
+            command: command.to_string(),
+            settings_category: cat.map(str::to_string),
+            display_name: command.to_string(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn visible_categories_returns_all_seven_when_no_claims() {
+        let v = visible_categories(&[]);
+        assert_eq!(v.len(), 7);
+        assert!(v.contains(&Category::Sidecar));
+    }
+
+    #[test]
+    fn visible_categories_hides_sidecar_when_claim_has_settings_category() {
+        let claim = mk_claim("local-voice", "voice", Some("voice"));
+        let v = visible_categories(&[claim]);
+        assert_eq!(v.len(), 6);
+        assert!(!v.contains(&Category::Sidecar));
+        assert_eq!(v[0], Category::Model);
+        assert_eq!(*v.last().unwrap(), Category::Plugins);
+    }
+
+    #[test]
+    fn visible_categories_keeps_sidecar_when_claim_has_no_settings_category() {
+        let claim = mk_claim("p", "ocr", None);
+        let v = visible_categories(&[claim]);
+        assert_eq!(v.len(), 7);
+        assert!(v.contains(&Category::Sidecar));
     }
 }

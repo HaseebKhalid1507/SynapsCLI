@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Recent (Dev Branch)
+- **Path B Phase 6 — The Big Move (extension contracts)** — synaps-cli core no longer contains whisper-specific code; the local-voice plugin owns it
+  - Deleted `src/voice/{models,download,rebuild}.rs` (whisper.cpp catalog, HuggingFace downloader, cmake-rebuild orchestrator)
+  - Slimmed `src/voice/discovery.rs` from ~400 LOC to ~190: only `discover()` / `discover_in()` / `DiscoveredVoiceSidecar` remain; `read_build_info`, `detect_host_backend`, `probe_*` are gone (callers use the Phase 5 `info.get` cache instead)
+  - Deleted in-core `/voice models|help|download|rebuild` action arms and parsers — those subcommands now route through the plugin via the Phase 2 interactive command contract; missing-plugin case errors with a clear message
+  - Deleted in-core whisper download UI: `App.{download_progress, download_filename, download_rx, voice_download_in_flight, model_browser_selected, cached_voice_compiled_backend}` plus `start_download` / `on_download_progress` / `on_download_complete` and the `download_change` event-loop arm; the sticky progress widget now exclusively renders generic `extensions::active_tasks::ActiveTasks` (Phase 3)
+  - Deleted `EditorKind::{ModelBrowser, WhisperModelPicker}`, `ActiveEditor::ModelBrowser`, `ModelBrowserRow`, `model_browser_rows`, `whisper_model_options`, `render_model_browser`, `render_download_progress_line`, plus the `voice_stt_model` / `voice_stt_backend` / `voice_language` setting definitions — the plugin replaces them via the Phase 4 settings categories contract
+  - **Migration shim:** on first launch, legacy global voice config keys (`voice_stt_model_path`, `voice_stt_model`, `voice_stt_backend`, `voice_language`) are copied into the plugin namespace `~/.synaps-cli/plugins/local-voice/config` if the destination is empty; legacy keys remain in place for safety. Reads at runtime prefer the plugin namespace and fall back to the legacy global key with a deprecation warning.
+  - Net change: `~−2,400` LOC removed from synaps-cli core; behaviour preserved when the local-voice plugin is installed
+- **Phase 2 — Extensions Capability Platform** — extensions are now first-class citizens
+  - Slash command extension contract (`commands` in plugin manifest)
+  - Settings panel extension contract (`settings` in plugin manifest)
+  - Keybind extension contract (User-tier binds via plugin manifest)
+  - Model-provider extension contract — extensions can register OpenAI-compatible providers as full agentic backends with tool-call support
+  - Capability discovery + permission gating per extension
+  - Slices P–W complete; 836 tests green (682 lib + 154 bin)
+- **Voice dictation** — toggle-driven mic capture wired to the input buffer
+  - `/voice` slash command with subcommands: `models`, `download <id>`, `help`, `rebuild [backend]`
+  - Configurable toggle key — defaults to F8; supported: F8, F2, F12, C-V, C-G (Ctrl+Shift and Ctrl+Alt are unreliable in terminals)
+  - Toggle-only flow: press once → start listening (🎤 listening pill), press again → stop, transcribe, append to input
+  - VAD-aware: final transcripts during an armed session insert text without disarming
+  - Settings → Voice category: toggle key, language cycler (14 langs), STT model, STT backend
+  - `voice_language` cycler: `auto / en / es / fr / de / it / pt / nl / ja / zh / ko / ar / hi / ru`
+  - Hot-reload keybind on settings save — no restart required
+  - Kitty keyboard protocol enabled for reliable F-key + modifier capture
+  - Voice sidecar lives in the `local-voice-plugin` (synaps-skills repo) — synaps core stays voice-free
+- **Whisper model manager** — discover, download, switch models in-app
+  - 10-entry catalog hard-coded in `src/voice/models.rs`: tiny / base / small / medium / large-v3 / large-v3-turbo + `.en` variants, with real SHA256s from HuggingFace
+  - `/voice models` renders an installed/uninstalled table
+  - `/voice download <id>` — streaming download with atomic `.partial → rename` install, SHA256 verification, cancellable, single-in-flight
+  - `EditorKind::ModelBrowser` — Settings → Voice → STT model browses the catalog inline, Up/Down to nav, Enter installs-or-selects
+  - Inline footer download progress while a model fetches
+  - Models live under `~/.synaps-cli/models/whisper/`
+- **Whisper backend selection** — pick CPU / CUDA / Metal / Vulkan / OpenBLAS or auto-detect
+  - `voice_stt_backend` cycler in Settings → Voice
+  - `auto` probes the host (`nvcc`, `vulkaninfo`, `pkg-config`, target-os) and picks the best available
+  - "Current build: <backend>" annotation surfaces the sidecar's compiled feature set
+  - ⚠ rebuild annotation when the selected backend differs from the compiled one
+  - `/voice rebuild [backend]` invokes `local-voice-plugin/scripts/setup.sh --features <backend>` and streams build output as System rows
+  - Sidecar reports its build via `--print-build-info` (JSON: `{backend, features, version}`)
+- **Chat UI rendering polish**
+  - System / Error messages now split on `\n` and word-wrap on each sub-line (same path as User / Text)
+  - Tab-aware soft wrap: continuation rows indent under the last-tab anchor column (4-col tab stops); safety clamp falls back to leading-space indent if the anchor exceeds 60% of width
+  - Fixes `/voice help`, `/chain ls`, `/keybinds`, plugin command output rendering
 - **Extension System** — process-based JSON-RPC hooks (before_message, before_tool_call, after_tool_call, on_session_start, on_session_end)
   - Tool-specific filtering: hooks can target specific tools
   - Context injection via HookResult::Inject
