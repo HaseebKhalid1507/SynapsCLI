@@ -21,6 +21,7 @@ pub mod install;
 pub mod keybinds;
 pub mod commands;
 pub mod trust;
+pub mod post_install;
 
 use std::path::PathBuf;
 use std::sync::Arc;
