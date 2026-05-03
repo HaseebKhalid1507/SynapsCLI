@@ -127,6 +127,127 @@ pub enum SetupError {
     Io(#[from] std::io::Error),
 }
 
+/// Why an extension command verification failed. Distinct from
+/// [`SetupError`] because the failure mode and remediation are
+/// different — here, the build "succeeded" but the artifact the
+/// manifest promised isn't there.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CommandVerifyError {
+    /// `extension.command` resolves to a relative path that escapes the
+    /// plugin directory (`..` traversal or symlink that points outside).
+    #[error("extension command path '{path}' escapes plugin directory")]
+    EscapesPluginDir { path: String },
+
+    /// The resolved path doesn't exist on disk. Most common cause:
+    /// setup script ran, exited 0, but didn't actually produce the
+    /// declared binary.
+    #[error("extension command '{path}' does not exist (resolved to {})", resolved.display())]
+    Missing { path: String, resolved: PathBuf },
+
+    /// The path exists but isn't executable (Unix only — Windows skips
+    /// this check). Common cause: build artifact missing the +x bit
+    /// after extraction from a source archive.
+    #[cfg(unix)]
+    #[error("extension command '{path}' exists but is not executable (mode {mode:o})")]
+    NotExecutable { path: String, mode: u32 },
+
+    /// The path resolves to a directory, not a file.
+    #[error("extension command '{path}' is a directory, not a file")]
+    NotAFile { path: String },
+}
+
+/// Verify that the extension binary declared by
+/// [`crate::extensions::manifest::ExtensionManifest::command`] actually
+/// exists and is executable inside `plugin_dir`. Used as the
+/// post-condition check after [`run_setup_script`] succeeds, so a
+/// build script that exits 0 but doesn't produce the promised binary
+/// surfaces a clear error instead of silently breaking spawn at
+/// runtime.
+///
+/// Mirrors the host-side resolution rules in
+/// [`crate::extensions::manager`]:
+/// - `command` is **absolute**: verify the absolute path
+/// - `command` is **bare** (no path separator): skip — it's a PATH
+///   lookup, not a plugin-shipped artifact
+/// - `command` is **relative with separators**: join with `plugin_dir`,
+///   canonicalize, ensure it stays inside `plugin_dir`, then verify
+///
+/// Returns `Ok(None)` when the manifest declares no extension or the
+/// command is a bare PATH lookup (nothing to verify).
+/// Returns `Ok(Some(resolved_path))` on successful verification.
+pub fn verify_extension_command(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> Result<Option<PathBuf>, CommandVerifyError> {
+    let Some(ext) = manifest.extension.as_ref() else {
+        return Ok(None);
+    };
+    let cmd = &ext.command;
+    let cmd_path = Path::new(cmd);
+
+    // Bare command name (e.g. "python3") — defer to PATH at spawn time.
+    if !cmd.contains(std::path::MAIN_SEPARATOR) && !cmd.contains('/') {
+        return Ok(None);
+    }
+
+    let resolved = if cmd_path.is_absolute() {
+        cmd_path.to_path_buf()
+    } else {
+        // Reject `..` traversal up front (don't rely on canonicalize).
+        if cmd_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(CommandVerifyError::EscapesPluginDir { path: cmd.clone() });
+        }
+        let joined = plugin_dir.join(cmd_path);
+        match joined.canonicalize() {
+            Ok(p) => {
+                let canonical_dir = plugin_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| plugin_dir.to_path_buf());
+                if !p.starts_with(&canonical_dir) {
+                    return Err(CommandVerifyError::EscapesPluginDir { path: cmd.clone() });
+                }
+                p
+            }
+            Err(_) => {
+                return Err(CommandVerifyError::Missing {
+                    path: cmd.clone(),
+                    resolved: joined,
+                });
+            }
+        }
+    };
+
+    if !resolved.exists() {
+        return Err(CommandVerifyError::Missing {
+            path: cmd.clone(),
+            resolved,
+        });
+    }
+    let meta = std::fs::metadata(&resolved).map_err(|_| CommandVerifyError::Missing {
+        path: cmd.clone(),
+        resolved: resolved.clone(),
+    })?;
+    if meta.is_dir() {
+        return Err(CommandVerifyError::NotAFile { path: cmd.clone() });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        // Any execute bit is enough — owner/group/other.
+        if mode & 0o111 == 0 {
+            return Err(CommandVerifyError::NotExecutable {
+                path: cmd.clone(),
+                mode,
+            });
+        }
+    }
+    Ok(Some(resolved))
+}
+
 /// Resolve the manifest-declared setup script to an absolute path
 /// inside `plugin_dir`, or return `Ok(None)` if no setup is declared.
 ///
@@ -652,5 +773,126 @@ mod tests {
             }),
         });
         assert!(resolve_setup_script(&m, dir.path()).unwrap().is_none());
+    }
+
+    // ---- verify_extension_command tests (slice C) ----
+
+    /// Helper: build a manifest whose extension declares `command`.
+    fn manifest_with_extension_command(command: &str) -> PluginManifest {
+        PluginManifest {
+            name: "test-plugin".to_string(),
+            version: None,
+            description: None,
+            keybinds: vec![],
+            compatibility: None,
+            commands: vec![],
+            extension: Some(ExtensionManifest {
+                protocol_version: 1,
+                runtime: ExtensionRuntime::Process,
+                command: command.to_string(),
+                setup: None,
+                prebuilt: ::std::collections::HashMap::new(),
+                args: vec![],
+                permissions: vec![],
+                hooks: vec![],
+                config: vec![],
+            }),
+            help_entries: vec![],
+            provides: None,
+            settings: None,
+        }
+    }
+
+    #[test]
+    fn verify_returns_ok_none_when_no_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_with_setup(None); // sidecar-only manifest
+        assert_eq!(verify_extension_command(&m, dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_returns_ok_none_for_bare_command_name() {
+        // Bare names defer to PATH lookup at spawn time, not our concern.
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_with_extension_command("python3");
+        assert_eq!(verify_extension_command(&m, dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_succeeds_when_relative_binary_exists_and_is_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/ext");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "#!/bin/sh\necho ok").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let m = manifest_with_extension_command("bin/ext");
+        let resolved = verify_extension_command(&m, dir.path()).unwrap();
+        assert!(resolved.is_some(), "should return resolved path");
+    }
+
+    #[test]
+    fn verify_returns_missing_when_binary_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_with_extension_command("bin/ext");
+        let err = verify_extension_command(&m, dir.path()).unwrap_err();
+        assert!(matches!(err, CommandVerifyError::Missing { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_returns_not_executable_when_bit_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/ext");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, "data").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+        let m = manifest_with_extension_command("bin/ext");
+        let err = verify_extension_command(&m, dir.path()).unwrap_err();
+        assert!(matches!(err, CommandVerifyError::NotExecutable { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn verify_returns_not_a_file_when_path_is_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/ext");
+        fs::create_dir_all(&bin).unwrap();
+        let m = manifest_with_extension_command("bin/ext");
+        let err = verify_extension_command(&m, dir.path()).unwrap_err();
+        assert!(matches!(err, CommandVerifyError::NotAFile { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn verify_rejects_parent_dir_traversal_in_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_with_extension_command("../escape/bin");
+        let err = verify_extension_command(&m, dir.path()).unwrap_err();
+        assert!(matches!(err, CommandVerifyError::EscapesPluginDir { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_rejects_symlink_pointing_outside_plugin_dir() {
+        let outer = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        // Create a target binary outside the plugin dir.
+        let target = outer.path().join("real-bin");
+        fs::write(&target, "x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        // Symlink inside the plugin dir to that outside binary.
+        let link = plugin.path().join("bin/ext");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let m = manifest_with_extension_command("bin/ext");
+        let err = verify_extension_command(&m, plugin.path()).unwrap_err();
+        assert!(
+            matches!(err, CommandVerifyError::EscapesPluginDir { .. }),
+            "got: {err:?}"
+        );
     }
 }
