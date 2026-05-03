@@ -79,6 +79,7 @@ pub(crate) struct App {
     pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
+    pub(crate) agent_name: String,
     /// Cached wrapped+highlighted message lines.
     /// `None` means "stale — rebuild on next draw". `Some((w, lines))` means
     /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
@@ -203,6 +204,9 @@ impl App {
             api_call_count: 0,
             session_cost: 0.0,
             session,
+            agent_name: synaps_cli::config::load_config()
+                .agent_name
+                .unwrap_or_else(|| "agent".to_string()),
             line_cache: None,
             show_full_output: false,
             logo_dismiss_t: None,
