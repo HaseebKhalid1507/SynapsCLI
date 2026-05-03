@@ -1,133 +1,72 @@
 //! Sidecar protocol types — line-JSON over stdio.
 //!
-//! These mirror `synaps-skills/local-voice-plugin/src/protocol.rs` so
-//! Synaps CLI core can talk to any compliant sidecar without depending
-//! on heavyweight modality-specific crates. The protocol is shared
-//! across all sidecar kinds (voice, OCR, agent, etc.) — every kind
-//! transports the same handshake / state / payload envelopes.
+//! The host treats sidecars as lego-block processes: it starts them, sends
+//! generic trigger frames, and consumes generic status/text frames. A sidecar
+//! may implement speech, OCR, gestures, automation, telemetry, or anything
+//! else; modality semantics live entirely in the plugin.
 //!
 //! Wire format: one JSON object per line on the sidecar's stdin/stdout.
-//! Synaps CLI sends [`SidecarCommand`] values; the sidecar replies with
-//! [`SidecarEvent`] values (interleaved with internally-generated
-//! events).
-//!
-//! ## Naming note
-//!
-//! Several event/command variants still carry voice-shaped wire names
-//! (`final_transcript`, `voice_control_pressed`, `voice_command`, the
-//! `dictation`/`command`/`conversation` mode values). Those are
-//! historical and shared with the plugin; a coordinated cross-repo
-//! migration to modality-neutral names (`payload_final`, `trigger_pressed`,
-//! `intent`, free-form session strings) is planned for a future phase
-//! but is **out of scope for Phase 7**. The Rust enum names are
-//! modality-neutral; serde aliases preserve wire compatibility.
 
 use serde::{Deserialize, Serialize};
 
 /// Protocol version understood by this build.
-pub const SIDECAR_PROTOCOL_VERSION: u16 = 1;
-
-/// Session mode the sidecar should run in.
-///
-/// The variant *values* are wire-format strings shared with the plugin
-/// (`dictation`, `command`, `conversation`). Callers that need a mode
-/// not enumerated here should be served by a future free-form-string
-/// variant; for now these three cover every kind we ship.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SidecarSessionMode {
-    Dictation,
-    Command,
-    Conversation,
-}
-
-/// Configuration sent in the [`SidecarCommand::Init`] handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SidecarConfig {
-    pub mode: SidecarSessionMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    pub protocol_version: u16,
-}
+pub const SIDECAR_PROTOCOL_VERSION: u16 = 2;
 
 /// Commands sent from Synaps CLI to the sidecar (one per line, JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidecarCommand {
+    /// Plugin-defined initialization payload. Core forwards the value
+    /// verbatim and does not interpret its schema.
     Init {
-        config: SidecarConfig,
+        config: serde_json::Value,
     },
-    /// User pressed the activation trigger (key, button, gesture, …).
-    /// Wire name kept as `voice_control_pressed` for plugin compat.
-    #[serde(rename = "voice_control_pressed")]
-    TriggerPressed,
-    /// User released the activation trigger.
-    /// Wire name kept as `voice_control_released` for plugin compat.
-    #[serde(rename = "voice_control_released")]
-    TriggerReleased,
+    /// Generic activation trigger. `name` and `payload` are plugin-defined.
+    Trigger {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
     Shutdown,
 }
 
-/// Free-form capability tag advertised by a sidecar in its `Hello`
-/// frame. Values are plugin-defined strings; core does not enumerate.
-///
-/// (Pre-Phase-7 this was a closed enum of `stt`/`barge_in`. Kept as an
-/// enum-shape with two known variants plus a catch-all for forward
-/// compatibility.)
+/// How text emitted by a sidecar should be applied to the input buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SidecarCapability {
-    Stt,
-    BargeIn,
+pub enum InsertTextMode {
+    Append,
+    Final,
+    Replace,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SidecarProviderState {
-    Ready,
-    Listening,
-    Transcribing,
-    Speaking,
-    Stopped,
-    Error,
-}
-
-/// Events emitted by the sidecar (one per line, JSON).
-///
-/// Several variants (`ListeningStarted`, `FinalTranscript`,
-/// `VoiceCommand`) carry voice-shaped wire names for backward
-/// compatibility with the local-voice plugin. A coordinated cross-repo
-/// migration to neutral names (`StateOpen`, `PayloadFinal`, `Intent`)
-/// is deferred to a future phase.
+/// Frames emitted by the sidecar (one per line, JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SidecarEvent {
+pub enum SidecarFrame {
     Hello {
         protocol_version: u16,
         extension: String,
-        capabilities: Vec<SidecarCapability>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     Status {
-        state: SidecarProviderState,
-        capabilities: Vec<SidecarCapability>,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
-    ListeningStarted,
-    ListeningStopped,
-    TranscribingStarted,
-    PartialTranscript {
+    InsertText {
         text: String,
+        mode: InsertTextMode,
     },
-    FinalTranscript {
-        text: String,
-    },
-    VoiceCommand {
-        command: String,
-    },
-    BargeIn,
     Error {
         message: String,
     },
+    #[serde(other)]
+    Custom,
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -136,26 +75,26 @@ mod tests {
     #[test]
     fn command_round_trip_init() {
         let cmd = SidecarCommand::Init {
-            config: SidecarConfig {
-                mode: SidecarSessionMode::Dictation,
-                language: Some("en".into()),
-                protocol_version: SIDECAR_PROTOCOL_VERSION,
-            },
+            config: serde_json::json!({
+                "protocol_version": SIDECAR_PROTOCOL_VERSION,
+                "plugin_config": { "mode": "whatever-the-plugin-wants" }
+            }),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"init\""));
-        assert!(json.contains("\"mode\":\"dictation\""));
+        assert!(json.contains("whatever-the-plugin-wants"));
         let parsed: SidecarCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cmd);
     }
 
     #[test]
-    fn command_round_trip_press_release_shutdown() {
-        for cmd in [
-            SidecarCommand::TriggerPressed,
-            SidecarCommand::TriggerReleased,
+    fn command_round_trip_trigger_shutdown() {
+        let commands = vec![
+            SidecarCommand::Trigger { name: "press".into(), payload: None },
+            SidecarCommand::Trigger { name: "release".into(), payload: Some(serde_json::json!({"source":"keybind"})) },
             SidecarCommand::Shutdown,
-        ] {
+        ];
+        for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();
             let parsed: SidecarCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, cmd);
@@ -163,78 +102,74 @@ mod tests {
     }
 
     #[test]
-    fn trigger_commands_use_legacy_voice_wire_names() {
-        // Wire-format compat: existing local-voice plugin reads
-        // "voice_control_pressed"/"voice_control_released". The Rust
-        // type names are neutral but the JSON stays bit-identical so
-        // we don't break the plugin.
-        let pressed = serde_json::to_string(&SidecarCommand::TriggerPressed).unwrap();
-        let released = serde_json::to_string(&SidecarCommand::TriggerReleased).unwrap();
-        assert!(pressed.contains("\"voice_control_pressed\""), "got {pressed}");
-        assert!(released.contains("\"voice_control_released\""), "got {released}");
+    fn trigger_payload_is_optional() {
+        let without_payload = serde_json::to_string(&SidecarCommand::Trigger {
+            name: "tap".into(),
+            payload: None,
+        }).unwrap();
+        assert!(without_payload.contains("\"type\":\"trigger\""));
+        assert!(!without_payload.contains("payload"));
+
+        let with_payload = serde_json::to_string(&SidecarCommand::Trigger {
+            name: "tap".into(),
+            payload: Some(serde_json::json!({"count":2})),
+        }).unwrap();
+        assert!(with_payload.contains("payload"));
     }
 
     #[test]
-    fn event_round_trip_hello() {
-        let event = SidecarEvent::Hello {
-            protocol_version: 1,
-            extension: "synaps-voice-plugin".to_string(),
-            capabilities: vec![SidecarCapability::Stt],
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"type\":\"hello\""));
-        let parsed: SidecarEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, event);
-    }
-
-    #[test]
-    fn event_round_trip_transcripts() {
-        for event in [
-            SidecarEvent::ListeningStarted,
-            SidecarEvent::TranscribingStarted,
-            SidecarEvent::PartialTranscript {
-                text: "hello".into(),
+    fn frame_round_trip_hello_status_insert_error() {
+        let frames = vec![
+            SidecarFrame::Hello {
+                protocol_version: SIDECAR_PROTOCOL_VERSION,
+                extension: "example-plugin".to_string(),
+                capabilities: vec!["anything".into(), "input.text".into()],
             },
-            SidecarEvent::FinalTranscript {
-                text: "hello world".into(),
+            SidecarFrame::Status {
+                state: "busy".into(),
+                label: Some("Working".into()),
+                capabilities: vec![],
             },
-            SidecarEvent::Error {
-                message: "model missing".into(),
+            SidecarFrame::InsertText {
+                text: "partial".into(),
+                mode: InsertTextMode::Append,
             },
-        ] {
-            let json = serde_json::to_string(&event).unwrap();
-            let parsed: SidecarEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, event);
+            SidecarFrame::InsertText {
+                text: "done".into(),
+                mode: InsertTextMode::Final,
+            },
+            SidecarFrame::Error { message: "missing model".into() },
+        ];
+        for frame in frames {
+            let json = serde_json::to_string(&frame).unwrap();
+            let parsed: SidecarFrame = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, frame);
         }
     }
 
     #[test]
-    fn parses_real_plugin_hello_line() {
-        // Wire format example from local-voice-plugin/src/main.rs::emit_ready.
-        let line = r#"{"type":"hello","protocol_version":1,"extension":"synaps-voice-plugin","capabilities":["stt"]}"#;
-        let parsed: SidecarEvent = serde_json::from_str(line).unwrap();
+    fn parses_generic_hello_line() {
+        let line = r#"{"type":"hello","protocol_version":2,"extension":"example-plugin","capabilities":["text.insert"]}"#;
+        let parsed: SidecarFrame = serde_json::from_str(line).unwrap();
         match parsed {
-            SidecarEvent::Hello {
-                protocol_version,
-                extension,
-                capabilities,
-            } => {
-                assert_eq!(protocol_version, 1);
-                assert_eq!(extension, "synaps-voice-plugin");
-                assert_eq!(capabilities, vec![SidecarCapability::Stt]);
+            SidecarFrame::Hello { protocol_version, extension, capabilities } => {
+                assert_eq!(protocol_version, SIDECAR_PROTOCOL_VERSION);
+                assert_eq!(extension, "example-plugin");
+                assert_eq!(capabilities, vec!["text.insert".to_string()]);
             }
             other => panic!("expected Hello, got {:?}", other),
         }
     }
 
     #[test]
-    fn parses_real_plugin_final_transcript_line() {
-        let line = r#"{"type":"final_transcript","text":"hello from the plugin"}"#;
-        let parsed: SidecarEvent = serde_json::from_str(line).unwrap();
+    fn parses_insert_text_final_line() {
+        let line = r#"{"type":"insert_text","text":"hello from a plugin","mode":"final"}"#;
+        let parsed: SidecarFrame = serde_json::from_str(line).unwrap();
         assert_eq!(
             parsed,
-            SidecarEvent::FinalTranscript {
-                text: "hello from the plugin".into()
+            SidecarFrame::InsertText {
+                text: "hello from a plugin".into(),
+                mode: InsertTextMode::Final,
             }
         );
     }

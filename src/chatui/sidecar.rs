@@ -18,9 +18,7 @@
 
 use synaps_cli::sidecar::discovery::{discover, DiscoveredSidecar};
 use synaps_cli::sidecar::manager::{SidecarManager, SidecarError, SidecarLifecycleEvent};
-use synaps_cli::sidecar::protocol::{
-    SidecarConfig, SidecarProviderState, SidecarSessionMode, SIDECAR_PROTOCOL_VERSION,
-};
+use synaps_cli::sidecar::protocol::{InsertTextMode, SIDECAR_PROTOCOL_VERSION};
 use synaps_cli::sidecar::spawn::SidecarSpawnArgs;
 
 use super::app::{App, ChatMessage};
@@ -28,12 +26,10 @@ use super::app::{App, ChatMessage};
 /// What the chatui currently shows for the sidecar indicator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SidecarUiStatus {
-    /// Manager is alive but not currently capturing audio.
+    /// Sidecar is not currently doing plugin-defined work.
     Idle,
-    /// Sidecar reported `ListeningStarted`.
-    Listening,
-    /// Sidecar reported `TranscribingStarted`.
-    Transcribing,
+    /// Sidecar is doing plugin-defined work and supplied a display label.
+    Active { label: String },
     /// Sidecar reported an error; user should `/sidecar toggle` to retry.
     Error(String),
 }
@@ -115,17 +111,12 @@ impl SidecarUiState {
             ));
         }
 
-        let (args, language) = build_spawn_args(&sidecar, spawn_args);
+        let args = build_spawn_args(&sidecar, spawn_args);
+        let config = serde_json::json!({
+            "protocol_version": SIDECAR_PROTOCOL_VERSION,
+        });
 
-        let manager = SidecarManager::spawn(
-            &sidecar.binary,
-            &args,
-            SidecarConfig {
-                mode: SidecarSessionMode::Dictation,
-                language: language.clone(),
-                protocol_version: SIDECAR_PROTOCOL_VERSION,
-            },
-        )
+        let manager = SidecarManager::spawn(&sidecar.binary, &args, config)
         .await
         .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
 
@@ -178,9 +169,8 @@ fn format_status_line(
 ) -> String {
     let label = display_name.unwrap_or("sidecar");
     let state = match status {
-        SidecarUiStatus::Idle => "idle",
-        SidecarUiStatus::Listening => "listening",
-        SidecarUiStatus::Transcribing => "transcribing",
+        SidecarUiStatus::Idle => "idle".to_string(),
+        SidecarUiStatus::Active { label } => label.clone(),
         SidecarUiStatus::Error(msg) => return format!("{label}: error — {msg}"),
     };
     format!(
@@ -206,52 +196,32 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
         SidecarLifecycleEvent::Ready { .. } => {
             // Sidecar handshake is informational; we already pressed.
         }
-        SidecarLifecycleEvent::StateChanged(state) => match state {
-            SidecarProviderState::Listening => v.status = SidecarUiStatus::Listening,
-            SidecarProviderState::Transcribing => v.status = SidecarUiStatus::Transcribing,
-            SidecarProviderState::Ready | SidecarProviderState::Stopped => {
-                // Only fall back to Idle when the user has actually
-                // released. Otherwise the VAD is just between utterances
-                // and the sidecar is still armed.
+        SidecarLifecycleEvent::StateChanged { state, label } => {
+            let is_inactive = matches!(state.as_str(), "idle" | "ready" | "stopped");
+            if is_inactive {
                 if !v.armed {
                     v.status = SidecarUiStatus::Idle;
                 }
-            }
-            SidecarProviderState::Error => {
-                v.status = SidecarUiStatus::Error("sidecar reported error state".into())
-            }
-            SidecarProviderState::Speaking => {}
-        },
-        SidecarLifecycleEvent::ListeningStarted => {
-            v.status = SidecarUiStatus::Listening;
-        }
-        SidecarLifecycleEvent::ListeningStopped => {
-            // The STT provider emits ListeningStopped between VAD
-            // utterances *and* on real shutdown. Only clear status if the
-            // user has unarmed (toggled off).
-            if !v.armed {
-                v.status = SidecarUiStatus::Idle;
+            } else {
+                v.status = SidecarUiStatus::Active {
+                    label: label.unwrap_or(state),
+                };
             }
         }
-        SidecarLifecycleEvent::TranscribingStarted => {
-            v.status = SidecarUiStatus::Transcribing;
-        }
-        SidecarLifecycleEvent::PartialTranscript(_) => {
-            // Reserved for V5+ — drop for now.
-        }
-        SidecarLifecycleEvent::FinalTranscript(text) => {
-            // Insert text but do NOT reset status: the VAD will keep
-            // emitting more utterances until the user toggles off.
-            let armed = v.armed;
-            insert_transcript_into_input(app, &text);
-            if !armed {
-                // Re-borrow because insert_transcript_into_input took
-                // a mutable borrow of `app`.
-                if let Some(v) = app.sidecars.get_mut(plugin_id) {
-                    v.status = SidecarUiStatus::Idle;
+        SidecarLifecycleEvent::InsertText { text, mode } => match mode {
+            InsertTextMode::Append => {
+                // Reserved for future live-preview support.
+            }
+            InsertTextMode::Final | InsertTextMode::Replace => {
+                let armed = v.armed;
+                insert_transcript_into_input(app, &text);
+                if !armed {
+                    if let Some(v) = app.sidecars.get_mut(plugin_id) {
+                        v.status = SidecarUiStatus::Idle;
+                    }
                 }
             }
-        }
+        },
         SidecarLifecycleEvent::Error(message) => {
             v.status = SidecarUiStatus::Error(message.clone());
             app.push_msg(ChatMessage::Error(format!(
@@ -341,22 +311,8 @@ mod tests {
             args: vec!["--foo".into(), "bar".into()],
             language: Some("fr".into()),
         };
-        let (out_args, lang) = build_spawn_args(&sidecar, Some(args));
+        let out_args = build_spawn_args(&sidecar, Some(args));
         assert_eq!(out_args, vec!["--foo", "bar"]);
-        assert_eq!(lang.as_deref(), Some("fr"));
-    }
-
-    #[test]
-    fn build_spawn_args_treats_auto_language_as_none() {
-        let sidecar = discovered(None);
-        for sentinel in ["", " ", "?", "auto", "(auto)"] {
-            let args = SidecarSpawnArgs {
-                args: vec![],
-                language: Some(sentinel.into()),
-            };
-            let (_, lang) = build_spawn_args(&sidecar, Some(args));
-            assert_eq!(lang, None, "sentinel `{sentinel}` should map to None");
-        }
     }
 
     #[test]
@@ -366,7 +322,7 @@ mod tests {
         let cargo_toml = std::env::current_dir().unwrap().join("Cargo.toml");
         let path_str = cargo_toml.to_string_lossy().into_owned();
         let sidecar = discovered(Some(&path_str));
-        let (out_args, _) = build_spawn_args(&sidecar, None);
+        let out_args = build_spawn_args(&sidecar, None);
         assert_eq!(out_args.len(), 2);
         assert_eq!(out_args[0], "--model-path");
         assert_eq!(out_args[1], path_str);
@@ -375,7 +331,7 @@ mod tests {
     #[test]
     fn build_spawn_args_skips_manifest_default_when_file_missing() {
         let sidecar = discovered(Some("/definitely/not/a/real/path/xyz.bin"));
-        let (out_args, _) = build_spawn_args(&sidecar, None);
+        let out_args = build_spawn_args(&sidecar, None);
         assert!(out_args.is_empty(), "missing default file must not produce args, got {out_args:?}");
     }
 
@@ -387,7 +343,7 @@ mod tests {
             args: vec!["--model-path".into(), "/plugin/chosen.bin".into()],
             language: None,
         };
-        let (out_args, _) = build_spawn_args(&sidecar, Some(plugin_args));
+        let out_args = build_spawn_args(&sidecar, Some(plugin_args));
         // Only one --model-path, and it's the plugin's choice.
         let count = out_args.iter().filter(|a| *a == "--model-path").count();
         assert_eq!(count, 1);
@@ -397,18 +353,16 @@ mod tests {
     #[test]
     fn build_spawn_args_returns_empty_when_no_plugin_args_and_no_manifest_default() {
         let sidecar = discovered(None);
-        let (out_args, lang) = build_spawn_args(&sidecar, None);
+        let out_args = build_spawn_args(&sidecar, None);
         assert!(out_args.is_empty());
-        assert_eq!(lang, None);
     }
 
     #[test]
     fn build_spawn_args_with_none_spawn_args_falls_back_to_manifest() {
         let cargo_toml = std::env::current_dir().unwrap().join("Cargo.toml");
         let sidecar = discovered(Some(&cargo_toml.to_string_lossy()));
-        let (out_args, lang) = build_spawn_args(&sidecar, None);
+        let out_args = build_spawn_args(&sidecar, None);
         assert_eq!(out_args[0], "--model-path");
-        assert_eq!(lang, None);
     }
 
     // ---- existing insert_transcript tests -----------------------------
@@ -510,41 +464,27 @@ fn expand_tilde(path: String) -> String {
 
 /// Combine plugin-supplied [`SidecarSpawnArgs`] with manifest defaults.
 ///
-/// Returns `(args, language)` ready for [`SidecarManager::spawn`] and the
-/// [`SidecarConfig`] handshake.
+/// Returns command-line args ready for [`SidecarManager::spawn`]. Core does
+/// not interpret sidecar-specific config; the plugin owns its CLI and Init
+/// schemas.
 ///
 /// Logic:
-/// - If the plugin returned spawn args, take its `args` verbatim and its
-///   `language` for the handshake.
+/// - If the plugin returned spawn args, take its `args` verbatim.
 /// - If the plugin's args don't already include `--model-path` and the
 ///   manifest declares a `default_path`, append `--model-path <expanded>`
 ///   when the file actually exists. Plugins that opt out of model-path
-///   bootstrapping by including `--model-path` themselves (or by passing
-///   an explicit empty list) keep full control.
+///   bootstrapping by including `--model-path` themselves keep full control.
 /// - If `spawn_args` is `None`, only the manifest default applies.
 ///
 /// This function is pure and unit-tested below.
 fn build_spawn_args(
     sidecar: &DiscoveredSidecar,
     spawn_args: Option<SidecarSpawnArgs>,
-) -> (Vec<String>, Option<String>) {
+) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
-    let mut language: Option<String> = None;
 
     if let Some(plugin_args) = spawn_args {
         args.extend(plugin_args.args);
-        language = plugin_args.language.and_then(|s| {
-            let trimmed = s.trim().to_string();
-            if trimmed.is_empty()
-                || trimmed == "?"
-                || trimmed == "auto"
-                || trimmed == "(auto)"
-            {
-                None
-            } else {
-                Some(trimmed)
-            }
-        });
     }
 
     let already_has_model_path = args.iter().any(|a| a == "--model-path");
@@ -562,5 +502,5 @@ fn build_spawn_args(
         }
     }
 
-    (args, language)
+    args
 }

@@ -1,13 +1,14 @@
 //! Integration test: `SidecarManager` drives a real sidecar binary in
-//! `--mock-transcript` mode and surfaces a `FinalTranscript` event.
+//! `--mock-transcript` mode and surfaces a final InsertText event.
 //!
-//! Skipped at runtime if the local-voice-plugin binary isn't built.
+//! Skipped at runtime if the local sidecar binary isn't built or still
+//! speaks the pre-Phase-9 v1 wire protocol.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use synaps_cli::sidecar::manager::{SidecarManager, SidecarLifecycleEvent};
-use synaps_cli::sidecar::protocol::{SidecarConfig, SidecarSessionMode, SIDECAR_PROTOCOL_VERSION};
+use synaps_cli::sidecar::protocol::{InsertTextMode, SIDECAR_PROTOCOL_VERSION};
 
 fn locate_sidecar() -> Option<PathBuf> {
     // Prefer an explicit env var (CI / Nix builds).
@@ -35,11 +36,7 @@ async fn manager_drives_sidecar_mock_transcript_end_to_end() {
     let mut manager = SidecarManager::spawn(
         &bin,
         &["--mock-transcript".into(), "hello from the sidecar".into()],
-        SidecarConfig {
-            mode: SidecarSessionMode::Dictation,
-            language: None,
-            protocol_version: SIDECAR_PROTOCOL_VERSION,
-        },
+        serde_json::json!({ "protocol_version": SIDECAR_PROTOCOL_VERSION }),
     )
     .await
     .expect("manager spawn should succeed");
@@ -57,21 +54,26 @@ async fn manager_drives_sidecar_mock_transcript_end_to_end() {
         let timed = tokio::time::timeout(remaining, manager.next_event()).await;
         let Ok(Some(event)) = timed else { break };
         match event {
-            SidecarLifecycleEvent::ListeningStarted => got_listening = true,
-            SidecarLifecycleEvent::FinalTranscript(text) => {
+            SidecarLifecycleEvent::StateChanged { state, .. } if state == "active" || state == "listening" => got_listening = true,
+            SidecarLifecycleEvent::InsertText { text, mode: InsertTextMode::Final } => {
                 got_transcript = Some(text);
                 break;
+            }
+            SidecarLifecycleEvent::Error(err) if err.contains("missing field `mode`") || err.contains("voice_control") => {
+                eprintln!("skipping: located sidecar binary still speaks pre-Phase-9 protocol: {err}");
+                let _ = manager.shutdown().await;
+                return;
             }
             SidecarLifecycleEvent::Error(err) => panic!("unexpected sidecar error: {err}"),
             _ => {}
         }
     }
 
-    assert!(got_listening, "expected ListeningStarted event");
+    assert!(got_listening, "expected active state event");
     assert_eq!(
         got_transcript.as_deref(),
         Some("hello from the sidecar"),
-        "expected mock transcript to surface as a FinalTranscript event"
+        "expected mock transcript to surface as a final InsertText event"
     );
 
     manager.shutdown().await.expect("graceful shutdown");
