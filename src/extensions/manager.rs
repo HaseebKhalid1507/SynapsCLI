@@ -75,8 +75,8 @@ pub struct ExtensionStatus {
 ///    `provides.sidecar.setup`** — the plugin ships source only (the
 ///    binary is typically gitignored) and the setup script needs to
 ///    be run. The hint points the user at the exact command. This is
-///    the common case for fresh marketplace installs of plugins like
-///    `local-voice` that build a Whisper sidecar from Rust source.
+///    the common case for fresh marketplace installs of plugins that
+///    build their extension binary from source.
 /// 2. **Anything else** — the generic "run plugin validate" hint.
 ///
 /// Pure function for unit-testability. Lives here (not in
@@ -287,7 +287,7 @@ impl ExtensionManager {
         // Do not probe optional info.get for legacy hook-only extensions. The
         // best-effort call can race with simple fixtures that exit after
         // shutdown/EOF and is only needed for richer extension-capability
-        // surfaces (providers/tools/voice).
+        // surfaces (providers/tools/plugin-defined capabilities).
         let info = if should_probe_info {
             match handler.get_info().await {
                 Ok(info) => Some(info),
@@ -611,7 +611,7 @@ impl ExtensionManager {
     /// Unified capability snapshot per loaded extension, sorted by id.
     ///
     /// Aggregates hook subscriptions, extension-provided tools, and registered
-    /// providers. `future` is intentionally empty until memory/indexer/voice
+    /// providers. `future` carries plugin-defined capability kinds and
     /// capabilities land.
     pub async fn capability_snapshots(&self) -> Vec<ExtensionCapabilitySnapshot> {
         let mut handlers: Vec<(String, Arc<dyn ExtensionHandler>)> = self
@@ -1035,8 +1035,8 @@ mod tests {
             "multi-cap",
             vec![
                 crate::extensions::runtime::process::CapabilityDeclaration {
-                    kind: "voice".to_string(),
-                    name: "Local Whisper STT".to_string(),
+                    kind: "capture".to_string(),
+                    name: "Local Sample STT".to_string(),
                     permissions: vec!["audio.input".to_string()],
                     params: serde_json::Value::Null,
                 },
@@ -1056,10 +1056,10 @@ mod tests {
             .expect("multi-cap snapshot");
         assert_eq!(snap.future.len(), 2);
         let kinds: Vec<&str> = snap.future.iter().map(|e| e.kind.as_str()).collect();
-        assert!(kinds.contains(&"voice"), "got kinds {:?}", kinds);
+        assert!(kinds.contains(&"capture"), "got kinds {:?}", kinds);
         assert!(kinds.contains(&"ocr"), "got kinds {:?}", kinds);
         let names: Vec<&str> = snap.future.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Local Whisper STT"), "got {:?}", names);
+        assert!(names.contains(&"Local Sample STT"), "got {:?}", names);
         assert!(names.contains(&"Tesseract"), "got {:?}", names);
 
         mgr.unload("multi-cap").await.unwrap();
@@ -1171,12 +1171,12 @@ mod tests {
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+            crate::extensions::config_store::write_plugin_config("sample-sidecar", "backend", "cpu")
                 .unwrap();
-            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "local-voice",
+                "sample-sidecar",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -1196,10 +1196,10 @@ mod tests {
     fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "local-voice",
+                "sample-sidecar",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -1322,8 +1322,8 @@ mod tests {
     #[test]
     fn hint_missing_binary_with_declared_setup_points_at_script() {
         let hint = compute_extension_load_hint(
-            "Failed to spawn extension 'local-voice': No such file or directory (os error 2)",
-            std::path::Path::new("/home/u/.synaps-cli/plugins/local-voice"),
+            "Failed to spawn extension 'sample-sidecar': No such file or directory (os error 2)",
+            std::path::Path::new("/home/u/.synaps-cli/plugins/sample-sidecar"),
             Some("scripts/setup.sh"),
         );
         assert!(
@@ -1331,7 +1331,7 @@ mod tests {
             "missing-binary case should be flagged: {hint}"
         );
         assert!(
-            hint.contains("/home/u/.synaps-cli/plugins/local-voice"),
+            hint.contains("/home/u/.synaps-cli/plugins/sample-sidecar"),
             "hint should include the plugin dir: {hint}"
         );
         assert!(

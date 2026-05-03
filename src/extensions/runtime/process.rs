@@ -382,7 +382,7 @@ pub struct InitializeCapabilitiesResult {
     pub tools: Vec<RegisteredExtensionToolSpec>,
     pub providers: Vec<RegisteredProviderSpec>,
     /// Generic, plugin-defined capabilities. Each entry's `kind` is a
-    /// free-form string the plugin author picks (e.g. `"voice"`,
+    /// free-form string the plugin author picks (e.g. `"capture"`,
     /// `"ocr"`, `"agent"`, `"foot_pedal"`); core does not enumerate or
     /// branch on it. Permissions are gated by the declared
     /// [`CapabilityDeclaration::permissions`] list.
@@ -400,7 +400,7 @@ pub struct InitializeCapabilitiesResult {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct CapabilityDeclaration {
     /// Free-form capability kind tag chosen by the plugin author.
-    /// Examples: `"voice"`, `"ocr"`, `"agent"`, `"clipboard_mirror"`.
+    /// Examples: `"capture"`, `"ocr"`, `"agent"`, `"clipboard_mirror"`.
     /// Must be non-empty; otherwise opaque to core.
     pub kind: String,
     /// Human-readable display name shown in `/extensions status` and
@@ -2074,7 +2074,7 @@ mod restart_policy_tests {
 }
 
 #[cfg(test)]
-mod voice_validator_tests {
+mod capture_validator_tests {
     use super::*;
     use crate::extensions::permissions::{Permission, PermissionSet};
 
@@ -2097,7 +2097,7 @@ mod voice_validator_tests {
 
     #[test]
     fn capability_validator_rejects_empty_kind() {
-        let d = cap("   ", "Whisper", &["audio.input"]);
+        let d = cap("   ", "Sample", &["audio.input"]);
         let perms = perms_with(&[Permission::AudioInput]);
         let err = validate_capability(&d, &perms).unwrap_err();
         assert!(err.contains("kind"), "got: {}", err);
@@ -2105,7 +2105,7 @@ mod voice_validator_tests {
 
     #[test]
     fn capability_validator_rejects_empty_name() {
-        let d = cap("voice", "   ", &["audio.input"]);
+        let d = cap("capture", "   ", &["audio.input"]);
         let perms = perms_with(&[Permission::AudioInput]);
         let err = validate_capability(&d, &perms).unwrap_err();
         assert!(err.contains("name"), "got: {}", err);
@@ -2113,7 +2113,7 @@ mod voice_validator_tests {
 
     #[test]
     fn capability_validator_rejects_unknown_permission_string() {
-        let d = cap("voice", "Whisper", &["audio.telepathy"]);
+        let d = cap("capture", "Sample", &["audio.telepathy"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
         let err = validate_capability(&d, &perms).unwrap_err();
         assert!(
@@ -2125,7 +2125,7 @@ mod voice_validator_tests {
 
     #[test]
     fn capability_validator_requires_every_declared_permission() {
-        let d = cap("voice", "Whisper", &["audio.input"]);
+        let d = cap("capture", "Sample", &["audio.input"]);
         let perms = perms_with(&[]);
         let err = validate_capability(&d, &perms).unwrap_err();
         assert!(
@@ -2137,7 +2137,7 @@ mod voice_validator_tests {
 
     #[test]
     fn capability_validator_accepts_when_all_permissions_granted() {
-        let d = cap("voice", "Whisper", &["audio.input", "audio.output"]);
+        let d = cap("capture", "Sample", &["audio.input", "audio.output"]);
         let perms = perms_with(&[Permission::AudioInput, Permission::AudioOutput]);
         validate_capability(&d, &perms).expect("should validate");
     }
@@ -2158,7 +2158,7 @@ mod voice_validator_tests {
         // different `kind` values both validate identically — proves
         // the validator does not enumerate kinds.
         let perms = perms_with(&[Permission::AudioInput]);
-        for kind in ["voice", "ocr", "agent", "foot_pedal", "eeg"] {
+        for kind in ["capture", "ocr", "agent", "foot_pedal", "eeg"] {
             let d = cap(kind, "Anything", &["audio.input"]);
             validate_capability(&d, &perms).expect("should validate");
         }

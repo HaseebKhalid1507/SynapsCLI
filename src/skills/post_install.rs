@@ -4,7 +4,7 @@
 //! a shell script relative to the plugin's root), the marketplace
 //! install flow auto-runs that script after the plugin's source is in
 //! place. This is how plugins that ship native binaries (e.g.
-//! `local-voice` building a Whisper sidecar from Rust source) get their
+//! source-shipped plugins building an extension binary) get their
 //! binaries built without forcing the user to run `scripts/setup.sh`
 //! by hand.
 //!
@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::skills::manifest::PluginManifest;
 
-/// Wall-clock cap on a single setup script. Whisper from-scratch
+/// Wall-clock cap on a single setup script. Sample from-scratch
 /// builds run ~5 minutes on a modern dev box; 10 minutes leaves a
 /// healthy margin for slower CI/older hardware without making a
 /// runaway script wedge the install flow forever.
@@ -345,12 +345,12 @@ mod tests {
     fn install_log_path_substitutes_colons() {
         let path = install_log_path(
             Path::new("/tmp/logs"),
-            "local-voice",
+            "sample-sidecar",
             "2026-05-02T19:30:45-04:00",
         );
         assert_eq!(
             path,
-            PathBuf::from("/tmp/logs/install/local-voice-2026-05-02T19-30-45-04-00.log")
+            PathBuf::from("/tmp/logs/install/sample-sidecar-2026-05-02T19-30-45-04-00.log")
         );
     }
 

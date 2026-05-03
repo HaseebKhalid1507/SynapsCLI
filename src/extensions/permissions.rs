@@ -32,9 +32,9 @@ pub enum Permission {
     ConfigWrite,
     /// Can subscribe to hot-reload notifications for its own plugin config.
     ConfigSubscribe,
-    /// Can capture audio (microphone) for voice STT/wake-word capabilities.
+    /// Can capture audio from input devices.
     AudioInput,
-    /// Can produce audio output (speakers) for voice TTS capabilities.
+    /// Can produce audio through output devices.
     AudioOutput,
 }
 

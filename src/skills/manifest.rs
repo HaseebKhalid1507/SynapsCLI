@@ -95,7 +95,7 @@ pub struct PluginManifest {
 /// ```jsonc
 /// "settings": {
 ///   "category": [
-///     { "id": "voice", "label": "Voice", "fields": [ ... ] }
+///     { "id": "capture", "label": "Sample", "fields": [ ... ] }
 ///   ]
 /// }
 /// ```
@@ -167,13 +167,12 @@ pub struct PluginProvides {
 }
 
 /// Sidecar binary that Synaps CLI launches as a long-running plugin
-/// process. Modality-agnostic: a plugin can use this for voice STT,
-/// OCR, agent runners, EEG dictation, or anything that fits the
-/// "trigger-driven streaming source" shape.
+/// process. Plugin semantics live outside core; any process that fits the
+/// trigger-driven JSONL streaming contract can use this abstraction.
 ///
 /// `command` is resolved relative to the plugin root unless absolute.
 /// `protocol_version` is matched against the line-JSON protocol version
-/// understood by `src/sidecar/protocol.rs` (currently `1`).
+/// understood by `src/sidecar/protocol.rs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SidecarManifest {
     pub command: String,
@@ -208,7 +207,7 @@ pub struct SidecarManifest {
 pub struct SidecarLifecycle {
     /// Slash-command name that owns this sidecar's lifecycle.
     /// Together with `toggle`/`status` subcommands forms e.g.
-    /// `/voice toggle`.
+    /// the plugin's toggle command.
     pub command: String,
     /// Settings category id (matches a `settings.categories[].id` in
     /// the plugin manifest) that should host the virtual toggle-key
@@ -216,7 +215,7 @@ pub struct SidecarLifecycle {
     #[serde(default)]
     pub settings_category: Option<String>,
     /// Display name shown in the pill, status line, and `/extensions`
-    /// (e.g. "Voice", "OCR"). Defaults to `command` when `None`.
+    /// (e.g. "Sample", "OCR"). Defaults to `command` when `None`.
     #[serde(default)]
     pub display_name: Option<String>,
     /// Pill-ordering hint (-100..=100, default 0). Higher = leftmost.
@@ -240,13 +239,6 @@ where
     Ok(raw.clamp(-100, 100))
 }
 
-/// Backwards-compat type alias. New code should use [`SidecarManifest`].
-#[deprecated(
-    since = "0.1.0-phase7",
-    note = "use SidecarManifest; the voice-prefixed alias will be removed in a future release"
-)]
-pub type VoiceSidecarManifest = SidecarManifest;
-
 fn default_sidecar_protocol_version() -> u16 {
     1
 }
@@ -258,13 +250,6 @@ pub struct SidecarModel {
     #[serde(default)]
     pub required: bool,
 }
-
-/// Backwards-compat type alias. New code should use [`SidecarModel`].
-#[deprecated(
-    since = "0.1.0-phase7",
-    note = "use SidecarModel; the voice-prefixed alias will be removed in a future release"
-)]
-pub type VoiceSidecarModel = SidecarModel;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceManifest {
@@ -313,15 +298,15 @@ pub struct MarketplacePluginEntry {
 mod tests {
     use super::*;
 
-    /// Sibling-repo manifest pin: the live `local-voice` plugin manifest
+    /// Sibling-repo manifest pin: the live `sample-sidecar` plugin manifest
     /// in `synaps-skills` must round-trip through this crate's parser
     /// with the Phase 8 lifecycle block + keybinds wired in. If this
     /// test fails because the file moved, update or delete the path —
     /// don't loosen the assertions.
     #[test]
-    fn local_voice_plugin_json_parses_with_phase8_lifecycle_and_keybinds() {
+    fn local_capture_plugin_json_parses_with_phase8_lifecycle_and_keybinds() {
         let path = "/home/jr/Projects/Maha-Media/.worktrees/\
-            synaps-skills-local-voice-plugin-commands-tasks/local-voice-plugin/\
+            synaps-skills-local-sidecar-plugin-commands-tasks/local-sidecar-plugin/\
             .synaps-plugin/plugin.json";
         let Ok(json) = std::fs::read_to_string(path) else {
             // Sibling worktree absent — skip rather than fail in CI/other
@@ -330,23 +315,23 @@ mod tests {
             return;
         };
         let m: PluginManifest =
-            serde_json::from_str(&json).expect("local-voice manifest must deserialize");
-        assert_eq!(m.name, "local-voice");
+            serde_json::from_str(&json).expect("sample-sidecar manifest must deserialize");
+        assert_eq!(m.name, "sample-sidecar");
 
         let provides = m.provides.expect("provides present");
         let sidecar = provides.sidecar.expect("sidecar present");
-        assert_eq!(sidecar.command, "bin/synaps-voice-plugin");
+        assert_eq!(sidecar.command, "bin/synaps-sidecar-plugin");
         let lc = sidecar.lifecycle.expect("lifecycle present");
-        assert_eq!(lc.command, "voice");
-        assert_eq!(lc.settings_category.as_deref(), Some("voice"));
-        assert_eq!(lc.effective_display_name(), "Voice");
+        assert_eq!(lc.command, "capture");
+        assert_eq!(lc.settings_category.as_deref(), Some("capture"));
+        assert_eq!(lc.effective_display_name(), "Sample");
         assert_eq!(lc.importance, 50);
 
         assert_eq!(m.keybinds.len(), 1);
         let kb = &m.keybinds[0];
         assert_eq!(kb.key, "C-Space");
         assert_eq!(kb.action, "slash_command");
-        assert_eq!(kb.command.as_deref(), Some("voice toggle"));
+        assert_eq!(kb.command.as_deref(), Some("capture toggle"));
     }
 
     #[test]
@@ -493,11 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn plugin_manifest_rejects_legacy_voice_sidecar_field() {
+    fn plugin_manifest_rejects_legacy_legacy_sidecar_field() {
         let json = r#"{
             "name": "legacy",
             "provides": {
-                "voice_sidecar": {
+                "legacy_sidecar": {
                     "command": "bin/old",
                     "protocol_version": 1
                 }
@@ -507,7 +492,7 @@ mod tests {
         let provides = m.provides.expect("provides block should deserialize");
         assert!(
             provides.sidecar.is_none(),
-            "legacy provides.voice_sidecar must not populate provides.sidecar"
+            "legacy provides.legacy_sidecar must not populate provides.sidecar"
         );
     }
 
@@ -540,9 +525,9 @@ mod tests {
                     "command": "bin/sidecar",
                     "protocol_version": 1,
                     "lifecycle": {
-                        "command": "voice",
-                        "settings_category": "voice",
-                        "display_name": "Voice",
+                        "command": "capture",
+                        "settings_category": "capture",
+                        "display_name": "Sample",
                         "importance": 50
                     }
                 }
@@ -556,11 +541,11 @@ mod tests {
             .unwrap()
             .lifecycle
             .expect("lifecycle should deserialize");
-        assert_eq!(lc.command, "voice");
-        assert_eq!(lc.settings_category.as_deref(), Some("voice"));
-        assert_eq!(lc.display_name.as_deref(), Some("Voice"));
+        assert_eq!(lc.command, "capture");
+        assert_eq!(lc.settings_category.as_deref(), Some("capture"));
+        assert_eq!(lc.display_name.as_deref(), Some("Sample"));
         assert_eq!(lc.importance, 50);
-        assert_eq!(lc.effective_display_name(), "Voice");
+        assert_eq!(lc.effective_display_name(), "Sample");
     }
 
     #[test]
@@ -583,7 +568,7 @@ mod tests {
                 "sidecar": {
                     "command": "bin/sidecar",
                     "protocol_version": 1,
-                    "lifecycle": { "command": "voice" }
+                    "lifecycle": { "command": "capture" }
                 }
             }
         }"#;
@@ -595,12 +580,12 @@ mod tests {
             .unwrap()
             .lifecycle
             .unwrap();
-        assert_eq!(lc.command, "voice");
+        assert_eq!(lc.command, "capture");
         assert!(lc.settings_category.is_none());
         assert!(lc.display_name.is_none());
         assert_eq!(lc.importance, 0);
         // effective_display_name falls back to `command` when display_name absent.
-        assert_eq!(lc.effective_display_name(), "voice");
+        assert_eq!(lc.effective_display_name(), "capture");
     }
 
     #[test]

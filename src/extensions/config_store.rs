@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn write_plugin_config_creates_parent_directory_and_appends_missing_key() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("plugins").join("voice").join("config");
+        let path = dir.path().join("plugins").join("capture").join("config");
 
         write_plugin_config_to(&path, "language", "auto").unwrap();
 

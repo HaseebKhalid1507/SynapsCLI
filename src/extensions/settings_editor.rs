@@ -162,11 +162,11 @@ mod tests {
     #[test]
     fn open_params_round_trip() {
         let p = SettingsEditorOpenParams {
-            category: "voice".to_string(),
+            category: "capture".to_string(),
             field: "model_path".to_string(),
         };
         let v = serde_json::to_value(&p).unwrap();
-        assert_eq!(v, json!({"category":"voice","field":"model_path"}));
+        assert_eq!(v, json!({"category":"capture","field":"model_path"}));
         let back: SettingsEditorOpenParams = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
     }

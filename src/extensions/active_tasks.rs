@@ -5,7 +5,7 @@
 //!
 //! Stored on `App` (or any container) as a `HashMap<String, TaskState>` so the
 //! sticky progress UI can render N concurrent tasks generically without any
-//! voice/whisper-specific knowledge. This module is intentionally decoupled
+//! plugin-specific knowledge. This module is intentionally decoupled
 //! from `App` so it can be unit-tested standalone.
 
 use std::collections::HashMap;
