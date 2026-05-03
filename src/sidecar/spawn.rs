@@ -39,8 +39,9 @@ pub struct SidecarSpawnArgs {
     /// as opaque.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Optional language hint for the [`crate::sidecar::protocol::SidecarConfig`]
-    /// handshake. If `None`, the handshake defaults apply.
+    /// Optional plugin-owned language hint. Core stores and forwards this
+    /// value only where a plugin explicitly asks for it; the sidecar
+    /// protocol does not prescribe language semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
