@@ -68,6 +68,39 @@ pub struct ExtensionStatus {
     pub restart_count: usize,
 }
 
+/// Compute the hint for an extension load failure.
+///
+/// Two cases:
+/// 1. **Missing extension binary AND plugin declares
+///    `provides.sidecar.setup`** — the plugin ships source only (the
+///    binary is typically gitignored) and the setup script needs to
+///    be run. The hint points the user at the exact command. This is
+///    the common case for fresh marketplace installs of plugins like
+///    `local-voice` that build a Whisper sidecar from Rust source.
+/// 2. **Anything else** — the generic "run plugin validate" hint.
+///
+/// Pure function for unit-testability. Lives here (not in
+/// `ExtensionLoadFailure`) because the sidecar/setup convention is a
+/// plugin-layer concern.
+pub fn compute_extension_load_hint(
+    error: &str,
+    plugin_dir: &std::path::Path,
+    declared_setup: Option<&str>,
+) -> String {
+    let missing_binary =
+        error.contains("No such file or directory") || error.contains("os error 2");
+    match (missing_binary, declared_setup) {
+        (true, Some(setup)) => format!(
+            "Extension binary missing — this plugin ships source only. \
+             Build it with: (cd {} && bash {}); then reload.",
+            plugin_dir.display(),
+            setup,
+        ),
+        _ => "Run `plugin validate <plugin-dir>` and confirm the extension command is installed"
+            .to_string(),
+    }
+}
+
 /// Manages the lifecycle of all loaded extensions.
 pub struct ExtensionManager {
     /// The shared hook bus.
@@ -904,11 +937,15 @@ impl ExtensionManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
+                    let setup_script = json
+                        .pointer("/provides/sidecar/setup")
+                        .and_then(|v| v.as_str());
+                    let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
                     failed.push(ExtensionLoadFailure::new(
                         plugin_name,
                         Some(manifest_path),
                         e,
-                        "Run `plugin validate <plugin-dir>` and confirm the extension command is installed",
+                        hint,
                     ));
                 }
             }
@@ -1278,5 +1315,71 @@ mod tests {
         mgr.providers.register("plug", plain_spec).unwrap();
         let ids = mgr.provider_tool_use_runtime_ids();
         assert_eq!(ids, vec!["plug:alpha".to_string()]);
+    }
+
+    // ---- compute_extension_load_hint --------------------------------
+
+    #[test]
+    fn hint_missing_binary_with_declared_setup_points_at_script() {
+        let hint = compute_extension_load_hint(
+            "Failed to spawn extension 'local-voice': No such file or directory (os error 2)",
+            std::path::Path::new("/home/u/.synaps-cli/plugins/local-voice"),
+            Some("scripts/setup.sh"),
+        );
+        assert!(
+            hint.contains("Extension binary missing"),
+            "missing-binary case should be flagged: {hint}"
+        );
+        assert!(
+            hint.contains("/home/u/.synaps-cli/plugins/local-voice"),
+            "hint should include the plugin dir: {hint}"
+        );
+        assert!(
+            hint.contains("bash scripts/setup.sh"),
+            "hint should show the exact command: {hint}"
+        );
+    }
+
+    #[test]
+    fn hint_missing_binary_without_declared_setup_falls_back_to_generic() {
+        let hint = compute_extension_load_hint(
+            "Failed to spawn extension 'foo': No such file or directory (os error 2)",
+            std::path::Path::new("/x/y"),
+            None,
+        );
+        assert!(
+            hint.contains("plugin validate"),
+            "no setup declared → generic hint: {hint}"
+        );
+        assert!(
+            !hint.contains("Extension binary missing"),
+            "should not falsely promise a setup script: {hint}"
+        );
+    }
+
+    #[test]
+    fn hint_other_error_with_declared_setup_falls_back_to_generic() {
+        let hint = compute_extension_load_hint(
+            "Extension 'foo' must subscribe to at least one hook or request a registration permission",
+            std::path::Path::new("/x/y"),
+            Some("scripts/setup.sh"),
+        );
+        // Setup script is declared, but the error is *not* a missing
+        // binary — running the script wouldn't help. Fall back to the
+        // generic hint so we don't mislead the user.
+        assert!(hint.contains("plugin validate"), "got {hint}");
+        assert!(!hint.contains("Extension binary missing"), "got {hint}");
+    }
+
+    #[test]
+    fn hint_recognises_os_error_2_format() {
+        // Older / cross-platform error formats may include the kernel
+        // errno but not the "No such file or directory" English text.
+        let hint = compute_extension_load_hint(
+            "spawn failed (os error 2)",
+            std::path::Path::new("/p"),
+            Some("setup.sh"),
+        );
+        assert!(hint.contains("Extension binary missing"), "got {hint}");
     }
 }
