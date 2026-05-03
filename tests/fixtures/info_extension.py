@@ -40,12 +40,12 @@ def info_payload():
     return {
         "build": {
             "backend": "cpu",
-            "features": ["local-stt"],
+            "features": ["fixture-backend"],
             "version": "0.1.0-test",
         },
         "capabilities": [
-            {"kind": "voice", "name": "Local Whisper STT", "modes": ["stt"]},
-            {"kind": "models", "name": "Whisper models"},
+            {"kind": "fixture", "name": "Fixture Capability", "modes": ["demo"]},
+            {"kind": "models", "name": "Fixture models"},
         ],
         "models": [
             {"id": "ggml-tiny.en.bin", "display_name": "Tiny English", "installed": True},
@@ -61,7 +61,7 @@ def main():
             break
         method = msg.get("method")
         if method == "initialize":
-            send_response(msg, {"protocol_version": 1, "capabilities": {"voice": {"name": "Local Whisper STT", "modes": ["stt"]}}})
+            send_response(msg, {"protocol_version": 1, "capabilities": {"capabilities": [{"kind": "fixture", "name": "Fixture Capability", "permissions": []}]}})
         elif method == "info.get":
             if os.environ.get("INFO_FIXTURE_DISABLE", "0") == "1":
                 send_response(msg, error={"code": -32601, "message": "method not found"})
