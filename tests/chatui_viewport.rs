@@ -46,6 +46,20 @@ fn edge_scrub_positions_do_not_duplicate_single_column_terminal() {
 }
 
 #[test]
+fn edge_scrub_area_respects_dynamic_bottom_protection() {
+    let area = viewport::edge_scrub_area(Rect::new(0, 0, 100, 30), 13)
+        .expect("room remains for message-area scrub");
+
+    assert_eq!(area, Rect::new(0, 2, 100, 15));
+    assert_eq!(area.y + area.height, 17, "protected rows begin at y=17");
+}
+
+#[test]
+fn edge_scrub_area_disables_when_bottom_ui_consumes_terminal() {
+    assert_eq!(viewport::edge_scrub_area(Rect::new(0, 0, 80, 12), 10), None);
+}
+
+#[test]
 fn scrub_edge_columns_resets_previous_frame_model_so_blank_edges_are_redrawn() {
     let backend = TestBackend::new(4, 2);
     let mut terminal = Terminal::new(backend).unwrap();
