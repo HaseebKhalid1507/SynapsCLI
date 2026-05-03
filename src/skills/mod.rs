@@ -107,12 +107,7 @@ pub async fn register(
     // there's no plugin-level F8 anymore, so picking a value in
     // /settings → Sidecar fully replaces the previous chord. Defaults to
     // F8 when no value has been chosen.
-    //
-    // Back-compat: legacy `voice_toggle_key` is read if the new key is
-    // absent. (Phase 7 deferred slice: replace `/voice toggle` literal
-    // with the active sidecar plugin's declared toggle command.)
     let sidecar_key = crate::config::read_config_value("sidecar_toggle_key")
-        .or_else(|| crate::config::read_config_value("voice_toggle_key"))
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "F8".to_string());
