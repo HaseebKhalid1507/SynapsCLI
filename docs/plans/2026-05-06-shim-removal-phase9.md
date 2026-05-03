@@ -4,7 +4,7 @@
 **Status:** draft (awaiting review)
 **Branch:** `feat/path-b-phase9-shim-removal`
 **Worktree:** `~/Projects/Maha-Media/.worktrees/SynapsCLI-path-b-phase9-shim-removal`
-**Convergence mode:** `none` (mechanical refactor with strong test coverage)
+**Convergence mode:** `none` (human-confirmed); use targeted subagents in dedicated worktrees for parallel inspection/implementation where useful
 
 ---
 
@@ -360,19 +360,21 @@ Mirror image of 9B in the plugin repo.
 
 ---
 
-## Open questions for review
+## Confirmed decisions
+
+1. **Scope ambition:** full 9A–9F. The sidecar abstraction must become lego-block generic; host code must not mention voice/STT/speech/listening/transcribing/dictation/barge-in/etc.
+2. **`InsertText`:** first-class host-generic wire frame.
+3. **Convergence mode:** `none`; use subagents instead where useful.
+4. **Execution:** use dedicated worktrees for subagent work; choose the cleverest safe ordering toward the end goal.
+
+## Original open questions (resolved)
 
 1. **Scope ambition.** The right reading of "lego blocks" is the full
-   redesign above (9A through 9F). Confirm that's what you want, vs. a
-   smaller "drop the named shims, leave the enums" Phase 9. My read is
-   the former — the iron-rule violation is in the *enums*, not just the
-   shims — but I want explicit confirmation before doing 9B/C/D/E.
+   redesign above (9A through 9F). Resolved: full redesign.
 2. **`InsertText` as a host-generic frame.** Is "insert text into the
    user's input buffer" host-universal enough to be a first-class wire
    frame, or should it be a `Custom` frame that the host happens to
-   recognize from any plugin that emits it? My recommendation: first-class,
-   because it's plausibly used by gesture/OCR/snippet/AI plugins, not
-   just voice.
+   recognize from any plugin that emits it? Resolved: first-class.
 3. **Trigger payload semantics.** Should `SidecarCommand::Trigger { name }`
    carry an optional `payload: Value`? That would let one plugin handle
    multiple trigger flavours from a single keybind config — recommend
@@ -386,7 +388,7 @@ Mirror image of 9B in the plugin repo.
 6. **Convergence mode.** I declared `none` because each slice is
    mechanical and well-tested. The 9B + 9E flag day might warrant
    `informed` if you want a second-set-of-eyes critique on the
-   protocol-v2 shape before lock-in. Confirm or override.
+   protocol-v2 shape before lock-in. Resolved: keep `none`; use subagents.
 
 ---
 
