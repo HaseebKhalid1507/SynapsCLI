@@ -23,6 +23,24 @@ fn project_plugins_disabled() -> bool {
         .unwrap_or(false)
 }
 
+
+fn installed_plugin_setup_failure(plugin_name: &str) -> Option<String> {
+    let state_path = crate::skills::state::PluginsState::default_path();
+    let state = crate::skills::state::PluginsState::load_from(&state_path).ok()?;
+    let plugin = state.installed.iter().find(|p| p.name == plugin_name)?;
+    match &plugin.setup_status {
+        crate::skills::state::SetupStatus::Failed { message, .. } => Some(message.clone()),
+        _ => None,
+    }
+}
+
+fn sanitize_hint_fragment(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect::<String>()
+}
+
 /// Actionable discovery/load failure for an installed plugin extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionLoadFailure {
@@ -91,10 +109,9 @@ pub fn compute_extension_load_hint(
         error.contains("No such file or directory") || error.contains("os error 2");
     match (missing_binary, declared_setup) {
         (true, Some(setup)) => format!(
-            "Extension binary missing — this plugin ships source only. \
-             Build it with: (cd {} && bash {}); then reload.",
-            plugin_dir.display(),
-            setup,
+            "Extension binary missing — this plugin ships source only. Run the setup script from the plugin directory, then reload. plugin_dir={}, setup={}",
+            sanitize_hint_fragment(&plugin_dir.display().to_string()),
+            sanitize_hint_fragment(setup),
         ),
         _ => "Run `plugin validate <plugin-dir>` and confirm the extension command is installed"
             .to_string(),
@@ -845,6 +862,16 @@ impl ExtensionManager {
                 tracing::debug!(plugin = %plugin_name, "Extension disabled via disabled_plugins config");
                 continue;
             }
+            if let Some(message) = installed_plugin_setup_failure(&plugin_name) {
+                tracing::warn!(plugin = %plugin_name, error = %message, "Skipping extension with failed post-install setup");
+                failed.push(ExtensionLoadFailure::new(
+                    plugin_name,
+                    None,
+                    format!("Post-install setup failed: {message}"),
+                    "Open /plugins, reinstall or update the plugin after fixing setup; extension load is disabled until setup succeeds",
+                ));
+                continue;
+            }
             let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
             if !manifest_path.exists() {
                 continue;
@@ -938,8 +965,9 @@ impl ExtensionManager {
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
                     let setup_script = json
-                        .pointer("/provides/sidecar/setup")
-                        .and_then(|v| v.as_str());
+                        .pointer("/extension/setup")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
                     let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
                     failed.push(ExtensionLoadFailure::new(
                         plugin_name,
@@ -1347,8 +1375,8 @@ mod tests {
             "hint should include the plugin dir: {hint}"
         );
         assert!(
-            hint.contains("bash scripts/setup.sh"),
-            "hint should show the exact command: {hint}"
+            hint.contains("setup=scripts/setup.sh"),
+            "hint should show sanitized setup path without copy-paste shell command: {hint}"
         );
     }
 

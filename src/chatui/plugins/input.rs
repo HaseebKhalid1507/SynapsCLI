@@ -408,6 +408,7 @@ mod tests {
                 source_subdir: None,
                 checksum_algorithm: None,
                 checksum_value: None,
+                setup_status: Default::default(),
             });
         }
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
@@ -452,6 +453,7 @@ mod tests {
             source_subdir: None,
             checksum_algorithm: None,
             checksum_value: None,
+            setup_status: Default::default(),
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 1; // marketplace row
@@ -488,6 +490,7 @@ mod tests {
             source_subdir: None,
             checksum_algorithm: None,
             checksum_value: None,
+            setup_status: Default::default(),
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 0; // Installed

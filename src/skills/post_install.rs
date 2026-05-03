@@ -40,7 +40,7 @@
 //! tokio runtime; the async runner is a thin shell over
 //! `tokio::process::Command`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::skills::manifest::PluginManifest;
@@ -56,6 +56,120 @@ use crate::skills::manifest::PluginManifest;
 /// Returns `None` for hosts we don't have a stable name for (caller
 /// then skips the prebuilt-fallback path and falls back to the setup
 /// script).
+
+/// Maximum accepted prebuilt archive size (128 MiB). Downloads are streamed and
+/// rejected before extraction if this cap is exceeded.
+pub const MAX_PREBUILT_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+
+const PREBUILT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PREBUILT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Sanitize a manifest-controlled string before using it as a filename fragment
+/// or displaying it in terse user-facing hints. Unsafe/control characters become
+/// `_`; empty/all-unsafe input becomes `plugin`.
+pub fn safe_name_fragment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(80));
+    for ch in input.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('.').trim_matches('_').to_string();
+    if trimmed.is_empty() || trimmed == ".." {
+        "plugin".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Normalize SHA-256 manifest values to lower-case hex. Rejects anything other
+/// than exactly 64 ASCII hex characters.
+pub fn normalize_sha256(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn prebuilt_url_allowed(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        if url.starts_with("file://") {
+            return true;
+        }
+    }
+    false
+}
+
+fn archive_suffix(url_for_suffix: &str) -> Result<&'static str, PrebuiltError> {
+    let url_clean = url_for_suffix
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url_for_suffix)
+        .to_ascii_lowercase();
+    if url_clean.ends_with(".tar.gz") || url_clean.ends_with(".tgz") {
+        Ok("tar.gz")
+    } else if url_clean.ends_with(".zip") {
+        Ok("zip")
+    } else if url_clean.ends_with(".tar.xz") || url_clean.ends_with(".tar.bz2") {
+        Err(PrebuiltError::UnsupportedArchive {
+            url: format!("{url_for_suffix} (xz/bz2 prebuilt archives are not supported by the hardened extractor; use .tar.gz or .zip)"),
+        })
+    } else {
+        Err(PrebuiltError::UnsupportedArchive {
+            url: url_for_suffix.to_string(),
+        })
+    }
+}
+
+fn validate_archive_relative_path(path: &Path) -> Result<(), PrebuiltError> {
+    if path.is_absolute() {
+        return Err(PrebuiltError::Extract(format!(
+            "archive entry '{}' is absolute",
+            path.display()
+        )));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
+        return Err(PrebuiltError::Extract(format!(
+            "archive entry '{}' escapes extraction directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn copy_dir_contents(src: &Path, dest: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let meta = entry.file_type()?;
+        if meta.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_contents(&from, &to)?;
+        } else if meta.is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&from, &to)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&from)?.permissions().mode();
+                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn host_triple() -> Option<&'static str> {
     let os = if cfg!(target_os = "linux") {
         "linux"
@@ -165,8 +279,9 @@ pub enum CommandVerifyError {
 /// runtime.
 ///
 /// Mirrors the host-side resolution rules in
-/// [`crate::extensions::manager`]:
-/// - `command` is **absolute**: verify the absolute path
+/// [`crate::extensions::manager`] except absolute plugin extension commands are
+/// rejected: shipped extension binaries must be plugin-relative.
+/// - `command` is **absolute**: reject
 /// - `command` is **bare** (no path separator): skip — it's a PATH
 ///   lookup, not a plugin-shipped artifact
 /// - `command` is **relative with separators**: join with `plugin_dir`,
@@ -191,7 +306,7 @@ pub fn verify_extension_command(
     }
 
     let resolved = if cmd_path.is_absolute() {
-        cmd_path.to_path_buf()
+        return Err(CommandVerifyError::EscapesPluginDir { path: cmd.clone() });
     } else {
         // Reject `..` traversal up front (don't rely on canonicalize).
         if cmd_path
@@ -284,6 +399,14 @@ pub enum PrebuiltError {
     #[error("refusing non-https prebuilt url '{url}'")]
     UnsafeUrl { url: String },
 
+    /// Manifest checksum is not exactly 64 hex characters.
+    #[error("invalid sha256 '{sha256}'; expected exactly 64 hex characters")]
+    InvalidSha256 { sha256: String },
+
+    /// Prebuilt response or stream exceeded the configured size cap.
+    #[error("prebuilt archive exceeds maximum size of {max} bytes")]
+    TooLarge { max: u64 },
+
     /// I/O setting up the temp file or moving extracted artifacts.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -334,63 +457,44 @@ pub async fn try_install_from_prebuilt(
         return Err(PrebuiltError::NoMatchingAsset);
     };
 
-    // URL safety: https only, with an env-var carve-out
-    // (`SYNAPS_ALLOW_FILE_PREBUILT=1`) so tests and local-dev mirrors
-    // can use `file://` without weakening production behavior.
-    let allow_file_scheme = std::env::var("SYNAPS_ALLOW_FILE_PREBUILT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !asset.url.starts_with("https://")
-        && !(allow_file_scheme && asset.url.starts_with("file://"))
-    {
+    if !prebuilt_url_allowed(&asset.url) {
         return Err(PrebuiltError::UnsafeUrl {
             url: asset.url.clone(),
         });
     }
+    let expected_sha = normalize_sha256(&asset.sha256).ok_or_else(|| PrebuiltError::InvalidSha256 {
+        sha256: asset.sha256.clone(),
+    })?;
 
-    // Download into a temp file inside plugin_dir so cleanup is
-    // automatic if extraction fails.
-    let tmp_archive = plugin_dir.join(format!(
-        ".prebuilt-{}-download",
-        triple,
-    ));
-    let _ = std::fs::remove_file(&tmp_archive);
+    let tmp_archive = plugin_dir.join(format!(".prebuilt-{triple}-download"));
+    match std::fs::remove_file(&tmp_archive) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(PrebuiltError::Io(e)),
+    }
 
-    let bytes = if let Some(path) = asset.url.strip_prefix("file://") {
-        // Test path: read directly from disk.
-        std::fs::read(path).map_err(|e| PrebuiltError::Download(format!("file read {path}: {e}")))?
-    } else {
-        // Real path: HTTP GET.
-        let response = reqwest::get(&asset.url)
-            .await
-            .map_err(|e| PrebuiltError::Download(e.to_string()))?;
-        if !response.status().is_success() {
-            return Err(PrebuiltError::Download(format!(
-                "HTTP {}",
-                response.status()
-            )));
+    let download_res = download_prebuilt_to_file(&asset.url, &tmp_archive, MAX_PREBUILT_ARCHIVE_BYTES).await;
+    let actual = match download_res {
+        Ok(sha) => sha,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_archive);
+            return Err(e);
         }
-        response
-            .bytes()
-            .await
-            .map_err(|e| PrebuiltError::Download(e.to_string()))?
-            .to_vec()
     };
-
-    // Checksum the bytes before touching disk.
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = hex_encode_lower(&hasher.finalize());
-    if !actual.eq_ignore_ascii_case(&asset.sha256) {
+    if actual != expected_sha {
+        let _ = std::fs::remove_file(&tmp_archive);
         return Err(PrebuiltError::ChecksumMismatch {
-            expected: asset.sha256.clone(),
+            expected: expected_sha,
             actual,
         });
     }
 
-    std::fs::write(&tmp_archive, &bytes)?;
-    let extract_res = extract_archive(&tmp_archive, plugin_dir, &asset.url);
+    let archive = tmp_archive.clone();
+    let dest = plugin_dir.to_path_buf();
+    let url = asset.url.clone();
+    let extract_res = tokio::task::spawn_blocking(move || extract_archive(&archive, &dest, &url))
+        .await
+        .map_err(|e| PrebuiltError::Extract(format!("extract task join error: {e}")))?;
     let _ = std::fs::remove_file(&tmp_archive);
     extract_res?;
 
@@ -405,86 +509,236 @@ pub async fn try_install_from_prebuilt(
     Ok(resolved)
 }
 
-/// Shell out to `tar` or `unzip` to extract `archive` into `dest_dir`.
-/// Suffix detection from the URL (which is more reliable than the
-/// temp-file name we picked).
+async fn download_prebuilt_to_file(
+    url: &str,
+    tmp_archive: &Path,
+    max_bytes: u64,
+) -> Result<String, PrebuiltError> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+
+    if let Some(path) = url.strip_prefix("file://") {
+        #[cfg(not(test))]
+        {
+            let _ = path;
+            return Err(PrebuiltError::UnsafeUrl { url: url.to_string() });
+        }
+        #[cfg(test)]
+        {
+            let mut input = std::fs::File::open(path)
+                .map_err(|e| PrebuiltError::Download(format!("file read {path}: {e}")))?;
+            let mut output = std::fs::File::create(tmp_archive)?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = std::io::Read::read(&mut input, &mut buf)
+                    .map_err(|e| PrebuiltError::Download(format!("file read {path}: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                if written > max_bytes {
+                    return Err(PrebuiltError::TooLarge { max: max_bytes });
+                }
+                hasher.update(&buf[..n]);
+                std::io::Write::write_all(&mut output, &buf[..n])?;
+            }
+            return Ok(hex_encode_lower(&hasher.finalize()));
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(PREBUILT_CONNECT_TIMEOUT)
+        .timeout(PREBUILT_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| PrebuiltError::Download(e.to_string()))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| PrebuiltError::Download(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(PrebuiltError::Download(format!("HTTP {}", response.status())));
+    }
+    if let Some(len) = response.content_length() {
+        if len > max_bytes {
+            return Err(PrebuiltError::TooLarge { max: max_bytes });
+        }
+    }
+
+    let mut output = tokio::fs::File::create(tmp_archive).await?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| PrebuiltError::Download(e.to_string()))?
+    {
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            return Err(PrebuiltError::TooLarge { max: max_bytes });
+        }
+        hasher.update(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut output, &chunk).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut output).await?;
+    Ok(hex_encode_lower(&hasher.finalize()))
+}
+
+/// Extract a prebuilt archive into a sandbox temp directory, validate entry
+/// paths, then copy validated contents into `dest_dir`. The hardened extractor
+/// supports `.tar.gz`/`.tgz` and `.zip`; xz/bz2 are rejected until a native
+/// decoder is added.
 fn extract_archive(
     archive: &Path,
     dest_dir: &Path,
     url_for_suffix: &str,
 ) -> Result<(), PrebuiltError> {
-    use std::process::Command;
-    // Strip query / fragment for suffix detection.
-    let url_clean = url_for_suffix
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url_for_suffix)
-        .to_ascii_lowercase();
+    let kind = archive_suffix(url_for_suffix)?;
+    let extract_root = dest_dir.join(format!(
+        ".prebuilt-extract-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    match std::fs::remove_dir_all(&extract_root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(PrebuiltError::Io(e)),
+    }
+    std::fs::create_dir_all(&extract_root)?;
+    let result = match kind {
+        "tar.gz" => extract_tar_gz_safe(archive, &extract_root),
+        "zip" => extract_zip_safe(archive, &extract_root),
+        _ => unreachable!(),
+    }
+    .and_then(|_| copy_dir_contents(&extract_root, dest_dir).map_err(PrebuiltError::Io));
+    let cleanup = std::fs::remove_dir_all(&extract_root);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(e)) => Err(PrebuiltError::Extract(format!(
+            "failed to clean extraction directory {}: {e}",
+            extract_root.display()
+        ))),
+        (Err(e), _) => Err(e),
+    }
+}
 
-    let (program, args): (&str, Vec<String>) = if url_clean.ends_with(".tar.gz")
-        || url_clean.ends_with(".tgz")
-    {
-        (
-            "tar",
-            vec![
-                "-xzf".into(),
-                archive.to_string_lossy().into_owned(),
-                "-C".into(),
-                dest_dir.to_string_lossy().into_owned(),
-            ],
-        )
-    } else if url_clean.ends_with(".tar.xz") {
-        (
-            "tar",
-            vec![
-                "-xJf".into(),
-                archive.to_string_lossy().into_owned(),
-                "-C".into(),
-                dest_dir.to_string_lossy().into_owned(),
-            ],
-        )
-    } else if url_clean.ends_with(".tar.bz2") {
-        (
-            "tar",
-            vec![
-                "-xjf".into(),
-                archive.to_string_lossy().into_owned(),
-                "-C".into(),
-                dest_dir.to_string_lossy().into_owned(),
-            ],
-        )
-    } else if url_clean.ends_with(".zip") {
-        (
-            "unzip",
-            vec![
-                "-q".into(),
-                "-o".into(),
-                archive.to_string_lossy().into_owned(),
-                "-d".into(),
-                dest_dir.to_string_lossy().into_owned(),
-            ],
-        )
-    } else {
-        return Err(PrebuiltError::UnsupportedArchive {
-            url: url_for_suffix.to_string(),
-        });
-    };
+fn extract_tar_gz_safe(archive: &Path, root: &Path) -> Result<(), PrebuiltError> {
+    use std::process::{Command, Stdio};
 
-    let out = Command::new(program).args(&args).output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            PrebuiltError::Extract(format!("'{program}' not found on PATH"))
-        } else {
-            PrebuiltError::Extract(format!("spawn {program}: {e}"))
-        }
-    })?;
+    let list = Command::new("tar")
+        .arg("-tzf")
+        .arg(archive)
+        .output()
+        .map_err(|e| PrebuiltError::Extract(format!("spawn tar: {e}")))?;
+    if !list.status.success() {
+        return Err(PrebuiltError::Extract(format!(
+            "tar list exited {}: {}",
+            list.status,
+            String::from_utf8_lossy(&list.stderr).trim()
+        )));
+    }
+    for line in String::from_utf8_lossy(&list.stdout).lines() {
+        validate_archive_relative_path(Path::new(line))?;
+    }
+    let out = Command::new("tar")
+        .arg("--no-same-owner")
+        .arg("--no-same-permissions")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PrebuiltError::Extract(format!("spawn tar: {e}")))?;
     if !out.status.success() {
         return Err(PrebuiltError::Extract(format!(
-            "{program} exited {}: {}",
+            "tar exited {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(())
+    validate_extracted_tree(root)
+}
+
+fn extract_zip_safe(archive: &Path, root: &Path) -> Result<(), PrebuiltError> {
+    use std::process::{Command, Stdio};
+
+    let list = Command::new("unzip")
+        .arg("-Z1")
+        .arg(archive)
+        .output()
+        .map_err(|e| PrebuiltError::Extract(format!("spawn unzip: {e}")))?;
+    if !list.status.success() {
+        return Err(PrebuiltError::Extract(format!(
+            "unzip list exited {}: {}",
+            list.status,
+            String::from_utf8_lossy(&list.stderr).trim()
+        )));
+    }
+    for line in String::from_utf8_lossy(&list.stdout).lines() {
+        validate_archive_relative_path(Path::new(line))?;
+    }
+    let out = Command::new("unzip")
+        .arg("-q")
+        .arg(archive)
+        .arg("-d")
+        .arg(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PrebuiltError::Extract(format!("spawn unzip: {e}")))?;
+    if !out.status.success() {
+        return Err(PrebuiltError::Extract(format!(
+            "unzip exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    validate_extracted_tree(root)
+}
+
+fn validate_extracted_tree(root: &Path) -> Result<(), PrebuiltError> {
+    let canonical_root = root.canonicalize()?;
+    fn walk(path: &Path, root: &Path) -> Result<(), PrebuiltError> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let p = entry.path();
+            if ty.is_symlink() {
+                let target = std::fs::canonicalize(&p).map_err(|e| {
+                    PrebuiltError::Extract(format!("symlink '{}' cannot be resolved: {e}", p.display()))
+                })?;
+                if !target.starts_with(root) {
+                    return Err(PrebuiltError::Extract(format!(
+                        "symlink '{}' escapes extraction directory",
+                        p.display()
+                    )));
+                }
+            } else if ty.is_dir() {
+                let c = p.canonicalize()?;
+                if !c.starts_with(root) {
+                    return Err(PrebuiltError::Extract(format!(
+                        "directory '{}' escapes extraction directory",
+                        p.display()
+                    )));
+                }
+                walk(&p, root)?;
+            } else if ty.is_file() {
+                let c = p.canonicalize()?;
+                if !c.starts_with(root) {
+                    return Err(PrebuiltError::Extract(format!(
+                        "file '{}' escapes extraction directory",
+                        p.display()
+                    )));
+                }
+            } else {
+                return Err(PrebuiltError::Extract(format!(
+                    "unsupported archive entry type '{}'",
+                    p.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+    walk(&canonical_root, &canonical_root)
 }
 
 /// Resolve the manifest-declared setup script to an absolute path
@@ -564,10 +818,11 @@ fn validate_setup_path(setup: &str, plugin_dir: &Path) -> Result<PathBuf, SetupE
 /// where rfc3339 has colons replaced with `-` so the filename is safe
 /// on Windows (and grep-friendly).
 pub fn install_log_path(logs_root: &Path, plugin_name: &str, now_rfc3339: &str) -> PathBuf {
-    let safe_ts = now_rfc3339.replace(':', "-");
+    let safe_ts = safe_name_fragment(&now_rfc3339.replace(':', "-"));
+    let safe_plugin = safe_name_fragment(plugin_name);
     logs_root
         .join("install")
-        .join(format!("{plugin_name}-{safe_ts}.log"))
+        .join(format!("{safe_plugin}-{safe_ts}.log"))
 }
 
 /// Run the resolved setup script against `plugin_dir`, streaming
@@ -601,9 +856,22 @@ pub async fn run_setup_script(
     );
     log_file.write_all(header.as_bytes()).await?;
 
+    if cfg!(windows) {
+        return Err(SetupError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "setup scripts require bash and are not supported on Windows in this release",
+        )));
+    }
+
     let mut cmd = Command::new("bash");
     cmd.arg(script)
         .current_dir(plugin_dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("USER", std::env::var_os("USER").unwrap_or_default())
+        .env("SHELL", std::env::var_os("SHELL").unwrap_or_default())
+        .env("SYNAPS_PLUGIN_DIR", plugin_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1135,34 +1403,24 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn verify_rejects_absolute_extension_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_with_extension_command("/tmp/ext");
+        let err = verify_extension_command(&m, dir.path()).unwrap_err();
+        assert!(matches!(err, CommandVerifyError::EscapesPluginDir { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn policy_normalizes_sha256_and_sanitizes_names() {
+        assert_eq!(normalize_sha256(&"A".repeat(64)).unwrap(), "a".repeat(64));
+        assert!(normalize_sha256("not-a-sha").is_none());
+        assert_eq!(safe_name_fragment("../bad\nname"), "bad_name");
+        assert_eq!(safe_name_fragment("normal-name_1.2"), "normal-name_1.2");
+    }
+
     // ---- try_install_from_prebuilt tests (slice E) ----
-
-    /// All prebuilt tests mutate the `SYNAPS_ALLOW_FILE_PREBUILT` env
-    /// var, so they must serialize on this lock to avoid stomping on
-    /// each other when run in parallel.
-    static PREBUILT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set `SYNAPS_ALLOW_FILE_PREBUILT=1` for this test scope so we can
-    /// exercise the file:// path. Reset on drop. Holds
-    /// `PREBUILT_ENV_LOCK` for the duration so parallel tests don't
-    /// race on the env var.
-    struct AllowFileGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl AllowFileGuard {
-        fn enable() -> Self {
-            let lock = PREBUILT_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("SYNAPS_ALLOW_FILE_PREBUILT", "1");
-            Self { _lock: lock }
-        }
-    }
-    impl Drop for AllowFileGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT");
-        }
-    }
 
     fn manifest_with_prebuilt(
         command: &str,
@@ -1236,8 +1494,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_returns_no_matching_asset_when_triple_missing() {
-        let _lock = PREBUILT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT");
         let dir = tempfile::tempdir().unwrap();
         // Asset under a deliberately wrong host triple.
         let m = manifest_with_prebuilt("bin/ext", "fake-triple-9999", "https://x", "00");
@@ -1247,13 +1503,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_rejects_non_https_url_in_production_builds() {
-        // file:// is allow-listed only via env var; http:// is blocked
-        // even when the env var is on.
-        let _lock = PREBUILT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SYNAPS_ALLOW_FILE_PREBUILT", "1");
-        struct Cleanup;
-        impl Drop for Cleanup { fn drop(&mut self) { std::env::remove_var("SYNAPS_ALLOW_FILE_PREBUILT"); } }
-        let _c = Cleanup;
+        // file:// is test-only; http:// is always blocked.
         let dir = tempfile::tempdir().unwrap();
         let triple = host_triple().expect("supported host");
         let m = manifest_with_prebuilt("bin/ext", triple, "http://example.com/x.tar.gz", "00");
@@ -1263,8 +1513,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_succeeds_with_valid_tarball_and_checksum() {
-        let _allow = AllowFileGuard::enable();
-        let staging = tempfile::tempdir().unwrap();
+                let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
         let url = format!("file://{}", archive.display());
@@ -1279,8 +1528,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_aborts_on_checksum_mismatch_without_extracting() {
-        let _allow = AllowFileGuard::enable();
-        let staging = tempfile::tempdir().unwrap();
+                let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         let (archive, _real_sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/ext");
         let url = format!("file://{}", archive.display());
@@ -1301,8 +1549,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_rejects_unsupported_archive_suffix() {
-        let _allow = AllowFileGuard::enable();
-        let staging = tempfile::tempdir().unwrap();
+                let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         // Make a .rar-named file (we only support tar/zip variants).
         let archive = staging.path().join("ext.rar");
@@ -1321,8 +1568,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn prebuilt_fails_verify_when_archive_does_not_contain_declared_command() {
-        let _allow = AllowFileGuard::enable();
-        let staging = tempfile::tempdir().unwrap();
+                let staging = tempfile::tempdir().unwrap();
         let plugin = tempfile::tempdir().unwrap();
         // Archive ships at bin/wrong-name but manifest declares bin/ext.
         let (archive, sha) = mk_tarball(staging.path(), "ext.tar.gz", "bin/wrong-name");

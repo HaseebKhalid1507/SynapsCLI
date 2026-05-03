@@ -271,6 +271,7 @@ mod tests {
                     source_subdir: None,
                     checksum_algorithm: None,
                     checksum_value: None,
+                    setup_status: Default::default(),
                 },
             ],
             trusted_hosts: vec![],
