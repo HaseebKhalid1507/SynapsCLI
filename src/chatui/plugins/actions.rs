@@ -430,14 +430,32 @@ async fn run_post_install_setup_for_dir(
             ));
         }
     };
+
+    // Fast-path (slice D): if the manifest declares an
+    // `extension.command` and that binary already exists and is
+    // executable inside the freshly-cloned plugin dir, skip the setup
+    // script entirely. This handles two cases:
+    //   1. Source ships a prebuilt binary in the repo
+    //   2. User reinstalled and the build artifact survived in place
+    if let Ok(Some(_resolved)) = post_install::verify_extension_command(&manifest, final_dir) {
+        return Ok(None);
+    }
+
     let resolved =
         post_install::resolve_setup_script(&manifest, final_dir).map_err(|e| e.to_string())?;
     let Some(script) = resolved else {
+        // No setup script declared. If the manifest declares an
+        // extension.command, verify it now — otherwise we'd silently
+        // accept an install with a dangling binary path.
+        if manifest.extension.is_some() {
+            post_install::verify_extension_command(&manifest, final_dir)
+                .map_err(|e| format!("extension command verification failed: {e}"))?;
+        }
         return Ok(None);
     };
     let logs_root = synaps_cli::config::resolve_write_path("logs");
     let log_path = post_install::install_log_path(&logs_root, plugin_name, &now_rfc3339());
-    match post_install::run_setup_script(
+    let setup_log = match post_install::run_setup_script(
         &script,
         final_dir,
         &log_path,
@@ -445,9 +463,25 @@ async fn run_post_install_setup_for_dir(
     )
     .await
     {
-        Ok(outcome) => Ok(Some(outcome.log_path)),
-        Err(e) => Err(e.to_string()),
+        Ok(outcome) => outcome.log_path,
+        Err(e) => return Err(e.to_string()),
+    };
+
+    // Slice C / F: post-condition check. If the manifest declares an
+    // `extension.command`, the setup script's job was to produce it.
+    // Surface a clear error if it didn't, instead of silently breaking
+    // spawn at runtime.
+    if manifest.extension.is_some() {
+        if let Err(e) = post_install::verify_extension_command(&manifest, final_dir) {
+            return Err(format!(
+                "setup script ran (see {}) but did not produce the declared extension binary: {}",
+                setup_log.display(),
+                e
+            ));
+        }
     }
+
+    Ok(Some(setup_log))
 }
 
 fn read_plugin_manifest(path: &std::path::Path) -> Result<PluginManifest, String> {
@@ -1696,5 +1730,99 @@ mod tests {
         let err = res.expect_err("non-zero exit should propagate");
         assert!(err.contains("13"), "error should mention exit code 13: {err}");
         assert!(err.contains(".log"), "error should point at log path: {err}");
+    }
+
+    /// Slice D: when the manifest's `extension.command` already exists
+    /// and is executable inside the freshly-cloned plugin dir, skip
+    /// the setup script entirely (fast-path for source-shipped binaries
+    /// or reinstalls where the artifact survived in place).
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_skipped_when_extension_binary_already_present() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"skip-test","extension":{"runtime":"process","command":"bin/ext","setup":"scripts/setup.sh"}}"#,
+        ).unwrap();
+        // Pre-create the binary so the fast-path triggers.
+        let bin = plugin_dir.path().join("bin/ext");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho prebuilt").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Setup script that, if invoked, would create a marker. We
+        // assert it's NOT created.
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let marker = plugin_dir.path().join("setup-ran.marker");
+        std::fs::write(
+            scripts.join("setup.sh"),
+            format!("#!/bin/bash\ntouch {}\necho ran\n", marker.display()),
+        ).unwrap();
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("skip-test", plugin_dir.path()).await;
+        match res {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) (fast-path skip), got {other:?}"),
+        }
+        assert!(!marker.exists(), "setup script must NOT have run on fast-path");
+    }
+
+    /// Slice C/F: setup script exits 0 but the declared
+    /// `extension.command` doesn't exist after — surface a clear
+    /// error instead of silently proceeding with a broken install.
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_fails_when_setup_does_not_produce_extension_binary() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"verify-test","extension":{"runtime":"process","command":"bin/missing","setup":"scripts/setup.sh"}}"#,
+        ).unwrap();
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        // Setup that "succeeds" but doesn't produce bin/missing.
+        std::fs::write(scripts.join("setup.sh"), "#!/bin/bash\necho lying setup\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("verify-test", plugin_dir.path()).await;
+        let err = res.expect_err("missing post-build artifact must error");
+        assert!(
+            err.contains("did not produce"),
+            "error should explain build didn't produce binary: {err}"
+        );
+        assert!(err.contains("bin/missing"), "error should name the missing path: {err}");
+    }
+
+    /// Slice F: no setup script declared but extension.command is also
+    /// missing → must error (don't silently accept a broken install).
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_fails_when_no_setup_and_extension_binary_missing() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"no-setup-no-bin","extension":{"runtime":"process","command":"bin/never-built"}}"#,
+        ).unwrap();
+        let res = run_post_install_setup_for_dir("no-setup-no-bin", plugin_dir.path()).await;
+        let err = res.expect_err("missing binary with no setup must error");
+        assert!(err.contains("verification failed"), "expected verify msg: {err}");
     }
 }
