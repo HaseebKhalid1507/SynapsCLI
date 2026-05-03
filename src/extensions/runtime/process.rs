@@ -476,74 +476,6 @@ struct InitializeCapabilities {
     /// Canonical generic capability list.
     #[serde(default)]
     capabilities: Vec<CapabilityDeclaration>,
-    /// Legacy alias accepted for one release: a plugin sending the old
-    /// `voice: { name, modes, endpoint }` shape gets translated into a
-    /// generic `CapabilityDeclaration` with `kind = "voice"`, with
-    /// permissions derived from the legacy `modes` enumeration. Remove
-    /// this field after the deprecation window.
-    #[serde(default)]
-    voice: Option<LegacyVoiceCapability>,
-}
-
-/// One-release back-compat shim. Mirrors the pre-Phase-7
-/// `VoiceCapabilityDeclaration` wire shape so existing plugins keep
-/// loading unchanged. New plugins should send `capabilities: [...]`.
-#[derive(Deserialize)]
-struct LegacyVoiceCapability {
-    name: String,
-    #[serde(default)]
-    modes: Vec<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-}
-
-impl LegacyVoiceCapability {
-    /// Translate the legacy shape into a generic
-    /// [`CapabilityDeclaration`]. Modes map to permissions:
-    /// `stt`/`wake_word` → `audio.input`, `tts` → `audio.output`.
-    /// Unknown modes are preserved in `params` but contribute no
-    /// permission requirement (so unknown-mode plugins fail later in
-    /// `validate_capability` only if they explicitly list a permission
-    /// the user did not grant).
-    fn into_capability(self) -> CapabilityDeclaration {
-        let mut permissions: Vec<String> = Vec::new();
-        for mode in &self.modes {
-            match mode.as_str() {
-                "stt" | "wake_word" => {
-                    let p = "audio.input".to_string();
-                    if !permissions.contains(&p) {
-                        permissions.push(p);
-                    }
-                }
-                "tts" => {
-                    let p = "audio.output".to_string();
-                    if !permissions.contains(&p) {
-                        permissions.push(p);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "modes".to_string(),
-            serde_json::Value::Array(
-                self.modes
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-        if let Some(ep) = self.endpoint {
-            params.insert("endpoint".to_string(), serde_json::Value::String(ep));
-        }
-        CapabilityDeclaration {
-            kind: "voice".to_string(),
-            name: self.name,
-            permissions,
-            params: serde_json::Value::Object(params),
-        }
-    }
 }
 
 /// A JSON-RPC notification frame received from an extension (no `id`).
@@ -1174,18 +1106,10 @@ impl ProcessExtension {
         }
         Self::validate_registered_tool_specs(id, &result.capabilities.tools)?;
         Self::validate_registered_provider_specs(id, &result.capabilities.providers)?;
-        // Merge canonical `capabilities: [...]` with the one-release
-        // legacy `voice: {...}` shim. Legacy entries are appended after
-        // canonical ones so a plugin sending both (during its own
-        // migration) gets a deterministic, deduplicable list.
-        let mut capabilities = result.capabilities.capabilities;
-        if let Some(legacy) = result.capabilities.voice {
-            capabilities.push(legacy.into_capability());
-        }
         Ok(InitializeCapabilitiesResult {
             tools: result.capabilities.tools,
             providers: result.capabilities.providers,
-            capabilities,
+            capabilities: result.capabilities.capabilities,
         })
     }
 
@@ -2240,104 +2164,6 @@ mod voice_validator_tests {
         }
     }
 
-    #[test]
-    fn legacy_voice_payload_is_translated_into_generic_capability() {
-        // Existing local-voice plugin sends `{ "voice": { "name": ...,
-        // "modes": ["stt"] } }`. After Phase 7 core synthesizes a
-        // generic `CapabilityDeclaration { kind: "voice", ... }` with
-        // permissions derived from the legacy mode list.
-        let value = serde_json::json!({
-            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
-            "capabilities": {
-                "voice": {
-                    "name": "Local Whisper STT",
-                    "modes": ["stt"],
-                    "endpoint": "stdio"
-                }
-            }
-        });
-        let result = ProcessExtension::parse_initialize_result("legacy-test", value)
-            .expect("parses");
-        assert_eq!(result.capabilities.len(), 1);
-        let cap = &result.capabilities[0];
-        assert_eq!(cap.kind, "voice");
-        assert_eq!(cap.name, "Local Whisper STT");
-        assert_eq!(cap.permissions, vec!["audio.input"]);
-        assert_eq!(
-            cap.params.get("modes").and_then(|m| m.as_array()).unwrap().len(),
-            1,
-        );
-        assert_eq!(
-            cap.params.get("endpoint").and_then(|e| e.as_str()),
-            Some("stdio"),
-        );
-    }
-
-    #[test]
-    fn legacy_voice_payload_with_tts_mode_maps_to_audio_output() {
-        let value = serde_json::json!({
-            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
-            "capabilities": {
-                "voice": {
-                    "name": "Piper",
-                    "modes": ["tts"]
-                }
-            }
-        });
-        let result = ProcessExtension::parse_initialize_result("legacy-tts", value)
-            .expect("parses");
-        assert_eq!(result.capabilities[0].permissions, vec!["audio.output"]);
-    }
-
-    #[test]
-    fn legacy_voice_payload_with_combined_modes_dedupes_permissions() {
-        // stt + wake_word both map to audio.input; tts maps to
-        // audio.output. The legacy translator must not produce
-        // duplicates.
-        let value = serde_json::json!({
-            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
-            "capabilities": {
-                "voice": {
-                    "name": "Combined",
-                    "modes": ["stt", "wake_word", "tts"]
-                }
-            }
-        });
-        let result = ProcessExtension::parse_initialize_result("legacy-combined", value)
-            .expect("parses");
-        let perms = &result.capabilities[0].permissions;
-        assert_eq!(perms.len(), 2);
-        assert!(perms.contains(&"audio.input".to_string()));
-        assert!(perms.contains(&"audio.output".to_string()));
-    }
-
-    #[test]
-    fn canonical_capabilities_list_is_preserved_alongside_legacy_voice_field() {
-        // A plugin in the middle of migrating may send both shapes
-        // simultaneously. Canonical entries come first, legacy
-        // translation appended.
-        let value = serde_json::json!({
-            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
-            "capabilities": {
-                "capabilities": [
-                    {
-                        "kind": "ocr",
-                        "name": "Tesseract",
-                        "permissions": []
-                    }
-                ],
-                "voice": {
-                    "name": "Whisper",
-                    "modes": ["stt"]
-                }
-            }
-        });
-        let result = ProcessExtension::parse_initialize_result("dual", value)
-            .expect("parses");
-        assert_eq!(result.capabilities.len(), 2);
-        assert_eq!(result.capabilities[0].kind, "ocr");
-        assert_eq!(result.capabilities[1].kind, "voice");
-    }
 }
 
 #[cfg(test)]
