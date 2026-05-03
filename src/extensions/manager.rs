@@ -485,6 +485,17 @@ impl ExtensionManager {
         }
     }
 
+    /// Start shutting down all extensions in the background.
+    ///
+    /// This is intended for process exit: the UI should not hang waiting for
+    /// extension child processes to acknowledge shutdown. Dropping the join handle
+    /// lets Tokio abort remaining work when the runtime exits.
+    pub fn shutdown_all_detached(manager: Arc<tokio::sync::RwLock<Self>>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            manager.write().await.shutdown_all().await;
+        })
+    }
+
     /// List running extension IDs.
     pub fn list(&self) -> Vec<&str> {
         self.extensions.keys().map(|s| s.as_str()).collect()
@@ -814,6 +825,16 @@ impl ExtensionManager {
     /// an `extension` field. Project-local plugins override user plugins with the
     /// same directory name.
     pub async fn discover_and_load(&mut self) -> (Vec<String>, Vec<ExtensionLoadFailure>) {
+        self.discover_and_load_with_progress(|_| {}).await
+    }
+
+    /// Discover and load all extensions, invoking `progress` after each load
+    /// attempt. Used by the async UI loader to update startup toasts without
+    /// blocking first paint.
+    pub async fn discover_and_load_with_progress<F>(&mut self, mut progress: F) -> (Vec<String>, Vec<ExtensionLoadFailure>)
+    where
+        F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
+    {
         let mut plugin_roots = vec![crate::config::base_dir().join("plugins")];
         if !project_plugins_disabled() {
             if let Ok(cwd) = std::env::current_dir() {
@@ -960,7 +981,12 @@ impl ExtensionManager {
             match self.load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone())).await {
                 Ok(()) => {
                     tracing::info!(plugin = %plugin_name, path = %plugin_dir.display(), "Extension loaded from plugins/");
-                    loaded.push(plugin_name);
+                    loaded.push(plugin_name.clone());
+                    progress(crate::extensions::loader::ExtensionLoaderEvent::Loaded {
+                        plugin: plugin_name,
+                        loaded: loaded.len(),
+                        failed: failed.len(),
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
@@ -969,12 +995,18 @@ impl ExtensionManager {
                         .and_then(|v| v.as_str())
                         .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
                     let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
-                    failed.push(ExtensionLoadFailure::new(
+                    let failure = ExtensionLoadFailure::new(
                         plugin_name,
                         Some(manifest_path),
                         e,
                         hint,
-                    ));
+                    );
+                    failed.push(failure.clone());
+                    progress(crate::extensions::loader::ExtensionLoaderEvent::Failed {
+                        failure,
+                        loaded: loaded.len(),
+                        failed: failed.len(),
+                    });
                 }
             }
         }

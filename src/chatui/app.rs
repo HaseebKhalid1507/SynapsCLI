@@ -158,6 +158,12 @@ pub(crate) struct App {
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Overlay toast provider used by core and extension-adjacent features.
+    pub(crate) toasts: super::toast::ToastProvider,
+    /// Channel for async extension loader progress events.
+    pub(crate) extension_loader_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_running: bool,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
@@ -179,6 +185,7 @@ impl App {
     pub(crate) fn new(session: Session) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -242,6 +249,10 @@ impl App {
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
             active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
+            toasts: super::toast::ToastProvider::new(),
+            extension_loader_rx: extension_loader_rx_init,
+            extension_loader_tx: extension_loader_tx_init,
+            extension_loader_running: false,
             keybinds: None,
         }
     }

@@ -26,6 +26,7 @@ pub mod commands;
 pub mod settings_editor;
 pub mod tasks;
 pub mod active_tasks;
+pub mod loader;
 pub mod providers;
 pub mod trust;
 pub mod audit;

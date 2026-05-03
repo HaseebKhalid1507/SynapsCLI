@@ -7,6 +7,7 @@ mod app;
 mod render;
 mod gamba;
 mod draw;
+mod toast;
 mod commands;
 mod input;
 mod stream_handler;
@@ -18,6 +19,8 @@ mod helpers;
 mod lifecycle;
 mod viewport;
 mod sidecar;
+mod signals;
+mod lightbox;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -125,6 +128,8 @@ pub async fn run(
     // ── Terminal setup ──
     let mut terminal = setup_terminal()?;
     let mut event_reader = EventStream::new();
+    let (shutdown_signal_tx, mut shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
@@ -182,17 +187,15 @@ pub async fn run(
     migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
     if !no_extensions {
-        let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
-        let handler_count = runtime.hook_bus().handler_count().await;
-        tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
-        // Extensions load silently — only surface failures
-        for failure in &failed {
-            app.push_msg(ChatMessage::System(format!(
-                "⚠ Extension '{}' failed: {}",
-                failure.plugin,
-                failure.concise_message()
-            )));
-        }
+        app.extension_loader_running = true;
+        app.toasts.upsert(toast::Toast::new("extension-loader", "Discovering extensions…")
+            .titled("Extensions")
+            .at(toast::ToastPosition::TOP_CENTER)
+            .ttl(None));
+        synaps_cli::extensions::loader::spawn_discover_and_load(
+            std::sync::Arc::clone(&ext_mgr_shared),
+            app.extension_loader_tx.clone(),
+        );
     }
 
     // ═══ HOOK: on_session_start ═══
@@ -216,6 +219,15 @@ pub async fn run(
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
 
         tokio::select! {
+
+            // ── OS shutdown signals: Ctrl-C from terminal, SIGTERM from tmux kill-pane/session ──
+            signal = shutdown_signal_rx.recv() => {
+                if let Some(signal) = signal {
+                    tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
+                    app.push_msg(ChatMessage::System(format!("shutting down ({})", signals::signal_label(signal))));
+                    exit_fx = Some(quit_effect());
+                }
+            }
 
             // ── Ping results — fires when a model ping completes ──
             result = app.ping_rx.recv() => {
@@ -254,6 +266,16 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                }
+            }
+
+            // ── Async extension loader progress ──
+            event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
+                if let Some(event) = event {
+                    handle_extension_loader_event(&mut app, &runtime, event).await;
+                } else {
+                    app.extension_loader_running = false;
+                    app.toasts.dismiss("extension-loader");
                 }
             }
 
@@ -333,8 +355,11 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 secret_prompts.poll_requests(&secret_prompt_rx);
+                if app.toasts.tick() {
+                    app.invalidate();
+                }
                 // Tick the in-flight plugin install spinner and reap the
                 // background clone task once it finishes.
                 let mut install_did_work = false;
@@ -1846,8 +1871,12 @@ pub async fn run(
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
-    // Gracefully shut down all extensions
-    ext_mgr_shared.write().await.shutdown_all().await;
+    // Let extension shutdown continue in the background; exit should not hang on
+    // extension post/session-end cleanup or slow child-process teardown.
+    let _extension_shutdown = synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
+        std::sync::Arc::clone(&ext_mgr_shared),
+    );
+    shutdown_signal_task.abort();
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1861,6 +1890,63 @@ pub async fn run(
     teardown_terminal(&mut terminal);
 
     Ok(())
+}
+
+fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>, persistent: bool) {
+    app.toasts.upsert(toast::Toast::new("extension-loader", "")
+        .titled(title)
+        .lines(lines)
+        .at(toast::ToastPosition::TOP_CENTER)
+        .ttl(if persistent { None } else { Some(std::time::Duration::from_secs(5)) }));
+    app.invalidate();
+}
+
+async fn handle_extension_loader_event(
+    app: &mut App,
+    runtime: &Runtime,
+    event: synaps_cli::extensions::loader::ExtensionLoaderEvent,
+) {
+    use synaps_cli::extensions::loader::ExtensionLoaderEvent;
+    match event {
+        ExtensionLoaderEvent::Started => {
+            handle_extension_loader_toast(app, "Extensions", vec!["Discovering extensions…".into()], true);
+        }
+        ExtensionLoaderEvent::Loaded { plugin, loaded, failed } => {
+            handle_extension_loader_toast(
+                app,
+                "Extensions",
+                vec![format!("Loaded {loaded} extension{}", if loaded == 1 { "" } else { "s" }), format!("Latest: {plugin}"), format!("Failures: {failed}")],
+                true,
+            );
+        }
+        ExtensionLoaderEvent::Failed { failure, loaded, failed } => {
+            handle_extension_loader_toast(
+                app,
+                "Extensions",
+                vec![format!("Loaded {loaded}, failed {failed}"), format!("⚠ {}", failure.plugin)],
+                true,
+            );
+            app.push_msg(ChatMessage::System(format!(
+                "⚠ Extension '{}' failed: {}",
+                failure.plugin,
+                failure.concise_message()
+            )));
+        }
+        ExtensionLoaderEvent::Finished { loaded, failed } => {
+            app.extension_loader_running = false;
+            let handler_count = runtime.hook_bus().handler_count().await;
+            tracing::info!(extensions = loaded.len(), failures = failed.len(), handlers = handler_count, "Extension discovery complete");
+            let lines = if failed.is_empty() {
+                vec![format!("✓ Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" })]
+            } else {
+                vec![
+                    format!("Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" }),
+                    format!("{} failed — see transcript", failed.len()),
+                ]
+            };
+            handle_extension_loader_toast(app, "Extensions", lines, false);
+        }
+    }
 }
 
 /// Phase 8 slice 8A.8: when a plugin has staked a lifecycle claim and

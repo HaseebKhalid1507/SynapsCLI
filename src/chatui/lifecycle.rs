@@ -56,18 +56,23 @@ pub(super) fn setup_terminal() -> synaps_cli::Result<Term> {
     Ok(terminal)
 }
 
-/// Reverse of `setup_terminal`: drop raw mode, leave alt screen, restore cursor.
-/// Best-effort — errors are swallowed (we are usually exiting anyway).
-pub(super) fn teardown_terminal(terminal: &mut Term) {
+pub(super) fn emergency_teardown_terminal() {
     disable_raw_mode().ok();
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     execute!(
-        terminal.backend_mut(),
+        stdout,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )
     .ok();
+}
+
+/// Reverse of `setup_terminal`: drop raw mode, leave alt screen, restore cursor.
+/// Best-effort — errors are swallowed (we are usually exiting anyway).
+pub(super) fn teardown_terminal(terminal: &mut Term) {
+    emergency_teardown_terminal();
     // Restore the real terminal cursor on exit. It is intentionally kept hidden
     // while the TUI is active because the chat input draws a stable block cursor
     // as part of the ratatui frame.
