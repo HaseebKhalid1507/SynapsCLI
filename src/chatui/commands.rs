@@ -1038,6 +1038,7 @@ mod tests {
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
             permissions: vec!["tools.register".to_string()],
             hooks: vec![],

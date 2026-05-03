@@ -28,6 +28,7 @@ fn manifest() -> ExtensionManifest {
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture_path()],
         // Need at least one registration permission so the extension
         // is permitted to load with no hooks. `audio.input` matches

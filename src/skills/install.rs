@@ -1,13 +1,26 @@
 //! Git-backed plugin install/uninstall/update.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
-/// Shared git clone logic. Validates URL, ensures dest parent exists,
-/// runs `git clone --depth=1`. Returns Ok(()) on success, cleans up on failure.
-fn clone_repo(source_url: &str, dest: &Path) -> Result<(), String> {
+/// Streaming `git clone --depth=1 --progress` — forwards every chunk of
+/// stderr (split on `\r`/`\n`) to `on_chunk` as it arrives.
+///
+/// The callback runs synchronously on the calling thread, so it must be
+/// fast (e.g. lock a Mutex, push a parsed snapshot, return). Designed to
+/// be invoked inside `tokio::task::spawn_blocking` from the chatui plugins
+/// modal, where the callback writes into a shared `InstallProgress`.
+///
+/// On failure, `dest` is best-effort removed so a partial clone doesn't
+/// confuse a retry.
+pub fn clone_repo_with_progress(
+    source_url: &str,
+    dest: &Path,
+    mut on_chunk: impl FnMut(&str),
+) -> Result<(), String> {
     if source_url.starts_with('-') {
         return Err(format!("refusing suspicious url: {}", source_url));
     }
@@ -15,10 +28,12 @@ fn clone_repo(source_url: &str, dest: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    let out = Command::new("git")
-        .args(["clone", "--depth=1", "-q", "--", source_url])
+    let mut child = Command::new("git")
+        .args(["clone", "--progress", "--depth=1", "--", source_url])
         .arg(dest)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "git not found on PATH".to_string()
@@ -26,12 +41,67 @@ fn clone_repo(source_url: &str, dest: &Path) -> Result<(), String> {
                 format!("spawn git: {}", e)
             }
         })?;
-    if !out.status.success() {
+
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "git stderr was not piped".to_string())?;
+    let mut buf = [0u8; 4096];
+    let mut accum = String::new();
+    let mut last_stderr = String::new();
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let s = String::from_utf8_lossy(&buf[..n]);
+                accum.push_str(&s);
+                last_stderr.push_str(&s);
+                // Process complete chunks (split on either CR or LF —
+                // git uses CR to overwrite the same progress line).
+                loop {
+                    let split = accum.find(|c: char| c == '\r' || c == '\n');
+                    let Some(pos) = split else { break };
+                    let chunk: String = accum.drain(..pos).collect();
+                    // Drop the single delimiter character.
+                    if !accum.is_empty() {
+                        accum.drain(..1);
+                    }
+                    if !chunk.is_empty() {
+                        on_chunk(&chunk);
+                    }
+                }
+                // Cap memory: keep last 16 KiB of raw stderr for error reporting.
+                if last_stderr.len() > 16 * 1024 {
+                    let cut = last_stderr.len() - 8 * 1024;
+                    last_stderr.replace_range(..cut, "");
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // Flush any tail fragment that wasn't terminated.
+    if !accum.is_empty() {
+        on_chunk(&accum);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("wait git: {}", e))?;
+    if !status.success() {
         let _ = std::fs::remove_dir_all(dest);
-        return Err(format!(
-            "git clone failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let trimmed = last_stderr.trim();
+        let detail = if trimmed.is_empty() {
+            format!("exit code {:?}", status.code())
+        } else {
+            // Take the last non-empty line as the most relevant error.
+            trimmed
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .next_back()
+                .unwrap_or(trimmed)
+                .to_string()
+        };
+        return Err(format!("git clone failed: {}", detail));
     }
     Ok(())
 }
@@ -39,10 +109,20 @@ fn clone_repo(source_url: &str, dest: &Path) -> Result<(), String> {
 /// `git clone --depth=1 <url> <dest>`, then `git rev-parse HEAD`.
 /// `dest` must not already exist.
 pub fn install_plugin(source_url: &str, dest: &Path) -> Result<String, String> {
+    install_plugin_with_progress(source_url, dest, |_| {})
+}
+
+/// Like [`install_plugin`] but streams `git clone --progress` chunks to
+/// `on_chunk`. See [`clone_repo_with_progress`] for callback semantics.
+pub fn install_plugin_with_progress(
+    source_url: &str,
+    dest: &Path,
+    on_chunk: impl FnMut(&str),
+) -> Result<String, String> {
     if dest.exists() {
         return Err(format!("{} already exists on disk; uninstall first", dest.display()));
     }
-    clone_repo(source_url, dest)?;
+    clone_repo_with_progress(source_url, dest, on_chunk)?;
     rev_parse_head(dest)
 }
 
@@ -62,6 +142,18 @@ pub fn install_plugin_from_subdir(
     subdir: &str,
     dest: &Path,
 ) -> Result<String, String> {
+    install_plugin_from_subdir_with_progress(marketplace_url, subdir, dest, |_| {})
+}
+
+/// Like [`install_plugin_from_subdir`] but streams `git clone --progress`
+/// chunks to `on_chunk`. See [`clone_repo_with_progress`] for callback
+/// semantics.
+pub fn install_plugin_from_subdir_with_progress(
+    marketplace_url: &str,
+    subdir: &str,
+    dest: &Path,
+    on_chunk: impl FnMut(&str),
+) -> Result<String, String> {
     if !crate::skills::marketplace::is_safe_plugin_name(subdir) {
         return Err(format!("refusing unsafe subdir name: {}", subdir));
     }
@@ -76,7 +168,7 @@ pub fn install_plugin_from_subdir(
     // Clean any stale temp from a prior aborted install.
     let _ = std::fs::remove_dir_all(&tmp);
 
-    clone_repo(marketplace_url, &tmp)?;
+    clone_repo_with_progress(marketplace_url, &tmp, on_chunk)?;
 
     let sha = match rev_parse_head(&tmp) {
         Ok(s) => s,
@@ -323,6 +415,52 @@ mod tests {
         ).unwrap();
         assert!(dest.join("SKILL.md").exists());
         assert_eq!(sha.len(), 40);
+    }
+
+    #[test]
+    fn install_with_progress_streams_chunks_and_returns_sha() {
+        use std::sync::{Arc, Mutex};
+        let (_tmp, bare) = mk_local_repo();
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("demo");
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks_clone = Arc::clone(&chunks);
+        let sha = install_plugin_with_progress(
+            &format!("file://{}", bare.display()),
+            &dest,
+            move |c| chunks_clone.lock().unwrap().push(c.to_string()),
+        )
+        .unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(dest.join("SKILL.md").exists());
+        let captured = chunks.lock().unwrap().clone();
+        // Local file:// clones are tiny and may or may not emit Receiving lines
+        // depending on git's heuristic, but they always emit *something*
+        // (e.g. "Cloning into '/tmp/...'") on stderr with --progress.
+        assert!(
+            !captured.is_empty(),
+            "expected at least one progress chunk from --progress, got none"
+        );
+    }
+
+    #[test]
+    fn install_with_progress_failure_propagates_stderr() {
+        use std::sync::{Arc, Mutex};
+        let dest_parent = tempfile::tempdir().unwrap();
+        let dest = dest_parent.path().join("demo");
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks_clone = Arc::clone(&chunks);
+        let err = install_plugin_with_progress(
+            "file:///definitely/not/a/real/repo.git",
+            &dest,
+            move |c| chunks_clone.lock().unwrap().push(c.to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("git clone failed"), "err was: {err}");
+        assert!(
+            !dest.exists(),
+            "failed clone must not leave a partial dest dir"
+        );
     }
 
     /// Like `mk_local_repo`, but puts the plugin content under `work/<sub>/`
