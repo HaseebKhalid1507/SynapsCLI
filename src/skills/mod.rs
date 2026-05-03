@@ -69,8 +69,13 @@ pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
 ) -> (Arc<CommandRegistry>, Arc<std::sync::RwLock<keybinds::KeybindRegistry>>) {
-    let (plugins, mut skills) = loader::load_all(&loader::default_roots());
+    let (mut plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
+
+    // Filter disabled plugins from commands, keybinds, and help too — not just skills
+    if !config.disabled_plugins.is_empty() {
+        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
+    }
 
     tracing::info!(
         plugins = plugins.len(),
@@ -120,8 +125,11 @@ pub async fn register(
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
-    let (plugins, mut skills) = loader::load_all(&loader::default_roots());
+    let (mut plugins, mut skills) = loader::load_all(&loader::default_roots());
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
+    if !config.disabled_plugins.is_empty() {
+        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
+    }
     tracing::info!(skills = skills.len(), "reloaded skills");
     registry.rebuild_with_plugins(skills, plugins);
 }
