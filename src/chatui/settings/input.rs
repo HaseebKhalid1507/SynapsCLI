@@ -496,7 +496,6 @@ fn cycler_current_value(key: &str, snap: &RuntimeSnapshot) -> String {
         "thinking" => snap.thinking.clone(),
         "context_window" => snap.context_window.clone(),
         "sidecar_toggle_key" => synaps_cli::config::read_config_value("sidecar_toggle_key")
-            .or_else(|| synaps_cli::config::read_config_value("voice_toggle_key"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
@@ -755,7 +754,7 @@ mod tests {
     fn enter_on_plugin_custom_field_requests_plugin_editor_open() {
         let s = snap_with_plugin_cats(vec![PluginSettingsCategory {
             plugin: "demo".into(),
-            id: "voice".into(),
+            id: "capture".into(),
             label: "Demo".into(),
             fields: vec![plugin_field("body", "Body", PluginSettingsEditor::Custom)],
         }]);
@@ -764,7 +763,7 @@ mod tests {
         match out {
             InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
                 assert_eq!(plugin_id, "demo");
-                assert_eq!(category, "voice");
+                assert_eq!(category, "capture");
                 assert_eq!(key, "body");
             }
             other => panic!("expected PluginCustomOpen, got {:?}",

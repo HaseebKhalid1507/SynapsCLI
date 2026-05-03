@@ -255,16 +255,16 @@ mod wireup_tests {
     fn claim(settings_category: Option<&str>) -> LifecycleClaim {
         LifecycleClaim {
             plugin: "p".into(),
-            command: "voice".into(),
+            command: "capture".into(),
             settings_category: settings_category.map(|s| s.into()),
-            display_name: "Voice".into(),
+            display_name: "Sample".into(),
             importance: 0,
         }
     }
 
     #[test]
     fn visible_categories_excludes_sidecar_when_claim_present() {
-        let snap = snap_with_claims(vec![claim(Some("voice"))]);
+        let snap = snap_with_claims(vec![claim(Some("capture"))]);
         let v = schema::visible_categories(&snap.lifecycle_claims);
         assert!(!v.contains(&schema::Category::Sidecar));
     }

@@ -158,7 +158,7 @@ pub(crate) struct App {
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
     pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
-    /// Live keybind registry — held so /settings can hot-swap voice toggle.
+    /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
 
@@ -1056,7 +1056,7 @@ mod tests {
     fn grouped_system_output_does_not_insert_rules_between_indented_lines() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("Extensions (1):".to_string()));
-        app.push_msg(ChatMessage::System("  voice — ok".to_string()));
+        app.push_msg(ChatMessage::System("  capture — ok".to_string()));
         app.push_msg(ChatMessage::System("    tools: speak".to_string()));
 
         let lines = app.render_lines(80);
@@ -1066,7 +1066,7 @@ mod tests {
             .expect("header system message should render");
         let child_idx = lines
             .iter()
-            .position(|line| line.spans.iter().any(|span| span.content.contains("voice — ok")))
+            .position(|line| line.spans.iter().any(|span| span.content.contains("capture — ok")))
             .expect("child system message should render");
         let grandchild_idx = lines
             .iter()

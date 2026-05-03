@@ -33,7 +33,7 @@ fn sidecar_pill_segment(
                 THEME.load().muted
             }
         }
-        super::sidecar::SidecarUiStatus::Listening => {
+        super::sidecar::SidecarUiStatus::Active { .. } => {
             let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
             let base = match THEME.load().status_streaming {
                 Color::Rgb(r, g, b) => (r, g, b),
@@ -45,13 +45,9 @@ fn sidecar_pill_segment(
                 (base.2 as f64 * pulse) as u8,
             )
         }
-        super::sidecar::SidecarUiStatus::Transcribing => THEME.load().status_streaming,
         super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
     };
-    let modifier = match &sidecar.status {
-        super::sidecar::SidecarUiStatus::Transcribing => Modifier::empty(),
-        _ => Modifier::BOLD,
-    };
+    let modifier = Modifier::BOLD;
     Span::styled(text, Style::default().fg(color).add_modifier(modifier))
 }
 
@@ -121,16 +117,15 @@ pub(crate) fn sidecar_pill_text(
     match status {
         super::sidecar::SidecarUiStatus::Idle => {
             if armed {
-                " \u{1f3a4} listening ".to_string()
+                format!(" \u{25cf} {label} active ")
             } else {
                 format!(" \u{25cb} {label} ")
             }
         }
-        super::sidecar::SidecarUiStatus::Listening => " \u{1f3a4} listening ".to_string(),
-        super::sidecar::SidecarUiStatus::Transcribing => {
+        super::sidecar::SidecarUiStatus::Active { label: state_label } => {
             let spinner_idx = (spinner_frame / 3) % SPINNER_FRAMES.len();
             let frame = SPINNER_FRAMES[spinner_idx];
-            format!(" {} transcribing ", frame)
+            format!(" {frame} {label}: {state_label} ")
         }
         super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
     }
@@ -193,17 +188,15 @@ mod sidecar_pill_tests {
     }
 
     #[test]
-    fn pill_listening_state_is_modality_neutral() {
-        // Listening / transcribing don't get the display name suffix
-        // (per slice 8A.5 spec — keep it simple).
+    fn pill_active_state_shows_plugin_supplied_label() {
         let text = sidecar_pill_text(
-            "Voice",
-            &super::super::sidecar::SidecarUiStatus::Listening,
+            "Plugin",
+            &super::super::sidecar::SidecarUiStatus::Active { label: "Working".into() },
             true,
             0,
         );
-        assert!(text.contains("listening"), "got: {text:?}");
-        assert!(!text.contains("Voice"), "got: {text:?}");
+        assert!(text.contains("Plugin"), "got: {text:?}");
+        assert!(text.contains("Working"), "got: {text:?}");
     }
 
     fn claim(plugin: &str, command: &str, importance: i32) -> synaps_cli::skills::registry::LifecycleClaim {

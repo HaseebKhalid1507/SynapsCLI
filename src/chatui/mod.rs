@@ -176,15 +176,6 @@ pub async fn run(
     let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
 
-    // ═══ Phase 6 migration: legacy `voice_*` global keys → plugin namespace ═══
-    // One-shot copy of the deprecated whisper-specific config keys into the
-    // local-voice plugin's own config (`~/.synaps-cli/plugins/local-voice/config`).
-    // Only writes when the destination is empty; never overwrites a value the
-    // user has already set under the new namespace. Legacy keys remain in
-    // place so users on a multi-version setup don't lose them — they can be
-    // pruned manually after upgrade.
-    migrate_legacy_voice_config_keys();
-    migrate_legacy_sidecar_toggle_key();
     // Phase 8 slice 8A.8: copy legacy `sidecar_toggle_key` into the
     // namespace of any plugin that has staked a lifecycle claim with
     // a settings_category. Idempotent: skips already-set new keys.
@@ -830,7 +821,7 @@ pub async fn run(
                                                 }
                                                 // Capability declarations (grouped from the `future` list).
                                                 // Each entry has a free-form kind declared by the plugin
-                                                // (e.g. "voice", "ocr", "agent"). Render grouped by kind so
+                                                // (e.g. "capture", "ocr", "agent"). Render grouped by kind so
                                                 // future capability types surface without core changes.
                                                 if !snap.future.is_empty() {
                                                     use std::collections::BTreeMap;
@@ -1254,7 +1245,7 @@ pub async fn run(
                                                     let plugin_key = state.sidecar.plugin_name.clone();
                                                     app.sidecars.insert(plugin_key.clone(), state);
                                                     app.push_msg(ChatMessage::System(
-                                                        format!("🎤 {label} online — press the toggle again to stop and transcribe")
+                                                        format!("{label} active — press the toggle again to stop")
                                                     ));
                                                     if let Some(v) = app.sidecars.get_mut(&plugin_key) {
                                                         v.armed = true;
@@ -1297,7 +1288,7 @@ pub async fn run(
                                                     "sidecar: not yet started — sidecar available from plugin '{}' at {}",
                                                     s.plugin_name, s.binary.display()
                                                 ),
-                                                None => "sidecar: no plugin provides a sidecar binary (install one, e.g. local-voice from synaps-skills)".to_string(),
+                                                None => "sidecar: no plugin provides a sidecar binary (install a plugin that declares provides.sidecar)".to_string(),
                                             }
                                         } else {
                                             // Multiple active — list each.
@@ -1849,99 +1840,6 @@ pub async fn run(
     Ok(())
 }
 
-/// One-time migration for Phase 6 (Path B / extension contracts).
-///
-/// Copies any value at the legacy global `voice_*` config keys into the
-/// `local-voice` plugin's namespaced config. Only writes when the
-/// destination is currently empty, so re-runs are idempotent and a user
-/// who has already migrated by hand keeps their values.
-///
-/// Returns silently on every failure path — config migration is
-/// best-effort; the runtime falls back to the legacy global keys via
-/// the deprecation shim in `chatui::sidecar` if this no-ops.
-fn migrate_legacy_voice_config_keys() {
-    const PLUGIN: &str = "local-voice";
-    // (legacy global key, plugin namespace key)
-    const PAIRS: &[(&str, &str)] = &[
-        ("voice_stt_model_path", "model_path"),
-        ("voice_stt_model", "model_path"),
-        ("voice_stt_backend", "backend"),
-        ("voice_language", "language"),
-    ];
-
-    for (legacy, plugin_key) in PAIRS {
-        let Some(legacy_value) = synaps_cli::config::read_config_value(legacy) else {
-            continue;
-        };
-        let trimmed = legacy_value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Don't overwrite a value the user has already set under the new key.
-        if synaps_cli::extensions::config_store::read_plugin_config(PLUGIN, plugin_key).is_some() {
-            continue;
-        }
-        match synaps_cli::extensions::config_store::write_plugin_config(
-            PLUGIN,
-            plugin_key,
-            trimmed,
-        ) {
-            Ok(()) => {
-                tracing::info!(
-                    "voice migration: copied `{}` → `~/.synaps-cli/plugins/{}/config:{}` \
-                     (legacy global key still present; safe to delete after restart)",
-                    legacy,
-                    PLUGIN,
-                    plugin_key
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "voice migration: failed to write `{}` to plugin namespace: {}",
-                    plugin_key,
-                    err
-                );
-            }
-        }
-    }
-}
-
-/// Phase 7 migration: copy `voice_toggle_key` → `sidecar_toggle_key`.
-///
-/// The toggle key is a generic sidecar setting, not a voice-specific
-/// one. The new key is read first; the legacy key is read as a
-/// fallback for one release. This migration writes the new key when
-/// only the legacy key is present, then leaves both in place (the
-/// legacy key remains as a passive copy until the user removes it).
-fn migrate_legacy_sidecar_toggle_key() {
-    const LEGACY: &str = "voice_toggle_key";
-    const NEW: &str = "sidecar_toggle_key";
-    if synaps_cli::config::read_config_value(NEW).is_some() {
-        return;
-    }
-    let Some(legacy_value) = synaps_cli::config::read_config_value(LEGACY) else {
-        return;
-    };
-    let trimmed = legacy_value.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    if let Err(err) = synaps_cli::config::write_config_value(NEW, trimmed) {
-        tracing::warn!(
-            "sidecar migration: failed to copy `{}` → `{}`: {}",
-            LEGACY,
-            NEW,
-            err
-        );
-    } else {
-        tracing::info!(
-            "sidecar migration: copied global `{}` → `{}` (legacy key still present; safe to delete)",
-            LEGACY,
-            NEW
-        );
-    }
-}
-
 /// Phase 8 slice 8A.8: when a plugin has staked a lifecycle claim and
 /// declared a `settings_category`, copy the legacy global
 /// `sidecar_toggle_key` value into the plugin-namespaced equivalent
@@ -2041,12 +1939,12 @@ mod migration_tests {
         std::fs::write(&cfg, "sidecar_toggle_key = F2\n").unwrap();
         with_home(&home, || {
             migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "local-voice",
-                "voice",
-                Some("voice"),
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
             )]);
             let v = synaps_cli::config::read_config_value(
-                "plugins.local-voice.voice._lifecycle_toggle_key",
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
             );
             assert_eq!(v.as_deref(), Some("F2"));
         });
@@ -2058,16 +1956,16 @@ mod migration_tests {
         let cfg = home.join(".synaps-cli/config");
         std::fs::write(
             &cfg,
-            "sidecar_toggle_key = F2\nplugins.local-voice.voice._lifecycle_toggle_key = F12\n",
+            "sidecar_toggle_key = F2\nplugins.sample-sidecar.capture._lifecycle_toggle_key = F12\n",
         ).unwrap();
         with_home(&home, || {
             migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "local-voice",
-                "voice",
-                Some("voice"),
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
             )]);
             let v = synaps_cli::config::read_config_value(
-                "plugins.local-voice.voice._lifecycle_toggle_key",
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
             );
             assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
         });
@@ -2080,12 +1978,12 @@ mod migration_tests {
         std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
         with_home(&home, || {
             migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "local-voice",
-                "voice",
-                Some("voice"),
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
             )]);
             assert!(synaps_cli::config::read_config_value(
-                "plugins.local-voice.voice._lifecycle_toggle_key"
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key"
             ).is_none());
         });
     }
@@ -2113,12 +2011,12 @@ mod migration_tests {
         std::fs::write(&cfg, "sidecar_toggle_key = C-V\n").unwrap();
         with_home(&home, || {
             migrate_sidecar_toggle_key_to_claimed_plugins(&[
-                claim("local-voice", "voice", Some("voice")),
+                claim("sample-sidecar", "capture", Some("capture")),
                 claim("ocr-plugin", "ocr", Some("ocr")),
             ]);
             assert_eq!(
                 synaps_cli::config::read_config_value(
-                    "plugins.local-voice.voice._lifecycle_toggle_key"
+                    "plugins.sample-sidecar.capture._lifecycle_toggle_key"
                 ).as_deref(),
                 Some("C-V")
             );
@@ -2140,7 +2038,7 @@ mod display_name_helper_tests {
     fn claim(plugin: &str, display: &str) -> LifecycleClaim {
         LifecycleClaim {
             plugin: plugin.into(),
-            command: "voice".into(),
+            command: "capture".into(),
             settings_category: None,
             display_name: display.into(),
             importance: 0,
@@ -2149,21 +2047,21 @@ mod display_name_helper_tests {
 
     #[test]
     fn pick_display_name_for_plugin_returns_match() {
-        let claims = vec![claim("local-voice", "Voice")];
+        let claims = vec![claim("sample-sidecar", "Sample")];
         assert_eq!(
-            pick_display_name_for_plugin("local-voice", &claims),
-            Some("Voice".to_string())
+            pick_display_name_for_plugin("sample-sidecar", &claims),
+            Some("Sample".to_string())
         );
     }
 
     #[test]
     fn pick_display_name_for_plugin_returns_none_for_unmatched() {
-        let claims = vec![claim("local-voice", "Voice")];
+        let claims = vec![claim("sample-sidecar", "Sample")];
         assert_eq!(pick_display_name_for_plugin("unknown", &claims), None);
     }
 
     #[test]
     fn pick_display_name_for_plugin_returns_none_with_empty_claims() {
-        assert_eq!(pick_display_name_for_plugin("local-voice", &[]), None);
+        assert_eq!(pick_display_name_for_plugin("sample-sidecar", &[]), None);
     }
 }

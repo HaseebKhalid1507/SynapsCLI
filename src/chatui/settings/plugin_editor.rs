@@ -126,7 +126,7 @@ pub(crate) fn effect_from_commit_reply(
                     let command = intent
                         .get("command")
                         .and_then(Value::as_str)
-                        .unwrap_or("voice")
+                        .unwrap_or(plugin_id)
                         .to_string();
                     let args: Vec<String> = intent
                         .get("args")
@@ -192,7 +192,7 @@ pub(crate) fn effect_from_commit_reply(
         if let Some(rest) = s.strip_prefix("download:") {
             return PluginEditorEffect::InvokeCommand {
                 plugin_id: plugin_id.to_string(),
-                command: "voice".to_string(),
+                command: plugin_id.to_string(),
                 args: vec!["download".to_string(), rest.to_string()],
             };
         }
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn parses_render_from_open_result_wrapper() {
         let render = render_from_open_result(json!({
-            "category": "voice",
+            "category": "capture",
             "field": "model_path",
             "render": {"rows": [{"label": "tiny", "data": "download:tiny"}], "cursor": 0}
         })).unwrap();
@@ -240,15 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn download_commit_routes_to_voice_download_command() {
+    fn download_commit_routes_to_declared_plugin_command() {
         let effect = effect_from_commit(
-            "local-voice",
+            "sample-sidecar",
             "model_path",
             SettingsEditorCommitParams { value: json!("download:base.en") },
         );
         assert_eq!(effect, PluginEditorEffect::InvokeCommand {
-            plugin_id: "local-voice".into(),
-            command: "voice".into(),
+            plugin_id: "sample-sidecar".into(),
+            command: "sample-sidecar".into(),
             args: vec!["download".into(), "base.en".into()],
         });
     }
@@ -256,12 +256,12 @@ mod tests {
     #[test]
     fn select_commit_routes_to_plugin_config_write() {
         let effect = effect_from_commit(
-            "local-voice",
+            "sample-sidecar",
             "model_path",
             SettingsEditorCommitParams { value: json!({"kind":"select", "path":"/tmp/ggml.bin"}) },
         );
         assert_eq!(effect, PluginEditorEffect::ConfigWrite {
-            plugin_id: "local-voice".into(),
+            plugin_id: "sample-sidecar".into(),
             key: "model_path".into(),
             value: "/tmp/ggml.bin".into(),
         });

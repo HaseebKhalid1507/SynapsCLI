@@ -125,7 +125,7 @@ define_settings! {
 
     sidecar_toggle_key, "Sidecar toggle key", Sidecar,
         EditorKind::Cycler(&["F8", "F2", "F12", "C-V", "C-G"]),
-        "Keybind that toggles the active sidecar plugin (e.g. voice dictation). Takes effect immediately.",
+        "Keybind that toggles the active sidecar plugin. Takes effect immediately.",
         |_runtime, app, value| {
             if let Some(kb) = app.keybinds.as_ref() {
                 match kb.write() {

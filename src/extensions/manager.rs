@@ -68,6 +68,39 @@ pub struct ExtensionStatus {
     pub restart_count: usize,
 }
 
+/// Compute the hint for an extension load failure.
+///
+/// Two cases:
+/// 1. **Missing extension binary AND plugin declares
+///    `provides.sidecar.setup`** — the plugin ships source only (the
+///    binary is typically gitignored) and the setup script needs to
+///    be run. The hint points the user at the exact command. This is
+///    the common case for fresh marketplace installs of plugins that
+///    build their extension binary from source.
+/// 2. **Anything else** — the generic "run plugin validate" hint.
+///
+/// Pure function for unit-testability. Lives here (not in
+/// `ExtensionLoadFailure`) because the sidecar/setup convention is a
+/// plugin-layer concern.
+pub fn compute_extension_load_hint(
+    error: &str,
+    plugin_dir: &std::path::Path,
+    declared_setup: Option<&str>,
+) -> String {
+    let missing_binary =
+        error.contains("No such file or directory") || error.contains("os error 2");
+    match (missing_binary, declared_setup) {
+        (true, Some(setup)) => format!(
+            "Extension binary missing — this plugin ships source only. \
+             Build it with: (cd {} && bash {}); then reload.",
+            plugin_dir.display(),
+            setup,
+        ),
+        _ => "Run `plugin validate <plugin-dir>` and confirm the extension command is installed"
+            .to_string(),
+    }
+}
+
 /// Manages the lifecycle of all loaded extensions.
 pub struct ExtensionManager {
     /// The shared hook bus.
@@ -254,7 +287,7 @@ impl ExtensionManager {
         // Do not probe optional info.get for legacy hook-only extensions. The
         // best-effort call can race with simple fixtures that exit after
         // shutdown/EOF and is only needed for richer extension-capability
-        // surfaces (providers/tools/voice).
+        // surfaces (providers/tools/plugin-defined capabilities).
         let info = if should_probe_info {
             match handler.get_info().await {
                 Ok(info) => Some(info),
@@ -578,7 +611,7 @@ impl ExtensionManager {
     /// Unified capability snapshot per loaded extension, sorted by id.
     ///
     /// Aggregates hook subscriptions, extension-provided tools, and registered
-    /// providers. `future` is intentionally empty until memory/indexer/voice
+    /// providers. `future` carries plugin-defined capability kinds and
     /// capabilities land.
     pub async fn capability_snapshots(&self) -> Vec<ExtensionCapabilitySnapshot> {
         let mut handlers: Vec<(String, Arc<dyn ExtensionHandler>)> = self
@@ -904,11 +937,15 @@ impl ExtensionManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to load extension");
+                    let setup_script = json
+                        .pointer("/provides/sidecar/setup")
+                        .and_then(|v| v.as_str());
+                    let hint = compute_extension_load_hint(&e, &plugin_dir, setup_script);
                     failed.push(ExtensionLoadFailure::new(
                         plugin_name,
                         Some(manifest_path),
                         e,
-                        "Run `plugin validate <plugin-dir>` and confirm the extension command is installed",
+                        hint,
                     ));
                 }
             }
@@ -998,8 +1035,8 @@ mod tests {
             "multi-cap",
             vec![
                 crate::extensions::runtime::process::CapabilityDeclaration {
-                    kind: "voice".to_string(),
-                    name: "Local Whisper STT".to_string(),
+                    kind: "capture".to_string(),
+                    name: "Local Sample STT".to_string(),
                     permissions: vec!["audio.input".to_string()],
                     params: serde_json::Value::Null,
                 },
@@ -1019,10 +1056,10 @@ mod tests {
             .expect("multi-cap snapshot");
         assert_eq!(snap.future.len(), 2);
         let kinds: Vec<&str> = snap.future.iter().map(|e| e.kind.as_str()).collect();
-        assert!(kinds.contains(&"voice"), "got kinds {:?}", kinds);
+        assert!(kinds.contains(&"capture"), "got kinds {:?}", kinds);
         assert!(kinds.contains(&"ocr"), "got kinds {:?}", kinds);
         let names: Vec<&str> = snap.future.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Local Whisper STT"), "got {:?}", names);
+        assert!(names.contains(&"Local Sample STT"), "got {:?}", names);
         assert!(names.contains(&"Tesseract"), "got {:?}", names);
 
         mgr.unload("multi-cap").await.unwrap();
@@ -1134,12 +1171,12 @@ mod tests {
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::extensions::config_store::write_plugin_config("local-voice", "backend", "cpu")
+            crate::extensions::config_store::write_plugin_config("sample-sidecar", "backend", "cpu")
                 .unwrap();
-            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "local-voice",
+                "sample-sidecar",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -1159,10 +1196,10 @@ mod tests {
     fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
-            crate::config::write_config_value("extension.local-voice.backend", "auto").unwrap();
+            crate::config::write_config_value("extension.sample-sidecar.backend", "auto").unwrap();
 
             let resolved = ExtensionManager::resolve_config(
-                "local-voice",
+                "sample-sidecar",
                 &[ExtensionConfigEntry {
                     key: "backend".to_string(),
                     value_type: None,
@@ -1278,5 +1315,71 @@ mod tests {
         mgr.providers.register("plug", plain_spec).unwrap();
         let ids = mgr.provider_tool_use_runtime_ids();
         assert_eq!(ids, vec!["plug:alpha".to_string()]);
+    }
+
+    // ---- compute_extension_load_hint --------------------------------
+
+    #[test]
+    fn hint_missing_binary_with_declared_setup_points_at_script() {
+        let hint = compute_extension_load_hint(
+            "Failed to spawn extension 'sample-sidecar': No such file or directory (os error 2)",
+            std::path::Path::new("/home/u/.synaps-cli/plugins/sample-sidecar"),
+            Some("scripts/setup.sh"),
+        );
+        assert!(
+            hint.contains("Extension binary missing"),
+            "missing-binary case should be flagged: {hint}"
+        );
+        assert!(
+            hint.contains("/home/u/.synaps-cli/plugins/sample-sidecar"),
+            "hint should include the plugin dir: {hint}"
+        );
+        assert!(
+            hint.contains("bash scripts/setup.sh"),
+            "hint should show the exact command: {hint}"
+        );
+    }
+
+    #[test]
+    fn hint_missing_binary_without_declared_setup_falls_back_to_generic() {
+        let hint = compute_extension_load_hint(
+            "Failed to spawn extension 'foo': No such file or directory (os error 2)",
+            std::path::Path::new("/x/y"),
+            None,
+        );
+        assert!(
+            hint.contains("plugin validate"),
+            "no setup declared → generic hint: {hint}"
+        );
+        assert!(
+            !hint.contains("Extension binary missing"),
+            "should not falsely promise a setup script: {hint}"
+        );
+    }
+
+    #[test]
+    fn hint_other_error_with_declared_setup_falls_back_to_generic() {
+        let hint = compute_extension_load_hint(
+            "Extension 'foo' must subscribe to at least one hook or request a registration permission",
+            std::path::Path::new("/x/y"),
+            Some("scripts/setup.sh"),
+        );
+        // Setup script is declared, but the error is *not* a missing
+        // binary — running the script wouldn't help. Fall back to the
+        // generic hint so we don't mislead the user.
+        assert!(hint.contains("plugin validate"), "got {hint}");
+        assert!(!hint.contains("Extension binary missing"), "got {hint}");
+    }
+
+    #[test]
+    fn hint_recognises_os_error_2_format() {
+        // Older / cross-platform error formats may include the kernel
+        // errno but not the "No such file or directory" English text.
+        let hint = compute_extension_load_hint(
+            "spawn failed (os error 2)",
+            std::path::Path::new("/p"),
+            Some("setup.sh"),
+        );
+        assert!(hint.contains("Extension binary missing"), "got {hint}");
     }
 }

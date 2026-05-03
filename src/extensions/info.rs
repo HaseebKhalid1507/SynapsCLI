@@ -32,7 +32,7 @@ pub struct PluginBuildInfo {
 /// One advertised capability.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PluginCapabilityInfo {
-    /// Capability class, e.g. `voice`, `models`, `tasks`, `settings`.
+    /// Capability class, e.g. `capture`, `models`, `tasks`, `settings`.
     pub kind: String,
     /// Display name.
     pub name: String,

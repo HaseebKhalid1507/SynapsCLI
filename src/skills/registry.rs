@@ -69,7 +69,7 @@ pub struct RegisteredPluginCommand {
 /// When a plugin declares a lifecycle claim, the command registry
 /// auto-registers `/<command> toggle` and `/<command> status` (and any
 /// future lifecycle verbs) so the plugin's own UX namespace —
-/// e.g. `/voice` for a voice plugin — drives sidecar lifecycle instead
+/// e.g. a plugin-owned command — drives sidecar lifecycle instead
 /// of the modality-laden `/sidecar` builtin.
 ///
 /// Multiple plugins may register lifecycle claims; in Phase 8 slice 8A
@@ -79,7 +79,7 @@ pub struct RegisteredPluginCommand {
 pub struct LifecycleClaim {
     /// Plugin (manifest) name that owns this claim.
     pub plugin: String,
-    /// Top-level command word the plugin claims, e.g. `"voice"`.
+    /// Top-level command word the plugin claims.
     pub command: String,
     /// Optional settings-category id that the host should inject
     /// per-plugin lifecycle keys (e.g. toggle keybind) into.
@@ -113,7 +113,7 @@ struct Inner {
     /// Path B Phase 4. The settings UI snapshots this on each open.
     plugin_settings_categories: Vec<PluginSettingsCategory>,
     /// Plugin-declared lifecycle claims (Phase 8 slice 8A). Indexed by
-    /// the claimed command word (e.g. `"voice"`). At most one claim per
+    /// the claimed command word. At most one claim per
     /// command word; first-loaded plugin wins on collision.
     lifecycle_claims: HashMap<String, LifecycleClaim>,
     /// Plugins that lost a lifecycle-claim collision, recorded so the
@@ -378,7 +378,7 @@ impl CommandRegistry {
     /// Look up a plugin command by its unqualified name. Returns the
     /// only match, or None if zero or multiple plugins claim the name.
     /// Used when a builtin command has the same identifier as a
-    /// plugin-owned command (e.g. `/voice` is both a deprecation alias
+    /// plugin-owned command that also has extension subcommands
     /// builtin and a plugin command name) and we need to bypass the
     /// builtin check to reach the plugin.
     pub fn find_plugin_command_unqualified(&self, name: &str) -> Option<Arc<RegisteredPluginCommand>> {
@@ -398,7 +398,7 @@ impl CommandRegistry {
         v.extend(r.skills.keys().cloned());
         v.extend(r.plugin_commands.keys().cloned());
         // Phase 8 slice 8A: plugin-claimed lifecycle commands surface
-        // as top-level commands too (e.g. `/voice`).
+        // as top-level commands too.
         v.extend(r.lifecycle_claims.keys().cloned());
         v.sort();
         v.dedup();
@@ -869,9 +869,9 @@ mod tests {
     }
 
     #[test]
-    fn plugin_settings_categories_does_not_hardcode_voice() {
+    fn plugin_settings_categories_does_not_hardcode_capture() {
         // Acceptance: declarative cycler/text fields are represented in
-        // core data without any voice-specific knowledge.
+        // core data without plugin-specific knowledge.
         let r = CommandRegistry::new_with_plugins(
             &[],
             vec![],
@@ -943,21 +943,21 @@ mod tests {
             &[],
             vec![],
             vec![mk_plugin_with_lifecycle(
-                "local-voice",
-                "voice",
-                Some("Voice"),
+                "sample-sidecar",
+                "capture",
+                Some("Sample"),
                 50,
-                Some("voice"),
+                Some("capture"),
             )],
         );
         let claim = reg
-            .lifecycle_for_command("voice")
-            .expect("voice lifecycle claim should be registered");
-        assert_eq!(claim.plugin, "local-voice");
-        assert_eq!(claim.command, "voice");
-        assert_eq!(claim.display_name, "Voice");
+            .lifecycle_for_command("capture")
+            .expect("sample lifecycle claim should be registered");
+        assert_eq!(claim.plugin, "sample-sidecar");
+        assert_eq!(claim.command, "capture");
+        assert_eq!(claim.display_name, "Sample");
         assert_eq!(claim.importance, 50);
-        assert_eq!(claim.settings_category.as_deref(), Some("voice"));
+        assert_eq!(claim.settings_category.as_deref(), Some("capture"));
     }
 
     #[test]
@@ -976,31 +976,31 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+            vec![mk_plugin_with_lifecycle("sample-sidecar", "capture", None, 0, None)],
         );
-        assert!(reg.all_commands().contains(&"voice".to_string()));
+        assert!(reg.all_commands().contains(&"capture".to_string()));
     }
 
     #[test]
     fn lifecycle_claim_collision_first_loaded_wins() {
-        // Two plugins both claim "voice"; first in the discovery
+        // Two plugins both claim "capture"; first in the discovery
         // order (the vec we pass) should win.
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
             vec![
-                mk_plugin_with_lifecycle("alpha-voice", "voice", Some("Alpha"), 10, None),
-                mk_plugin_with_lifecycle("beta-voice", "voice", Some("Beta"), 90, None),
+                mk_plugin_with_lifecycle("alpha-sidecar", "capture", Some("Alpha"), 10, None),
+                mk_plugin_with_lifecycle("beta-sidecar", "capture", Some("Beta"), 90, None),
             ],
         );
-        let claim = reg.lifecycle_for_command("voice").unwrap();
-        assert_eq!(claim.plugin, "alpha-voice");
+        let claim = reg.lifecycle_for_command("capture").unwrap();
+        assert_eq!(claim.plugin, "alpha-sidecar");
         let collisions = reg.lifecycle_claim_collisions();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0], (
-            "beta-voice".to_string(),
-            "voice".to_string(),
-            "alpha-voice".to_string(),
+            "beta-sidecar".to_string(),
+            "capture".to_string(),
+            "alpha-sidecar".to_string(),
         ));
     }
 
@@ -1010,20 +1010,20 @@ mod tests {
             &[],
             vec![],
             vec![
-                mk_plugin_with_lifecycle("local-voice", "voice", None, 50, None),
+                mk_plugin_with_lifecycle("sample-sidecar", "capture", None, 50, None),
                 mk_plugin_with_lifecycle("ocr-plugin", "ocr", None, 30, None),
             ],
         );
         let claims = reg.lifecycle_claims();
         let mut names: Vec<_> = claims.iter().map(|c| c.command.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["ocr", "voice"]);
+        assert_eq!(names, vec!["capture", "ocr"]);
     }
 
     #[test]
     fn lifecycle_for_command_returns_none_when_no_claim() {
         let reg = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
-        assert!(reg.lifecycle_for_command("voice").is_none());
+        assert!(reg.lifecycle_for_command("capture").is_none());
     }
 
     #[test]
@@ -1031,12 +1031,12 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_with_lifecycle("local-voice", "voice", None, 0, None)],
+            vec![mk_plugin_with_lifecycle("sample-sidecar", "capture", None, 0, None)],
         );
-        assert!(reg.lifecycle_for_command("voice").is_some());
+        assert!(reg.lifecycle_for_command("capture").is_some());
         // Rebuild without the plugin: the claim must vanish.
         reg.rebuild_with_plugins(vec![], vec![]);
-        assert!(reg.lifecycle_for_command("voice").is_none());
+        assert!(reg.lifecycle_for_command("capture").is_none());
         assert!(reg.lifecycle_claim_collisions().is_empty());
     }
 
@@ -1111,19 +1111,19 @@ mod tests {
             &[],
             vec![],
             vec![mk_plugin_lifecycle_plus_settings(
-                "local-voice",
-                "voice",
-                Some("voice"),
-                &["voice"],
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
+                &["capture"],
             )],
         );
         let cats = reg.plugin_settings_categories();
-        let voice = cats
+        let capture = cats
             .iter()
-            .find(|c| c.id == "voice" && c.plugin == "local-voice")
-            .expect("voice category present");
-        assert!(!voice.fields.is_empty());
-        let first = &voice.fields[0];
+            .find(|c| c.id == "capture" && c.plugin == "sample-sidecar")
+            .expect("sample category present");
+        assert!(!capture.fields.is_empty());
+        let first = &capture.fields[0];
         assert_eq!(first.key, "_lifecycle_toggle_key");
         assert_eq!(first.label, "Toggle key");
         match &first.editor {
@@ -1141,7 +1141,7 @@ mod tests {
             }
             other => panic!("expected cycler, got {other:?}"),
         }
-        assert_eq!(voice.fields[1].key, "existing");
+        assert_eq!(capture.fields[1].key, "existing");
     }
 
     #[test]
@@ -1149,11 +1149,11 @@ mod tests {
         let reg = CommandRegistry::new_with_plugins(
             &[],
             vec![],
-            vec![mk_plugin_lifecycle_plus_settings("p", "ocr", None, &["voice"])],
+            vec![mk_plugin_lifecycle_plus_settings("p", "ocr", None, &["capture"])],
         );
         let cats = reg.plugin_settings_categories();
-        let voice = cats.iter().find(|c| c.id == "voice").expect("category");
-        assert!(voice.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
+        let capture = cats.iter().find(|c| c.id == "capture").expect("category");
+        assert!(capture.fields.iter().all(|f| f.key != "_lifecycle_toggle_key"));
     }
 
     #[test]
@@ -1163,9 +1163,9 @@ mod tests {
             vec![],
             vec![mk_plugin_lifecycle_plus_settings(
                 "p",
-                "voice",
+                "capture",
                 Some("nonexistent"),
-                &["voice"],
+                &["capture"],
             )],
         );
         let cats = reg.plugin_settings_categories();
@@ -1181,10 +1181,10 @@ mod tests {
             vec![],
             vec![
                 mk_plugin_lifecycle_plus_settings(
-                    "voice-plugin",
-                    "voice",
-                    Some("voice"),
-                    &["voice"],
+                    "sidecar-plugin",
+                    "capture",
+                    Some("capture"),
+                    &["capture"],
                 ),
                 mk_plugin_lifecycle_plus_settings(
                     "ocr-plugin",
@@ -1195,9 +1195,9 @@ mod tests {
             ],
         );
         let cats = reg.plugin_settings_categories();
-        let voice = cats.iter().find(|c| c.plugin == "voice-plugin").unwrap();
+        let capture = cats.iter().find(|c| c.plugin == "sidecar-plugin").unwrap();
         let ocr = cats.iter().find(|c| c.plugin == "ocr-plugin").unwrap();
-        assert_eq!(voice.fields[0].key, "_lifecycle_toggle_key");
+        assert_eq!(capture.fields[0].key, "_lifecycle_toggle_key");
         assert_eq!(ocr.fields[0].key, "_lifecycle_toggle_key");
     }
 }

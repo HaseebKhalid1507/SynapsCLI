@@ -10,9 +10,7 @@
 //! ## Manifest schema
 //!
 //! Plugins declare a sidecar via `provides.sidecar` in their plugin
-//! manifest. The legacy spelling `provides.voice_sidecar` is still
-//! accepted via a serde alias for one release (see
-//! [`crate::skills::manifest::PluginProvides`]).
+//! manifest.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +21,7 @@ use crate::skills::Plugin;
 /// be spawned by [`crate::sidecar::manager::SidecarManager`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredSidecar {
-    /// Plugin name from the manifest (e.g. "local-voice").
+    /// Plugin name from the manifest.
     pub plugin_name: String,
     /// Absolute path to the plugin's root directory.
     pub plugin_root: PathBuf,
@@ -122,28 +120,25 @@ mod tests {
     use std::path::PathBuf;
 
     fn sidecar_plugin() -> Plugin {
-        // Uses the legacy `voice_sidecar` field name to assert that the
-        // serde alias keeps Phase-6-era plugin manifests deserializing.
-        // Canonical-name coverage lives in
-        // `discover_accepts_canonical_sidecar_field`.
+        // Canonical `provides.sidecar` fixture.
         let manifest_json = r#"{
-            "name": "local-voice",
+            "name": "sample-sidecar",
             "provides": {
-                "voice_sidecar": {
-                    "command": "bin/synaps-voice-plugin",
+                "sidecar": {
+                    "command": "bin/sample-sidecar",
                     "setup": "scripts/setup.sh",
                     "protocol_version": 1,
                     "model": {
-                        "default_path": "~/.synaps-cli/models/whisper/ggml-base.en.bin",
-                        "required_for_real_stt": true
+                        "default_path": "~/.synaps-cli/models/sample/model.bin",
+                        "required": true
                     }
                 }
             }
         }"#;
         let manifest: PluginManifest = serde_json::from_str(manifest_json).unwrap();
         Plugin {
-            name: "local-voice".into(),
-            root: PathBuf::from("/opt/synaps-skills/local-voice-plugin"),
+            name: "sample-sidecar".into(),
+            root: PathBuf::from("/opt/synaps-skills/sample-sidecar"),
             marketplace: None,
             version: None,
             description: None,
@@ -176,15 +171,15 @@ mod tests {
     fn discover_resolves_relative_binary_under_plugin_root() {
         let plugins = vec![sidecar_plugin()];
         let sidecar = discover_in(&plugins).expect("sidecar plugin should be discovered");
-        assert_eq!(sidecar.plugin_name, "local-voice");
+        assert_eq!(sidecar.plugin_name, "sample-sidecar");
         assert_eq!(
             sidecar.binary,
-            PathBuf::from("/opt/synaps-skills/local-voice-plugin/bin/synaps-voice-plugin")
+            PathBuf::from("/opt/synaps-skills/sample-sidecar/bin/sample-sidecar")
         );
         assert_eq!(
             sidecar.setup_script.as_deref(),
             Some(PathBuf::from(
-                "/opt/synaps-skills/local-voice-plugin/scripts/setup.sh"
+                "/opt/synaps-skills/sample-sidecar/scripts/setup.sh"
             ))
             .as_deref()
         );
@@ -196,7 +191,7 @@ mod tests {
         let plugin_json = r#"{
             "name": "abs-sidecar",
             "provides": {
-                "voice_sidecar": {
+                "sidecar": {
                     "command": "/usr/local/bin/sidecar",
                     "protocol_version": 1
                 }
@@ -220,14 +215,13 @@ mod tests {
     fn discover_picks_first_plugin_with_a_sidecar() {
         let plugins = vec![plain_plugin("zzz"), sidecar_plugin(), plain_plugin("aaa")];
         let sidecar = discover_in(&plugins).expect("should find sidecar plugin");
-        assert_eq!(sidecar.plugin_name, "local-voice");
+        assert_eq!(sidecar.plugin_name, "sample-sidecar");
     }
 
     #[test]
     fn discover_accepts_canonical_sidecar_field() {
         // Phase 7 slice G: new plugins should declare `provides.sidecar`
-        // (no voice prefix). This test guards the canonical wire shape
-        // independently of the back-compat alias.
+        // This test guards the canonical manifest shape.
         let plugin_json = r#"{
             "name": "modality-neutral",
             "provides": {
@@ -286,12 +280,12 @@ mod tests {
 
     #[test]
     fn discovered_propagates_lifecycle_when_present() {
-        let plugin = plugin_with_lifecycle("p", "voice", 50);
+        let plugin = plugin_with_lifecycle("p", "sensor", 50);
         let s = discover_in(&[plugin]).expect("should discover");
         let lc = s.lifecycle.expect("lifecycle should propagate");
-        assert_eq!(lc.command, "voice");
+        assert_eq!(lc.command, "sensor");
         assert_eq!(lc.importance, 50);
-        assert_eq!(lc.effective_display_name(), "voice-display");
+        assert_eq!(lc.effective_display_name(), "sensor-display");
     }
 
     #[test]

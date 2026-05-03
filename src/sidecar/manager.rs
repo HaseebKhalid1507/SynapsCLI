@@ -2,13 +2,12 @@
 //!
 //! [`SidecarManager`] spawns a sidecar process, writes line-JSON
 //! [`SidecarCommand`] values to its stdin, and surfaces the
-//! deserialized [`SidecarEvent`] stream as higher-level
+//! deserialized [`SidecarFrame`] stream as higher-level
 //! [`SidecarLifecycleEvent`] values on an mpsc channel.
 //!
-//! Modality-agnostic. The actual per-modality runtime (mic/STT, OCR,
-//! agent, etc.) lives in the plugin process; this module is
-//! intentionally small and dependency-free beyond `tokio` +
-//! `serde_json`.
+//! Modality-agnostic. Plugin-specific work lives in the plugin process;
+//! this module is intentionally small and dependency-free beyond `tokio`
+//! and `serde_json`.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -19,31 +18,31 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
 
-use super::protocol::{
-    SidecarCapability, SidecarCommand, SidecarConfig, SidecarEvent, SidecarProviderState,
-};
+use super::protocol::{InsertTextMode, SidecarCommand, SidecarFrame, SIDECAR_PROTOCOL_VERSION};
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// High-level events emitted by the manager. This is a curated subset
-/// of [`SidecarEvent`] tailored for the chatui consumer; raw protocol
-/// events that aren't actionable yet (e.g. `BargeIn`) are dropped.
+/// of [`SidecarFrame`] tailored for chatui consumers; plugin-specific
+/// frames that are not actionable by core are dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarLifecycleEvent {
-    /// Sidecar handshake complete; STT is available.
+    /// Sidecar handshake complete.
     Ready {
         protocol_version: u16,
         extension: String,
-        capabilities: Vec<SidecarCapability>,
+        capabilities: Vec<String>,
     },
-    /// Sidecar reports a state transition.
-    StateChanged(SidecarProviderState),
-    ListeningStarted,
-    ListeningStopped,
-    TranscribingStarted,
-    PartialTranscript(String),
-    /// Final transcript ready to insert into the input buffer.
-    FinalTranscript(String),
+    /// Sidecar reports a plugin-defined state transition.
+    StateChanged {
+        state: String,
+        label: Option<String>,
+    },
+    /// Sidecar wants text applied to the input buffer.
+    InsertText {
+        text: String,
+        mode: InsertTextMode,
+    },
     /// Sidecar reported an error message.
     Error(String),
     /// Sidecar process exited (clean or otherwise).
@@ -89,7 +88,7 @@ impl SidecarManager {
     pub async fn spawn(
         bin: &Path,
         args: &[String],
-        config: SidecarConfig,
+        config: serde_json::Value,
     ) -> Result<Self, SidecarError> {
         let mut command = Command::new(bin);
         command
@@ -125,7 +124,7 @@ impl SidecarManager {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let event = match serde_json::from_str::<SidecarEvent>(&line) {
+                let event = match serde_json::from_str::<SidecarFrame>(&line) {
                     Ok(ev) => ev,
                     Err(err) => {
                         let _ = event_tx
@@ -137,32 +136,31 @@ impl SidecarManager {
                     }
                 };
                 let mapped = match event {
-                    SidecarEvent::Hello {
+                    SidecarFrame::Hello {
                         protocol_version,
                         extension,
                         capabilities,
-                    } => Some(SidecarLifecycleEvent::Ready {
-                        protocol_version,
-                        extension,
-                        capabilities,
-                    }),
-                    SidecarEvent::Status { state, .. } => {
-                        Some(SidecarLifecycleEvent::StateChanged(state))
+                    } => {
+                        if protocol_version < SIDECAR_PROTOCOL_VERSION {
+                            Some(SidecarLifecycleEvent::Error(format!(
+                                "sidecar protocol v{protocol_version} is too old; host requires v{SIDECAR_PROTOCOL_VERSION}. Update the plugin via /plugins."
+                            )))
+                        } else {
+                            Some(SidecarLifecycleEvent::Ready {
+                                protocol_version,
+                                extension,
+                                capabilities,
+                            })
+                        }
                     }
-                    SidecarEvent::ListeningStarted => Some(SidecarLifecycleEvent::ListeningStarted),
-                    SidecarEvent::ListeningStopped => Some(SidecarLifecycleEvent::ListeningStopped),
-                    SidecarEvent::TranscribingStarted => {
-                        Some(SidecarLifecycleEvent::TranscribingStarted)
+                    SidecarFrame::Status { state, label, .. } => {
+                        Some(SidecarLifecycleEvent::StateChanged { state, label })
                     }
-                    SidecarEvent::PartialTranscript { text } => {
-                        Some(SidecarLifecycleEvent::PartialTranscript(text))
+                    SidecarFrame::InsertText { text, mode } => {
+                        Some(SidecarLifecycleEvent::InsertText { text, mode })
                     }
-                    SidecarEvent::FinalTranscript { text } => {
-                        Some(SidecarLifecycleEvent::FinalTranscript(text))
-                    }
-                    SidecarEvent::Error { message } => Some(SidecarLifecycleEvent::Error(message)),
-                    // Reserved for future capabilities; drop silently.
-                    SidecarEvent::VoiceCommand { .. } | SidecarEvent::BargeIn => None,
+                    SidecarFrame::Error { message } => Some(SidecarLifecycleEvent::Error(message)),
+                    SidecarFrame::Custom => None,
                 };
                 if let Some(event) = mapped {
                     if event_tx.send(event).await.is_err() {
@@ -196,14 +194,14 @@ impl SidecarManager {
         Ok(manager)
     }
 
-    /// Send a trigger-pressed command.
+    /// Send a trigger press command.
     pub async fn press(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::TriggerPressed).await
+        self.send(SidecarCommand::Trigger { name: "press".into(), payload: None }).await
     }
 
-    /// Send a trigger-released command.
+    /// Send a trigger release command.
     pub async fn release(&mut self) -> Result<(), SidecarError> {
-        self.send(SidecarCommand::TriggerReleased).await
+        self.send(SidecarCommand::Trigger { name: "release".into(), payload: None }).await
     }
 
     /// Send a graceful `shutdown` command and reap the child process.

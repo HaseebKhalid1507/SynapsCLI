@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn visible_categories_hides_sidecar_when_claim_has_settings_category() {
-        let claim = mk_claim("local-voice", "voice", Some("voice"));
+        let claim = mk_claim("sample-sidecar", "capture", Some("capture"));
         let v = visible_categories(&[claim]);
         assert_eq!(v.len(), 6);
         assert!(!v.contains(&Category::Sidecar));

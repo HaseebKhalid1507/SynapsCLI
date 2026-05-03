@@ -1,18 +1,10 @@
 //! Plugin-supplied sidecar spawn parameters.
 //!
-//! Phase 7 deassume-the-host slice F: removes the last hardcoded
-//! plugin name (`local-voice`) from `synaps-cli` core. Previously,
-//! `chatui/sidecar.rs` reached into the `local-voice` plugin's
-//! namespaced config to read `model_path` / `language` and assembled
-//! sidecar CLI arguments by hand — meaning core knew, by string
-//! literal, which plugin it was hosting.
-//!
-//! With this RPC the plugin owns its own bootstrap. Core asks
-//! `sidecar.spawn_args` and the plugin replies with the args to
-//! pass to its binary plus an optional handshake language. The
-//! plugin is free to source those values from anywhere it likes
-//! (its own config namespace, environment, autodetected hardware).
-//! Core never sees plugin-specific keys.
+//! This RPC keeps bootstrap ownership inside the selected plugin. Core asks
+//! `sidecar.spawn_args` and the plugin replies with the args to pass to its
+//! binary plus optional metadata. The plugin is free to source those values
+//! from anywhere it likes (its own config namespace, environment, hardware,
+//! or generated defaults). Core never sees plugin-specific keys.
 //!
 //! ## Wire shape (`sidecar.spawn_args` response)
 //!
@@ -39,8 +31,9 @@ pub struct SidecarSpawnArgs {
     /// as opaque.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Optional language hint for the [`crate::sidecar::protocol::SidecarConfig`]
-    /// handshake. If `None`, the handshake defaults apply.
+    /// Optional plugin-owned language hint. Core stores and forwards this
+    /// value only where a plugin explicitly asks for it; the sidecar
+    /// protocol does not prescribe language semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }

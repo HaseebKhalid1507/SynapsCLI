@@ -42,8 +42,8 @@ async fn manager_caches_plugin_info_after_initialize() {
         .plugin_info("info-test-ext")
         .expect("plugin info should be cached");
     assert_eq!(info.build.as_ref().unwrap().backend, "cpu");
-    assert_eq!(info.build.as_ref().unwrap().features, vec!["local-stt"]);
-    assert_eq!(info.capabilities[0].kind, "voice");
+    assert_eq!(info.build.as_ref().unwrap().features, vec!["fixture-backend"]);
+    assert_eq!(info.capabilities[0].kind, "fixture");
     assert_eq!(info.models[0].id, "ggml-tiny.en.bin");
     assert!(info.models[0].installed);
 
