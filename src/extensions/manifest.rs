@@ -23,6 +23,15 @@ pub struct ExtensionManifest {
     pub runtime: ExtensionRuntime,
     /// Command to start the extension process.
     pub command: String,
+    /// Optional path to a post-install setup script (relative to plugin
+    /// root). When present, the marketplace install flow runs this
+    /// script after the plugin source is in place — used by source-shipped
+    /// extensions (e.g. Rust binaries) that need to compile a binary
+    /// before [`Self::command`] resolves. Same security model as
+    /// `provides.sidecar.setup` (path must stay inside the plugin dir;
+    /// see [`crate::skills::post_install`] for the runner).
+    #[serde(default)]
+    pub setup: Option<String>,
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
@@ -301,6 +310,7 @@ mod tests {
             protocol_version: 999,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
             args: vec![],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![HookSubscription {
@@ -321,6 +331,7 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
             args: vec![],
             permissions: vec!["providers.register".to_string()],
             hooks: vec![],
@@ -336,6 +347,7 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
             args: vec![],
             permissions: vec!["session.lifecycle".to_string()],
             hooks: vec![HookSubscription {
@@ -358,6 +370,7 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),
+            setup: None,
             args: vec!["--verbose".to_string()],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![HookSubscription {

@@ -24,6 +24,7 @@ fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
         args: vec![fixture_path()],
         permissions: perms.into_iter().map(String::from).collect(),
         hooks: vec![],

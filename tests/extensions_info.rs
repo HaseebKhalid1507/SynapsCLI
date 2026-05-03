@@ -21,6 +21,7 @@ fn manifest() -> ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
         args: vec![fixture_path()],
         permissions: vec!["audio.input".to_string(), "config.subscribe".to_string()],
         hooks: vec![],
