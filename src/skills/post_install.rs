@@ -45,6 +45,46 @@ use std::time::Duration;
 
 use crate::skills::manifest::PluginManifest;
 
+/// Stable host-triple string used as the lookup key in
+/// [`crate::extensions::manifest::ExtensionManifest::prebuilt`]. We
+/// intentionally use a compact `<os>-<arch>` form (e.g.
+/// `linux-x86_64`, `darwin-arm64`, `windows-x86_64`) rather than full
+/// Rust target triples (`x86_64-unknown-linux-gnu`) because plugin
+/// authors hand-write these strings into JSON manifests — readability
+/// > pedantry.
+///
+/// Returns `None` for hosts we don't have a stable name for (caller
+/// then skips the prebuilt-fallback path and falls back to the setup
+/// script).
+pub fn host_triple() -> Option<&'static str> {
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        return None;
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        return None;
+    };
+    // Use a small static table so the returned slice is `'static`.
+    Some(match (os, arch) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "arm64") => "linux-arm64",
+        ("darwin", "x86_64") => "darwin-x86_64",
+        ("darwin", "arm64") => "darwin-arm64",
+        ("windows", "x86_64") => "windows-x86_64",
+        ("windows", "arm64") => "windows-arm64",
+        _ => return None,
+    })
+}
+
 /// Wall-clock cap on a single setup script. Sample from-scratch
 /// builds run ~5 minutes on a modern dev box; 10 minutes leaves a
 /// healthy margin for slower CI/older hardware without making a
@@ -266,6 +306,32 @@ mod tests {
     use crate::extensions::manifest::{ExtensionManifest, ExtensionRuntime};
     use crate::skills::manifest::{PluginProvides, SidecarManifest};
     use std::fs;
+
+    #[test]
+    fn host_triple_matches_compiled_target_when_supported() {
+        // Run-time check: triple must be one of the known stable strings
+        // on supported hosts (we test on linux/macos/windows in CI).
+        let known = [
+            "linux-x86_64", "linux-arm64",
+            "darwin-x86_64", "darwin-arm64",
+            "windows-x86_64", "windows-arm64",
+        ];
+        let got = host_triple();
+        if cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+            && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+        {
+            let s = got.expect("supported host should yield a triple");
+            assert!(known.contains(&s), "unexpected triple: {}", s);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn host_triple_is_linux_x86_64_on_this_box() {
+        // Sanity-pin for the dev box this is being authored on; harmless
+        // elsewhere because of the cfg gate.
+        assert_eq!(host_triple(), Some("linux-x86_64"));
+    }
 
     fn manifest_with_setup(setup: Option<&str>) -> PluginManifest {
         PluginManifest {
