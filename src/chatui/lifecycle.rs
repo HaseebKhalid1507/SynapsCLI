@@ -45,9 +45,14 @@ pub(super) fn setup_terminal() -> synaps_cli::Result<Term> {
         )
     );
     let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend).map_err(|e| {
+    let mut terminal = Terminal::new(backend).map_err(|e| {
         synaps_cli::error::RuntimeError::Tool(format!("terminal setup failed: {}", e))
     })?;
+    // Synaps renders its own input cursor in the ratatui buffer. Keeping the
+    // hardware cursor hidden for the whole TUI frame lifecycle prevents it from
+    // becoming visible at transient backend draw/scrub positions during
+    // high-frequency streaming redraws.
+    terminal.hide_cursor().ok();
     Ok(terminal)
 }
 
@@ -63,5 +68,8 @@ pub(super) fn teardown_terminal(terminal: &mut Term) {
         LeaveAlternateScreen
     )
     .ok();
+    // Restore the real terminal cursor on exit. It is intentionally kept hidden
+    // while the TUI is active because the chat input draws a stable block cursor
+    // as part of the ratatui frame.
     terminal.show_cursor().ok();
 }

@@ -362,13 +362,35 @@ pub(crate) fn draw(
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     secret_prompts: &synaps_cli::tools::SecretPromptQueue,
 ) -> io::Result<()> {
-    super::viewport::scrub_crossterm_terminal_edges(terminal, Style::default().bg(THEME.load().bg))?;
     let model = runtime.model();
     let thinking = runtime.thinking_level();
     // Don't draw while casino owns the terminal
     if app.gamba_child.is_some() {
         return Ok(());
     }
+
+    let term_size = terminal.size()?;
+    let has_subagents = !app.subagents.is_empty();
+    let subagent_height = if has_subagents {
+        (app.subagents.len() as u16 + 2).min(8) // cap at 6 agents visible
+    } else {
+        0
+    };
+    let input_inner_width = term_size.width.saturating_sub(2); // subtract border left+right
+    let (input_lines, _, _) = app.input_wrap_info(input_inner_width);
+    let max_input_lines: u16 = 10;
+    let input_height = (input_lines.min(max_input_lines)) + 2; // +2 for borders
+    let download_height: u16 = if !app.active_tasks.is_empty() { 1 } else { 0 };
+    let protected_bottom_rows = subagent_height
+        .saturating_add(download_height)
+        .saturating_add(input_height)
+        .saturating_add(1); // footer
+    super::viewport::scrub_crossterm_terminal_edges(
+        terminal,
+        protected_bottom_rows,
+        Style::default().bg(THEME.load().bg),
+    )?;
+
     terminal.draw(|frame| {
         // Subagent panel height: 2 (border top/bottom) + 1 per active agent
         let has_subagents = !app.subagents.is_empty();
@@ -879,11 +901,23 @@ pub(crate) fn draw(
         .block(input_block);
         frame.render_widget(input_widget, outer[4]);
 
-        // Cursor — position relative to scroll offset
-        frame.set_cursor_position((
-            outer[4].x + 1 + cursor_col,
-            outer[4].y + 1 + cursor_row - input_scroll,
-        ));
+        // Chat input cursor — draw it into the frame instead of using the
+        // terminal hardware cursor. This keeps the cursor cell anchored at the
+        // desired input location for every frame, including during streaming
+        // redraws and direct edge scrubs.
+        let cursor_x = outer[4].x + 1 + cursor_col;
+        let cursor_y = outer[4].y + 1 + cursor_row - input_scroll;
+        if cursor_x < outer[4].x.saturating_add(outer[4].width)
+            && cursor_y < outer[4].y.saturating_add(outer[4].height)
+        {
+            if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
+                let symbol = cell.symbol().to_string();
+                let cursor_symbol = if symbol.trim().is_empty() { " " } else { symbol.as_str() };
+                cell.set_symbol(cursor_symbol)
+                    .set_fg(THEME.load().bg)
+                    .set_bg(THEME.load().input_fg);
+            }
+        }
 
         // -- Active task progress bar ----------------------------------------
         // Renders a generic single-line widget above the input when any

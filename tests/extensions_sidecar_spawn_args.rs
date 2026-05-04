@@ -27,6 +27,7 @@ fn manifest() -> ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
         args: vec![fixture_path()],
         // Need at least one registration permission so the extension
         // is permitted to load with no hooks. `audio.input` matches

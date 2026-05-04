@@ -49,6 +49,20 @@ pub(crate) fn scrub_edge_columns_in_buffer(buf: &mut Buffer, area: Rect, style: 
     }
 }
 
+/// Compute the row range that is safe to physically scrub without touching the
+/// input/footer area. The input height is dynamic, so this must be derived per
+/// frame rather than using a fixed bottom margin.
+pub(crate) fn edge_scrub_area(size: Rect, protected_bottom_rows: u16) -> Option<Rect> {
+    // Skip the header plus the message pane's top border/padding area. This
+    // preserves top-level UI chrome while still covering the transcript rows
+    // that can accumulate edge residue during streaming redraws.
+    let skip_top = 2u16;
+    let safe_height = size
+        .height
+        .saturating_sub(skip_top.saturating_add(protected_bottom_rows));
+    (safe_height > 0).then(|| Rect::new(0, skip_top, size.width, safe_height))
+}
+
 /// Physically blank the terminal edge columns and reset ratatui's back buffer so
 /// the following draw does not optimize those blanks away.
 #[cfg(test)]
@@ -70,29 +84,33 @@ where
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn scrub_crossterm_terminal_edges<W>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
+    protected_bottom_rows: u16,
     style: Style,
 ) -> io::Result<()>
 where
     W: Write,
 {
     let size = terminal.size()?;
-    // Only scrub the interior rows, skip first 2 rows (header + top border)
-    // and last 4 rows (input box borders + status bar). This preserves
-    // border characters on widgets that use Borders::ALL.
-    let skip_top = 2u16;
-    let skip_bottom = 4u16;
-    let safe_height = size.height.saturating_sub(skip_top + skip_bottom);
-    if safe_height == 0 {
+    let Some(area) = edge_scrub_area(Rect::new(0, 0, size.width, size.height), protected_bottom_rows) else {
         return Ok(());
+    };
+
+    // This scrub writes directly to the terminal before ratatui's diff flush.
+    // The TUI keeps the hardware cursor hidden for its whole lifecycle and
+    // draws the input cursor into the ratatui buffer, so these transient backend
+    // cursor moves can never become visible.
+
+    {
+        let backend = terminal.backend_mut();
+        for (x, y) in edge_scrub_positions(area) {
+            backend.queue(MoveTo(x, y))?;
+            backend.queue(Print(" "))?;
+        }
+        std::io::Write::flush(backend)?;
     }
-    let area = Rect::new(0, skip_top, size.width, safe_height);
-    let backend = terminal.backend_mut();
-    for (x, y) in edge_scrub_positions(area) {
-        backend.queue(MoveTo(x, y))?;
-        backend.queue(Print(" "))?;
-    }
+
     scrub_edge_columns_in_buffer(terminal.current_buffer_mut(), area, style);
-    std::io::Write::flush(terminal.backend_mut())
+    Ok(())
 }
 
 /// Render a scrolled transcript viewport without relying on terminal scroll-region

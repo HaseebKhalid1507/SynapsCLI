@@ -24,6 +24,7 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
