@@ -23,6 +23,25 @@ pub struct ExtensionManifest {
     pub runtime: ExtensionRuntime,
     /// Command to start the extension process.
     pub command: String,
+    /// Optional path to a post-install setup script (relative to plugin
+    /// root). When present, the marketplace install flow runs this
+    /// script after the plugin source is in place — used by source-shipped
+    /// extensions (e.g. Rust binaries) that need to compile a binary
+    /// before [`Self::command`] resolves. Same security model as
+    /// `provides.sidecar.setup` (path must stay inside the plugin dir;
+    /// see [`crate::skills::post_install`] for the runner).
+    #[serde(default)]
+    pub setup: Option<String>,
+    /// Optional per-host-triple prebuilt asset map. When the installer
+    /// can't find [`Self::command`] on disk after the source clone, it
+    /// looks up the current host's triple (e.g. `linux-x86_64`,
+    /// `darwin-arm64`, `windows-x86_64` — see
+    /// [`crate::skills::post_install::host_triple`]) in this map and,
+    /// if a matching [`PrebuiltAsset`] exists, downloads and extracts
+    /// it into the plugin dir as a fast path that skips
+    /// [`Self::setup`]. Empty by default.
+    #[serde(default)]
+    pub prebuilt: std::collections::HashMap<String, PrebuiltAsset>,
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
@@ -37,9 +56,40 @@ pub struct ExtensionManifest {
     pub config: Vec<ExtensionConfigEntry>,
 }
 
+/// Per-host-triple prebuilt distribution asset for an extension. Lives
+/// inside [`ExtensionManifest::prebuilt`]. When a matching entry exists
+/// for the current host, the installer fetches `url`, verifies its
+/// SHA-256 against `sha256`, and extracts it into the plugin install
+/// directory — letting users skip a (potentially slow) source build.
+///
+/// The archive is expected to lay out files relative to the plugin root
+/// such that [`ExtensionManifest::command`] resolves after extraction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrebuiltAsset {
+    /// HTTPS URL of the archive (`.tar.gz` or `.zip`). The installer
+    /// refuses non-`https://` schemes and `file://` (except in tests
+    /// gated by `cfg(test)`).
+    pub url: String,
+    /// Hex-encoded SHA-256 of the archive bytes; **required**. The
+    /// installer aborts and surfaces an error if the downloaded bytes
+    /// don't match — same model as the existing marketplace
+    /// `checksum_value` for plugin sources.
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionConfigValueKind {
+    String,
+    Bool,
+    Number,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtensionConfigEntry {
     pub key: String,
+    #[serde(default, rename = "type")]
+    pub value_type: Option<ExtensionConfigValueKind>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -75,6 +125,7 @@ impl ExtensionManifest {
             matches!(
                 permission.as_str(),
                 "tools.register" | "providers.register" | "memory.read" | "memory.write"
+                    | "config.write" | "config.subscribe" | "audio.input" | "audio.output"
             )
         });
         if self.hooks.is_empty() && !has_capability_permission {
@@ -213,6 +264,31 @@ mod tests {
     }
 
     #[test]
+    fn extension_config_entry_deserializes_optional_type() {
+        let json = r#"{
+            "key": "backend",
+            "type": "string",
+            "description": "Backend selector",
+            "default": "auto"
+        }"#;
+
+        let entry: ExtensionConfigEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.key, "backend");
+        assert_eq!(entry.value_type, Some(ExtensionConfigValueKind::String));
+        assert_eq!(entry.description.as_deref(), Some("Backend selector"));
+        assert_eq!(entry.default, Some(serde_json::Value::String("auto".to_string())));
+    }
+
+    #[test]
+    fn extension_config_entry_omitted_type_is_none() {
+        let json = r#"{"key": "backend"}"#;
+
+        let entry: ExtensionConfigEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.key, "backend");
+        assert_eq!(entry.value_type, None);
+    }
+
+    #[test]
     fn hook_subscription_tool_defaults_to_none() {
         let json = r#"{
             "runtime": "process",
@@ -265,6 +341,8 @@ mod tests {
             protocol_version: 999,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![HookSubscription {
@@ -285,6 +363,8 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![],
             permissions: vec!["providers.register".to_string()],
             hooks: vec![],
@@ -300,6 +380,8 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![],
             permissions: vec!["session.lifecycle".to_string()],
             hooks: vec![HookSubscription {
@@ -322,6 +404,8 @@ mod tests {
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec!["--verbose".to_string()],
             permissions: vec!["tools.intercept".to_string()],
             hooks: vec![HookSubscription {
@@ -391,5 +475,54 @@ mod tests {
         let rt = ExtensionRuntime::Process;
         let json = serde_json::to_string(&rt).unwrap();
         assert_eq!(json, r#""process""#);
+    }
+
+    #[test]
+    fn extension_manifest_defaults_prebuilt_to_empty_when_absent() {
+        // Older manifests without `prebuilt` must still parse cleanly.
+        let json = r#"{
+            "runtime": "process",
+            "command": "bin/ext"
+        }"#;
+        let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert!(m.prebuilt.is_empty());
+        assert!(m.setup.is_none());
+    }
+
+    #[test]
+    fn extension_manifest_round_trips_prebuilt_assets() {
+        let json = r#"{
+            "runtime": "process",
+            "command": "bin/ext",
+            "prebuilt": {
+                "linux-x86_64": {
+                    "url": "https://example.com/ext-linux-x86_64.tar.gz",
+                    "sha256": "abc123"
+                },
+                "darwin-arm64": {
+                    "url": "https://example.com/ext-darwin-arm64.tar.gz",
+                    "sha256": "def456"
+                }
+            }
+        }"#;
+        let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.prebuilt.len(), 2);
+        let linux = m.prebuilt.get("linux-x86_64").expect("linux entry");
+        assert_eq!(linux.url, "https://example.com/ext-linux-x86_64.tar.gz");
+        assert_eq!(linux.sha256, "abc123");
+        // Round-trip
+        let back = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            back["prebuilt"]["darwin-arm64"]["sha256"],
+            serde_json::Value::String("def456".to_string())
+        );
+    }
+
+    #[test]
+    fn prebuilt_asset_requires_both_url_and_sha256() {
+        // Missing sha256 must error — no silent acceptance of unverified assets.
+        let json = r#"{ "url": "https://example.com/x.tar.gz" }"#;
+        let res: Result<PrebuiltAsset, _> = serde_json::from_str(json);
+        assert!(res.is_err(), "PrebuiltAsset without sha256 must fail to parse");
     }
 }

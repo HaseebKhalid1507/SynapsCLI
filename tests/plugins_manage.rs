@@ -96,6 +96,7 @@ async fn end_to_end_add_install_uninstall() {
         source_subdir: None,
         checksum_algorithm: None,
         checksum_value: None,
+        setup_status: Default::default(),
     });
 
     let state_path = tmp.path().join("plugins.json");

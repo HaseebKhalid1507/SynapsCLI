@@ -48,7 +48,7 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override (default: claude-opus-4-7). Use claude-sonnet-4-6 for lighter tasks."
+                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
                 },
                 "timeout": {
                     "type": "integer",
@@ -208,7 +208,7 @@ impl Tool for SubagentStartTool {
                                     crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
                                         state_a.write().unwrap().partial_text.push_str(&text);
                                     }
-                                    crate::StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => {
+                                    crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                                         tool_count += 1;
                                         if let Some(ref tx) = tx_events_a {
                                             let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentUpdate {

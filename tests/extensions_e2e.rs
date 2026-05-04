@@ -141,6 +141,8 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["tools.intercept".to_string()],
         hooks: vec![
@@ -250,6 +252,8 @@ async fn extension_tools_are_registered_in_tool_registry() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["tools.register".to_string()],
         hooks: vec![],
@@ -308,6 +312,8 @@ async fn extension_registering_tools_requires_tools_register_permission() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "env".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![
             format!("SYNAPS_REGISTER_TOOL_PID_FILE={}", pid_file.display()),
             "python3".to_string(),
@@ -357,6 +363,8 @@ async fn extension_tool_specs_are_validated() {
             protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "env".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![
                 format!("SYNAPS_REGISTER_TOOL_MODE={mode}"),
                 "python3".to_string(),
@@ -386,6 +394,8 @@ async fn extension_provider_metadata_is_registered_when_permission_is_declared()
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
@@ -426,6 +436,8 @@ async fn provider_capability_specs_are_validated() {
             protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "env".to_string(),
+            setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec![
                 format!("SYNAPS_PROVIDER_MODE={mode}"),
                 "python3".to_string(),
@@ -451,12 +463,18 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
+    synaps_cli::extensions::config_store::write_plugin_config(
+        "config-test",
+        "endpoint",
+        "http://localhost:1234",
+    )
+    .unwrap();
     fs::write(home.path().join("config"), "extension.config-test.endpoint = http://localhost:1234\n").unwrap();
     std::env::set_var("CONFIG_TEST_TOKEN", "secret-token");
 
     let fixture = std::env::current_dir()
         .unwrap()
-        .join("tests/fixtures/config_extension.py")
+        .join("tests/fixtures/config_seen_extension.py")
         .to_string_lossy()
         .to_string();
     let plugin_dir = tempfile::tempdir().unwrap();
@@ -466,6 +484,8 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["tools.intercept".to_string()],
         hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
@@ -476,6 +496,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
         config: vec![
             ExtensionConfigEntry {
                 key: "endpoint".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -483,6 +504,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "mode".to_string(),
+                value_type: None,
                 description: None,
                 required: false,
                 default: Some(serde_json::json!("safe")),
@@ -490,6 +512,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
             },
             ExtensionConfigEntry {
                 key: "token".to_string(),
+                value_type: None,
                 description: None,
                 required: true,
                 default: None,
@@ -519,6 +542,8 @@ async fn extension_missing_required_config_fails_before_spawn() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "/definitely/not/spawned".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![],
         permissions: vec!["tools.intercept".to_string()],
         hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
@@ -528,6 +553,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
         }],
         config: vec![ExtensionConfigEntry {
             key: "endpoint".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -561,11 +587,14 @@ async fn extension_provider_complete_routes_to_process() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -620,11 +649,14 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,
@@ -702,6 +734,8 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
@@ -1057,11 +1091,14 @@ async fn audit_log_records_disabled_route() {
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],
         config: vec![ExtensionConfigEntry {
             key: "prefix".to_string(),
+            value_type: None,
             description: None,
             required: true,
             default: None,

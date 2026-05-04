@@ -2,9 +2,9 @@
 //! Centralized so the settings dropdown, defaults, and subagent hints agree.
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
+    ("claude-sonnet-4-6",         "Sonnet 4.6 — balanced (default)"),
     ("claude-opus-4-7",           "Opus 4.7 — most capable"),
     ("claude-opus-4-6",           "Opus 4.6 — previous flagship"),
-    ("claude-sonnet-4-6",         "Sonnet 4.6 — balanced"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
 ];
 

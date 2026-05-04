@@ -29,9 +29,15 @@ pub(super) enum InputAction {
     /// Plugins modal emitted an outcome — handled in the async main loop
     /// because most variants perform async I/O (network, filesystem).
     PluginsOutcome(super::plugins::InputOutcome),
+    /// /help find lightbox emitted an outcome.
+    HelpFindOutcome,
     /// Settings modal asked to open the plugins marketplace as a nested overlay.
     OpenPluginsMarketplace,
     PingModels,
+    /// Open a plugin-owned custom settings editor via `settings.editor.open`.
+    PluginEditorOpen { plugin_id: String, category: String, field: String },
+    /// Forward a keypress to the active plugin-owned custom settings editor.
+    PluginEditorKey { plugin_id: String, category: String, field: String, key: crossterm::event::KeyEvent },
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -43,6 +49,20 @@ pub(super) fn handle_event(
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
+    // Route events to /help find while it's open.
+    if let Some(state) = app.help_find.as_mut() {
+        if let Event::Key(key) = event {
+            let outcome = super::help_find::handle_event(state, key);
+            return match outcome {
+                super::help_find::HelpFindAction::Close => {
+                    app.help_find = None;
+                    InputAction::None
+                }
+                super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+            };
+        }
+        return InputAction::None;
+    }
     // Route events to the models modal while it's open.
     if let Some(state) = app.models.as_mut() {
         if let Event::Key(key) = event {
@@ -80,6 +100,21 @@ pub(super) fn handle_event(
     }
     // Route events to the settings modal while it's open.
     if let Some(state) = app.settings.as_mut() {
+        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
+            if let Event::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    state.edit_mode = None;
+                    return InputAction::None;
+                }
+                return InputAction::PluginEditorKey {
+                    plugin_id: plugin_id.clone(),
+                    category: category.clone(),
+                    field: field.clone(),
+                    key,
+                };
+            }
+            return InputAction::None;
+        }
         // Handle paste into active editors (API key, text, custom model)
         if let Event::Paste(text) = event {
             match &mut state.edit_mode {
@@ -103,6 +138,27 @@ pub(super) fn handle_event(
                 super::settings::InputOutcome::None => {}
                 super::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
+                }
+                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
+                    let row_key = format!("plugin.{}.{}", plugin_id, key);
+                    match synaps_cli::extensions::config_store::write_plugin_config(
+                        &plugin_id, &key, &value,
+                    ) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((row_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((row_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                    return InputAction::PluginEditorOpen {
+                        plugin_id,
+                        category,
+                        field: key,
+                    };
                 }
                 super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
                     let cfg_key = format!("provider.{}", provider_id);
@@ -333,6 +389,18 @@ fn handle_key(
 
     // Plugin/user keybinds — check before core binds, but only when not streaming
     if !streaming {
+        // Trace modifier-heavy or special keys to help debug "key X not
+        // working" issues across terminals. Plain typing isn't logged.
+        let traceable = matches!(code, KeyCode::F(_))
+            || modifiers.contains(KeyModifiers::CONTROL)
+            || modifiers.contains(KeyModifiers::ALT);
+        if traceable {
+            tracing::info!(
+                ?code,
+                ?modifiers,
+                "key event received in chatui input"
+            );
+        }
         if let Some(bind) = keybinds.match_key(code, modifiers) {
             use synaps_cli::skills::keybinds::KeybindAction;
             return match &bind.action {
@@ -374,6 +442,9 @@ fn handle_key(
             return process_streaming_submit(app);
         }
         (KeyCode::Tab, _) if app.input.starts_with('/') && app.input.len() > 1 => {
+            if open_help_find_for_ambiguous_slash(app, registry) {
+                return InputAction::HelpFindOutcome;
+            }
             handle_tab_complete(app, registry);
             // Skip the tab_cycle reset below — we just set it.
             return InputAction::None;
@@ -483,6 +554,24 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
+    let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
+        return false;
+    };
+    let help_registry = synaps_cli::help::HelpRegistry::new(
+        synaps_cli::help::builtin_entries(),
+        registry.plugin_help_entries(),
+    );
+    if help_registry.command_prefix_match_count(&query) < 2 {
+        return false;
+    }
+    app.help_find = Some(synaps_cli::help::HelpFindState::new(
+        help_registry.entries().to_vec(),
+        &query,
+    ));
+    true
 }
 
 /// Tab completion for slash commands. First Tab completes to the longest
