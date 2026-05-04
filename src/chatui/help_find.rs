@@ -1,0 +1,280 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, BorderType, Clear, Paragraph},
+    Frame,
+};
+
+use super::theme::THEME;
+
+pub(crate) enum HelpFindAction {
+    None,
+    Close,
+}
+
+pub(crate) fn handle_event(state: &mut synaps_cli::help::HelpFindState, key: KeyEvent) -> HelpFindAction {
+    if state.detail_entry().is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                state.close_detail();
+                return HelpFindAction::None;
+            }
+            _ => return HelpFindAction::None,
+        }
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => HelpFindAction::Close,
+        (KeyCode::Enter, _) => {
+            state.open_selected();
+            HelpFindAction::None
+        }
+        (KeyCode::Up, _) => {
+            state.move_up();
+            HelpFindAction::None
+        }
+        (KeyCode::Down, _) => {
+            state.move_down();
+            HelpFindAction::None
+        }
+        (KeyCode::Backspace, _) => {
+            state.backspace();
+            HelpFindAction::None
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            state.clear_filter();
+            HelpFindAction::None
+        }
+        (KeyCode::Char(ch), KeyModifiers::NONE) | (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
+            state.push_char(ch);
+            HelpFindAction::None
+        }
+        _ => HelpFindAction::None,
+    }
+}
+
+pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help::HelpFindState) {
+    let width = ((area.width as u32 * 8 / 10) as u16).max(50).min(area.width);
+    let height = ((area.height as u32 * 8 / 10) as u16).max(14).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let modal = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(" Find help ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.load().border_active));
+    let inner = padded_rect(block.inner(modal), 2, 1);
+    frame.render_widget(block, modal);
+
+    if let Some(entry) = state.detail_entry().cloned() {
+        render_detail(frame, modal, &entry);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled("Search: ", Style::default().fg(THEME.load().muted)),
+        Span::styled(state.filter().to_string(), Style::default().fg(THEME.load().input_fg)),
+    ]));
+    frame.render_widget(search, chunks[0]);
+
+    let visible_height = chunks[1].height as usize;
+    state.set_visible_height(visible_height);
+    let rows = state.filtered_rows();
+    let result_count = state.filtered_entries().len();
+    let lines: Vec<Line<'static>> = if rows.is_empty() {
+        state
+            .no_results_message()
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
+            .collect()
+    } else {
+        let rendered_rows = render_help_find_rows(&rows, state, chunks[1].width as usize);
+        let row_heights = rendered_rows.iter().map(Vec::len).collect::<Vec<_>>();
+        let start = synaps_cli::help::visible_help_find_window(
+            &row_heights,
+            state.cursor(),
+            state.scroll(),
+            visible_height,
+        );
+        let mut used_height = 0usize;
+        rendered_rows
+            .into_iter()
+            .skip(start)
+            .take_while(|row_lines| {
+                let next = used_height + row_lines.len().max(1);
+                if next <= visible_height {
+                    used_height = next;
+                    true
+                } else {
+                    false
+                }
+            })
+            .flatten()
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let footer = format!("{} result{}  ↑↓ move  Enter details  type filter  Esc close", result_count, if result_count == 1 { "" } else { "s" });
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(THEME.load().muted)))),
+        chunks[2],
+    );
+}
+
+fn highlighted_spans(text: &str, query: &str, base: Style, matched: Style) -> Vec<Span<'static>> {
+    synaps_cli::help::highlight_segments(text, query)
+        .into_iter()
+        .map(|segment| Span::styled(segment.text, if segment.matched { matched } else { base }))
+        .collect()
+}
+
+fn render_help_find_rows(
+    rows: &[synaps_cli::help::HelpFindRow<'_>],
+    state: &synaps_cli::help::HelpFindState,
+    width: usize,
+) -> Vec<Vec<Line<'static>>> {
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| match row {
+            synaps_cli::help::HelpFindRow::Category(category) => {
+                let spacer = if idx == 0 { Vec::new() } else { vec![Line::from("")] };
+                spacer
+                    .into_iter()
+                    .chain(std::iter::once(Line::from(Span::styled(
+                        category.to_string(),
+                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
+                    ))))
+                    .collect()
+            }
+            synaps_cli::help::HelpFindRow::Entry(entry) => {
+                let selected = idx == state.cursor();
+                let marker = if selected { "›" } else { " " };
+                let command_style = if selected {
+                    Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(THEME.load().input_fg)
+                };
+                let summary_style = Style::default().fg(THEME.load().muted);
+                let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
+                wrapped_entry_lines(marker, entry, state.filter(), width, command_style, summary_style, match_style)
+            }
+        })
+        .collect()
+}
+
+fn wrapped_entry_lines(
+    marker: &str,
+    entry: &synaps_cli::help::HelpEntry,
+    query: &str,
+    width: usize,
+    command_style: Style,
+    summary_style: Style,
+    match_style: Style,
+) -> Vec<Line<'static>> {
+    let selected = marker == "›";
+    synaps_cli::help::wrap_help_find_entry_lines(&entry.command, &entry.summary, selected, width)
+        .into_iter()
+        .map(|(command_part, summary)| {
+            let mut spans = highlighted_spans(&command_part, query, command_style, match_style);
+            if !summary.is_empty() {
+                if !command_part.trim().is_empty() {
+                    spans.push(Span::raw("  "));
+                }
+                spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn padded_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(horizontal),
+        area.y.saturating_add(vertical),
+        area.width.saturating_sub(horizontal.saturating_mul(2)),
+        area.height.saturating_sub(vertical.saturating_mul(2)),
+    )
+}
+
+fn wrapped_raw_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    synaps_cli::help::wrap_help_text(text, width)
+        .into_iter()
+        .map(|line| Line::from(Span::raw(line)))
+        .collect()
+}
+
+fn wrapped_styled_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    synaps_cli::help::wrap_help_text(text, width)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect()
+}
+
+fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpEntry) {
+    let block = Block::default()
+        .title(format!(" {} ", entry.command))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.load().border_active));
+    let inner = padded_rect(block.inner(modal), 2, 1);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(block, modal);
+
+    let mut lines = vec![
+        Line::from(Span::styled(entry.title.clone(), Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    lines.extend(wrapped_styled_lines(&entry.summary, inner.width as usize, Style::default().fg(THEME.load().input_fg)));
+    if let Some(source) = synaps_cli::help::source_display(entry) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Source: {}", source),
+            Style::default().fg(THEME.load().muted),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.extend(entry.lines.iter().flat_map(|line| {
+        wrapped_raw_lines(line, inner.width as usize)
+    }));
+    if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Usage", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
+        lines.extend(wrapped_raw_lines(&format!("  {}", usage), inner.width as usize));
+    }
+    if !entry.examples.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Examples", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
+        for example in &entry.examples {
+            let rendered = if example.description.trim().is_empty() {
+                format!("  {}", example.command)
+            } else {
+                format!("  {:<16} {}", example.command, example.description)
+            };
+            lines.extend(wrapped_raw_lines(&rendered, inner.width as usize));
+        }
+    }
+    lines.push(Line::from(""));
+    if !entry.related.is_empty() {
+        lines.extend(wrapped_styled_lines(
+            &format!("Related: {}", entry.related.join(", ")),
+            inner.width as usize,
+            Style::default().fg(THEME.load().muted),
+        ));
+    }
+    lines.push(Line::from(Span::styled("Esc back", Style::default().fg(THEME.load().muted))));
+    frame.render_widget(Paragraph::new(lines), inner);
+}

@@ -326,10 +326,10 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     history.push(HistoryEntry::Text { content: text, time: ts });
                 }
             }
-            StreamEvent::Llm(LlmEvent::ToolUseStart(tool_name)) => {
+            StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
                 let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
             }
-            StreamEvent::Llm(LlmEvent::ToolUseDelta(delta)) => {
+            StreamEvent::Llm(LlmEvent::ToolUseDelta { delta, .. }) => {
                 let _ = broadcast.send(ServerMessage::ToolUseDelta(delta));
             }
             StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {

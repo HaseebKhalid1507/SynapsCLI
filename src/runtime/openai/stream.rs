@@ -191,7 +191,7 @@ pub(crate) async fn call_codex_stream_inner(
         "model": cfg.model,
         "store": false,
         "stream": true,
-        "instructions": system_prompt.clone().unwrap_or_default(),
+        "instructions": codex_instructions(system_prompt),
         "input": codex_input_messages(oai_messages),
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -269,6 +269,17 @@ pub(crate) async fn call_codex_stream_inner(
     }))
 }
 
+const CODEX_AUTONOMOUS_LOOP_POLICY: &str = "\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]";
+
+fn codex_instructions(system_prompt: &Option<String>) -> String {
+    let mut instructions = system_prompt.clone().unwrap_or_default();
+    if instructions.contains("[Synaps autonomous harness policy]") {
+        return instructions;
+    }
+    instructions.push_str(CODEX_AUTONOMOUS_LOOP_POLICY);
+    instructions
+}
+
 fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
@@ -328,6 +339,23 @@ struct CodexToolAccumulator {
     started: bool,
 }
 
+/// Parse a function-call arguments string into a JSON `Value`, mirroring
+/// `runtime::api::parse_tool_input` so the chat UI's `LlmEvent::ToolUse`
+/// handling sees the same shape regardless of provider.
+///
+/// Empty / whitespace input becomes `{}`. Invalid JSON becomes
+/// `{"__parse_error": "..."}` — the agent loop already understands that
+/// shape and converts it into an `is_error: true` tool_result.
+fn parse_tool_arguments(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => json!({ "__parse_error": format!("invalid tool input JSON: {}", e) }),
+    }
+}
+
 impl CodexSseDecoder {
     fn push_line(
         &mut self,
@@ -384,8 +412,12 @@ impl CodexSseDecoder {
                 if !delta.is_empty() {
                     let tool = self.ensure_tool(idx);
                     tool.arguments.push_str(delta);
+                    let tool_id = tool.id.clone();
                     let _ = tx.send(StreamEvent::Llm(
-                        crate::runtime::types::LlmEvent::ToolUseDelta(delta.to_string()),
+                        crate::runtime::types::LlmEvent::ToolUseDelta {
+                            tool_id,
+                            delta: delta.to_string(),
+                        },
                     ));
                 }
             }
@@ -433,7 +465,10 @@ impl CodexSseDecoder {
         if !tool.started && !tool.name.is_empty() {
             tool.started = true;
             let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUseStart(tool.name.clone()),
+                crate::runtime::types::LlmEvent::ToolUseStart {
+                    tool_name: tool.name.clone(),
+                    tool_id: tool.id.clone(),
+                },
             ));
         }
     }
@@ -464,7 +499,10 @@ impl CodexSseDecoder {
         if !tool.started && !tool.name.is_empty() {
             tool.started = true;
             let _ = tx.send(StreamEvent::Llm(
-                crate::runtime::types::LlmEvent::ToolUseStart(tool.name.clone()),
+                crate::runtime::types::LlmEvent::ToolUseStart {
+                    tool_name: tool.name.clone(),
+                    tool_id: tool.id.clone(),
+                },
             ));
         }
         let completed = if !tool.id.is_empty() && !tool.name.is_empty() {
@@ -483,6 +521,21 @@ impl CodexSseDecoder {
             if self.completed_tools.iter().any(|done| done.id == call.id) {
                 return;
             }
+            // Emit the finalized `ToolUse` event so the chat UI can collapse
+            // the streaming `ToolUseStart` (animated) into a stable
+            // `ToolUse` block. Without this the bash-trace animation
+            // persists forever and parallel tool blocks render as "still
+            // running" even after they've completed. Mirrors the
+            // Anthropic path in `runtime/api.rs` which emits the same
+            // event on tool-use content_block_stop.
+            let input = parse_tool_arguments(&call.function.arguments);
+            let _ = tx.send(StreamEvent::Llm(
+                crate::runtime::types::LlmEvent::ToolUse {
+                    tool_name: call.function.name.clone(),
+                    tool_id: call.id.clone(),
+                    input,
+                },
+            ));
             self.completed_tools.push(ToolCall {
                 id: call.id,
                 kind: call.kind,
@@ -583,6 +636,15 @@ mod codex_input_messages_tests {
                 arguments: r#"{"command":"ls"}"#.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn codex_instructions_appends_autonomous_loop_policy() {
+        let instructions = codex_instructions(&Some("Project-specific rules.".to_string()));
+        assert!(instructions.contains("Project-specific rules."));
+        assert!(instructions.contains("Do not stop at phase boundaries"));
+        assert!(instructions.contains("Do not ask the user whether to continue"));
+        assert!(instructions.contains("continue autonomously until the full requested job is complete"));
     }
 
     #[test]
@@ -713,21 +775,33 @@ mod codex_decoder_tests {
         let starts: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUseStart(name)) => Some(name.as_str()),
+                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
+                    Some((tool_name.as_str(), tool_id.as_str()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(starts, vec!["bash"], "exactly one ToolUseStart");
+        assert_eq!(
+            starts,
+            vec![("bash", "call_abc")],
+            "exactly one ToolUseStart with correct tool_id"
+        );
 
-        // Two argument deltas streamed.
+        // Two argument deltas streamed (each carrying the tool_id so
+        // parallel calls can be routed correctly by the chat UI).
         let deltas: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Llm(LlmEvent::ToolUseDelta(d)) => Some(d.as_str()),
+                StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
+                    Some((tool_id.as_str(), delta.as_str()))
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas, vec![r#"{"cmd""#, r#":"ls"}"#]);
+        assert_eq!(
+            deltas,
+            vec![("call_abc", r#"{"cmd""#), ("call_abc", r#":"ls"}"#)]
+        );
     }
 
     #[test]
@@ -757,6 +831,104 @@ mod codex_decoder_tests {
         assert_eq!(by_id["call_1"].function.arguments, r#"{"cmd":"ls"}"#);
         assert_eq!(by_id["call_2"].function.name, "read");
         assert_eq!(by_id["call_2"].function.arguments, r#"{"path":"a"}"#);
+    }
+
+    #[test]
+    fn output_item_done_emits_tool_use_event() {
+        // Regression: the codex decoder must emit `LlmEvent::ToolUse` once a
+        // function_call's `output_item.done` arrives so the chat UI can
+        // collapse `ChatMessage::ToolUseStart` (animated) into the finalized
+        // `ChatMessage::ToolUse`. Without this the bash-trace animation
+        // persists forever and parallel tool blocks render as "still
+        // running" even after they've completed.
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_abc","name":"bash"}}"#,
+            "",
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"ls\"}"}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_abc","name":"bash","arguments":"{\"command\":\"ls\"}"}}"#,
+            "",
+        ];
+        let (_decoder, _text, events) = drive(&lines);
+
+        let tool_uses: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
+                    Some((tool_name.as_str(), tool_id.as_str(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_uses.len(), 1, "expected exactly one ToolUse finalize event");
+        assert_eq!(tool_uses[0].0, "bash");
+        assert_eq!(tool_uses[0].1, "call_abc");
+        assert_eq!(
+            tool_uses[0].2,
+            serde_json::json!({"command": "ls"}),
+            "input must be parsed as a JSON Value, not a string"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_emit_tool_use_per_index() {
+        // Regression: parallel tool calls must each get their own ToolUse
+        // finalize event with the correct tool_id, so the chat UI can route
+        // their results back to the right block by id.
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"bash"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_2","name":"read"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"a\"}"}}"#,
+            "",
+        ];
+        let (_decoder, _text, events) = drive(&lines);
+
+        let tool_uses: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
+                    Some((tool_name.clone(), tool_id.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tool_uses.len(), 2, "one ToolUse finalize per parallel call");
+        let by_id: std::collections::BTreeMap<&str, &(String, String, serde_json::Value)> =
+            tool_uses.iter().map(|t| (t.1.as_str(), t)).collect();
+        assert_eq!(by_id["call_1"].0, "bash");
+        assert_eq!(by_id["call_1"].2, serde_json::json!({"command": "ls"}));
+        assert_eq!(by_id["call_2"].0, "read");
+        assert_eq!(by_id["call_2"].2, serde_json::json!({"path": "a"}));
+    }
+
+    #[test]
+    fn malformed_arguments_emit_tool_use_with_parse_error() {
+        // If the model produces invalid JSON arguments, surface a structured
+        // parse error in the `input` (matching how the Anthropic path
+        // handles it via parse_tool_input) so the agent loop can return an
+        // error tool_result instead of silently dropping the tool.
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_bad","name":"bash"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_bad","name":"bash","arguments":"{not json"}}"#,
+            "",
+        ];
+        let (_decoder, _text, events) = drive(&lines);
+
+        let tool_use = events.iter().find_map(|e| match e {
+            StreamEvent::Llm(LlmEvent::ToolUse { input, .. }) => Some(input.clone()),
+            _ => None,
+        });
+        let input = tool_use.expect("ToolUse event missing");
+        assert!(
+            input.get("__parse_error").and_then(Value::as_str).is_some(),
+            "malformed arguments must surface __parse_error, got {input}"
+        );
     }
 
     #[test]

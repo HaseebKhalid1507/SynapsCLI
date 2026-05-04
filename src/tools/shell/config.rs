@@ -59,6 +59,7 @@ fn default_prompt_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use crate::core::config::load_config;
 
     #[test]
@@ -74,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_shell_config_from_file() {
         // These tests must run sequentially since they mutate HOME env var.
         // Combined into one test to avoid parallel races.
@@ -88,10 +90,15 @@ mod tests {
             std::fs::write(&config_path, config_content).unwrap();
 
             let original_home = std::env::var("HOME").ok();
+            let original_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+            std::env::remove_var("SYNAPS_BASE_DIR");
             std::env::set_var("HOME", "/tmp/synaps-shell-test-1");
             let config = load_config();
             if let Some(home) = original_home {
                 std::env::set_var("HOME", home);
+            }
+            if let Some(base_dir) = original_base_dir {
+                std::env::set_var("SYNAPS_BASE_DIR", base_dir);
             }
             let _ = std::fs::remove_dir_all("/tmp/synaps-shell-test-1");
 
@@ -113,10 +120,15 @@ mod tests {
             std::fs::write(&config_path, config_content).unwrap();
 
             let original_home = std::env::var("HOME").ok();
+            let original_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+            std::env::remove_var("SYNAPS_BASE_DIR");
             std::env::set_var("HOME", "/tmp/synaps-shell-test-2");
             let config = load_config();
             if let Some(home) = original_home {
                 std::env::set_var("HOME", home);
+            }
+            if let Some(base_dir) = original_base_dir {
+                std::env::set_var("SYNAPS_BASE_DIR", base_dir);
             }
             let _ = std::fs::remove_dir_all("/tmp/synaps-shell-test-2");
 
@@ -136,10 +148,15 @@ mod tests {
             std::fs::write(&config_path, config_content).unwrap();
 
             let original_home = std::env::var("HOME").ok();
+            let original_base_dir = std::env::var("SYNAPS_BASE_DIR").ok();
+            std::env::remove_var("SYNAPS_BASE_DIR");
             std::env::set_var("HOME", "/tmp/synaps-shell-test-3");
             let config = load_config();
             if let Some(home) = original_home {
                 std::env::set_var("HOME", home);
+            }
+            if let Some(base_dir) = original_base_dir {
+                std::env::set_var("SYNAPS_BASE_DIR", base_dir);
             }
             let _ = std::fs::remove_dir_all("/tmp/synaps-shell-test-3");
 

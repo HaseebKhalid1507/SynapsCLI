@@ -1,8 +1,8 @@
 //! Unified capability snapshot for extensions.
 //!
 //! Aggregates hook subscriptions, extension-provided tools, and registered
-//! providers into a single per-extension summary. Future capabilities
-//! (memory, indexer, voice) plug in here.
+//! providers into a single per-extension summary. Plugin-declared
+//! capability kinds plug in here without core enumeration.
 
 use crate::extensions::providers::RegisteredProviderSummary;
 use crate::extensions::runtime::ExtensionHealth;
@@ -15,7 +15,7 @@ pub struct ExtensionCapabilitySnapshot {
     pub hooks: Vec<HookCapabilityEntry>,
     pub tools: Vec<ToolCapabilityEntry>,
     pub providers: Vec<RegisteredProviderSummary>,
-    /// Future: memory, indexer, voice. Empty for now.
+    /// Plugin-declared capability entries. Empty when none are advertised.
     pub future: Vec<FutureCapabilityEntry>,
 }
 
@@ -35,7 +35,7 @@ pub struct ToolCapabilityEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FutureCapabilityEntry {
-    pub kind: String, // "memory" | "indexer" | "voice"
+    pub kind: String, // free-form capability kind declared by the plugin
     pub name: String,
 }
 

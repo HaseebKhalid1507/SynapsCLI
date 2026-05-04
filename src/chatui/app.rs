@@ -9,9 +9,26 @@ pub(crate) enum ChatMessage {
     User(String),
     Thinking(String),
     Text(String),
-    ToolUseStart(String, String),  // (tool_name, partial_input)
-    ToolUse { tool_name: String, input: String },
-    ToolResult { content: String, elapsed_ms: Option<u64> },
+    /// Streaming tool-use placeholder. `tool_id` lets the chat UI route
+    /// subsequent input deltas and the final finalize event to *this*
+    /// block when multiple tools run in parallel — without it, the
+    /// "always update last message" hack misroutes deltas/results to
+    /// whichever tool block happens to be most recent.
+    ToolUseStart {
+        tool_id: String,
+        tool_name: String,
+        partial_input: String,
+    },
+    ToolUse {
+        tool_id: String,
+        tool_name: String,
+        input: String,
+    },
+    ToolResult {
+        tool_id: String,
+        content: String,
+        elapsed_ms: Option<u64>,
+    },
     Error(String),
     System(String),
     Event { source: String, severity: String, text: String },
@@ -62,6 +79,7 @@ pub(crate) struct App {
     pub(crate) api_call_count: u32,
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
+    pub(crate) agent_name: String,
     /// Cached wrapped+highlighted message lines.
     /// `None` means "stale — rebuild on next draw". `Some((w, lines))` means
     /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
@@ -77,6 +95,10 @@ pub(crate) struct App {
     /// Counter for unique subagent IDs within a session
     /// Tracks when the current tool started executing (for elapsed time display)
     pub(crate) tool_start_time: Option<std::time::Instant>,
+    /// Per-tool start times keyed by `tool_id`. Lets parallel tool calls
+    /// each show their own elapsed-time on the result block, instead of
+    /// sharing a single timer that the last-started tool clobbers.
+    pub(crate) tool_start_times: std::collections::HashMap<String, std::time::Instant>,
     /// Saved context from an aborted response — injected into the next user message
     pub(crate) abort_context: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
@@ -96,6 +118,8 @@ pub(crate) struct App {
     pub(crate) plugins: Option<super::plugins::PluginsModalState>,
     /// Active models router modal state (Some while /model or /models is open).
     pub(crate) models: Option<super::models::ModelsModalState>,
+    /// Active /help find lightbox state.
+    pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -127,6 +151,21 @@ pub(crate) struct App {
     /// immediately after MouseDown(Right). We suppress only within a short TTL
     /// window (~150ms) to avoid eating legitimate Ctrl+V pastes.
     pub(crate) suppress_paste_until: Option<std::time::Instant>,
+    /// Active sidecar instances keyed by plugin id (manifest name).
+    ///
+    /// Phase 8 8B: replaces the legacy single `Option<SidecarUiState>` so
+    /// multiple plugin-claimed sidecars can be hosted concurrently.
+    pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
+    /// Generic extension-provided active tasks rendered in the sticky progress area.
+    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Overlay toast provider used by core and extension-adjacent features.
+    pub(crate) toasts: super::toast::ToastProvider,
+    /// Channel for async extension loader progress events.
+    pub(crate) extension_loader_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
+    pub(crate) extension_loader_running: bool,
+    /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
+    pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -146,6 +185,7 @@ impl App {
     pub(crate) fn new(session: Session) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -171,6 +211,9 @@ impl App {
             api_call_count: 0,
             session_cost: 0.0,
             session,
+            agent_name: synaps_cli::config::load_config()
+                .agent_name
+                .unwrap_or_else(|| "agent".to_string()),
             line_cache: None,
             show_full_output: false,
             logo_dismiss_t: None,
@@ -178,6 +221,7 @@ impl App {
             last_line_count: 0,
             subagents: Vec::new(),
             tool_start_time: None,
+            tool_start_times: std::collections::HashMap::new(),
             abort_context: None,
             queued_message: None,
             input_before_paste: None,
@@ -188,6 +232,7 @@ impl App {
             settings: None,
             plugins: None,
             models: None,
+            help_find: None,
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
@@ -202,6 +247,13 @@ impl App {
             msg_area_rect: None,
             visible_line_range: None,
             suppress_paste_until: None,
+            sidecars: std::collections::HashMap::new(),
+            active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
+            toasts: super::toast::ToastProvider::new(),
+            extension_loader_rx: extension_loader_rx_init,
+            extension_loader_tx: extension_loader_tx_init,
+            extension_loader_running: false,
+            keybinds: None,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
@@ -411,7 +463,7 @@ impl App {
     fn render_lines_uses_spinner(&self) -> bool {
         self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
             ChatMessage::Thinking(text) => text == "…",
-            ChatMessage::ToolUseStart(_, _) => true,
+            ChatMessage::ToolUseStart { .. } => true,
             ChatMessage::ToolUse { .. } => {
                 idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
             }
@@ -442,10 +494,33 @@ impl App {
 
     /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
     pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
-        // Walk backwards from idx to find the preceding ToolUse
+        // Prefer matching by tool_id when the result carries one — under
+        // parallel tool calls a `ToolResult` may not be positionally
+        // adjacent to its matching `ToolUse`.
+        let target_id: Option<String> = match self.messages.get(idx).map(|m| &m.msg) {
+            Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => Some(tool_id.clone()),
+            _ => None,
+        };
+        if let Some(id) = target_id {
+            for m in self.messages.iter() {
+                if let ChatMessage::ToolUse { tool_id, tool_name, input } = &m.msg {
+                    if tool_id == &id && tool_name == "read" {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
+                            if let Some(path) = parsed["path"].as_str() {
+                                if let Some(ext) = std::path::Path::new(path).extension() {
+                                    return ext.to_string_lossy().to_string();
+                                }
+                            }
+                        }
+                        return String::new();
+                    }
+                }
+            }
+        }
+        // Fallback: walk backwards from idx to find the preceding ToolUse
         if idx == 0 { return String::new(); }
         for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, ref input } = self.messages[i].msg {
+            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.messages[i].msg {
                 if tool_name == "read" {
                     // Extract path from the JSON input
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
@@ -465,13 +540,162 @@ impl App {
 
     /// Find the tool name from the ToolUse message preceding a ToolResult at index `idx`.
     pub(crate) fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
+        // Prefer matching by tool_id when the result carries one — this
+        // is the only way to render parallel-tool outputs correctly,
+        // since results may not be positionally adjacent to their
+        // matching tool_use.
+        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.messages.get(idx).map(|m| &m.msg) {
+            if !tool_id.is_empty() {
+                for m in self.messages.iter() {
+                    match &m.msg {
+                        ChatMessage::ToolUse { tool_id: tid, tool_name, .. }
+                        | ChatMessage::ToolUseStart { tool_id: tid, tool_name, .. }
+                            if tid == tool_id =>
+                        {
+                            return Some(tool_name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         if idx == 0 { return None; }
         for i in (0..idx).rev() {
             if let ChatMessage::ToolUse { ref tool_name, .. } = self.messages[i].msg {
                 return Some(tool_name.clone());
             }
+            if let ChatMessage::ToolUseStart { ref tool_name, .. } = self.messages[i].msg {
+                return Some(tool_name.clone());
+            }
         }
         None
+    }
+
+    // ── Tool-event routing ──────────────────────────────────────────────
+    //
+    // Stream events arrive interleaved when the model fans out parallel
+    // tool calls. The chat UI keeps a flat `Vec<ChatMessage>`, so to keep
+    // each on-screen tool block correct we must route every delta /
+    // finalize / result event back to the block whose `tool_id` matches.
+    //
+    // The earlier "always update last message" approach worked for
+    // sequential tool calls but corrupts state under parallelism — input
+    // deltas from tool A would land on tool B's `ToolUseStart`, and the
+    // first arriving result would be silently overwritten by the second.
+
+    /// Locate the index of a `ToolUseStart` block with this `tool_id`.
+    pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
+        self.messages.iter().rposition(|m| matches!(
+            &m.msg,
+            ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
+        ))
+    }
+
+    /// Locate the latest `ToolResult` block for this `tool_id`.
+    pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
+        self.messages.iter().rposition(|m| matches!(
+            &m.msg,
+            ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
+        ))
+    }
+
+    /// Begin streaming a new tool call. Records start time per-tool so
+    /// elapsed-ms is correct under parallel execution.
+    pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
+        let now = std::time::Instant::now();
+        self.tool_start_time = Some(now);
+        if !tool_id.is_empty() {
+            self.tool_start_times.insert(tool_id.clone(), now);
+        }
+        self.push_msg(ChatMessage::ToolUseStart {
+            tool_id,
+            tool_name,
+            partial_input: String::new(),
+        });
+    }
+
+    /// Append a chunk of the tool's input JSON to the matching
+    /// `ToolUseStart` block. Falls back to "last ToolUseStart" only when
+    /// the event lacks a tool_id (legacy paths).
+    pub(crate) fn on_tool_use_delta(&mut self, tool_id: &str, delta: &str) {
+        let target_idx = if !tool_id.is_empty() {
+            self.find_tool_use_start_idx(tool_id)
+        } else {
+            self.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
+        };
+        if let Some(idx) = target_idx {
+            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.messages[idx].msg {
+                partial_input.push_str(delta);
+                self.invalidate();
+            }
+        }
+    }
+
+    /// Finalize a streaming tool call. Replaces the matching
+    /// `ToolUseStart` in place — keeping its position so on-screen order
+    /// matches the order the model emitted the calls.
+    pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
+        // Track start time even if we never saw a ToolUseStart (some
+        // providers go straight to a finalized tool_use).
+        if !tool_id.is_empty() {
+            self.tool_start_times.entry(tool_id.clone()).or_insert_with(std::time::Instant::now);
+        }
+        self.tool_start_time = Some(std::time::Instant::now());
+
+        if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
+            self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
+            self.invalidate();
+            return;
+        }
+        // No matching start (e.g. provider only emits finalized blocks) —
+        // append a new finalized block at the end.
+        self.push_msg(ChatMessage::ToolUse { tool_id, tool_name, input: input_str });
+    }
+
+    /// Stream a chunk of tool output. Appends to the matching
+    /// `ToolResult` if one exists, otherwise creates a new placeholder.
+    pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
+        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
+            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+                if elapsed_ms.is_none() {
+                    content.push_str(&delta);
+                    self.invalidate();
+                    return;
+                }
+            }
+        }
+        self.push_msg(ChatMessage::ToolResult { tool_id, content: delta, elapsed_ms: None });
+    }
+
+    /// Finalize a tool result. Replaces any in-flight `ToolResult` for
+    /// this `tool_id` (including a delta-buffered one) and stamps the
+    /// elapsed time using the per-tool start time.
+    pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
+        let elapsed = self
+            .tool_start_times
+            .remove(&tool_id)
+            .map(|t| t.elapsed().as_millis() as u64);
+        // Clear the shared "active tool" timer once the *latest* tool
+        // finishes — otherwise the bash trace animation lingers.
+        if self.tool_start_times.is_empty() {
+            self.tool_start_time = None;
+        }
+
+        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
+            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+                if elapsed_ms.is_none() {
+                    *content = result;
+                    self.messages[idx].msg = ChatMessage::ToolResult {
+                        tool_id,
+                        content: std::mem::take(content),
+                        elapsed_ms: elapsed,
+                    };
+                    self.invalidate();
+                    return;
+                }
+            }
+        }
+        self.push_msg(ChatMessage::ToolResult { tool_id, content: result, elapsed_ms: elapsed });
     }
 
     /// Capture all assistant output since the last user message as abort context.
@@ -496,7 +720,7 @@ impl App {
                         parts.push(format!("[response]: {}", t));
                     }
                 }
-                ChatMessage::ToolUse { tool_name, input } => {
+                ChatMessage::ToolUse { tool_name, input, .. } => {
                     // Truncate input to keep context lean
                     let input_preview: String = input.chars().take(200).collect();
                     parts.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
@@ -740,6 +964,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use crate::chatui::theme::THEME;
     use super::*;
 
     fn test_app() -> App {
@@ -750,18 +975,22 @@ mod tests {
     fn active_tool_result_is_only_latest_incomplete_result() {
         let mut app = test_app();
         app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_1".to_string(),
             tool_name: "bash".to_string(),
             input: "{}".to_string(),
         });
         app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_1".to_string(),
             content: "first output".to_string(),
             elapsed_ms: None,
         });
         app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_2".to_string(),
             tool_name: "bash".to_string(),
             input: "{}".to_string(),
         });
         app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_2".to_string(),
             content: "second output".to_string(),
             elapsed_ms: None,
         });
@@ -775,10 +1004,12 @@ mod tests {
     fn completed_latest_tool_result_is_not_active() {
         let mut app = test_app();
         app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_1".to_string(),
             tool_name: "bash".to_string(),
             input: "{}".to_string(),
         });
         app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_1".to_string(),
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
@@ -813,10 +1044,12 @@ mod tests {
     fn animation_tick_for_active_bash_result_invalidates_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_1".to_string(),
             tool_name: "bash".to_string(),
             input: "{}".to_string(),
         });
         app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_1".to_string(),
             content: String::new(),
             elapsed_ms: None,
         });
@@ -831,6 +1064,68 @@ mod tests {
     }
 
     #[test]
+    fn grouped_system_output_does_not_insert_rules_between_indented_lines() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("Extensions (1):".to_string()));
+        app.push_msg(ChatMessage::System("  capture — ok".to_string()));
+        app.push_msg(ChatMessage::System("    tools: speak".to_string()));
+
+        let lines = app.render_lines(80);
+        let header_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("Extensions (1):")))
+            .expect("header system message should render");
+        let child_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("capture — ok")))
+            .expect("child system message should render");
+        let grandchild_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("tools: speak")))
+            .expect("grandchild system message should render");
+
+        let has_rule = |slice: &[ratatui::text::Line]| {
+            slice
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("─ · ─")))
+        };
+        assert!(!has_rule(&lines[header_idx + 1..child_idx]));
+        assert!(!has_rule(&lines[child_idx + 1..grandchild_idx]));
+    }
+
+    #[test]
+    fn unrelated_consecutive_system_messages_still_get_a_rule() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::System("first".to_string()));
+        app.push_msg(ChatMessage::System("second".to_string()));
+
+        let lines = app.render_lines(80);
+        let first_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("first")))
+            .expect("first system message should render");
+        let second_idx = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains("second")))
+            .expect("second system message should render");
+
+        let between = &lines[first_idx + 1..second_idx];
+        let rule_idx = between
+            .iter()
+            .position(|line| line.spans.iter().any(|span| {
+                span.content.contains("─ · ─")
+                    && span.style.fg == Some(THEME.load().muted)
+                    && !span.style.add_modifier.contains(ratatui::style::Modifier::DIM)
+            }))
+            .expect("expected centered rule between consecutive system messages");
+        let is_blank = |line: &ratatui::text::Line| {
+            line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
+        };
+        assert!(rule_idx > 0 && is_blank(&between[rule_idx - 1]), "expected blank line before centered rule; got {:?}", between);
+        assert!(rule_idx + 1 < between.len() && is_blank(&between[rule_idx + 1]), "expected blank line after centered rule; got {:?}", between);
+    }
+
+    #[test]
     fn pasted_message_display_preserves_text_typed_after_paste() {
         let mut app = test_app();
         app.input_before_paste = Some("before".to_string());
@@ -839,5 +1134,207 @@ mod tests {
         let display = app.user_display_text_for_submission("beforePASTED after");
 
         assert_eq!(display, "before [Pasted 6 chars] after");
+    }
+
+    // ── Parallel tool-event routing (Bug 2 regression coverage) ─────────
+
+    fn last_tool_use(app: &App, tool_id: &str) -> Option<(String, String)> {
+        app.messages.iter().find_map(|m| match &m.msg {
+            ChatMessage::ToolUse { tool_id: tid, tool_name, input } if tid == tool_id => {
+                Some((tool_name.clone(), input.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    fn tool_use_start_partial(app: &App, tool_id: &str) -> Option<String> {
+        app.messages.iter().find_map(|m| match &m.msg {
+            ChatMessage::ToolUseStart { tool_id: tid, partial_input, .. } if tid == tool_id => {
+                Some(partial_input.clone())
+            }
+            _ => None,
+        })
+    }
+
+    fn tool_result_content(app: &App, tool_id: &str) -> Option<String> {
+        app.messages.iter().find_map(|m| match &m.msg {
+            ChatMessage::ToolResult { tool_id: tid, content, .. } if tid == tool_id => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn parallel_tool_use_deltas_are_routed_by_tool_id() {
+        // Regression: deltas from two interleaved parallel tool calls
+        // must each land on their own ToolUseStart block. The pre-fix
+        // behavior always appended to the most recent ToolUseStart,
+        // corrupting the second tool's input with the first's deltas.
+        let mut app = test_app();
+        app.on_tool_use_start("call_a".to_string(), "bash".to_string());
+        app.on_tool_use_start("call_b".to_string(), "read".to_string());
+
+        // Codex sends deltas in interleaved order — exercise that.
+        app.on_tool_use_delta("call_b", "{\"path\":");
+        app.on_tool_use_delta("call_a", "{\"command\":");
+        app.on_tool_use_delta("call_a", "\"ls\"}");
+        app.on_tool_use_delta("call_b", "\"a\"}");
+
+        assert_eq!(
+            tool_use_start_partial(&app, "call_a").as_deref(),
+            Some(r#"{"command":"ls"}"#),
+            "call_a partial input must accumulate only call_a's deltas"
+        );
+        assert_eq!(
+            tool_use_start_partial(&app, "call_b").as_deref(),
+            Some(r#"{"path":"a"}"#),
+            "call_b partial input must accumulate only call_b's deltas"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_use_finalize_collapses_matching_start() {
+        // Regression: finalize event must replace the matching
+        // ToolUseStart in place, not push a new ToolUse at the end —
+        // so on-screen order matches the order tools were called.
+        let mut app = test_app();
+        app.on_tool_use_start("call_a".to_string(), "bash".to_string());
+        app.on_tool_use_start("call_b".to_string(), "read".to_string());
+
+        app.on_tool_use_finalized(
+            "call_a".to_string(),
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+        );
+        app.on_tool_use_finalized(
+            "call_b".to_string(),
+            "read".to_string(),
+            r#"{"path":"a"}"#.to_string(),
+        );
+
+        // Both are now ToolUse, no lingering ToolUseStart.
+        let lingering_starts = app
+            .messages
+            .iter()
+            .filter(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
+            .count();
+        assert_eq!(
+            lingering_starts, 0,
+            "every ToolUseStart must collapse on finalize — leftover starts cause perpetual bash-trace animations"
+        );
+        assert_eq!(
+            last_tool_use(&app, "call_a"),
+            Some(("bash".to_string(), r#"{"command":"ls"}"#.to_string()))
+        );
+        assert_eq!(
+            last_tool_use(&app, "call_b"),
+            Some(("read".to_string(), r#"{"path":"a"}"#.to_string()))
+        );
+
+        // On-screen order matches call order (call_a appears before call_b).
+        let positions: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match &m.msg {
+                ChatMessage::ToolUse { tool_id, .. } => Some(tool_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec!["call_a", "call_b"]);
+    }
+
+    #[test]
+    fn parallel_tool_results_do_not_overwrite_each_other() {
+        // Regression: two ToolResult events arriving back-to-back must
+        // each land on their own block by tool_id. The pre-fix path
+        // pushed the first as a new message and then *overwrote* it
+        // with the second — losing the first tool's output entirely.
+        let mut app = test_app();
+        app.on_tool_use_start("call_a".to_string(), "bash".to_string());
+        app.on_tool_use_start("call_b".to_string(), "bash".to_string());
+        app.on_tool_use_finalized(
+            "call_a".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        );
+        app.on_tool_use_finalized(
+            "call_b".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        );
+
+        app.on_tool_result("call_a".to_string(), "first output".to_string());
+        app.on_tool_result("call_b".to_string(), "second output".to_string());
+
+        assert_eq!(
+            tool_result_content(&app, "call_a").as_deref(),
+            Some("first output"),
+            "call_a's result must survive — was overwritten by call_b in the buggy implementation"
+        );
+        assert_eq!(
+            tool_result_content(&app, "call_b").as_deref(),
+            Some("second output")
+        );
+    }
+
+    #[test]
+    fn tool_result_delta_streams_into_matching_block() {
+        let mut app = test_app();
+        app.on_tool_use_start("call_a".to_string(), "bash".to_string());
+        app.on_tool_use_start("call_b".to_string(), "bash".to_string());
+        app.on_tool_use_finalized(
+            "call_a".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        );
+        app.on_tool_use_finalized(
+            "call_b".to_string(),
+            "bash".to_string(),
+            "{}".to_string(),
+        );
+
+        // Interleaved deltas — must accumulate into the right block.
+        app.on_tool_result_delta("call_a".to_string(), "alpha-".to_string());
+        app.on_tool_result_delta("call_b".to_string(), "beta-".to_string());
+        app.on_tool_result_delta("call_a".to_string(), "one".to_string());
+        app.on_tool_result_delta("call_b".to_string(), "two".to_string());
+
+        // Then finalize results.
+        app.on_tool_result("call_a".to_string(), "alpha-one".to_string());
+        app.on_tool_result("call_b".to_string(), "beta-two".to_string());
+
+        assert_eq!(
+            tool_result_content(&app, "call_a").as_deref(),
+            Some("alpha-one")
+        );
+        assert_eq!(
+            tool_result_content(&app, "call_b").as_deref(),
+            Some("beta-two")
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_record_per_tool_elapsed_time() {
+        let mut app = test_app();
+        app.on_tool_use_start("call_a".to_string(), "bash".to_string());
+        app.on_tool_use_start("call_b".to_string(), "bash".to_string());
+
+        // Sleep deliberately tiny so Instant::elapsed > 0 is guaranteed.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.on_tool_result("call_a".to_string(), "a".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.on_tool_result("call_b".to_string(), "b".to_string());
+
+        let a_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+            ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_a" => *elapsed_ms,
+            _ => None,
+        });
+        let b_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+            ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_b" => *elapsed_ms,
+            _ => None,
+        });
+        assert!(a_elapsed.is_some(), "call_a must record elapsed_ms from its own start_time");
+        assert!(b_elapsed.is_some(), "call_b must record elapsed_ms from its own start_time");
     }
 }

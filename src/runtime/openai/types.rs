@@ -220,6 +220,7 @@ pub enum OaiEvent {
     },
     ToolCallArgumentsDelta {
         index: u32,
+        id: String,
         delta: String,
     },
     ToolCallsComplete {
@@ -229,6 +230,7 @@ pub enum OaiEvent {
     Usage {
         prompt_tokens: u32,
         completion_tokens: u32,
+        cached_tokens: u32,
     },
     Warning(String),
     Done,

@@ -120,6 +120,7 @@ fn command_names(commands: &[ManifestCommand]) -> Vec<String> {
             ManifestCommand::Shell(c) => c.name.clone(),
             ManifestCommand::ExtensionTool(c) => c.name.clone(),
             ManifestCommand::SkillPrompt(c) => c.name.clone(),
+            ManifestCommand::Interactive(c) => c.name.clone(),
         })
         .collect();
     names.sort();

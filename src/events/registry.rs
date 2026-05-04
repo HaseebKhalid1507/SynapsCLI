@@ -189,6 +189,7 @@ fn find_session_registration_in(query: &str, dir: &std::path::Path) -> Option<Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn tmp_registry() -> TempDir {
@@ -321,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn socket_path_format() {
         let path = socket_path_for_session("20240101-120000-ab12");
         // Sockets now live in the registry dir, not /tmp

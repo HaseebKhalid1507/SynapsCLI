@@ -275,7 +275,10 @@ impl ApiMethods {
                                     current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
                                     current_tool_input_json.clear();
                                     in_tool_use = true;
-                                    let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart(current_tool_name.clone())));
+                                    let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart {
+                                        tool_name: current_tool_name.clone(),
+                                        tool_id: current_tool_id.clone(),
+                                    }));
                                 }
                                 Some("text") => {
                                     if !current_text.is_empty() {
@@ -314,7 +317,10 @@ impl ApiMethods {
                                 Some("input_json_delta") => {
                                     if let Some(json_chunk) = delta["partial_json"].as_str() {
                                         current_tool_input_json.push_str(json_chunk);
-                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta(json_chunk.to_string())));
+                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                                            tool_id: current_tool_id.clone(),
+                                            delta: json_chunk.to_string(),
+                                        }));
                                     }
                                 }
                                 _ => {}

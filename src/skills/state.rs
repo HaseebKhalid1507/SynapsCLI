@@ -69,6 +69,24 @@ pub struct CachedPluginIndexMetadata {
     pub trust_homepage: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SetupStatus {
+    NotRequired,
+    Succeeded { log_path: Option<String> },
+    Failed { message: String, log_path: Option<String> },
+}
+
+impl Default for SetupStatus {
+    fn default() -> Self { Self::NotRequired }
+}
+
+impl SetupStatus {
+    pub fn allows_extension_load(&self) -> bool {
+        !matches!(self, SetupStatus::Failed { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledPlugin {
     pub name: String,
@@ -90,6 +108,10 @@ pub struct InstalledPlugin {
     pub checksum_algorithm: Option<String>,
     #[serde(default)]
     pub checksum_value: Option<String>,
+    /// Post-install setup/prebuilt/verify status. Missing in older state files
+    /// defaults to `NotRequired` for backward compatibility.
+    #[serde(default)]
+    pub setup_status: SetupStatus,
 }
 
 impl PluginsState {
@@ -108,10 +130,13 @@ impl PluginsState {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // atomic write via temp + rename
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)
+        // Atomic write via unique temp file + rename (avoids concurrent trampling)
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::fs::write(tmp.path(), json)?;
+        // fsync before rename so data is durable on power loss
+        std::fs::File::open(tmp.path()).and_then(|f| f.sync_all())?;
+        tmp.persist(path).map_err(|e| e.error).map(|_| ())
     }
 
     /// Resolve the on-disk path for the current profile.
@@ -151,6 +176,7 @@ mod tests {
                 source_subdir: None,
                 checksum_algorithm: None,
                 checksum_value: None,
+                setup_status: Default::default(),
             }],
             trusted_hosts: vec!["github.com/maha-media".into()],
         };

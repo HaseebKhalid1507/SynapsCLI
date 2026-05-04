@@ -7,14 +7,20 @@ mod app;
 mod render;
 mod gamba;
 mod draw;
+mod toast;
 mod commands;
 mod input;
 mod stream_handler;
 mod settings;
 mod plugins;
 mod models;
+mod help_find;
 mod helpers;
 mod lifecycle;
+mod viewport;
+mod sidecar;
+mod signals;
+mod lightbox;
 
 use app::{App, ChatMessage};
 use draw::{draw, boot_effect, quit_effect};
@@ -109,6 +115,7 @@ pub async fn run(
             App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
         }
     };
+    app.keybinds = Some(keybind_registry.clone());
 
     // Sync the context bar denominator with the runtime's effective window
     // (respects config override like `context_window = 200k`).
@@ -121,6 +128,8 @@ pub async fn run(
     // ── Terminal setup ──
     let mut terminal = setup_terminal()?;
     let mut event_reader = EventStream::new();
+    let (shutdown_signal_tx, mut shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
     let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
@@ -171,18 +180,22 @@ pub async fn run(
     );
     let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
+
+    // Phase 8 slice 8A.8: copy legacy `sidecar_toggle_key` into the
+    // namespace of any plugin that has staked a lifecycle claim with
+    // a settings_category. Idempotent: skips already-set new keys.
+    migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
+
     if !no_extensions {
-        let (loaded, failed) = ext_mgr_shared.write().await.discover_and_load().await;
-        let handler_count = runtime.hook_bus().handler_count().await;
-        tracing::info!(extensions = loaded.len(), handlers = handler_count, "Extension discovery complete");
-        // Extensions load silently — only surface failures
-        for failure in &failed {
-            app.push_msg(ChatMessage::System(format!(
-                "⚠ Extension '{}' failed: {}",
-                failure.plugin,
-                failure.concise_message()
-            )));
-        }
+        app.extension_loader_running = true;
+        app.toasts.upsert(toast::Toast::new("extension-loader", "Discovering extensions…")
+            .titled("Extensions")
+            .at(toast::ToastPosition::TOP_CENTER)
+            .ttl(None));
+        synaps_cli::extensions::loader::spawn_discover_and_load(
+            std::sync::Arc::clone(&ext_mgr_shared),
+            app.extension_loader_tx.clone(),
+        );
     }
 
     // ═══ HOOK: on_session_start ═══
@@ -206,6 +219,15 @@ pub async fn run(
         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
 
         tokio::select! {
+
+            // ── OS shutdown signals: Ctrl-C from terminal, SIGTERM from tmux kill-pane/session ──
+            signal = shutdown_signal_rx.recv() => {
+                if let Some(signal) = signal {
+                    tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
+                    app.push_msg(ChatMessage::System(format!("shutting down ({})", signals::signal_label(signal))));
+                    exit_fx = Some(quit_effect());
+                }
+            }
 
             // ── Ping results — fires when a model ping completes ──
             result = app.ping_rx.recv() => {
@@ -244,6 +266,41 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                }
+            }
+
+            // ── Async extension loader progress ──
+            event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
+                if let Some(event) = event {
+                    handle_extension_loader_event(&mut app, &runtime, event).await;
+                } else {
+                    app.extension_loader_running = false;
+                    app.toasts.dismiss("extension-loader");
+                }
+            }
+
+            // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
+            sidecar_event = async {
+                if app.sidecars.is_empty() {
+                    let _: () = std::future::pending().await;
+                    unreachable!()
+                } else {
+                    // Collect (plugin_id, &mut manager) and race them.
+                    let mut futures = Vec::with_capacity(app.sidecars.len());
+                    for (pid, v) in app.sidecars.iter_mut() {
+                        let pid = pid.clone();
+                        futures.push(Box::pin(async move {
+                            let ev = v.manager.next_event().await;
+                            (pid, ev)
+                        }));
+                    }
+                    let ((pid, ev), _, _) = futures::future::select_all(futures).await;
+                    (pid, ev)
+                }
+            } => {
+                let (pid, sidecar_event) = sidecar_event;
+                if let Some(event) = sidecar_event {
+                    self::sidecar::handle_event(&mut app, &pid, event);
                 }
             }
 
@@ -298,8 +355,34 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 secret_prompts.poll_requests(&secret_prompt_rx);
+                if app.toasts.tick() {
+                    app.invalidate();
+                }
+                // Tick the in-flight plugin install spinner and reap the
+                // background clone task once it finishes.
+                let mut install_did_work = false;
+                let mut install_finished = false;
+                if let Some(plugins_state) = app.plugins.as_mut() {
+                    if plugins_state.is_install_active() {
+                        plugins_state.tick_install_spinner();
+                        install_did_work = true;
+                        if plugins_state.install_ready_to_reap() {
+                            install_finished = true;
+                        }
+                    }
+                }
+                if install_finished {
+                    if let Some(plugins_state) = app.plugins.as_mut() {
+                        self::plugins::actions::complete_pending_install_clone(
+                            plugins_state, &registry, &config,
+                        ).await;
+                    }
+                }
+                if install_did_work || install_finished {
+                    app.invalidate();
+                }
                 let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
                 if message_animation_needs_clear {
                     if let Ok(size) = terminal.size() {
@@ -441,9 +524,12 @@ pub async fn run(
                             continue;
                         }
                         let is_streaming = app.streaming;
-                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &keybind_registry);
+                        let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
+                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
+                        drop(kb_guard);
                         match action {
                             InputAction::None => {}
+                            InputAction::HelpFindOutcome => {}
                             InputAction::Quit => {
                                 exit_fx = Some(quit_effect());
                             }
@@ -483,7 +569,11 @@ pub async fn run(
                                 app.save_session().await;
                             }
                             InputAction::SlashCommand(cmd, arg) => {
-                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &keybind_registry).await {
+                                let kb_snapshot = {
+                                    let g = keybind_registry.read().expect("keybind registry poisoned");
+                                    g.clone()
+                                };
+                                match commands::handle_command(&cmd, &arg, &mut app, &mut runtime, &system_prompt_path, &registry, &kb_snapshot).await {
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
@@ -518,6 +608,16 @@ pub async fn run(
                                                 )));
                                             }
                                         }
+                                    }
+                                    CommandAction::OpenHelpFind { query } => {
+                                        let registry = synaps_cli::help::HelpRegistry::new(
+                                            synaps_cli::help::builtin_entries(),
+                                            registry.plugin_help_entries(),
+                                        );
+                                        app.help_find = Some(synaps_cli::help::HelpFindState::new(
+                                            registry.entries().to_vec(),
+                                            &query,
+                                        ));
                                     }
                                     CommandAction::ReloadPlugins => {
                                         synaps_cli::skills::reload_registry(&registry, &config);
@@ -572,11 +672,24 @@ pub async fn run(
                                         steer_tx = Some(s_tx);
                                     }
                                     CommandAction::PluginCommand { command, arg } => {
-                                        commands::execute_command_action(
-                                            CommandAction::PluginCommand { command, arg },
-                                            &mut app,
-                                            &runtime,
-                                        ).await;
+                                        if matches!(
+                                            command.backend,
+                                            synaps_cli::skills::registry::RegisteredPluginCommandBackend::Interactive { .. }
+                                        ) {
+                                            let manager = ext_mgr_shared.read().await;
+                                            commands::execute_interactive_plugin_command_events(
+                                                &command,
+                                                &arg,
+                                                &manager,
+                                                &mut app,
+                                            ).await;
+                                        } else {
+                                            commands::execute_command_action(
+                                                CommandAction::PluginCommand { command, arg },
+                                                &mut app,
+                                                &runtime,
+                                            ).await;
+                                        }
                                     }
                                     CommandAction::Compact { custom_instructions } => {
                                         // Need at least 2 full turns (user + assistant = 2 messages each).
@@ -754,34 +867,43 @@ pub async fn run(
                                                         .join(", ");
                                                     app.push_msg(ChatMessage::System(format!("    tools: {}", rendered)));
                                                 }
-                                                // Voice capabilities (grouped from the `future` list).
-                                                let voice_entries: Vec<&str> = snap
-                                                    .future
-                                                    .iter()
-                                                    .filter(|e| e.kind == "voice")
-                                                    .map(|e| e.name.as_str())
-                                                    .collect();
-                                                if !voice_entries.is_empty() {
-                                                    // Each entry is "<name> (<mode>)". Group by name; collect modes.
+                                                // Capability declarations (grouped from the `future` list).
+                                                // Each entry has a free-form kind declared by the plugin
+                                                // (e.g. "capture", "ocr", "agent"). Render grouped by kind so
+                                                // future capability types surface without core changes.
+                                                if !snap.future.is_empty() {
                                                     use std::collections::BTreeMap;
-                                                    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                                                    for entry in &voice_entries {
-                                                        if let Some(open) = entry.rfind(" (") {
-                                                            if entry.ends_with(')') {
-                                                                let name = entry[..open].to_string();
-                                                                let mode = entry[open + 2..entry.len() - 1].to_string();
-                                                                grouped.entry(name).or_default().push(mode);
+                                                    // kind -> name -> Vec<mode>
+                                                    let mut by_kind: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+                                                    for entry in &snap.future {
+                                                        let bucket = by_kind.entry(entry.kind.clone()).or_default();
+                                                        // entry.name is "<plugin-name> (<mode>)" in the legacy
+                                                        // shim; preserve the existing display behaviour.
+                                                        if let Some(open) = entry.name.rfind(" (") {
+                                                            if entry.name.ends_with(')') {
+                                                                let name = entry.name[..open].to_string();
+                                                                let mode = entry.name[open + 2..entry.name.len() - 1].to_string();
+                                                                bucket.entry(name).or_default().push(mode);
                                                                 continue;
                                                             }
                                                         }
-                                                        grouped.entry((*entry).to_string()).or_default();
+                                                        bucket.entry(entry.name.clone()).or_default();
                                                     }
-                                                    for (name, modes) in grouped {
-                                                        let modes_str = modes.join("/");
-                                                        app.push_msg(ChatMessage::System(format!(
-                                                            "    voice: {} [{}]",
-                                                            name, modes_str
-                                                        )));
+                                                    for (kind, names) in &by_kind {
+                                                        for (name, modes) in names {
+                                                            let modes_str = modes.join("/");
+                                                            if modes_str.is_empty() {
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "    {}: {}",
+                                                                    kind, name
+                                                                )));
+                                                            } else {
+                                                                app.push_msg(ChatMessage::System(format!(
+                                                                    "    {}: {} [{}]",
+                                                                    kind, name, modes_str
+                                                                )));
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 for provider in &snap.providers {
@@ -868,7 +990,8 @@ pub async fn run(
                                                 let source_label = match &entry.source {
                                                     synaps_cli::extensions::config::ConfigSource::EnvOverride(name) => format!("env override ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::SecretEnv(name) => format!("secret env ({})", name),
-                                                    synaps_cli::extensions::config::ConfigSource::ConfigKey(name) => format!("config key ({})", name),
+                                                    synaps_cli::extensions::config::ConfigSource::PluginConfig => "plugin config".to_string(),
+                                                    synaps_cli::extensions::config::ConfigSource::LegacyConfigKey(name) => format!("legacy config key ({})", name),
                                                     synaps_cli::extensions::config::ConfigSource::Default => "default".to_string(),
                                                     synaps_cli::extensions::config::ConfigSource::Missing => "missing".to_string(),
                                                 };
@@ -1090,6 +1213,141 @@ pub async fn run(
                                             ).await;
                                         });
                                     }
+
+                                    CommandAction::SidecarToggle { plugin_id } => {
+                                        // Phase 8 8B: target either the
+                                        // claim-supplied plugin id, or fall
+                                        // back to the legacy single-slot
+                                        // discovery for the unclaimed case.
+                                        let all = synaps_cli::sidecar::discovery::discover_all();
+                                        let target = plugin_id
+                                            .clone()
+                                            .or_else(|| all.first().map(|s| s.plugin_name.clone()));
+                                        let Some(target_pid) = target else {
+                                            app.push_msg(ChatMessage::Error(
+                                                "sidecar unavailable: no plugin provides a sidecar binary".to_string()
+                                            ));
+                                            continue;
+                                        };
+
+                                        if app.sidecars.contains_key(&target_pid) {
+                                            // Subsequent toggle on existing sidecar — arm flag is source of truth.
+                                            let label = app.sidecars.get(&target_pid)
+                                                .and_then(|s| s.display_name.as_deref())
+                                                .unwrap_or("sidecar")
+                                                .to_string();
+                                            let v = app.sidecars.get_mut(&target_pid).unwrap();
+                                            if v.armed {
+                                                v.armed = false;
+                                                if let Err(err) = v.manager.release().await {
+                                                    app.push_msg(ChatMessage::Error(format!("{label} release failed: {err}")));
+                                                }
+                                                app.push_msg(ChatMessage::System(
+                                                    format!("{label}: stopping — final transcript will be appended")
+                                                ));
+                                            } else {
+                                                v.armed = true;
+                                                if let Err(err) = v.manager.press().await {
+                                                    v.armed = false;
+                                                    app.push_msg(ChatMessage::Error(format!("{label} press failed: {err}")));
+                                                }
+                                            }
+                                        } else {
+                                            // Spawn new sidecar instance for target_pid.
+                                            let Some(discovered) = all.into_iter().find(|s| s.plugin_name == target_pid) else {
+                                                app.push_msg(ChatMessage::Error(format!(
+                                                    "sidecar plugin '{}' not discoverable", target_pid,
+                                                )));
+                                                continue;
+                                            };
+                                            let (sidecar_plugin_info, sidecar_spawn_args) = {
+                                                let manager = ext_mgr_shared.read().await;
+                                                let info = manager.plugin_info(&target_pid).cloned();
+                                                let args = match manager.sidecar_spawn_args(&target_pid).await {
+                                                    Ok(a) => Some(a),
+                                                    Err(err) => {
+                                                        tracing::debug!(
+                                                            plugin = %target_pid,
+                                                            error = %err,
+                                                            "sidecar.spawn_args RPC unavailable; using manifest defaults",
+                                                        );
+                                                        None
+                                                    }
+                                                };
+                                                (info, args)
+                                            };
+                                            match self::sidecar::SidecarUiState::spawn_for(
+                                                discovered,
+                                                sidecar_spawn_args,
+                                                sidecar_plugin_info.as_ref(),
+                                            ).await {
+                                                Ok(mut state) => {
+                                                    let claims = registry.lifecycle_claims();
+                                                    let display = pick_display_name_for_plugin(
+                                                        &state.sidecar.plugin_name,
+                                                        &claims,
+                                                    );
+                                                    state.set_display_name(display);
+                                                    let label = state.display_name.clone()
+                                                        .unwrap_or_else(|| "sidecar".to_string());
+                                                    let plugin_key = state.sidecar.plugin_name.clone();
+                                                    app.sidecars.insert(plugin_key.clone(), state);
+                                                    app.push_msg(ChatMessage::System(
+                                                        format!("{label} active — press the toggle again to stop")
+                                                    ));
+                                                    if let Some(v) = app.sidecars.get_mut(&plugin_key) {
+                                                        v.armed = true;
+                                                        if let Err(err) = v.manager.press().await {
+                                                            v.armed = false;
+                                                            v.status = self::sidecar::SidecarUiStatus::Error(err.to_string());
+                                                            app.push_msg(ChatMessage::Error(format!("{label} press failed: {err}")));
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    app.push_msg(ChatMessage::Error(format!("sidecar unavailable: {err}")));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    CommandAction::SidecarStatus { plugin_id } => {
+                                        // Phase 8 8B: show status for the
+                                        // requested plugin, or — when None —
+                                        // for the single legacy sidecar (or
+                                        // the discovery hint when none have
+                                        // been spawned).
+                                        let line = if let Some(pid) = plugin_id.as_deref() {
+                                            match app.sidecars.get(pid) {
+                                                Some(v) => v.status_line(),
+                                                None => match synaps_cli::sidecar::discovery::discover_all().into_iter().find(|s| s.plugin_name == pid) {
+                                                    Some(s) => format!(
+                                                        "sidecar: not yet started — sidecar available from plugin '{}' at {}",
+                                                        s.plugin_name, s.binary.display()
+                                                    ),
+                                                    None => format!("sidecar: no plugin '{}' provides a sidecar", pid),
+                                                },
+                                            }
+                                        } else if app.sidecars.len() == 1 {
+                                            app.sidecars.values().next().unwrap().status_line()
+                                        } else if app.sidecars.is_empty() {
+                                            match synaps_cli::sidecar::discovery::discover() {
+                                                Some(s) => format!(
+                                                    "sidecar: not yet started — sidecar available from plugin '{}' at {}",
+                                                    s.plugin_name, s.binary.display()
+                                                ),
+                                                None => "sidecar: no plugin provides a sidecar binary (install a plugin that declares provides.sidecar)".to_string(),
+                                            }
+                                        } else {
+                                            // Multiple active — list each.
+                                            let mut lines: Vec<String> = app.sidecars.values()
+                                                .map(|v| v.status_line()).collect();
+                                            lines.sort();
+                                            lines.join("\n")
+                                        };
+                                        app.push_msg(ChatMessage::System(line));
+                                    }
+
                                 }
                             }
                             InputAction::Submit(input) => {
@@ -1175,6 +1433,7 @@ pub async fn run(
                                         CommandAction::OpenModels => {}
                                         CommandAction::OpenSettings => {}
                                         CommandAction::OpenPlugins => {}
+                                        CommandAction::OpenHelpFind { .. } => {}
                                         CommandAction::ReloadPlugins => {}
                                         // handle_streaming_command never returns LoadSkill, PluginCommand, or Compact.
                                         CommandAction::LoadSkill { .. } => {}
@@ -1191,6 +1450,8 @@ pub async fn run(
                                         CommandAction::ExtensionsAudit { .. } => {}
                                         CommandAction::ExtensionsMemory(_) => {}
                                         CommandAction::Ping => {}
+                                        CommandAction::SidecarToggle { .. } => {}
+                                        CommandAction::SidecarStatus { .. } => {}
                                     }
                                 } else {
                                     // Normal text during streaming — steer/queue
@@ -1295,6 +1556,118 @@ pub async fn run(
                             }
                             InputAction::SettingsApply(key, value) => {
                                 apply_setting(key, &value, &mut app, &mut runtime);
+                            }
+                            InputAction::PluginEditorOpen { plugin_id, category, field } => {
+                                let manager = ext_mgr_shared.read().await;
+                                match manager.settings_editor_open(&plugin_id, &category, &field).await
+                                    .and_then(settings::plugin_editor::render_from_open_result)
+                                {
+                                    Ok(render) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = None;
+                                            state.edit_mode = Some(settings::ActiveEditor::PluginCustom {
+                                                plugin_id: plugin_id.clone(),
+                                                category: category.clone(),
+                                                field: field.clone(),
+                                                render: settings::plugin_editor::PluginEditorSession {
+                                                    plugin_id,
+                                                    category,
+                                                    field,
+                                                    render,
+                                                },
+                                            });
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if let Some(state) = app.settings.as_mut() {
+                                            state.row_error = Some((
+                                                format!("plugin.{}.{}", plugin_id, field),
+                                                err,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            InputAction::PluginEditorKey { plugin_id, category, field, key } => {
+                                let wire_key = settings::plugin_editor::key_to_wire(key);
+                                if wire_key == "Enter" {
+                                    let selected = app.settings.as_ref().and_then(|state| {
+                                        match &state.edit_mode {
+                                            Some(settings::ActiveEditor::PluginCustom { render, .. }) => {
+                                                let cursor = render.render.cursor.unwrap_or(0);
+                                                render.render.rows.get(cursor).and_then(|r| r.data.clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    });
+                                    if let Some(value) = selected {
+                                        let manager = ext_mgr_shared.read().await;
+                                        match manager.settings_editor_commit(&plugin_id, &category, &field, value.clone()).await {
+                                            Ok(reply) => {
+                                                let effect = settings::plugin_editor::effect_from_commit_reply(
+                                                    &plugin_id,
+                                                    &field,
+                                                    reply,
+                                                );
+                                                match effect {
+                                                    settings::plugin_editor::PluginEditorEffect::None => {}
+                                                    settings::plugin_editor::PluginEditorEffect::ConfigWrite { plugin_id, key, value } => {
+                                                        match synaps_cli::extensions::config_store::write_plugin_config(&plugin_id, &key, &value) {
+                                                            Ok(()) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.edit_mode = None;
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), "saved".to_string()));
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                if let Some(state) = app.settings.as_mut() {
+                                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), err.to_string()));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    settings::plugin_editor::PluginEditorEffect::InvokeCommand { plugin_id, command, args } => {
+                                                        if let Some(state) = app.settings.as_mut() {
+                                                            state.edit_mode = None;
+                                                            state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), "download started".to_string()));
+                                                        }
+                                                        commands::execute_interactive_plugin_command_by_parts(
+                                                            &plugin_id,
+                                                            &command,
+                                                            args,
+                                                            &manager,
+                                                            &mut app,
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                if let Some(state) = app.settings.as_mut() {
+                                                    state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let manager = ext_mgr_shared.read().await;
+                                    match manager.settings_editor_key(&plugin_id, &category, &field, &wire_key).await
+                                        .and_then(settings::plugin_editor::render_from_key_result)
+                                    {
+                                        Ok(Some(render)) => {
+                                            if let Some(settings::ActiveEditor::PluginCustom { render: session, .. }) =
+                                                app.settings.as_mut().and_then(|s| s.edit_mode.as_mut())
+                                            {
+                                                session.render = render;
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            if let Some(state) = app.settings.as_mut() {
+                                                state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), err));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             InputAction::PluginsOutcome(outcome) => {
                                 if let Some(state) = app.plugins.as_mut() {
@@ -1498,8 +1871,12 @@ pub async fn run(
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
-    // Gracefully shut down all extensions
-    ext_mgr_shared.write().await.shutdown_all().await;
+    // Let extension shutdown continue in the background; exit should not hang on
+    // extension post/session-end cleanup or slow child-process teardown.
+    let _extension_shutdown = synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
+        std::sync::Arc::clone(&ext_mgr_shared),
+    );
+    shutdown_signal_task.abort();
 
     // Signal the inbox watcher's blocking thread to exit, then abort the async task.
     watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1513,4 +1890,287 @@ pub async fn run(
     teardown_terminal(&mut terminal);
 
     Ok(())
+}
+
+fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>, persistent: bool) {
+    app.toasts.upsert(toast::Toast::new("extension-loader", "")
+        .titled(title)
+        .lines(lines)
+        .at(toast::ToastPosition::TOP_CENTER)
+        .ttl(if persistent { None } else { Some(std::time::Duration::from_secs(5)) }));
+    app.invalidate();
+}
+
+async fn handle_extension_loader_event(
+    app: &mut App,
+    runtime: &Runtime,
+    event: synaps_cli::extensions::loader::ExtensionLoaderEvent,
+) {
+    use synaps_cli::extensions::loader::ExtensionLoaderEvent;
+    match event {
+        ExtensionLoaderEvent::Started => {
+            handle_extension_loader_toast(app, "Extensions", vec!["Discovering extensions…".into()], true);
+        }
+        ExtensionLoaderEvent::Loaded { plugin, loaded, failed } => {
+            handle_extension_loader_toast(
+                app,
+                "Extensions",
+                vec![format!("Loaded {loaded} extension{}", if loaded == 1 { "" } else { "s" }), format!("Latest: {plugin}"), format!("Failures: {failed}")],
+                true,
+            );
+        }
+        ExtensionLoaderEvent::Failed { failure, loaded, failed } => {
+            handle_extension_loader_toast(
+                app,
+                "Extensions",
+                vec![format!("Loaded {loaded}, failed {failed}"), format!("⚠ {}", failure.plugin)],
+                true,
+            );
+            app.push_msg(ChatMessage::System(format!(
+                "⚠ Extension '{}' failed: {}",
+                failure.plugin,
+                failure.concise_message()
+            )));
+        }
+        ExtensionLoaderEvent::Finished { loaded, failed } => {
+            app.extension_loader_running = false;
+            let handler_count = runtime.hook_bus().handler_count().await;
+            tracing::info!(extensions = loaded.len(), failures = failed.len(), handlers = handler_count, "Extension discovery complete");
+            let lines = if failed.is_empty() {
+                vec![format!("✓ Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" })]
+            } else {
+                vec![
+                    format!("Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" }),
+                    format!("{} failed — see transcript", failed.len()),
+                ]
+            };
+            handle_extension_loader_toast(app, "Extensions", lines, false);
+        }
+    }
+}
+
+/// Phase 8 slice 8A.8: when a plugin has staked a lifecycle claim and
+/// declared a `settings_category`, copy the legacy global
+/// `sidecar_toggle_key` value into the plugin-namespaced equivalent
+/// (`plugins.{plugin}.{cat}._lifecycle_toggle_key`) so the user's
+/// toggle-key choice follows them across the rename. Idempotent: any
+/// claim whose new key is already set is skipped, and a missing legacy
+/// value is a no-op.
+fn migrate_sidecar_toggle_key_to_claimed_plugins(
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) {
+    const LEGACY: &str = "sidecar_toggle_key";
+    let Some(legacy_value) = synaps_cli::config::read_config_value(LEGACY) else {
+        return;
+    };
+    let trimmed = legacy_value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    for claim in claims {
+        let Some(ref cat) = claim.settings_category else { continue };
+        let new_key = format!(
+            "plugins.{}.{}._lifecycle_toggle_key",
+            claim.plugin, cat
+        );
+        if synaps_cli::config::read_config_value(&new_key).is_some() {
+            continue;
+        }
+        match synaps_cli::config::write_config_value(&new_key, trimmed) {
+            Ok(()) => tracing::info!(
+                "sidecar migration: copied global `{}` → `{}` for plugin `{}`",
+                LEGACY,
+                new_key,
+                claim.plugin,
+            ),
+            Err(err) => tracing::warn!(
+                "sidecar migration: failed to copy `{}` → `{}`: {}",
+                LEGACY,
+                new_key,
+                err,
+            ),
+        }
+    }
+}
+
+/// Look up the display name for a sidecar's owning plugin from the
+/// lifecycle-claim snapshot. Returns `None` if no claim matches.
+///
+/// Phase 8 8A.5 follow-up: used post-spawn to populate
+/// [`SidecarUiState::display_name`] from the registry claim.
+fn pick_display_name_for_plugin(
+    plugin_name: &str,
+    claims: &[synaps_cli::skills::registry::LifecycleClaim],
+) -> Option<String> {
+    claims
+        .iter()
+        .find(|c| c.plugin == plugin_name)
+        .map(|c| c.display_name.clone())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn make_test_home(subdir: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/tmp/synaps-mig-test-{}", subdir));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".synaps-cli")).unwrap();
+        dir
+    }
+
+    fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        f();
+        if let Some(h) = original {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    fn claim(plugin: &str, command: &str, cat: Option<&str>) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: plugin.to_string(),
+            command: command.to_string(),
+            settings_category: cat.map(str::to_string),
+            display_name: command.to_string(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn migrate_copies_legacy_into_namespaced_key() {
+        let home = make_test_home("copy-into-namespaced");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = F2\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
+            )]);
+            let v = synaps_cli::config::read_config_value(
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+            );
+            assert_eq!(v.as_deref(), Some("F2"));
+        });
+    }
+
+    #[test]
+    fn migrate_skips_when_new_key_already_set() {
+        let home = make_test_home("skip-existing");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(
+            &cfg,
+            "sidecar_toggle_key = F2\nplugins.sample-sidecar.capture._lifecycle_toggle_key = F12\n",
+        ).unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
+            )]);
+            let v = synaps_cli::config::read_config_value(
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+            );
+            assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
+        });
+    }
+
+    #[test]
+    fn migrate_is_noop_when_legacy_unset() {
+        let home = make_test_home("noop-no-legacy");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+                "sample-sidecar",
+                "capture",
+                Some("capture"),
+            )]);
+            assert!(synaps_cli::config::read_config_value(
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key"
+            ).is_none());
+        });
+    }
+
+    #[test]
+    fn migrate_skips_claim_without_settings_category() {
+        let home = make_test_home("skip-no-category");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = F8\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim("p", "ocr", None)]);
+            // No namespaced key written for a claim with no category.
+            let contents = std::fs::read_to_string(&cfg).unwrap();
+            assert!(
+                !contents.contains("_lifecycle_toggle_key"),
+                "no namespaced key should be written when settings_category is None: {contents}"
+            );
+        });
+    }
+
+    #[test]
+    fn migrate_handles_multiple_claims_in_one_pass() {
+        let home = make_test_home("multi-claim");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "sidecar_toggle_key = C-V\n").unwrap();
+        with_home(&home, || {
+            migrate_sidecar_toggle_key_to_claimed_plugins(&[
+                claim("sample-sidecar", "capture", Some("capture")),
+                claim("ocr-plugin", "ocr", Some("ocr")),
+            ]);
+            assert_eq!(
+                synaps_cli::config::read_config_value(
+                    "plugins.sample-sidecar.capture._lifecycle_toggle_key"
+                ).as_deref(),
+                Some("C-V")
+            );
+            assert_eq!(
+                synaps_cli::config::read_config_value(
+                    "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
+                ).as_deref(),
+                Some("C-V")
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod display_name_helper_tests {
+    use super::pick_display_name_for_plugin;
+    use synaps_cli::skills::registry::LifecycleClaim;
+
+    fn claim(plugin: &str, display: &str) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: plugin.into(),
+            command: "capture".into(),
+            settings_category: None,
+            display_name: display.into(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_match() {
+        let claims = vec![claim("sample-sidecar", "Sample")];
+        assert_eq!(
+            pick_display_name_for_plugin("sample-sidecar", &claims),
+            Some("Sample".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_none_for_unmatched() {
+        let claims = vec![claim("sample-sidecar", "Sample")];
+        assert_eq!(pick_display_name_for_plugin("unknown", &claims), None);
+    }
+
+    #[test]
+    fn pick_display_name_for_plugin_returns_none_with_empty_claims() {
+        assert_eq!(pick_display_name_for_plugin("sample-sidecar", &[]), None);
+    }
 }
