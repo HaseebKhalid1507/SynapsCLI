@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Alignment},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Paragraph, Padding},
+    widgets::{Block, Borders, BorderType, Clear, Paragraph, Padding, Wrap},
     Terminal,
 };
 use std::io;
@@ -255,6 +255,34 @@ mod sidecar_pill_tests {
 use super::theme::THEME;
 use super::markdown::format_tokens;
 use super::app::{App, SPINNER_FRAMES};
+
+fn render_toasts(frame: &mut ratatui::Frame<'_>, provider: &super::toast::ToastProvider) {
+    let area = frame.area();
+    for toast in provider.visible() {
+        let lines = super::toast::toast_lines(toast);
+        let content_width = lines.iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .max()
+            .unwrap_or(1) as u16;
+        let width = content_width.saturating_add(4).clamp(18, area.width.min(64));
+        let height = (lines.len() as u16).saturating_add(2).clamp(3, area.height.max(1));
+        let rect = super::toast::toast_rect(area, width, height, toast.position);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(THEME.load().border_active))
+            .style(Style::default().bg(THEME.load().bg));
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(THEME.load().help_fg)),
+            rect,
+        );
+    }
+}
 
 /// Generate a bash execution trace animation string and its pulsing color.
 /// Returns (trace_string, Color) for use in Span styling.
@@ -1074,6 +1102,8 @@ pub(crate) fn draw(
             ];
             frame.render_widget(Paragraph::new(text).block(block).alignment(Alignment::Left), modal_area);
         }
+
+        render_toasts(frame, &app.toasts);
 
         if let Some(ref state) = app.settings {
             let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
