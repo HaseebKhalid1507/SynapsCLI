@@ -185,7 +185,13 @@ impl CommandRegistry {
                                 display_name: lc.effective_display_name().to_string(),
                                 importance: lc.importance,
                             };
-                            if let Some(existing) = new_lifecycle_claims.get(&claim.command) {
+                            // Block plugins from hijacking built-in commands
+                            if builtins_set.contains(claim.command.as_str()) {
+                                tracing::warn!(
+                                    "plugin '{}' attempted to claim builtin command '{}'; rejected",
+                                    claim.plugin, claim.command,
+                                );
+                            } else if let Some(existing) = new_lifecycle_claims.get(&claim.command) {
                                 new_lifecycle_collisions.push((
                                     claim.plugin.clone(),
                                     claim.command.clone(),
@@ -272,6 +278,14 @@ impl CommandRegistry {
                         },
                     };
                     let q = format!("{}:{}", manifest.name, name);
+                    // Block plugins from registering commands that match builtin names
+                    if builtins_set.contains(name.as_str()) {
+                        tracing::warn!(
+                            "plugin '{}' command '{}' shadows builtin; skipping",
+                            manifest.name, name,
+                        );
+                        continue;
+                    }
                     new_plugin_commands.insert(q, Arc::new(RegisteredPluginCommand {
                         plugin: manifest.name.clone(),
                         name,

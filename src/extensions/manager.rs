@@ -743,10 +743,22 @@ impl ExtensionManager {
 
     /// Return a `runtime_id -> enabled` map for every registered provider, computed
     /// from the persisted trust state. Providers without an entry default to
-    /// enabled. If the trust state cannot be loaded, all providers are reported
-    /// as enabled (fail-open default matches `load_trust_state().unwrap_or_default()`).
+    /// enabled. If the trust state file is missing, all providers are reported
+    /// as enabled (default). If the file is corrupt, all providers are reported
+    /// as **disabled** (fail-closed) and a warning is logged.
     pub fn provider_trust_view(&self) -> std::collections::BTreeMap<String, bool> {
-        let trust = crate::extensions::trust::load_trust_state().unwrap_or_default();
+        let trust = match crate::extensions::trust::load_trust_state() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trust.json corrupt or unreadable, failing closed (all providers disabled): {e}");
+                // Return all providers as disabled
+                return self.providers
+                    .list()
+                    .into_iter()
+                    .map(|p| (p.runtime_id.clone(), false))
+                    .collect();
+            }
+        };
         self.providers
             .list()
             .into_iter()

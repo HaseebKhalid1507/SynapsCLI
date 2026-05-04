@@ -499,6 +499,9 @@ pub struct NotificationFrame {
 struct Inbox {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     notification_sink: Mutex<Option<mpsc::UnboundedSender<NotificationFrame>>>,
+    /// Set to true when the reader task exits (EOF or error). Used to prevent
+    /// callers from registering pending requests that will never be fulfilled.
+    closed: std::sync::atomic::AtomicBool,
     /// Permissions granted to the calling extension. Set after manifest
     /// validation; checked by inbound RPC handlers (e.g. memory.append).
     permissions: RwLock<Option<crate::extensions::permissions::PermissionSet>>,
@@ -515,6 +518,7 @@ impl Inbox {
         Self {
             pending: Mutex::new(HashMap::new()),
             notification_sink: Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
             extension_id,
@@ -522,7 +526,9 @@ impl Inbox {
     }
 
     /// Drains all pending request senders, sending `Err(reason)` to each.
+    /// Also marks the inbox as closed so no new requests can be registered.
     async fn fail_all_pending(&self, reason: &str) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
         let drained: Vec<_> = {
             let mut pending = self.pending.lock().await;
             pending.drain().collect()
@@ -610,6 +616,20 @@ impl ProcessExtension {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
+
+        // Clear the inherited environment so extensions cannot read secrets from
+        // the parent process (e.g. ANTHROPIC_API_KEY, SSH_AUTH_SOCK, AWS_*).
+        // Only forward a minimal set of safe, non-sensitive variables.
+        // TODO: forward the extension's declared `secret_env` values here once
+        //       secret_env is resolved at spawn time rather than config time.
+        cmd.env_clear();
+        for var in &["PATH", "HOME", "LANG", "TERM", "XDG_RUNTIME_DIR"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
+        cmd.kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
@@ -1136,6 +1156,10 @@ impl ProcessExtension {
                         "Extension '{}' registered tool '{}' with invalid tool name: must not contain whitespace",
                         id, name
                     ),
+                    IdValidationError::ContainsControl { ch } => format!(
+                        "Extension '{}' registered tool '{}' with invalid tool name: contains control character U+{:04X}",
+                        id, name, ch as u32
+                    ),
                 });
             }
             if !names.insert(name.to_string()) {
@@ -1222,6 +1246,10 @@ impl ProcessExtension {
                             "Extension '{}' registered provider '{}' with invalid model id '{}': must not contain whitespace",
                             id, provider_id, model_id
                         ),
+                        IdValidationError::ContainsControl { ch } => format!(
+                            "Extension '{}' registered provider '{}' with invalid model id '{}': contains control character U+{:04X}",
+                            id, provider_id, model_id, ch as u32
+                        ),
                     });
                 }
                 if !model_ids.insert(model_id.to_string()) {
@@ -1299,7 +1327,12 @@ impl ProcessExtension {
             self.cwd.as_ref(),
             self.inbox.clone(),
         ).await?);
+        // Reset closed flag now that we have a fresh transport
+        self.inbox.closed.store(false, std::sync::atomic::Ordering::Release);
         self.initialize_locked(state).await?;
+        // Reset counter on successful restart so transient failures hours apart
+        // don't accumulate toward the permanent disable threshold.
+        self.restart_count.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1315,12 +1348,18 @@ impl ProcessExtension {
             config: Value::Object(Default::default()),
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let value = self.call_once_locked(
-            state.as_mut().expect("state should exist for initialize"),
-            "initialize",
-            serde_json::to_value(params).map_err(|e| e.to_string())?,
-            id,
-        ).await?;
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.call_once_locked(
+                state.as_mut().expect("state should exist for initialize"),
+                "initialize",
+                serde_json::to_value(params).map_err(|e| e.to_string())?,
+                id,
+            ),
+        )
+        .await
+        .map_err(|_| format!("Extension '{}' initialize timed out after 10s", self.id))?
+        ?;
         Self::parse_initialize_result(&self.id, value).map(|_| ())
     }
 
@@ -1343,9 +1382,22 @@ impl ProcessExtension {
         .map_err(|e| format!("Serialize error: {}", e))?;
 
         let (tx, rx) = oneshot::channel::<Result<Value, String>>();
+        // Check if inbox is closed before registering — if the reader already
+        // exited, no one will ever send a response on this channel.
+        if self.inbox.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("transport closed: inbox is shut down".to_string());
+        }
+
         // Register pending BEFORE writing so the reader can route a fast
         // response without racing against the insert.
         self.inbox.pending.lock().await.insert(id, tx);
+
+        // Double-check: if closed was set between our check and the insert,
+        // remove the entry and fail immediately.
+        if self.inbox.closed.load(std::sync::atomic::Ordering::Acquire) {
+            self.inbox.pending.lock().await.remove(&id);
+            return Err("transport closed: inbox shut down during registration".to_string());
+        }
 
         let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
         let write_result = {
@@ -1396,6 +1448,26 @@ impl ProcessExtension {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let timeout_secs = if method == "tool.call" { 120 } else { 30 };
+        let id_str = self.id.clone();
+        let method_str = method.to_string();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.call_inner(method, params),
+        )
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(format!(
+                "Extension '{}' method '{}' timed out after {}s",
+                id_str, method_str, timeout_secs
+            )),
+        }
+    }
+
+    async fn call_inner(&self, method: &str, params: Value) -> Result<Value, String> {
         let _call_guard = self.call_lock.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut state_guard = self.state.lock().await;

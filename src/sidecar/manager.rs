@@ -66,6 +66,8 @@ pub enum SidecarError {
     AlreadyShutDown,
     #[error("failed to encode sidecar command: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("sidecar protocol error: {0}")]
+    Protocol(String),
 }
 
 /// Supervises one sidecar process and its line-JSON streams.
@@ -182,13 +184,41 @@ impl SidecarManager {
             })
         });
 
-        let manager = Self {
+        let mut manager = Self {
             child: Some(child),
             stdin,
             rx,
             reader_handle: Some(reader_handle),
             stderr_handle,
         };
+
+        // Wait for the sidecar's Hello frame before sending Init.
+        // The sidecar must announce its protocol version first so we can
+        // reject incompatible versions before committing to the handshake.
+        // Timeout: 10s — if the sidecar can't say Hello in 10s, it's broken.
+        let hello_timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            manager.rx.recv(),
+        )
+        .await
+        .map_err(|_| SidecarError::Protocol("sidecar did not send Hello within 10s".to_string()))?;
+
+        match hello_timeout {
+            Some(SidecarLifecycleEvent::Ready { .. }) => {
+                // Hello received and protocol version is acceptable — proceed with Init
+            }
+            Some(SidecarLifecycleEvent::Error(e)) => {
+                return Err(SidecarError::Protocol(format!("sidecar Hello failed: {e}")));
+            }
+            Some(other) => {
+                return Err(SidecarError::Protocol(format!(
+                    "expected Hello from sidecar, got: {:?}", other
+                )));
+            }
+            None => {
+                return Err(SidecarError::Protocol("sidecar exited before sending Hello".to_string()));
+            }
+        }
 
         manager.send(SidecarCommand::Init { config }).await?;
         Ok(manager)

@@ -48,7 +48,7 @@ impl Tool for SubagentStartTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override (default: claude-opus-4-7). Use claude-sonnet-4-6 for lighter tasks."
+                    "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks."
                 },
                 "timeout": {
                     "type": "integer",

@@ -63,8 +63,10 @@ regex = "1"
 dirs = "5"
 libc = "0.2"
 zeroize = "1.8.2"
+tempfile = "3"
 
 [dev-dependencies]
+serial_test = "3.4.0"
 tempfile = "3"
 
 [[bin]]
