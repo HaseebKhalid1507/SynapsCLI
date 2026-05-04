@@ -7,7 +7,7 @@
 //! field for `AddMarketplace`).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use synaps_cli::skills::{
     install,
@@ -23,11 +23,12 @@ use synaps_cli::skills::{
     post_install,
     reload_registry,
     registry::CommandRegistry,
-    state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState},
+    state::{CachedPluginIndexMetadata, InstalledPlugin, Marketplace, PluginsState, SetupStatus},
     update_diff::diff_plugin_manifests,
 };
 
-use super::state::{PluginsModalState, RightMode};
+use super::progress::{parse_progress_line, InstallProgress, InstallProgressHandle};
+use super::state::{PendingInstallTask, PluginsModalState, RightMode};
 
 /// Persist plugins state to its canonical path. Helper used by every mutator.
 fn commit_plugins_state(file: &PluginsState) -> std::io::Result<()> {
@@ -212,7 +213,7 @@ pub(crate) async fn apply_install(
     run_install_flow(
         state, plugin_name, effective_source, subdir, Some(marketplace_name), None,
         registry, config,
-    ).await;
+    );
 }
 
 fn plugin_index_entry_from_cached(
@@ -316,7 +317,7 @@ pub(crate) async fn apply_install_from_index_entry(
         checksum,
         registry,
         config,
-    ).await;
+    );
 }
 
 /// Trust the host, then install. Used for `TrustAndInstall` outcome.
@@ -346,7 +347,7 @@ pub(crate) async fn apply_trust_and_install(
             break;
         }
     }
-    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config).await;
+    run_install_flow(state, plugin_name, source, subdir, marketplace_name, None, registry, config);
 }
 
 /// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
@@ -357,13 +358,34 @@ fn install_plugin_to_temp_with_checksum(
     final_dest: &std::path::Path,
     expected_checksum: Option<(String, String)>,
 ) -> Result<(String, PathBuf), String> {
+    install_plugin_to_temp_with_progress(
+        plugin_name,
+        source_url,
+        subdir,
+        final_dest,
+        expected_checksum,
+        |_| {},
+    )
+}
+
+/// Same as [`install_plugin_to_temp_with_checksum`] but forwards every
+/// chunk of `git clone --progress` stderr to `on_chunk` so the chatui
+/// modal can drive a live progress gauge.
+fn install_plugin_to_temp_with_progress(
+    plugin_name: &str,
+    source_url: &str,
+    subdir: Option<String>,
+    final_dest: &std::path::Path,
+    expected_checksum: Option<(String, String)>,
+    on_chunk: impl FnMut(&str),
+) -> Result<(String, PathBuf), String> {
     let parent = final_dest.parent().ok_or_else(|| "dest has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     let tmp = parent.join(format!(".{}-pending-install", plugin_name));
     let _ = std::fs::remove_dir_all(&tmp);
     let sha = match subdir {
-        Some(s) => install::install_plugin_from_subdir(source_url, &s, &tmp),
-        None => install::install_plugin(source_url, &tmp),
+        Some(s) => install::install_plugin_from_subdir_with_progress(source_url, &s, &tmp, on_chunk),
+        None => install::install_plugin_with_progress(source_url, &tmp, on_chunk),
     }?;
     if let Some((algorithm, expected)) = expected_checksum {
         if let Err(e) = install::verify_plugin_dir_checksum(&tmp, &algorithm, &expected) {
@@ -396,26 +418,94 @@ fn cancel_pending_temp(temp_dir: &std::path::Path) {
 ///   file. The caller should set `state.row_error = Some(message)` but
 ///   still proceed to record the install (source is on disk; user can
 ///   rerun setup manually).
+#[derive(Debug, Clone)]
+enum PostInstallOutcome {
+    NotRequired,
+    BinaryAlreadyPresent,
+    PrebuiltInstalled,
+    SetupSucceeded(PathBuf),
+}
+
+impl PostInstallOutcome {
+    fn setup_status(&self) -> SetupStatus {
+        match self {
+            PostInstallOutcome::SetupSucceeded(path) => SetupStatus::Succeeded {
+                log_path: Some(path.display().to_string()),
+            },
+            _ => SetupStatus::NotRequired,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PostInstallError {
+    #[error("{0}")]
+    Hard(String),
+    #[error("{0}")]
+    SoftSetup(String),
+}
+
+impl PostInstallError {
+    fn setup_status(&self) -> SetupStatus {
+        SetupStatus::Failed {
+            message: self.to_string(),
+            log_path: None,
+        }
+    }
+}
+
 async fn run_post_install_setup_for_dir(
     plugin_name: &str,
     final_dir: &std::path::Path,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<PostInstallOutcome, PostInstallError> {
     let manifest = match read_plugin_manifest(final_dir) {
         Ok(m) => m,
         Err(e) => {
-            return Err(format!(
+            return Err(PostInstallError::Hard(format!(
                 "installed but could not read manifest to check for setup script: {e}"
-            ));
+            )));
         }
     };
-    let resolved =
-        post_install::resolve_setup_script(&manifest, final_dir).map_err(|e| e.to_string())?;
+
+    // Fast-path (slice D): if the manifest declares an
+    // `extension.command` and that binary already exists and is
+    // executable inside the freshly-cloned plugin dir, skip the setup
+    // script entirely. This handles two cases:
+    //   1. Source ships a prebuilt binary in the repo
+    //   2. User reinstalled and the build artifact survived in place
+    if let Ok(Some(_resolved)) = post_install::verify_extension_command(&manifest, final_dir) {
+        return Ok(PostInstallOutcome::BinaryAlreadyPresent);
+    }
+
+    // Slice E: try a per-host prebuilt download before falling back to
+    // the (potentially slow) source build. Only `NoMatchingAsset`
+    // falls through to setup — any other error (checksum mismatch,
+    // network failure, extract failure) surfaces immediately so we
+    // never silently mask a security or infrastructure problem with
+    // an opaque rebuild.
+    match post_install::try_install_from_prebuilt(&manifest, final_dir).await {
+        Ok(_resolved) => return Ok(PostInstallOutcome::PrebuiltInstalled),
+        Err(post_install::PrebuiltError::NoMatchingAsset) => {}
+        Err(e) => {
+            return Err(PostInstallError::Hard(format!("prebuilt asset install failed: {e}")));
+        }
+    }
+
+    let resolved = post_install::resolve_setup_script(&manifest, final_dir)
+        .map_err(|e| PostInstallError::Hard(e.to_string()))?;
     let Some(script) = resolved else {
-        return Ok(None);
+        // No setup script declared. If the manifest declares an
+        // extension.command, verify it now — otherwise we'd silently
+        // accept an install with a dangling binary path.
+        if manifest.extension.is_some() {
+            post_install::verify_extension_command(&manifest, final_dir)
+                .map_err(|e| PostInstallError::Hard(format!("extension command verification failed: {e}")))?;
+        }
+        return Ok(PostInstallOutcome::NotRequired);
     };
     let logs_root = synaps_cli::config::resolve_write_path("logs");
     let log_path = post_install::install_log_path(&logs_root, plugin_name, &now_rfc3339());
-    match post_install::run_setup_script(
+    let setup_log = match post_install::run_setup_script(
         &script,
         final_dir,
         &log_path,
@@ -423,9 +513,25 @@ async fn run_post_install_setup_for_dir(
     )
     .await
     {
-        Ok(outcome) => Ok(Some(outcome.log_path)),
-        Err(e) => Err(e.to_string()),
+        Ok(outcome) => outcome.log_path,
+        Err(e) => return Err(PostInstallError::SoftSetup(e.to_string())),
+    };
+
+    // Slice C / F: post-condition check. If the manifest declares an
+    // `extension.command`, the setup script's job was to produce it.
+    // Surface a clear error if it didn't, instead of silently breaking
+    // spawn at runtime.
+    if manifest.extension.is_some() {
+        if let Err(e) = post_install::verify_extension_command(&manifest, final_dir) {
+            return Err(PostInstallError::SoftSetup(format!(
+                "setup script ran (see {}) but did not produce the declared extension binary: {}",
+                setup_log.display(),
+                e
+            )));
+        }
     }
+
+    Ok(PostInstallOutcome::SetupSucceeded(setup_log))
 }
 
 fn read_plugin_manifest(path: &std::path::Path) -> Result<PluginManifest, String> {
@@ -459,6 +565,7 @@ fn record_installed_plugin(
     installed_commit: String,
     source_subdir: Option<String>,
     checksum: Option<(String, String)>,
+    setup_status: SetupStatus,
 ) {
     state.file.installed.push(InstalledPlugin {
         name: plugin_name,
@@ -470,6 +577,7 @@ fn record_installed_plugin(
         source_subdir,
         checksum_algorithm: checksum.as_ref().map(|(algorithm, _)| algorithm.clone()),
         checksum_value: checksum.map(|(_, value)| value),
+        setup_status,
     });
 }
 
@@ -484,15 +592,26 @@ fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -
         .map(|index| (index.checksum_algorithm.clone(), index.checksum_value.clone()))
 }
 
-async fn run_install_flow(
+/// Kick off a background `git clone --progress` for `plugin_name` and
+/// return immediately. The actual install is finished later by
+/// [`complete_pending_install_clone`] which is polled from the main loop's
+/// animation tick when [`PluginsModalState::install_task_finished`]
+/// returns true.
+///
+/// While the task runs:
+/// - `state.mode` is set to `RightMode::Installing { progress }`, so the
+///   modal renders an animated gauge.
+/// - `state.pending_install` holds the JoinHandle and the metadata we
+///   need to resume the install pipeline once the clone finishes.
+fn run_install_flow(
     state: &mut PluginsModalState,
     plugin_name: String,
     source_url: String,
     subdir: Option<String>,
     marketplace_name: Option<String>,
     expected_checksum: Option<(String, String)>,
-    registry: &Arc<CommandRegistry>,
-    config: &synaps_cli::SynapsConfig,
+    _registry: &Arc<CommandRegistry>,
+    _config: &synaps_cli::SynapsConfig,
 ) {
     let dest = match install_dir_for(&plugin_name) {
         Ok(d) => d,
@@ -501,36 +620,113 @@ async fn run_install_flow(
             return;
         }
     };
-    // Run git on a blocking thread into a temp directory first. If the plugin has
-    // an executable extension, show the inspected permissions before finalizing.
+    // Don't kick off a second clone if one is already running — the modal
+    // gates 'i' while in Installing mode, but defend in depth.
+    if state.pending_install.is_some() {
+        return;
+    }
+
+    let progress: InstallProgressHandle =
+        Arc::new(Mutex::new(InstallProgress::new(plugin_name.clone())));
+    let progress_for_task = Arc::clone(&progress);
+
     let src = source_url.clone();
     let dest_clone = dest.clone();
     let subdir_for_install = subdir.clone();
     let plugin_name_for_task = plugin_name.clone();
-    let expected_checksum_for_task = expected_checksum.clone();
-    let install_res = tokio::task::spawn_blocking(move || {
-        install_plugin_to_temp_with_checksum(
+    let expected_for_task = expected_checksum.clone();
+
+    let join = tokio::task::spawn_blocking(move || {
+        install_plugin_to_temp_with_progress(
             &plugin_name_for_task,
             &src,
             subdir_for_install,
             &dest_clone,
-            expected_checksum_for_task,
+            expected_for_task,
+            |chunk| {
+                if let Some(snap) = parse_progress_line(chunk) {
+                    if let Ok(mut p) = progress_for_task.lock() {
+                        p.apply(snap);
+                    }
+                }
+            },
         )
-    })
-    .await;
+    });
+
+    state.mode = RightMode::Installing {
+        progress: Arc::clone(&progress),
+    };
+    state.pending_install = Some(PendingInstallTask {
+        join,
+        progress,
+        plugin_name,
+        source_url,
+        subdir,
+        marketplace_name,
+        expected_checksum,
+        final_dir: dest,
+    });
+    state.row_error = None;
+}
+
+/// Reap a finished background install task and run the post-clone half of
+/// the install pipeline (executable-extension confirm prompt, finalize,
+/// post-install setup, persist). Called from the main loop's animation
+/// tick once [`PluginsModalState::install_task_finished`] returns true.
+///
+/// Safe to call when no install is in flight — returns immediately.
+pub(crate) async fn complete_pending_install_clone(
+    state: &mut PluginsModalState,
+    registry: &Arc<CommandRegistry>,
+    config: &synaps_cli::SynapsConfig,
+) {
+    let Some(task) = state.pending_install.take() else {
+        return;
+    };
+    // Drop the Installing overlay before we render the next frame — the
+    // PendingInstallConfirm / List transitions below will set the right mode.
+    state.mode = RightMode::List;
+
+    let PendingInstallTask {
+        join,
+        progress,
+        plugin_name,
+        source_url,
+        subdir,
+        marketplace_name,
+        expected_checksum,
+        final_dir: dest,
+    } = task;
+
+    let install_res = join.await;
+
     let (sha, temp_dir) = match install_res {
-        Ok(Ok(v)) => v,
+        Ok(Ok(v)) => {
+            if let Ok(mut p) = progress.lock() {
+                p.finish_clone();
+            }
+            v
+        }
         Ok(Err(e)) => {
+            if let Ok(mut p) = progress.lock() {
+                p.fail(e.clone());
+            }
             state.row_error = Some(e);
             return;
         }
         Err(e) => {
-            state.row_error = Some(format!("install task join error: {}", e));
+            let msg = format!("install task join error: {}", e);
+            if let Ok(mut p) = progress.lock() {
+                p.fail(msg.clone());
+            }
+            state.row_error = Some(msg);
             return;
         }
     };
     let summary = summarize_plugin_dir(&temp_dir);
-    let has_executable_extension = summary.iter().any(|line| line == "executable extension: yes");
+    let has_executable_extension = read_plugin_manifest(&temp_dir)
+        .map(|manifest| manifest.extension.is_some())
+        .unwrap_or(true);
     if has_executable_extension {
         state.mode = RightMode::PendingInstallConfirm {
             plugin_name,
@@ -539,8 +735,12 @@ async fn run_install_flow(
             marketplace_name,
             summary,
             installed_commit: sha,
-            checksum_algorithm: expected_checksum.as_ref().map(|(algorithm, _)| algorithm.clone()),
-            checksum_value: expected_checksum.as_ref().map(|(_, value)| value.clone()),
+            checksum_algorithm: expected_checksum
+                .as_ref()
+                .map(|(algorithm, _)| algorithm.clone()),
+            checksum_value: expected_checksum
+                .as_ref()
+                .map(|(_, value)| value.clone()),
             temp_dir,
             final_dir: dest,
         };
@@ -551,7 +751,11 @@ async fn run_install_flow(
         state.row_error = Some(e);
         return;
     }
+    if let Ok(mut p) = progress.lock() {
+        p.set_setup_running();
+    }
     let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &dest).await;
+    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
     let plugin_name_for_msg = plugin_name.clone();
     record_installed_plugin(
         state,
@@ -561,6 +765,7 @@ async fn run_install_flow(
         sha,
         subdir,
         expected_checksum,
+        setup_status,
     );
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
@@ -617,6 +822,7 @@ pub(crate) async fn apply_confirm_pending_install(
     }
 
     let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &final_dir).await;
+    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
 
     record_installed_plugin(
         state,
@@ -626,6 +832,7 @@ pub(crate) async fn apply_confirm_pending_install(
         installed_commit,
         subdir,
         checksum_algorithm.zip(checksum_value),
+        setup_status,
     );
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
@@ -809,9 +1016,12 @@ pub(crate) async fn apply_confirm_pending_update(
             return;
         }
     }
+    let setup_outcome = run_post_install_setup_for_dir(&plugin_name, &final_dir).await;
+    let setup_status = setup_outcome.as_ref().map(|o| o.setup_status()).unwrap_or_else(|e| e.setup_status());
     if let Some(p) = state.file.installed.iter_mut().find(|p| p.name == plugin_name) {
         p.installed_commit = installed_commit;
         p.latest_commit = None;
+        p.setup_status = setup_status;
     }
     if let Err(e) = commit_plugins_state(&state.file) {
         state.row_error = Some(format!(
@@ -821,7 +1031,12 @@ pub(crate) async fn apply_confirm_pending_update(
         return;
     }
     reload_registry(registry, config);
-    state.row_error = None;
+    state.row_error = match setup_outcome {
+        Ok(_) => None,
+        Err(msg) => Some(format!(
+            "updated '{plugin_name}' but setup script failed: {msg}"
+        )),
+    };
 }
 
 pub(crate) fn apply_cancel_pending_update(state: &mut PluginsModalState) {
@@ -1235,7 +1450,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn install_from_index_entry_uses_pending_install_and_reinspects_manifest() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1293,6 +1508,8 @@ mod tests {
             &config,
         )
         .await;
+        // Background clone now runs to completion; drain it before asserting.
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let RightMode::PendingInstallConfirm {
             source_url,
@@ -1313,7 +1530,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn update_rejects_index_checksum_mismatch_before_preview() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1330,6 +1547,7 @@ mod tests {
                 source_subdir: None,
                 checksum_algorithm: Some("sha256".into()),
                 checksum_value: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                setup_status: Default::default(),
             }],
             trusted_hosts: vec![],
         });
@@ -1348,7 +1566,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn update_preview_uses_refreshed_index_checksum_and_shows_manifest_diff() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare, work) = fixture_plugin_repo_with_work();
@@ -1401,6 +1619,7 @@ mod tests {
                 source_subdir: None,
                 checksum_algorithm: Some("sha256".into()),
                 checksum_value: Some(old_checksum),
+                setup_status: Default::default(),
             }],
             trusted_hosts: vec![],
         });
@@ -1420,7 +1639,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_extension_install_can_be_cancelled_without_touching_real_state() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1438,8 +1657,8 @@ mod tests {
             None,
             &registry,
             &config,
-        )
-        .await;
+        );
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
             RightMode::PendingInstallConfirm { temp_dir, final_dir, summary, .. } => {
@@ -1464,7 +1683,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_extension_install_confirm_moves_temp_and_records_plugin() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
         let (_repo_tmp, bare) = fixture_plugin_repo();
@@ -1482,8 +1701,8 @@ mod tests {
             None,
             &registry,
             &config,
-        )
-        .await;
+        );
+        complete_pending_install_clone(&mut state, &registry, &config).await;
 
         let (temp_dir, final_dir) = match &state.mode {
             RightMode::PendingInstallConfirm { temp_dir, final_dir, .. } => {
@@ -1518,7 +1737,7 @@ mod tests {
     /// fixture just to assert the hook fires.
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_runs_declared_script() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1542,14 +1761,14 @@ mod tests {
 
         let res = run_post_install_setup_for_dir("hook-test", plugin_dir.path()).await;
         assert!(res.is_ok(), "got {res:?}");
-        let log = res.unwrap().expect("setup was declared so log should be Some");
+        let log = match res.unwrap() { PostInstallOutcome::SetupSucceeded(p) => p, other => panic!("expected setup success, got {other:?}") };
         assert!(marker.exists(), "setup script should have created the marker");
         assert!(log.starts_with(home.path().join("logs/install")));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_returns_ok_none_when_no_setup_declared() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1563,14 +1782,14 @@ mod tests {
 
         let res = run_post_install_setup_for_dir("no-setup-test", plugin_dir.path()).await;
         match res {
-            Ok(None) => {}
+            Ok(PostInstallOutcome::NotRequired | PostInstallOutcome::BinaryAlreadyPresent | PostInstallOutcome::PrebuiltInstalled) => {}
             other => panic!("expected Ok(None), got {other:?}"),
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_propagates_non_zero_exit() {
-        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
 
@@ -1588,7 +1807,183 @@ mod tests {
 
         let res = run_post_install_setup_for_dir("fail-test", plugin_dir.path()).await;
         let err = res.expect_err("non-zero exit should propagate");
-        assert!(err.contains("13"), "error should mention exit code 13: {err}");
-        assert!(err.contains(".log"), "error should point at log path: {err}");
+        assert!(err.to_string().contains("13"), "error should mention exit code 13: {err}");
+        assert!(err.to_string().contains(".log"), "error should point at log path: {err}");
+    }
+
+    /// Slice D: when the manifest's `extension.command` already exists
+    /// and is executable inside the freshly-cloned plugin dir, skip
+    /// the setup script entirely (fast-path for source-shipped binaries
+    /// or reinstalls where the artifact survived in place).
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_skipped_when_extension_binary_already_present() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"skip-test","extension":{"runtime":"process","command":"bin/ext","setup":"scripts/setup.sh"}}"#,
+        ).unwrap();
+        // Pre-create the binary so the fast-path triggers.
+        let bin = plugin_dir.path().join("bin/ext");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho prebuilt").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Setup script that, if invoked, would create a marker. We
+        // assert it's NOT created.
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let marker = plugin_dir.path().join("setup-ran.marker");
+        std::fs::write(
+            scripts.join("setup.sh"),
+            format!("#!/bin/bash\ntouch {}\necho ran\n", marker.display()),
+        ).unwrap();
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("skip-test", plugin_dir.path()).await;
+        match res {
+            Ok(PostInstallOutcome::NotRequired | PostInstallOutcome::BinaryAlreadyPresent | PostInstallOutcome::PrebuiltInstalled) => {}
+            other => panic!("expected Ok(None) (fast-path skip), got {other:?}"),
+        }
+        assert!(!marker.exists(), "setup script must NOT have run on fast-path");
+    }
+
+    /// Slice C/F: setup script exits 0 but the declared
+    /// `extension.command` doesn't exist after — surface a clear
+    /// error instead of silently proceeding with a broken install.
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_fails_when_setup_does_not_produce_extension_binary() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"verify-test","extension":{"runtime":"process","command":"bin/missing","setup":"scripts/setup.sh"}}"#,
+        ).unwrap();
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        // Setup that "succeeds" but doesn't produce bin/missing.
+        std::fs::write(scripts.join("setup.sh"), "#!/bin/bash\necho lying setup\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = run_post_install_setup_for_dir("verify-test", plugin_dir.path()).await;
+        let err = res.expect_err("missing post-build artifact must error");
+        assert!(
+            err.to_string().contains("did not produce"),
+            "error should explain build didn't produce binary: {err}"
+        );
+        assert!(err.to_string().contains("bin/missing"), "error should name the missing path: {err}");
+    }
+
+    /// Slice F: no setup script declared but extension.command is also
+    /// missing → must error (don't silently accept a broken install).
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_setup_fails_when_no_setup_and_extension_binary_missing() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_dir).unwrap();
+        std::fs::write(
+            synaps_dir.join("plugin.json"),
+            r#"{"name":"no-setup-no-bin","extension":{"runtime":"process","command":"bin/never-built"}}"#,
+        ).unwrap();
+        let res = run_post_install_setup_for_dir("no-setup-no-bin", plugin_dir.path()).await;
+        let err = res.expect_err("missing binary with no setup must error");
+        assert!(err.to_string().contains("verification failed"), "expected verify msg: {err}");
+    }
+
+    /// file:// prebuilt assets are not accepted through the production post-install
+    /// path; src/skills/post_install.rs has cfg(test)-local unit coverage for file archives.
+    #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_install_rejects_file_prebuilt_url_in_production_path() {
+        let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set_base_dir(home.path(), &home.path().join("gitconfig"));
+        // file:// asset URLs are accepted only in cfg(test) code paths.
+
+        // Stage a tarball containing bin/ext.
+        let staging = tempfile::tempdir().unwrap();
+        let work = staging.path().join("staging");
+        std::fs::create_dir_all(work.join("bin")).unwrap();
+        std::fs::write(work.join("bin/ext"), "#!/bin/sh\necho prebuilt\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            work.join("bin/ext"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let archive = staging.path().join("ext.tar.gz");
+        let out = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&work)
+            .arg("bin/ext")
+            .output()
+            .expect("system tar must be present");
+        assert!(out.status.success());
+        let bytes = std::fs::read(&archive).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let sha: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let triple = synaps_cli::skills::post_install::host_triple()
+            .expect("supported test host");
+
+        // Plugin dir with a manifest that declares both prebuilt AND
+        // setup — prebuilt wins, setup must NOT run.
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let synaps_plugin_dir = plugin_dir.path().join(".synaps-plugin");
+        std::fs::create_dir_all(&synaps_plugin_dir).unwrap();
+        let manifest_json = format!(
+            r#"{{
+                "name":"prebuilt-test",
+                "extension":{{
+                    "runtime":"process",
+                    "command":"bin/ext",
+                    "setup":"scripts/setup.sh",
+                    "prebuilt":{{
+                        "{triple}":{{
+                            "url":"file://{archive}",
+                            "sha256":"{sha}"
+                        }}
+                    }}
+                }}
+            }}"#,
+            triple = triple,
+            archive = archive.display(),
+            sha = sha,
+        );
+        std::fs::write(synaps_plugin_dir.join("plugin.json"), &manifest_json).unwrap();
+        // Setup script that would create a marker if invoked.
+        let scripts = plugin_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let marker = plugin_dir.path().join("setup-ran.marker");
+        std::fs::write(
+            scripts.join("setup.sh"),
+            format!("#!/bin/bash\ntouch {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(scripts.join("setup.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let res = run_post_install_setup_for_dir("prebuilt-test", plugin_dir.path()).await;
+        let err = res.expect_err("file:// prebuilt should be rejected outside post_install cfg(test) unit tests");
+        assert!(err.to_string().contains("refusing non-https prebuilt url"), "got: {err}");
+        assert!(!marker.exists(), "setup script must not run after unsafe prebuilt URL");
     }
 }

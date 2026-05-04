@@ -25,6 +25,7 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
         permissions: vec!["providers.register".to_string()],
         hooks: vec![],

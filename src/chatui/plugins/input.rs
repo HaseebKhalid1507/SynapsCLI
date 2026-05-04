@@ -30,6 +30,7 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
         RightMode::Confirm { .. } => return confirm_key(state, key),
         RightMode::PendingInstallConfirm { .. } => return pending_install_key(key),
         RightMode::PendingUpdateConfirm { .. } => return pending_update_key(key),
+        RightMode::Installing { .. } => return InputOutcome::None,
         RightMode::Detail { .. } => return detail_key(state, key),
         RightMode::List => {}
     }
@@ -407,6 +408,7 @@ mod tests {
                 source_subdir: None,
                 checksum_algorithm: None,
                 checksum_value: None,
+                setup_status: Default::default(),
             });
         }
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
@@ -451,6 +453,7 @@ mod tests {
             source_subdir: None,
             checksum_algorithm: None,
             checksum_value: None,
+            setup_status: Default::default(),
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 1; // marketplace row
@@ -487,6 +490,7 @@ mod tests {
             source_subdir: None,
             checksum_algorithm: None,
             checksum_value: None,
+            setup_status: Default::default(),
         });
         let mut s = crate::chatui::plugins::PluginsModalState::new(file);
         s.selected_left = 0; // Installed

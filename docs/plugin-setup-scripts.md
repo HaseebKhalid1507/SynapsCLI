@@ -1,166 +1,54 @@
-# Plugin Setup Scripts (Post-Install Build Hooks)
+# Plugin extension setup and prebuilt contract
 
-When a plugin ships native code (a Rust sidecar, a Python virtualenv,
-a node_modules tree) the built artifact is typically gitignored — it's
-platform-specific, large, and cheap to rebuild. The marketplace clones
-source-only, which means a fresh install would otherwise leave the user
-staring at:
+Synaps runs post-install work after a plugin source tree is cloned or updated.
 
-```
-⚠ Extension 'local-voice' failed: Failed to spawn extension
-  'local-voice': No such file or directory (os error 2)
-```
-
-The setup-script hook closes that gap. Plugins that need a build step
-declare a `provides.sidecar.setup` path in their manifest, and Synaps
-auto-runs that script after the marketplace install completes.
-
-## Manifest declaration
-
-In `.synaps-plugin/plugin.json`:
+## Manifest fields
 
 ```json
 {
-  "name": "local-voice",
   "extension": {
-    "command": "bin/synaps-voice-plugin",
-    "args": ["--extension-rpc"],
-    ...
-  },
-  "provides": {
-    "sidecar": {
-      "command": "bin/synaps-voice-plugin",
-      "setup": "scripts/setup.sh",
-      "protocol_version": 1
+    "runtime": "process",
+    "command": "extensions/my-ext/target/release/my-ext",
+    "setup": "scripts/setup.sh",
+    "prebuilt": {
+      "linux-x86_64": {
+        "url": "https://example.com/my-ext-linux-x86_64.tar.gz",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
     }
   }
 }
 ```
 
-The `setup` path is **relative to the plugin's root directory** (the
-directory that contains `.synaps-plugin/`). Absolute paths and `..`
-components are rejected at install time — the path must resolve inside
-the plugin dir.
+- `extension.setup` takes precedence over legacy `provides.sidecar.setup`.
+- `extension.command` for shipped binaries must be plugin-relative. Absolute paths and `..` traversal are rejected. Bare PATH commands remain supported for interpreter-style extensions.
+- `extension.prebuilt` keys use compact host triples such as `linux-x86_64`, `linux-arm64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64`, and `windows-arm64`.
+- Prebuilt `url` must be HTTPS in production builds. `file://` is accepted only in tests.
+- `sha256` must be exactly 64 hex characters; values are normalized to lowercase before comparison.
 
-## What the script must do
+## Install order
 
-1. **Build the extension binary** at the path the manifest's
-   `extension.command` points to. For `local-voice` that means
-   `bin/synaps-voice-plugin`.
-2. **Validate any preconditions** (Rust toolchain, native libs, model
-   files). Fail loudly with a non-zero exit on missing prerequisites
-   so the install message is actionable.
-3. **Be idempotent** — Synaps may call it again on update / refresh.
-   Skip work that's already done where you can.
-4. **Be quiet on success and verbose on failure** — output is captured
-   to a log; users see the log path on failure.
+1. If `extension.command` already resolves to an executable plugin-relative file, setup is skipped.
+2. If a matching `extension.prebuilt` asset exists, Synaps downloads it with request timeouts and a 128 MiB size cap, verifies SHA-256 while streaming, extracts it through a sandbox, and verifies `extension.command`.
+3. If no prebuilt matches, Synaps runs `extension.setup` (or legacy sidecar setup) with `bash` from the plugin directory.
+4. After setup, Synaps verifies the declared extension binary exists and is executable.
 
-A minimal `scripts/setup.sh` skeleton:
+## Prebuilt archive layout
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+Archives should contain files at the paths expected by the manifest, for example `extensions/my-ext/target/release/my-ext`. Flat plugin-relative layout is supported. Do not rely on a top-level wrapper directory unless your `extension.command` includes that directory.
 
-plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-binary_name="my-extension"
+Supported archive types: `.tar.gz`, `.tgz`, and `.zip`. Archive entries with absolute paths, `..`, special file types, or symlinks escaping the extraction root are rejected.
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: Rust/Cargo is required. Install from https://rustup.rs/" >&2
-  exit 1
-fi
+## Setup environment and platform policy
 
-cd "$plugin_dir"
-echo "Building $binary_name..."
-cargo build --release
+Setup scripts run as `bash <script>` with current directory set to the plugin root. The environment is reduced to a small allowlist (`PATH`, `HOME`, `USER`, `SHELL`) plus `SYNAPS_PLUGIN_DIR`; API keys and other parent-process secrets are not inherited by default. Windows setup scripts are not supported in this release; use prebuilt assets on Windows.
 
-mkdir -p "$plugin_dir/bin"
-cp "$plugin_dir/target/release/$binary_name" "$plugin_dir/bin/$binary_name"
-chmod +x "$plugin_dir/bin/$binary_name"
+## Failure behavior
 
-echo "Installed: $plugin_dir/bin/$binary_name"
-```
+Plugins remain recorded after recoverable setup failures, but their setup status is persisted. Extensions with failed setup are skipped on later session start until setup succeeds via reinstall/update. Hard security failures such as checksum mismatch, unsafe URL, path escape, or invalid command are surfaced clearly and should not be ignored.
 
-## Runtime contract
+Troubleshooting:
 
-Synaps invokes the script as:
-
-```
-bash <resolved-script>
-```
-
-with:
-
-- **cwd** set to the plugin root
-- **stdin** closed (`/dev/null`)
-- **stdout + stderr** captured to
-  `~/.synaps-cli/logs/install/<plugin>-<timestamp>.log`
-- **wall-clock timeout** of 10 minutes (`SETUP_TIMEOUT`)
-
-Exit `0` → the install succeeds silently and Synaps reloads the
-extension registry. Any non-zero exit, kill-by-timeout, or I/O failure
-is surfaced to the user as:
-
-```
-installed 'my-plugin' but setup script failed: <error>; see <log-path>
-```
-
-The plugin **stays installed** even when setup fails — the source is
-on disk, and the user can re-run the script manually. Synaps will
-attempt to start the extension on next session; if the build is still
-missing, the spawn-error message will helpfully include the exact
-command to run:
-
-```
-Extension binary missing — this plugin ships source only.
-Build it with: (cd /home/u/.synaps-cli/plugins/my-plugin && bash scripts/setup.sh);
-then reload.
-```
-
-## Security model
-
-Setup scripts are arbitrary shell — they can do anything the user can
-do. Mitigations:
-
-- **Path validation**: the declared setup path is canonicalized and
-  must live inside the plugin dir (no symlink-escape).
-- **Trust gate**: the existing pre-install confirmation dialog (shown
-  for any plugin that declares an `extension` block) applies — by the
-  time the user has accepted "this plugin will run code on my
-  machine," running the build script is strictly less powerful than
-  running the extension itself.
-- **Wall-clock cap**: a runaway `setup.sh` can't wedge the install
-  flow indefinitely.
-- **Capture, don't swallow**: every byte of stdout/stderr lands in the
-  log. Failed installs are diagnosable.
-
-## Platform notes
-
-- v1 supports POSIX shells only (`bash`). Plugins targeting Windows
-  should ship a pre-built binary committed to the repo, or a
-  `setup.ps1` shim invoked from a `setup.sh` `case "$(uname)"` block.
-- The script inherits the user's `PATH`. If your build needs a
-  specific toolchain (`cmake`, `clang`, native libs), the script
-  should `command -v` them and fail with a clear message rather than
-  proceeding to a confusing rustc error.
-
-## Disabling auto-run
-
-There is no per-plugin "skip setup" flag in v1. If a user wants to
-inspect the script before letting it run, they can:
-
-1. Cancel the install at the confirmation dialog
-2. Clone the repo manually, inspect the script
-3. Drop the cloned tree into `~/.synaps-cli/plugins/<name>/` and run
-   the script themselves
-
-In a future iteration we may add `--skip-setup` to the install action
-or surface a "show setup script before running" preview pane.
-
-## Related
-
-- `src/skills/post_install.rs` — the helper module
-- `src/chatui/plugins/actions.rs` — install-flow wiring
-- `src/extensions/manager.rs::compute_extension_load_hint` — runtime
-  hint when binary is missing
-- [`docs/extensions/README.md`](./extensions/README.md) — what
-  extensions are and how they hook into Synaps
+- Missing binary: check the setup log path shown in `/plugins`, run the setup script from the plugin directory, then reinstall/update.
+- Checksum mismatch: publish a new manifest SHA-256 or replace the corrupt asset.
+- Archive rejected: remove absolute/traversal entries and avoid escaping symlinks.

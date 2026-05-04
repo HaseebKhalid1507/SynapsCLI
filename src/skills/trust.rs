@@ -137,6 +137,7 @@ mod tests {
             runtime: ExtensionRuntime::Process,
             command: "python3".to_string(),
             setup: None,
+            prebuilt: ::std::collections::HashMap::new(),
             args: vec!["ext.py".to_string()],
             permissions: vec!["tools.intercept".to_string(), "privacy.llm_content".to_string()],
             hooks: vec![HookSubscription {

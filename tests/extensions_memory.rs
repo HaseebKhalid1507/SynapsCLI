@@ -31,6 +31,7 @@ fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture_path()],
         permissions: perms.into_iter().map(String::from).collect(),
         hooks: vec![],

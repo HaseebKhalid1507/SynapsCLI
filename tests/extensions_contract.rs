@@ -195,6 +195,7 @@ async fn manager_rejects_bad_manifest_before_spawning_process() {
         runtime: ExtensionRuntime::Process,
         command: "/definitely/not/a/real/extension-binary".to_string(),
         setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
         args: vec![],
         permissions: vec!["tools.typo".to_string()],
         hooks: vec![HookSubscription {
