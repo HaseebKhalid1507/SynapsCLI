@@ -107,6 +107,7 @@ pub fn find_all_chains_by_head(session_id: &str) -> io::Result<Vec<NamedChain>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -144,6 +145,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn save_load_delete_list() {
         with_tmp_home(|| {
             assert!(list_chains().unwrap().is_empty());
@@ -171,6 +173,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn overwrite_updates_head() {
         with_tmp_home(|| {
             save_chain("c", "one").unwrap();

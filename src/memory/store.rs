@@ -127,9 +127,9 @@ pub(crate) fn append_to(base: &Path, record: &MemoryRecord) -> Result<(), Memory
     fs::create_dir_all(&dir)?;
     let path = namespace_path(&dir, &record.namespace);
     let mut f = OpenOptions::new().append(true).create(true).open(&path)?;
-    let line = serde_json::to_string(record)?;
+    let mut line = serde_json::to_string(record)?;
+    line.push('\n');
     f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
     Ok(())
 }
 

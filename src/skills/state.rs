@@ -108,10 +108,13 @@ impl PluginsState {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // atomic write via temp + rename
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)
+        // Atomic write via unique temp file + rename (avoids concurrent trampling)
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::fs::write(tmp.path(), json)?;
+        // fsync before rename so data is durable on power loss
+        std::fs::File::open(tmp.path()).and_then(|f| f.sync_all())?;
+        tmp.persist(path).map_err(|e| e.error).map(|_| ())
     }
 
     /// Resolve the on-disk path for the current profile.

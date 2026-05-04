@@ -81,10 +81,11 @@ fn append_record_to_path(path: &std::path::Path, record: &SessionIndexRecord) ->
         .append(true)
         .open(path)
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("open session index: {err}")))?;
-    serde_json::to_writer(&mut file, record)
+    let mut line = serde_json::to_string(record)
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("serialize session index record: {err}")))?;
+    line.push('\n');
     use std::io::Write;
-    file.write_all(b"\n")
+    file.write_all(line.as_bytes())
         .map_err(|err| crate::core::error::RuntimeError::Session(format!("write session index record: {err}")))?;
     Ok(())
 }
@@ -101,10 +102,13 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
         if line.trim().is_empty() {
             continue;
         }
-        records.push(
-            serde_json::from_str::<SessionIndexRecord>(line)
-                .map_err(|err| crate::core::error::RuntimeError::Session(format!("parse session index record: {err}")))?,
-        );
+        match serde_json::from_str::<SessionIndexRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                tracing::warn!("skipping malformed session index line: {err}");
+                continue;
+            }
+        }
     }
     records.reverse();
     Ok(records)
@@ -113,6 +117,7 @@ fn read_recent_from_path(path: &std::path::Path, limit: usize) -> crate::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use serde_json::Value;
     use std::sync::Mutex;
 
@@ -148,6 +153,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn append_record_creates_jsonl_under_base_dir() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("creates-jsonl");
@@ -168,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn append_start_and_end_are_valid_json_lines() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("start-end-lines");
@@ -184,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_returns_newest_records_in_chronological_order() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("read-recent");
@@ -202,6 +210,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_missing_index_returns_empty() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("missing-index");
@@ -211,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_recent_limit_zero_returns_empty() {
         let _lock = ENV_LOCK.lock().unwrap();
         let base = temp_base_dir("limit-zero");

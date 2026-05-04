@@ -126,7 +126,15 @@ pub async fn try_route(
             // Per-provider trust gate: a disabled provider must not be invoked.
             // The check runs before any IPC and we DO NOT silently fall back to
             // built-in routing — instead return a clear routing error.
-            let trust = crate::extensions::trust::load_trust_state().unwrap_or_default();
+            let trust = match crate::extensions::trust::load_trust_state() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("trust.json corrupt or unreadable, failing closed: {e}");
+                    return Some(Err(
+                        format!("Cannot route to provider: trust state unreadable: {e}").into()
+                    ));
+                }
+            };
             if !crate::extensions::trust::is_provider_enabled(&trust, &provider_runtime_id) {
                 let _ = crate::extensions::audit::append_audit_entry(
                     &crate::extensions::audit::new_audit_entry(

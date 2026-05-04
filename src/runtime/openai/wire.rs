@@ -59,6 +59,14 @@ pub struct RawUsage {
     pub prompt_tokens: Option<u32>,
     #[serde(default)]
     pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<RawPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 /// Legacy text-only SSE line parser. Kept for simple use-cases; the main
@@ -187,9 +195,13 @@ impl StreamDecoder {
             }
         }
         if let Some(u) = chunk.usage {
+            let cached = u.prompt_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0);
             sink.extend(Some(OaiEvent::Usage {
                 prompt_tokens: u.prompt_tokens.unwrap_or(0),
                 completion_tokens: u.completion_tokens.unwrap_or(0),
+                cached_tokens: cached,
             }));
         }
     }

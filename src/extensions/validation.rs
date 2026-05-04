@@ -18,6 +18,7 @@ pub enum IdValidationError {
     TooLong { len: usize, max: usize },
     ContainsReserved { ch: char },
     ContainsWhitespace,
+    ContainsControl { ch: char },
 }
 
 impl std::fmt::Display for IdValidationError {
@@ -29,6 +30,9 @@ impl std::fmt::Display for IdValidationError {
                 write!(f, "must not contain reserved character '{}'", ch)
             }
             Self::ContainsWhitespace => write!(f, "must not contain whitespace"),
+            Self::ContainsControl { ch } => {
+                write!(f, "must not contain control character U+{:04X}", *ch as u32)
+            }
         }
     }
 }
@@ -46,6 +50,9 @@ pub fn validate_id_segment(id: &str) -> Result<(), IdValidationError> {
             max: MAX_ID_LENGTH,
         });
     }
+    if let Some(ch) = id.chars().find(|c| c.is_control() && !c.is_whitespace()) {
+        return Err(IdValidationError::ContainsControl { ch });
+    }
     if let Some(ch) = id.chars().find(|c| RESERVED_CHARS.contains(c)) {
         return Err(IdValidationError::ContainsReserved { ch });
     }
@@ -53,6 +60,15 @@ pub fn validate_id_segment(id: &str) -> Result<(), IdValidationError> {
         return Err(IdValidationError::ContainsWhitespace);
     }
     Ok(())
+}
+
+/// Strip control characters from a display string (tool descriptions, help text, etc.).
+/// Preserves newlines and tabs but removes ESC, BEL, and other C0/C1 control codes
+/// that could inject ANSI escape sequences into the TUI.
+pub fn sanitize_display_string(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
 }
 
 /// Build a context-prefixed error message for validation failures.
@@ -146,5 +162,25 @@ mod tests {
         let msg = format!("{}", IdValidationError::TooLong { len: 65, max: 64 });
         assert!(msg.contains("65"));
         assert!(msg.contains("64"));
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        assert_eq!(
+            validate_id_segment("foo\x1Bbar"),
+            Err(IdValidationError::ContainsControl { ch: '\x1B' })
+        );
+        assert_eq!(
+            validate_id_segment("foo\x07bar"),
+            Err(IdValidationError::ContainsControl { ch: '\x07' })
+        );
+    }
+
+    #[test]
+    fn sanitize_display_string_strips_controls() {
+        assert_eq!(sanitize_display_string("hello\x1B[31mworld"), "hello[31mworld");
+        assert_eq!(sanitize_display_string("ok\x07bell"), "okbell");
+        // Preserves newlines and tabs
+        assert_eq!(sanitize_display_string("a\nb\tc"), "a\nb\tc");
     }
 }

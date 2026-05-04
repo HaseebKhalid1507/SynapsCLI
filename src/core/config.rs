@@ -424,6 +424,7 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_parse_thinking_budget() {
@@ -494,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_config_value_replaces_existing_key() {
         let home = make_test_home("replace");
         let cfg = home.join(".synaps-cli/config");
@@ -510,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_config_value_appends_when_missing() {
         let home = make_test_home("append");
         let cfg = home.join(".synaps-cli/config");
@@ -526,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_config_value_preserves_comments() {
         let home = make_test_home("comments");
         let cfg = home.join(".synaps-cli/config");
@@ -543,6 +547,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_config_value_preserves_unknown_keys() {
         let home = make_test_home("unknown");
         let cfg = home.join(".synaps-cli/config");
@@ -558,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn write_config_value_creates_file_if_absent() {
         let home = make_test_home("create");
         let cfg = home.join(".synaps-cli/config");
@@ -573,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn load_config_parses_theme_key() {
         let dir = std::path::PathBuf::from("/tmp/synaps-config-test-theme/.synaps-cli");
         let _ = std::fs::create_dir_all(&dir);
@@ -594,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_load_config_disable_lists() {
         let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
         let _ = std::fs::create_dir_all(&test_dir);
@@ -630,6 +638,7 @@ disabled_skills = baz, plug:qual
     }
 
     #[test]
+    #[serial]
     fn favorite_model_helpers_round_trip_through_config_file() {
         let home = make_test_home("favorite-models");
         let cfg = home.join(".synaps-cli/config");
@@ -652,6 +661,7 @@ disabled_skills = baz, plug:qual
     }
 
     #[test]
+    #[serial]
     fn test_load_config_new_keys() {
         // Create a temporary config directory with the new keys
         let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-new-keys/.synaps-cli");
