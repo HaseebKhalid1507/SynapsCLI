@@ -49,6 +49,11 @@ brew install HaseebKhalid1507/tap/synaps  # Homebrew (macOS/Linux)
 ```
 
 ```bash
+curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
+sudo dpkg -i synaps_amd64.deb           # Debian/Ubuntu
+```
+
+```bash
 curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh  # shell installer
 ```
 
