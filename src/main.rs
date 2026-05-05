@@ -37,7 +37,24 @@ enum Command {
         system: Option<String>,
     },
     /// Plain text streaming chat
-    Chat,
+    /// Headless chat with full engine (MCP, extensions, skills, sessions)
+    Chat {
+        /// Continue a previous session (optional session ID, name, or chain)
+        #[arg(long, short = 'c')]
+        continue_session: Option<String>,
+        /// System prompt (path or inline)
+        #[arg(long, short = 's')]
+        system: Option<String>,
+        /// Agent name (loads agent prompt from ~/.synaps-cli/agents/)
+        #[arg(long, short = 'a')]
+        agent: Option<String>,
+        /// Profile name
+        #[arg(long)]
+        profile: Option<String>,
+        /// Disable extensions
+        #[arg(long)]
+        no_extensions: bool,
+    },
     /// WebSocket API server
     Server {
         #[arg(long, short, default_value = "3145")]
@@ -128,8 +145,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Run { prompt, agent, system }) => {
             cmd::run::run(prompt, agent, system).await?;
         }
-        Some(Command::Chat) => {
-            cmd::chat::run().await?;
+        Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
+            cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
         Some(Command::Server { port, host, system, continue_session }) => {
             cmd::server::run(port, host, system, continue_session, cli.profile).await?;
