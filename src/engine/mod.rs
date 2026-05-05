@@ -5,3 +5,4 @@
 //! all non-visual operations.
 
 pub mod setup;
+pub mod commands;
