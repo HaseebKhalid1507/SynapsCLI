@@ -1,0 +1,17 @@
+mod neon_rain;
+mod amber;
+mod phosphor;
+mod solarized_dark;
+mod blood;
+mod ocean;
+mod rose_pine;
+mod nord;
+mod dracula;
+mod monokai;
+mod gruvbox;
+mod catppuccin;
+mod tokyo_night;
+mod sunset;
+mod ice;
+mod forest;
+mod lavender;
