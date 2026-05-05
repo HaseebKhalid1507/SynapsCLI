@@ -34,12 +34,22 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 
 ---
 
-## Quick Start
+## Install
 
 ```bash
-cargo install synaps
-synaps login              # OAuth (Claude Pro/Max/Team)
-synaps                    # Launch TUI
+cargo install synaps                    # crates.io (recommended)
+```
+
+```bash
+yay -S synaps                           # AUR (Arch/EndeavourOS)
+```
+
+```bash
+brew install HaseebKhalid1507/tap/synaps  # Homebrew (macOS/Linux)
+```
+
+```bash
+curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh  # shell installer
 ```
 
 Or build from source:
@@ -48,6 +58,13 @@ git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
 cd SynapsCLI
 cargo build --release
 ./target/release/synaps
+```
+
+## Quick Start
+
+```bash
+synaps login              # OAuth (Claude Pro/Max/Team)
+synaps                    # Launch TUI
 ```
 
 Or use an API key instead of OAuth:
