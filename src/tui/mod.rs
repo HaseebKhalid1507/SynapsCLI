@@ -46,81 +46,46 @@ pub async fn run(
     profile: Option<String>,
     no_extensions: bool,
 ) -> Result<()> {
-    if let Some(ref prof) = profile {
-        synaps_cli::config::set_profile(Some(prof.clone()));
-    }
+    // ── Engine boot ──
+    let boot = synaps_cli::engine::setup::boot(synaps_cli::engine::setup::EngineOpts {
+        continue_session: continue_session.clone(),
+        system,
+        profile,
+        no_extensions,
+    }).await?;
 
-    let _log_guard = synaps_cli::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
+    let mut runtime = boot.runtime;
+    let mut config = boot.config;
+    let registry = boot.registry;
+    let keybind_registry = boot.keybind_registry;
+    let mcp_server_count = boot.mcp_server_count;
+    let system_prompt_path = boot.system_prompt_path;
 
-    // Load config and apply
-    let mut config = synaps_cli::config::load_config();
-    runtime.apply_config(&config);
-
-    // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
-    runtime.set_system_prompt(system_prompt);
-
-    // Discover plugins/skills, build command registry, register load_skill tool.
-    let tools_shared = runtime.tools_shared();
-    let (registry, keybind_registry) = synaps_cli::skills::register(&tools_shared, &config).await;
-    let _skill_count = registry.all_skills().len();
-
-    // Set up lazy MCP loading (if configured in ~/.synaps-cli/mcp.json)
-    let mcp_server_count = synaps_cli::mcp::setup_lazy_mcp(&runtime.tools_shared()).await;
-
-    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-
-    // Session: continue existing or create new
-    let mut app = match continue_session {
-        Some(ref maybe_id) => {
-            let session = match maybe_id {
-                Some(ref id) => resolve_session(id).unwrap_or_else(|e| {
-                    eprintln!("Failed to load session '{}': {}", id, e);
-                    std::process::exit(1);
-                }),
-                None => latest_session().unwrap_or_else(|e| {
-                    eprintln!("No sessions to continue: {}", e);
-                    std::process::exit(1);
-                }),
-            };
-            runtime.set_model(session.model.clone());
-            if let Some(ref sp) = session.system_prompt {
-                runtime.set_system_prompt(sp.clone());
+    // Build App from engine boot results
+    let mut app = if boot.continued {
+        let mut app = App::new(boot.session.clone());
+        app.api_messages = boot.api_messages;
+        app.total_input_tokens = boot.total_input_tokens;
+        app.total_output_tokens = boot.total_output_tokens;
+        app.session_cost = boot.session_cost;
+        app.abort_context = boot.abort_context;
+        rebuild_display_messages(&app.api_messages.clone(), &mut app);
+        app.push_msg(ChatMessage::System(format!("resumed session {}", boot.session.id)));
+        if let Some(ref info) = boot.continue_info {
+            if let Some(ref via) = info.resolved_via {
+                app.push_msg(ChatMessage::System(format!("  ↳ resolved via {} '{}'", via, info.query)));
             }
-            let mut app = App::new(session.clone());
-            app.api_messages = session.api_messages.clone();
-            app.total_input_tokens = session.total_input_tokens;
-            app.total_output_tokens = session.total_output_tokens;
-            app.session_cost = session.session_cost;
-            app.abort_context = session.abort_context.clone();
-            rebuild_display_messages(&session.api_messages, &mut app);
-            app.push_msg(ChatMessage::System(format!("resumed session {}", session.id)));
-            match continue_session.as_ref().and_then(|o| o.as_ref()) {
-                Some(q) if *q != session.id => {
-                    if synaps_cli::chain::load_chain(q).is_ok() {
-                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via chain '{}'", q)));
-                    } else if synaps_cli::session::find_session_by_name(q).is_ok() {
-                        app.push_msg(ChatMessage::System(format!("  ↳ resolved via name '{}'", q)));
-                    }
-                }
-                _ => {}
-            }
-            if app.abort_context.is_some() {
-                app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
-            }
-            app
         }
-        None => {
-            App::new(Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt()))
+        if app.abort_context.is_some() {
+            app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
         }
+        app
+    } else {
+        App::new(boot.session)
     };
     app.keybinds = Some(keybind_registry.clone());
-
-    // Sync the context bar denominator with the runtime's effective window
-    // (respects config override like `context_window = 200k`).
     app.last_turn_context_window = runtime.context_window();
-    // MCP server count logged but not shown — the banner hides the ASCII art.
+
     if mcp_server_count > 0 {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
     }
@@ -141,49 +106,15 @@ pub async fn run(
     let mut exit_fx: Option<Effect> = None;
     let mut last_frame = Instant::now();
 
-    // Start inbox watcher — file-drop ingestion for external events
-    let watcher_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher_task = {
-        let inbox_dir = synaps_cli::config::base_dir().join("inbox");
-        let event_queue = runtime.event_queue().clone();
-        let shutdown = watcher_shutdown.clone();
-        tokio::spawn(async move {
-            synaps_cli::events::watch_inbox(inbox_dir, event_queue, shutdown).await;
-        })
-    };
+    // ── Engine-managed background tasks (inbox watcher, socket, extensions) ──
+    let watcher_shutdown = boot.watcher_shutdown;
+    let watcher_task = boot.watcher_task;
+    let socket_shutdown = boot.socket_shutdown;
+    let socket_task = boot.socket_task;
+    let session_socket_path = boot.session_socket_path;
+    let ext_mgr_shared = boot.ext_manager;
 
-    // Start per-session Unix socket listener + register in session registry
-    let socket_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_socket_path = synaps_cli::events::registry::socket_path_for_session(&app.session.id);
-    let socket_task = synaps_cli::events::socket::listen_session_socket(
-        session_socket_path.clone(),
-        runtime.event_queue().clone(),
-        socket_shutdown.clone(),
-    );
-    let session_registration = synaps_cli::events::registry::SessionRegistration {
-        session_id: app.session.id.clone(),
-        name: app.session.name.clone(),
-        socket_path: session_socket_path.clone(),
-        pid: std::process::id(),
-        started_at: chrono::Utc::now(),
-    };
-    if let Err(e) = synaps_cli::events::registry::register_session(&session_registration) {
-        tracing::warn!("Failed to register session: {}", e);
-    }
-
-
-    // ═══ Extension Discovery ═══
-    // Scan ~/.synaps-cli/plugins/ for extensions and load them
-    let ext_mgr = synaps_cli::extensions::manager::ExtensionManager::new_with_tools(
-        std::sync::Arc::clone(runtime.hook_bus()),
-        runtime.tools_shared(),
-    );
-    let ext_mgr_shared = std::sync::Arc::new(tokio::sync::RwLock::new(ext_mgr));
-    synaps_cli::runtime::openai::set_extension_manager_for_routing(std::sync::Arc::clone(&ext_mgr_shared));
-
-    // Phase 8 slice 8A.8: copy legacy `sidecar_toggle_key` into the
-    // namespace of any plugin that has staked a lifecycle claim with
-    // a settings_category. Idempotent: skips already-set new keys.
+    // Legacy sidecar key migration
     migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
     if !no_extensions {
@@ -198,19 +129,7 @@ pub async fn run(
         );
     }
 
-    // ═══ HOOK: on_session_start ═══
-    {
-        let mut index_record = SessionIndexRecord::start(&app.session.id);
-        index_record.model = Some(app.session.model.clone());
-        index_record.profile = synaps_cli::core::config::get_profile();
-        index_record.cwd = std::env::current_dir().ok();
-        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
-            tracing::warn!("failed to append session start index record: {}", err);
-        }
-
-        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_start(&app.session.id);
-        let _ = runtime.hook_bus().emit(&hook_event).await;
-    }
+    // on_session_start hook already fired by engine::setup::boot()
 
     // ── Event loop ──
     loop {
