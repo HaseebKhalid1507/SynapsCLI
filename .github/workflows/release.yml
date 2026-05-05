@@ -279,6 +279,27 @@ jobs:
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # ── Publish to crates.io ──
+  # ── Build .deb package ──
+  publish-deb:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+      - name: Build .deb
+        run: cargo deb --no-build --target x86_64-unknown-linux-gnu || cargo deb
+      - name: Upload .deb to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEB=$(find target -name "*.deb" | head -1)
+          gh release upload "${{ needs.plan.outputs.tag }}" "$DEB" --clobber
+
   publish-crates:
     needs:
       - plan
