@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod chatui;
+mod tui;
 mod watcher;
 mod cmd;
 
@@ -140,7 +141,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            if std::env::var("SYNAPS_TUI").as_deref() == Ok("engine") {
+                tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            } else {
+                chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            }
         }
         Some(Command::Run { prompt, agent, system }) => {
             cmd::run::run(prompt, agent, system).await?;
