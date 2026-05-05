@@ -37,7 +37,7 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 ## Quick Start
 
 ```bash
-cargo install synaps-cli
+cargo install synaps
 synaps login              # OAuth (Claude Pro/Max/Team)
 synaps                    # Launch TUI
 ```
