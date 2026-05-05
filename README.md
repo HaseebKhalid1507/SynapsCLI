@@ -6,7 +6,7 @@
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~34K lines](https://img.shields.io/badge/lines-~34K-green.svg)
+![~70K lines](https://img.shields.io/badge/lines-~70K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
 > **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
@@ -19,7 +19,7 @@ One binary, any model. Start with Claude, drop in a free Groq key, point at loca
 
 ## Why SynapsCLI?
 
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~34K lines, `cargo build` and you're done.
+- ⚡ **Sub-100ms cold start.** Single Rust binary, ~70K lines, `cargo build` and you're done.
 - 🌐 **Any model, any provider.** Claude, Groq, Cerebras, NVIDIA NIM, OpenRouter, or your local Ollama. 17 providers, 55+ models. Set a key, pick a model, go.
 - 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
 - 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
