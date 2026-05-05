@@ -93,3 +93,14 @@ panic = "abort"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[package.metadata.deb]
+maintainer = "Haseeb Khalid <haseebkhalid1507@gmail.com>"
+copyright = "2026, Haseeb Khalid"
+license-file = ["LICENSE", "0"]
+extended-description = "Terminal-native AI agent runtime. Parallel orchestration, reactive subagents, MCP client, autonomous watcher daemon."
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/synaps", "usr/bin/", "755"],
+]
