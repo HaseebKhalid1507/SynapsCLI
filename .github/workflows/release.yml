@@ -404,8 +404,8 @@ jobs:
           arch=('x86_64' 'aarch64')
           url="https://github.com/HaseebKhalid1507/SynapsCLI"
           license=('MIT')
-          depends=('gcc-libs')
-          makedepends=('cargo')
+          depends=('gcc-libs' 'oniguruma' 'openssl')
+          makedepends=('cargo' 'oniguruma')
           source=("\$url/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${SHA256}')
 
@@ -440,7 +440,10 @@ jobs:
           	arch = aarch64
           	license = MIT
           	makedepends = cargo
+          	makedepends = oniguruma
           	depends = gcc-libs
+          	depends = oniguruma
+          	depends = openssl
           	source = https://github.com/HaseebKhalid1507/SynapsCLI/archive/refs/tags/v${VERSION}.tar.gz
           	sha256sums = ${SHA256}
 
