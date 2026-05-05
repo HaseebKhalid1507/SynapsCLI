@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
 license = "MIT"
-description = "A terminal-native AI agent runtime"
+description = "Terminal-native AI agent runtime — parallel orchestration, reactive subagents, MCP, autonomous supervision"
 repository = "https://github.com/HaseebKhalid1507/SynapsCLI"
 homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
 keywords = ["ai", "agent", "terminal", "cli", "rust"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", "docs/", "tests/fixtures/", "assets/", "examples/"]
 rust-version = "1.80"
 
 [dependencies]
