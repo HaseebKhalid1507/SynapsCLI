@@ -337,6 +337,29 @@ pub(super) async fn handle_command(
             }
         }
     }
+
+    // ── Engine-level commands (shared with headless) ──
+    if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
+        use synaps_cli::engine::commands::CommandResult;
+        return match result {
+            CommandResult::Quit => CommandAction::Quit,
+            CommandResult::ModelChanged { model } => {
+                app.push_msg(ChatMessage::System(format!("model → {}", model)));
+                CommandAction::None
+            }
+            CommandResult::ThinkingChanged { level, budget } => {
+                app.push_msg(ChatMessage::System(format!("thinking → {} ({})", level, budget)));
+                CommandAction::None
+            }
+            CommandResult::Compact => CommandAction::Compact { custom_instructions: None },
+            CommandResult::Error(e) => {
+                app.push_msg(ChatMessage::Error(e));
+                CommandAction::None
+            }
+            _ => CommandAction::None,
+        };
+    }
+
     match cmd {
         "clear" => {
             app.save_session().await;
