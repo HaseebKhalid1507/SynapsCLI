@@ -7,3 +7,4 @@
 pub mod setup;
 pub mod commands;
 pub mod stream;
+pub mod session;
