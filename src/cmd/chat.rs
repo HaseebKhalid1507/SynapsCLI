@@ -282,6 +282,14 @@ pub async fn run(
 
     // ── Shutdown ──
     conv.save().await;
+
+    // Fire on_session_end hook
+    let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
+        &conv.session.id,
+        None, // no transcript in headless
+    );
+    let _ = runtime.hook_bus().emit(&hook_event).await;
+
     boot.watcher_shutdown.store(true, std::sync::atomic::Ordering::Release);
     boot.socket_shutdown.store(true, std::sync::atomic::Ordering::Release);
     synaps_cli::events::registry::unregister_session(&conv.session.id);
