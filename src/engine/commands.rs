@@ -3,7 +3,6 @@
 //! The engine processes a command and returns a `CommandResult`.
 //! Renderers (TUI, headless) decide how to display the result.
 
-use serde_json::Value;
 
 /// Result of processing a slash command in the engine.
 #[derive(Debug, Clone)]

@@ -146,7 +146,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         abort_tasks(&watcher_shutdown, &watcher_task);
         socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         socket_task.abort();
-        return Err(crate::error::RuntimeError::Tool(format!("Failed to register session: {}", e)));
+        tracing::warn!("Failed to register session: {}", e);
     }
 
     // Extension manager
