@@ -141,10 +141,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            if std::env::var("SYNAPS_TUI").as_deref() == Ok("engine") {
-                tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
-            } else {
+            if std::env::var("SYNAPS_TUI").as_deref() == Ok("legacy") {
                 chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
+            } else {
+                tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
             }
         }
         Some(Command::Run { prompt, agent, system }) => {
