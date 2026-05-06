@@ -81,7 +81,7 @@ class SynapsAgent(BaseInstalledAgent):
         # synaps chat reads from stdin, uses tools, outputs to stdout
         await self.exec_as_agent(
             environment,
-            command=f"echo {shlex.quote(instruction)} | synaps chat 2>/tmp/synaps-stderr.log; echo EXIT: $?; cat /tmp/synaps-stderr.log",
+            command=f"echo {shlex.quote(instruction)} | synaps chat 2>/dev/null",
         )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
