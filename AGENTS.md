@@ -25,12 +25,13 @@ cargo clippy --all-targets               # linting
 - `synaps` (no args) — interactive TUI (the main product)
 - `synaps --continue [NAME_OR_ID]` — resume last session, or resolve a chain bookmark / session alias / partial session ID via `resolve_session()` (chain name → session name → partial ID)
 - `synaps --no-extensions` — disable the extension system (skips plugin hook registration)
-- `synaps chat` — single-shot CLI chat
-- `synaps run` — non-interactive one-shot command
+- `synaps chat` — fully-featured headless mode (MCP, extensions, skills, sessions, compaction, event bus)
 - `synaps agent` — headless worker managed by the watcher
 - `synaps watcher` — supervisor daemon
 - `synaps login` — OAuth flow
-- `synaps server` / `synaps client` — WebSocket relay (less-used)
+- `synaps server` — WebSocket API server
+- `synaps send` — push events into a running session
+- `synaps status` — check account usage
 
 **Test quirks:**
 - 7 PTY tests in `src/tools/shell/pty.rs` and `src/tools/shell/{start,send,end}.rs` fail under parallel due to TTY contention. Use `--test-threads=1`. Not a bug.
@@ -44,7 +45,12 @@ cargo clippy --all-targets               # linting
 src/
 ├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, config, models, etc.
 ├── main.rs               — unified CLI entry point, subcommand dispatch
-├── cmd_*.rs              — subcommand handlers (run, chat, server, client, agent, login, watcher)
+├── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status)
+├── engine/               — shared headless engine used by chat and agent
+│   ├── setup.rs          — boot sequence (config, runtime, extensions, session)
+│   ├── commands.rs       — slash-command handling for headless mode
+│   ├── stream.rs         — StreamEvent consumer for headless rendering
+│   └── session.rs        — ConversationState (messages, history)
 ├── core/                 — shared primitives
 │   ├── config.rs         — SynapsConfig, load/write, profile resolution
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
@@ -80,7 +86,7 @@ src/
 │   ├── secret_prompt.rs  — secure sudo password prompt handling
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
-├── chatui/               — the TUI (module, entered via default `synaps` subcommand)
+├── tui/                  — the TUI (module, entered via default `synaps` subcommand)
 │   ├── mod.rs            — event loop + apply_setting()
 │   ├── app.rs            — App state, record_cost(), line cache
 │   ├── input.rs          — key handling, process_submit()
@@ -169,10 +175,10 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 
 Adding a setting requires touching 5 files. Miss one and you get silent failures.
 
-1. **`src/chatui/settings/schema.rs`** — add a `SettingDef` to `ALL_SETTINGS`. Pick `EditorKind::Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`.
-2. **`src/chatui/mod.rs::apply_setting()`** — add a match arm that mutates `Runtime` (e.g. `runtime.set_foo(v)`).
+1. **`src/tui/settings/schema.rs`** — add a `SettingDef` to `ALL_SETTINGS`. Pick `EditorKind::Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`.
+2. **`src/tui/mod.rs::apply_setting()`** — add a match arm that mutates `Runtime` (e.g. `runtime.set_foo(v)`).
 3. **`src/core/config.rs::load_config()`** — add a branch to parse the key from the config file.
-4. **`src/chatui/commands.rs`** — if it has a slash command (e.g. `/foo`), add to `ALL_COMMANDS` and handle in `handle_command`.
+4. **`src/tui/commands.rs`** — if it has a slash command (e.g. `/foo`), add to `ALL_COMMANDS` and handle in `handle_command`.
 5. **`src/skills/mod.rs`** — add to `BUILTIN_COMMANDS` (for tab-complete via `CommandRegistry`).
 
 The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step 3 omissions. The other sites are not tested. Be careful.
@@ -185,7 +191,7 @@ The `every_setting_key_is_known_to_load_config` test in `schema.rs` catches step
 2. For OpenAI-compatible provider models: add to `src/runtime/openai/registry.rs` in the provider's `models` array as `(model_id, label, tier)`.
 3. If it supports adaptive thinking: update `model_supports_adaptive_thinking()` (~line 26).
 4. If context window differs: update `context_window_for_model()` (~line 94).
-5. Pricing: update the match in `src/chatui/app.rs::record_cost()` (~line 256). Default falls back to Sonnet pricing.
+5. Pricing: see `src/pricing.rs` for the unified pricing table. `record_cost()` in `src/tui/app.rs` uses it. Default falls back to Sonnet pricing.
 6. There are existing tests in `core/models.rs` — extend them.
 
 ### Adding a New Provider
@@ -224,17 +230,17 @@ The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return
 
 ### Adding a New Theme
 
-1. Add a `Theme::my_theme()` method in `src/chatui/theme/palettes.rs` returning a populated `Theme` struct (all ~30 color fields).
-2. Register in `src/chatui/theme/mod.rs::Theme::builtin()` (~line 110) — add a `match` arm.
-3. Add the theme name to the list returned by `src/chatui/settings/mod.rs::theme_options()`.
+1. Add a `Theme::my_theme()` method in `src/tui/theme/palettes.rs` returning a populated `Theme` struct (all ~30 color fields).
+2. Register in `src/tui/theme/mod.rs::Theme::builtin()` (~line 110) — add a `match` arm.
+3. Add the theme name to the list returned by `src/tui/settings/mod.rs::theme_options()`.
 4. Test via `/settings → Appearance → Theme` or config `theme = my-theme`. Requires chatui restart to apply.
 
 ### Adding a New Slash Command
 
 1. Add name to `BUILTIN_COMMANDS` (skills/mod.rs:49).
-2. If it should work during streaming, add to `STREAMING_COMMANDS` (commands.rs:20).
-3. Add a match arm in `handle_command()` (commands.rs).
-4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `mod.rs` event loop.
+2. If it should work during streaming, add to `STREAMING_COMMANDS` (tui/commands.rs:20).
+3. Add a match arm in `handle_command()` (tui/commands.rs).
+4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `tui/mod.rs` event loop.
 
 ### Plugin Agent Resolution
 
@@ -363,7 +369,7 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
 12. **Anthropic auth is optional.** `get_auth_token()` returns `auth_type: "none"` if no credentials found. The app boots fine. Anthropic API calls fail lazily with a clear message pointing to `synaps login` or `/model groq/...`.
 13. **`/compact` doesn't route through providers** — uses `call_api_simple` which is Anthropic-only. Known issue (see `docs/open-provider-issues.md`).
-14. **Cost display is Claude-only.** The `$X.XX` in the status bar uses Claude pricing for all models. Non-Claude shows wrong numbers. Known issue.
+14. **Cost display uses `pricing.rs`.** Unified pricing table in `src/pricing.rs` covers all providers. Still Claude-centric for providers with unknown pricing — those fall back to Sonnet rates.
 15. **Config file contains API keys.** Written with `0600` permissions. `ProviderConfig` Debug impl redacts `api_key`. Don't log raw config values.
 
 ---
@@ -390,14 +396,14 @@ Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`.
 ## File Layout Conventions
 
 - **One file per tool** in `src/tools/*.rs`. Complex tools get a sub-directory (e.g. `src/tools/shell/`).
-- **Chatui separation of concerns:**
-  - `input.rs` — key handling
-  - `draw.rs`/`render.rs` — rendering
-  - `app.rs` — state
-  - `commands.rs` — slash commands
-  - `stream_handler.rs` — StreamEvent → App mutation
+- **TUI separation of concerns:**
+  - `tui/input.rs` — key handling
+  - `tui/draw.rs`/`tui/render.rs` — rendering
+  - `tui/app.rs` — state
+  - `tui/commands.rs` — slash commands
+  - `tui/stream_handler.rs` — StreamEvent → App mutation
 - **Tests** live in `#[cfg(test)] mod tests { ... }` at the bottom of each file.
-- **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `main.rs::apply_setting()`.
+- **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `tui/mod.rs::apply_setting()`.
 - **Re-exports** happen at module roots (`tools/mod.rs`, `core/mod.rs`) and at the crate root (`lib.rs`). Prefer using the crate-root re-exports: `synaps_cli::Runtime`, `synaps_cli::config::...`, `synaps_cli::models::...`.
 
 ### Notable Docs
