@@ -295,9 +295,7 @@ pub async fn run(
     );
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
-    boot.watcher_shutdown.store(true, std::sync::atomic::Ordering::Release);
-    boot.socket_shutdown.store(true, std::sync::atomic::Ordering::Release);
-    synaps_cli::events::registry::unregister_session(&conv.session.id);
+    boot.background.shutdown();
     eprintln!("session saved: {} (${:.4})", &conv.session.id[..8], conv.session_cost);
     Ok(())
 }

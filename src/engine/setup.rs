@@ -17,6 +17,34 @@ pub struct EngineOpts {
     pub no_extensions: bool,
 }
 
+/// Background tasks spawned during boot. Aborts on drop.
+pub struct BackgroundTasks {
+    watcher_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    watcher_task: tokio::task::JoinHandle<()>,
+    socket_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    socket_task: tokio::task::JoinHandle<()>,
+    session_socket_path: String,
+    session_id: String,
+}
+
+impl BackgroundTasks {
+    /// Signal all tasks to stop and unregister the session.
+    pub fn shutdown(&self) {
+        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        crate::events::registry::unregister_session(&self.session_id);
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.watcher_task.abort();
+        self.socket_task.abort();
+    }
+}
+
 /// Result of the boot sequence — everything a renderer needs to start.
 pub struct EngineBoot {
     pub runtime: Runtime,
@@ -38,11 +66,8 @@ pub struct EngineBoot {
     pub mcp_server_count: usize,
     pub system_prompt_path: std::path::PathBuf,
     pub ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
-    pub watcher_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    pub watcher_task: tokio::task::JoinHandle<()>,
-    pub socket_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    pub socket_task: tokio::task::JoinHandle<()>,
-    pub session_socket_path: String,
+    /// Background tasks — inbox watcher, socket listener. Aborts on drop.
+    pub background: BackgroundTasks,
 }
 
 /// Info about how a continued session was resolved.
@@ -150,6 +175,8 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
     }
 
+    let session_id = sb.session.id.clone();
+
     Ok(EngineBoot {
         runtime,
         config,
@@ -166,11 +193,14 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         mcp_server_count,
         system_prompt_path,
         ext_manager,
-        watcher_shutdown,
-        watcher_task,
-        socket_shutdown,
-        socket_task,
-        session_socket_path,
+        background: BackgroundTasks {
+            watcher_shutdown,
+            watcher_task,
+            socket_shutdown,
+            socket_task,
+            session_socket_path,
+            session_id,
+        },
     })
 }
 
