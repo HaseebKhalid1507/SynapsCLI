@@ -477,6 +477,10 @@ pub(crate) fn draw(
         } else {
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
+        let version_span = Span::styled(
+            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(THEME.load().muted),
+        );
         let header = Paragraph::new(Line::from({
             let mut spans = vec![
                 Span::styled("  Synaps", Style::default().fg(THEME.load().header_fg).add_modifier(Modifier::BOLD)),
@@ -487,6 +491,14 @@ pub(crate) fn draw(
             for span in sidecar_pill_spans(app, registry) {
                 spans.push(span);
             }
+            // Push version to the right by filling remaining space
+            let used: usize = spans.iter().map(|s| s.content.len()).sum();
+            let total = outer[0].width as usize;
+            if total > used + version_span.content.len() {
+                let pad = total - used - version_span.content.len();
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            spans.push(version_span);
             spans
         }))
         .style(Style::default().bg(THEME.load().bg));
