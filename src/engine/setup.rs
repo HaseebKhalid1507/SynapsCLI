@@ -30,6 +30,10 @@ pub struct EngineBoot {
     pub continued: bool,
     pub continue_info: Option<ContinueInfo>,
     pub registry: Arc<CommandRegistry>,
+    /// Keybind registry. Uses std::sync::RwLock (not tokio) because keybind
+    /// lookups are synchronous, fast, and called from input handling code
+    /// that cannot await. This is safe as long as the lock is never held
+    /// across an await point.
     pub keybind_registry: Arc<std::sync::RwLock<KeybindRegistry>>,
     pub mcp_server_count: usize,
     pub system_prompt_path: std::path::PathBuf,
@@ -55,6 +59,9 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         crate::config::set_profile(Some(prof.clone()));
     }
 
+    // Note: _log_guard is dropped at the end of boot(). This is fine because
+    // tracing-subscriber uses a global subscriber that persists independently.
+    // The guard only controls the file appender flush, not the subscriber lifetime.
     let _log_guard = crate::logging::init_logging();
     let mut runtime = Runtime::new().await?;
 
