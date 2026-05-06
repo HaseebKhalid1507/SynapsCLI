@@ -150,21 +150,16 @@ synaps status                    # check account usage + reset times
 ```
 Or use `/status` inside the TUI.
 
-### One-Shot
-```bash
-synaps run "explain this error"     # single prompt
-synaps run "fix it" --agent spike   # with named agent
-```
-
 ### Headless Chat
 ```bash
-echo "explain this error" | cat error.log - | synaps chat
+echo "explain this error" | synaps chat                    # piped
+synaps chat --agent spike                                  # with named agent
+synaps chat --continue abc123                              # resume session
 ```
 
 ### Server Mode
 ```bash
 synaps server --port 3145
-synaps client ws://localhost:3145
 ```
 
 ### Autonomous Agents
