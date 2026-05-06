@@ -89,6 +89,12 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         })
     };
 
+    // Helper: abort background tasks on error
+    let abort_tasks = |ws: &Arc<std::sync::atomic::AtomicBool>, wt: &tokio::task::JoinHandle<()>| {
+        ws.store(true, std::sync::atomic::Ordering::Relaxed);
+        wt.abort();
+    };
+
     // Start per-session Unix socket listener + register in session registry
     let socket_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let session_socket_path = crate::events::registry::socket_path_for_session(&sb.session.id);
@@ -105,7 +111,10 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         started_at: chrono::Utc::now(),
     };
     if let Err(e) = crate::events::registry::register_session(&session_registration) {
-        tracing::warn!("Failed to register session: {}", e);
+        abort_tasks(&watcher_shutdown, &watcher_task);
+        socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        socket_task.abort();
+        return Err(crate::error::RuntimeError::Tool(format!("Failed to register session: {}", e)));
     }
 
     // Extension manager
