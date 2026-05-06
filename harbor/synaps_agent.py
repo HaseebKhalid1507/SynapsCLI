@@ -68,7 +68,7 @@ class SynapsAgent(BaseInstalledAgent):
         # --no-extensions to avoid plugin discovery overhead in benchmark containers
         await self.exec_as_agent(
             environment,
-            command=f"echo {shlex.quote(instruction)} | synaps chat --no-extensions",
+            command=f"echo {shlex.quote(instruction)} | synaps chat",
         )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
