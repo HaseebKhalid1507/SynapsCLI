@@ -167,14 +167,12 @@ fn resolve_or_create_session(
     match continue_session {
         Some(ref maybe_id) => {
             let session = match maybe_id {
-                Some(ref id) => resolve_session(id).unwrap_or_else(|e| {
-                    eprintln!("Failed to load session '{}': {}", id, e);
-                    std::process::exit(1);
-                }),
-                None => latest_session().unwrap_or_else(|e| {
-                    eprintln!("No sessions to continue: {}", e);
-                    std::process::exit(1);
-                }),
+                Some(ref id) => resolve_session(id).map_err(|e| {
+                    crate::error::RuntimeError::Tool(format!("Failed to load session '{}': {}", id, e))
+                })?,
+                None => latest_session().map_err(|e| {
+                    crate::error::RuntimeError::Tool(format!("No sessions to continue: {}", e))
+                })?,
             };
             runtime.set_model(session.model.clone());
             if let Some(ref sp) = session.system_prompt {
