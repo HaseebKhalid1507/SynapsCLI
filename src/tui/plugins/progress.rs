@@ -69,6 +69,7 @@ pub struct CloneProgress {
 }
 
 impl CloneProgress {
+    #[cfg(test)]
     pub fn new(phase: ClonePhase) -> Self {
         Self {
             phase,
@@ -243,6 +244,7 @@ fn extract_throughput(rest: &str) -> Option<String> {
 
 /// Split a buffer on either CR or LF into chunks. Used by the stderr reader
 /// since git uses `\r` to overwrite the same line.
+#[cfg(test)]
 pub fn split_progress_chunks(buf: &str) -> Vec<&str> {
     buf.split(|c: char| c == '\r' || c == '\n')
         .filter(|s| !s.is_empty())

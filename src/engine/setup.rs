@@ -23,6 +23,7 @@ pub struct BackgroundTasks {
     watcher_task: tokio::task::JoinHandle<()>,
     socket_shutdown: Arc<std::sync::atomic::AtomicBool>,
     socket_task: tokio::task::JoinHandle<()>,
+    #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
 }
