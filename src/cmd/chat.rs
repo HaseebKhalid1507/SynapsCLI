@@ -52,10 +52,15 @@ pub async fn run(
 
     // Extension discovery
     if !no_extensions {
+        let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
         synaps_cli::extensions::loader::spawn_discover_and_load(
             std::sync::Arc::clone(&boot.ext_manager),
-            tokio::sync::mpsc::unbounded_channel().0, // discard loader events in headless
+            loader_tx,
         );
+        // Drain loader events in the background — prevents SendError crash
+        tokio::spawn(async move {
+            while loader_rx.recv().await.is_some() {}
+        });
     }
 
     eprintln!("synaps {} | {} | session {}", 
@@ -233,7 +238,7 @@ pub async fn run(
                 EngineStreamEvent::SteeringDelivered { message } => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
                 }
-                EngineStreamEvent::Done => {}
+                EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
                 EngineStreamEvent::Error(e) => {
                     eprintln!("\x1b[31m❌ {}\x1b[0m", e);
                 }

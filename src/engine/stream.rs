@@ -39,6 +39,8 @@ pub enum EngineStreamEvent {
         cache_creation: u64,
         model: Option<String>,
     },
+    /// Internal bookkeeping — no visual output.
+    Noop,
     /// Stream completed.
     Done,
     /// Stream errored.
@@ -110,8 +112,7 @@ pub fn process_stream_event(
         }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
             *messages = history;
-            // No visible event for this — it's internal bookkeeping
-            (EngineStreamEvent::Done, StreamCompletion::Continue)
+            (EngineStreamEvent::Noop, StreamCompletion::Continue)
         }
         StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
             subagents.push(SubagentTracker {
