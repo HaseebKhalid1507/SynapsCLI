@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 
-mod chatui;
 mod tui;
 mod watcher;
 mod cmd;
@@ -29,7 +28,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// One-shot prompt execution
     /// Headless chat with full engine (MCP, extensions, skills, sessions)
     Chat {
         /// Continue a previous session (optional session ID, name, or chain)
@@ -107,11 +105,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            if std::env::var("SYNAPS_TUI").as_deref() == Ok("legacy") {
-                chatui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
-            } else {
-                tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
-            }
+            tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
         }
         Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
