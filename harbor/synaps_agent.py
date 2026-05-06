@@ -72,11 +72,16 @@ class SynapsAgent(BaseInstalledAgent):
         Pipes the instruction into `synaps chat` which has full tool access
         (bash, file read/write/edit, etc.) via the built-in tool suite.
         """
-        # synaps chat reads from stdin, uses tools, outputs to stdout
-        # --no-extensions to avoid plugin discovery overhead in benchmark containers
+        # Debug: log install state
         await self.exec_as_agent(
             environment,
-            command=f"echo {shlex.quote(instruction)} | synaps chat",
+            command="echo '=== SYNAPS DEBUG ===' && which synaps && synaps --version && ls -la ~/.synaps-cli/ && echo '=== END DEBUG ==='",
+        )
+
+        # synaps chat reads from stdin, uses tools, outputs to stdout
+        await self.exec_as_agent(
+            environment,
+            command=f"echo {shlex.quote(instruction)} | synaps chat 2>/tmp/synaps-stderr.log; echo EXIT: $?; cat /tmp/synaps-stderr.log",
         )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
