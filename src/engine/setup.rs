@@ -76,8 +76,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let system_prompt_path = crate::config::resolve_read_path("system.md");
 
     // Session: continue existing or create new
-    let (session, api_messages, total_input_tokens, total_output_tokens, session_cost, abort_context, continued, continue_info) =
-        resolve_or_create_session(&mut runtime, &opts.continue_session)?;
+    let sb = resolve_or_create_session(&mut runtime, &opts.continue_session)?;
 
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -92,15 +91,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Start per-session Unix socket listener + register in session registry
     let socket_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let session_socket_path = crate::events::registry::socket_path_for_session(&session.id);
+    let session_socket_path = crate::events::registry::socket_path_for_session(&sb.session.id);
     let socket_task = crate::events::socket::listen_session_socket(
         session_socket_path.clone(),
         runtime.event_queue().clone(),
         socket_shutdown.clone(),
     );
     let session_registration = crate::events::registry::SessionRegistration {
-        session_id: session.id.clone(),
-        name: session.name.clone(),
+        session_id: sb.session.id.clone(),
+        name: sb.session.name.clone(),
         socket_path: session_socket_path.clone(),
         pid: std::process::id(),
         started_at: chrono::Utc::now(),
@@ -119,15 +118,15 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 
     // Session start hook
     {
-        let mut index_record = crate::core::session_index::SessionIndexRecord::start(&session.id);
-        index_record.model = Some(session.model.clone());
+        let mut index_record = crate::core::session_index::SessionIndexRecord::start(&sb.session.id);
+        index_record.model = Some(sb.session.model.clone());
         index_record.profile = crate::core::config::get_profile();
         index_record.cwd = std::env::current_dir().ok();
         if let Err(err) = crate::core::session_index::append_record(&index_record) {
             tracing::warn!("failed to append session start index record: {}", err);
         }
 
-        let hook_event = crate::extensions::hooks::events::HookEvent::on_session_start(&session.id);
+        let hook_event = crate::extensions::hooks::events::HookEvent::on_session_start(&sb.session.id);
         let _ = runtime.hook_bus().emit(&hook_event).await;
     }
 
@@ -138,14 +137,14 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     Ok(EngineBoot {
         runtime,
         config,
-        session,
-        api_messages,
-        total_input_tokens,
-        total_output_tokens,
-        session_cost,
-        abort_context,
-        continued,
-        continue_info,
+        session: sb.session,
+        api_messages: sb.api_messages,
+        total_input_tokens: sb.total_input_tokens,
+        total_output_tokens: sb.total_output_tokens,
+        session_cost: sb.session_cost,
+        abort_context: sb.abort_context,
+        continued: sb.continued,
+        continue_info: sb.continue_info,
         registry,
         keybind_registry,
         mcp_server_count,
@@ -160,10 +159,22 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 }
 
 /// Resolve a session to continue, or create a new one.
+/// Result of session resolution.
+struct SessionBootResult {
+    session: Session,
+    api_messages: Vec<serde_json::Value>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    session_cost: f64,
+    abort_context: Option<String>,
+    continued: bool,
+    continue_info: Option<ContinueInfo>,
+}
+
 fn resolve_or_create_session(
     runtime: &mut Runtime,
     continue_session: &Option<Option<String>>,
-) -> Result<(Session, Vec<serde_json::Value>, u64, u64, f64, Option<String>, bool, Option<ContinueInfo>)> {
+) -> Result<SessionBootResult> {
     match continue_session {
         Some(ref maybe_id) => {
             let session = match maybe_id {
@@ -198,20 +209,29 @@ fn resolve_or_create_session(
                 }
             });
 
-            Ok((
-                session.clone(),
-                session.api_messages.clone(),
-                session.total_input_tokens,
-                session.total_output_tokens,
-                session.session_cost,
-                session.abort_context.clone(),
-                true,
+            Ok(SessionBootResult {
+                api_messages: session.api_messages.clone(),
+                total_input_tokens: session.total_input_tokens,
+                total_output_tokens: session.total_output_tokens,
+                session_cost: session.session_cost,
+                abort_context: session.abort_context.clone(),
+                continued: true,
                 continue_info,
-            ))
+                session,
+            })
         }
         None => {
             let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
-            Ok((session, Vec::new(), 0, 0, 0.0, None, false, None))
+            Ok(SessionBootResult {
+                session,
+                api_messages: Vec::new(),
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                session_cost: 0.0,
+                abort_context: None,
+                continued: false,
+                continue_info: None,
+            })
         }
     }
 }
