@@ -4,6 +4,7 @@
 //! messages, token counts, cost, abort context.
 
 use crate::{Session, Runtime};
+use crate::pricing::calculate_cost;
 use serde_json::Value;
 
 /// Conversation state tracked by the engine.
@@ -105,18 +106,7 @@ impl ConversationState {
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
 
-        // Pricing per million tokens
-        let (input_price, output_price) = match model {
-            m if m.contains("opus") => (5.0, 25.0),
-            m if m.contains("sonnet") => (3.0, 15.0),
-            m if m.contains("haiku") => (1.0, 5.0),
-            _ => (3.0, 15.0),
-        };
-        let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-                 + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
-                 + (cache_creation as f64 / 1_000_000.0) * input_price * 1.25
-                 + (output_tokens as f64 / 1_000_000.0) * output_price;
-        self.session_cost += cost;
+        self.session_cost += calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation);
     }
 
     /// Estimate current token count (for compaction decisions).

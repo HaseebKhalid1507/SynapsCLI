@@ -2,6 +2,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 use chrono::Local;
 use synaps_cli::Session;
+use synaps_cli::pricing::calculate_cost;
 
 
 #[derive(Clone)]
@@ -409,22 +410,8 @@ impl App {
         self.last_turn_context_window = context_window_override
             .unwrap_or_else(|| synaps_cli::models::context_window_for_model(model));
         self.api_call_count += 1;
-        // Pricing per million tokens (as of 2026-04, from platform.claude.com/docs/en/about-claude/pricing)
-        // Opus 4.5+ = $5/$25, Sonnet 4+ = $3/$15, Haiku 4.5 = $1/$5, Haiku 3.5 = $0.80/$4
-        // Note: output_tokens from the API includes adaptive thinking tokens —
-        // these are invisible in the TUI but billed at the output rate.
-        let (input_price, output_price) = match model {
-            m if m.contains("opus") => (5.0, 25.0),
-            m if m.contains("sonnet") => (3.0, 15.0),
-            m if m.contains("haiku") => (1.0, 5.0), // Haiku 4.5 pricing
-            _ => (3.0, 15.0), // default to sonnet pricing
-        };
-        // Cache reads bill at 0.1x input price; cache writes at 1.25x (5-min TTL)
-        let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-                 + (cache_read as f64 / 1_000_000.0) * input_price * 0.1
-                 + (cache_creation as f64 / 1_000_000.0) * input_price * 1.25
-                 + (output_tokens as f64 / 1_000_000.0) * output_price;
-        self.session_cost += cost;
+        // Delegate cost calculation to the single source of truth in `pricing`.
+        self.session_cost += calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation);
     }
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
