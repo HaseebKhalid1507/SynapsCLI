@@ -351,6 +351,7 @@ pub(crate) async fn apply_trust_and_install(
 }
 
 /// Clone/snapshot into a temporary sibling directory. Returns (HEAD sha, temp dir path).
+#[allow(dead_code)] // convenience wrapper — callers currently use _with_progress directly
 fn install_plugin_to_temp_with_checksum(
     plugin_name: &str,
     source_url: &str,

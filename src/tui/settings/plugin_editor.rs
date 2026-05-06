@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use synaps_cli::extensions::settings_editor::{
-    SettingsEditorCloseParams, SettingsEditorCommitParams, SettingsEditorKeyParams,
+    SettingsEditorCloseParams, SettingsEditorKeyParams,
     SettingsEditorOpenParams, SettingsEditorRenderParams,
 };
 
@@ -103,6 +103,7 @@ pub(crate) fn close_note(params: SettingsEditorCloseParams) -> Option<String> {
     params.reason.filter(|s| !s.trim().is_empty())
 }
 
+#[cfg(test)]
 pub(crate) fn effect_from_commit(
     plugin_id: &str,
     field: &str,
@@ -219,6 +220,7 @@ pub(crate) fn effect_from_commit_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::settings_editor::SettingsEditorCommitParams;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 

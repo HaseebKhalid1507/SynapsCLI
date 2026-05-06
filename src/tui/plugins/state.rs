@@ -2,11 +2,10 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use synaps_cli::skills::state::{PluginsState, InstalledPlugin, CachedPlugin};
 
-use super::progress::{InstallProgress, InstallProgressHandle};
+use super::progress::InstallProgressHandle;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LeftRow {

@@ -18,6 +18,7 @@ pub(crate) fn lightbox_safe_area(area: Rect) -> Rect {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn centered_lightbox_rect(area: Rect, width: u16, height: u16) -> Rect {
     let safe = lightbox_safe_area(area);
     let width = width.min(safe.width);

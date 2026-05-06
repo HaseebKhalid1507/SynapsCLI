@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{CATEGORIES, EditorKind, visible_categories};
+use super::schema::{EditorKind, visible_categories};
 use super::draw::current_value_for;
 
 pub(crate) enum InputOutcome {
