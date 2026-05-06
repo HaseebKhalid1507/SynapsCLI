@@ -107,11 +107,7 @@ pub async fn run(
     let mut last_frame = Instant::now();
 
     // ── Engine-managed background tasks (inbox watcher, socket, extensions) ──
-    let watcher_shutdown = boot.watcher_shutdown;
-    let watcher_task = boot.watcher_task;
-    let socket_shutdown = boot.socket_shutdown;
-    let socket_task = boot.socket_task;
-    let session_socket_path = boot.session_socket_path;
+    let background = boot.background;
     let ext_mgr_shared = boot.ext_manager;
 
     // Legacy sidecar key migration
@@ -1797,14 +1793,8 @@ pub async fn run(
     );
     shutdown_signal_task.abort();
 
-    // Signal the inbox watcher's blocking thread to exit, then abort the async task.
-    watcher_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-    watcher_task.abort();
-
-    // Shut down per-session socket + unregister from registry
-    socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-    socket_task.abort();
-    synaps_cli::events::registry::unregister_session(&app.session.id);
+    // Shut down background tasks (inbox watcher, socket, session registry)
+    background.shutdown();
 
     teardown_terminal(&mut terminal);
 
