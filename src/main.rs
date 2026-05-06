@@ -30,14 +30,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One-shot prompt execution
-    Run {
-        prompt: String,
-        #[arg(long, short)]
-        agent: Option<String>,
-        #[arg(long, short = 'S')]
-        system: Option<String>,
-    },
-    /// Plain text streaming chat
     /// Headless chat with full engine (MCP, extensions, skills, sessions)
     Chat {
         /// Continue a previous session (optional session ID, name, or chain)
@@ -66,11 +58,6 @@ enum Command {
         system: Option<String>,
         #[arg(long = "continue", value_name = "NAME_OR_ID")]
         continue_session: Option<Option<String>>,
-    },
-    /// WebSocket client
-    Client {
-        #[arg(long, default_value = "ws://127.0.0.1:3145")]
-        url: String,
     },
     /// Headless autonomous agent
     Agent {
@@ -109,27 +96,6 @@ enum Command {
         #[arg(long)]
         broadcast: bool,
     },
-    /// Persistent headless agent — idles, wakes on events, responds, sleeps
-    Daemon {
-        /// Load agent prompt from ~/.synaps-cli/agents/<name>.md
-        #[arg(long, short)]
-        agent: Option<String>,
-        /// Inline system prompt
-        #[arg(long, short = 'S')]
-        system: Option<String>,
-        /// Human-readable session name for targeting via `synaps send --session`
-        #[arg(long)]
-        name: Option<String>,
-        /// Override model
-        #[arg(long)]
-        model: Option<String>,
-        /// Override thinking level
-        #[arg(long)]
-        thinking: Option<String>,
-        /// Token threshold for auto-compaction (oldest messages summarized). Default: 80000
-        #[arg(long, default_value = "80000")]
-        compact_at: usize,
-    },
 }
 
 #[tokio::main]
@@ -147,17 +113,11 @@ async fn main() -> anyhow::Result<()> {
                 tui::run(cli.continue_session, cli.system, cli.profile, cli.no_extensions).await?;
             }
         }
-        Some(Command::Run { prompt, agent, system }) => {
-            cmd::run::run(prompt, agent, system).await?;
-        }
         Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
         Some(Command::Server { port, host, system, continue_session }) => {
             cmd::server::run(port, host, system, continue_session, cli.profile).await?;
-        }
-        Some(Command::Client { url }) => {
-            cmd::client::run(url).await?;
         }
         Some(Command::Agent { config, trigger_context }) => {
             cmd::agent::run(config, trigger_context).await;
@@ -173,9 +133,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
             cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
-        }
-        Some(Command::Daemon { agent, system, name, model, thinking, compact_at }) => {
-            cmd::daemon::run(agent, system, name, model, thinking, compact_at).await?;
         }
     }
     Ok(())
