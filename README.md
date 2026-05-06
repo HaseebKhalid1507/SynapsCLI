@@ -155,7 +155,11 @@ Or use `/status` inside the TUI.
 echo "explain this error" | synaps chat                    # piped
 synaps chat --agent spike                                  # with named agent
 synaps chat --continue abc123                              # resume session
+synaps chat --no-extensions                                # skip extension system
+synaps chat --system prompt.md                             # custom system prompt
 ```
+
+Full engine in headless mode: MCP, extensions, skills, session persistence, compaction, event bus — same as the TUI, just stdin/stdout.
 
 ### Server Mode
 ```bash
@@ -358,9 +362,10 @@ One binary. Subcommands dispatched from `main.rs`. Two API paths: Anthropic (nat
 ```
 src/
 ├── main.rs          # unified CLI entry point + subcommand dispatch
-├── cmd/             # subcommand handlers (run, chat, server, client, agent, login, watcher)
-├── chatui/          # TUI: event loop, rendering, markdown, themes, settings, plugins
+├── cmd/             # subcommand handlers (chat, server, agent, login, watcher, send, status)
+├── tui/             # TUI: event loop, rendering, markdown, themes, settings, plugins
 │   └── settings/    # /settings modal — model picker, provider keys, themes
+├── engine/          # shared headless engine (setup, commands, stream, session)
 ├── runtime/         # THE BRAIN
 │   ├── api.rs       # Anthropic API + provider router (try_route)
 │   ├── stream.rs    # tool dispatch loop (provider-agnostic)
@@ -374,6 +379,7 @@ src/
 ├── events/          # event bus: types, priority queue, inotify watcher
 ├── tools/           # 15 built-in tools (bash, read, write, edit, subagent*, shell*, etc.)
 ├── mcp/             # Model Context Protocol client, lazy server spawning
+├── pricing.rs       # unified pricing for all providers/models
 ├── watcher/         # supervisor daemon, IPC, heartbeats
 └── skills/          # markdown-driven behavioral guidelines + plugin marketplace
 ```
@@ -381,9 +387,8 @@ src/
 | Subcommand | Purpose |
 |------------|---------|
 | *(none)* | Interactive TUI with streaming + subagent panel |
-| `run` | One-shot prompt, prints to stdout |
-| `chat` | Headless streaming chat for scripting |
-| `server` / `client` | WebSocket transport |
+| `chat` | Fully-featured headless mode (MCP, extensions, skills, sessions, compaction) |
+| `server` | WebSocket API server |
 | `agent` | Worker runtime spawned by watcher |
 | `watcher` | Supervisor daemon for autonomous agents |
 | `login` | OAuth flow |
