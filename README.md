@@ -13,7 +13,7 @@
 
 One binary, any model. Start with Claude, drop in a free Groq key, point at localhost for private — same subagents, same TUI, same config. No Node. No Python. No Electron. No excuses.
 
-<!-- screenshot: chatui with subagent panel + cyberpunk theme -->
+<!-- screenshot: TUI with subagent panel + cyberpunk theme -->
 
 ---
 

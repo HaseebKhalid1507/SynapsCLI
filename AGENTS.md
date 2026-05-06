@@ -131,7 +131,7 @@ src/
 
 This is the single most important flow to understand.
 
-1. **User input** → `chatui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
+1. **User input** → `tui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
 2. **Stream kickoff** → `Runtime::run_stream_with_messages()` in `runtime/mod.rs` (~line 377).
 3. **API body build** → `runtime/api.rs::call_api_stream()` (~line 30). Steps:
    - **Provider routing** → `openai::try_route(model, ...)` checks if the model has a provider prefix (e.g. `groq/llama-3.3-70b`). If yes, routes through `openai/stream.rs` instead of Anthropic. If no, falls through to Anthropic.
@@ -143,7 +143,7 @@ This is the single most important flow to understand.
 4. **SSE parse** → line-by-line in `api.rs` (~line 200+). Emits `StreamEvent`s (TextDelta, ThinkingDelta, ToolUse, Usage, MessageStop, Error).
 5. **Tool dispatch** → `runtime/stream.rs` collects `ToolUse` blocks, executes them in parallel via `tokio::spawn`, feeds `tool_result` blocks back into the next turn.
 6. **Loop** → steps 3–5 repeat until `stop_reason != "tool_use"` (typically `"end_turn"`).
-7. **UI update** → `chatui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`.
+7. **UI update** → `tui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`.
 
 `StreamEvent` (in `runtime/types.rs`) is the wire format between Runtime and any UI. Add new event variants here if you need to surface something new.
 
@@ -233,7 +233,7 @@ The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return
 1. Add a `Theme::my_theme()` method in `src/tui/theme/palettes.rs` returning a populated `Theme` struct (all ~30 color fields).
 2. Register in `src/tui/theme/mod.rs::Theme::builtin()` (~line 110) — add a `match` arm.
 3. Add the theme name to the list returned by `src/tui/settings/mod.rs::theme_options()`.
-4. Test via `/settings → Appearance → Theme` or config `theme = my-theme`. Requires chatui restart to apply.
+4. Test via `/settings → Appearance → Theme` or config `theme = my-theme`. Requires TUI restart to apply.
 
 ### Adding a New Slash Command
 
@@ -286,7 +286,7 @@ Plugins declare keybinds in `plugin.json`:
 1. `ManifestKeybind` (skills/keybinds.rs) — serde struct for plugin.json parsing
 2. `KeybindRegistry` (skills/keybinds.rs) — collects + resolves conflicts
 3. Built during `skills::register()` (skills/mod.rs) alongside command registry
-4. Checked in `handle_key()` (chatui/input.rs) before the core match block
+4. Checked in `handle_key()` (tui/input.rs) before the core match block
 5. `parse_key()` / `format_key()` for notation ↔ KeyCombo conversion
 
 **Priority:** Core (Ctrl+C, Esc, etc.) > user config (`keybind.*`) > plugin. Core binds are never overridable. User config always wins over plugins.
@@ -347,7 +347,7 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
   → core/config.rs::load_config()  — parses key = value, env var overrides
   → Runtime::apply_config()         — sets fields on Runtime
   → runtime/api.rs reads from Runtime at request time
-  → chatui/mod.rs::apply_setting() — runtime mutation + write_config_value() for live /settings changes
+  → tui/mod.rs::apply_setting() — runtime mutation + write_config_value() for live /settings changes
 ```
 
 `SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `core/config.rs::resolve_read_path()`.
@@ -365,7 +365,7 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced by skipping registration in `tools/subagent.rs`.
 8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
-10. **OAuth tokens are file-locked** via `fs4`. Concurrent chatui + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
+10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
 11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
 12. **Anthropic auth is optional.** `get_auth_token()` returns `auth_type: "none"` if no credentials found. The app boots fine. Anthropic API calls fail lazily with a clear message pointing to `synaps login` or `/model groq/...`.
 13. **`/compact` doesn't route through providers** — uses `call_api_simple` which is Anthropic-only. Known issue (see `docs/open-provider-issues.md`).
@@ -425,7 +425,7 @@ Owns: `model`, `thinking_budget`, `system_prompt`, `ToolRegistry` (behind `Arc<R
 Key entry points:
 - `run_single(&self, prompt)` → `Result<String>` — one-shot, no streaming. Used by `cli` and `chat` binaries.
 - `run_stream(&self, prompt, cancel)` → stream of `StreamEvent` — fire-and-forget (synthesizes messages).
-- `run_stream_with_messages(...)` → stream with caller-supplied message history. **Used by chatui.**
+- `run_stream_with_messages(...)` → stream with caller-supplied message history. **Used by TUI.**
 
 Config: `Runtime::apply_config(&SynapsConfig)` at startup; setters (`set_model`, `set_thinking_budget`, etc.) for live updates.
 
@@ -437,7 +437,7 @@ Runtime is `Clone` (cheap — uses `Arc` internally) so subagents can fork from 
 
 Things an agent should know about, but not necessarily fix in-passing:
 
-- **Command list duplication** (`ALL_COMMANDS` / `BUILTIN_COMMANDS`). Should be unified into one `pub const` consumed by both chatui and skills registry.
+- **Command list duplication** (`ALL_COMMANDS` / `BUILTIN_COMMANDS`). Should be unified into one `pub const` consumed by both TUI and skills registry.
 - **Settings require 5-site edits.** A macro or derive could collapse this.
 - **`src/tools/agent.rs`** is legacy, superseded by `subagent.rs`. Kept for compatibility with older agent definitions. Remove after deprecation window.
 - **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
@@ -465,7 +465,7 @@ IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, 
 
 ## Tool Reference (for agents running INSIDE SynapsCLI)
 
-This is the runtime tool surface. An LLM agent running in chatui, synaps agent, or as a subagent sees these tools.
+This is the runtime tool surface. An LLM agent running in the TUI, synaps agent, or as a subagent sees these tools.
 
 ### `bash`
 Execute shell commands via `bash -c`.
