@@ -28,13 +28,21 @@ class SynapsAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         """Install synaps from pre-built binary."""
+        # Ensure curl and xz are available
+        await self.exec_as_root(
+            environment,
+            command="apt-get update -qq && apt-get install -y -qq curl xz-utils > /dev/null 2>&1",
+        )
+
         # Download pre-built binary — no compilation needed
         await self.exec_as_root(
             environment,
             command=(
                 "curl -fsSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-x86_64-unknown-linux-gnu.tar.xz "
-                "| tar xJ -C /usr/local/bin/ --strip-components=1 "
-                "&& chmod +x /usr/local/bin/synaps"
+                "-o /tmp/synaps.tar.xz "
+                "&& tar xJf /tmp/synaps.tar.xz -C /usr/local/bin/ --strip-components=1 "
+                "&& chmod +x /usr/local/bin/synaps "
+                "&& rm /tmp/synaps.tar.xz"
             ),
         )
 
