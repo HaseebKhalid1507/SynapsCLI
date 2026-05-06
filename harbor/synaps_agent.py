@@ -27,24 +27,18 @@ class SynapsAgent(BaseInstalledAgent):
         return "0.1.4"
 
     async def install(self, environment: BaseEnvironment) -> None:
-        """Install synaps via the shell installer from GitHub Releases."""
-        # Install dependencies
+        """Install synaps from pre-built binary."""
+        # Download pre-built binary — no compilation needed
         await self.exec_as_root(
             environment,
-            command="apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev",
-        )
-
-        # Install synaps from the shell installer (pre-built binary)
-        await self.exec_as_agent(
-            environment,
             command=(
-                "curl -fsSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh "
-                "|| cargo install synaps"  # fallback to cargo if installer fails
+                "curl -fsSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-x86_64-unknown-linux-gnu.tar.xz "
+                "| tar xJ -C /usr/local/bin/ --strip-components=1 "
+                "&& chmod +x /usr/local/bin/synaps"
             ),
         )
 
         # Copy OAuth auth token if SYNAPS_AUTH_JSON env var is set
-        # Usage: export SYNAPS_AUTH_JSON="$(cat ~/.synaps-cli/auth.json)"
         await self.exec_as_agent(
             environment,
             command=(
@@ -55,12 +49,6 @@ class SynapsAgent(BaseInstalledAgent):
                 '  echo "OAuth auth configured"; '
                 'fi'
             ),
-        )
-
-        # Verify installation
-        await self.exec_as_agent(
-            environment,
-            command="synaps --help",
         )
 
     @with_prompt_template
