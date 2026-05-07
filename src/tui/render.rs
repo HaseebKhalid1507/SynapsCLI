@@ -543,7 +543,6 @@ impl App {
                         &tmsg.msg,
                     ) {
                         lines.push(Line::from(""));
-                        lines.push(Line::from(""));
                     }
                     // Newline-aware AND wrap-aware: split on '\n' first so
                     // explicit line breaks always render as separate rows,
