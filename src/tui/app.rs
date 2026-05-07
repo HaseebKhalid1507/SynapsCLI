@@ -1071,17 +1071,21 @@ mod tests {
             .position(|line| line.spans.iter().any(|span| span.content.contains("tools: speak")))
             .expect("grandchild system message should render");
 
-        let has_rule = |slice: &[ratatui::text::Line]| {
-            slice
-                .iter()
-                .any(|line| line.spans.iter().any(|span| span.content.contains("─ · ─")))
+        // Related system messages should not have extra blank-line separators between them
+        // (they flow as a continuous block).
+        let has_separator = |slice: &[ratatui::text::Line]| {
+            // Two consecutive blank lines indicate a separator was inserted
+            slice.windows(2).any(|w| {
+                let blank = |l: &ratatui::text::Line| l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty());
+                blank(&w[0]) && blank(&w[1])
+            })
         };
-        assert!(!has_rule(&lines[header_idx + 1..child_idx]));
-        assert!(!has_rule(&lines[child_idx + 1..grandchild_idx]));
+        assert!(!has_separator(&lines[header_idx + 1..child_idx]));
+        assert!(!has_separator(&lines[child_idx + 1..grandchild_idx]));
     }
 
     #[test]
-    fn unrelated_consecutive_system_messages_still_get_a_rule() {
+    fn unrelated_consecutive_system_messages_get_blank_line_separator() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("first".to_string()));
         app.push_msg(ChatMessage::System("second".to_string()));
@@ -1097,19 +1101,10 @@ mod tests {
             .expect("second system message should render");
 
         let between = &lines[first_idx + 1..second_idx];
-        let rule_idx = between
-            .iter()
-            .position(|line| line.spans.iter().any(|span| {
-                span.content.contains("─ · ─")
-                    && span.style.fg == Some(THEME.load().muted)
-                    && !span.style.add_modifier.contains(ratatui::style::Modifier::DIM)
-            }))
-            .expect("expected centered rule between consecutive system messages");
         let is_blank = |line: &ratatui::text::Line| {
             line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
         };
-        assert!(rule_idx > 0 && is_blank(&between[rule_idx - 1]), "expected blank line before centered rule; got {:?}", between);
-        assert!(rule_idx + 1 < between.len() && is_blank(&between[rule_idx + 1]), "expected blank line after centered rule; got {:?}", between);
+        assert!(between.iter().any(|l| is_blank(l)), "expected blank line between consecutive system messages");
     }
 
     #[test]
