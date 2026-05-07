@@ -543,7 +543,6 @@ impl App {
                         &tmsg.msg,
                     ) {
                         lines.push(Line::from(""));
-                        lines.push(system_separator_line(m, width));
                         lines.push(Line::from(""));
                     }
                     // Newline-aware AND wrap-aware: split on '\n' first so
