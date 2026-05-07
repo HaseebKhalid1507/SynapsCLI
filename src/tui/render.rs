@@ -619,13 +619,4 @@ fn is_grouped_system_continuation(prev: &str, current: &str) -> bool {
         || prev.trim_end().ends_with('…')
 }
 
-fn system_separator_line(margin: &str, width: usize) -> Line<'static> {
-    let rule_width = width.saturating_sub(margin.len()).min(34).max(9);
-    let side = "─".repeat(rule_width.saturating_sub(3) / 2);
-    let rule = format!("{} · {}", side, side);
-    let pad = width.saturating_sub(margin.len() + rule.chars().count()) / 2;
-    Line::from(vec![
-        Span::raw(format!("{}{}", margin, " ".repeat(pad))),
-        Span::styled(rule, Style::default().fg(THEME.load().muted)),
-    ])
-}
+
