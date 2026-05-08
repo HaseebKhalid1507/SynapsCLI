@@ -2,6 +2,7 @@ use synaps_cli::{Runtime, CancellationToken, Session, truncate_str};
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
 use synaps_cli::engine::setup::{self, EngineOpts, BackgroundTasks};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -472,46 +473,79 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     let broadcast = &state.broadcast_tx;
 
+    // Server-specific overrides — handled BEFORE engine to preserve existing
+    // wire behaviour for cases the engine doesn't know about.
+    if name == "thinking" && args == "adaptive" {
+        let mut rt = state.runtime.lock().await;
+        rt.set_thinking_budget(0);
+        let _ = broadcast.send(ServerMessage::System {
+            message: format!("thinking set to: {}", rt.thinking_level()),
+        });
+        return;
+    }
+    // Engine doesn't display current values when args are empty for these,
+    // but the existing server contract does. Intercept first.
+    if name == "model" && args.is_empty() {
+        let rt = state.runtime.lock().await;
+        let _ = broadcast.send(ServerMessage::System {
+            message: format!("current model: {}", rt.model()),
+        });
+        return;
+    }
+    if name == "thinking" && args.is_empty() {
+        let rt = state.runtime.lock().await;
+        let _ = broadcast.send(ServerMessage::System {
+            message: format!(
+                "thinking: {} ({})",
+                rt.thinking_level(),
+                rt.thinking_budget()
+            ),
+        });
+        return;
+    }
+
+    // Try engine-level command (model with args, thinking with engine-known
+    // levels, quit, compact).
+    let engine_result = {
+        let mut rt = state.runtime.lock().await;
+        engine_commands::handle_engine_command(name, args, &mut rt)
+    };
+
+    if let Some(result) = engine_result {
+        match result {
+            CommandResult::ModelChanged { model } => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: format!("model set to: {model}"),
+                });
+            }
+            CommandResult::ThinkingChanged { level, .. } => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: format!("thinking set to: {level}"),
+                });
+            }
+            CommandResult::Quit => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: "/quit ignored — server is long-lived; close the WebSocket instead"
+                        .to_string(),
+                });
+            }
+            CommandResult::Compact => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: "/compact not yet wired in server mode".to_string(),
+                });
+            }
+            CommandResult::Error(msg) => {
+                let _ = broadcast.send(ServerMessage::Error { message: msg });
+            }
+            other => {
+                tracing::debug!(?other, "engine command result not handled by server");
+            }
+        }
+        return;
+    }
+
+    // Server-specific commands the engine doesn't cover.
     match name {
-        "model" => {
-            if args.is_empty() {
-                let rt = state.runtime.lock().await;
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("current model: {}", rt.model()),
-                });
-            } else {
-                let mut rt = state.runtime.lock().await;
-                rt.set_model(args.to_string());
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("model set to: {}", args),
-                });
-            }
-        }
-        "thinking" => {
-            let mut rt = state.runtime.lock().await;
-            match args {
-                "low" => { rt.set_thinking_budget(2048); }
-                "medium" | "med" => { rt.set_thinking_budget(4096); }
-                "high" => { rt.set_thinking_budget(16384); }
-                "xhigh" => { rt.set_thinking_budget(32768); }
-                "adaptive" => { rt.set_thinking_budget(0); }
-                "" => {
-                    let _ = broadcast.send(ServerMessage::System {
-                        message: format!("thinking: {} ({})", rt.thinking_level(), rt.thinking_budget()),
-                    });
-                    return;
-                }
-                _ => {
-                    let _ = broadcast.send(ServerMessage::Error {
-                        message: "usage: /thinking low|medium|high|xhigh".to_string(),
-                    });
-                    return;
-                }
-            }
-            let _ = broadcast.send(ServerMessage::System {
-                message: format!("thinking set to: {}", rt.thinking_level()),
-            });
-        }
         "clear" => {
             state.save_session().await;
             state.api_messages.write().await.clear();
@@ -522,7 +556,9 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
             {
                 let rt = state.runtime.lock().await;
                 *state.session.write().await = Session::new(
-                    rt.model(), rt.thinking_level(), rt.system_prompt()
+                    rt.model(),
+                    rt.thinking_level(),
+                    rt.system_prompt(),
                 );
             }
             let _ = broadcast.send(ServerMessage::System {
@@ -546,7 +582,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
         }
         _ => {
             let _ = broadcast.send(ServerMessage::Error {
-                message: format!("unknown command: {}", name),
+                message: format!("unknown command: {name}"),
             });
         }
     }
