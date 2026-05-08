@@ -18,7 +18,12 @@ pub enum EngineStreamEvent {
     /// Tool use input delta.
     ToolDelta { tool_id: String, delta: String },
     /// Tool use finalized.
-    ToolFinalized { tool_id: String, tool_name: String, input: String },
+    ///
+    /// `input` is the parsed JSON value, not a stringified version. Renderers
+    /// that need a string preview (chat.rs, server's HistoryEntry::ToolUse)
+    /// can call `serde_json::to_string` themselves; the wire-format ToolUse
+    /// in server mode passes the Value through directly.
+    ToolFinalized { tool_id: String, tool_name: String, input: serde_json::Value },
     /// Tool result delta.
     ToolResultDelta { tool_id: String, delta: String },
     /// Tool result complete.
@@ -101,8 +106,7 @@ pub fn process_stream_event(
             (EngineStreamEvent::ToolDelta { tool_id, delta }, StreamCompletion::Continue)
         }
         StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-            let input_str = serde_json::to_string(&input).unwrap_or_default();
-            (EngineStreamEvent::ToolFinalized { tool_id, tool_name, input: input_str }, StreamCompletion::Continue)
+            (EngineStreamEvent::ToolFinalized { tool_id, tool_name, input }, StreamCompletion::Continue)
         }
         StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
             (EngineStreamEvent::ToolResultDelta { tool_id, delta }, StreamCompletion::Continue)
