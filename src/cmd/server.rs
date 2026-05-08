@@ -592,10 +592,13 @@ async fn apply_engine_event_side_effects(
         EngineStreamEvent::ToolFinalized {
             tool_name, input, ..
         } => {
+            // HistoryEntry::ToolUse.input is `String` for display purposes;
+            // engine emits `Value` now, so serialise here.
+            let input_str = serde_json::to_string(input).unwrap_or_default();
             state
                 .push_history(HistoryEntry::ToolUse {
                     tool_name: tool_name.clone(),
-                    input: input.clone(),
+                    input: input_str,
                     time: ts.to_string(),
                 })
                 .await;
@@ -662,13 +665,13 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
             tool_name,
             input,
         } => {
-            // Engine serialised input to JSON string; reparse for the wire.
-            let input_value =
-                serde_json::from_str(&input).unwrap_or(serde_json::Value::String(input));
+            // Engine emits Value directly now — pass through without
+            // the previous Value→String→Value round-trip that could
+            // silently corrupt input on serialisation failure.
             Some(ServerMessage::ToolUse {
                 tool_name,
                 tool_id,
-                input: input_value,
+                input,
             })
         }
         EngineStreamEvent::ToolResultDelta { tool_id, delta } => {
@@ -699,18 +702,14 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     let broadcast = &state.broadcast_tx;
 
-    // Server-specific overrides — handled BEFORE engine to preserve existing
-    // wire behaviour for cases the engine doesn't know about.
-    if name == "thinking" && args == "adaptive" {
-        let mut rt = state.runtime.lock().await;
-        rt.set_thinking_budget(0);
-        let _ = broadcast.send(ServerMessage::System {
-            message: format!("thinking set to: {}", rt.thinking_level()),
-        });
-        return;
-    }
-    // Engine doesn't display current values when args are empty for these,
-    // but the existing server contract does. Intercept first.
+    // Server-specific overrides — handled BEFORE engine to preserve
+    // existing wire behaviour for empty-arg display queries that the
+    // engine treats as no-ops.
+    //
+    // `/thinking adaptive` previously needed an override here too, but
+    // engine::commands now knows the `adaptive` level natively (matches
+    // the runtime's own label for budget=0), so it routes through the
+    // engine path below. One less special case to drift.
     if name == "model" && args.is_empty() {
         let rt = state.runtime.lock().await;
         let _ = broadcast.send(ServerMessage::System {

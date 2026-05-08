@@ -26,6 +26,13 @@ pub struct BackgroundTasks {
     #[allow(dead_code)] // stored for potential future use (e.g. reconnect)
     session_socket_path: String,
     session_id: String,
+    /// File-appender flush guard. Holding this for the lifetime of the
+    /// renderer keeps the non-blocking log writer's background thread
+    /// alive — without it, log lines emitted after `boot()` returns can
+    /// be silently dropped before they reach disk. Dropped last when
+    /// BackgroundTasks drops.
+    #[allow(dead_code)]
+    log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl BackgroundTasks {
@@ -85,10 +92,17 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         crate::config::set_profile(Some(prof.clone()));
     }
 
-    // Note: _log_guard is dropped at the end of boot(). This is fine because
-    // tracing-subscriber uses a global subscriber that persists independently.
-    // The guard only controls the file appender flush, not the subscriber lifetime.
-    let _log_guard = crate::logging::init_logging();
+    // Capture the WorkerGuard from the file appender. tracing-appender's
+    // non-blocking writer uses a background flush thread; the guard is
+    // an RAII handle that stops that thread on drop. The previous code
+    // dropped it at the end of boot() with a comment claiming "this is
+    // fine because tracing-subscriber uses a global subscriber" — which
+    // is true for the subscriber, but NOT for the file appender's
+    // background thread. With the guard dropped, log lines emitted after
+    // boot() returned (Extension loaded, hook traces, etc.) could be
+    // silently lost. We hand the guard down through EngineBoot so the
+    // renderer (TUI / chat / server) keeps it alive for its lifetime.
+    let log_guard = crate::logging::init_logging();
     let mut runtime = Runtime::new().await?;
 
     // Load config and apply
@@ -147,7 +161,14 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
         abort_tasks(&watcher_shutdown, &watcher_task);
         socket_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         socket_task.abort();
-        tracing::warn!("Failed to register session: {}", e);
+        // Fail loudly: returning Ok with already-aborted handles silently
+        // poisoned downstream — server inherited dead watcher/socket tasks
+        // and a session that wasn't in the registry, so other tools couldn't
+        // see it. Better to fail boot than start in a broken state.
+        return Err(crate::core::error::RuntimeError::Session(format!(
+            "failed to register session {}: {}",
+            session_registration.session_id, e
+        )));
     }
 
     // Extension manager
@@ -201,6 +222,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
             socket_task,
             session_socket_path,
             session_id,
+            log_guard,
         },
     })
 }

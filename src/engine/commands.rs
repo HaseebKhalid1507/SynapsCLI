@@ -148,6 +148,11 @@ pub fn handle_engine_command(
         "thinking" if !arg.is_empty() => {
             let (level, budget) = match arg {
                 "off" | "none" => ("off".to_string(), 0),
+                // `adaptive` matches the runtime's own label for budget=0
+                // (see core::models::thinking_level_for_budget). Adding
+                // it here removes the need for renderers to pre-intercept
+                // this case before delegating to the engine.
+                "adaptive" => ("adaptive".to_string(), 0),
                 "low" => ("low".to_string(), 2048),
                 "medium" | "med" => ("medium".to_string(), 4096),
                 "high" => ("high".to_string(), 16384),
@@ -157,7 +162,7 @@ pub fn handle_engine_command(
                         (format!("custom({})", n), n)
                     } else {
                         return Some(CommandResult::Error(
-                            format!("unknown thinking level: {} (use off/low/medium/high/xhigh or a number)", other)
+                            format!("unknown thinking level: {} (use off/adaptive/low/medium/high/xhigh or a number)", other)
                         ));
                     }
                 }
