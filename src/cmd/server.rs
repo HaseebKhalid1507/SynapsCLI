@@ -83,9 +83,35 @@ impl ServerState {
         conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model);
     }
 
+    /// Save the conversation to disk.
+    ///
+    /// Reproduces ConversationState::save inline so we can release the
+    /// `conv` write-lock BEFORE the slow `Session::save().await`
+    /// (atomic file rename). Holding the conv lock across that I/O
+    /// would block every other state read — particularly the stream
+    /// loop's `process_stream_event` write — for the duration of the
+    /// disk write.
     async fn save_session(&self) {
-        let mut conv = self.conv.write().await;
-        conv.save().await;
+        let session_to_save = {
+            let mut conv = self.conv.write().await;
+            if conv.api_messages.is_empty() {
+                return;
+            }
+            // Mirror ConversationState::save body — sync conv state into
+            // the embedded session struct.
+            conv.session.api_messages = conv.api_messages.clone();
+            conv.session.total_input_tokens = conv.total_input_tokens;
+            conv.session.total_output_tokens = conv.total_output_tokens;
+            conv.session.session_cost = conv.session_cost;
+            conv.session.abort_context = conv.abort_context.clone();
+            conv.session.updated_at = chrono::Utc::now();
+            conv.session.auto_title();
+            // Clone the session out so we can save it without holding the lock.
+            conv.session.clone()
+        }; // conv write-lock released here
+        if let Err(e) = session_to_save.save().await {
+            tracing::error!("Failed to save session: {}", e);
+        }
     }
 
     async fn push_history(&self, entry: HistoryEntry) {
@@ -273,10 +299,37 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     let mut broadcast_rx = state.broadcast_tx.subscribe();
 
     // Task: forward broadcast messages → this client's WebSocket
+    //
+    // `while let Ok(msg) = ...` would silently exit on RecvError::Lagged
+    // (slow client falls behind the 256-buffer ring), leaving the WS
+    // reader loop alive but the writer dead — a zombie connection that
+    // looks healthy from the outside. Match explicitly so we keep the
+    // forward pipe alive and only break on a real Closed.
     let tx_handle = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_tx.send(Message::Text(json)).await.is_err() {
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(msg) => {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if ws_tx.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        dropped = n,
+                        "client lagged on broadcast channel — keeping forward pipe alive"
+                    );
+                    // Best-effort: tell the client they missed messages.
+                    let warn = ServerMessage::System {
+                        message: format!("[client lagged — {} message(s) dropped]", n),
+                    };
+                    if let Ok(json) = serde_json::to_string(&warn) {
+                        let _ = ws_tx.send(Message::Text(json)).await;
+                    }
+                    // Continue the loop — receiver remains usable after Lagged.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
                 }
             }
