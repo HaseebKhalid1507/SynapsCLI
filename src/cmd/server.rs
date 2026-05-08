@@ -36,6 +36,30 @@ struct ServerState {
     background: BackgroundTasks,
 }
 
+/// RAII guard that clears the streaming flag on drop.
+///
+/// Without this, a panic or task cancellation inside the stream loop would
+/// leave `streaming = true` forever, bricking the server until process
+/// restart. The guard ensures the flag clears on every exit path —
+/// happy completion, error, panic, future-drop — without manual cleanup
+/// at every return site.
+///
+/// `cancel_token` is intentionally not part of this guard: a stale token
+/// in `cancel_token` is harmless (the stream it referenced is dead, and
+/// the next user message overwrites the slot before any new stream
+/// starts). The streaming flag is the safety-critical one.
+struct StreamingGuard {
+    state: Arc<ServerState>,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.state
+            .streaming
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl ServerState {
     fn timestamp() -> String {
         Local::now().format("%H:%M").to_string()
@@ -299,6 +323,10 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         });
         return;
     }
+    // RAII: clears `streaming` on every return path, including panic.
+    let _streaming_guard = StreamingGuard {
+        state: Arc::clone(state),
+    };
 
     // Add to history
     let ts = ServerState::timestamp();
