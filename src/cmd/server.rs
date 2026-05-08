@@ -1,5 +1,6 @@
 use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, CancellationToken, Session, truncate_str};
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
+use synaps_cli::engine::setup::{self, EngineOpts, BackgroundTasks};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -26,6 +27,10 @@ struct ServerState {
     /// Broadcast channel — server events go to ALL connected clients
     broadcast_tx: broadcast::Sender<ServerMessage>,
     client_count: RwLock<usize>,
+    /// Background tasks from engine boot — kept alive for server lifetime.
+    /// Aborts on drop (inbox watcher, per-session socket listener).
+    #[allow(dead_code)] // held for RAII; tasks tear down when ServerState drops
+    background: BackgroundTasks,
 }
 
 impl ServerState {
@@ -77,45 +82,27 @@ pub async fn run(
     continue_session: Option<Option<String>>,
     profile: Option<String>,
 ) -> anyhow::Result<()> {
-    if let Some(ref prof) = profile {
-        synaps_cli::config::set_profile(Some(prof.clone()));
-    }
+    // ── Boot via engine ──
+    // Replaces ~50 lines of inlined Runtime::new + system prompt + session
+    // resolution. Also gains: skills registry, MCP, inbox watcher,
+    // per-session socket, on_session_start hook, extension manager,
+    // session-start index record.
+    let boot = setup::boot(EngineOpts {
+        continue_session,
+        system,
+        profile,
+        no_extensions: false,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("engine boot failed: {e}"))?;
 
-    let _log_guard = synaps_cli::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
-
-    // Load config and apply
-    let config = synaps_cli::config::load_config();
-    runtime.apply_config(&config);
-
-    // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
-    runtime.set_system_prompt(system_prompt);
-
-    // Session: continue existing or create new
-    let (session, initial_api_messages, initial_history, initial_in, initial_out, initial_cost) =
-        match continue_session {
-            Some(maybe_id) => {
-                let session = match maybe_id {
-                    Some(id) => synaps_cli::resolve_session(&id)?,
-                    None => synaps_cli::latest_session()?,
-                };
-                runtime.set_model(session.model.clone());
-                if let Some(ref sp) = session.system_prompt {
-                    runtime.set_system_prompt(sp.clone());
-                }
-                let api_msgs = session.api_messages.clone();
-                let history = rebuild_history(&api_msgs);
-                let input_t = session.total_input_tokens;
-                let output_t = session.total_output_tokens;
-                let cost = session.session_cost;
-                (session, api_msgs, history, input_t, output_t, cost)
-            }
-            None => {
-                let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
-                (session, Vec::new(), Vec::new(), 0, 0, 0.0)
-            }
-        };
+    let runtime = boot.runtime;
+    let session = boot.session;
+    let initial_api_messages = boot.api_messages;
+    let initial_history = rebuild_history(&initial_api_messages);
+    let initial_in = boot.total_input_tokens;
+    let initial_out = boot.total_output_tokens;
+    let initial_cost = boot.session_cost;
 
     let session_id = session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
@@ -132,6 +119,7 @@ pub async fn run(
         cancel_token: RwLock::new(None),
         broadcast_tx,
         client_count: RwLock::new(0),
+        background: boot.background,
     });
 
     let app = Router::new()
