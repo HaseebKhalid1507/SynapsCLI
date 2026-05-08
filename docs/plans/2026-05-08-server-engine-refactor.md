@@ -125,3 +125,85 @@ pub enum ServerMessage {
 
 If we don't want to add this variant in v1, the translator silently drops
 subagent events (same as today). Boss decides at phase 2 review.
+
+---
+
+## Amendments — Outcomes (post-implementation)
+
+This section is appended after the 4-phase implementation + Path A
+review fixes shipped. Reality diverged from projection in three ways
+worth acknowledging in the plan-of-record:
+
+### LOC budget
+
+| Plan said | Reality |
+|-----------|---------|
+| 544 → ~300–350 (40% reduction) | 544 → 793 (+46%) |
+
+The projection was wrong. Three sources of growth:
+
+1. **Translator helpers** (Phase 2) — `apply_engine_event_side_effects`
+   + `engine_event_to_server_message` are ownership-driven extractions.
+   The engine emits engine-shaped events; server emits wire-shaped
+   messages. The split adds surface area but localizes the translation.
+
+2. **Command pre-intercept** (Phase 3) — server-specific commands
+   (`/thinking adaptive`, empty-arg queries, `/system`, `/clear`)
+   stay as fallthrough so the wire contract is preserved while the
+   engine-handled commands delegate. ~30 LOC of server overrides.
+
+3. **Path A fixes** (post-review) — graceful shutdown handler,
+   AutoSendQueued/AutoTriggerEvents loop, RAII guard, broadcast lag
+   handling. All real new functionality not in the original plan.
+
+The trade is **correctness > LOC**. Decoupling, observability, and
+parity with chat.rs justified the growth. Future cleanup that could
+shrink server.rs lives in **engine-side** changes:
+  - Make engine emit protocol-shaped events directly → translator dies.
+  - Add `Session::display_history()` helper → `rebuild_history` dies.
+  - Extend `engine::commands` to know `adaptive` thinking → pre-intercept dies.
+
+### `engine::session::ConversationState` adoption
+
+The original plan listed `ConversationState` as one of the four engine
+surfaces to wire. The first 4 phases skipped it (kept 5 separate
+`RwLock` fields on `ServerState`). Path A Fix 5 adopted it.
+
+Concrete bugs fixed by the late adoption:
+  - **Pricing drift** — server's hardcoded match (opus/sonnet/haiku)
+    didn't know newer models. Now goes through `engine::pricing::calculate_cost`.
+  - **Cache-token billing** — old `add_usage(input, output, model)`
+    ignored `cache_read` / `cache_creation` fields on
+    `EngineStreamEvent::Usage`. ConversationState's add_usage takes
+    all four token kinds.
+
+### `cargo clippy` success criterion
+
+Plan said *"clippy clean."* In practice this was scoped to the
+files modified by this branch (`src/cmd/server.rs`). The whole-crate
+clippy state has pre-existing lint suggestions that predate this
+work; addressing them is a separate cleanup PR. Spec criterion
+should read *"no new clippy warnings on src/cmd/server.rs."*
+
+### Path A — security fixes deferred
+
+The 8-agent review surfaced 8 security findings (CSWSH, system-prompt
+injection, broadcast privacy leak, etc.) that all pre-exist on `dev`.
+None were introduced by this refactor. They are tracked separately
+under `feat/server-hardening` because:
+  - Most require design decisions (token auth, origin allowlist,
+    per-client routing).
+  - All change wire/runtime behavior visible to clients.
+  - This PR's scope is "use the engine"; security is its own feature.
+
+### What this PR ships
+
+- All 6 listed regressions closed (extensions, on_session_start,
+  per-session socket, MCP, inbox watcher, session-start index record).
+- 5 critical Path A bugs fixed (extension loader, TOCTOU, RAII,
+  graceful shutdown, ConversationState).
+- 2 latency/correctness bugs fixed (broadcast lag, save_session
+  lock ordering).
+- Wire format unchanged. No breaking changes.
+- Same engine consumption pattern as `cmd/chat.rs`.
+
