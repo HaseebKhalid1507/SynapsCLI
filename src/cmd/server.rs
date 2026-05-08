@@ -25,7 +25,7 @@ struct ServerState {
     total_input_tokens: RwLock<u64>,
     total_output_tokens: RwLock<u64>,
     session_cost: RwLock<f64>,
-    streaming: RwLock<bool>,
+    streaming: std::sync::atomic::AtomicBool,
     cancel_token: RwLock<Option<CancellationToken>>,
     /// Broadcast channel — server events go to ALL connected clients
     broadcast_tx: broadcast::Sender<ServerMessage>,
@@ -151,7 +151,7 @@ pub async fn run(
         total_input_tokens: RwLock::new(initial_in),
         total_output_tokens: RwLock::new(initial_out),
         session_cost: RwLock::new(initial_cost),
-        streaming: RwLock::new(false),
+        streaming: std::sync::atomic::AtomicBool::new(false),
         cancel_token: RwLock::new(None),
         broadcast_tx,
         client_count: RwLock::new(0),
@@ -267,7 +267,7 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
             let _ = state.broadcast_tx.send(ServerMessage::StatusResponse {
                 model: runtime.model().to_string(),
                 thinking: runtime.thinking_level().to_string(),
-                streaming: *state.streaming.read().await,
+                streaming: state.streaming.load(std::sync::atomic::Ordering::Acquire),
                 session_id: session.id.clone(),
                 total_input_tokens: *state.total_input_tokens.read().await,
                 total_output_tokens: *state.total_output_tokens.read().await,
@@ -285,16 +285,19 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
 }
 
 async fn handle_user_message(content: String, state: &Arc<ServerState>) {
-    // Don't allow concurrent streaming
+    // Atomic check-then-set: if `streaming` was already true, reject.
+    // AcqRel gives us happens-before ordering on the flag toggle without the
+    // cross-thread sync overhead of SeqCst, which we don't need for a single
+    // boolean flag. Replaces a previous read+write split that allowed two
+    // concurrent clients to slip through.
+    if state
+        .streaming
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
     {
-        let is_streaming = *state.streaming.read().await;
-        if is_streaming {
-            let _ = state.broadcast_tx.send(ServerMessage::Error {
-                message: "already streaming — cancel first or wait".to_string(),
-            });
-            return;
-        }
-        *state.streaming.write().await = true;
+        let _ = state.broadcast_tx.send(ServerMessage::Error {
+            message: "already streaming — cancel first or wait".to_string(),
+        });
+        return;
     }
 
     // Add to history
@@ -380,7 +383,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         }
     }
 
-    *state.streaming.write().await = false;
+    state
+        .streaming
+        .store(false, std::sync::atomic::Ordering::Release);
     *state.cancel_token.write().await = None;
 }
 
