@@ -10,21 +10,23 @@ use chrono::Local;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
+use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
-use synaps_cli::{truncate_str, CancellationToken, Runtime, Session};
+use synaps_cli::{truncate_str, CancellationToken, Runtime};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Shared server state
 struct ServerState {
     runtime: Mutex<Runtime>,
-    session: RwLock<Session>,
-    api_messages: RwLock<Vec<serde_json::Value>>,
+    /// Engine-level conversation state — single source of truth for
+    /// session, api_messages, token counters (including cache_read /
+    /// cache_creation), cost, abort_context, queued_message,
+    /// pending_events. Replaces 5 separate RwLocks that diverged from
+    /// engine pricing and silently dropped cache tokens.
+    conv: RwLock<ConversationState>,
     display_history: RwLock<Vec<HistoryEntry>>,
-    total_input_tokens: RwLock<u64>,
-    total_output_tokens: RwLock<u64>,
-    session_cost: RwLock<f64>,
     streaming: std::sync::atomic::AtomicBool,
     cancel_token: RwLock<Option<CancellationToken>>,
     /// Broadcast channel — server events go to ALL connected clients
@@ -65,36 +67,25 @@ impl ServerState {
         Local::now().format("%H:%M").to_string()
     }
 
-    async fn add_usage(&self, input_tokens: u64, output_tokens: u64, model: &str) {
-        *self.total_input_tokens.write().await += input_tokens;
-        *self.total_output_tokens.write().await += output_tokens;
-
-        let (input_price, output_price) = match model {
-            m if m.contains("opus") => (15.0, 75.0),
-            m if m.contains("sonnet") => (3.0, 15.0),
-            m if m.contains("haiku") => (0.80, 4.0),
-            _ => (3.0, 15.0),
-        };
-        let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-            + (output_tokens as f64 / 1_000_000.0) * output_price;
-        *self.session_cost.write().await += cost;
+    /// Add usage from a stream's Usage event. Delegates to ConversationState
+    /// which uses engine::pricing::calculate_cost (handles cache tokens
+    /// correctly and tracks every model the engine knows about — opus,
+    /// sonnet, haiku, plus future ones added to engine pricing).
+    async fn add_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        model: &str,
+    ) {
+        let mut conv = self.conv.write().await;
+        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model);
     }
 
     async fn save_session(&self) {
-        let api_msgs = self.api_messages.read().await;
-        if api_msgs.is_empty() {
-            return;
-        }
-        let mut session = self.session.write().await;
-        session.api_messages = api_msgs.clone();
-        session.total_input_tokens = *self.total_input_tokens.read().await;
-        session.total_output_tokens = *self.total_output_tokens.read().await;
-        session.session_cost = *self.session_cost.read().await;
-        session.updated_at = chrono::Utc::now();
-        session.auto_title();
-        if let Err(e) = session.save().await {
-            tracing::error!("Failed to save session: {}", e);
-        }
+        let mut conv = self.conv.write().await;
+        conv.save().await;
     }
 
     async fn push_history(&self, entry: HistoryEntry) {
@@ -157,24 +148,20 @@ pub async fn run(
     });
 
     let runtime = boot.runtime;
-    let session = boot.session;
-    let initial_api_messages = boot.api_messages;
-    let initial_history = rebuild_history(&initial_api_messages);
-    let initial_in = boot.total_input_tokens;
-    let initial_out = boot.total_output_tokens;
-    let initial_cost = boot.session_cost;
+    let initial_history = rebuild_history(&boot.api_messages);
+    let conv = if boot.continued {
+        ConversationState::from_resumed(boot.session)
+    } else {
+        ConversationState::new(boot.session)
+    };
 
-    let session_id = session.id.clone();
+    let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
 
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
-        session: RwLock::new(session),
-        api_messages: RwLock::new(initial_api_messages),
+        conv: RwLock::new(conv),
         display_history: RwLock::new(initial_history),
-        total_input_tokens: RwLock::new(initial_in),
-        total_output_tokens: RwLock::new(initial_out),
-        session_cost: RwLock::new(initial_cost),
         streaming: std::sync::atomic::AtomicBool::new(false),
         cancel_token: RwLock::new(None),
         broadcast_tx,
@@ -340,16 +327,22 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
             });
         }
         ClientMessage::Status => {
+            // Snapshot all status fields under a single conv read-lock to avoid
+            // tearing across multiple awaits and to release the runtime mutex
+            // before we do anything expensive (broadcast send).
             let runtime = state.runtime.lock().await;
-            let session = state.session.read().await;
+            let model = runtime.model().to_string();
+            let thinking = runtime.thinking_level().to_string();
+            drop(runtime);
+            let conv = state.conv.read().await;
             let _ = state.broadcast_tx.send(ServerMessage::StatusResponse {
-                model: runtime.model().to_string(),
-                thinking: runtime.thinking_level().to_string(),
+                model,
+                thinking,
                 streaming: state.streaming.load(std::sync::atomic::Ordering::Acquire),
-                session_id: session.id.clone(),
-                total_input_tokens: *state.total_input_tokens.read().await,
-                total_output_tokens: *state.total_output_tokens.read().await,
-                session_cost: *state.session_cost.read().await,
+                session_id: conv.session.id.clone(),
+                total_input_tokens: conv.total_input_tokens,
+                total_output_tokens: conv.total_output_tokens,
+                session_cost: conv.session_cost,
                 connected_clients: *state.client_count.read().await,
             });
         }
@@ -391,83 +384,105 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
         })
         .await;
 
-    // Add to API messages
+    // Push initial user message into conv.api_messages (single source of truth).
     {
-        let mut msgs = state.api_messages.write().await;
-        msgs.push(serde_json::json!({"role": "user", "content": content}));
+        let mut conv = state.conv.write().await;
+        conv.api_messages
+            .push(serde_json::json!({"role": "user", "content": content}));
     }
 
-    // Start streaming
-    let cancel = CancellationToken::new();
-    *state.cancel_token.write().await = Some(cancel.clone());
+    // Server-local subagent tracker — chat.rs has the same. queued_message
+    // and pending_events are NOT local; they live in ConversationState
+    // because process_stream_event needs to mutate them across multiple
+    // stream calls in a single user-message handling cycle (AutoSendQueued
+    // and AutoTriggerEvents both produce follow-up turns).
+    let mut subagents: Vec<SubagentTracker> = Vec::new();
 
-    let messages = state.api_messages.read().await.clone();
     let model = {
         let rt = state.runtime.lock().await;
         rt.model().to_string()
     };
-
-    let mut stream = {
-        let rt = state.runtime.lock().await;
-        rt.run_stream_with_messages(messages, cancel, None, None)
-            .await
-    };
-
     let broadcast = state.broadcast_tx.clone();
 
-    // Engine-level per-stream state. Server doesn't currently expose
-    // queued_message or pending_events through the protocol, so we keep
-    // them local — process_stream_event still drains them on completion.
-    let mut subagents: Vec<SubagentTracker> = Vec::new();
-    let mut queued_message: Option<String> = None;
-    let mut pending_events: Vec<String> = Vec::new();
+    // Outer turn loop — runs until StreamCompletion::Done or Error.
+    // AutoSendQueued and AutoTriggerEvents both push another user-style
+    // entry into conv.api_messages and continue the loop, mirroring how
+    // cmd/chat.rs handles the same completions. Without this loop, the
+    // queued message and pending events would sit in api_messages with
+    // no follow-up turn — the next real user message would ship malformed
+    // history to the API.
+    'turn: loop {
+        // Snapshot messages and set up a fresh cancel token for this turn.
+        let messages = state.conv.read().await.api_messages.clone();
+        let cancel = CancellationToken::new();
+        *state.cancel_token.write().await = Some(cancel.clone());
 
-    // Process stream events through the engine
-    while let Some(event) = stream.next().await {
-        let ts = ServerState::timestamp();
-
-        // process_stream_event mutates api_messages in place — hold the
-        // write lock only for the call itself, then release before any
-        // broadcast / display_history work.
-        let (engine_event, completion) = {
-            let mut api_msgs = state.api_messages.write().await;
-            stream::process_stream_event(
-                event,
-                &mut api_msgs,
-                &mut subagents,
-                &mut queued_message,
-                &mut pending_events,
-            )
+        let mut stream = {
+            let rt = state.runtime.lock().await;
+            rt.run_stream_with_messages(messages, cancel, None, None)
+                .await
         };
 
-        // Side effects that depend on the event kind: display_history,
-        // usage accounting, session save on MessageHistory boundaries.
-        apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
+        // Inner loop — process events from this turn's stream.
+        while let Some(event) = stream.next().await {
+            let ts = ServerState::timestamp();
 
-        // Translate to wire format and broadcast (if there's anything to send).
-        if let Some(msg) = engine_event_to_server_message(engine_event) {
-            let _ = broadcast.send(msg);
+            // process_stream_event mutates conv fields in place. Hold the
+            // write lock only for the call itself, then release before
+            // broadcast / display_history work to keep latency low.
+            let (engine_event, completion) = {
+                let mut conv = state.conv.write().await;
+                let conv = &mut *conv;
+                stream::process_stream_event(
+                    event,
+                    &mut conv.api_messages,
+                    &mut subagents,
+                    &mut conv.queued_message,
+                    &mut conv.pending_events,
+                )
+            };
+
+            apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
+
+            if let Some(msg) = engine_event_to_server_message(engine_event) {
+                let _ = broadcast.send(msg);
+            }
+
+            match completion {
+                StreamCompletion::Continue => {}
+                StreamCompletion::Done | StreamCompletion::Error(_) => {
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::AutoSendQueued(queued) => {
+                    // Take the queued user message out of conv (process_stream_event
+                    // already cleared the option in conv) and push it as the
+                    // next user turn. Then save and continue the outer loop.
+                    {
+                        let mut conv = state.conv.write().await;
+                        conv.api_messages
+                            .push(serde_json::json!({"role": "user", "content": queued}));
+                    }
+                    state.save_session().await;
+                    continue 'turn;
+                }
+                StreamCompletion::AutoTriggerEvents => {
+                    // pending_events were already drained into conv.api_messages
+                    // by process_stream_event. Save and trigger a follow-up turn.
+                    state.save_session().await;
+                    continue 'turn;
+                }
+            }
         }
 
-        // Stream-completion handling. Server doesn't currently support
-        // auto-send-queued or auto-trigger-events flows; treat them as Done.
-        match completion {
-            StreamCompletion::Continue => {}
-            StreamCompletion::Done
-            | StreamCompletion::AutoSendQueued(_)
-            | StreamCompletion::AutoTriggerEvents => {
-                state.save_session().await;
-            }
-            StreamCompletion::Error(_) => {
-                // process_stream_event already trimmed dangling messages.
-                state.save_session().await;
-            }
-        }
+        // Stream ended without an explicit completion (network drop or
+        // similar). Save and exit — don't loop forever waiting for events
+        // that won't come.
+        state.save_session().await;
+        break 'turn;
     }
 
-    state
-        .streaming
-        .store(false, std::sync::atomic::Ordering::Release);
+    // _streaming_guard's Drop clears `streaming` — no manual store needed.
     *state.cancel_token.write().await = None;
 }
 
@@ -525,9 +540,19 @@ async fn apply_engine_event_side_effects(
         EngineStreamEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_read,
+            cache_creation,
             ..
         } => {
-            state.add_usage(*input_tokens, *output_tokens, model).await;
+            state
+                .add_usage(
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read,
+                    *cache_creation,
+                    model,
+                )
+                .await;
         }
         EngineStreamEvent::Error(err) => {
             state
@@ -677,17 +702,15 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     // Server-specific commands the engine doesn't cover.
     match name {
         "clear" => {
-            state.save_session().await;
-            state.api_messages.write().await.clear();
-            state.display_history.write().await.clear();
-            *state.total_input_tokens.write().await = 0;
-            *state.total_output_tokens.write().await = 0;
-            *state.session_cost.write().await = 0.0;
+            // Delegate to ConversationState::clear, which saves the current
+            // session and replaces it with a fresh one. Mirrors how
+            // cmd/chat.rs handles /clear.
             {
                 let rt = state.runtime.lock().await;
-                *state.session.write().await =
-                    Session::new(rt.model(), rt.thinking_level(), rt.system_prompt());
+                let mut conv = state.conv.write().await;
+                conv.clear(&rt).await;
             }
+            state.display_history.write().await.clear();
             let _ = broadcast.send(ServerMessage::System {
                 message: "session cleared".to_string(),
             });
