@@ -503,7 +503,17 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
             match completion {
                 StreamCompletion::Continue => {}
-                StreamCompletion::Done | StreamCompletion::Error(_) => {
+                StreamCompletion::Done => {
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::Error(ref err_msg) => {
+                    // process_stream_event has already trimmed dangling
+                    // messages and emitted EngineStreamEvent::Error which
+                    // we translated to a ServerMessage::Error above. Log
+                    // for traceability instead of silently dropping the
+                    // string with `_`.
+                    tracing::debug!(error = %err_msg, "stream completed with error");
                     state.save_session().await;
                     break 'turn;
                 }
@@ -539,9 +549,17 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     *state.cancel_token.write().await = None;
 }
 
-/// Apply event-specific side effects that the wire-message translator can't:
-///   - Append/extend display_history (replay buffer for late-connecting clients)
-///   - Bump usage counters on Usage events
+/// Apply event-specific side effects: append to `display_history`
+/// (the replay buffer for late-connecting WS clients) and bump the
+/// engine-managed usage counters when a `Usage` event arrives.
+///
+/// This is a *separate* function from `engine_event_to_server_message`
+/// for an ownership reason, not a logical-split reason: that function
+/// consumes the `EngineStreamEvent` by value to build a `ServerMessage`,
+/// so any work that needs `&EngineStreamEvent` must run first while
+/// the event is still borrowable. The split is dictated by Rust's
+/// borrow checker; if `EngineStreamEvent` becomes `Clone` cheaply,
+/// these can collapse.
 async fn apply_engine_event_side_effects(
     event: &EngineStreamEvent,
     state: &Arc<ServerState>,
@@ -791,7 +809,22 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     }
 }
 
-/// Rebuild display history from API messages (for --continue)
+/// Rebuild the WS replay buffer (`display_history`) from raw API messages
+/// after a `--continue` boot.
+///
+/// Why this stays — the engine has no public API for "give me a
+/// display-friendly history view" of api_messages. `display_history` is
+/// a server-renderer concern (replay buffer for late-joining WS clients),
+/// distinct from the LLM-facing api_messages list. Until the engine
+/// exposes an equivalent helper, server has to do the JSON-block
+/// decoding here.
+///
+/// Known limitation: this is a manual `block["type"].as_str()` walk.
+/// Adding a new block type to the protocol means updating both
+/// `engine::stream::process_stream_event` and this function or losing
+/// fidelity in the replay buffer for resumed sessions. Tracked as
+/// follow-up — engine should expose a `Session::display_history()`
+/// helper.
 fn rebuild_history(api_messages: &[serde_json::Value]) -> Vec<HistoryEntry> {
     let mut history = Vec::new();
     for msg in api_messages {
