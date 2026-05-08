@@ -1,8 +1,3 @@
-use synaps_cli::{Runtime, CancellationToken, Session, truncate_str};
-use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
-use synaps_cli::engine::setup::{self, EngineOpts, BackgroundTasks};
-use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -10,10 +5,15 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::Local;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
+use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
+use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
+use synaps_cli::{truncate_str, CancellationToken, Runtime, Session};
 use tokio::sync::{broadcast, Mutex, RwLock};
-use chrono::Local;
 
 /// Shared server state
 struct ServerState {
@@ -51,7 +51,7 @@ impl ServerState {
             _ => (3.0, 15.0),
         };
         let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-                 + (output_tokens as f64 / 1_000_000.0) * output_price;
+            + (output_tokens as f64 / 1_000_000.0) * output_price;
         *self.session_cost.write().await += cost;
     }
 
@@ -265,10 +265,12 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
     // Add to history
     let ts = ServerState::timestamp();
-    state.push_history(HistoryEntry::User {
-        content: content.clone(),
-        time: ts,
-    }).await;
+    state
+        .push_history(HistoryEntry::User {
+            content: content.clone(),
+            time: ts,
+        })
+        .await;
 
     // Add to API messages
     {
@@ -288,7 +290,8 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
     let mut stream = {
         let rt = state.runtime.lock().await;
-        rt.run_stream_with_messages(messages, cancel, None, None).await
+        rt.run_stream_with_messages(messages, cancel, None, None)
+            .await
     };
 
     let broadcast = state.broadcast_tx.clone();
@@ -379,7 +382,9 @@ async fn apply_engine_event_side_effects(
                 });
             }
         }
-        EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
+        EngineStreamEvent::ToolFinalized {
+            tool_name, input, ..
+        } => {
             state
                 .push_history(HistoryEntry::ToolUse {
                     tool_name: tool_name.clone(),
@@ -435,10 +440,14 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
             Some(ServerMessage::ToolUseStart { tool_name })
         }
         EngineStreamEvent::ToolDelta { delta, .. } => Some(ServerMessage::ToolUseDelta(delta)),
-        EngineStreamEvent::ToolFinalized { tool_id, tool_name, input } => {
+        EngineStreamEvent::ToolFinalized {
+            tool_id,
+            tool_name,
+            input,
+        } => {
             // Engine serialised input to JSON string; reparse for the wire.
-            let input_value = serde_json::from_str(&input)
-                .unwrap_or(serde_json::Value::String(input));
+            let input_value =
+                serde_json::from_str(&input).unwrap_or(serde_json::Value::String(input));
             Some(ServerMessage::ToolUse {
                 tool_name,
                 tool_id,
@@ -555,11 +564,8 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
             *state.session_cost.write().await = 0.0;
             {
                 let rt = state.runtime.lock().await;
-                *state.session.write().await = Session::new(
-                    rt.model(),
-                    rt.thinking_level(),
-                    rt.system_prompt(),
-                );
+                *state.session.write().await =
+                    Session::new(rt.model(), rt.thinking_level(), rt.system_prompt());
             }
             let _ = broadcast.send(ServerMessage::System {
                 message: "session cleared".to_string(),
@@ -623,7 +629,8 @@ fn rebuild_history(api_messages: &[serde_json::Value]) -> Vec<HistoryEntry> {
                             }
                             Some("tool_use") => {
                                 let name = block["name"].as_str().unwrap_or("").to_string();
-                                let input = serde_json::to_string(&block["input"]).unwrap_or_default();
+                                let input =
+                                    serde_json::to_string(&block["input"]).unwrap_or_default();
                                 history.push(HistoryEntry::ToolUse {
                                     tool_name: name,
                                     input,
