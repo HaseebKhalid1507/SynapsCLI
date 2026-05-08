@@ -197,8 +197,62 @@ pub async fn run(
     eprintln!("║  Session:   {:<24}║", &session_id);
     eprintln!("╚══════════════════════════════════════╝");
 
-    axum::serve(listener, app).await?;
+    // Serve with graceful shutdown on SIGINT/SIGTERM.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // ── Graceful teardown ──
+    // Mirrors cmd/chat.rs end-of-session sequence:
+    //   1. Save the session to disk (was previously skipped on shutdown).
+    //   2. Fire on_session_end hook so extensions get a clean exit
+    //      notification (jawz-shutdown, stelline harvest, etc.).
+    //   3. Call BackgroundTasks::shutdown() to unregister the session
+    //      socket + run/<id>.json file. Drop alone aborts tasks but
+    //      leaves stale registry entries.
+    eprintln!("\n↓ graceful shutdown — saving session, firing hooks, unregistering.");
+    state.save_session().await;
+    {
+        let runtime = state.runtime.lock().await;
+        let hook = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
+            &session_id,
+            None, // server doesn't preserve a transcript blob — extensions can read api_messages from disk
+        );
+        let _ = runtime.hook_bus().emit(&hook).await;
+    }
+    state.background.shutdown();
+
     Ok(())
+}
+
+/// Listen for SIGINT (Ctrl-C) or SIGTERM (`systemctl stop`) and resolve
+/// when either arrives. axum's `with_graceful_shutdown` takes a future
+/// that, when ready, signals the server to stop accepting new connections,
+/// drain in-flight requests, and return.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
