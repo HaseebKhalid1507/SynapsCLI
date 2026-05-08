@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -86,9 +87,16 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     // ── Boot via engine ──
     // Replaces ~50 lines of inlined Runtime::new + system prompt + session
-    // resolution. Also gains: skills registry, MCP, inbox watcher,
-    // per-session socket, on_session_start hook, extension manager,
-    // session-start index record.
+    // resolution. Boot gives us:
+    //   - config + system prompt loaded
+    //   - skills registry built (server doesn't consume the registry handle,
+    //     but `load_skill` tool registration is a side effect we keep)
+    //   - lazy MCP setup
+    //   - session resolved (continue or new)
+    //   - inbox watcher + per-session Unix socket + session registry entry
+    //   - extension manager constructed (still needs explicit loader spawn below)
+    //   - on_session_start hook emitted (no subscribers until extensions loaded)
+    //   - session-start index record appended
     let boot = setup::boot(EngineOpts {
         continue_session,
         system,
@@ -96,7 +104,33 @@ pub async fn run(
         no_extensions: false,
     })
     .await
-    .map_err(|e| anyhow::anyhow!("engine boot failed: {e}"))?;
+    .context("engine boot failed")?;
+
+    // ── Discover and load extensions ──
+    // setup::boot constructs an empty ExtensionManager. We have to actually
+    // discover plugins from disk and spawn their processes here, mirroring
+    // cmd/chat.rs. Without this, on_session_start fires onto an empty bus
+    // and no before_tool_call / before_message / on_session_end hooks ever
+    // run in server mode — defeating the purpose of the engine refactor.
+    let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
+    synaps_cli::extensions::loader::spawn_discover_and_load(
+        Arc::clone(&boot.ext_manager),
+        loader_tx,
+    );
+    // Drain loader events in the background — prevents SendError in the loader
+    // and lets us log when discovery completes.
+    tokio::spawn(async move {
+        use synaps_cli::extensions::loader::ExtensionLoaderEvent;
+        while let Some(ev) = loader_rx.recv().await {
+            if let ExtensionLoaderEvent::Finished { loaded, failed } = ev {
+                tracing::info!(
+                    server_extensions_loaded = loaded.len(),
+                    server_extensions_failed = failed.len(),
+                    "server: extensions ready"
+                );
+            }
+        }
+    });
 
     let runtime = boot.runtime;
     let session = boot.session;
