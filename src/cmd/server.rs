@@ -1,6 +1,7 @@
-use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, CancellationToken, Session, truncate_str};
+use synaps_cli::{Runtime, CancellationToken, Session, truncate_str};
 use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
 use synaps_cli::engine::setup::{self, EngineOpts, BackgroundTasks};
+use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -291,108 +292,181 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
     let broadcast = state.broadcast_tx.clone();
 
-    // Process stream events
+    // Engine-level per-stream state. Server doesn't currently expose
+    // queued_message or pending_events through the protocol, so we keep
+    // them local — process_stream_event still drains them on completion.
+    let mut subagents: Vec<SubagentTracker> = Vec::new();
+    let mut queued_message: Option<String> = None;
+    let mut pending_events: Vec<String> = Vec::new();
+
+    // Process stream events through the engine
     while let Some(event) = stream.next().await {
         let ts = ServerState::timestamp();
-        match event {
-            StreamEvent::Llm(LlmEvent::Thinking(text)) => {
-                let _ = broadcast.send(ServerMessage::Thinking { content: text.clone() });
-                // Append to last thinking entry or create new
-                let mut history = state.display_history.write().await;
-                if let Some(HistoryEntry::Thinking { content: ref mut c, .. }) = history.last_mut() {
-                    c.push_str(&text);
-                } else {
-                    history.push(HistoryEntry::Thinking { content: text, time: ts });
-                }
-            }
-            StreamEvent::Llm(LlmEvent::Text(text)) => {
-                let _ = broadcast.send(ServerMessage::Text { content: text.clone() });
-                let mut history = state.display_history.write().await;
-                if let Some(HistoryEntry::Text { content: ref mut c, .. }) = history.last_mut() {
-                    c.push_str(&text);
-                } else {
-                    history.push(HistoryEntry::Text { content: text, time: ts });
-                }
-            }
-            StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
-                let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
-            }
-            StreamEvent::Llm(LlmEvent::ToolUseDelta { delta, .. }) => {
-                let _ = broadcast.send(ServerMessage::ToolUseDelta(delta));
-            }
-            StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                let _ = broadcast.send(ServerMessage::ToolUse {
-                    tool_name: tool_name.clone(),
-                    tool_id: tool_id.clone(),
-                    input: input.clone(),
-                });
-                state.push_history(HistoryEntry::ToolUse {
-                    tool_name,
-                    input: serde_json::to_string(&input).unwrap_or_default(),
-                    time: ts,
-                }).await;
-            }
-            StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, delta }) => {
-                let _ = broadcast.send(ServerMessage::ToolResultDelta {
-                    tool_id,
-                    delta,
-                });
-            }
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: _, result }) => {
-                let _ = broadcast.send(ServerMessage::ToolResult {
-                    tool_id: String::new(),
-                    result: result.clone(),
-                });
-                state.push_history(HistoryEntry::ToolResult {
-                    result,
-                    time: ts,
-                }).await;
-            }
-            StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-                *state.api_messages.write().await = history;
+
+        // process_stream_event mutates api_messages in place — hold the
+        // write lock only for the call itself, then release before any
+        // broadcast / display_history work.
+        let (engine_event, completion) = {
+            let mut api_msgs = state.api_messages.write().await;
+            stream::process_stream_event(
+                event,
+                &mut api_msgs,
+                &mut subagents,
+                &mut queued_message,
+                &mut pending_events,
+            )
+        };
+
+        // Side effects that depend on the event kind: display_history,
+        // usage accounting, session save on MessageHistory boundaries.
+        apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
+
+        // Translate to wire format and broadcast (if there's anything to send).
+        if let Some(msg) = engine_event_to_server_message(engine_event) {
+            let _ = broadcast.send(msg);
+        }
+
+        // Stream-completion handling. Server doesn't currently support
+        // auto-send-queued or auto-trigger-events flows; treat them as Done.
+        match completion {
+            StreamCompletion::Continue => {}
+            StreamCompletion::Done
+            | StreamCompletion::AutoSendQueued(_)
+            | StreamCompletion::AutoTriggerEvents => {
                 state.save_session().await;
             }
-            StreamEvent::Session(SessionEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens: _,
-                cache_creation_input_tokens: _,
-                model: _,
-            }) => {
-                state.add_usage(input_tokens, output_tokens, &model).await;
-                let _ = broadcast.send(ServerMessage::Usage { input_tokens, output_tokens });
-            }
-            StreamEvent::Session(SessionEvent::Done) => {
-                let _ = broadcast.send(ServerMessage::Done);
-            }
-            // Subagent events — not yet wired to server protocol
-            StreamEvent::Agent(AgentEvent::SubagentStart { .. })
-            | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
-            | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
-            | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. }) => {}
-            StreamEvent::Session(SessionEvent::Error(err)) => {
-                let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
-                state.push_history(HistoryEntry::Error {
-                    content: err,
-                    time: ts,
-                }).await;
-
-                // Clean up trailing broken messages (same logic as chatui)
-                let mut msgs = state.api_messages.write().await;
-                if let Some(last) = msgs.last() {
-                    let role = last["role"].as_str().unwrap_or("");
-                    let is_text_user = role == "user" && last["content"].is_string();
-                    let is_assistant = role == "assistant";
-                    if is_text_user || is_assistant {
-                        msgs.pop();
-                    }
-                }
+            StreamCompletion::Error(_) => {
+                // process_stream_event already trimmed dangling messages.
+                state.save_session().await;
             }
         }
     }
 
     *state.streaming.write().await = false;
     *state.cancel_token.write().await = None;
+}
+
+/// Apply event-specific side effects that the wire-message translator can't:
+///   - Append/extend display_history (replay buffer for late-connecting clients)
+///   - Bump usage counters on Usage events
+async fn apply_engine_event_side_effects(
+    event: &EngineStreamEvent,
+    state: &Arc<ServerState>,
+    model: &str,
+    ts: &str,
+) {
+    match event {
+        EngineStreamEvent::Thinking(text) => {
+            let mut history = state.display_history.write().await;
+            if let Some(HistoryEntry::Thinking { content: c, .. }) = history.last_mut() {
+                c.push_str(text);
+            } else {
+                history.push(HistoryEntry::Thinking {
+                    content: text.clone(),
+                    time: ts.to_string(),
+                });
+            }
+        }
+        EngineStreamEvent::Text(text) => {
+            let mut history = state.display_history.write().await;
+            if let Some(HistoryEntry::Text { content: c, .. }) = history.last_mut() {
+                c.push_str(text);
+            } else {
+                history.push(HistoryEntry::Text {
+                    content: text.clone(),
+                    time: ts.to_string(),
+                });
+            }
+        }
+        EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
+            state
+                .push_history(HistoryEntry::ToolUse {
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        EngineStreamEvent::ToolResult { result, .. } => {
+            state
+                .push_history(HistoryEntry::ToolResult {
+                    result: result.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        EngineStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => {
+            state.add_usage(*input_tokens, *output_tokens, model).await;
+        }
+        EngineStreamEvent::Error(err) => {
+            state
+                .push_history(HistoryEntry::Error {
+                    content: err.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        // Variants without server-side side effects.
+        EngineStreamEvent::ToolStart { .. }
+        | EngineStreamEvent::ToolDelta { .. }
+        | EngineStreamEvent::ToolResultDelta { .. }
+        | EngineStreamEvent::SubagentStart { .. }
+        | EngineStreamEvent::SubagentUpdate { .. }
+        | EngineStreamEvent::SubagentDone { .. }
+        | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Done
+        | EngineStreamEvent::Noop => {}
+    }
+}
+
+/// Translate an engine-level event to the wire-format ServerMessage.
+/// Returns None for events that have no client-facing representation
+/// (subagent / steering / noop — TODO: wire subagent variant in v2).
+fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMessage> {
+    match event {
+        EngineStreamEvent::Thinking(content) => Some(ServerMessage::Thinking { content }),
+        EngineStreamEvent::Text(content) => Some(ServerMessage::Text { content }),
+        EngineStreamEvent::ToolStart { tool_name, .. } => {
+            Some(ServerMessage::ToolUseStart { tool_name })
+        }
+        EngineStreamEvent::ToolDelta { delta, .. } => Some(ServerMessage::ToolUseDelta(delta)),
+        EngineStreamEvent::ToolFinalized { tool_id, tool_name, input } => {
+            // Engine serialised input to JSON string; reparse for the wire.
+            let input_value = serde_json::from_str(&input)
+                .unwrap_or(serde_json::Value::String(input));
+            Some(ServerMessage::ToolUse {
+                tool_name,
+                tool_id,
+                input: input_value,
+            })
+        }
+        EngineStreamEvent::ToolResultDelta { tool_id, delta } => {
+            Some(ServerMessage::ToolResultDelta { tool_id, delta })
+        }
+        EngineStreamEvent::ToolResult { tool_id, result } => {
+            Some(ServerMessage::ToolResult { tool_id, result })
+        }
+        EngineStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => Some(ServerMessage::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+        EngineStreamEvent::Done => Some(ServerMessage::Done),
+        EngineStreamEvent::Error(message) => Some(ServerMessage::Error { message }),
+        // Server protocol doesn't expose these (yet).
+        EngineStreamEvent::SubagentStart { .. }
+        | EngineStreamEvent::SubagentUpdate { .. }
+        | EngineStreamEvent::SubagentDone { .. }
+        | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Noop => None,
+    }
 }
 
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
