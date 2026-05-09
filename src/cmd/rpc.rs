@@ -130,6 +130,7 @@ async fn spawn_prompt(
 ) -> InFlight {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let cancel_check = cancel.clone();
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
 
@@ -165,20 +166,15 @@ async fn spawn_prompt(
                     st.save_session().await;
                     continue;
                 }
-                StreamEvent::Session(SessionEvent::Usage { .. }) => {
-                    if let StreamEvent::Session(ref se) = ev {
-                        accumulate_usage(&mut usage_acc, se);
-                    }
-                    if let StreamEvent::Session(SessionEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        ..
-                    }) = &ev
-                    {
-                        let mut st = state.lock().await;
-                        st.total_input_tokens += input_tokens;
-                        st.total_output_tokens += output_tokens;
-                    }
+                StreamEvent::Session(se @ SessionEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                }) => {
+                    accumulate_usage(&mut usage_acc, se);
+                    let mut st = state.lock().await;
+                    st.total_input_tokens += input_tokens;
+                    st.total_output_tokens += output_tokens;
                     continue;
                 }
                 // ── Turn complete ───────────────────────────────────────────
@@ -225,13 +221,24 @@ async fn spawn_prompt(
             }
         }
 
-        // Stream exhausted without Session::Done — typically a cancellation.
+        // Stream ended without Session::Done. If we requested cancellation, that's an
+        // orderly abort; otherwise it's a silent failure (provider drop, extension
+        // crash, etc.) and the parent must be told.
+        let cancelled = cancel_check.is_cancelled();
         let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+        let body = if cancelled {
+            serde_json::json!({ "ok": true, "cancelled": true })
+        } else {
+            serde_json::json!({
+                "ok": false,
+                "error": "stream ended without Done"
+            })
+        };
         let _ = wtx
             .send(Ev::Response {
                 id: pid.clone(),
                 command: "prompt".to_string(),
-                body: serde_json::json!({ "ok": true }),
+                body,
             })
             .await;
         state.lock().await.in_flight = None;

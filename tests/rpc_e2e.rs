@@ -712,7 +712,12 @@ mod tier2 {
                 }
                 "response" if frame["command"] == "prompt" => {
                     assert_eq!(frame["id"], "t2p2");
-                    // ok may be true or false when cancelled — both are valid.
+                    // Cancelled stream must report ok: true, cancelled: true.
+                    assert_eq!(frame["ok"], true, "cancelled prompt must return ok: true");
+                    assert_eq!(
+                        frame["cancelled"], true,
+                        "cancelled prompt must carry cancelled: true"
+                    );
                     saw_prompt_response = true;
                     if saw_abort_response {
                         break;
