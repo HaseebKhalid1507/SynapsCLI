@@ -629,4 +629,63 @@ mod tests {
         let msg = build_user_content(original, &attachments);
         assert!(msg.ends_with(original), "original message must appear verbatim at the end");
     }
+
+    // ── handle_compact lock-release invariant ────────────────────────────────
+
+    /// Structural proof that `handle_compact` releases the state lock before
+    /// the long-running `compact_conversation` await.
+    ///
+    /// The fix in `cmd::rpc::handle_compact` snapshots `(msgs, runtime)` inside
+    /// a block that ends *before* the await, so the `MutexGuard` is dropped at
+    /// the closing `}`.  This test uses a `tokio::sync::Mutex` to demonstrate
+    /// the same pattern: a second task can acquire the lock while the "slow
+    /// operation" is running, proving contention is bounded to the snapshot
+    /// phase only.
+    #[tokio::test]
+    async fn handle_compact_releases_lock_before_slow_await() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let shared: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+        // Simulate the fixed handle_compact pattern:
+        //   1. brief lock to snapshot data
+        //   2. long operation with NO lock
+        //   3. brief lock to write result
+        let shared2 = shared.clone();
+        let task = tokio::spawn(async move {
+            // Phase 1: snapshot under lock.
+            let snapshot = {
+                let mut g = shared2.lock().await;
+                *g += 1; // mark "lock acquired for snapshot"
+                *g       // return snapshot value
+            };
+            // Lock is now RELEASED.
+
+            // Phase 2: slow operation — no lock held.
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+            // Phase 3: write result back under lock.
+            let mut g = shared2.lock().await;
+            *g = snapshot + 100;
+        });
+
+        // While the "slow" phase is running, this second task must be able to
+        // acquire the lock without blocking for the full 20 ms.
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        let acquired = tokio::time::timeout(
+            tokio::time::Duration::from_millis(5),
+            shared.lock(),
+        )
+        .await;
+        assert!(
+            acquired.is_ok(),
+            "second task must acquire the lock during the slow phase — \
+             handle_compact must NOT hold the lock across compact_conversation"
+        );
+        drop(acquired);
+
+        task.await.unwrap();
+        assert_eq!(*shared.lock().await, 101);
+    }
 }

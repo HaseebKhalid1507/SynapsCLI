@@ -279,19 +279,23 @@ async fn handle_prompt(
 
 /// Handle the `Compact` command.
 ///
-/// Holds the lock across the async compaction call. This is intentional:
-/// `Compact` is documented as not concurrent with `Prompt`, so the lock
-/// contention window is bounded by the compaction LLM round-trip.
+/// The lock is held only for brief snapshot and write-back phases; the slow
+/// LLM round-trip in `compact_conversation` runs with **no lock held** so
+/// that `Abort`, `GetState`, and `GetSessionStats` remain responsive.
 async fn handle_compact(
     id: String,
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
 ) {
-    let summary_result = {
+    // 1. Brief lock: snapshot what compact_conversation needs, then drop guard.
+    let (msgs, runtime) = {
         let st = state.lock().await;
-        let msgs = st.api_messages.clone();
-        synaps_cli::core::compaction::compact_conversation(&msgs, &st.runtime, None).await
+        (st.api_messages.clone(), st.runtime.clone())
     };
+
+    // 2. Long-running LLM call — no lock held.
+    let summary_result =
+        synaps_cli::core::compaction::compact_conversation(&msgs, &runtime, None).await;
 
     match summary_result {
         Ok(summary) => {
