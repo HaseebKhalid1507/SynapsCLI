@@ -338,6 +338,21 @@ async fn handle_new_session(
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
 ) {
+    // Reject if a streaming prompt is in flight.
+    {
+        let st = state.lock().await;
+        if st.is_streaming() {
+            tracing::warn!(id, "rejected new_session — stream in flight");
+            let _ = writer_tx
+                .send(Ev::Error {
+                    id: Some(id),
+                    message: "another prompt is in flight; abort first".to_string(),
+                })
+                .await;
+            return;
+        }
+    }
+
     let new_session_id = {
         let mut st = state.lock().await;
         st.save_session().await;

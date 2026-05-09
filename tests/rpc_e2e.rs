@@ -750,4 +750,102 @@ mod tier2 {
             "expected Response {{ command: prompt }} after abort"
         );
     }
+
+    /// `NewSession` while a stream is in-flight must be rejected with an
+    /// `Error { id: Some("ns1"), message: "...abort first" }` frame, and the
+    /// streaming prompt must complete normally afterwards.
+    #[tokio::test]
+    async fn new_session_rejected_while_streaming() {
+        if !python3_available() {
+            eprintln!(
+                "skipping tier2::new_session_rejected_while_streaming: python3 unavailable"
+            );
+            return;
+        }
+
+        let (mut child, _ready) = match spawn_with_echo_provider().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "skipping tier2::new_session_rejected_while_streaming: spawn failed: {e}"
+                );
+                return;
+            }
+        };
+
+        // Start a streaming prompt.
+        child
+            .send(&json!({
+                "type": "prompt",
+                "id": "t2p3",
+                "message": "stream me",
+                "attachments": []
+            }))
+            .await
+            .expect("send prompt");
+
+        // Wait ~150 ms so the stream is definitely in-flight (first 200 ms sleep
+        // in the slow provider is still running).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Send NewSession while in-flight — must be rejected.
+        child
+            .send(&json!({"type": "new_session", "id": "ns1"}))
+            .await
+            .expect("send new_session");
+
+        let mut saw_ns_error = false;
+        let mut saw_prompt_response = false;
+
+        for _ in 0..40 {
+            let frame = match child.recv_timeout(Duration::from_secs(10)).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("recv error: {e}");
+                    break;
+                }
+            };
+
+            match frame["type"].as_str().unwrap_or("") {
+                "error" => {
+                    if frame["id"] == "ns1" {
+                        let msg = frame["message"].as_str().unwrap_or("");
+                        assert!(
+                            msg.contains("abort first"),
+                            "expected 'abort first' in error message, got: {msg}"
+                        );
+                        saw_ns_error = true;
+                    } else {
+                        // Engine error from the prompt itself — skip test.
+                        eprintln!(
+                            "skipping tier2::new_session_rejected_while_streaming: engine error: {}",
+                            frame["message"]
+                        );
+                        let _ = child.shutdown().await;
+                        return;
+                    }
+                }
+                "response" if frame["command"] == "prompt" => {
+                    assert_eq!(frame["id"], "t2p3");
+                    saw_prompt_response = true;
+                }
+                _ => {}
+            }
+
+            if saw_ns_error && saw_prompt_response {
+                break;
+            }
+        }
+
+        let _ = child.shutdown().await;
+
+        assert!(
+            saw_ns_error,
+            "expected Error {{ id: 'ns1', message: '...abort first' }}"
+        );
+        assert!(
+            saw_prompt_response,
+            "expected prompt t2p3 to complete after rejected new_session"
+        );
+    }
 }
