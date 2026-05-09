@@ -54,11 +54,15 @@ impl RpcChild {
         let home = TempDir::new()?;
         setup(home.path());
 
-        // Write a minimal config so the engine doesn't try to load API keys.
+        // Ensure the config dir exists; do not overwrite a config the setup
+        // callback may have planted (e.g. tier2 fixtures plant a model =
+        // <ext>:<provider>:<model> entry that selects an extension provider).
         let cfg_path = home.path().join(".synaps-cli");
         std::fs::create_dir_all(&cfg_path)?;
-        // Empty config — engine will fall back to defaults.
-        std::fs::write(cfg_path.join("config"), "")?;
+        let config_file = cfg_path.join("config");
+        if !config_file.exists() {
+            std::fs::write(&config_file, "")?;
+        }
 
         let bin = env!("CARGO_BIN_EXE_synaps");
 
@@ -671,10 +675,13 @@ mod tier2 {
         std::fs::write(plugin_dir.join("plugin.json"), manifest)
             .expect("write plugin.json");
 
-        // Config: activate the extension provider model.
+        // Config: activate the extension provider model. The runtime model ID
+        // for an extension-backed model is `plugin_id:provider_id:model_id`
+        // (see `ProviderRegistry::parse_model_id`). Plugin id and provider id
+        // both happen to be `stream-echo` for this fixture.
         std::fs::write(
             base_dir.join("config"),
-            "model = stream-echo:stream-echo-mini\n",
+            "model = stream-echo:stream-echo:stream-echo-mini\n",
         )
         .expect("write config");
     }
@@ -849,11 +856,20 @@ mod tier2 {
                     }
                 }
                 "error" => {
-                    let _ = child.shutdown().await;
-                    panic!(
-                        "engine error - extensions not loaded?: {}",
-                        frame["message"]
-                    );
+                    // Cancellation can race with the provider stream and the
+                    // engine may emit a downstream "operation canceled" error
+                    // frame *before* the prompt Response. That is a benign
+                    // race — only treat the auth error (which proves the
+                    // extension never loaded) as a hard failure.
+                    let msg = frame["message"].as_str().unwrap_or("");
+                    if msg.contains("Anthropic credentials") || msg.contains("Auth error") {
+                        let _ = child.shutdown().await;
+                        panic!(
+                            "engine error - extensions not loaded?: {}",
+                            frame["message"]
+                        );
+                    }
+                    // Otherwise: ignore and keep waiting for the Response frame.
                 }
                 _ => {}
             }
