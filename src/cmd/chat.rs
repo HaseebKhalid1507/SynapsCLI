@@ -218,7 +218,8 @@ pub async fn run(
                     io::stderr().flush().ok();
                 }
                 EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
-                    let preview: String = input.chars().take(60).collect();
+                    let input_preview = serde_json::to_string(&input).unwrap_or_default();
+                    let preview: String = input_preview.chars().take(60).collect();
                     eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
                 }
                 EngineStreamEvent::ToolResult { result, .. } => {
