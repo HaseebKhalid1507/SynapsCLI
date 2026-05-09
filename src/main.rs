@@ -75,6 +75,21 @@ enum Command {
     Login,
     /// Show account usage and reset times
     Status,
+    /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
+    Rpc {
+        /// Resume an existing session by ID, name, or prefix.
+        #[arg(long = "continue", value_name = "SESSION_ID")]
+        continue_id: Option<String>,
+        /// System prompt: a string or path to a file.
+        #[arg(long = "system", short = 's', value_name = "PROMPT_OR_FILE")]
+        system: Option<String>,
+        /// Override the active model for this session.
+        #[arg(long = "model", short = 'm', value_name = "MODEL_ID")]
+        model: Option<String>,
+        /// Configuration profile to load.
+        #[arg(long = "profile", value_name = "PROFILE")]
+        profile: Option<String>,
+    },
     /// Send an event to the inbox (picked up by running session)
     Send {
         /// Message text
@@ -124,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        Some(Command::Rpc { continue_id, system, model, profile }) => {
+            cmd::rpc::run(continue_id, system, model, profile).await?;
         }
         Some(Command::Send { message, source, severity, channel, content_type, session, broadcast }) => {
             cmd::send::run(message, source, severity, channel, content_type, session, broadcast).await?;
