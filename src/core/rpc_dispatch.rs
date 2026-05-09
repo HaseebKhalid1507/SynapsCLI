@@ -1,0 +1,632 @@
+//! Pure helper functions for the `synaps rpc` command dispatcher.
+//!
+//! These are extracted from `cmd::rpc` so they can be unit-tested via
+//! `cargo test --lib` without hitting the binary-crate's TUI dependencies.
+//!
+//! See `docs/rpc-protocol.md` and `synaps-bridge.SPEC.md §4` for the wire
+//! protocol specification these functions implement.
+
+use crate::core::rpc_protocol::{
+    AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
+};
+use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+
+// ─── Frame parsing ────────────────────────────────────────────────────────────
+
+/// Maximum allowed inbound frame size in bytes (1 MiB).
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Parse a raw UTF-8 line into an [`RpcCommand`], enforcing the 1 MiB frame limit.
+///
+/// # Returns
+/// - `Ok(RpcCommand)` on success.
+/// - `Err(RpcEvent::Error { id: None, … })` on oversize or malformed input —
+///   the caller should emit the error event and **continue** (do not exit).
+pub fn parse_frame(line: &str, max_bytes: usize) -> Result<RpcCommand, RpcEvent> {
+    if line.len() > max_bytes {
+        return Err(RpcEvent::Error {
+            id: None,
+            message: "frame exceeds 1 MiB limit".to_string(),
+        });
+    }
+    serde_json::from_str::<RpcCommand>(line).map_err(|e| RpcEvent::Error {
+        id: None,
+        message: e.to_string(),
+    })
+}
+
+// ─── StreamEvent → RpcEvent mapping ──────────────────────────────────────────
+
+/// Map a single [`StreamEvent`] to an optional [`RpcEvent`].
+///
+/// Returns `None` for events that are intentionally dropped on the wire:
+/// - `LlmEvent::ToolResultDelta` — wire format has no streaming-result variant;
+///   the final `ToolResult` carries the complete text.
+/// - `AgentEvent::SteeringDelivered` — internal hook signal, not exposed.
+///
+/// `Session(*)` variants also return `None` — they carry session bookkeeping
+/// data (message history, usage counters, completion/error signals) that the
+/// streaming loop in `cmd::rpc` must handle directly with mutable access to
+/// [`RpcState`].
+pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
+    match ev {
+        StreamEvent::Llm(LlmEvent::Thinking(s)) => Some(RpcEvent::MessageUpdate {
+            event: AssistantEvent::ThinkingDelta { delta: s.clone() },
+        }),
+        StreamEvent::Llm(LlmEvent::Text(s)) => Some(RpcEvent::MessageUpdate {
+            event: AssistantEvent::TextDelta { delta: s.clone() },
+        }),
+        StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id }) => {
+            Some(RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallStart {
+                    tool_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                },
+            })
+        }
+        StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, delta }) => {
+            Some(RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallInputDelta {
+                    tool_id: tool_id.clone(),
+                    delta: delta.clone(),
+                },
+            })
+        }
+        // tool_name is intentionally dropped — already sent in ToolcallStart
+        StreamEvent::Llm(LlmEvent::ToolUse { tool_id, input, .. }) => {
+            Some(RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallInput {
+                    tool_id: tool_id.clone(),
+                    input: input.clone(),
+                },
+            })
+        }
+        StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+            Some(RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallResult {
+                    tool_id: tool_id.clone(),
+                    result: result.clone(),
+                },
+            })
+        }
+        // Drop — wire format has no streaming-result variant; final ToolResult carries full text
+        StreamEvent::Llm(LlmEvent::ToolResultDelta { .. }) => None,
+
+        StreamEvent::Agent(AgentEvent::SubagentStart {
+            subagent_id,
+            agent_name,
+            task_preview,
+        }) => Some(RpcEvent::SubagentStart {
+            subagent_id: *subagent_id,
+            agent_name: agent_name.clone(),
+            task_preview: task_preview.clone(),
+        }),
+        StreamEvent::Agent(AgentEvent::SubagentUpdate {
+            subagent_id,
+            agent_name,
+            status,
+        }) => Some(RpcEvent::SubagentUpdate {
+            subagent_id: *subagent_id,
+            agent_name: agent_name.clone(),
+            status: status.clone(),
+        }),
+        StreamEvent::Agent(AgentEvent::SubagentDone {
+            subagent_id,
+            agent_name,
+            result_preview,
+            duration_secs,
+        }) => Some(RpcEvent::SubagentDone {
+            subagent_id: *subagent_id,
+            agent_name: agent_name.clone(),
+            result_preview: result_preview.clone(),
+            duration_secs: *duration_secs,
+        }),
+        // Drop — internal hook signal, not part of wire format
+        StreamEvent::Agent(AgentEvent::SteeringDelivered { .. }) => None,
+
+        // Session bookkeeping events are handled by the streaming loop in cmd::rpc
+        // with direct mutable access to RpcState; they are never forwarded as-is.
+        StreamEvent::Session(_) => None,
+    }
+}
+
+// ─── Usage accumulator ────────────────────────────────────────────────────────
+
+/// Accumulate a [`SessionEvent::Usage`] payload into a [`TurnUsage`] counter.
+///
+/// Non-Usage session events are silently ignored so callers can pass any
+/// [`SessionEvent`] without pre-filtering.  The `model` field is set from the
+/// first Usage event seen and never overwritten.
+pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
+    if let SessionEvent::Usage {
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        model,
+    } = event
+    {
+        acc.input_tokens += input_tokens;
+        acc.output_tokens += output_tokens;
+        acc.cache_read_input_tokens += cache_read_input_tokens;
+        acc.cache_creation_input_tokens += cache_creation_input_tokens;
+        if acc.model.is_none() {
+            acc.model = model.clone();
+        }
+    }
+}
+
+// ─── User-content builder ─────────────────────────────────────────────────────
+
+/// Build the user message string to push into `api_messages`.
+///
+/// When attachments are present (v0) a human-readable note listing the file
+/// paths is prepended.  File bytes are **not** read — Task 10 handles that.
+pub fn build_user_content(message: &str, attachments: &[RpcAttachment]) -> String {
+    if attachments.is_empty() {
+        return message.to_string();
+    }
+    let paths: Vec<&str> = attachments.iter().map(|a| a.path.as_str()).collect();
+    format!("[user attached files: {}]\n{}", paths.join(", "), message)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::rpc_protocol::{AssistantEvent, RpcCommand, RpcEvent, RpcAttachment, TurnUsage};
+    use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+    use serde_json::json;
+
+    // ── parse_frame ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_frame_valid_prompt() {
+        let line = r#"{"type":"prompt","id":"abc","message":"hello"}"#;
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        assert!(result.is_ok(), "should parse valid prompt frame");
+        match result.unwrap() {
+            RpcCommand::Prompt { id, message, attachments } => {
+                assert_eq!(id, "abc");
+                assert_eq!(message, "hello");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_frame_valid_shutdown() {
+        let line = r#"{"type":"shutdown"}"#;
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), RpcCommand::Shutdown));
+    }
+
+    #[test]
+    fn parse_frame_valid_follow_up() {
+        let line = r#"{"type":"follow_up","id":"f1","message":"and then?"}"#;
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        match result.unwrap() {
+            RpcCommand::FollowUp { id, message } => {
+                assert_eq!(id, "f1");
+                assert_eq!(message, "and then?");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_frame_valid_abort() {
+        let line = r#"{"type":"abort","id":"x"}"#;
+        assert!(matches!(parse_frame(line, MAX_FRAME_BYTES).unwrap(), RpcCommand::Abort { .. }));
+    }
+
+    #[test]
+    fn parse_frame_malformed_json() {
+        let line = "not json at all";
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RpcEvent::Error { id, message } => {
+                assert!(id.is_none(), "malformed-JSON error must have id=None");
+                assert!(!message.is_empty(), "error message must be non-empty");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_frame_valid_json_unknown_type() {
+        // Unknown `type` tags should be a deserialisation error (serde enum).
+        let line = r#"{"type":"does_not_exist","id":"1"}"#;
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        assert!(result.is_err(), "unknown type should fail to deserialise");
+    }
+
+    #[test]
+    fn parse_frame_oversize() {
+        let oversize = "x".repeat(MAX_FRAME_BYTES + 1);
+        let result = parse_frame(&oversize, MAX_FRAME_BYTES);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RpcEvent::Error { id, message } => {
+                assert!(id.is_none());
+                assert!(
+                    message.contains("1 MiB"),
+                    "expected '1 MiB' in message, got: {message}"
+                );
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_frame_exactly_at_limit_valid_json() {
+        // A well-formed frame at exactly the limit must not trigger the size error.
+        let line = r#"{"type":"get_state","id":"x"}"#;
+        assert!(line.len() <= MAX_FRAME_BYTES);
+        let result = parse_frame(line, MAX_FRAME_BYTES);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_frame_custom_small_limit() {
+        // Oversize relative to a custom limit.
+        let line = r#"{"type":"shutdown"}"#; // 19 bytes
+        let result = parse_frame(line, 5);   // limit = 5
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RpcEvent::Error { id, .. } => assert!(id.is_none()),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // ── map_stream_event ─────────────────────────────────────────────────────
+
+    #[test]
+    fn map_llm_thinking() {
+        let ev = StreamEvent::Llm(LlmEvent::Thinking("hmm".to_string()));
+        let rpc = map_stream_event(&ev).expect("Thinking must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::ThinkingDelta { delta },
+            } => assert_eq!(delta, "hmm"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_text() {
+        let ev = StreamEvent::Llm(LlmEvent::Text("hi".to_string()));
+        let rpc = map_stream_event(&ev).expect("Text must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::TextDelta { delta },
+            } => assert_eq!(delta, "hi"),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_tool_use_start() {
+        let ev = StreamEvent::Llm(LlmEvent::ToolUseStart {
+            tool_name: "bash".to_string(),
+            tool_id: "tid1".to_string(),
+        });
+        let rpc = map_stream_event(&ev).expect("ToolUseStart must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallStart { tool_id, tool_name },
+            } => {
+                assert_eq!(tool_id, "tid1");
+                assert_eq!(tool_name, "bash");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_tool_use_delta() {
+        let ev = StreamEvent::Llm(LlmEvent::ToolUseDelta {
+            tool_id: "tid1".to_string(),
+            delta: r#"{"cmd":"#.to_string(),
+        });
+        let rpc = map_stream_event(&ev).expect("ToolUseDelta must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallInputDelta { tool_id, delta },
+            } => {
+                assert_eq!(tool_id, "tid1");
+                assert_eq!(delta, r#"{"cmd":"#);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_tool_use_final_drops_tool_name() {
+        let ev = StreamEvent::Llm(LlmEvent::ToolUse {
+            tool_name: "bash".to_string(), // must be dropped per spec
+            tool_id: "tid1".to_string(),
+            input: json!({"cmd": "ls"}),
+        });
+        let rpc = map_stream_event(&ev).expect("ToolUse must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallInput { tool_id, input },
+            } => {
+                assert_eq!(tool_id, "tid1");
+                assert_eq!(input, json!({"cmd": "ls"}));
+                // tool_name intentionally absent from ToolcallInput
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_tool_result() {
+        let ev = StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "tid1".to_string(),
+            result: "output here".to_string(),
+        });
+        let rpc = map_stream_event(&ev).expect("ToolResult must produce an event");
+        match rpc {
+            RpcEvent::MessageUpdate {
+                event: AssistantEvent::ToolcallResult { tool_id, result },
+            } => {
+                assert_eq!(tool_id, "tid1");
+                assert_eq!(result, "output here");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_llm_tool_result_delta_is_dropped() {
+        let ev = StreamEvent::Llm(LlmEvent::ToolResultDelta {
+            tool_id: "tid1".to_string(),
+            delta: "partial".to_string(),
+        });
+        assert!(
+            map_stream_event(&ev).is_none(),
+            "ToolResultDelta must be dropped — wire format has no streaming-result variant"
+        );
+    }
+
+    #[test]
+    fn map_agent_subagent_start() {
+        let ev = StreamEvent::Agent(AgentEvent::SubagentStart {
+            subagent_id: 7,
+            agent_name: "worker".to_string(),
+            task_preview: "do thing".to_string(),
+        });
+        let rpc = map_stream_event(&ev).expect("SubagentStart must produce an event");
+        match rpc {
+            RpcEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
+                assert_eq!(subagent_id, 7);
+                assert_eq!(agent_name, "worker");
+                assert_eq!(task_preview, "do thing");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_agent_subagent_update() {
+        let ev = StreamEvent::Agent(AgentEvent::SubagentUpdate {
+            subagent_id: 7,
+            agent_name: "worker".to_string(),
+            status: "running".to_string(),
+        });
+        let rpc = map_stream_event(&ev).expect("SubagentUpdate must produce an event");
+        match rpc {
+            RpcEvent::SubagentUpdate { subagent_id, agent_name, status } => {
+                assert_eq!(subagent_id, 7);
+                assert_eq!(agent_name, "worker");
+                assert_eq!(status, "running");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_agent_subagent_done() {
+        let ev = StreamEvent::Agent(AgentEvent::SubagentDone {
+            subagent_id: 7,
+            agent_name: "worker".to_string(),
+            result_preview: "done!".to_string(),
+            duration_secs: 1.5,
+        });
+        let rpc = map_stream_event(&ev).expect("SubagentDone must produce an event");
+        match rpc {
+            RpcEvent::SubagentDone {
+                subagent_id,
+                agent_name,
+                result_preview,
+                duration_secs,
+            } => {
+                assert_eq!(subagent_id, 7);
+                assert_eq!(agent_name, "worker");
+                assert_eq!(result_preview, "done!");
+                assert!((duration_secs - 1.5).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_agent_steering_delivered_is_dropped() {
+        let ev = StreamEvent::Agent(AgentEvent::SteeringDelivered {
+            message: "steer".to_string(),
+        });
+        assert!(
+            map_stream_event(&ev).is_none(),
+            "SteeringDelivered must be dropped — internal hook signal"
+        );
+    }
+
+    #[test]
+    fn map_session_events_all_return_none() {
+        // All Session variants return None; the streaming loop handles them
+        // directly with mutable access to RpcState.
+        let events: &[StreamEvent] = &[
+            StreamEvent::Session(SessionEvent::Done),
+            StreamEvent::Session(SessionEvent::Error("oops".to_string())),
+            StreamEvent::Session(SessionEvent::MessageHistory(vec![])),
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                model: None,
+            }),
+        ];
+        for ev in events {
+            assert!(
+                map_stream_event(ev).is_none(),
+                "Session event {:?} should return None",
+                ev
+            );
+        }
+    }
+
+    // ── accumulate_usage ─────────────────────────────────────────────────────
+
+    fn zero_usage() -> TurnUsage {
+        TurnUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn accumulate_usage_basic() {
+        let mut acc = zero_usage();
+        let ev = SessionEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 10,
+            cache_creation_input_tokens: 5,
+            model: Some("claude-3-5".to_string()),
+        };
+        accumulate_usage(&mut acc, &ev);
+        assert_eq!(acc.input_tokens, 100);
+        assert_eq!(acc.output_tokens, 50);
+        assert_eq!(acc.cache_read_input_tokens, 10);
+        assert_eq!(acc.cache_creation_input_tokens, 5);
+        assert_eq!(acc.model.as_deref(), Some("claude-3-5"));
+    }
+
+    #[test]
+    fn accumulate_usage_additive_across_calls() {
+        let mut acc = TurnUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            model: Some("first-model".to_string()),
+        };
+        let ev = SessionEvent::Usage {
+            input_tokens: 20,
+            output_tokens: 8,
+            cache_read_input_tokens: 2,
+            cache_creation_input_tokens: 1,
+            model: Some("second-model".to_string()),
+        };
+        accumulate_usage(&mut acc, &ev);
+        assert_eq!(acc.input_tokens, 30);
+        assert_eq!(acc.output_tokens, 13);
+        assert_eq!(acc.cache_read_input_tokens, 2);
+        assert_eq!(acc.cache_creation_input_tokens, 1);
+        // Model must NOT be overwritten once set (first-wins semantics)
+        assert_eq!(acc.model.as_deref(), Some("first-model"));
+    }
+
+    #[test]
+    fn accumulate_usage_sets_model_when_none() {
+        let mut acc = zero_usage();
+        let ev = SessionEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            model: Some("my-model".to_string()),
+        };
+        accumulate_usage(&mut acc, &ev);
+        assert_eq!(acc.model.as_deref(), Some("my-model"));
+    }
+
+    #[test]
+    fn accumulate_usage_ignores_done() {
+        let mut acc = zero_usage();
+        acc.input_tokens = 5;
+        accumulate_usage(&mut acc, &SessionEvent::Done);
+        assert_eq!(acc.input_tokens, 5, "Done must not mutate the accumulator");
+    }
+
+    #[test]
+    fn accumulate_usage_ignores_error() {
+        let mut acc = zero_usage();
+        acc.output_tokens = 3;
+        accumulate_usage(&mut acc, &SessionEvent::Error("boom".to_string()));
+        assert_eq!(acc.output_tokens, 3, "Error must not mutate the accumulator");
+    }
+
+    #[test]
+    fn accumulate_usage_ignores_message_history() {
+        let mut acc = zero_usage();
+        acc.input_tokens = 7;
+        accumulate_usage(&mut acc, &SessionEvent::MessageHistory(vec![]));
+        assert_eq!(acc.input_tokens, 7, "MessageHistory must not mutate the accumulator");
+    }
+
+    // ── build_user_content ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_user_content_no_attachments() {
+        assert_eq!(build_user_content("hello", &[]), "hello");
+    }
+
+    #[test]
+    fn build_user_content_single_attachment() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/a.txt".to_string(),
+            name: None,
+            mime: None,
+        }];
+        let msg = build_user_content("check this", &attachments);
+        assert!(msg.starts_with("[user attached files: /tmp/a.txt]"));
+        assert!(msg.contains("check this"));
+    }
+
+    #[test]
+    fn build_user_content_multiple_attachments() {
+        let attachments = vec![
+            RpcAttachment { path: "/tmp/a.txt".to_string(), name: None, mime: None },
+            RpcAttachment { path: "/tmp/b.pdf".to_string(), name: None, mime: None },
+        ];
+        let msg = build_user_content("check these", &attachments);
+        assert!(
+            msg.contains("[user attached files: /tmp/a.txt, /tmp/b.pdf]"),
+            "paths must be comma-separated: {msg}"
+        );
+        assert!(msg.contains("check these"));
+    }
+
+    #[test]
+    fn build_user_content_preserves_original_message() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/x".to_string(),
+            name: Some("x".to_string()),
+            mime: Some("text/plain".to_string()),
+        }];
+        let original = "multi\nline\nmessage";
+        let msg = build_user_content(original, &attachments);
+        assert!(msg.ends_with(original), "original message must appear verbatim at the end");
+    }
+}

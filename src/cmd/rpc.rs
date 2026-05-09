@@ -1,0 +1,692 @@
+//! `synaps rpc` — headless line-JSON server on stdin/stdout.
+//!
+//! One process = one synaps session. The bridge daemon spawns one of these per
+//! Slack thread and communicates via LDJSON frames on the child's
+//! `stdin` / `stdout` pipes.
+//!
+//! # Protocol
+//!
+//! See `docs/rpc-protocol.md` and `synaps-bridge.SPEC.md §4` for the full
+//! wire-format specification. In brief:
+//!
+//! * Parent → child: [`synaps_cli::core::rpc_protocol::RpcCommand`] frames (line-JSON on stdin)
+//! * Child → parent: [`synaps_cli::core::rpc_protocol::RpcEvent`] frames (line-JSON on stdout)
+//! * First byte on stdout is always `{` — the `Ready` frame.
+//! * Max inbound frame: 1 MiB.
+//! * **stdout is reserved for protocol frames only.** All `tracing::*` output
+//!   goes to the log file / stderr.
+
+use anyhow::Context;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use futures::StreamExt;
+
+use synaps_cli::{
+    Runtime, Session, SessionEvent, StreamEvent,
+    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, RpcEvent as Ev, TurnUsage, RPC_PROTOCOL_VERSION},
+    core::rpc_dispatch::{
+        accumulate_usage, build_user_content, map_stream_event, parse_frame, MAX_FRAME_BYTES,
+    },
+};
+use synaps_cli::runtime::openai::registry::{list_models, list_providers};
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// Capacity of the writer-task channel (frames). Provides backpressure when the
+/// parent reads slowly.
+const WRITER_CHAN_CAP: usize = 256;
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+/// Tracks a currently in-flight streaming prompt.
+struct InFlight {
+    /// Correlation id of the originating Prompt/FollowUp command.
+    /// Retained for diagnostics and future Task 3 e2e introspection.
+    #[allow(dead_code)]
+    prompt_id: String,
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+/// Full runtime state for the RPC session.
+struct RpcState {
+    runtime: Runtime,
+    session: Session,
+    api_messages: Vec<serde_json::Value>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    session_cost: f64,
+    in_flight: Option<InFlight>,
+}
+
+impl RpcState {
+    /// Persist the current conversation to the session file. No-op if the
+    /// message list is empty.
+    async fn save_session(&mut self) {
+        if self.api_messages.is_empty() {
+            return;
+        }
+        self.session.api_messages = self.api_messages.clone();
+        self.session.total_input_tokens = self.total_input_tokens;
+        self.session.total_output_tokens = self.total_output_tokens;
+        self.session.session_cost = self.session_cost;
+        self.session.updated_at = chrono::Utc::now();
+        self.session.auto_title();
+        if let Err(e) = self.session.save().await {
+            tracing::error!(error = %e, "failed to save session");
+        }
+    }
+
+    /// Returns `true` if a streaming task is currently running.
+    fn is_streaming(&self) -> bool {
+        self.in_flight.is_some()
+    }
+}
+
+// ─── Frame serialisation ──────────────────────────────────────────────────────
+
+/// Serialise an [`RpcEvent`] to a JSON string (no trailing newline).
+///
+/// Serialisation of well-typed enum variants should never fail. If it does, a
+/// fallback error frame is returned so the writer task never silently drops data.
+fn encode_event(ev: &RpcEvent) -> String {
+    serde_json::to_string(ev).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "BUG: failed to serialise RpcEvent");
+        format!(r#"{{"type":"error","message":"internal serialisation error: {e}"}}"#)
+    })
+}
+
+// ─── Writer task ──────────────────────────────────────────────────────────────
+
+/// Spawn a dedicated task that owns stdout and serialises frames from a channel.
+///
+/// All code paths must route frames through the returned sender; nothing else
+/// may write to stdout so protocol frames never interleave with diagnostics.
+fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            // println! is correct here — stdout IS the protocol channel.
+            println!("{}", encode_event(&ev));
+        }
+    })
+}
+
+// ─── Streaming task ───────────────────────────────────────────────────────────
+
+/// Spawn a streaming task for a `Prompt` or `FollowUp` command.
+///
+/// The task takes a snapshot of `api_messages` while briefly holding the mutex,
+/// then releases it before the long-running LLM stream begins so that `Abort`
+/// and read-only commands (`GetState`, `GetSessionStats`) can still acquire the
+/// lock while the stream is in flight.
+async fn spawn_prompt(
+    prompt_id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) -> InFlight {
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let pid = prompt_id.clone();
+    let wtx = writer_tx.clone();
+
+    let handle = tokio::spawn(async move {
+        // Snapshot message history; release lock before blocking on the stream.
+        let messages = {
+            let st = state.lock().await;
+            st.api_messages.clone()
+        };
+
+        // Acquire lock only long enough to start the stream future.
+        let mut stream = {
+            let st = state.lock().await;
+            st.runtime
+                .run_stream_with_messages(messages, cancel_clone, None, None)
+                .await
+        };
+
+        let mut usage_acc = TurnUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            model: None,
+        };
+
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                // ── Session bookkeeping ─────────────────────────────────────
+                StreamEvent::Session(SessionEvent::MessageHistory(msgs)) => {
+                    let mut st = state.lock().await;
+                    st.api_messages = msgs.clone();
+                    st.save_session().await;
+                    continue;
+                }
+                StreamEvent::Session(SessionEvent::Usage { .. }) => {
+                    if let StreamEvent::Session(ref se) = ev {
+                        accumulate_usage(&mut usage_acc, se);
+                    }
+                    if let StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    }) = &ev
+                    {
+                        let mut st = state.lock().await;
+                        st.total_input_tokens += input_tokens;
+                        st.total_output_tokens += output_tokens;
+                    }
+                    continue;
+                }
+                // ── Turn complete ───────────────────────────────────────────
+                StreamEvent::Session(SessionEvent::Done) => {
+                    let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+                    let _ = wtx
+                        .send(Ev::Response {
+                            id: pid.clone(),
+                            command: "prompt".to_string(),
+                            body: serde_json::json!({ "ok": true }),
+                        })
+                        .await;
+                    state.lock().await.in_flight = None;
+                    return;
+                }
+                // ── Turn error (always returns early) ───────────────────────
+                StreamEvent::Session(SessionEvent::Error(msg)) => {
+                    let _ = wtx
+                        .send(Ev::Error {
+                            id: Some(pid.clone()),
+                            message: msg.clone(),
+                        })
+                        .await;
+                    let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+                    let _ = wtx
+                        .send(Ev::Response {
+                            id: pid.clone(),
+                            command: "prompt".to_string(),
+                            body: serde_json::json!({ "ok": false, "error": msg }),
+                        })
+                        .await;
+                    state.lock().await.in_flight = None;
+                    return;
+                }
+                _ => {}
+            }
+
+            // Forward mapped LLM / Agent events to the parent.
+            if let Some(rpc_ev) = map_stream_event(&ev) {
+                if wtx.send(rpc_ev).await.is_err() {
+                    tracing::warn!("writer channel closed; aborting stream early");
+                    break;
+                }
+            }
+        }
+
+        // Stream exhausted without Session::Done — typically a cancellation.
+        let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+        let _ = wtx
+            .send(Ev::Response {
+                id: pid.clone(),
+                command: "prompt".to_string(),
+                body: serde_json::json!({ "ok": true }),
+            })
+            .await;
+        state.lock().await.in_flight = None;
+    });
+
+    InFlight { prompt_id, cancel, handle }
+}
+
+// ─── Per-command handlers ─────────────────────────────────────────────────────
+
+/// Handle a `Prompt` or `FollowUp` command (same engine path, no attachments on FollowUp).
+async fn handle_prompt(
+    id: String,
+    message: String,
+    attachments: Vec<RpcAttachment>,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    // Reject concurrent prompt.
+    {
+        let st = state.lock().await;
+        if st.is_streaming() {
+            tracing::warn!(id, "rejected concurrent prompt — stream already in flight");
+            let _ = writer_tx
+                .send(Ev::Error {
+                    id: Some(id),
+                    message: "another prompt is in flight; abort first".to_string(),
+                })
+                .await;
+            return;
+        }
+    }
+
+    // Push user message.
+    let content = build_user_content(&message, &attachments);
+    {
+        let mut st = state.lock().await;
+        st.api_messages
+            .push(serde_json::json!({"role": "user", "content": content}));
+    }
+
+    let in_flight = spawn_prompt(id, state.clone(), writer_tx).await;
+    state.lock().await.in_flight = Some(in_flight);
+}
+
+/// Handle the `Compact` command.
+///
+/// Holds the lock across the async compaction call. This is intentional:
+/// `Compact` is documented as not concurrent with `Prompt`, so the lock
+/// contention window is bounded by the compaction LLM round-trip.
+async fn handle_compact(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let summary_result = {
+        let st = state.lock().await;
+        let msgs = st.api_messages.clone();
+        synaps_cli::core::compaction::compact_conversation(&msgs, &st.runtime, None).await
+    };
+
+    match summary_result {
+        Ok(summary) => {
+            {
+                let mut st = state.lock().await;
+                st.api_messages =
+                    vec![serde_json::json!({"role": "user", "content": summary.clone()})];
+                st.save_session().await;
+            }
+            let _ = writer_tx
+                .send(Ev::Response {
+                    id,
+                    command: "compact".to_string(),
+                    body: serde_json::json!({ "summary": summary }),
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "compact_conversation failed");
+            let _ = writer_tx
+                .send(Ev::Error {
+                    id: Some(id),
+                    message: e.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+/// Handle the `NewSession` command.
+async fn handle_new_session(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let new_session_id = {
+        let mut st = state.lock().await;
+        st.save_session().await;
+        let new_sess =
+            Session::new(st.runtime.model(), st.runtime.thinking_level(), st.runtime.system_prompt());
+        let sid = new_sess.id.clone();
+        st.session = new_sess;
+        st.api_messages.clear();
+        st.total_input_tokens = 0;
+        st.total_output_tokens = 0;
+        st.session_cost = 0.0;
+        sid
+    };
+
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "new_session".to_string(),
+            body: serde_json::json!({ "session_id": new_session_id }),
+        })
+        .await;
+}
+
+/// Handle the `GetMessages` command.
+async fn handle_get_messages(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let messages = state.lock().await.api_messages.clone();
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "get_messages".to_string(),
+            body: serde_json::json!({ "messages": messages }),
+        })
+        .await;
+}
+
+/// Handle the `SetModel` command.
+async fn handle_set_model(
+    id: String,
+    model: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    state.lock().await.runtime.set_model(model.clone());
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "set_model".to_string(),
+            body: serde_json::json!({ "model": model }),
+        })
+        .await;
+}
+
+/// Handle the `GetAvailableModels` command.
+async fn handle_get_available_models(id: String, writer_tx: mpsc::Sender<RpcEvent>) {
+    let overrides: BTreeMap<String, String> = BTreeMap::new();
+    let providers = list_providers(&overrides);
+
+    let mut models_list: Vec<serde_json::Value> = Vec::new();
+    for (provider_key, _provider_name, _has_key, _count) in &providers {
+        if let Some(models) = list_models(provider_key) {
+            for (model_id, model_name, _default_flag) in models {
+                models_list.push(serde_json::json!({
+                    "provider": provider_key,
+                    "model_id": model_id,
+                    "model_name": model_name,
+                }));
+            }
+        }
+    }
+
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "get_available_models".to_string(),
+            body: serde_json::json!({ "models": models_list }),
+        })
+        .await;
+}
+
+/// Handle the `Abort` command.
+///
+/// Cancels the in-flight stream (if any) via its `CancellationToken`, awaits
+/// the task so it can clean up `in_flight`, then always replies `{ ok: true }`.
+async fn handle_abort(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let handle_opt = {
+        let mut st = state.lock().await;
+        if let Some(inf) = st.in_flight.take() {
+            inf.cancel.cancel();
+            Some(inf.handle)
+        } else {
+            None
+        }
+    };
+
+    if let Some(handle) = handle_opt {
+        if let Err(e) = handle.await {
+            tracing::warn!(error = ?e, "streaming task panicked during abort");
+        }
+    }
+
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "abort".to_string(),
+            body: serde_json::json!({ "ok": true }),
+        })
+        .await;
+}
+
+/// Handle the `GetSessionStats` command.
+async fn handle_get_session_stats(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let body = {
+        let st = state.lock().await;
+        serde_json::json!({
+            "input_tokens":  st.total_input_tokens,
+            "output_tokens": st.total_output_tokens,
+            "cost":          st.session_cost,
+            "message_count": st.api_messages.len(),
+            "model":         st.runtime.model(),
+            "session_id":    st.session.id,
+        })
+    };
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "get_session_stats".to_string(),
+            body,
+        })
+        .await;
+}
+
+/// Handle the `GetState` command.
+async fn handle_get_state(
+    id: String,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let body = {
+        let st = state.lock().await;
+        serde_json::json!({
+            "streaming":     st.is_streaming(),
+            "model":         st.runtime.model(),
+            "session_id":    st.session.id,
+            "message_count": st.api_messages.len(),
+        })
+    };
+    let _ = writer_tx
+        .send(Ev::Response {
+            id,
+            command: "get_state".to_string(),
+            body,
+        })
+        .await;
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+/// Run the `synaps rpc` headless server.
+///
+/// Reads [`RpcCommand`] frames from stdin (line-delimited JSON) and writes
+/// [`RpcEvent`] frames to stdout. The very first frame emitted is always a
+/// [`RpcEvent::Ready`] event advertising the session id, active model, and
+/// protocol version.
+///
+/// All flags are optional. With no `--continue` a fresh [`Session`] is created.
+pub async fn run(
+    continue_id: Option<String>,
+    system: Option<String>,
+    model: Option<String>,
+    profile: Option<String>,
+) -> anyhow::Result<()> {
+    // 1. Apply profile before loading config (affects the config directory).
+    if let Some(ref prof) = profile {
+        synaps_cli::config::set_profile(Some(prof.clone()));
+    }
+
+    // 2. Init structured logging — writes to log file / stderr, never stdout.
+    let _log_guard = synaps_cli::logging::init_logging();
+
+    // 3. Build Runtime and apply config.
+    let mut runtime = Runtime::new()
+        .await
+        .context("failed to initialise Runtime")?;
+    let config = synaps_cli::config::load_config();
+    runtime.apply_config(&config);
+
+    // 4. Resolve system prompt (CLI flag > ~/.synaps-cli/system.md > built-in default).
+    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
+    runtime.set_system_prompt(system_prompt);
+
+    // 5. Create or resume Session.
+    let (session, initial_messages, initial_in, initial_out, initial_cost) =
+        match continue_id {
+            Some(ref id) => {
+                let sess = synaps_cli::resolve_session(id).map_err(|e| {
+                    anyhow::anyhow!("cannot resume session '{}': {}", id, e)
+                })?;
+                // Restore persisted model and system prompt.
+                runtime.set_model(sess.model.clone());
+                if let Some(ref sp) = sess.system_prompt {
+                    runtime.set_system_prompt(sp.clone());
+                }
+                let msgs = sess.api_messages.clone();
+                let tin = sess.total_input_tokens;
+                let tout = sess.total_output_tokens;
+                let cost = sess.session_cost;
+                (sess, msgs, tin, tout, cost)
+            }
+            None => {
+                let sess = Session::new(
+                    runtime.model(),
+                    runtime.thinking_level(),
+                    runtime.system_prompt(),
+                );
+                (sess, Vec::new(), 0u64, 0u64, 0.0f64)
+            }
+        };
+
+    // 6. CLI --model overrides whatever was persisted in the session.
+    if let Some(ref m) = model {
+        runtime.set_model(m.clone());
+    }
+
+    // Capture session_id + model for the Ready frame before state is consumed.
+    let ready_session_id = session.id.clone();
+    let ready_model = runtime.model().to_string();
+
+    // 7. Build shared state.
+    let state = Arc::new(Mutex::new(RpcState {
+        runtime,
+        session,
+        api_messages: initial_messages,
+        total_input_tokens: initial_in,
+        total_output_tokens: initial_out,
+        session_cost: initial_cost,
+        in_flight: None,
+    }));
+
+    // 8. Spawn the writer task that owns stdout.
+    let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
+    let _writer_handle = spawn_writer(writer_rx);
+
+    // 9. Emit Ready — guaranteed to be the first byte on stdout.
+    writer_tx
+        .send(Ev::Ready {
+            session_id: ready_session_id,
+            model: ready_model,
+            protocol_version: RPC_PROTOCOL_VERSION,
+        })
+        .await
+        .context("writer channel closed before Ready frame could be sent")?;
+
+    tracing::info!("synaps rpc ready");
+
+    // 10. Reader loop: one line = one RpcCommand frame.
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    loop {
+        match lines.next_line().await {
+            Err(e) => {
+                tracing::error!(error = %e, "stdin read error; exiting");
+                break;
+            }
+            Ok(None) => {
+                // EOF — parent closed stdin; treat the same as Shutdown.
+                tracing::info!("stdin EOF; saving session and exiting");
+                state.lock().await.save_session().await;
+                break;
+            }
+            Ok(Some(line)) => {
+                let line = line.trim_end_matches('\r'); // tolerate CRLF
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                let cmd = match parse_frame(line, MAX_FRAME_BYTES) {
+                    Ok(c) => c,
+                    Err(err_ev) => {
+                        tracing::warn!("frame parse error");
+                        let _ = writer_tx.send(err_ev).await;
+                        continue;
+                    }
+                };
+
+                tracing::debug!(?cmd, "received RpcCommand");
+
+                match cmd {
+                    RpcCommand::Prompt { id, message, attachments } => {
+                        handle_prompt(id, message, attachments, state.clone(), writer_tx.clone())
+                            .await;
+                    }
+                    RpcCommand::FollowUp { id, message } => {
+                        // Same engine path as Prompt — no attachments.
+                        handle_prompt(id, message, Vec::new(), state.clone(), writer_tx.clone())
+                            .await;
+                    }
+                    RpcCommand::Compact { id } => {
+                        handle_compact(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::NewSession { id } => {
+                        handle_new_session(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::GetMessages { id } => {
+                        handle_get_messages(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::SetModel { id, model: m } => {
+                        handle_set_model(id, m, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::GetAvailableModels { id } => {
+                        handle_get_available_models(id, writer_tx.clone()).await;
+                    }
+                    RpcCommand::Abort { id } => {
+                        handle_abort(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::GetSessionStats { id } => {
+                        handle_get_session_stats(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::GetState { id } => {
+                        handle_get_state(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::Shutdown => {
+                        tracing::info!("Shutdown received; draining and exiting");
+
+                        // Spec: let an in-flight stream finish naturally (no cancel).
+                        // Poll in_flight until the streaming task clears it.
+                        loop {
+                            let done = state.lock().await.in_flight.is_none();
+                            if done {
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+
+                        state.lock().await.save_session().await;
+
+                        // Drop the sender so the writer task flushes and exits.
+                        drop(writer_tx);
+
+                        // Give the writer task a moment to flush its buffer.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
