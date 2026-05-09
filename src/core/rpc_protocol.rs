@@ -59,6 +59,10 @@ pub const RPC_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcAttachment {
     /// Local filesystem path the rpc child can read.
+    ///
+    /// Convention (enforced when Task 10 adds binary attachment support):
+    /// MUST be an absolute path; MUST NOT contain `..` segments. Path-traversal
+    /// validation will reject relative or `..`-bearing paths at that point.
     pub path: String,
     /// Optional human-meaningful filename (defaults to basename of `path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +264,10 @@ pub enum RpcEvent {
         /// The command name this is responding to (e.g. `"get_messages"`).
         command: String,
         /// Arbitrary response payload, flattened into the JSON frame.
+        ///
+        /// Type-erased to `serde_json::Value` for forward-compat with new
+        /// `command` strings. Rust consumers wanting strong typing should
+        /// inspect `command` and re-deserialise `body` into a per-command struct.
         #[serde(flatten)]
         body: serde_json::Value,
     },
