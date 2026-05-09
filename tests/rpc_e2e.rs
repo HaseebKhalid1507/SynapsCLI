@@ -756,12 +756,11 @@ mod tier2 {
                     }
                 }
                 "error" => {
-                    eprintln!(
-                        "skipping tier2::prompt_to_agent_end_happy_path: engine error: {}",
+                    let _ = child.shutdown().await;
+                    panic!(
+                        "engine error - extensions not loaded?: {}",
                         frame["message"]
                     );
-                    let _ = child.shutdown().await;
-                    return;
                 }
                 _ => {}
             }
@@ -850,12 +849,11 @@ mod tier2 {
                     }
                 }
                 "error" => {
-                    eprintln!(
-                        "skipping tier2::abort_mid_stream: engine error: {}",
+                    let _ = child.shutdown().await;
+                    panic!(
+                        "engine error - extensions not loaded?: {}",
                         frame["message"]
                     );
-                    let _ = child.shutdown().await;
-                    return;
                 }
                 _ => {}
             }
@@ -943,12 +941,11 @@ mod tier2 {
                         saw_ns_error = true;
                     } else {
                         // Engine error from the prompt itself — skip test.
-                        eprintln!(
-                            "skipping tier2::new_session_rejected_while_streaming: engine error: {}",
+                        let _ = child.shutdown().await;
+                        panic!(
+                            "engine error - extensions not loaded?: {}",
                             frame["message"]
                         );
-                        let _ = child.shutdown().await;
-                        return;
                     }
                 }
                 "response" if frame["command"] == "prompt" => {
@@ -1035,12 +1032,11 @@ mod tier2 {
             // slow fixture didn't register in time), the environment can't
             // exercise this guard — skip rather than fail.
             if frame["type"] == "error" && frame["id"] == "p1" {
-                eprintln!(
-                    "skipping tier2::concurrent_prompt_rejected: engine error on p1: {}",
+                let _ = child.shutdown().await;
+                panic!(
+                    "engine error - extensions not loaded?: {}",
                     frame["message"]
                 );
-                let _ = child.shutdown().await;
-                return;
             }
 
             if frame["type"] == "error" && frame["id"] == "p2" {
