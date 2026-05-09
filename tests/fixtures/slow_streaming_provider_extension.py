@@ -6,6 +6,11 @@ so that an `Abort` sent ~150 ms after the `Prompt` lands deterministically
 arrives during the second sleep.
 
 LSP framing: Content-Length: <n>\r\n\r\n<body>
+
+The framing format and method names (`initialize`, `provider.complete`,
+`provider.stream`, `shutdown`) are defined by the SynapsCLI extension protocol
+in `src/extensions/process/` — keep this fixture in sync with that source of
+truth if the extension protocol ever changes.
 """
 import json
 import sys

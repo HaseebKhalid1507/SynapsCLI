@@ -27,7 +27,7 @@ use futures::StreamExt;
 
 use synaps_cli::{
     Runtime, Session, SessionEvent, StreamEvent,
-    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, RpcEvent as Ev, TurnUsage, RPC_PROTOCOL_VERSION},
+    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
     core::rpc_dispatch::{
         accumulate_usage, build_user_content, map_stream_event, parse_frame, MAX_FRAME_BYTES,
     },
@@ -46,7 +46,6 @@ const WRITER_CHAN_CAP: usize = 256;
 struct InFlight {
     /// Correlation id of the originating Prompt/FollowUp command.
     /// Retained for diagnostics and future Task 3 e2e introspection.
-    #[allow(dead_code)]
     prompt_id: String,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
@@ -179,9 +178,9 @@ async fn spawn_prompt(
                 }
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
-                    let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+                    let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
                     let _ = wtx
-                        .send(Ev::Response {
+                        .send(RpcEvent::Response {
                             id: pid.clone(),
                             command: "prompt".to_string(),
                             body: serde_json::json!({ "ok": true }),
@@ -193,14 +192,14 @@ async fn spawn_prompt(
                 // ── Turn error (always returns early) ───────────────────────
                 StreamEvent::Session(SessionEvent::Error(msg)) => {
                     let _ = wtx
-                        .send(Ev::Error {
+                        .send(RpcEvent::Error {
                             id: Some(pid.clone()),
                             message: msg.clone(),
                         })
                         .await;
-                    let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+                    let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
                     let _ = wtx
-                        .send(Ev::Response {
+                        .send(RpcEvent::Response {
                             id: pid.clone(),
                             command: "prompt".to_string(),
                             body: serde_json::json!({ "ok": false, "error": msg }),
@@ -225,7 +224,7 @@ async fn spawn_prompt(
         // orderly abort; otherwise it's a silent failure (provider drop, extension
         // crash, etc.) and the parent must be told.
         let cancelled = cancel_check.is_cancelled();
-        let _ = wtx.send(Ev::AgentEnd { usage: usage_acc.clone() }).await;
+        let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
         let body = if cancelled {
             serde_json::json!({ "ok": true, "cancelled": true })
         } else {
@@ -235,7 +234,7 @@ async fn spawn_prompt(
             })
         };
         let _ = wtx
-            .send(Ev::Response {
+            .send(RpcEvent::Response {
                 id: pid.clone(),
                 command: "prompt".to_string(),
                 body,
@@ -263,7 +262,7 @@ async fn handle_prompt(
         if st.is_streaming() {
             tracing::warn!(id, "rejected concurrent prompt — stream already in flight");
             let _ = writer_tx
-                .send(Ev::Error {
+                .send(RpcEvent::Error {
                     id: Some(id),
                     message: "another prompt is in flight; abort first".to_string(),
                 })
@@ -313,7 +312,7 @@ async fn handle_compact(
                 st.save_session().await;
             }
             let _ = writer_tx
-                .send(Ev::Response {
+                .send(RpcEvent::Response {
                     id,
                     command: "compact".to_string(),
                     body: serde_json::json!({ "summary": summary }),
@@ -323,7 +322,7 @@ async fn handle_compact(
         Err(e) => {
             tracing::error!(error = %e, "compact_conversation failed");
             let _ = writer_tx
-                .send(Ev::Error {
+                .send(RpcEvent::Error {
                     id: Some(id),
                     message: e.to_string(),
                 })
@@ -344,7 +343,7 @@ async fn handle_new_session(
         if st.is_streaming() {
             tracing::warn!(id, "rejected new_session — stream in flight");
             let _ = writer_tx
-                .send(Ev::Error {
+                .send(RpcEvent::Error {
                     id: Some(id),
                     message: "another prompt is in flight; abort first".to_string(),
                 })
@@ -368,7 +367,7 @@ async fn handle_new_session(
     };
 
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "new_session".to_string(),
             body: serde_json::json!({ "session_id": new_session_id }),
@@ -384,7 +383,7 @@ async fn handle_get_messages(
 ) {
     let messages = state.lock().await.api_messages.clone();
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "get_messages".to_string(),
             body: serde_json::json!({ "messages": messages }),
@@ -401,7 +400,7 @@ async fn handle_set_model(
 ) {
     state.lock().await.runtime.set_model(model.clone());
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "set_model".to_string(),
             body: serde_json::json!({ "model": model }),
@@ -428,7 +427,7 @@ async fn handle_get_available_models(id: String, writer_tx: mpsc::Sender<RpcEven
     }
 
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "get_available_models".to_string(),
             body: serde_json::json!({ "models": models_list }),
@@ -448,6 +447,7 @@ async fn handle_abort(
     let handle_opt = {
         let mut st = state.lock().await;
         if let Some(inf) = st.in_flight.take() {
+            tracing::info!(prompt_id = %inf.prompt_id, abort_id = %id, "aborted in-flight stream");
             inf.cancel.cancel();
             Some(inf.handle)
         } else {
@@ -462,7 +462,7 @@ async fn handle_abort(
     }
 
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "abort".to_string(),
             body: serde_json::json!({ "ok": true }),
@@ -488,7 +488,7 @@ async fn handle_get_session_stats(
         })
     };
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "get_session_stats".to_string(),
             body,
@@ -512,7 +512,7 @@ async fn handle_get_state(
         })
     };
     let _ = writer_tx
-        .send(Ev::Response {
+        .send(RpcEvent::Response {
             id,
             command: "get_state".to_string(),
             body,
@@ -609,7 +609,7 @@ pub async fn run(
 
     // 9. Emit Ready — guaranteed to be the first byte on stdout.
     writer_tx
-        .send(Ev::Ready {
+        .send(RpcEvent::Ready {
             session_id: ready_session_id,
             model: ready_model,
             protocol_version: RPC_PROTOCOL_VERSION,

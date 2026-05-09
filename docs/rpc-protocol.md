@@ -29,6 +29,11 @@ MCP, skills, and session persistence all work identically.
 - **stdout is reserved for protocol frames only** — no diagnostics or logging
   ever appear there.  All `tracing::*` output goes to the log file / stderr.
 
+> **v0 limitation:** the `prompt` command's `attachments` field carries file
+> paths but the rpc child does NOT read file bytes — it prepends a textual
+> note `[user attached files: "<path>", ...]` to the user message instead.
+> Binary attachment support is planned for Task 10.
+
 ---
 
 ## §2 — Version and Handshake
