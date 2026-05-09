@@ -162,12 +162,17 @@ pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
 ///
 /// When attachments are present (v0) a human-readable note listing the file
 /// paths is prepended.  File bytes are **not** read — Task 10 handles that.
+fn quote_path(p: &str) -> String {
+    let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 pub fn build_user_content(message: &str, attachments: &[RpcAttachment]) -> String {
     if attachments.is_empty() {
         return message.to_string();
     }
-    let paths: Vec<&str> = attachments.iter().map(|a| a.path.as_str()).collect();
-    format!("[user attached files: {}]\n{}", paths.join(", "), message)
+    let parts: Vec<String> = attachments.iter().map(|a| quote_path(&a.path)).collect();
+    format!("[user attached files: {}]\n{}", parts.join(", "), message)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -600,7 +605,7 @@ mod tests {
             mime: None,
         }];
         let msg = build_user_content("check this", &attachments);
-        assert!(msg.starts_with("[user attached files: /tmp/a.txt]"));
+        assert!(msg.starts_with("[user attached files: \"/tmp/a.txt\"]"));
         assert!(msg.contains("check this"));
     }
 
@@ -612,8 +617,8 @@ mod tests {
         ];
         let msg = build_user_content("check these", &attachments);
         assert!(
-            msg.contains("[user attached files: /tmp/a.txt, /tmp/b.pdf]"),
-            "paths must be comma-separated: {msg}"
+            msg.contains("[user attached files: \"/tmp/a.txt\", \"/tmp/b.pdf\"]"),
+            "paths must be quoted and comma-separated: {msg}"
         );
         assert!(msg.contains("check these"));
     }
@@ -628,6 +633,68 @@ mod tests {
         let original = "multi\nline\nmessage";
         let msg = build_user_content(original, &attachments);
         assert!(msg.ends_with(original), "original message must appear verbatim at the end");
+    }
+
+    // ── build_user_content: quoting edge cases ───────────────────────────────
+
+    #[test]
+    fn build_user_content_path_with_comma_is_quoted() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/a,b.pdf".to_string(),
+            name: None,
+            mime: None,
+        }];
+        let msg = build_user_content("look", &attachments);
+        assert!(
+            msg.contains("\"/tmp/a,b.pdf\""),
+            "comma path must be wrapped in quotes: {msg}"
+        );
+        // Must NOT appear as bare unquoted path
+        assert!(
+            !msg.contains("[user attached files: /tmp/a,b.pdf]"),
+            "bare unquoted comma path must not appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_user_content_multiple_paths_each_quoted() {
+        let attachments = vec![
+            RpcAttachment { path: "/p1".to_string(), name: None, mime: None },
+            RpcAttachment { path: "/p2".to_string(), name: None, mime: None },
+        ];
+        let msg = build_user_content("x", &attachments);
+        assert!(
+            msg.contains("\"/p1\", \"/p2\""),
+            "each path must be individually quoted: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_user_content_path_with_embedded_quote_is_escaped() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/he\"llo".to_string(),
+            name: None,
+            mime: None,
+        }];
+        let msg = build_user_content("x", &attachments);
+        assert!(
+            msg.contains("\"/tmp/he\\\"llo\""),
+            "embedded double-quote must be backslash-escaped: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_user_content_path_with_backslash_is_escaped() {
+        let attachments = vec![RpcAttachment {
+            path: "/tmp/a\\b".to_string(),
+            name: None,
+            mime: None,
+        }];
+        let msg = build_user_content("x", &attachments);
+        assert!(
+            msg.contains("\"/tmp/a\\\\b\""),
+            "backslash in path must be doubled: {msg}"
+        );
     }
 
     // ── handle_compact lock-release invariant ────────────────────────────────
