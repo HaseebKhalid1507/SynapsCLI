@@ -415,86 +415,6 @@ mod tier1 {
         child.shutdown().await.expect("clean shutdown");
     }
 
-    /// Concurrent `Prompt` while one is (trivially) in-flight →
-    /// `Error { id: <second_id>, message contains "abort first" }`.
-    ///
-    /// Because no LLM is wired, the first `Prompt` will almost immediately
-    /// produce an error (no API key) and clear `in_flight`.  To make the race
-    /// deterministic we rely on the engine serialising both Prompt dispatches
-    /// inside the reader loop — both are processed synchronously before the
-    /// first streaming task can resolve.  We send both commands back-to-back
-    /// before reading any response.
-    ///
-    /// Acceptance criterion: at least one `error` frame must contain
-    /// "abort first" (or the second Prompt hits its own error path) —
-    /// either indicates the concurrent-prompt guard fired.
-    #[tokio::test]
-    async fn concurrent_prompt_rejected() {
-        let (mut child, _ready) = spawn_and_ready().await.expect("spawn");
-
-        // Send both prompts before reading any output so the reader loop
-        // processes them sequentially while the first streaming task is
-        // still in_flight (it hasn't had a chance to run yet).
-        child
-            .send(&json!({"type": "prompt", "id": "p1", "message": "hello", "attachments": []}))
-            .await
-            .expect("send p1");
-        child
-            .send(&json!({"type": "prompt", "id": "p2", "message": "world", "attachments": []}))
-            .await
-            .expect("send p2");
-
-        // Collect up to 10 frames within 8 s; we're looking for an error frame
-        // with "abort first" message, which proves the concurrent-prompt guard
-        // fired for p2.
-        let mut found_concurrent_error = false;
-        for _ in 0..10 {
-            match child.recv_timeout(Duration::from_secs(8)).await {
-                Ok(frame) => {
-                    if frame["type"] == "error" {
-                        if let Some(msg) = frame["message"].as_str() {
-                            if msg.contains("abort first") {
-                                found_concurrent_error = true;
-                                break;
-                            }
-                        }
-                    }
-                    // If we get a response for p2 that's *not* an error, the
-                    // engine may have processed p1 completely before p2 arrived.
-                    // That's still valid — just stop collecting.
-                    if frame["type"] == "response" && frame["id"] == "p2" {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        // We assert that we observed the concurrent-prompt guard.
-        // If the child was too fast and p1 completed before p2 was dispatched,
-        // the test is still meaningful: it exercised the path without crashing.
-        // A hard assert here would be flaky, so we document what we observed.
-        if !found_concurrent_error {
-            eprintln!(
-                "note: concurrent_prompt_rejected — engine processed p1 before \
-                 p2 arrived; concurrent-guard path not exercised this run"
-            );
-        }
-
-        // Must still be alive.
-        child
-            .send(&json!({"type": "abort", "id": "cleanup"}))
-            .await
-            .ok();
-        // Drain remaining frames.
-        for _ in 0..5 {
-            if child.recv_timeout(Duration::from_millis(200)).await.is_err() {
-                break;
-            }
-        }
-
-        let _ = child.shutdown().await;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +766,105 @@ mod tier2 {
         assert!(
             saw_prompt_response,
             "expected prompt t2p3 to complete after rejected new_session"
+        );
+    }
+
+    /// A second `Prompt` while a slow stream is in-flight must be rejected with
+    /// `Error { id: "p2", message: "...abort first..." }`.
+    ///
+    /// Uses the slow-streaming fixture (200 ms sleeps between tokens) so the
+    /// timing is deterministic: p2 is dispatched while p1 is still streaming.
+    #[tokio::test]
+    async fn concurrent_prompt_rejected() {
+        if !python3_available() {
+            eprintln!("skipping tier2::concurrent_prompt_rejected: python3 unavailable");
+            return;
+        }
+
+        let (mut child, _ready) = match spawn_with_echo_provider().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping tier2::concurrent_prompt_rejected: spawn failed: {e}");
+                return;
+            }
+        };
+
+        // Start a slow streaming prompt.
+        child
+            .send(&json!({
+                "type": "prompt",
+                "id": "p1",
+                "message": "stream me",
+                "attachments": []
+            }))
+            .await
+            .expect("send p1");
+
+        // Wait 150 ms — p1 is now mid-stream (first 200 ms sleep still running).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Send second prompt while p1 is in-flight — must be rejected.
+        child
+            .send(&json!({
+                "type": "prompt",
+                "id": "p2",
+                "message": "should be rejected",
+                "attachments": []
+            }))
+            .await
+            .expect("send p2");
+
+        let mut found_concurrent_error = false;
+
+        for _ in 0..40 {
+            let frame = match child.recv_timeout(Duration::from_secs(10)).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("recv error: {e}");
+                    break;
+                }
+            };
+
+            // If the engine itself errors on p1 (e.g. auth failure because the
+            // slow fixture didn't register in time), the environment can't
+            // exercise this guard — skip rather than fail.
+            if frame["type"] == "error" && frame["id"] == "p1" {
+                eprintln!(
+                    "skipping tier2::concurrent_prompt_rejected: engine error on p1: {}",
+                    frame["message"]
+                );
+                let _ = child.shutdown().await;
+                return;
+            }
+
+            if frame["type"] == "error" && frame["id"] == "p2" {
+                let msg = frame["message"].as_str().unwrap_or("");
+                assert!(
+                    msg.contains("abort first"),
+                    "expected 'abort first' in concurrent-prompt error, got: {msg}"
+                );
+                found_concurrent_error = true;
+                break;
+            }
+        }
+
+        // Abort p1 and drain remaining frames.
+        child
+            .send(&json!({"type": "abort", "id": "ab_p1"}))
+            .await
+            .ok();
+        for _ in 0..10 {
+            if child.recv_timeout(Duration::from_millis(300)).await.is_err() {
+                break;
+            }
+        }
+
+        let _ = child.shutdown().await;
+
+        assert!(
+            found_concurrent_error,
+            "expected Error {{ id: 'p2', message: '...abort first...' }} \
+             when a second Prompt is sent while p1 is still streaming"
         );
     }
 }
