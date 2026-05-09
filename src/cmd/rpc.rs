@@ -73,6 +73,9 @@ impl RpcState {
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
+        self.session.model = self.runtime.model().to_string();
+        self.session.system_prompt = self.runtime.system_prompt().map(|s| s.to_string());
+        self.session.thinking_level = self.runtime.thinking_level().to_string();
         self.session.updated_at = chrono::Utc::now();
         self.session.auto_title();
         if let Err(e) = self.session.save().await {

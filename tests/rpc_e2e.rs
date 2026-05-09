@@ -109,6 +109,67 @@ impl RpcChild {
         Ok(RpcChild { child, stdin, stdout, _home: home })
     }
 
+    /// Spawn `synaps rpc` reusing an existing HOME directory.
+    ///
+    /// This is used by `continue_resumes_history` to share a single `TempDir`
+    /// between two successive children so session files are visible to both.
+    /// The caller retains ownership of the `TempDir` and must ensure it
+    /// outlives both children.
+    async fn spawn_with_home(
+        args: &[&str],
+        home_path: &Path,
+        dummy_home: TempDir, // caller passes a dummy TempDir to satisfy the _home field
+    ) -> anyhow::Result<Self> {
+        let cfg_path = home_path.join(".synaps-cli");
+        std::fs::create_dir_all(&cfg_path)?;
+        std::fs::write(cfg_path.join("config"), "")?;
+
+        let bin = env!("CARGO_BIN_EXE_synaps");
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("rpc");
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.env("HOME", home_path)
+            .env("SYNAPS_BASE_DIR", &cfg_path)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("GROQ_API_KEY")
+            .env_remove("CEREBRAS_API_KEY")
+            .env_remove("NVIDIA_API_KEY")
+            .env_remove("SAMBANOVA_API_KEY")
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("DEEPINFRA_API_KEY")
+            .env_remove("DEEPINFRA_TOKEN")
+            .env_remove("HUGGINGFACE_API_KEY")
+            .env_remove("HF_TOKEN")
+            .env_remove("FIREWORKS_API_KEY")
+            .env_remove("HYPERBOLIC_API_KEY")
+            .env_remove("SCALEWAY_API_KEY")
+            .env_remove("SILICONFLOW_API_KEY")
+            .env_remove("TOGETHER_API_KEY")
+            .env_remove("CHUTES_API_KEY")
+            .env_remove("CODESTRAL_API_KEY")
+            .env_remove("PERPLEXITY_API_KEY")
+            .env_remove("PPLX_API_KEY")
+            .env_remove("MISTRAL_API_KEY")
+            .env_remove("XAI_API_KEY")
+            .env_remove("DEEPSEEK_API_KEY")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout_raw = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdout = BufReader::new(stdout_raw);
+
+        Ok(RpcChild { child, stdin, stdout, _home: dummy_home })
+    }
+
     /// Read one line from the child's stdout and parse it as a JSON Value.
     /// Times out after `dur`.
     async fn recv_timeout(&mut self, dur: Duration) -> anyhow::Result<Value> {
@@ -435,6 +496,129 @@ mod tier1 {
         );
 
         child.shutdown().await.expect("clean shutdown");
+    }
+
+    /// `--continue <id>` resumes an existing session:
+    /// * session_id is preserved across restart
+    /// * model set in session A is preserved in session B (via Ready frame)
+    /// * `get_messages` returns the user message sent in session A
+    ///
+    /// Tier-1 safe: no LLM is needed. The prompt fails (no API key), but the
+    /// user message is pushed to `api_messages` BEFORE the streaming task is
+    /// spawned (see `handle_prompt`), so the message survives and is saved on
+    /// `Shutdown`.
+    #[tokio::test]
+    async fn continue_resumes_history() {
+        // A single HOME shared by both children so session files are visible.
+        let shared_home = TempDir::new().expect("TempDir");
+        let home_path = shared_home.path().to_path_buf();
+
+        // ── Session A ────────────────────────────────────────────────────────
+        let dummy_a = TempDir::new().expect("dummy TempDir A");
+        let mut child_a =
+            RpcChild::spawn_with_home(&[], &home_path, dummy_a).await.expect("spawn A");
+        let ready_a = child_a.recv().await.expect("Ready A");
+        assert_eq!(ready_a["type"], "ready", "first frame from A must be 'ready'");
+
+        let session_id = ready_a["session_id"].as_str().expect("session_id in Ready A").to_string();
+
+        // Change to a non-default model so we can verify persistence.
+        let chosen_model = "claude-opus-4-5";
+        child_a
+            .send(&serde_json::json!({
+                "type": "set_model",
+                "id": "sm_a",
+                "model": chosen_model
+            }))
+            .await
+            .expect("set_model send");
+        let sm_resp = child_a.recv().await.expect("set_model response");
+        assert_eq!(sm_resp["type"], "response");
+        assert_eq!(sm_resp["command"], "set_model");
+
+        // Send a prompt — it will fail (no LLM), but the user message is
+        // pushed to api_messages before the stream starts.
+        let prompt_text = "hello from session A";
+        child_a
+            .send(&serde_json::json!({
+                "type": "prompt",
+                "id": "p_a",
+                "message": prompt_text
+            }))
+            .await
+            .expect("prompt send");
+
+        // Drain frames until the prompt response arrives (error path).
+        // Expected sequence: error frame, agent_end, response{ok:false}.
+        // We collect up to 10 frames to avoid hanging on unexpected output.
+        let mut got_prompt_response = false;
+        for _ in 0..10 {
+            let frame = child_a
+                .recv_timeout(Duration::from_secs(10))
+                .await
+                .expect("frame from A after prompt");
+            // The prompt response is {"type":"response","command":"prompt",...}
+            if frame["type"] == "response" && frame["command"] == "prompt" {
+                got_prompt_response = true;
+                break;
+            }
+        }
+        assert!(got_prompt_response, "prompt response frame never arrived");
+
+        // Shutdown A — save_session() runs here, persisting api_messages.
+        child_a.shutdown().await.expect("clean shutdown A");
+
+        // ── Session B (--continue) ───────────────────────────────────────────
+        let dummy_b = TempDir::new().expect("dummy TempDir B");
+        let mut child_b =
+            RpcChild::spawn_with_home(&["--continue", &session_id], &home_path, dummy_b)
+                .await
+                .expect("spawn B");
+        let ready_b = child_b.recv().await.expect("Ready B");
+        assert_eq!(ready_b["type"], "ready", "first frame from B must be 'ready'");
+
+        // 1. Session identity is preserved.
+        assert_eq!(
+            ready_b["session_id"].as_str().expect("session_id in Ready B"),
+            session_id,
+            "session_id must match across --continue restart"
+        );
+
+        // 2. Model is preserved.
+        assert_eq!(
+            ready_b["model"].as_str().expect("model in Ready B"),
+            chosen_model,
+            "model must be restored from persisted session"
+        );
+
+        // 3. Message history includes the original user message.
+        child_b
+            .send(&serde_json::json!({"type": "get_messages", "id": "gm_b"}))
+            .await
+            .expect("get_messages send");
+        let gm_resp = child_b.recv().await.expect("get_messages response");
+        assert_eq!(gm_resp["type"], "response");
+        assert_eq!(gm_resp["command"], "get_messages");
+
+        let messages = gm_resp["messages"].as_array().expect("messages array");
+        assert!(!messages.is_empty(), "resumed session must have at least one message");
+
+        let has_user_msg = messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .map(|s| s.contains(prompt_text))
+                    .unwrap_or(false)
+        });
+        assert!(
+            has_user_msg,
+            "get_messages must return the original user message; got: {messages:?}"
+        );
+
+        child_b.shutdown().await.expect("clean shutdown B");
+
+        // shared_home dropped here — after both children are gone.
+        drop(shared_home);
     }
 
 }
