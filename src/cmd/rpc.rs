@@ -605,7 +605,7 @@ pub async fn run(
 
     // 8. Spawn the writer task that owns stdout.
     let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
-    let _writer_handle = spawn_writer(writer_rx);
+    let writer_handle = spawn_writer(writer_rx);
 
     // 9. Emit Ready — guaranteed to be the first byte on stdout.
     writer_tx
@@ -701,11 +701,25 @@ pub async fn run(
 
                         state.lock().await.save_session().await;
 
-                        // Drop the sender so the writer task flushes and exits.
+                        // Drop the sender so the writer task drains its queue and exits.
                         drop(writer_tx);
 
-                        // Give the writer task a moment to flush its buffer.
-                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                        // Bounded wait: 1 s is plenty for 256 buffered frames over a stdio pipe.
+                        // Replaces the former unconditional sleep(20 ms) which could drop frames.
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(1),
+                            writer_handle,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {} // writer finished cleanly
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = ?e, "writer task panicked during shutdown")
+                            }
+                            Err(_) => tracing::warn!(
+                                "writer task did not drain within 1s; exiting anyway"
+                            ),
+                        }
 
                         std::process::exit(0);
                     }
