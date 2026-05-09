@@ -31,6 +31,7 @@ use synaps_cli::{
     core::rpc_dispatch::{
         accumulate_usage, build_user_content, map_stream_event, parse_frame, MAX_FRAME_BYTES,
     },
+    engine::setup::{self, EngineOpts},
 };
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 
@@ -194,6 +195,26 @@ async fn spawn_prompt(
                 }
                 // ── Turn error (always returns early) ───────────────────────
                 StreamEvent::Session(SessionEvent::Error(msg)) => {
+                    // If we requested cancellation, the engine surfaces the
+                    // cancel as a downstream `SessionEvent::Error` (typically
+                    // "operation canceled" from the OpenAI stream layer). That
+                    // is a benign abort, not a failure — report ok: true,
+                    // cancelled: true exactly as the stream-exhausted branch
+                    // below would, and skip the noisy Error frame.
+                    if cancel_check.is_cancelled() {
+                        let _ = wtx
+                            .send(RpcEvent::AgentEnd { usage: usage_acc.clone() })
+                            .await;
+                        let _ = wtx
+                            .send(RpcEvent::Response {
+                                id: pid.clone(),
+                                command: "prompt".to_string(),
+                                body: serde_json::json!({ "ok": true, "cancelled": true }),
+                            })
+                            .await;
+                        state.lock().await.in_flight = None;
+                        return;
+                    }
                     let _ = wtx
                         .send(RpcEvent::Error {
                             id: Some(pid.clone()),
@@ -539,63 +560,63 @@ pub async fn run(
     model: Option<String>,
     profile: Option<String>,
 ) -> anyhow::Result<()> {
-    // 1. Apply profile before loading config (affects the config directory).
-    if let Some(ref prof) = profile {
-        synaps_cli::config::set_profile(Some(prof.clone()));
-    }
+    // 1. Boot the engine via the shared setup path. This handles profile,
+    //    logging, Runtime + config, system prompt, skills/MCP registration,
+    //    session resolution, inbox watcher, and per-session socket. Mirrors
+    //    `cmd/chat.rs::run` so RPC mode picks up the same provider extensions
+    //    (Groq, OpenAI-compat, etc.) as the TUI and chat modes.
+    let boot = setup::boot(EngineOpts {
+        continue_session: continue_id.map(Some),
+        system,
+        profile,
+        no_extensions: false,
+    })
+    .await
+    .context("engine boot failed")?;
 
-    // 2. Init structured logging — writes to log file / stderr, never stdout.
-    let _log_guard = synaps_cli::logging::init_logging();
+    let mut runtime = boot.runtime;
+    let session = boot.session;
+    let initial_messages = boot.api_messages;
+    let initial_in = boot.total_input_tokens;
+    let initial_out = boot.total_output_tokens;
+    let initial_cost = boot.session_cost;
+    let ext_manager = boot.ext_manager;
+    let background = boot.background;
 
-    // 3. Build Runtime and apply config.
-    let mut runtime = Runtime::new()
-        .await
-        .context("failed to initialise Runtime")?;
-    let config = synaps_cli::config::load_config();
-    runtime.apply_config(&config);
-
-    // 4. Resolve system prompt (CLI flag > ~/.synaps-cli/system.md > built-in default).
-    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
-    runtime.set_system_prompt(system_prompt);
-
-    // 5. Create or resume Session.
-    let (session, initial_messages, initial_in, initial_out, initial_cost) =
-        match continue_id {
-            Some(ref id) => {
-                let sess = synaps_cli::resolve_session(id).map_err(|e| {
-                    anyhow::anyhow!("cannot resume session '{}': {}", id, e)
-                })?;
-                // Restore persisted model and system prompt.
-                runtime.set_model(sess.model.clone());
-                if let Some(ref sp) = sess.system_prompt {
-                    runtime.set_system_prompt(sp.clone());
-                }
-                let msgs = sess.api_messages.clone();
-                let tin = sess.total_input_tokens;
-                let tout = sess.total_output_tokens;
-                let cost = sess.session_cost;
-                (sess, msgs, tin, tout, cost)
-            }
-            None => {
-                let sess = Session::new(
-                    runtime.model(),
-                    runtime.thinking_level(),
-                    runtime.system_prompt(),
-                );
-                (sess, Vec::new(), 0u64, 0u64, 0.0f64)
-            }
-        };
-
-    // 6. CLI --model overrides whatever was persisted in the session.
+    // 2. CLI --model overrides whatever was persisted in the resumed session.
     if let Some(ref m) = model {
         runtime.set_model(m.clone());
     }
+
+    // 3. Discover and load planted process extensions (provider plugins live
+    //    here). We block Ready on the loader's `Finished` event so the bridge
+    //    cannot send a Prompt before extension-backed providers have
+    //    registered. Bounded by a 2 s grace period — extension loading is
+    //    best-effort, not a hard fail.
+    let (loader_tx, mut loader_rx) = mpsc::unbounded_channel();
+    synaps_cli::extensions::loader::spawn_discover_and_load(
+        Arc::clone(&ext_manager),
+        loader_tx,
+    );
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        async {
+            while let Some(ev) = loader_rx.recv().await {
+                if matches!(ev, synaps_cli::extensions::loader::ExtensionLoaderEvent::Finished { .. }) {
+                    break;
+                }
+            }
+        },
+    )
+    .await;
+    // Any straggler events after this point are simply dropped when the
+    // receiver is dropped; the loader task will exit when its sender drops.
 
     // Capture session_id + model for the Ready frame before state is consumed.
     let ready_session_id = session.id.clone();
     let ready_model = runtime.model().to_string();
 
-    // 7. Build shared state.
+    // 4. Build shared state.
     let state = Arc::new(Mutex::new(RpcState {
         runtime,
         session,
@@ -606,7 +627,7 @@ pub async fn run(
         in_flight: None,
     }));
 
-    // 8. Spawn the writer task that owns stdout.
+    // 5. Spawn the writer task that owns stdout.
     let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
     let writer_handle = spawn_writer(writer_rx);
 
@@ -636,6 +657,7 @@ pub async fn run(
                 // EOF — parent closed stdin; treat the same as Shutdown.
                 tracing::info!("stdin EOF; saving session and exiting");
                 state.lock().await.save_session().await;
+                background.shutdown();
                 break;
             }
             Ok(Some(line)) => {
@@ -703,6 +725,12 @@ pub async fn run(
                         }
 
                         state.lock().await.save_session().await;
+
+                        // Signal background tasks (inbox watcher, session
+                        // socket listener) to stop. The `BackgroundTasks`
+                        // value is dropped at function exit, which aborts
+                        // the join handles as a hard backstop.
+                        background.shutdown();
 
                         // Drop the sender so the writer task drains its queue and exits.
                         drop(writer_tx);
