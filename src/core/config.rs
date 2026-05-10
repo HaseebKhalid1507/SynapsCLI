@@ -106,6 +106,42 @@ pub struct ServerConfig {
     pub max_message_size: Option<usize>,
 }
 
+/// Bridge daemon configuration parsed from `bridge.*` keys.
+///
+/// Controls best-effort mirroring of watcher heartbeats over the bridge
+/// daemon's UDS `ControlSocket` (`heartbeat_emit` op). All keys are optional
+/// and the feature is OFF by default.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    /// Path to the bridge daemon's UDS control socket.
+    /// When `None`, defaults to `base_dir().join("bridge/control.sock")`.
+    pub uds_path: Option<PathBuf>,
+    /// When true, every watcher heartbeat tick mirrors a `heartbeat_emit`
+    /// JSON-RPC call over the UDS socket. Errors are logged at debug only.
+    pub heartbeat_mirror: bool,
+    /// Per-call timeout in milliseconds (covers connect + write + read).
+    pub heartbeat_timeout_ms: u64,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            uds_path: None,
+            heartbeat_mirror: false,
+            heartbeat_timeout_ms: 250,
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Resolve the UDS path, falling back to the default under `base_dir()`.
+    pub fn resolved_uds_path(&self) -> PathBuf {
+        self.uds_path
+            .clone()
+            .unwrap_or_else(|| base_dir().join("bridge/control.sock"))
+    }
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -125,6 +161,7 @@ pub struct SynapsConfig {
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
     pub server: ServerConfig,
+    pub bridge: BridgeConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
 }
@@ -148,6 +185,7 @@ impl Default for SynapsConfig {
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
+            bridge: BridgeConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
         }
@@ -274,6 +312,32 @@ fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &st
     }
 }
 
+/// Parse bridge.* configuration keys and update the BridgeConfig.
+fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &str) {
+    match key {
+        "bridge.uds_path" => {
+            if val.is_empty() {
+                bridge_config.uds_path = None;
+            } else {
+                bridge_config.uds_path = Some(PathBuf::from(val));
+            }
+        }
+        "bridge.heartbeat_mirror" => {
+            bridge_config.heartbeat_mirror = matches!(val, "true" | "1" | "yes");
+        }
+        "bridge.heartbeat_timeout_ms" => {
+            if let Ok(ms) = val.parse::<u64>() {
+                bridge_config.heartbeat_timeout_ms = ms;
+            } else {
+                eprintln!("Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default", val);
+            }
+        }
+        _ => {
+            // Unknown bridge.* keys preserved (not rejected)
+        }
+    }
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -344,6 +408,8 @@ pub fn load_config() -> SynapsConfig {
                     parse_shell_config_key(&mut config.shell, key, val);
                 } else if key.starts_with("server.") {
                     parse_server_config_key(&mut config.server, key, val);
+                } else if key.starts_with("bridge.") {
+                    parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
@@ -534,6 +600,66 @@ mod tests {
         assert_eq!(config.server.token, None);
         assert!(!config.server.auto_approve_confirms);
         assert_eq!(config.server.max_message_size, None);
+        // Bridge config defaults
+        assert!(config.bridge.uds_path.is_none());
+        assert!(!config.bridge.heartbeat_mirror);
+        assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_bridge_keys() {
+        let home = make_test_home("bridge-keys");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "\
+bridge.uds_path = /tmp/some/control.sock\n\
+bridge.heartbeat_mirror = true\n\
+bridge.heartbeat_timeout_ms = 750\n\
+").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(
+                config.bridge.uds_path,
+                Some(std::path::PathBuf::from("/tmp/some/control.sock")),
+            );
+            assert!(config.bridge.heartbeat_mirror);
+            assert_eq!(config.bridge.heartbeat_timeout_ms, 750);
+            assert_eq!(
+                config.bridge.resolved_uds_path(),
+                std::path::PathBuf::from("/tmp/some/control.sock"),
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_bridge_config_defaults() {
+        let cfg = BridgeConfig::default();
+        assert!(cfg.uds_path.is_none());
+        assert!(!cfg.heartbeat_mirror);
+        assert_eq!(cfg.heartbeat_timeout_ms, 250);
+        // resolved path falls under base_dir()/bridge/control.sock
+        let resolved = cfg.resolved_uds_path();
+        assert!(resolved.ends_with("bridge/control.sock"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_bridge_heartbeat_mirror_defaults_off_when_unset() {
+        let home = make_test_home("bridge-default-off");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert!(!config.bridge.heartbeat_mirror);
+            assert!(config.bridge.uds_path.is_none());
+            assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
