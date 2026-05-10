@@ -12,7 +12,6 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// built-in surface; the runtime merges this with discovered skills via
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
-
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit"];
 
