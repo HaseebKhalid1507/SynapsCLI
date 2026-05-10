@@ -1,31 +1,78 @@
-use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, CancellationToken, Session, truncate_str};
-use synaps_cli::protocol::{ClientMessage, ServerMessage, HistoryEntry};
+use anyhow::Context;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
+use chrono::Local;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
+use synaps_cli::engine::session::ConversationState;
+use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
+use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
+use synaps_cli::{truncate_str, CancellationToken, Runtime};
+use axum::extract::Query;
+use rand::Rng;
+use std::collections::HashMap;
+use synaps_cli::core::config::load_config;
+use synaps_cli::core::config::resolve_write_path;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use chrono::Local;
 
 /// Shared server state
 struct ServerState {
     runtime: Mutex<Runtime>,
-    session: RwLock<Session>,
-    api_messages: RwLock<Vec<serde_json::Value>>,
+    allowed_origins: Vec<String>,
+    /// Engine-level conversation state — single source of truth for
+    /// session, api_messages, token counters (including cache_read /
+    /// cache_creation), cost, abort_context, queued_message,
+    /// pending_events. Replaces 5 separate RwLocks that diverged from
+    /// engine pricing and silently dropped cache tokens.
+    conv: RwLock<ConversationState>,
     display_history: RwLock<Vec<HistoryEntry>>,
-    total_input_tokens: RwLock<u64>,
-    total_output_tokens: RwLock<u64>,
-    session_cost: RwLock<f64>,
-    streaming: RwLock<bool>,
+    streaming: std::sync::atomic::AtomicBool,
     cancel_token: RwLock<Option<CancellationToken>>,
     /// Broadcast channel — server events go to ALL connected clients
     broadcast_tx: broadcast::Sender<ServerMessage>,
     client_count: RwLock<usize>,
+    /// Background tasks from engine boot — kept alive for server lifetime.
+    /// Aborts on drop (inbox watcher, per-session socket listener).
+    #[allow(dead_code)] // held for RAII; tasks tear down when ServerState drops
+    background: BackgroundTasks,
+    /// Resolved auth token — None means skip auth (backward compat).
+    auth_token: Option<String>,
+    /// Maximum inbound WebSocket message size in bytes. None = no cap.
+    max_message_size: Option<usize>,
+    /// Auto-approve confirm hooks (headless/agent mode).
+    auto_approve_confirms: bool,
+}
+
+/// RAII guard that clears the streaming flag on drop.
+///
+/// Without this, a panic or task cancellation inside the stream loop would
+/// leave `streaming = true` forever, bricking the server until process
+/// restart. The guard ensures the flag clears on every exit path —
+/// happy completion, error, panic, future-drop — without manual cleanup
+/// at every return site.
+///
+/// `cancel_token` is intentionally not part of this guard: a stale token
+/// in `cancel_token` is harmless (the stream it referenced is dead, and
+/// the next user message overwrites the slot before any new stream
+/// starts). The streaming flag is the safety-critical one.
+struct StreamingGuard {
+    state: Arc<ServerState>,
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        self.state
+            .streaming
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ServerState {
@@ -33,34 +80,49 @@ impl ServerState {
         Local::now().format("%H:%M").to_string()
     }
 
-    async fn add_usage(&self, input_tokens: u64, output_tokens: u64, model: &str) {
-        *self.total_input_tokens.write().await += input_tokens;
-        *self.total_output_tokens.write().await += output_tokens;
-
-        let (input_price, output_price) = match model {
-            m if m.contains("opus") => (15.0, 75.0),
-            m if m.contains("sonnet") => (3.0, 15.0),
-            m if m.contains("haiku") => (0.80, 4.0),
-            _ => (3.0, 15.0),
-        };
-        let cost = (input_tokens as f64 / 1_000_000.0) * input_price
-                 + (output_tokens as f64 / 1_000_000.0) * output_price;
-        *self.session_cost.write().await += cost;
+    /// Add usage from a stream's Usage event. Delegates to ConversationState
+    /// which uses engine::pricing::calculate_cost (handles cache tokens
+    /// correctly and tracks every model the engine knows about — opus,
+    /// sonnet, haiku, plus future ones added to engine pricing).
+    async fn add_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        model: &str,
+    ) {
+        let mut conv = self.conv.write().await;
+        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model);
     }
 
+    /// Save the conversation to disk.
+    ///
+    /// Reproduces ConversationState::save inline so we can release the
+    /// `conv` write-lock BEFORE the slow `Session::save().await`
+    /// (atomic file rename). Holding the conv lock across that I/O
+    /// would block every other state read — particularly the stream
+    /// loop's `process_stream_event` write — for the duration of the
+    /// disk write.
     async fn save_session(&self) {
-        let api_msgs = self.api_messages.read().await;
-        if api_msgs.is_empty() {
-            return;
-        }
-        let mut session = self.session.write().await;
-        session.api_messages = api_msgs.clone();
-        session.total_input_tokens = *self.total_input_tokens.read().await;
-        session.total_output_tokens = *self.total_output_tokens.read().await;
-        session.session_cost = *self.session_cost.read().await;
-        session.updated_at = chrono::Utc::now();
-        session.auto_title();
-        if let Err(e) = session.save().await {
+        let session_to_save = {
+            let mut conv = self.conv.write().await;
+            if conv.api_messages.is_empty() {
+                return;
+            }
+            // Mirror ConversationState::save body — sync conv state into
+            // the embedded session struct.
+            conv.session.api_messages = conv.api_messages.clone();
+            conv.session.total_input_tokens = conv.total_input_tokens;
+            conv.session.total_output_tokens = conv.total_output_tokens;
+            conv.session.session_cost = conv.session_cost;
+            conv.session.abort_context = conv.abort_context.clone();
+            conv.session.updated_at = chrono::Utc::now();
+            conv.session.auto_title();
+            // Clone the session out so we can save it without holding the lock.
+            conv.session.clone()
+        }; // conv write-lock released here
+        if let Err(e) = session_to_save.save().await {
             tracing::error!("Failed to save session: {}", e);
         }
     }
@@ -76,62 +138,122 @@ pub async fn run(
     system: Option<String>,
     continue_session: Option<Option<String>>,
     profile: Option<String>,
+    token_override: Option<String>,
+    auto_approve_flag: bool,
+    allowed_origins_override: Option<String>,
 ) -> anyhow::Result<()> {
-    if let Some(ref prof) = profile {
-        synaps_cli::config::set_profile(Some(prof.clone()));
-    }
+    // ── Boot via engine ──
+    // Replaces ~50 lines of inlined Runtime::new + system prompt + session
+    // resolution. Boot gives us:
+    //   - config + system prompt loaded
+    //   - skills registry built (server doesn't consume the registry handle,
+    //     but `load_skill` tool registration is a side effect we keep)
+    //   - lazy MCP setup
+    //   - session resolved (continue or new)
+    //   - inbox watcher + per-session Unix socket + session registry entry
+    //   - extension manager constructed (still needs explicit loader spawn below)
+    //   - on_session_start hook emitted (no subscribers until extensions loaded)
+    //   - session-start index record appended
+    let boot = setup::boot(EngineOpts {
+        continue_session,
+        system,
+        profile,
+        no_extensions: false,
+    })
+    .await
+    .context("engine boot failed")?;
 
-    let _log_guard = synaps_cli::logging::init_logging();
-    let mut runtime = Runtime::new().await?;
-
-    // Load config and apply
-    let config = synaps_cli::config::load_config();
-    runtime.apply_config(&config);
-
-    // Load system prompt
-    let system_prompt = synaps_cli::config::resolve_system_prompt(system.as_deref());
-    runtime.set_system_prompt(system_prompt);
-
-    // Session: continue existing or create new
-    let (session, initial_api_messages, initial_history, initial_in, initial_out, initial_cost) =
-        match continue_session {
-            Some(maybe_id) => {
-                let session = match maybe_id {
-                    Some(id) => synaps_cli::resolve_session(&id)?,
-                    None => synaps_cli::latest_session()?,
-                };
-                runtime.set_model(session.model.clone());
-                if let Some(ref sp) = session.system_prompt {
-                    runtime.set_system_prompt(sp.clone());
-                }
-                let api_msgs = session.api_messages.clone();
-                let history = rebuild_history(&api_msgs);
-                let input_t = session.total_input_tokens;
-                let output_t = session.total_output_tokens;
-                let cost = session.session_cost;
-                (session, api_msgs, history, input_t, output_t, cost)
+    // ── Discover and load extensions ──
+    // setup::boot constructs an empty ExtensionManager. We have to actually
+    // discover plugins from disk and spawn their processes here, mirroring
+    // cmd/chat.rs. Without this, on_session_start fires onto an empty bus
+    // and no before_tool_call / before_message / on_session_end hooks ever
+    // run in server mode — defeating the purpose of the engine refactor.
+    let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
+    synaps_cli::extensions::loader::spawn_discover_and_load(
+        Arc::clone(&boot.ext_manager),
+        loader_tx,
+    );
+    // Drain loader events in the background — prevents SendError in the loader
+    // and lets us log when discovery completes.
+    tokio::spawn(async move {
+        use synaps_cli::extensions::loader::ExtensionLoaderEvent;
+        while let Some(ev) = loader_rx.recv().await {
+            if let ExtensionLoaderEvent::Finished { loaded, failed } = ev {
+                tracing::info!(
+                    server_extensions_loaded = loaded.len(),
+                    server_extensions_failed = failed.len(),
+                    "server: extensions ready"
+                );
             }
-            None => {
-                let session = Session::new(runtime.model(), runtime.thinking_level(), runtime.system_prompt());
-                (session, Vec::new(), Vec::new(), 0, 0, 0.0)
-            }
-        };
+        }
+    });
 
-    let session_id = session.id.clone();
+    let runtime = boot.runtime;
+    let initial_history = rebuild_history(&boot.api_messages);
+    let conv = if boot.continued {
+        ConversationState::from_resumed(boot.session)
+    } else {
+        ConversationState::new(boot.session)
+    };
+
+    let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
+
+    // ── Resolve auth token + server config ──
+    let config = load_config();
+    // CLI overrides take precedence over config file values.
+    let allowed_origins = if let Some(ref origins) = allowed_origins_override {
+        origins.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else {
+        config.server.allowed_origins.clone()
+    };
+    let max_message_size = config.server.max_message_size;
+    let auto_approve_confirms = auto_approve_flag || config.server.auto_approve_confirms;
+    let auth_token: Option<String> = match &token_override {
+        // --token "" disables auth entirely
+        Some(t) if t.is_empty() => None,
+        // --token <value> uses that value
+        Some(t) => Some(t.clone()),
+        // No CLI override — use config or auto-generate
+        None => {
+            let token = if let Some(t) = config.server.token {
+                t
+            } else {
+                // Auto-generate a 32-byte random hex token.
+                let bytes: [u8; 32] = rand::rng().random();
+                bytes.iter().map(|b| format!("{:02x}", b)).collect()
+            };
+            // Atomic write: temp file → rename.
+            let token_path = resolve_write_path("server-token");
+            let tmp_path = token_path.with_extension("tmp");
+            if let Err(e) = std::fs::write(&tmp_path, &token) {
+                eprintln!("Warning: could not write token file: {e}");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+                }
+                let _ = std::fs::rename(&tmp_path, &token_path);
+            }
+            Some(token)
+        }
+    };
 
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
-        session: RwLock::new(session),
-        api_messages: RwLock::new(initial_api_messages),
+        conv: RwLock::new(conv),
         display_history: RwLock::new(initial_history),
-        total_input_tokens: RwLock::new(initial_in),
-        total_output_tokens: RwLock::new(initial_out),
-        session_cost: RwLock::new(initial_cost),
-        streaming: RwLock::new(false),
+        streaming: std::sync::atomic::AtomicBool::new(false),
         cancel_token: RwLock::new(None),
         broadcast_tx,
         client_count: RwLock::new(0),
+        background: boot.background,
+        auth_token: auth_token.clone(),
+        allowed_origins,
+        max_message_size,
+        auto_approve_confirms,
     });
 
     let app = Router::new()
@@ -147,10 +269,67 @@ pub async fn run(
     eprintln!("╠══════════════════════════════════════╣");
     eprintln!("║  Listening: ws://{}:{:<5}      ║", host, port);
     eprintln!("║  Session:   {:<24}║", &session_id);
+    if let Some(ref tok) = auth_token {
+        eprintln!("║  Token:     {:<24}║", &tok[..tok.len().min(24)]);
+    }
     eprintln!("╚══════════════════════════════════════╝");
 
-    axum::serve(listener, app).await?;
+    // Serve with graceful shutdown on SIGINT/SIGTERM.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // ── Graceful teardown ──
+    // Mirrors cmd/chat.rs end-of-session sequence:
+    //   1. Save the session to disk (was previously skipped on shutdown).
+    //   2. Fire on_session_end hook so extensions get a clean exit
+    //      notification (jawz-shutdown, stelline harvest, etc.).
+    //   3. Call BackgroundTasks::shutdown() to unregister the session
+    //      socket + run/<id>.json file. Drop alone aborts tasks but
+    //      leaves stale registry entries.
+    eprintln!("\n↓ graceful shutdown — saving session, firing hooks, unregistering.");
+    state.save_session().await;
+    {
+        let runtime = state.runtime.lock().await;
+        let hook = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
+            &session_id,
+            None, // server doesn't preserve a transcript blob — extensions can read api_messages from disk
+        );
+        let _ = runtime.hook_bus().emit(&hook).await;
+    }
+    state.background.shutdown();
+
     Ok(())
+}
+
+/// Listen for SIGINT (Ctrl-C) or SIGTERM (`systemctl stop`) and resolve
+/// when either arrives. axum's `with_graceful_shutdown` takes a future
+/// that, when ready, signals the server to stop accepting new connections,
+/// drain in-flight requests, and return.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -160,8 +339,53 @@ async fn health_handler() -> impl IntoResponse {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Origin validation — reject non-matching origins when allowlist is configured.
+    if !state.allowed_origins.is_empty() {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        match origin {
+            Some(o) if state.allowed_origins.iter().any(|a| a == o) => {}
+            _ => {
+                tracing::warn!(
+                    origin = ?headers.get(axum::http::header::ORIGIN).map(|v| v.to_str().unwrap_or("<invalid>")),
+                    "WebSocket upgrade rejected: origin not in allowlist"
+                );
+                return (StatusCode::FORBIDDEN, "Forbidden: origin not allowed").into_response();
+            }
+        }
+    }
+
+    // Token auth — validate ?token=X or Authorization: Bearer X.
+    if let Some(ref expected) = state.auth_token {
+        let provided = params.get("token").map(|s| s.as_str()).or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+        let valid = match provided {
+            Some(tok) => {
+                // Constant-time comparison to prevent timing attacks.
+                let a = tok.as_bytes();
+                let b = expected.as_bytes();
+                a.len() == b.len() && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+            }
+            None => false,
+        };
+
+        if !valid {
+            tracing::warn!("WebSocket upgrade rejected: invalid or missing auth token");
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+
     ws.on_upgrade(|socket| handle_client(socket, state))
+        .into_response()
 }
 
 async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
@@ -184,10 +408,37 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     let mut broadcast_rx = state.broadcast_tx.subscribe();
 
     // Task: forward broadcast messages → this client's WebSocket
+    //
+    // `while let Ok(msg) = ...` would silently exit on RecvError::Lagged
+    // (slow client falls behind the 256-buffer ring), leaving the WS
+    // reader loop alive but the writer dead — a zombie connection that
+    // looks healthy from the outside. Match explicitly so we keep the
+    // forward pipe alive and only break on a real Closed.
     let tx_handle = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_tx.send(Message::Text(json)).await.is_err() {
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(msg) => {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if ws_tx.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        dropped = n,
+                        "client lagged on broadcast channel — keeping forward pipe alive"
+                    );
+                    // Best-effort: tell the client they missed messages.
+                    let warn = ServerMessage::System {
+                        message: format!("[client lagged — {} message(s) dropped]", n),
+                    };
+                    if let Ok(json) = serde_json::to_string(&warn) {
+                        let _ = ws_tx.send(Message::Text(json)).await;
+                    }
+                    // Continue the loop — receiver remains usable after Lagged.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
                 }
             }
@@ -198,6 +449,20 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(text) => {
+                // Message size cap — reject oversized payloads before deserialization.
+                if let Some(max) = state.max_message_size {
+                    let len = text.len();
+                    if len > max {
+                        tracing::warn!(len, max, "inbound message too large — dropping");
+                        let _ = state.broadcast_tx.send(ServerMessage::Error {
+                            message: format!(
+                                "Message too large: {} bytes exceeds limit of {} bytes",
+                                len, max
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     handle_message(client_msg, &state).await;
                 }
@@ -238,16 +503,22 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
             });
         }
         ClientMessage::Status => {
+            // Snapshot all status fields under a single conv read-lock to avoid
+            // tearing across multiple awaits and to release the runtime mutex
+            // before we do anything expensive (broadcast send).
             let runtime = state.runtime.lock().await;
-            let session = state.session.read().await;
+            let model = runtime.model().to_string();
+            let thinking = runtime.thinking_level().to_string();
+            drop(runtime);
+            let conv = state.conv.read().await;
             let _ = state.broadcast_tx.send(ServerMessage::StatusResponse {
-                model: runtime.model().to_string(),
-                thinking: runtime.thinking_level().to_string(),
-                streaming: *state.streaming.read().await,
-                session_id: session.id.clone(),
-                total_input_tokens: *state.total_input_tokens.read().await,
-                total_output_tokens: *state.total_output_tokens.read().await,
-                session_cost: *state.session_cost.read().await,
+                model,
+                thinking,
+                streaming: state.streaming.load(std::sync::atomic::Ordering::Acquire),
+                session_id: conv.session.id.clone(),
+                total_input_tokens: conv.total_input_tokens,
+                total_output_tokens: conv.total_output_tokens,
+                session_cost: conv.session_cost,
                 connected_clients: *state.client_count.read().await,
             });
         }
@@ -261,208 +532,378 @@ async fn handle_message(msg: ClientMessage, state: &Arc<ServerState>) {
 }
 
 async fn handle_user_message(content: String, state: &Arc<ServerState>) {
-    // Don't allow concurrent streaming
+    // Atomic check-then-set: if `streaming` was already true, reject.
+    // AcqRel gives us happens-before ordering on the flag toggle without the
+    // cross-thread sync overhead of SeqCst, which we don't need for a single
+    // boolean flag. Replaces a previous read+write split that allowed two
+    // concurrent clients to slip through.
+    if state
+        .streaming
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
     {
-        let is_streaming = *state.streaming.read().await;
-        if is_streaming {
-            let _ = state.broadcast_tx.send(ServerMessage::Error {
-                message: "already streaming — cancel first or wait".to_string(),
-            });
-            return;
-        }
-        *state.streaming.write().await = true;
+        let _ = state.broadcast_tx.send(ServerMessage::Error {
+            message: "already streaming — cancel first or wait".to_string(),
+        });
+        return;
     }
+    // RAII: clears `streaming` on every return path, including panic.
+    let _streaming_guard = StreamingGuard {
+        state: Arc::clone(state),
+    };
 
     // Add to history
     let ts = ServerState::timestamp();
-    state.push_history(HistoryEntry::User {
-        content: content.clone(),
-        time: ts,
-    }).await;
+    state
+        .push_history(HistoryEntry::User {
+            content: content.clone(),
+            time: ts,
+        })
+        .await;
 
-    // Add to API messages
+    // Push initial user message into conv.api_messages (single source of truth).
     {
-        let mut msgs = state.api_messages.write().await;
-        msgs.push(serde_json::json!({"role": "user", "content": content}));
+        let mut conv = state.conv.write().await;
+        conv.api_messages
+            .push(serde_json::json!({"role": "user", "content": content}));
     }
 
-    // Start streaming
-    let cancel = CancellationToken::new();
-    *state.cancel_token.write().await = Some(cancel.clone());
+    // Server-local subagent tracker — chat.rs has the same. queued_message
+    // and pending_events are NOT local; they live in ConversationState
+    // because process_stream_event needs to mutate them across multiple
+    // stream calls in a single user-message handling cycle (AutoSendQueued
+    // and AutoTriggerEvents both produce follow-up turns).
+    let mut subagents: Vec<SubagentTracker> = Vec::new();
 
-    let messages = state.api_messages.read().await.clone();
     let model = {
         let rt = state.runtime.lock().await;
         rt.model().to_string()
     };
-
-    let mut stream = {
-        let rt = state.runtime.lock().await;
-        rt.run_stream_with_messages(messages, cancel, None, None).await
-    };
-
     let broadcast = state.broadcast_tx.clone();
 
-    // Process stream events
-    while let Some(event) = stream.next().await {
-        let ts = ServerState::timestamp();
-        match event {
-            StreamEvent::Llm(LlmEvent::Thinking(text)) => {
-                let _ = broadcast.send(ServerMessage::Thinking { content: text.clone() });
-                // Append to last thinking entry or create new
-                let mut history = state.display_history.write().await;
-                if let Some(HistoryEntry::Thinking { content: ref mut c, .. }) = history.last_mut() {
-                    c.push_str(&text);
-                } else {
-                    history.push(HistoryEntry::Thinking { content: text, time: ts });
-                }
-            }
-            StreamEvent::Llm(LlmEvent::Text(text)) => {
-                let _ = broadcast.send(ServerMessage::Text { content: text.clone() });
-                let mut history = state.display_history.write().await;
-                if let Some(HistoryEntry::Text { content: ref mut c, .. }) = history.last_mut() {
-                    c.push_str(&text);
-                } else {
-                    history.push(HistoryEntry::Text { content: text, time: ts });
-                }
-            }
-            StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
-                let _ = broadcast.send(ServerMessage::ToolUseStart { tool_name });
-            }
-            StreamEvent::Llm(LlmEvent::ToolUseDelta { delta, .. }) => {
-                let _ = broadcast.send(ServerMessage::ToolUseDelta(delta));
-            }
-            StreamEvent::Llm(LlmEvent::ToolUse { tool_name, tool_id, input }) => {
-                let _ = broadcast.send(ServerMessage::ToolUse {
-                    tool_name: tool_name.clone(),
-                    tool_id: tool_id.clone(),
-                    input: input.clone(),
-                });
-                state.push_history(HistoryEntry::ToolUse {
-                    tool_name,
-                    input: serde_json::to_string(&input).unwrap_or_default(),
-                    time: ts,
-                }).await;
-            }
-            StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id, delta }) => {
-                let _ = broadcast.send(ServerMessage::ToolResultDelta {
-                    tool_id,
-                    delta,
-                });
-            }
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: _, result }) => {
-                let _ = broadcast.send(ServerMessage::ToolResult {
-                    tool_id: String::new(),
-                    result: result.clone(),
-                });
-                state.push_history(HistoryEntry::ToolResult {
-                    result,
-                    time: ts,
-                }).await;
-            }
-            StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-                *state.api_messages.write().await = history;
-                state.save_session().await;
-            }
-            StreamEvent::Session(SessionEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens: _,
-                cache_creation_input_tokens: _,
-                model: _,
-            }) => {
-                state.add_usage(input_tokens, output_tokens, &model).await;
-                let _ = broadcast.send(ServerMessage::Usage { input_tokens, output_tokens });
-            }
-            StreamEvent::Session(SessionEvent::Done) => {
-                let _ = broadcast.send(ServerMessage::Done);
-            }
-            // Subagent events — not yet wired to server protocol
-            StreamEvent::Agent(AgentEvent::SubagentStart { .. })
-            | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
-            | StreamEvent::Agent(AgentEvent::SubagentDone { .. })
-            | StreamEvent::Agent(AgentEvent::SteeringDelivered { .. }) => {}
-            StreamEvent::Session(SessionEvent::Error(err)) => {
-                let _ = broadcast.send(ServerMessage::Error { message: err.clone() });
-                state.push_history(HistoryEntry::Error {
-                    content: err,
-                    time: ts,
-                }).await;
+    // Outer turn loop — runs until StreamCompletion::Done or Error.
+    // AutoSendQueued and AutoTriggerEvents both push another user-style
+    // entry into conv.api_messages and continue the loop, mirroring how
+    // cmd/chat.rs handles the same completions. Without this loop, the
+    // queued message and pending events would sit in api_messages with
+    // no follow-up turn — the next real user message would ship malformed
+    // history to the API.
+    'turn: loop {
+        // Snapshot messages and set up a fresh cancel token for this turn.
+        let messages = state.conv.read().await.api_messages.clone();
+        let cancel = CancellationToken::new();
+        *state.cancel_token.write().await = Some(cancel.clone());
 
-                // Clean up trailing broken messages (same logic as chatui)
-                let mut msgs = state.api_messages.write().await;
-                if let Some(last) = msgs.last() {
-                    let role = last["role"].as_str().unwrap_or("");
-                    let is_text_user = role == "user" && last["content"].is_string();
-                    let is_assistant = role == "assistant";
-                    if is_text_user || is_assistant {
-                        msgs.pop();
+        let mut stream = {
+            let rt = state.runtime.lock().await;
+            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
+                .await
+        };
+
+        // Inner loop — process events from this turn's stream.
+        while let Some(event) = stream.next().await {
+            let ts = ServerState::timestamp();
+
+            // process_stream_event mutates conv fields in place. Hold the
+            // write lock only for the call itself, then release before
+            // broadcast / display_history work to keep latency low.
+            let (engine_event, completion) = {
+                let mut conv = state.conv.write().await;
+                let conv = &mut *conv;
+                stream::process_stream_event(
+                    event,
+                    &mut conv.api_messages,
+                    &mut subagents,
+                    &mut conv.queued_message,
+                    &mut conv.pending_events,
+                )
+            };
+
+            apply_engine_event_side_effects(&engine_event, state, &model, &ts).await;
+
+            if let Some(msg) = engine_event_to_server_message(engine_event) {
+                let _ = broadcast.send(msg);
+            }
+
+            match completion {
+                StreamCompletion::Continue => {}
+                StreamCompletion::Done => {
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::Error(ref err_msg) => {
+                    // process_stream_event has already trimmed dangling
+                    // messages and emitted EngineStreamEvent::Error which
+                    // we translated to a ServerMessage::Error above. Log
+                    // for traceability instead of silently dropping the
+                    // string with `_`.
+                    tracing::debug!(error = %err_msg, "stream completed with error");
+                    state.save_session().await;
+                    break 'turn;
+                }
+                StreamCompletion::AutoSendQueued(queued) => {
+                    // Take the queued user message out of conv (process_stream_event
+                    // already cleared the option in conv) and push it as the
+                    // next user turn. Then save and continue the outer loop.
+                    {
+                        let mut conv = state.conv.write().await;
+                        conv.api_messages
+                            .push(serde_json::json!({"role": "user", "content": queued}));
                     }
+                    state.save_session().await;
+                    continue 'turn;
+                }
+                StreamCompletion::AutoTriggerEvents => {
+                    // pending_events were already drained into conv.api_messages
+                    // by process_stream_event. Save and trigger a follow-up turn.
+                    state.save_session().await;
+                    continue 'turn;
                 }
             }
         }
+
+        // Stream ended without an explicit completion (network drop or
+        // similar). Save and exit — don't loop forever waiting for events
+        // that won't come.
+        state.save_session().await;
+        break 'turn;
     }
 
-    *state.streaming.write().await = false;
+    // _streaming_guard's Drop clears `streaming` — no manual store needed.
     *state.cancel_token.write().await = None;
+}
+
+/// Apply event-specific side effects: append to `display_history`
+/// (the replay buffer for late-connecting WS clients) and bump the
+/// engine-managed usage counters when a `Usage` event arrives.
+///
+/// This is a *separate* function from `engine_event_to_server_message`
+/// for an ownership reason, not a logical-split reason: that function
+/// consumes the `EngineStreamEvent` by value to build a `ServerMessage`,
+/// so any work that needs `&EngineStreamEvent` must run first while
+/// the event is still borrowable. The split is dictated by Rust's
+/// borrow checker; if `EngineStreamEvent` becomes `Clone` cheaply,
+/// these can collapse.
+async fn apply_engine_event_side_effects(
+    event: &EngineStreamEvent,
+    state: &Arc<ServerState>,
+    model: &str,
+    ts: &str,
+) {
+    match event {
+        EngineStreamEvent::Thinking(text) => {
+            let mut history = state.display_history.write().await;
+            if let Some(HistoryEntry::Thinking { content: c, .. }) = history.last_mut() {
+                c.push_str(text);
+            } else {
+                history.push(HistoryEntry::Thinking {
+                    content: text.clone(),
+                    time: ts.to_string(),
+                });
+            }
+        }
+        EngineStreamEvent::Text(text) => {
+            let mut history = state.display_history.write().await;
+            if let Some(HistoryEntry::Text { content: c, .. }) = history.last_mut() {
+                c.push_str(text);
+            } else {
+                history.push(HistoryEntry::Text {
+                    content: text.clone(),
+                    time: ts.to_string(),
+                });
+            }
+        }
+        EngineStreamEvent::ToolFinalized {
+            tool_name, input, ..
+        } => {
+            // HistoryEntry::ToolUse.input is `String` for display purposes;
+            // engine emits `Value` now, so serialise here.
+            let input_str = serde_json::to_string(input).unwrap_or_default();
+            state
+                .push_history(HistoryEntry::ToolUse {
+                    tool_name: tool_name.clone(),
+                    input: input_str,
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        EngineStreamEvent::ToolResult { result, .. } => {
+            state
+                .push_history(HistoryEntry::ToolResult {
+                    result: result.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        EngineStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_creation,
+            ..
+        } => {
+            state
+                .add_usage(
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read,
+                    *cache_creation,
+                    model,
+                )
+                .await;
+        }
+        EngineStreamEvent::Error(err) => {
+            state
+                .push_history(HistoryEntry::Error {
+                    content: err.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
+        // Variants without server-side side effects.
+        EngineStreamEvent::ToolStart { .. }
+        | EngineStreamEvent::ToolDelta { .. }
+        | EngineStreamEvent::ToolResultDelta { .. }
+        | EngineStreamEvent::SubagentStart { .. }
+        | EngineStreamEvent::SubagentUpdate { .. }
+        | EngineStreamEvent::SubagentDone { .. }
+        | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Done
+        | EngineStreamEvent::Noop => {}
+    }
+}
+
+/// Translate an engine-level event to the wire-format ServerMessage.
+/// Returns None for events that have no client-facing representation
+/// (subagent / steering / noop — TODO: wire subagent variant in v2).
+fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMessage> {
+    match event {
+        EngineStreamEvent::Thinking(content) => Some(ServerMessage::Thinking { content }),
+        EngineStreamEvent::Text(content) => Some(ServerMessage::Text { content }),
+        EngineStreamEvent::ToolStart { tool_name, .. } => {
+            Some(ServerMessage::ToolUseStart { tool_name })
+        }
+        EngineStreamEvent::ToolDelta { delta, .. } => Some(ServerMessage::ToolUseDelta(delta)),
+        EngineStreamEvent::ToolFinalized {
+            tool_id,
+            tool_name,
+            input,
+        } => {
+            // Engine emits Value directly now — pass through without
+            // the previous Value→String→Value round-trip that could
+            // silently corrupt input on serialisation failure.
+            Some(ServerMessage::ToolUse {
+                tool_name,
+                tool_id,
+                input,
+            })
+        }
+        EngineStreamEvent::ToolResultDelta { tool_id, delta } => {
+            Some(ServerMessage::ToolResultDelta { tool_id, delta })
+        }
+        EngineStreamEvent::ToolResult { tool_id, result } => {
+            Some(ServerMessage::ToolResult { tool_id, result })
+        }
+        EngineStreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => Some(ServerMessage::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+        EngineStreamEvent::Done => Some(ServerMessage::Done),
+        EngineStreamEvent::Error(message) => Some(ServerMessage::Error { message }),
+        // Server protocol doesn't expose these (yet).
+        EngineStreamEvent::SubagentStart { .. }
+        | EngineStreamEvent::SubagentUpdate { .. }
+        | EngineStreamEvent::SubagentDone { .. }
+        | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Noop => None,
+    }
 }
 
 async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
     let broadcast = &state.broadcast_tx;
 
+    // Server-specific overrides — handled BEFORE engine to preserve
+    // existing wire behaviour for empty-arg display queries that the
+    // engine treats as no-ops.
+    //
+    // `/thinking adaptive` previously needed an override here too, but
+    // engine::commands now knows the `adaptive` level natively (matches
+    // the runtime's own label for budget=0), so it routes through the
+    // engine path below. One less special case to drift.
+    if name == "model" && args.is_empty() {
+        let rt = state.runtime.lock().await;
+        let _ = broadcast.send(ServerMessage::System {
+            message: format!("current model: {}", rt.model()),
+        });
+        return;
+    }
+    if name == "thinking" && args.is_empty() {
+        let rt = state.runtime.lock().await;
+        let _ = broadcast.send(ServerMessage::System {
+            message: format!(
+                "thinking: {} ({})",
+                rt.thinking_level(),
+                rt.thinking_budget()
+            ),
+        });
+        return;
+    }
+
+    // Try engine-level command (model with args, thinking with engine-known
+    // levels, quit, compact).
+    let engine_result = {
+        let mut rt = state.runtime.lock().await;
+        engine_commands::handle_engine_command(name, args, &mut rt)
+    };
+
+    if let Some(result) = engine_result {
+        match result {
+            CommandResult::ModelChanged { model } => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: format!("model set to: {model}"),
+                });
+            }
+            CommandResult::ThinkingChanged { level, .. } => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: format!("thinking set to: {level}"),
+                });
+            }
+            CommandResult::Quit => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: "/quit ignored — server is long-lived; close the WebSocket instead"
+                        .to_string(),
+                });
+            }
+            CommandResult::Compact => {
+                let _ = broadcast.send(ServerMessage::System {
+                    message: "/compact not yet wired in server mode".to_string(),
+                });
+            }
+            CommandResult::Error(msg) => {
+                let _ = broadcast.send(ServerMessage::Error { message: msg });
+            }
+            other => {
+                tracing::debug!(?other, "engine command result not handled by server");
+            }
+        }
+        return;
+    }
+
+    // Server-specific commands the engine doesn't cover.
     match name {
-        "model" => {
-            if args.is_empty() {
-                let rt = state.runtime.lock().await;
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("current model: {}", rt.model()),
-                });
-            } else {
-                let mut rt = state.runtime.lock().await;
-                rt.set_model(args.to_string());
-                let _ = broadcast.send(ServerMessage::System {
-                    message: format!("model set to: {}", args),
-                });
-            }
-        }
-        "thinking" => {
-            let mut rt = state.runtime.lock().await;
-            match args {
-                "low" => { rt.set_thinking_budget(2048); }
-                "medium" | "med" => { rt.set_thinking_budget(4096); }
-                "high" => { rt.set_thinking_budget(16384); }
-                "xhigh" => { rt.set_thinking_budget(32768); }
-                "adaptive" => { rt.set_thinking_budget(0); }
-                "" => {
-                    let _ = broadcast.send(ServerMessage::System {
-                        message: format!("thinking: {} ({})", rt.thinking_level(), rt.thinking_budget()),
-                    });
-                    return;
-                }
-                _ => {
-                    let _ = broadcast.send(ServerMessage::Error {
-                        message: "usage: /thinking low|medium|high|xhigh".to_string(),
-                    });
-                    return;
-                }
-            }
-            let _ = broadcast.send(ServerMessage::System {
-                message: format!("thinking set to: {}", rt.thinking_level()),
-            });
-        }
         "clear" => {
-            state.save_session().await;
-            state.api_messages.write().await.clear();
-            state.display_history.write().await.clear();
-            *state.total_input_tokens.write().await = 0;
-            *state.total_output_tokens.write().await = 0;
-            *state.session_cost.write().await = 0.0;
+            // Delegate to ConversationState::clear, which saves the current
+            // session and replaces it with a fresh one. Mirrors how
+            // cmd/chat.rs handles /clear.
             {
                 let rt = state.runtime.lock().await;
-                *state.session.write().await = Session::new(
-                    rt.model(), rt.thinking_level(), rt.system_prompt()
-                );
+                let mut conv = state.conv.write().await;
+                conv.clear(&rt).await;
             }
+            state.display_history.write().await.clear();
             let _ = broadcast.send(ServerMessage::System {
                 message: "session cleared".to_string(),
             });
@@ -484,13 +925,28 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
         }
         _ => {
             let _ = broadcast.send(ServerMessage::Error {
-                message: format!("unknown command: {}", name),
+                message: format!("unknown command: {name}"),
             });
         }
     }
 }
 
-/// Rebuild display history from API messages (for --continue)
+/// Rebuild the WS replay buffer (`display_history`) from raw API messages
+/// after a `--continue` boot.
+///
+/// Why this stays — the engine has no public API for "give me a
+/// display-friendly history view" of api_messages. `display_history` is
+/// a server-renderer concern (replay buffer for late-joining WS clients),
+/// distinct from the LLM-facing api_messages list. Until the engine
+/// exposes an equivalent helper, server has to do the JSON-block
+/// decoding here.
+///
+/// Known limitation: this is a manual `block["type"].as_str()` walk.
+/// Adding a new block type to the protocol means updating both
+/// `engine::stream::process_stream_event` and this function or losing
+/// fidelity in the replay buffer for resumed sessions. Tracked as
+/// follow-up — engine should expose a `Session::display_history()`
+/// helper.
 fn rebuild_history(api_messages: &[serde_json::Value]) -> Vec<HistoryEntry> {
     let mut history = Vec::new();
     for msg in api_messages {
@@ -525,7 +981,8 @@ fn rebuild_history(api_messages: &[serde_json::Value]) -> Vec<HistoryEntry> {
                             }
                             Some("tool_use") => {
                                 let name = block["name"].as_str().unwrap_or("").to_string();
-                                let input = serde_json::to_string(&block["input"]).unwrap_or_default();
+                                let input =
+                                    serde_json::to_string(&block["input"]).unwrap_or_default();
                                 history.push(HistoryEntry::ToolUse {
                                     tool_name: name,
                                     input,
