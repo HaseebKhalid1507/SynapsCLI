@@ -350,6 +350,10 @@ async fn ws_handler(
         match origin {
             Some(o) if state.allowed_origins.iter().any(|a| a == o) => {}
             _ => {
+                tracing::warn!(
+                    origin = ?headers.get(axum::http::header::ORIGIN).map(|v| v.to_str().unwrap_or("<invalid>")),
+                    "WebSocket upgrade rejected: origin not in allowlist"
+                );
                 return (StatusCode::FORBIDDEN, "Forbidden: origin not allowed").into_response();
             }
         }
@@ -364,11 +368,19 @@ async fn ws_handler(
                 .and_then(|v| v.strip_prefix("Bearer "))
         });
 
-        match provided {
-            Some(tok) if tok == expected.as_str() => {}
-            _ => {
-                return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        let valid = match provided {
+            Some(tok) => {
+                // Constant-time comparison to prevent timing attacks.
+                let a = tok.as_bytes();
+                let b = expected.as_bytes();
+                a.len() == b.len() && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
             }
+            None => false,
+        };
+
+        if !valid {
+            tracing::warn!("WebSocket upgrade rejected: invalid or missing auth token");
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
