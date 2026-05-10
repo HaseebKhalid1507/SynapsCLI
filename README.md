@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="SynapsCLI" width="600" />
+  <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
 </p>
 
 <h3 align="center">The agent runtime that boots before your Node binary finishes importing.</h3>
