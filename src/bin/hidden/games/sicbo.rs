@@ -55,8 +55,8 @@ impl SicBoBet {
         let is_triple = dice[0] == dice[1] && dice[1] == dice[2];
 
         match self {
-            SicBoBet::Big => total >= 11 && total <= 17 && !is_triple,
-            SicBoBet::Small => total >= 4 && total <= 10 && !is_triple,
+            SicBoBet::Big => (11..=17).contains(&total) && !is_triple,
+            SicBoBet::Small => (4..=10).contains(&total) && !is_triple,
             SicBoBet::Odd => total % 2 == 1,
             SicBoBet::Even => total % 2 == 0,
             SicBoBet::AnyTriple => is_triple,
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn big_wins_on_12() {
-        assert!(SicBoBet::Big.wins(&[4, 4, 4]) == false); // triple excluded
+        assert!(!SicBoBet::Big.wins(&[4, 4, 4])); // triple excluded
         assert!(SicBoBet::Big.wins(&[4, 5, 3])); // 12, not triple
     }
 

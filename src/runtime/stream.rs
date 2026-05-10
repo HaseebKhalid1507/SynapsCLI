@@ -42,6 +42,7 @@ pub(super) struct StreamSession {
     pub(super) event_queue: Arc<crate::events::EventQueue>,
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
+    pub(super) auto_approve_confirms: bool,
 }
 
 pub(super) struct StreamMethods;
@@ -72,6 +73,7 @@ impl StreamMethods {
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue, hook_bus, secret_prompt,
+            auto_approve_confirms,
         } = session;
         let mut messages = initial_messages;
 
@@ -265,6 +267,7 @@ impl StreamMethods {
                                         input.clone(),
                                     ).await,
                                     secret_prompt.as_ref(),
+                                    auto_approve_confirms,
                                 ).await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
@@ -353,6 +356,7 @@ impl StreamMethods {
                         let tool_name_for_hook = tool_name.clone();
                         let runtime_name_for_hook = runtime_name.clone();
                         let prompt_inner = secret_prompt.clone();
+                        let auto_approve_inner = auto_approve_confirms;
 
                         join_set.spawn(async move {
                             let result = match tool {
@@ -366,6 +370,7 @@ impl StreamMethods {
                                             input.clone(),
                                         ).await,
                                         prompt_inner.as_ref(),
+                                        auto_approve_inner,
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, format!("Tool call blocked by extension: {}", reason))

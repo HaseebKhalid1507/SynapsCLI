@@ -55,7 +55,7 @@ impl KenoGame {
     }
 
     pub fn toggle_pick(&mut self, num: u8) {
-        if num < 1 || num > 80 { return; }
+        if !(1..=80).contains(&num) { return; }
         if let Some(idx) = self.picks.iter().position(|&n| n == num) {
             self.picks.remove(idx);
         } else if self.picks.len() < MAX_PICKS {

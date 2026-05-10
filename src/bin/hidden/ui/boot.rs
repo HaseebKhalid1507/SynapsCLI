@@ -74,9 +74,8 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
             theme::GREEN
         } else if line.contains("CONNECTION") {
             theme::CYAN
-        } else if line.contains("██") || line.contains("╔╝") || line.contains("═╝") {
-            theme::AMBER
-        } else if line.contains("B  L  E  R  S") {
+        } else if line.contains("██") || line.contains("╔╝") || line.contains("═╝") || line.contains("B  L  E  R  S") {
+            #[allow(clippy::if_same_then_else)]
             theme::AMBER
         } else if line.contains("═") || line.contains("║") || line.contains("╔") || line.contains("╚") {
             theme::AMBER_DIM
@@ -89,7 +88,7 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
             // Animate the dots
             let dots = (elapsed_ms / 200) % 4;
             let dot_str: String = ".".repeat(dots).chars().chain(std::iter::repeat(' ').take(3 - dots)).collect();
-            let animated = line.replace("...", &format!("{}", dot_str));
+            let animated = line.replace("...", &dot_str);
             // Draw manually with animation
             let mut cx = area.left();
             for ch in animated.chars() {
