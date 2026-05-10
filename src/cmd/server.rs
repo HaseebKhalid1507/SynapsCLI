@@ -45,6 +45,10 @@ struct ServerState {
     background: BackgroundTasks,
     /// Resolved auth token — None means skip auth (backward compat).
     auth_token: Option<String>,
+    /// Maximum inbound WebSocket message size in bytes. None = no cap.
+    max_message_size: Option<usize>,
+    /// Auto-approve confirm hooks (headless/agent mode).
+    auto_approve_confirms: bool,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -193,9 +197,12 @@ pub async fn run(
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
 
-    // ── Resolve auth token ──
+    // ── Resolve auth token + server config ──
+    let config = load_config();
+    let allowed_origins = config.server.allowed_origins.clone();
+    let max_message_size = config.server.max_message_size;
+    let auto_approve_confirms = config.server.auto_approve_confirms;
     let auth_token: Option<String> = {
-        let config = load_config();
         let token = if let Some(t) = config.server.token {
             t
         } else {
@@ -229,6 +236,9 @@ pub async fn run(
         client_count: RwLock::new(0),
         background: boot.background,
         auth_token: auth_token.clone(),
+        allowed_origins,
+        max_message_size,
+        auto_approve_confirms,
     });
 
     let app = Router::new()
@@ -317,8 +327,21 @@ async fn ws_handler(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Origin validation — reject non-matching origins when allowlist is configured.
+    if !state.allowed_origins.is_empty() {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        match origin {
+            Some(o) if state.allowed_origins.iter().any(|a| a == o) => {}
+            _ => {
+                return (StatusCode::FORBIDDEN, "Forbidden: origin not allowed").into_response();
+            }
+        }
+    }
+
+    // Token auth — validate ?token=X or Authorization: Bearer X.
     if let Some(ref expected) = state.auth_token {
-        // Check ?token=X query param first, then Authorization: Bearer X header.
         let provided = params.get("token").map(|s| s.as_str()).or_else(|| {
             headers
                 .get("authorization")
@@ -399,6 +422,20 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(text) => {
+                // Message size cap — reject oversized payloads before deserialization.
+                if let Some(max) = state.max_message_size {
+                    let len = text.len();
+                    if len > max {
+                        tracing::warn!(len, max, "inbound message too large — dropping");
+                        let _ = state.broadcast_tx.send(ServerMessage::Error {
+                            message: format!(
+                                "Message too large: {} bytes exceeds limit of {} bytes",
+                                len, max
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     handle_message(client_msg, &state).await;
                 }
@@ -531,7 +568,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
         let mut stream = {
             let rt = state.runtime.lock().await;
-            rt.run_stream_with_messages(messages, cancel, None, None, false)
+            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
                 .await
         };
 
