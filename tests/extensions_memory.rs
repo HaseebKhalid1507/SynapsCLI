@@ -40,6 +40,7 @@ fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn extension_can_append_and_query_within_its_namespace() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -76,6 +77,7 @@ async fn extension_can_append_and_query_within_its_namespace() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn extension_without_permission_cannot_append() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -103,6 +105,7 @@ async fn extension_without_permission_cannot_append() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn extension_cannot_use_other_namespace() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     let home = tempfile::tempdir().unwrap();

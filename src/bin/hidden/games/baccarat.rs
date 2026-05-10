@@ -37,7 +37,7 @@ fn card_points(card: &Card) -> u8 {
 }
 
 pub fn hand_total(cards: &[Card]) -> u8 {
-    cards.iter().map(|c| card_points(c)).sum::<u8>() % 10
+    cards.iter().map(card_points).sum::<u8>() % 10
 }
 
 pub struct BaccaratGame {
@@ -106,8 +106,8 @@ impl BaccaratGame {
                 Some(p3) => match banker_total {
                     0..=2 => true,
                     3 => p3 != 8,
-                    4 => p3 >= 2 && p3 <= 7,
-                    5 => p3 >= 4 && p3 <= 7,
+                    4 => (2..=7).contains(&p3),
+                    5 => (4..=7).contains(&p3),
                     6 => p3 == 6 || p3 == 7,
                     _ => false,
                 },

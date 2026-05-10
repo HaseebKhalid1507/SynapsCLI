@@ -220,7 +220,7 @@ pub(crate) fn effect_from_commit_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::settings_editor::SettingsEditorCommitParams;
+    use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 

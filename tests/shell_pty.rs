@@ -1,6 +1,6 @@
 //! Integration tests for interactive shell sessions.
 
-use synaps_cli::tools::shell::{SessionManager, session::{SessionOpts, SendResult}};
+use synaps_cli::tools::shell::{SessionManager, session::SessionOpts};
 use synaps_cli::tools::shell::config::ShellConfig;
 use std::collections::HashMap;
 use std::time::Duration;

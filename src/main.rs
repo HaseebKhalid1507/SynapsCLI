@@ -1,3 +1,18 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::single_match,
+    clippy::field_reassign_with_default,
+    clippy::manual_clamp,
+    clippy::needless_borrow,
+    clippy::explicit_auto_deref,
+    clippy::manual_strip,
+    clippy::unwrap_or_default,
+    clippy::await_holding_lock,
+    clippy::useless_format,
+    clippy::cmp_owned,
+)]
+
 use clap::{Parser, Subcommand};
 
 mod tui;

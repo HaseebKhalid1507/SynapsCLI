@@ -90,6 +90,7 @@ impl CrapsGame {
     }
 
     /// Resolve after roll animation. Returns Some(payout) if round is over.
+    #[allow(clippy::needless_return, clippy::unnecessary_unwrap)]
     pub fn resolve_roll(&mut self) -> Option<i64> {
         let total = self.total();
         self.roll_history.push(total);

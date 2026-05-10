@@ -951,7 +951,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::theme::THEME;
     use super::*;
 
     fn test_app() -> App {
