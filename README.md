@@ -5,7 +5,7 @@
 # SynapsCLI
 
 ![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
-![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![~70K lines](https://img.shields.io/badge/lines-~70K-green.svg)
 ![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
 
@@ -405,7 +405,7 @@ Config lives at `~/.synaps-cli/` — config, sessions, agents, plugins, skills, 
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
 
 ## Author
 
