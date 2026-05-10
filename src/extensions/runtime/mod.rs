@@ -56,6 +56,7 @@ impl ExtensionHealth {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod health_tests {
     use super::ExtensionHealth;
 

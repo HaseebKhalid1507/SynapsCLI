@@ -1,9 +1,9 @@
 [package]
 name = "synaps"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
-license = "MIT"
+license = "Apache-2.0"
 description = "Terminal-native AI agent runtime — parallel orchestration, reactive subagents, MCP, autonomous supervision"
 repository = "https://github.com/HaseebKhalid1507/SynapsCLI"
 homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
@@ -35,7 +35,7 @@ tokio-util = "0.7"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tachyonfx = "0.9"
-syntect = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-onig"] }
+syntect = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
 
 # Auth / OAuth deps
 sha2 = "0.10"

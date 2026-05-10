@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 const STARTING_TOKENS: u64 = 404;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GameStats {
     pub played: u64,
     pub won: u64,
@@ -12,13 +12,7 @@ pub struct GameStats {
     pub biggest_loss: u64,
 }
 
-impl Default for GameStats {
-    fn default() -> Self {
-        Self { played: 0, won: 0, lost: 0, biggest_win: 0, biggest_loss: 0 }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlackjackStats {
     #[serde(flatten)]
     pub base: GameStats,
@@ -26,23 +20,11 @@ pub struct BlackjackStats {
     pub pushes: u64,
 }
 
-impl Default for BlackjackStats {
-    fn default() -> Self {
-        Self { base: GameStats::default(), blackjacks: 0, pushes: 0 }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlotsStats {
     #[serde(flatten)]
     pub base: GameStats,
     pub jackpots: u64,
-}
-
-impl Default for SlotsStats {
-    fn default() -> Self {
-        Self { base: GameStats::default(), jackpots: 0 }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +80,7 @@ pub fn save(data: &SaveData) -> std::io::Result<()> {
     }
 
     let json = serde_json::to_string_pretty(data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json)?;

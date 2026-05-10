@@ -74,6 +74,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::collapsible_if)]
     pub fn tick(&mut self, dt: Duration) {
         self.elapsed += dt;
         self.frame = self.frame.wrapping_add(1);

@@ -18,18 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Coarse classification of a task; affects how it's rendered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Download,
     Rebuild,
+    #[default]
     Generic,
-}
-
-impl Default for TaskKind {
-    fn default() -> Self {
-        TaskKind::Generic
-    }
 }
 
 /// Parsed task notification.

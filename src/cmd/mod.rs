@@ -1,6 +1,7 @@
 pub(crate) mod agent;
 pub(crate) mod chat;
 pub(crate) mod login;
+pub(crate) mod rpc;
 pub(crate) mod send;
 pub(crate) mod status;
 pub(crate) mod server;

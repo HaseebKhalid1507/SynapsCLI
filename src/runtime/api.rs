@@ -51,6 +51,7 @@ impl ApiMethods {
     /// Static inner version — used by both `call_api_stream` (instance) and
     /// `run_stream_internal` (spawned task) so there's one implementation.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::collapsible_match)]
     pub(super) async fn call_api_stream_inner(
         auth: &Arc<RwLock<AuthState>>,
         client: &Client,

@@ -44,11 +44,11 @@ fn draw_card(buf: &mut Buffer, area: Rect, x: usize, y: usize, card: &Card, face
     // Top-left rank+suit, center suit, bottom-right rank+suit
     let r_pad = if rank.len() == 1 { " " } else { "" };
     let lines = [
-        format!("┌─────┐"),
+        "┌─────┐".to_string(),
         format!("│{}{}{} │", rank, r_pad, suit),
         format!("│  {}  │", suit),
         format!("│ {}{} │", r_pad, rank),  // intentionally mirrored without suit for space
-        format!("└─────┘"),
+        "└─────┘".to_string(),
     ];
 
     for (dy, line) in lines.iter().enumerate() {

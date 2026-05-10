@@ -264,7 +264,7 @@ pub fn resolve_provider(
     overrides: &BTreeMap<String, String>,
 ) -> Option<(ProviderConfig, &'static str)> {
     let specs = providers();
-    let spec = specs.into_iter().find(|s| s.key == key)?;
+    let spec = specs.iter().find(|s| s.key == key)?;
     let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)?;
     Some((
         ProviderConfig {
@@ -288,7 +288,7 @@ pub fn resolve_provider_model(
         return Some(resolve_local(model, overrides));
     }
     let specs = providers();
-    let spec = specs.into_iter().find(|s| s.key == key)?;
+    let spec = specs.iter().find(|s| s.key == key)?;
     let api_key = resolve_api_key(spec.key, spec.env_vars, overrides)?;
     Some(ProviderConfig {
         base_url: spec.base_url.to_string(),
@@ -382,7 +382,7 @@ pub fn list_providers(
     overrides: &BTreeMap<String, String>,
 ) -> Vec<(&'static str, &'static str, bool, usize)> {
     providers()
-        .into_iter()
+        .iter()
         .map(|s| {
             let has_key = resolve_api_key(s.key, s.env_vars, overrides).is_some();
             (s.key, s.name, has_key, s.models.len())
@@ -393,7 +393,7 @@ pub fn list_providers(
 /// List models for a provider.
 pub fn list_models(key: &str) -> Option<Vec<(&'static str, &'static str, &'static str)>> {
     let specs = providers();
-    let spec = specs.into_iter().find(|s| s.key == key)?;
+    let spec = specs.iter().find(|s| s.key == key)?;
     Some(spec.models.to_vec())
 }
 
@@ -402,7 +402,7 @@ pub fn configured_providers(
     overrides: &BTreeMap<String, String>,
 ) -> Vec<(&'static str, &'static str, &'static str)> {
     providers()
-        .into_iter()
+        .iter()
         .filter_map(|s| {
             resolve_api_key(s.key, s.env_vars, overrides)
                 .map(|_| (s.key, s.name, s.default_model))

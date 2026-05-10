@@ -72,6 +72,7 @@ fn save_provider_auth_at(
     let lock_path = path.with_extension("json.lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;

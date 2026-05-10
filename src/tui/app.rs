@@ -951,7 +951,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::tui::theme::THEME;
     use super::*;
 
     fn test_app() -> App {
@@ -1104,7 +1103,7 @@ mod tests {
         let is_blank = |line: &ratatui::text::Line| {
             line.spans.is_empty() || line.spans.iter().all(|span| span.content.is_empty())
         };
-        assert!(between.iter().any(|l| is_blank(l)), "expected blank line between consecutive system messages");
+        assert!(between.iter().any(is_blank), "expected blank line between consecutive system messages");
     }
 
     #[test]
