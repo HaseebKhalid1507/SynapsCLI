@@ -1,8 +1,12 @@
 //! `synaps chat` — fully-featured headless mode.
 //!
 //! Same engine as the TUI (MCP, extensions, skills, session persistence,
-//! compaction, event bus) but renders to stdin/stdout. Built for scripting,
+//! compaction) but renders to stdin/stdout. Built for scripting,
 //! piping, SSH, CI, and agent benchmark frameworks like Harbor.
+//!
+//! Note: the inbox watcher and session socket are started by `engine::setup::boot()`
+//! but inbound events are not actively drained in this mode. Events will accumulate
+//! until the session ends. Full event-queue handling is a TUI-only feature for now.
 
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::commands::{self, CommandResult};
