@@ -260,7 +260,7 @@ pub async fn run(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
@@ -580,7 +580,7 @@ pub async fn run(
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
                                         let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
-                                        stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
+                                        stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
                                         cancel_token = Some(ct);
@@ -1293,7 +1293,7 @@ pub async fn run(
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
                                 let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
-                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
+                                stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
                                 cancel_token = Some(ct);
@@ -1739,7 +1739,7 @@ pub async fn run(
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
                             let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
@@ -1753,7 +1753,7 @@ pub async fn run(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone())).await);
+                            stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);

@@ -2,6 +2,7 @@ use anyhow::Context;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -15,11 +16,17 @@ use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
+use axum::extract::Query;
+use rand::Rng;
+use std::collections::HashMap;
+use synaps_cli::core::config::load_config;
+use synaps_cli::core::config::resolve_write_path;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Shared server state
 struct ServerState {
     runtime: Mutex<Runtime>,
+    allowed_origins: Vec<String>,
     /// Engine-level conversation state — single source of truth for
     /// session, api_messages, token counters (including cache_read /
     /// cache_creation), cost, abort_context, queued_message,
@@ -36,6 +43,12 @@ struct ServerState {
     /// Aborts on drop (inbox watcher, per-session socket listener).
     #[allow(dead_code)] // held for RAII; tasks tear down when ServerState drops
     background: BackgroundTasks,
+    /// Resolved auth token — None means skip auth (backward compat).
+    auth_token: Option<String>,
+    /// Maximum inbound WebSocket message size in bytes. None = no cap.
+    max_message_size: Option<usize>,
+    /// Auto-approve confirm hooks (headless/agent mode).
+    auto_approve_confirms: bool,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -125,6 +138,9 @@ pub async fn run(
     system: Option<String>,
     continue_session: Option<Option<String>>,
     profile: Option<String>,
+    token_override: Option<String>,
+    auto_approve_flag: bool,
+    allowed_origins_override: Option<String>,
 ) -> anyhow::Result<()> {
     // ── Boot via engine ──
     // Replaces ~50 lines of inlined Runtime::new + system prompt + session
@@ -184,6 +200,47 @@ pub async fn run(
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
 
+    // ── Resolve auth token + server config ──
+    let config = load_config();
+    // CLI overrides take precedence over config file values.
+    let allowed_origins = if let Some(ref origins) = allowed_origins_override {
+        origins.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else {
+        config.server.allowed_origins.clone()
+    };
+    let max_message_size = config.server.max_message_size;
+    let auto_approve_confirms = auto_approve_flag || config.server.auto_approve_confirms;
+    let auth_token: Option<String> = match &token_override {
+        // --token "" disables auth entirely
+        Some(t) if t.is_empty() => None,
+        // --token <value> uses that value
+        Some(t) => Some(t.clone()),
+        // No CLI override — use config or auto-generate
+        None => {
+            let token = if let Some(t) = config.server.token {
+                t
+            } else {
+                // Auto-generate a 32-byte random hex token.
+                let bytes: [u8; 32] = rand::rng().random();
+                bytes.iter().map(|b| format!("{:02x}", b)).collect()
+            };
+            // Atomic write: temp file → rename.
+            let token_path = resolve_write_path("server-token");
+            let tmp_path = token_path.with_extension("tmp");
+            if let Err(e) = std::fs::write(&tmp_path, &token) {
+                eprintln!("Warning: could not write token file: {e}");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+                }
+                let _ = std::fs::rename(&tmp_path, &token_path);
+            }
+            Some(token)
+        }
+    };
+
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
         conv: RwLock::new(conv),
@@ -193,6 +250,10 @@ pub async fn run(
         broadcast_tx,
         client_count: RwLock::new(0),
         background: boot.background,
+        auth_token: auth_token.clone(),
+        allowed_origins,
+        max_message_size,
+        auto_approve_confirms,
     });
 
     let app = Router::new()
@@ -208,6 +269,9 @@ pub async fn run(
     eprintln!("╠══════════════════════════════════════╣");
     eprintln!("║  Listening: ws://{}:{:<5}      ║", host, port);
     eprintln!("║  Session:   {:<24}║", &session_id);
+    if let Some(ref tok) = auth_token {
+        eprintln!("║  Token:     {:<24}║", &tok[..tok.len().min(24)]);
+    }
     eprintln!("╚══════════════════════════════════════╝");
 
     // Serve with graceful shutdown on SIGINT/SIGTERM.
@@ -275,8 +339,41 @@ async fn health_handler() -> impl IntoResponse {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Origin validation — reject non-matching origins when allowlist is configured.
+    if !state.allowed_origins.is_empty() {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        match origin {
+            Some(o) if state.allowed_origins.iter().any(|a| a == o) => {}
+            _ => {
+                return (StatusCode::FORBIDDEN, "Forbidden: origin not allowed").into_response();
+            }
+        }
+    }
+
+    // Token auth — validate ?token=X or Authorization: Bearer X.
+    if let Some(ref expected) = state.auth_token {
+        let provided = params.get("token").map(|s| s.as_str()).or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+        match provided {
+            Some(tok) if tok == expected.as_str() => {}
+            _ => {
+                return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+            }
+        }
+    }
+
     ws.on_upgrade(|socket| handle_client(socket, state))
+        .into_response()
 }
 
 async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
@@ -340,6 +437,20 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(text) => {
+                // Message size cap — reject oversized payloads before deserialization.
+                if let Some(max) = state.max_message_size {
+                    let len = text.len();
+                    if len > max {
+                        tracing::warn!(len, max, "inbound message too large — dropping");
+                        let _ = state.broadcast_tx.send(ServerMessage::Error {
+                            message: format!(
+                                "Message too large: {} bytes exceeds limit of {} bytes",
+                                len, max
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     handle_message(client_msg, &state).await;
                 }
@@ -472,7 +583,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
         let mut stream = {
             let rt = state.runtime.lock().await;
-            rt.run_stream_with_messages(messages, cancel, None, None)
+            rt.run_stream_with_messages(messages, cancel, None, None, state.auto_approve_confirms)
                 .await
         };
 
