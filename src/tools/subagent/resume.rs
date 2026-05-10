@@ -178,6 +178,7 @@ impl Tool for SubagentResumeTool {
                         cancel,
                         Some(steer_rx),
                         None,
+                        false,
                     ).await;
 
                     let mut tool_count = 0u32;

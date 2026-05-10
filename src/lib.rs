@@ -9,6 +9,8 @@ pub mod memory;
 pub mod help;
 pub mod sidecar;
 pub mod toast;
+pub mod engine;
+pub mod pricing;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
