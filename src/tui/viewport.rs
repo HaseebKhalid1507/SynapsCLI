@@ -8,10 +8,10 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::Style,
-    text::Line,
-    widgets::{Paragraph, Widget},
     Terminal,
 };
+#[cfg(test)]
+use ratatui::{text::Line, widgets::{Paragraph, Widget}};
 
 /// Terminal cells that should be physically blanked before each diff draw.
 ///
@@ -117,7 +117,7 @@ where
 /// optimizations. Clearing the viewport cells before drawing prevents edge-column
 /// residue when content moves upward by one row and a previously occupied first or
 /// last cell is blank in the new frame.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn render_scrolled_lines(
     buf: &mut Buffer,
     area: Rect,

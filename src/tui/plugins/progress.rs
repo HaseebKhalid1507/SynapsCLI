@@ -246,7 +246,7 @@ fn extract_throughput(rest: &str) -> Option<String> {
 /// since git uses `\r` to overwrite the same line.
 #[cfg(test)]
 pub fn split_progress_chunks(buf: &str) -> Vec<&str> {
-    buf.split(|c: char| c == '\r' || c == '\n')
+    buf.split(['\r', '\n'])
         .filter(|s| !s.is_empty())
         .collect()
 }
