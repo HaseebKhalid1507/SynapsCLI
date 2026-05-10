@@ -11,3 +11,5 @@ pub mod models;
 pub mod compaction;
 pub mod chain;
 pub mod session_index;
+pub mod rpc_protocol;
+pub mod rpc_dispatch;
