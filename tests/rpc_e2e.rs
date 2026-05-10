@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_match)]
 //! End-to-end subprocess harness for `synaps rpc`.
 //!
 //! Spawns the real `synaps` binary as a child process, drives it over its

@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use synaps_cli::extensions::settings_editor::{
-    SettingsEditorCloseParams, SettingsEditorKeyParams,
+    SettingsEditorCloseParams, SettingsEditorCommitParams, SettingsEditorKeyParams,
     SettingsEditorOpenParams, SettingsEditorRenderParams,
 };
 
@@ -220,7 +220,6 @@ pub(crate) fn effect_from_commit_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
