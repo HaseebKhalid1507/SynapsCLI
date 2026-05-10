@@ -528,6 +528,55 @@ mod tests {
         assert!(config.disabled_skills.is_empty());
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
+        // Server config defaults
+        assert!(config.server.allowed_origins.is_empty());
+        assert_eq!(config.server.token, None);
+        assert!(!config.server.auto_approve_confirms);
+        assert_eq!(config.server.max_message_size, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_server_keys() {
+        let home = make_test_home("server-keys");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "\
+server.allowed_origins = http://localhost:3000, http://localhost:5193\n\
+server.token = my-secret-token\n\
+server.auto_approve_confirms = true\n\
+server.max_message_size = 65536\n\
+context_window = 200k\n\
+").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.server.allowed_origins, vec![
+                "http://localhost:3000".to_string(),
+                "http://localhost:5193".to_string(),
+            ]);
+            assert_eq!(config.server.token, Some("my-secret-token".to_string()));
+            assert!(config.server.auto_approve_confirms);
+            // Explicit max_message_size takes precedence over context_window derivation
+            assert_eq!(config.server.max_message_size, Some(65536));
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_max_message_size_derived_from_context_window() {
+        let home = make_test_home("server-derive");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "context_window = 200k\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            // 200_000 tokens * 4 bytes/token = 800_000 bytes
+            assert_eq!(config.server.max_message_size, Some(800_000));
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
