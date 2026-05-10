@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 /// Returns the final assistant response as an Anthropic-shaped content Value
 /// (`{"content": [..text.., ..tool_use..]}`) so the outer agent loop can keep
 /// using the same handling as the native Anthropic path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_oai_stream_inner(
     cfg: &ProviderConfig,
     client: &reqwest::Client,
@@ -145,6 +146,7 @@ pub(crate) async fn call_oai_stream_inner(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_codex_stream_inner(
     cfg: &ProviderConfig,
     client: &reqwest::Client,

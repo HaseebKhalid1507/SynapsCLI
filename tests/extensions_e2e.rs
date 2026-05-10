@@ -1,3 +1,4 @@
+#![allow(clippy::await_holding_lock, clippy::useless_format)]
 //! Integration test: spawn the time extension and verify JSON-RPC communication.
 
 use std::fs;
@@ -171,6 +172,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         serde_json::json!({"command": "rm -rf /tmp/nope"}),
         before,
         None,
+        false,
     ).await;
     let input = match decision {
         synaps_cli::runtime::BeforeToolCallDecision::Continue { input } => input,

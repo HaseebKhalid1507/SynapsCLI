@@ -164,7 +164,7 @@ impl Tool for SubagentStartTool {
                         let mgr = ext_mgr.read().await;
                         if let Some(shared) = mgr.tools_shared() {
                             let extension_tools = shared.read().await;
-                            crate::ToolRegistry::without_subagent_with_extensions(&*extension_tools)
+                            crate::ToolRegistry::without_subagent_with_extensions(&extension_tools)
                         } else {
                             crate::ToolRegistry::without_subagent()
                         }
@@ -180,7 +180,7 @@ impl Tool for SubagentStartTool {
                         cancel_inner.cancel();
                     });
 
-                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx), None).await;
+                    let mut stream = runtime.run_stream_with_messages(vec![serde_json::json!({"role": "user", "content": task})], cancel, Some(steer_rx), None, false).await;
 
                     let mut tool_count = 0u32;
                     let mut total_input_tokens = 0u64;

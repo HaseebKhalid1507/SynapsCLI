@@ -69,16 +69,13 @@ pub struct CachedPluginIndexMetadata {
     pub trust_homepage: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SetupStatus {
+    #[default]
     NotRequired,
     Succeeded { log_path: Option<String> },
     Failed { message: String, log_path: Option<String> },
-}
-
-impl Default for SetupStatus {
-    fn default() -> Self { Self::NotRequired }
 }
 
 impl SetupStatus {

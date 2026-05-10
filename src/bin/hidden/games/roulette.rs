@@ -67,12 +67,12 @@ impl BetType {
             BetType::Black => result > 0 && number_color(result) == RouletteColor::Black,
             BetType::Odd => result > 0 && result % 2 == 1,
             BetType::Even => result > 0 && result % 2 == 0,
-            BetType::Low => result >= 1 && result <= 18,
-            BetType::High => result >= 19 && result <= 36,
+            BetType::Low => (1..=18).contains(&result),
+            BetType::High => (19..=36).contains(&result),
             BetType::Dozen(d) => match d {
-                1 => result >= 1 && result <= 12,
-                2 => result >= 13 && result <= 24,
-                3 => result >= 25 && result <= 36,
+                1 => (1..=12).contains(&result),
+                2 => (13..=24).contains(&result),
+                3 => (25..=36).contains(&result),
                 _ => false,
             },
         }

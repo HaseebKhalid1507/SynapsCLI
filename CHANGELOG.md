@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Recent (Dev Branch)
+- **Engine refactor + `chat` headless mode** — `daemon`, `run`, and `client` subcommands deleted; `chat` is now fully-featured headless mode with MCP, extensions, skills, sessions, compaction, and the event bus (same engine as the TUI, stdin/stdout rendering)
+  - New `engine/` module: `setup.rs` (boot), `commands.rs` (headless slash commands), `stream.rs` (StreamEvent consumer), `session.rs` (ConversationState)
+  - `chatui/` module deleted — `tui/` is the sole frontend
+  - New `pricing.rs` — centralized Anthropic pricing (Opus/Sonnet/Haiku) with cache billing support
+  - New `harbor/synaps_agent.py` — Terminal-Bench integration agent
+  - Clippy CI added (`cargo clippy --all-targets` gates PRs)
+  - Published on crates.io as `synaps` (v0.1.x); available via `cargo install synaps`, AUR (`yay -S synaps`), Homebrew, and GitHub Releases
 - **Path B Phase 6 — The Big Move (extension contracts)** — synaps-cli core no longer contains whisper-specific code; the local-voice plugin owns it
   - Deleted `src/voice/{models,download,rebuild}.rs` (whisper.cpp catalog, HuggingFace downloader, cmake-rebuild orchestrator)
   - Slimmed `src/voice/discovery.rs` from ~400 LOC to ~190: only `discover()` / `discover_in()` / `DiscoveredVoiceSidecar` remain; `read_build_info`, `detect_host_backend`, `probe_*` are gone (callers use the Phase 5 `info.get` cache instead)
@@ -169,15 +176,16 @@ All notable changes to this project will be documented in this file.
 - **Plugins subdir sources and cascade uninstall**: install from subdir-based plugin repos, cascade-remove plugins when their marketplace is deleted
 - **Settings → Plugins marketplace overlay**: "Open Plugin Marketplace" action row in Settings, opens plugins modal as nested overlay
 - **Hidden binary**: GamblersDen bundled as `hidden` binary alongside `synaps`
-- **Single binary architecture**: all 8 binaries consolidated into `synaps`
+- **Single binary architecture**: all binaries consolidated into `synaps`
   - `synaps` (no args) = TUI (was `chatui`)
-  - `synaps run` = one-shot prompt (was `cli run`)
-  - `synaps chat` = streaming chat (was `chat`)
+  - `synaps chat` = fully-featured headless mode (MCP, extensions, skills, sessions)
   - `synaps server` = WebSocket API (was `server`)
-  - `synaps client` = WS client (was `client`)
   - `synaps agent` = headless worker (was `synaps-agent`)
   - `synaps watcher` = supervisor (was `watcher`)
   - `synaps login` = OAuth (was `login`)
+  - `synaps send` = push events into a running session
+  - `synaps status` = check account usage
+  - (Removed: `run`, `client`, `daemon`)
 - **Live theme preview in /settings**: scroll themes to preview, Enter confirms, Esc reverts
 - **Theme hot-reload**: `/theme <name>` applies instantly without restart (ArcSwap)
 - **Settings picker scroll**: theme/model picker scrolls with cursor

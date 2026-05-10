@@ -196,7 +196,7 @@ mod tests {
 
         // Give the task a moment to push
         for _ in 0..50 {
-            if queue.len() > 0 {
+            if !queue.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -256,7 +256,7 @@ mod tests {
         client2.shutdown().await.unwrap();
 
         for _ in 0..50 {
-            if queue.len() > 0 {
+            if !queue.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

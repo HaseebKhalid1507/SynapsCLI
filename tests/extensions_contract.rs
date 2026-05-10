@@ -215,6 +215,7 @@ async fn manager_rejects_bad_manifest_before_spawning_process() {
 static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn discovery_reports_malformed_extension_and_spawn_failures() {
     let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
     use std::fs;

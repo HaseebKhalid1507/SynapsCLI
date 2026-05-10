@@ -105,7 +105,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         params,
         &registry,
         &Arc::new(synaps_cli::extensions::hooks::HookBus::new()),
-        || test_context(),
+        test_context,
         1000,
         4,
     ).await.expect("provider loop succeeds");

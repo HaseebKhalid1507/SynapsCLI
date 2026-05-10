@@ -71,6 +71,10 @@ pub struct KeybindRegistry {
     collisions: Vec<KeybindCollision>,
 }
 
+impl Default for KeybindRegistry {
+    fn default() -> Self { Self::new() }
+}
+
 impl KeybindRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
@@ -231,8 +235,8 @@ impl KeybindRegistry {
 
             let action = if value == "disabled" {
                 KeybindAction::Disabled
-            } else if value.starts_with('/') {
-                let cmd = value[1..].to_string();
+            } else if let Some(stripped) = value.strip_prefix('/') {
+                let cmd = stripped.to_string();
                 KeybindAction::SlashCommand(cmd)
             } else {
                 KeybindAction::InjectPrompt(value.clone())
@@ -414,9 +418,7 @@ pub fn format_key(combo: &KeyCombo) -> String {
         _ => "?".to_string(),
     };
     parts.push(&key);
-    // Need to own the string for the key
-    let key_owned = parts.join("+");
-    key_owned
+    parts.join("+")
 }
 
 #[cfg(test)]
