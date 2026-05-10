@@ -105,8 +105,8 @@ subagent(agent: "spike", task: "refactor the auth module")
 
 # Or dispatch reactively — don't wait, steer mid-flight
 subagent_start(agent: "chrollo", task: "audit this codebase for vulnerabilities")
-subagent_steer(handle: "sa_1", message: "focus on the API routes")
-subagent_collect(handle: "sa_1")
+subagent_steer(handle_id: "sa_1", message: "focus on the API routes")
+subagent_collect(handle_id: "sa_1")
 ```
 
 The big agent dispatches little helper agents — like a chef with sous-chefs. You can poke them mid-task, redirect them, or let them run. And there's a **watcher** that supervises the fleet so they don't crash or burn through your budget.
@@ -127,7 +127,7 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 ## Features
 
-**⚡ Fast.** ~70K lines of Rust. Sub-100ms cold start. Single binary, no runtime dependencies.
+**⚡ Fast.** ~73K lines of Rust. Sub-100ms cold start. Single binary, no runtime dependencies.
 
 **🌐 Any model.** Claude, GPT-4, Gemini, Llama, Qwen, Mistral, DeepSeek — 17 providers including free tiers (Groq, Cerebras, NVIDIA NIM). Swap mid-session with `/model`.
 
@@ -137,7 +137,7 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 **📡 Event bus.** Push events into a running session from any script, cron, or service. The agent reacts in real time.
 
-**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls.
+**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_message_complete`, `on_compaction`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls.
 
 **🧠 Context that lasts.** 90%+ prompt cache hit rate. `/compact` replaces history with a structured checkpoint. Chain sessions across days.
 
@@ -199,11 +199,12 @@ That's it. No YAML. No TOML. No JSON. Key = value. Done.
 
 Plugins are like stickers you snap onto your agent — want code guardrails? Stick on a security plugin. Want memory? Stick on a memory plugin. Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot.
 
-Extensions hook into the agent loop via 5 lifecycle events. They can block tool calls, inject context, modify inputs, or just observe. Permission-gated. Sandboxed processes.
+Extensions hook into the agent loop via 7 lifecycle events. They can block tool calls, inject context, modify inputs, or just observe. Permission-gated. Sandboxed processes.
 
 ```
 ~/.synaps-cli/plugins/my-guard/
-├── plugin.json        # manifest: hooks, permissions, keybinds
+├── .synaps-plugin/
+│   └── plugin.json    # manifest: hooks, permissions, keybinds
 └── index.js           # JSON-RPC 2.0 over stdio
 ```
 
@@ -238,7 +239,9 @@ src/
 ├── events/          # event bus + priority queue
 ├── mcp/             # Model Context Protocol client
 ├── watcher/         # autonomous agent supervisor
-└── skills/          # markdown-driven behavioral guidelines
+├── skills/          # markdown-driven behavioral guidelines
+├── memory/          # local plugin memory store
+└── sidecar/         # long-running plugin companion processes
 ```
 
 Two API paths: Anthropic (native) and OpenAI-compatible (17 providers). Both emit the same `StreamEvent` — the TUI and tool loop are provider-blind.
