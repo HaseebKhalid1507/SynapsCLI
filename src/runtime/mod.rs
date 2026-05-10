@@ -480,7 +480,7 @@ impl Runtime {
                                     input.clone(),
                                     emit_before_tool_call(
                                         &self.hook_bus,
-                                        &tool_name,
+                                        tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
                                     ).await,
@@ -498,7 +498,7 @@ impl Runtime {
                                     };
                                     let _ = emit_after_tool_call(
                                         &self.hook_bus,
-                                        &tool_name,
+                                        tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
                                         output.clone(),

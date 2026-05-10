@@ -892,7 +892,7 @@ pub fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
     for word in content.split_whitespace() {
         let separator = if current.trim().is_empty() { "" } else { " " };
         let candidate_len = current.len() + separator.len() + word.len();
-        if candidate_len > width && current.trim().len() > 0 {
+        if candidate_len > width && !current.trim().is_empty() {
             lines.push(current);
             current = format!("{}{}", indent, word);
         } else {
@@ -928,7 +928,7 @@ pub fn wrap_help_find_entry_lines(command: &str, summary: &str, selected: bool, 
     let marker = if selected { "›" } else { " " };
     let first_prefix = format!("{} ", marker);
     let continuation_prefix = "    ";
-    let first_command_width = width.saturating_sub(first_prefix.chars().count()).min(22).max(8);
+    let first_command_width = width.saturating_sub(first_prefix.chars().count()).clamp(8, 22);
     let command_lines = wrap_help_find_token(command, first_command_width);
     let mut lines = Vec::new();
 

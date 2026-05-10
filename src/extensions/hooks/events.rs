@@ -58,6 +58,7 @@ impl HookKind {
     ///
     /// Returns `None` for unrecognised strings so callers can surface
     /// a manifest validation error rather than silently dropping hooks.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "before_tool_call" => Some(Self::BeforeToolCall),
@@ -88,14 +89,14 @@ impl HookKind {
 
     /// Whether this hook accepts a handler result action.
     pub fn allows_result(&self, result: &HookResult) -> bool {
-        match (self, result) {
-            (_, HookResult::Continue) => true,
-            (Self::BeforeToolCall, HookResult::Block { .. }) => true,
-            (Self::BeforeToolCall, HookResult::Confirm { .. }) => true,
-            (Self::BeforeToolCall, HookResult::Modify { .. }) => true,
-            (Self::BeforeMessage, HookResult::Inject { .. }) => true,
-            _ => false,
-        }
+        matches!(
+            (self, result),
+            (_, HookResult::Continue)
+                | (Self::BeforeToolCall, HookResult::Block { .. })
+                | (Self::BeforeToolCall, HookResult::Confirm { .. })
+                | (Self::BeforeToolCall, HookResult::Modify { .. })
+                | (Self::BeforeMessage, HookResult::Inject { .. })
+        )
     }
 
     /// The [`Permission`] an extension must hold to subscribe to this hook.
@@ -305,10 +306,11 @@ impl HookEvent {
 /// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HookResult {
     /// Allow execution to proceed unchanged.
+    #[default]
     Continue,
     /// Prevent the hooked operation. The `reason` is surfaced to the user.
     Block { reason: String },
@@ -322,13 +324,15 @@ pub enum HookResult {
     Modify { input: Value },
 }
 
-impl Default for HookResult {
-    fn default() -> Self {
-        Self::Continue
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+impl HookEvent {
+    /// Set the runtime name for tool-related events.
+    pub fn with_runtime_name(mut self, name: &str) -> Self {
+        self.tool_runtime_name = Some(name.to_string());
+        self
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -569,13 +573,5 @@ mod tests {
     fn hook_result_continue_serde() {
         let json = serde_json::to_string(&HookResult::Continue).unwrap();
         assert_eq!(json, r#"{"action":"continue"}"#);
-    }
-}
-
-impl HookEvent {
-    /// Set the runtime name for tool-related events.
-    pub fn with_runtime_name(mut self, name: &str) -> Self {
-        self.tool_runtime_name = Some(name.to_string());
-        self
     }
 }

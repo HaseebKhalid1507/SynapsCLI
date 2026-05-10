@@ -120,7 +120,7 @@ pub fn process_stream_event(
         }
         StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
             subagents.push(SubagentTracker {
-                id: subagent_id.clone(),
+                id: subagent_id,
                 name: agent_name.clone(),
                 status: format!("starting: {}", task_preview),
                 start_time: std::time::Instant::now(),
