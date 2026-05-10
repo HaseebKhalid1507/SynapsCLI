@@ -138,6 +138,9 @@ pub async fn run(
     system: Option<String>,
     continue_session: Option<Option<String>>,
     profile: Option<String>,
+    token_override: Option<String>,
+    auto_approve_flag: bool,
+    allowed_origins_override: Option<String>,
 ) -> anyhow::Result<()> {
     // ── Boot via engine ──
     // Replaces ~50 lines of inlined Runtime::new + system prompt + session
@@ -199,31 +202,43 @@ pub async fn run(
 
     // ── Resolve auth token + server config ──
     let config = load_config();
-    let allowed_origins = config.server.allowed_origins.clone();
+    // CLI overrides take precedence over config file values.
+    let allowed_origins = if let Some(ref origins) = allowed_origins_override {
+        origins.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else {
+        config.server.allowed_origins.clone()
+    };
     let max_message_size = config.server.max_message_size;
-    let auto_approve_confirms = config.server.auto_approve_confirms;
-    let auth_token: Option<String> = {
-        let token = if let Some(t) = config.server.token {
-            t
-        } else {
-            // Auto-generate a 32-byte random hex token.
-            let bytes: [u8; 32] = rand::rng().random();
-            bytes.iter().map(|b| format!("{:02x}", b)).collect()
-        };
-        // Atomic write: temp file → rename.
-        let token_path = resolve_write_path("server-token");
-        let tmp_path = token_path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &token) {
-            eprintln!("Warning: could not write token file: {e}");
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    let auto_approve_confirms = auto_approve_flag || config.server.auto_approve_confirms;
+    let auth_token: Option<String> = match &token_override {
+        // --token "" disables auth entirely
+        Some(t) if t.is_empty() => None,
+        // --token <value> uses that value
+        Some(t) => Some(t.clone()),
+        // No CLI override — use config or auto-generate
+        None => {
+            let token = if let Some(t) = config.server.token {
+                t
+            } else {
+                // Auto-generate a 32-byte random hex token.
+                let bytes: [u8; 32] = rand::rng().random();
+                bytes.iter().map(|b| format!("{:02x}", b)).collect()
+            };
+            // Atomic write: temp file → rename.
+            let token_path = resolve_write_path("server-token");
+            let tmp_path = token_path.with_extension("tmp");
+            if let Err(e) = std::fs::write(&tmp_path, &token) {
+                eprintln!("Warning: could not write token file: {e}");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+                }
+                let _ = std::fs::rename(&tmp_path, &token_path);
             }
-            let _ = std::fs::rename(&tmp_path, &token_path);
+            Some(token)
         }
-        Some(token)
     };
 
     let state = Arc::new(ServerState {

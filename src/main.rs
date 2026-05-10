@@ -56,6 +56,15 @@ enum Command {
         system: Option<String>,
         #[arg(long = "continue", value_name = "NAME_OR_ID")]
         continue_session: Option<Option<String>>,
+        /// Auth token (overrides config). Empty string disables auth.
+        #[arg(long)]
+        token: Option<String>,
+        /// Auto-approve extension confirm hooks without prompting.
+        #[arg(long)]
+        auto_approve_confirms: bool,
+        /// Comma-separated allowed origins (overrides config).
+        #[arg(long)]
+        allowed_origins: Option<String>,
     },
     /// Headless autonomous agent
     Agent {
@@ -110,8 +119,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Chat { continue_session, system, agent, profile, no_extensions }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
         }
-        Some(Command::Server { port, host, system, continue_session }) => {
-            cmd::server::run(port, host, system, continue_session, cli.profile).await?;
+        Some(Command::Server { port, host, system, continue_session, token, auto_approve_confirms, allowed_origins }) => {
+            cmd::server::run(port, host, system, continue_session, cli.profile, token, auto_approve_confirms, allowed_origins).await?;
         }
         Some(Command::Agent { config, trigger_context }) => {
             cmd::agent::run(config, trigger_context).await;
