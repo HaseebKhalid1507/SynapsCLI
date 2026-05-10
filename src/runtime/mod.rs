@@ -51,7 +51,6 @@ pub async fn emit_before_tool_call(
 
 
 /// Resolve a before_tool_call result that may request user confirmation.
-/// Resolve a before_tool_call result that may request user confirmation.
 ///
 /// When `auto_approve_confirms` is true, `Confirm` is short-circuited to `Continue`.
 /// Headless/non-interactive callers with `auto_approve_confirms = false` fail closed.
