@@ -2,6 +2,7 @@ use anyhow::Context;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -15,11 +16,17 @@ use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
+use axum::extract::Query;
+use rand::Rng;
+use std::collections::HashMap;
+use synaps_cli::core::config::load_config;
+use synaps_cli::core::config::resolve_write_path;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Shared server state
 struct ServerState {
     runtime: Mutex<Runtime>,
+    allowed_origins: Vec<String>,
     /// Engine-level conversation state — single source of truth for
     /// session, api_messages, token counters (including cache_read /
     /// cache_creation), cost, abort_context, queued_message,
@@ -36,6 +43,8 @@ struct ServerState {
     /// Aborts on drop (inbox watcher, per-session socket listener).
     #[allow(dead_code)] // held for RAII; tasks tear down when ServerState drops
     background: BackgroundTasks,
+    /// Resolved auth token — None means skip auth (backward compat).
+    auth_token: Option<String>,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -184,6 +193,32 @@ pub async fn run(
     let session_id = conv.session.id.clone();
     let (broadcast_tx, _) = broadcast::channel::<ServerMessage>(256);
 
+    // ── Resolve auth token ──
+    let auth_token: Option<String> = {
+        let config = load_config();
+        let token = if let Some(t) = config.server.token {
+            t
+        } else {
+            // Auto-generate a 32-byte random hex token.
+            let bytes: [u8; 32] = rand::rng().random();
+            bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        };
+        // Atomic write: temp file → rename.
+        let token_path = resolve_write_path("server-token");
+        let tmp_path = token_path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &token) {
+            eprintln!("Warning: could not write token file: {e}");
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::rename(&tmp_path, &token_path);
+        }
+        Some(token)
+    };
+
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
         conv: RwLock::new(conv),
@@ -192,8 +227,8 @@ pub async fn run(
         cancel_token: RwLock::new(None),
         broadcast_tx,
         client_count: RwLock::new(0),
-        max_message_size,
         background: boot.background,
+        auth_token: auth_token.clone(),
     });
 
     let app = Router::new()
@@ -209,6 +244,9 @@ pub async fn run(
     eprintln!("╠══════════════════════════════════════╣");
     eprintln!("║  Listening: ws://{}:{:<5}      ║", host, port);
     eprintln!("║  Session:   {:<24}║", &session_id);
+    if let Some(ref tok) = auth_token {
+        eprintln!("║  Token:     {:<24}║", &tok[..tok.len().min(24)]);
+    }
     eprintln!("╚══════════════════════════════════════╝");
 
     // Serve with graceful shutdown on SIGINT/SIGTERM.
@@ -276,8 +314,28 @@ async fn health_handler() -> impl IntoResponse {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Some(ref expected) = state.auth_token {
+        // Check ?token=X query param first, then Authorization: Bearer X header.
+        let provided = params.get("token").map(|s| s.as_str()).or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+
+        match provided {
+            Some(tok) if tok == expected.as_str() => {}
+            _ => {
+                return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+            }
+        }
+    }
+
     ws.on_upgrade(|socket| handle_client(socket, state))
+        .into_response()
 }
 
 async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
@@ -341,19 +399,6 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(text) => {
-                if let Some(max) = state.max_message_size {
-                    let len = text.len();
-                    if len > max {
-                        tracing::warn!(len, max, "inbound message too large — dropping");
-                        let _ = state.broadcast_tx.send(ServerMessage::Error {
-                            message: format!(
-                                "Message too large: {} bytes exceeds limit of {} bytes",
-                                len, max
-                            ),
-                        });
-                        continue;
-                    }
-                }
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     handle_message(client_msg, &state).await;
                 }
@@ -486,7 +531,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
 
         let mut stream = {
             let rt = state.runtime.lock().await;
-            rt.run_stream_with_messages(messages, cancel, None, None)
+            rt.run_stream_with_messages(messages, cancel, None, None, false)
                 .await
         };
 
