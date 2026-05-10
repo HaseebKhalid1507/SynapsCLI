@@ -104,6 +104,9 @@ pub(crate) fn close_note(params: SettingsEditorCloseParams) -> Option<String> {
 }
 
 #[cfg(test)]
+use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
+
+#[cfg(test)]
 pub(crate) fn effect_from_commit(
     plugin_id: &str,
     field: &str,

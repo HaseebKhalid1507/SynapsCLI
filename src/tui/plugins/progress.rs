@@ -70,6 +70,7 @@ pub struct CloneProgress {
 
 impl CloneProgress {
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn new(phase: ClonePhase) -> Self {
         Self {
             phase,
