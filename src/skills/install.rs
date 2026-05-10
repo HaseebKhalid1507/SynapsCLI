@@ -59,7 +59,7 @@ pub fn clone_repo_with_progress(
                 // Process complete chunks (split on either CR or LF —
                 // git uses CR to overwrite the same progress line).
                 loop {
-                    let split = accum.find(|c: char| c == '\r' || c == '\n');
+                    let split = accum.find(['\r', '\n']);
                     let Some(pos) = split else { break };
                     let chunk: String = accum.drain(..pos).collect();
                     // Drop the single delimiter character.
@@ -96,8 +96,7 @@ pub fn clone_repo_with_progress(
             // Take the last non-empty line as the most relevant error.
             trimmed
                 .lines()
-                .filter(|l| !l.trim().is_empty())
-                .next_back()
+                .rfind(|l| !l.trim().is_empty())
                 .unwrap_or(trimmed)
                 .to_string()
         };

@@ -89,6 +89,7 @@ pub fn resolve_route(model: &str, provider_keys: &BTreeMap<String, String>) -> P
 ///
 /// This is the single routing entry point — both streaming and non-streaming
 /// callers in `api.rs` use this instead of duplicating the routing logic.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_route(
     model: &str,
     client: &reqwest::Client,

@@ -650,8 +650,7 @@ mod tests {
     // 4. Max sessions limit → error on exceeding
     #[tokio::test]
     async fn test_max_sessions_limit() {
-        let mut config = ShellConfig::default();
-        config.max_sessions = 2;
+        let config = ShellConfig { max_sessions: 2, ..Default::default() };
         let mgr = SessionManager::new(config);
 
         let (id1, _, _s) = mgr

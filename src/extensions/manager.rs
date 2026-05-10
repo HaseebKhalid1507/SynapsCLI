@@ -960,6 +960,7 @@ impl ExtensionManager {
                 }
             };
 
+            #[allow(clippy::if_same_then_else)]
             let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
                 ext_manifest.command.clone()
             } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR) && !ext_manifest.command.contains('/') {

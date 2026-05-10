@@ -56,7 +56,6 @@ use crate::skills::manifest::PluginManifest;
 /// Returns `None` for hosts we don't have a stable name for (caller
 /// then skips the prebuilt-fallback path and falls back to the setup
 /// script).
-
 /// Maximum accepted prebuilt archive size (128 MiB). Downloads are streamed and
 /// rejected before extraction if this cap is exceeded.
 pub const MAX_PREBUILT_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
@@ -901,6 +900,7 @@ pub async fn run_setup_script(
             log_file.write_all(&err_buf).await?;
             log_file.flush().await?;
         }
+        #[allow(clippy::needless_question_mark)]
         Ok::<_, std::io::Error>(status?)
     };
 

@@ -45,6 +45,10 @@ pub struct SecretPromptQueue {
     pending: std::collections::VecDeque<SecretPromptRequest>,
 }
 
+impl Default for SecretPromptQueue {
+    fn default() -> Self { Self::new() }
+}
+
 impl SecretPromptQueue {
     pub fn new() -> Self {
         Self {
