@@ -1,6 +1,7 @@
 #![allow(
     clippy::too_many_arguments,
     clippy::collapsible_if,
+    clippy::collapsible_match,
     clippy::single_match,
     clippy::field_reassign_with_default,
     clippy::manual_clamp,
@@ -11,6 +12,7 @@
     clippy::await_holding_lock,
     clippy::useless_format,
     clippy::cmp_owned,
+    clippy::items_after_test_module,
 )]
 
 use clap::{Parser, Subcommand};
