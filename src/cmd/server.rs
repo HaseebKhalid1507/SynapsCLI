@@ -192,6 +192,7 @@ pub async fn run(
         cancel_token: RwLock::new(None),
         broadcast_tx,
         client_count: RwLock::new(0),
+        max_message_size,
         background: boot.background,
     });
 
@@ -340,6 +341,19 @@ async fn handle_client(socket: WebSocket, state: Arc<ServerState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Text(text) => {
+                if let Some(max) = state.max_message_size {
+                    let len = text.len();
+                    if len > max {
+                        tracing::warn!(len, max, "inbound message too large — dropping");
+                        let _ = state.broadcast_tx.send(ServerMessage::Error {
+                            message: format!(
+                                "Message too large: {} bytes exceeds limit of {} bytes",
+                                len, max
+                            ),
+                        });
+                        continue;
+                    }
+                }
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                     handle_message(client_msg, &state).await;
                 }
