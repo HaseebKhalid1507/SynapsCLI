@@ -12,7 +12,8 @@
 </p>
 
 <p align="center">
-  One Rust binary. Any model. Any provider.
+  One Rust binary. Any model. Any provider.<br><br>
+  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki"><b>📖 Read the Wiki</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/Installation"><b>⚡ Quick Start</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/FAQ-and-Troubleshooting"><b>❓ FAQ</b></a>
 </p>
 
 ---
@@ -120,7 +121,7 @@ The big agent dispatches little helper agents — like a chef with sous-chefs. Y
 
 Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. You build a team, not a chatbot.
 
-*New to AI agents? Read the [ELI5](ELI5.md).*
+*New to AI agents? Read the [ELI5](ELI5.md). Want the full tour? Check the **[Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki)**.*
 
 ---
 
@@ -208,7 +209,7 @@ Extensions hook into the agent loop via 5 lifecycle events. They can block tool 
 
 And anything in the world can poke your agent — monitoring systems, cron jobs, CI pipelines. `synaps send "the website is down" --source uptime-kuma` and your agent wakes up and handles it.
 
-See [docs/extensions/](docs/extensions/) for the protocol spec.
+See [docs/extensions/](docs/extensions/) for the protocol spec, or the **[Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki)** for the full documentation — 36 pages covering everything from installation to multi-agent orchestration.
 
 ---
 
