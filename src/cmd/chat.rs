@@ -181,7 +181,7 @@ pub async fn run(
 
         let cancel = CancellationToken::new();
         let mut stream = runtime.run_stream_with_messages(
-            conv.api_messages.clone(), cancel, None, None
+            conv.api_messages.clone(), cancel, None, None, false
         ).await;
 
         let mut in_thinking = false;
