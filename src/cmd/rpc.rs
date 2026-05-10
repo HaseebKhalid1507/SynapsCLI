@@ -148,7 +148,7 @@ async fn spawn_prompt(
         let mut stream = {
             let st = state.lock().await;
             st.runtime
-                .run_stream_with_messages(messages, cancel_clone, None, None)
+                .run_stream_with_messages(messages, cancel_clone, None, None, false)
                 .await
         };
 
