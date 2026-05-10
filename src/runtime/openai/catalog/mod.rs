@@ -61,6 +61,7 @@ pub enum Modality {
 }
 
 impl Modality {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "text"  => Modality::Text,

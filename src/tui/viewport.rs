@@ -8,10 +8,10 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::Style,
-    text::Line,
-    widgets::{Paragraph, Widget},
     Terminal,
 };
+#[cfg(test)]
+use ratatui::{text::Line, widgets::{Paragraph, Widget}};
 
 /// Terminal cells that should be physically blanked before each diff draw.
 ///
@@ -66,6 +66,7 @@ pub(crate) fn edge_scrub_area(size: Rect, protected_bottom_rows: u16) -> Option<
 /// Physically blank the terminal edge columns and reset ratatui's back buffer so
 /// the following draw does not optimize those blanks away.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn scrub_terminal_edges<B>(terminal: &mut Terminal<B>, style: Style) -> io::Result<()>
 where
     B: Backend,
@@ -117,7 +118,8 @@ where
 /// optimizations. Clearing the viewport cells before drawing prevents edge-column
 /// residue when content moves upward by one row and a previously occupied first or
 /// last cell is blank in the new frame.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn render_scrolled_lines(
     buf: &mut Buffer,
     area: Rect,

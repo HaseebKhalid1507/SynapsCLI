@@ -81,6 +81,7 @@ fn draw_reels(buf: &mut Buffer, area: Rect, game: &SlotsGame, app: &App, w: usiz
 
         draw_str(buf, area, rx, reel_y, "╔═══════╗", border_color);
 
+        #[allow(clippy::needless_range_loop)]
         for dy in 0..3 {
             let sym = window[dy];
             let y = reel_y + 1 + dy;

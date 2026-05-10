@@ -104,6 +104,9 @@ pub(crate) fn close_note(params: SettingsEditorCloseParams) -> Option<String> {
 }
 
 #[cfg(test)]
+use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
+
+#[cfg(test)]
 pub(crate) fn effect_from_commit(
     plugin_id: &str,
     field: &str,
@@ -220,7 +223,7 @@ pub(crate) fn effect_from_commit_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::settings_editor::SettingsEditorCommitParams;
+    use synaps_cli::extensions::settings_editor::SettingsEditorCommitParams;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 

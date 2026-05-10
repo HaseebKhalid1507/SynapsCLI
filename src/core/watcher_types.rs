@@ -113,18 +113,12 @@ pub struct HeartbeatConfig {
 }
 
 /// Hooks that fire on agent lifecycle events.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct HooksConfig {
     /// Drop a JSON event into ~/.synaps-cli/inbox/ when the agent completes.
     /// Picked up by the event bus in any running TUI session.
     #[serde(default)]
     pub notify_inbox: bool,
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self { notify_inbox: false }
-    }
 }
 
 /// What the agent writes for its next self

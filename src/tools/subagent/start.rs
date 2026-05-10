@@ -164,7 +164,7 @@ impl Tool for SubagentStartTool {
                         let mgr = ext_mgr.read().await;
                         if let Some(shared) = mgr.tools_shared() {
                             let extension_tools = shared.read().await;
-                            crate::ToolRegistry::without_subagent_with_extensions(&*extension_tools)
+                            crate::ToolRegistry::without_subagent_with_extensions(&extension_tools)
                         } else {
                             crate::ToolRegistry::without_subagent()
                         }

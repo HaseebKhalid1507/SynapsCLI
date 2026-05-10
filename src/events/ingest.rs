@@ -168,7 +168,7 @@ mod tests {
         tokio::fs::write(&path, serde_json::to_string(&event).unwrap()).await.unwrap();
 
         for _ in 0..30 {
-            if queue.len() > 0 { break; }
+            if !queue.is_empty() { break; }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

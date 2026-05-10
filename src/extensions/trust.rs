@@ -165,7 +165,7 @@ mod tests {
         let mut state = ProviderTrustState::default();
         disable_provider(&mut state, "plug:prov", None);
         enable_provider(&mut state, "plug:prov");
-        assert!(state.disabled.get("plug:prov").is_none());
+        assert!(!state.disabled.contains_key("plug:prov"));
         assert!(is_provider_enabled(&state, "plug:prov"));
     }
 

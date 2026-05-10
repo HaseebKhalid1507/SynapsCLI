@@ -1,139 +1,84 @@
 <p align="center">
-  <img src="assets/banner.png" alt="SynapsCLI" />
+  <img src="assets/banner.png" alt="SynapsCLI" width="600" />
 </p>
 
-# SynapsCLI
+<h3 align="center">The agent runtime that boots before your Node binary finishes importing.</h3>
 
-![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)
-![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)
-![~70K lines](https://img.shields.io/badge/lines-~70K-green.svg)
-![GitHub stars](https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=social)
+<p align="center">
+  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/stargazers"><img src="https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=flat&color=yellow" alt="Stars"></a>
+  <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/d/synaps?color=orange&label=installs" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/rust-1.95%2B-orange.svg" alt="Rust">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://discord.gg/TODO"><img src="https://img.shields.io/discord/0?color=7289da&label=discord" alt="Discord"></a>
+</p>
 
-> **A Rust-native AI agent runtime that boots before your Node binary finishes `require()`-ing.**
-
-One binary, any model. Start with Claude, drop in a free Groq key, point at localhost for private — same subagents, same TUI, same config. No Node. No Python. No Electron. No excuses.
-
-<!-- screenshot: TUI with subagent panel + cyberpunk theme -->
+<p align="center">
+  One Rust binary. Any model. Any provider.
+</p>
 
 ---
 
-## Why SynapsCLI?
-
-- ⚡ **Sub-100ms cold start.** Single Rust binary, ~70K lines, `cargo build` and you're done.
-- 🌐 **Any model, any provider.** Claude, Groq, Cerebras, NVIDIA NIM, OpenRouter, or your local Ollama. 17 providers, 55+ models. Set a key, pick a model, go.
-- 🎭 **Named agents, not anonymous forks.** `subagent(agent: "spike", task: "...")` dispatches a crew member with their own soul. Watch them all work in a live panel.
-- 📡 **Event Bus.** External systems push events into a running session — the agent reacts in real time. `synaps send` from any script, cron job, or monitoring tool.
-- 🔄 **Reactive Subagents.** Dispatch, poll, steer, collect. Five tools that turn fire-and-forget into collaborative orchestration.
-- 🤖 **Autonomous mode that won't eat your wallet.** `watcher` supervises long-running agents with heartbeats, crash recovery, cost limits, and session handoff.
-- 🎨 **18 themes.** cyberpunk, tokyo-night, gruvbox, catppuccin, nord, dracula, and friends. Live preview in `/settings`, hot-reload with `/theme`.
-- 🧠 **90%+ prompt cache hit rate.** Hand-tuned cache breakpoints beat auto-cache (tested: 90% vs 53%). Built for multi-hour sessions.
-- ✍️ **Mid-stream steering.** Type while the model is generating to redirect in real time.
-- 🖱️ **Mouse text selection.** Left-click drag to select, right-click to copy/paste. Works in the TUI.
-- 🔌 **MCP + plugins + skills.** Model Context Protocol servers spawn lazily. Skills load from markdown. Plugins ship as marketplaces.
-- 🔗 **Plugin agent resolution.** `subagent(agent: "dev-tools:sage")` — dispatch agents from installed plugins via `plugin:agent` syntax.
+<!-- TODO: Replace with demo GIF/video -->
+<p align="center">
+  <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
+</p>
 
 ---
 
 ## Install
 
 ```bash
-cargo install synaps                    # crates.io (recommended)
+cargo install synaps              # crates.io
+```
+
+<details>
+<summary>More options</summary>
+
+```bash
+brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
+yay -S synaps                               # Arch / EndeavourOS
 ```
 
 ```bash
-yay -S synaps                           # AUR (Arch/EndeavourOS)
-```
-
-```bash
-brew install HaseebKhalid1507/tap/synaps  # Homebrew (macOS/Linux)
-```
-
-```bash
+# Debian/Ubuntu
 curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
-sudo dpkg -i synaps_amd64.deb           # Debian/Ubuntu
+sudo dpkg -i synaps_amd64.deb
 ```
 
 ```bash
-curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh  # shell installer
+# Shell installer (any platform)
+curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
 ```
 
-Or build from source:
 ```bash
-git clone https://github.com/HaseebKhalid1507/SynapsCLI.git
-cd SynapsCLI
-cargo build --release
-./target/release/synaps
+# From source
+git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
+cargo build --release && ./target/release/synaps
 ```
 
-## Quick Start
+</details>
+
+## Go
 
 ```bash
-synaps login              # OAuth (Claude Pro/Max/Team)
-synaps                    # Launch TUI
+synaps login                      # OAuth with Claude Pro/Max
+synaps                            # launch
 ```
 
-Or use an API key instead of OAuth:
+Or skip OAuth — any API key works:
+
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY="sk-ant-..."   # or GROQ_API_KEY, CEREBRAS_API_KEY, etc.
 synaps
 ```
 
-### Other Models
-
-No Claude key? No problem. SynapsCLI works with any OpenAI-compatible provider.
-
-```bash
-# Set a free provider key (Groq, Cerebras, NVIDIA — no credit card)
-export GROQ_API_KEY="gsk_..."
-synaps
-/model groq/llama-3.3-70b-versatile
-```
-
-Or configure in `~/.synaps-cli/config`:
-```
-provider.groq = gsk_...
-provider.cerebras = csk-...
-provider.nvidia = nvapi-...
-provider.local.url = http://localhost:11434/v1
-model = groq/llama-3.3-70b-versatile
-```
-
-17 providers supported. `/ping` to health-check them all. Manage keys in `/settings → Providers`.
-
-| Provider | Free tier | Models |
-|----------|-----------|--------|
-| Groq | 30 RPM, 14.4K req/day | Llama 3.3 70B, Llama 4 Scout |
-| Cerebras | 30 RPM, 1M tokens/day | Qwen3 235B (S+ tier) |
-| NVIDIA NIM | ~40 RPM | Qwen3 Coder 480B, Devstral 2, Mistral Large 675B |
-| Google AI Studio | 60 RPM | Gemini 2.5 Flash |
-| Local (Ollama/vLLM) | Unlimited | Any local model |
-
-Full list: `synaps` → `/settings` → Providers.
-
-`/help` for commands. `/theme` to browse the candy store. `/compact` when context gets long. `/status` to check usage. `/saveas <name>` to alias a session. `/chain name <name>` to bookmark a compaction lineage.
-
-```bash
-synaps send "alert" --source monitoring  # inject events from anywhere
-```
+17 providers. 55+ models. Set a key, pick a model, go.
 
 ---
 
-## Usage
+## What It Looks Like
 
-One binary, every mode as a subcommand.
-
-### Default — Interactive TUI
-```bash
-synaps                              # launch TUI
-synaps --continue                   # resume last session
-synaps --continue my-project        # resume by name (session alias or chain bookmark)
-synaps --system prompt.md           # custom system prompt
-synaps --no-extensions              # disable extension system
-```
-
-Name a session with `/saveas my-project`, or bookmark a compaction lineage with `/chain name my-project` — then `synaps --continue my-project` picks up where you left off. Resolution tries chain name → session name → partial ID.
-
-Streaming, markdown, syntax highlighting, and a live panel showing every subagent you dispatched.
+<!-- TODO: screenshot of TUI with subagent panel -->
 
 ```
 ╭ ◈ 4 agents ────────────────────────────────────╮
@@ -144,260 +89,143 @@ Streaming, markdown, syntax highlighting, and a live panel showing every subagen
 ╰─────────────────────────────────────────────────╯
 ```
 
-### Usage Status
-```bash
-synaps status                    # check account usage + reset times
-```
-Or use `/status` inside the TUI.
-
-### Headless Chat
-```bash
-echo "explain this error" | synaps chat                    # piped
-synaps chat --agent spike                                  # with named agent
-synaps chat --continue abc123                              # resume session
-synaps chat --no-extensions                                # skip extension system
-synaps chat --system prompt.md                             # custom system prompt
-```
-
-Full engine in headless mode: MCP, extensions, skills, session persistence, compaction, event bus — same as the TUI, just stdin/stdout.
-
-### Server Mode
-```bash
-synaps server --port 3145
-```
-
-### Autonomous Agents
-```bash
-synaps watcher init scout           # scaffold an agent
-synaps watcher deploy scout         # run supervised
-synaps watcher start                # start supervisor
-synaps watcher status               # monitor the fleet
-synaps watcher logs scout -f        # tail the brain
-```
-
-Minimal agent config (`~/.synaps-cli/watcher/scout/config.toml`):
-
-```toml
-[agent]
-name = "scout"
-model = "claude-sonnet-4-20250514"
-trigger = "watch"               # manual | always | watch
-
-[trigger]
-paths = ["./src"]
-patterns = ["*.rs"]
-
-[limits]
-max_session_cost_usd = 0.50
-max_daily_cost_usd = 10.0
-```
-
-Full schema in [AGENTS.md](AGENTS.md). Agents checkpoint state on exit and resume where they left off.
-
-### Event Bus
-```bash
-# Any script, cron job, or service can push events into a running session
-synaps send "Jellyfin is DOWN" --source uptime-kuma --severity high
-synaps send "deploy complete" --source ci --severity low --content-type event
-synaps send "check PR #42" --source github --channel reviews
-```
-Events appear as styled cards in the TUI and auto-trigger the agent to respond. During streaming, events buffer and flush after the current response completes.
+You dispatch agents. They work in parallel. You watch them think.
 
 ---
 
-## Built-in Tools
+## The Pitch
 
-| Tool | Purpose |
-|------|---------|
-| `bash` | Shell execution (30s default, 300s max) |
-| `read` / `write` / `edit` | Atomic, UTF-8 validated file ops |
-| `grep` / `find` / `ls` | Regex, glob, directory ops |
-| `subagent` | Dispatch a named crew member |
-| `subagent_start` | Dispatch reactive subagent (returns immediately) |
-| `subagent_status` | Poll running subagent progress |
-| `subagent_steer` | Inject guidance into running subagent |
-| `subagent_collect` | Check if subagent is done, get result |
-| `shell_start/send/end` | Interactive PTY sessions |
-| `connect_mcp_server` | Load tools from MCP servers |
-| `load_skill` | Load behavioral guidelines from markdown |
+Most CLI agents are single-threaded conversations with a language model. Synaps is a **runtime** — a place where multiple named agents live, collaborate, and persist across sessions.
 
-See [AGENTS.md](AGENTS.md) for parameters and behavior.
+```bash
+# Dispatch a named agent with its own personality and tools
+subagent(agent: "spike", task: "refactor the auth module")
 
----
-
-## Extensions
-
-SynapsCLI has a first-class extension system. Extensions are external processes that hook into the agent loop via JSON-RPC 2.0 over stdio.
-
-- **5 hooks:** `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`
-- **Tool-specific filtering:** narrow a hook to a single tool by adding `"tool"` to the registration, e.g. `{ "hook": "before_tool_call", "tool": "bash" }` fires only for bash calls
-- **Context injection:** Extensions inject context into the system prompt via `HookResult::Inject`
-- **Permission-gated:** 6 permissions control what extensions can access
-- **Drop-in plugins:** Clone into `~/.synaps-cli/plugins/<name>/` and restart
-
-### Available Extensions
-
-- [**Synaps Deck**](https://github.com/HaseebKhalid1507/synaps-deck) — Live agent dashboard at localhost:3456
-- [**Axel**](https://github.com/HaseebKhalid1507/axel) — Portable agent intelligence (.r8 brain files)
-
-See [docs/extensions/](docs/extensions/) for the full guide and protocol spec.
-
----
-
-## Context Compaction
-
-Long sessions eat context. `/compact` fixes that.
-
-```
-/compact                          # summarize & replace history
-/compact focus on the auth module  # with custom focus
+# Or dispatch reactively — don't wait, steer mid-flight
+subagent_start(agent: "chrollo", task: "audit this codebase for vulnerabilities")
+subagent_steer(handle: "sa_1", message: "focus on the API routes")
+subagent_collect(handle: "sa_1")
 ```
 
-The LLM produces a structured checkpoint (goals, progress, decisions, file ops, next steps) and the entire message history is replaced with that summary. Iterative — `/compact` again merges new work into the existing summary. Inspired by [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
-
-- Chain sessions: `/compact` creates a new linked session, preserving the original
-- Configurable model: compaction defaults to Sonnet (saves tokens)
-- System prompt carried through compaction chains
+Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. You build a team, not a chatbot.
 
 ---
 
-## Themes
+## Features
 
-`minimal` · `cyberpunk` · `tokyo-night` · `gruvbox` · `catppuccin` · `nord` · `dracula` · `solarized-dark` · `solarized-light` · `monokai` · `one-dark` · `rose-pine` · `kanagawa` · `ayu-dark` · `ayu-light` · `github-dark` · `github-light` · `terminal` · `default`
+**⚡ Fast.** ~70K lines of Rust. Sub-100ms cold start. Single binary, no runtime dependencies.
 
-Preview live in `/settings` (scroll to preview, Enter to confirm, Esc to revert). Or hot-swap instantly with `/theme <name>`.
+**🌐 Any model.** Claude, GPT-4, Gemini, Llama, Qwen, Mistral, DeepSeek — 17 providers including free tiers (Groq, Cerebras, NVIDIA NIM). Swap mid-session with `/model`.
+
+**🎭 Named agents.** `spike`, `chrollo`, `shady`, `zero` — each with a soul. Dispatch by name, watch them work in the live panel.
+
+**🔄 Reactive orchestration.** Dispatch → poll → steer → collect. Five tools that turn fire-and-forget into collaborative multi-agent workflows.
+
+**📡 Event bus.** Push events into a running session from any script, cron, or service. The agent reacts in real time.
+
+**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls.
+
+**🧠 Context that lasts.** 90%+ prompt cache hit rate. `/compact` replaces history with a structured checkpoint. Chain sessions across days.
+
+**🤖 Autonomous mode.** `synaps watcher` supervises long-running agents with heartbeats, crash recovery, cost limits, and session handoff.
+
+**🎨 18 themes.** From `neon-rain` to `tokyo-night`. Hot-swap with `/theme`.
+
+---
+
+## Modes
+
+| Command | What it does |
+|---------|-------------|
+| `synaps` | Interactive TUI — streaming, markdown, syntax highlighting, subagent panel |
+| `synaps chat` | Headless — same engine, stdin/stdout. For scripts, pipes, CI |
+| `synaps server` | WebSocket API with token auth, origin validation, streaming |
+| `synaps rpc` | Line-JSON IPC — one process per thread, for bridges (Slack, Discord) |
+| `synaps watcher` | Supervisor daemon for autonomous agent fleets |
+
+---
+
+## Tools
+
+15 built-in, zero config:
+
+| | | |
+|---|---|---|
+| `bash` | `read` / `write` / `edit` | `grep` / `find` / `ls` |
+| `subagent` | `subagent_start` / `_status` / `_steer` / `_collect` | `shell_start` / `_send` / `_end` |
+| `connect_mcp_server` | `load_skill` | |
+
+Plus anything from MCP servers. `connect_mcp_server` and they're live.
 
 ---
 
 ## Configuration
 
-Config lives at `~/.synaps-cli/config`. Simple `key = value` format.
-
 ```
-# Model
-model = claude-opus-4-7
-thinking = high
-context_window = 200k
-compaction_model = claude-sonnet-4-6
+~/.synaps-cli/config
+```
 
-# Provider API keys
+```ini
+model = claude-sonnet-4-6
+thinking = high
+theme = neon-rain
+context_window = 200k
+
 provider.groq = gsk_...
 provider.cerebras = csk-...
-provider.nvidia = nvapi-...
-provider.local.url = http://localhost:11434/v1
 
-# Appearance
-theme = cyberpunk
-
-# Custom keybinds
 keybind.F5 = /compact
-keybind.A-h = /help
-keybind.A-k = /keybinds
-keybind.F6 = disabled
 ```
 
-Provider keys can also be set via environment variables (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.) or through `/settings → Providers` in the TUI.
+That's it. No YAML. No TOML. No JSON. Key = value. Done.
 
 ---
 
-## Keybinds
+## Extensions & Plugins
 
-Plugins can register keyboard shortcuts, and users can override or add their own.
+Drop a folder in `~/.synaps-cli/plugins/` — it's live on next boot.
 
-### User keybinds (in config)
+Extensions hook into the agent loop via 5 lifecycle events. They can block tool calls, inject context, modify inputs, or just observe. Permission-gated. Sandboxed processes.
 
 ```
-keybind.F5 = /compact           # F5 runs /compact
-keybind.A-s = /scholar          # Alt+S runs /scholar
-keybind.A-k = /keybinds         # Alt+K shows all keybinds
-keybind.F6 = disabled           # Disable a plugin keybind
+~/.synaps-cli/plugins/my-guard/
+├── plugin.json        # manifest: hooks, permissions, keybinds
+└── index.js           # JSON-RPC 2.0 over stdio
 ```
 
-### Plugin keybinds (in plugin.json)
+See [docs/extensions/](docs/extensions/) for the protocol spec.
 
-Plugins declare keybinds in their manifest:
+---
 
-```json
-{
-  "name": "my-plugin",
-  "keybinds": [
-    {
-      "key": "F5",
-      "action": "slash_command",
-      "command": "compact",
-      "description": "Quick compact"
-    },
-    {
-      "key": "A-r",
-      "action": "load_skill",
-      "skill": "code-review",
-      "description": "Load code review"
-    }
-  ]
-}
-```
+## Philosophy
 
-### Key notation
+Synaps has opinions:
 
-| Notation | Meaning |
-|----------|---------|
-| `C-x` | Ctrl+X |
-| `A-x` | Alt+X |
-| `S-x` | Shift+X |
-| `C-A-x` | Ctrl+Alt+X |
-| `F1`–`F12` | Function keys |
-| `Space`, `Tab`, `Enter`, `Esc` | Special keys |
-
-### Priority
-
-Core keybinds (Ctrl+C, Esc, Enter, etc.) are never overridable. User config overrides plugins. `/keybinds` to see what's registered.
+- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services, not conversations.
+- **Speed is a feature.** If your agent runtime takes 2 seconds to boot, you've already lost the developer who wanted to use it in a git hook.
+- **Multi-agent is the default.** Single-agent is a special case of multi-agent with n=1. The architecture should reflect that.
+- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
 
 ---
 
 <details>
-<summary><b>🧬 Architecture (for the curious)</b></summary>
-
-One binary. Subcommands dispatched from `main.rs`. Two API paths: Anthropic (native) and OpenAI-compatible (17 providers).
+<summary><b>Architecture</b></summary>
 
 ```
 src/
-├── main.rs          # unified CLI entry point + subcommand dispatch
-├── cmd/             # subcommand handlers (chat, server, agent, login, watcher, send, status)
-├── tui/             # TUI: event loop, rendering, markdown, themes, settings, plugins
-│   └── settings/    # /settings modal — model picker, provider keys, themes
-├── engine/          # shared headless engine (setup, commands, stream, session)
-├── runtime/         # THE BRAIN
-│   ├── api.rs       # Anthropic API + provider router (try_route)
-│   ├── stream.rs    # tool dispatch loop (provider-agnostic)
-│   └── openai/      # OpenAI-compatible provider engine
-│       ├── registry.rs   # 17 providers, 55+ models
-│       ├── stream.rs     # SSE streaming + BytesMut/memchr parsing
-│       ├── translate.rs  # Anthropic↔OpenAI format bridge
-│       ├── wire.rs       # StreamDecoder + tool call accumulation
-│       └── ping.rs       # /ping health check
-├── core/            # config, session, chain, auth, models, logging
-├── events/          # event bus: types, priority queue, inotify watcher
-├── tools/           # 15 built-in tools (bash, read, write, edit, subagent*, shell*, etc.)
-├── mcp/             # Model Context Protocol client, lazy server spawning
-├── pricing.rs       # unified pricing for all providers/models
-├── watcher/         # supervisor daemon, IPC, heartbeats
-└── skills/          # markdown-driven behavioral guidelines + plugin marketplace
+├── main.rs          # CLI dispatch
+├── engine/          # shared boot, commands, stream, session
+├── runtime/         # LLM API + provider router (Anthropic native + OpenAI-compat)
+├── tui/             # terminal UI, themes, settings, plugin modals
+├── tools/           # 15 built-in tools
+├── extensions/      # JSON-RPC extension system
+├── events/          # event bus + priority queue
+├── mcp/             # Model Context Protocol client
+├── watcher/         # autonomous agent supervisor
+└── skills/          # markdown-driven behavioral guidelines
 ```
 
-| Subcommand | Purpose |
-|------------|---------|
-| *(none)* | Interactive TUI with streaming + subagent panel |
-| `chat` | Fully-featured headless mode (MCP, extensions, skills, sessions, compaction) |
-| `server` | WebSocket API server |
-| `agent` | Worker runtime spawned by watcher |
-| `watcher` | Supervisor daemon for autonomous agents |
-| `login` | OAuth flow |
-| `send` | Push events into a running session |
-| `status` | Check account usage |
-
-**Provider routing:** Model IDs with a `/` (e.g. `groq/llama-3.3-70b`) route through `runtime/openai/`. Everything else goes to Anthropic. Both paths emit the same `StreamEvent` type — the TUI and tool loop are provider-blind.
-
-Config lives at `~/.synaps-cli/` — config, sessions, agents, plugins, skills, chains, mcp.json. Project-local `.synaps-cli/` overrides global. Provider API keys stored with `0600` permissions.
+Two API paths: Anthropic (native) and OpenAI-compatible (17 providers). Both emit the same `StreamEvent` — the TUI and tool loop are provider-blind.
 
 </details>
 
@@ -405,8 +233,11 @@ Config lives at `~/.synaps-cli/` — config, sessions, agents, plugins, skills, 
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
 
-## Author
+---
 
-Built by [Haseeb Khalid](https://github.com/HaseebKhalid1507) because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.
+<p align="center">
+  Built by <a href="https://github.com/HaseebKhalid1507">Haseeb Khalid</a><br>
+  <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
+</p>

@@ -811,7 +811,7 @@ impl ProcessExtension {
                     return;
                 }
             };
-            let method = method_field.unwrap();
+            let Some(method) = method_field else { return };
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             let inbox = inbox.clone();
             let extension_id = extension_id.to_string();
@@ -951,7 +951,8 @@ impl ProcessExtension {
     /// JSON-RPC error response. Currently routes:
     /// - `memory.append` (requires `memory.write`)
     /// - `memory.query`  (requires `memory.read`)
-    /// All other methods return -32601 (method not found).
+    ///   All other methods return -32601 (method not found).
+    #[allow(clippy::doc_lazy_continuation)]
     async fn handle_inbound_request(
         inbox: &Arc<Inbox>,
         method: &str,
@@ -1535,8 +1536,8 @@ impl ProcessExtension {
     /// Routes:
     /// - `command.output` whose `request_id` matches → sink as `Output(event)`
     ///   (other request_ids are ignored — concurrent invocations must use distinct ids
-    ///    and may overlap in the same `subscribe_notifications` channel; mismatched
-    ///    frames are dropped here intentionally).
+    ///   and may overlap in the same `subscribe_notifications` channel; mismatched
+    ///   frames are dropped here intentionally).
     /// - `task.start|update|log|done` → sink as `Task(event)` regardless of request_id.
     /// - Anything else → logged at trace and dropped.
     pub(crate) fn forward_invoke_command_frame(

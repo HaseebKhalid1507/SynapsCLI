@@ -108,14 +108,29 @@ impl Tool for BashTool {
         let max_output = ctx.limits.max_tool_output;
 
         let script = bash_script_with_secure_sudo(command);
-        let mut child = tokio::process::Command::new("bash")
-            .arg("-c")
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
             .arg(&script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+
+        // Start the child in a new session (setsid) so it has no controlling
+        // terminal. Programs that open /dev/tty directly (SSH fingerprint
+        // prompts, gpg pinentry, git credential helpers, pagers) will get
+        // ENXIO and fail with a readable error on stderr instead of hanging
+        // invisibly until timeout. Sudo is unaffected — we already force
+        // `-S` (stdin) via bash_script_with_secure_sudo().
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        let mut child = cmd.spawn()
             .map_err(|e| RuntimeError::Tool(e.to_string()))?;
 
         let stdout = child.stdout.take()

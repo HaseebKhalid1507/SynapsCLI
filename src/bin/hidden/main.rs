@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code, unused_variables, clippy::too_many_arguments, clippy::field_reassign_with_default, clippy::explicit_counter_loop, clippy::collapsible_match)]
 mod app;
 mod games;
 mod save;

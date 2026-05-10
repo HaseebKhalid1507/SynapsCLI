@@ -338,7 +338,7 @@ jobs:
             homepage "https://github.com/HaseebKhalid1507/SynapsCLI"
             url "$TAR_URL"
             sha256 "$SHA256"
-            license "MIT"
+            license "Apache-2.0"
 
             depends_on "rust" => :build
 
@@ -403,7 +403,7 @@ jobs:
           pkgdesc="Terminal-native AI agent runtime built in Rust"
           arch=('x86_64' 'aarch64')
           url="https://github.com/HaseebKhalid1507/SynapsCLI"
-          license=('MIT')
+          license=('Apache-2.0')
           depends=('gcc-libs' 'oniguruma' 'openssl')
           makedepends=('cargo' 'oniguruma')
           source=("\$url/archive/refs/tags/v\$pkgver.tar.gz")
@@ -438,7 +438,7 @@ jobs:
           	url = https://github.com/HaseebKhalid1507/SynapsCLI
           	arch = x86_64
           	arch = aarch64
-          	license = MIT
+          	license = Apache-2.0
           	makedepends = cargo
           	makedepends = oniguruma
           	depends = gcc-libs

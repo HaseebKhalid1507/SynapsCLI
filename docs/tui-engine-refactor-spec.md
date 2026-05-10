@@ -1,7 +1,11 @@
 # TUI Engine Refactor — Specification
 
-**Branch:** `feat/headless-engine`  
-**Approach:** Copy `src/chatui/` → `src/tui/`, refactor the copy to use engine modules. `chatui/` stays untouched as stable fallback.
+> **Note:** This spec is historical. The refactor is complete as of v0.1.5.
+> `chatui/` has been deleted — `tui/` is the sole frontend. The `SYNAPS_TUI`
+> env var and legacy fallback described below no longer exist.
+
+**Branch:** `feat/headless-engine` (merged)  
+**Approach:** Copied `src/chatui/` → `src/tui/`, refactored the copy to use engine modules. `chatui/` was removed after migration.
 
 ---
 

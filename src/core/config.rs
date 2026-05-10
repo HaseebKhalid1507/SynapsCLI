@@ -247,6 +247,7 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
+#[allow(clippy::collapsible_match)]
 fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &str) {
     match key {
         "server.allowed_origins" => {
