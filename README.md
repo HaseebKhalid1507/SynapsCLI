@@ -253,6 +253,6 @@ Apache 2.0. See [LICENSE](LICENSE).
 ---
 
 <p align="center">
-  Built by <a href="https://github.com/HaseebKhalid1507">Haseeb Khalid</a><br>
+  Built by <a href="https://github.com/HaseebKhalid1507">Haseeb Khalid</a> and <a href="https://github.com/JR-Morton">JR Morton</a><br>
   <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
 </p>
