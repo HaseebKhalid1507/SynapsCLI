@@ -66,6 +66,7 @@ pub(crate) fn edge_scrub_area(size: Rect, protected_bottom_rows: u16) -> Option<
 /// Physically blank the terminal edge columns and reset ratatui's back buffer so
 /// the following draw does not optimize those blanks away.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn scrub_terminal_edges<B>(terminal: &mut Terminal<B>, style: Style) -> io::Result<()>
 where
     B: Backend,
@@ -118,6 +119,7 @@ where
 /// residue when content moves upward by one row and a previously occupied first or
 /// last cell is blank in the new frame.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn render_scrolled_lines(
     buf: &mut Buffer,
     area: Rect,
