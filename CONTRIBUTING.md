@@ -48,4 +48,4 @@ cargo test --release --lib
 
 ## License
 
-By contributing, you agree your work is licensed under MIT.
+By contributing, you agree your work is licensed under Apache 2.0.
