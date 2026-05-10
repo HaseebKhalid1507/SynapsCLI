@@ -91,6 +91,21 @@ pub fn get_active_config_dir() -> PathBuf {
     base
 }
 
+/// Server security configuration parsed from `server.*` keys.
+#[derive(Debug, Clone, Default)]
+pub struct ServerConfig {
+    /// Comma-separated list of allowed Origin headers. Empty = allow all (localhost-only protection).
+    pub allowed_origins: Vec<String>,
+    /// Pre-shared authentication token. If set, clients must provide it on WebSocket upgrade
+    /// via `?token=X` query param or `Authorization: Bearer X` header. If None, auto-generated on boot.
+    pub token: Option<String>,
+    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless/agent mode).
+    pub auto_approve_confirms: bool,
+    /// Maximum inbound message size in bytes. Defaults to context_window * 4 (rough token→byte estimate).
+    /// None means no artificial cap.
+    pub max_message_size: Option<usize>,
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -109,6 +124,7 @@ pub struct SynapsConfig {
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub shell: ShellConfig,
+    pub server: ServerConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
 }
@@ -131,6 +147,7 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             shell: ShellConfig::default(),
+            server: ServerConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
         }
@@ -229,6 +246,33 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
     }
 }
 
+/// Parse server.* configuration keys and update the ServerConfig.
+fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &str) {
+    match key {
+        "server.allowed_origins" => {
+            server_config.allowed_origins = parse_comma_list(val);
+        }
+        "server.token" => {
+            if !val.is_empty() {
+                server_config.token = Some(val.to_string());
+            }
+        }
+        "server.auto_approve_confirms" => {
+            server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
+        }
+        "server.max_message_size" => {
+            if let Ok(size) = val.parse::<usize>() {
+                server_config.max_message_size = Some(size);
+            } else {
+                eprintln!("Warning: invalid value for server.max_message_size: '{}', ignored", val);
+            }
+        }
+        _ => {
+            // Unknown server.* keys preserved (not rejected)
+        }
+    }
+}
+
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -294,9 +338,11 @@ pub fn load_config() -> SynapsConfig {
                 config.disabled_skills = parse_comma_list(val);
             }
             _ => {
-                // Handle shell.* keys
+                // Handle namespaced keys
                 if key.starts_with("shell.") {
                     parse_shell_config_key(&mut config.shell, key, val);
+                } else if key.starts_with("server.") {
+                    parse_server_config_key(&mut config.server, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
@@ -304,6 +350,14 @@ pub fn load_config() -> SynapsConfig {
                 }
                 // Other unknown keys silently ignored
             }
+        }
+    }
+
+    // Derive max_message_size from context_window if not explicitly set.
+    // Rough estimate: 1 token ≈ 4 bytes. Context window in tokens → bytes.
+    if config.server.max_message_size.is_none() {
+        if let Some(ctx_tokens) = config.context_window {
+            config.server.max_message_size = Some((ctx_tokens as usize) * 4);
         }
     }
 
