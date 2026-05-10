@@ -94,7 +94,9 @@ You dispatch agents. They work in parallel. You watch them think.
 
 ## The Pitch
 
-Most CLI agents are single-threaded conversations with a language model. Synaps is a **runtime** — a place where multiple named agents live, collaborate, and persist across sessions.
+Most CLI agents are single-threaded conversations with a language model. Synaps is a **harness** — a place where multiple named agents live, collaborate, and persist across sessions.
+
+Think of it like LEGO: the **brain** is one piece (talks to AI models), the **tools** are blocks (read files, run commands, search), and **plugins** are stickers you snap on — voice, security, memory, whatever you need. Swap the AI behind it at any time. The cool part isn't *which AI you have* — it's *how cleverly you put your agents together*.
 
 ```bash
 # Dispatch a named agent with its own personality and tools
@@ -106,7 +108,19 @@ subagent_steer(handle: "sa_1", message: "focus on the API routes")
 subagent_collect(handle: "sa_1")
 ```
 
+The big agent dispatches little helper agents — like a chef with sous-chefs. You can poke them mid-task, redirect them, or let them run. And there's a **watcher** that supervises the fleet so they don't crash or burn through your budget.
+
+```
+     🤖 Main Agent
+       │ "you chop, you stir, you watch the oven"
+   ┌───┼────┬──────┐
+   🤖   🤖   🤖    🤖
+  spike shady chrollo zero
+```
+
 Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. You build a team, not a chatbot.
+
+*New to AI agents? Read the [ELI5](ELI5.md).*
 
 ---
 
@@ -182,7 +196,7 @@ That's it. No YAML. No TOML. No JSON. Key = value. Done.
 
 ## Extensions & Plugins
 
-Drop a folder in `~/.synaps-cli/plugins/` — it's live on next boot.
+Plugins are like stickers you snap onto your agent — want code guardrails? Stick on a security plugin. Want memory? Stick on a memory plugin. Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot.
 
 Extensions hook into the agent loop via 5 lifecycle events. They can block tool calls, inject context, modify inputs, or just observe. Permission-gated. Sandboxed processes.
 
@@ -191,6 +205,8 @@ Extensions hook into the agent loop via 5 lifecycle events. They can block tool 
 ├── plugin.json        # manifest: hooks, permissions, keybinds
 └── index.js           # JSON-RPC 2.0 over stdio
 ```
+
+And anything in the world can poke your agent — monitoring systems, cron jobs, CI pipelines. `synaps send "the website is down" --source uptime-kuma` and your agent wakes up and handles it.
 
 See [docs/extensions/](docs/extensions/) for the protocol spec.
 
