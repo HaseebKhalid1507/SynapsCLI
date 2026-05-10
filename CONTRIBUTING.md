@@ -42,7 +42,7 @@ cargo test --release --lib
 
 - **Bug reports** with reproduction steps
 - **Tool implementations** (new tools following the `Tool` trait in `src/tools/mod.rs`)
-- **Themes** (add to `src/tui/theme/palettes.rs`)
+- **Themes** (add to `src/tui/theme/palettes/`)
 - **MCP server configs** (share working `mcp.json` setups)
 - **Skills/plugins** (markdown-driven behavioral guidelines)
 

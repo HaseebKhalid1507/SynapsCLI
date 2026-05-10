@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 - **Engine refactor + `chat` headless mode** — `daemon`, `run`, and `client` subcommands deleted; `chat` is now fully-featured headless mode with MCP, extensions, skills, sessions, compaction, and the event bus (same engine as the TUI, stdin/stdout rendering)
   - New `engine/` module: `setup.rs` (boot), `commands.rs` (headless slash commands), `stream.rs` (StreamEvent consumer), `session.rs` (ConversationState)
   - `chatui/` module deleted — `tui/` is the sole frontend
-  - New `pricing.rs` — unified pricing table covering all 17 providers/55+ models
+  - New `pricing.rs` — centralized Anthropic pricing (Opus/Sonnet/Haiku) with cache billing support
   - New `harbor/synaps_agent.py` — Terminal-Bench integration agent
   - Clippy CI added (`cargo clippy --all-targets` gates PRs)
   - Published on crates.io as `synaps` (v0.1.x); available via `cargo install synaps`, AUR (`yay -S synaps`), Homebrew, and GitHub Releases
