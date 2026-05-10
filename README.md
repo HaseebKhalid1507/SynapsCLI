@@ -7,9 +7,8 @@
 <p align="center">
   <a href="https://github.com/HaseebKhalid1507/SynapsCLI/stargazers"><img src="https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=flat&color=yellow" alt="Stars"></a>
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/d/synaps?color=orange&label=installs" alt="Downloads"></a>
-  <img src="https://img.shields.io/badge/rust-1.95%2B-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
-  <a href="https://discord.gg/TODO"><img src="https://img.shields.io/discord/0?color=7289da&label=discord" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -147,12 +146,12 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 ## Tools
 
-15 built-in, zero config:
+18 built-in, zero config:
 
 | | | |
 |---|---|---|
 | `bash` | `read` / `write` / `edit` | `grep` / `find` / `ls` |
-| `subagent` | `subagent_start` / `_status` / `_steer` / `_collect` | `shell_start` / `_send` / `_end` |
+| `subagent` / `subagent_resume` | `subagent_start` / `_status` / `_steer` / `_collect` | `shell_start` / `_send` / `_end` |
 | `connect_mcp_server` | `load_skill` | |
 
 Plus anything from MCP servers. `connect_mcp_server` and they're live.
@@ -217,7 +216,7 @@ src/
 ├── engine/          # shared boot, commands, stream, session
 ├── runtime/         # LLM API + provider router (Anthropic native + OpenAI-compat)
 ├── tui/             # terminal UI, themes, settings, plugin modals
-├── tools/           # 15 built-in tools
+├── tools/           # 18 built-in tools
 ├── extensions/      # JSON-RPC extension system
 ├── events/          # event bus + priority queue
 ├── mcp/             # Model Context Protocol client
