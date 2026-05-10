@@ -138,6 +138,46 @@ pub async fn emit_heartbeat(
     }
 }
 
+/// Resolve the synaps_user_id for a heartbeat: env `SYNAPS_USER_ID` or `"local"`.
+pub fn resolve_synaps_user_id() -> String {
+    std::env::var("SYNAPS_USER_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// High-level helper used by the watcher supervisor.
+///
+/// Reads the `BridgeConfig` and:
+/// - returns `Ok(())` immediately when `heartbeat_mirror == false`
+///   (without touching the socket at all)
+/// - otherwise calls [`emit_heartbeat`] with the configured UDS path and timeout
+///
+/// Callers should `tokio::spawn` this and discard the result so the watcher
+/// loop is never blocked or failed by bridge unavailability.
+pub async fn mirror_heartbeat(
+    bridge_cfg: &synaps_cli::config::BridgeConfig,
+    agent_name: &str,
+    healthy: bool,
+    details: Value,
+) -> Result<(), BridgeClientError> {
+    if !bridge_cfg.heartbeat_mirror {
+        return Ok(());
+    }
+    let uds = bridge_cfg.resolved_uds_path();
+    let user_id = resolve_synaps_user_id();
+    emit_heartbeat(
+        &uds,
+        Duration::from_millis(bridge_cfg.heartbeat_timeout_ms),
+        "agent",
+        agent_name,
+        healthy,
+        details,
+        &user_id,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +368,72 @@ mod tests {
             other => panic!("expected Timeout, got {other:?}"),
         }
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn mirror_heartbeat_skips_when_disabled() {
+        // Point at a non-existent socket; with mirror disabled this must NOT
+        // attempt to connect and must return Ok(()).
+        let bogus = std::path::PathBuf::from(
+            "/tmp/synaps-bridge-NEVER-EXISTS-disabled.sock",
+        );
+        let cfg = synaps_cli::config::BridgeConfig {
+            uds_path: Some(bogus),
+            heartbeat_mirror: false,
+            heartbeat_timeout_ms: 100,
+        };
+        let res = mirror_heartbeat(&cfg, "agent-x", true, json!({})).await;
+        assert!(res.is_ok(), "disabled mirror must short-circuit Ok, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn mirror_heartbeat_emits_when_enabled() {
+        let path = temp_sock("mirror-on");
+        let (task, recorded) =
+            spawn_fake_bridge(path.clone(), r#"{"ok":true}"#);
+
+        let cfg = synaps_cli::config::BridgeConfig {
+            uds_path: Some(path),
+            heartbeat_mirror: true,
+            heartbeat_timeout_ms: 1000,
+        };
+        let res = mirror_heartbeat(
+            &cfg,
+            "research-bot",
+            true,
+            json!({"session_count": 7}),
+        )
+        .await;
+        assert!(res.is_ok(), "expected Ok, got {res:?}");
+
+        let lines = recorded.lock().await.clone();
+        assert_eq!(lines.len(), 1);
+        let req: Value = serde_json::from_str(lines[0].trim_end()).unwrap();
+        assert_eq!(req["op"], "heartbeat_emit");
+        assert_eq!(req["component"], "agent");
+        assert_eq!(req["id"], "research-bot");
+        assert_eq!(req["healthy"], true);
+        assert_eq!(req["details"]["session_count"], 7);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mirror_heartbeat_returns_unavailable_when_socket_missing() {
+        let bogus = std::env::temp_dir().join(format!(
+            "synaps-bridge-mirror-missing-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&bogus);
+        let cfg = synaps_cli::config::BridgeConfig {
+            uds_path: Some(bogus),
+            heartbeat_mirror: true,
+            heartbeat_timeout_ms: 200,
+        };
+        let res = mirror_heartbeat(&cfg, "x", true, json!({})).await;
+        match res {
+            Err(BridgeClientError::Unavailable(_)) => {}
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 }
