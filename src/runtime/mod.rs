@@ -51,14 +51,22 @@ pub async fn emit_before_tool_call(
 
 
 /// Resolve a before_tool_call result that may request user confirmation.
+/// Resolve a before_tool_call result that may request user confirmation.
 ///
-/// Headless/non-interactive callers fail closed for `confirm` by returning `Block`.
+/// When `auto_approve_confirms` is true, `Confirm` is short-circuited to `Continue`.
+/// Headless/non-interactive callers with `auto_approve_confirms = false` fail closed.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+    auto_approve_confirms: bool,
 ) -> crate::extensions::hooks::events::HookResult {
     match hook_result {
         crate::extensions::hooks::events::HookResult::Confirm { message } => {
+            if auto_approve_confirms {
+                tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
+                return crate::extensions::hooks::events::HookResult::Continue;
+            }
+
             let Some(prompt) = secret_prompt else {
                 return crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
@@ -93,8 +101,9 @@ pub async fn resolve_before_tool_call_decision(
     original_input: Value,
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
+    auto_approve_confirms: bool,
 ) -> BeforeToolCallDecision {
-    match resolve_before_tool_call_result(hook_result, secret_prompt).await {
+    match resolve_before_tool_call_result(hook_result, secret_prompt, auto_approve_confirms).await {
         crate::extensions::hooks::events::HookResult::Block { reason } => {
             BeforeToolCallDecision::Block { reason }
         }
@@ -477,6 +486,7 @@ impl Runtime {
                                         input.clone(),
                                     ).await,
                                     None,
+                                    false,
                                 ).await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
@@ -550,6 +560,7 @@ impl Runtime {
                                                 input.clone(),
                                             ).await,
                                             None,
+                                            false,
                                         ).await;
                                         if let crate::runtime::BeforeToolCallDecision::Block { reason } = decision {
                                             format!("Tool call blocked by extension: {}", reason)
@@ -641,7 +652,7 @@ impl Runtime {
     /// Run a prompt as a cancellable stream of [`StreamEvent`]s. Convenience wrapper
     /// around [`run_stream_with_messages`] for single-turn usage.
     pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None, None).await
+        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None, None, false).await
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -653,6 +664,7 @@ impl Runtime {
         cancel: CancellationToken,
         steering_rx: Option<mpsc::UnboundedReceiver<String>>,
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
+        auto_approve_confirms: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -695,6 +707,7 @@ impl Runtime {
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue, secret_prompt,
             hook_bus: self.hook_bus.clone(),
+            auto_approve_confirms,
         };
 
         tokio::spawn(async move {
@@ -746,6 +759,7 @@ mod tests {
                 message: "Run deploy?".into(),
             },
             None,
+            false,
         )
         .await;
 
@@ -764,6 +778,7 @@ mod tests {
                 input: serde_json::json!({"command":"echo safe"}),
             },
             None,
+            false,
         ).await;
 
         match result {
@@ -791,6 +806,7 @@ mod tests {
                 message: "Run deploy?".into(),
             },
             Some(&handle),
+            false,
         )
         .await;
 
@@ -816,6 +832,7 @@ mod tests {
                 message: "Run deploy?".into(),
             },
             Some(&handle),
+            false,
         )
         .await;
 

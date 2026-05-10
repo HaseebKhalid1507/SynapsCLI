@@ -247,6 +247,7 @@ pub async fn execute_provider_tool_use(
             input.clone(),
         ).await,
         ctx.capabilities.secret_prompt.as_ref(),
+        false,
     ).await;
 
     let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else {
