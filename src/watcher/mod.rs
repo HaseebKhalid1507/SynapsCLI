@@ -16,6 +16,7 @@
 mod ipc;
 mod supervisor;
 mod display;
+pub(crate) mod bridge_client;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
