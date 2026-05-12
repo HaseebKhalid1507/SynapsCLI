@@ -8,7 +8,7 @@ pub use restart::RestartPolicy;
 use async_trait::async_trait;
 use serde_json::Value;
 use crate::extensions::hooks::events::{HookEvent, HookResult};
-use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent};
+use self::process::{ProviderCompleteParams, ProviderCompleteResult, ProviderStreamEvent, NotificationFrame};
 use crate::extensions::info::PluginInfo;
 use crate::extensions::commands::CommandOutputEvent;
 use crate::extensions::tasks::TaskEvent;
@@ -150,6 +150,17 @@ pub trait ExtensionHandler: Send + Sync {
 
     /// Gracefully shut down the extension.
     async fn shutdown(&self);
+
+    /// Subscribe to raw JSON-RPC notifications from this extension.
+    /// Returns a monotonic subscription id (for unsubscribing) and a
+    /// receiver that yields every notification frame. The default
+    /// implementation returns a channel whose sender is immediately
+    /// dropped, so the receiver yields `None` right away — effectively
+    /// a no-op for handler impls that don't support notifications.
+    async fn subscribe_notifications(&self) -> (usize, tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>) {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (0, rx)
+    }
 
     /// Current health state of this handler.
     async fn health(&self) -> ExtensionHealth {

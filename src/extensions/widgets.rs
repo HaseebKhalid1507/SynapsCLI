@@ -150,6 +150,14 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
     }
 }
 
+/// Event sent from a background notification watcher to the TUI.
+/// Carries the source extension id and the parsed widget event.
+#[derive(Debug, Clone)]
+pub struct ExtensionWidgetEvent {
+    pub extension_id: String,
+    pub event: WidgetEvent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

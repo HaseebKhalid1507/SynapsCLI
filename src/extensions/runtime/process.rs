@@ -1948,6 +1948,10 @@ impl ExtensionHandler for ProcessExtension {
             .await;
     }
 
+    async fn subscribe_notifications(&self) -> (usize, tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>) {
+        ProcessExtension::subscribe_notifications(self).await
+    }
+
     async fn restart_count(&self) -> usize {
         self.restart_count()
     }
