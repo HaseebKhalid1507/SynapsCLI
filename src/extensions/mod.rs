@@ -25,6 +25,7 @@ pub mod info;
 pub mod commands;
 pub mod settings_editor;
 pub mod tasks;
+pub mod widgets;
 pub mod active_tasks;
 pub mod loader;
 pub mod providers;
