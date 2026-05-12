@@ -38,6 +38,15 @@ const VALID_POSITIONS: &[&str] = &[
     "bottom_right",
 ];
 
+/// A single styled text span sent over the wire from an extension.
+/// Extensions specify colors as CSS-style hex strings (e.g. `"#ff0000"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledSpan {
+    pub text: String,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+}
+
 /// Parsed widget notification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WidgetEvent {
@@ -46,6 +55,10 @@ pub enum WidgetEvent {
     Upsert {
         id: String,
         lines: Vec<String>,
+        /// Optional per-span styled lines. Each inner Vec is one display line,
+        /// each `StyledSpan` carries text + optional fg/bg colors. When present,
+        /// the TUI renders these instead of plain `lines`.
+        styled_lines: Option<Vec<Vec<StyledSpan>>>,
         /// One of the nine position strings; always present (defaults to
         /// `"top_right"` when the plugin omits the field).
         position: String,
@@ -141,7 +154,44 @@ pub fn parse_widget_event(method: &str, params: &Value) -> Result<WidgetEvent, S
                 }
             };
 
-            Ok(WidgetEvent::Upsert { id, lines, position, title, ttl_secs })
+            // --- styled_lines (optional) ---
+            let styled_lines = match obj.get("styled_lines") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let outer = v.as_array().ok_or_else(|| {
+                        "widget.upsert 'styled_lines' must be an array of arrays".to_string()
+                    })?;
+                    let mut result = Vec::with_capacity(outer.len());
+                    for (i, row) in outer.iter().enumerate() {
+                        let spans_arr = row.as_array().ok_or_else(|| {
+                            format!("widget.upsert 'styled_lines[{i}]' must be an array of span objects")
+                        })?;
+                        let mut spans = Vec::with_capacity(spans_arr.len());
+                        for (j, span_val) in spans_arr.iter().enumerate() {
+                            let span_obj = span_val.as_object().ok_or_else(|| {
+                                format!("widget.upsert 'styled_lines[{i}][{j}]' must be an object")
+                            })?;
+                            let text = span_obj.get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    format!("widget.upsert 'styled_lines[{i}][{j}].text' must be a string")
+                                })?
+                                .to_string();
+                            let fg = span_obj.get("fg")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            let bg = span_obj.get("bg")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            spans.push(StyledSpan { text, fg, bg });
+                        }
+                        result.push(spans);
+                    }
+                    Some(result)
+                }
+            };
+
+            Ok(WidgetEvent::Upsert { id, lines, styled_lines, position, title, ttl_secs })
         }
 
         "widget.dismiss" => Ok(WidgetEvent::Dismiss { id }),
@@ -180,6 +230,7 @@ mod tests {
                 position: "top_right".into(),
                 title: None,
                 ttl_secs: None,
+                styled_lines: None,
             }
         );
     }
@@ -205,6 +256,7 @@ mod tests {
                 position: "bottom_left".into(),
                 title: Some("My Widget".into()),
                 ttl_secs: Some(30),
+                styled_lines: None,
             }
         );
     }

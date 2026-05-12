@@ -19,6 +19,10 @@ pub(crate) struct Toast {
     id: String,
     pub(crate) title: Option<String>,
     pub(crate) lines: Vec<String>,
+    /// Pre-styled rich lines. When set, `toast_lines()` returns these instead
+    /// of converting `lines` to plain `Line::from`. Enables per-character
+    /// colors for pixel art, status indicators, and themed widgets.
+    pub(crate) rich_lines: Option<Vec<Line<'static>>>,
     pub(crate) position: ToastPosition,
     created_at: Instant,
     ttl: Option<Duration>,
@@ -30,6 +34,7 @@ impl Toast {
             id: id.into(),
             title: None,
             lines: vec![line.into()],
+            rich_lines: None,
             position: ToastPosition::default(),
             created_at: Instant::now(),
             ttl: Some(Duration::from_secs(4)),
@@ -44,6 +49,18 @@ impl Toast {
     pub(crate) fn lines(mut self, lines: Vec<String>) -> Self {
         self.lines = lines;
         self
+    }
+
+    /// Set pre-styled rich lines. When present, these take priority over
+    /// plain `lines` in rendering — enabling per-character fg/bg colors.
+    pub(crate) fn rich(mut self, lines: Vec<Line<'static>>) -> Self {
+        self.rich_lines = Some(lines);
+        self
+    }
+
+    /// Whether this toast has rich (pre-styled) content.
+    pub(crate) fn has_rich_lines(&self) -> bool {
+        self.rich_lines.is_some()
     }
 
     pub(crate) fn at(mut self, position: ToastPosition) -> Self {
@@ -138,6 +155,15 @@ pub(crate) fn anchor_point(area: Rect, position: ToastPosition) -> Position {
 }
 
 pub(crate) fn toast_lines(toast: &Toast) -> Vec<Line<'static>> {
+    // Rich lines take priority — they carry per-span styling for pixel art etc.
+    if let Some(rich) = &toast.rich_lines {
+        let mut lines = Vec::new();
+        if let Some(title) = &toast.title {
+            lines.push(Line::from(title.clone()));
+        }
+        lines.extend(rich.iter().cloned());
+        return lines;
+    }
     let mut lines = Vec::new();
     if let Some(title) = &toast.title {
         lines.push(Line::from(title.clone()));
