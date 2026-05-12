@@ -165,6 +165,9 @@ pub(crate) struct App {
     pub(crate) extension_loader_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
     pub(crate) extension_loader_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
     pub(crate) extension_loader_running: bool,
+    /// Channel for receiving widget events from background extension notification watchers.
+    pub(crate) widget_rx: tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
+    pub(crate) widget_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
 }
@@ -187,6 +190,7 @@ impl App {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -254,6 +258,8 @@ impl App {
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
             extension_loader_running: false,
+            widget_rx: widget_rx_init,
+            widget_tx: widget_tx_init,
             keybinds: None,
         }
     }

@@ -501,6 +501,19 @@ impl ExtensionManager {
         self.extensions.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Return Arc references to all running extension handlers, sorted by ID.
+    /// Intended for background notification watchers that need to hold onto
+    /// handlers beyond the lifetime of a manager lock.
+    pub fn handlers(&self) -> Vec<(String, Arc<dyn super::runtime::ExtensionHandler>)> {
+        let mut out: Vec<_> = self
+            .extensions
+            .iter()
+            .map(|(id, h)| (id.clone(), Arc::clone(h)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Number of running extensions.
     pub fn count(&self) -> usize {
         self.extensions.len()
