@@ -1809,7 +1809,7 @@ pub async fn run(
 fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::ExtensionWidgetEvent) {
     use synaps_cli::extensions::widgets::WidgetEvent;
     match event.event {
-        WidgetEvent::Upsert { id, lines, position, title, ttl_secs } => {
+        WidgetEvent::Upsert { id, lines, styled_lines, position, title, ttl_secs } => {
             let pos = match position.as_str() {
                 "top_left"      => toast::ToastPosition::TOP_LEFT,
                 "top_center"    => toast::ToastPosition::TOP_CENTER,
@@ -1830,6 +1830,28 @@ fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::Ex
             .lines(lines)
             .at(pos)
             .ttl(ttl);
+            // Convert styled_lines → rich ratatui Lines if present.
+            if let Some(styled) = styled_lines {
+                use ratatui::style::Style;
+                use ratatui::text::{Line, Span};
+                let rich: Vec<Line<'static>> = styled.into_iter().map(|spans| {
+                    Line::from(spans.into_iter().map(|s| {
+                        let mut style = Style::default();
+                        if let Some(ref fg) = s.fg {
+                            if let Some(c) = parse_hex_color(fg) {
+                                style = style.fg(c);
+                            }
+                        }
+                        if let Some(ref bg) = s.bg {
+                            if let Some(c) = parse_hex_color(bg) {
+                                style = style.bg(c);
+                            }
+                        }
+                        Span::styled(s.text, style)
+                    }).collect::<Vec<_>>())
+                }).collect();
+                t = t.rich(rich);
+            }
             if let Some(title) = title {
                 t = t.titled(title);
             }
@@ -1839,6 +1861,16 @@ fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::Ex
             app.toasts.dismiss(&format!("widget:{}", id));
         }
     }
+}
+
+/// Parse a CSS-style hex color string (e.g. "#ff0000") into a ratatui Color.
+fn parse_hex_color(s: &str) -> Option<ratatui::style::Color> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(ratatui::style::Color::Rgb(r, g, b))
 }
 
 fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>, persistent: bool) {
