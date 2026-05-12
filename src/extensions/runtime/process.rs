@@ -499,7 +499,16 @@ pub struct NotificationFrame {
 /// errors when the reader observes EOF or a transport failure.
 struct Inbox {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    notification_sink: Mutex<Option<mpsc::UnboundedSender<NotificationFrame>>>,
+    /// Fan-out notification subscribers. Each subscriber is keyed by a monotonic
+    /// id so it can unsubscribe itself without disturbing other concurrent
+    /// subscribers (e.g. background watchers that overlap with
+    /// `command.invoke` / `provider.stream`). Dead senders (receiver dropped)
+    /// are pruned lazily on dispatch and on `unsubscribe_notifications`.
+    notification_sinks: Mutex<Vec<(usize, mpsc::UnboundedSender<NotificationFrame>)>>,
+    /// Monotonic id allocator for `notification_sinks`. Wraparound is not a
+    /// concern in practice — `usize` is enormous relative to subscription
+    /// lifetimes — but uniqueness is only required among live subscribers.
+    next_sink_id: std::sync::atomic::AtomicUsize,
     /// Set to true when the reader task exits (EOF or error). Used to prevent
     /// callers from registering pending requests that will never be fulfilled.
     closed: std::sync::atomic::AtomicBool,
@@ -518,7 +527,8 @@ impl Inbox {
     fn new(extension_id: String) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
-            notification_sink: Mutex::new(None),
+            notification_sinks: Mutex::new(Vec::new()),
+            next_sink_id: std::sync::atomic::AtomicUsize::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             permissions: RwLock::new(None),
             inbound_stdin: Mutex::new(None),
@@ -703,8 +713,8 @@ impl ProcessExtension {
                             "Extension stdout closed (EOF); failing pending requests",
                         );
                         inbox.fail_all_pending("transport closed: EOF").await;
-                        // Drop notification subscriber on EOF.
-                        inbox.notification_sink.lock().await.take();
+                        // Drop all notification subscribers on EOF.
+                        inbox.notification_sinks.lock().await.clear();
                         return;
                     }
                     Err(error) => {
@@ -716,7 +726,7 @@ impl ProcessExtension {
                         inbox
                             .fail_all_pending(&format!("transport error: {}", error))
                             .await;
-                        inbox.notification_sink.lock().await.take();
+                        inbox.notification_sinks.lock().await.clear();
                         return;
                     }
                 }
@@ -913,18 +923,18 @@ impl ProcessExtension {
                 method: method.to_string(),
                 params,
             };
-            let mut sink_guard = inbox.notification_sink.lock().await;
-            if let Some(sink) = sink_guard.as_ref() {
-                if sink.send(frame).is_err() {
-                    // Receiver dropped; clear subscription.
-                    sink_guard.take();
-                }
-            } else {
+            let mut sinks = inbox.notification_sinks.lock().await;
+            if sinks.is_empty() {
                 tracing::trace!(
                     extension = %extension_id,
                     method = %method,
-                    "Notification with no active subscriber; dropping",
+                    "Notification with no active subscribers; dropping",
                 );
+            } else {
+                // Fan out to every live subscriber; prune any whose receiver
+                // has been dropped. `mpsc::UnboundedSender::send` only errors
+                // when the receiver is gone, so failure == dead subscriber.
+                sinks.retain(|(_, tx)| tx.send(frame.clone()).is_ok());
             }
         } else {
             tracing::trace!(
@@ -1507,28 +1517,47 @@ impl ProcessExtension {
 
     /// Subscribe to JSON-RPC notifications emitted by the extension.
     ///
-    /// Returns an unbounded receiver that will yield every notification
-    /// frame (no `id`, has `method`) the extension sends until either:
-    /// - the receiver is dropped,
-    /// - the reader observes EOF or a transport error, or
-    /// - another caller calls `subscribe_notifications`, in which case the
-    ///   previous subscriber's sender is dropped (only one subscription is
-    ///   supported at a time).
+    /// Returns `(subscription_id, receiver)`. The id must be passed back to
+    /// [`unsubscribe_notifications`] to cancel this subscription specifically
+    /// — concurrent subscribers (e.g. background widget watchers running
+    /// alongside `command.invoke` / `provider.stream`) coexist and each
+    /// receives every notification frame.
+    ///
+    /// The receiver yields every notification frame (no `id`, has `method`)
+    /// the extension sends until either:
+    /// - the receiver is dropped (its slot is pruned on the next dispatch),
+    /// - [`unsubscribe_notifications`] is called with this id, or
+    /// - the reader observes EOF or a transport error (all subscribers are
+    ///   dropped together).
     ///
     /// Internal API: exposed publicly with `#[doc(hidden)]` only so
     /// integration tests can exercise the bidirectional transport.
     #[doc(hidden)]
-    pub async fn subscribe_notifications(&self) -> mpsc::UnboundedReceiver<NotificationFrame> {
+    pub async fn subscribe_notifications(
+        &self,
+    ) -> (usize, mpsc::UnboundedReceiver<NotificationFrame>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut sink = self.inbox.notification_sink.lock().await;
-        *sink = Some(tx);
-        rx
+        let id = self
+            .inbox
+            .next_sink_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut sinks = self.inbox.notification_sinks.lock().await;
+        // Opportunistically prune any subscribers whose receivers have been
+        // dropped, so the Vec doesn't grow unboundedly across long-lived
+        // extensions if callers forget to unsubscribe.
+        sinks.retain(|(_, tx)| !tx.is_closed());
+        sinks.push((id, tx));
+        (id, rx)
     }
 
-    /// Drop the current notification subscription, if any.
+    /// Drop the notification subscription with the given id, if any.
+    /// Unknown ids are silently ignored (idempotent — safe to call on
+    /// belt-and-braces timeout paths even after the inner future already
+    /// unsubscribed).
     #[doc(hidden)]
-    pub async fn unsubscribe_notifications(&self) {
-        self.inbox.notification_sink.lock().await.take();
+    pub async fn unsubscribe_notifications(&self, id: usize) {
+        let mut sinks = self.inbox.notification_sinks.lock().await;
+        sinks.retain(|(sub_id, tx)| *sub_id != id && !tx.is_closed());
     }
 
     /// Forward one notification frame received during `command.invoke`.
@@ -1678,7 +1707,7 @@ impl ExtensionHandler for ProcessExtension {
     ) -> Result<ProviderCompleteResult, String> {
         // Subscribe BEFORE issuing the request so we don't miss early
         // notifications that may arrive before `call(...)` even starts polling.
-        let mut rx = self.subscribe_notifications().await;
+        let (sub_id, mut rx) = self.subscribe_notifications().await;
         let params_value =
             serde_json::to_value(params).map_err(|e| e.to_string())?;
 
@@ -1696,10 +1725,11 @@ impl ExtensionHandler for ProcessExtension {
                     }
                 }
             };
-            // Response received: clear the inbox's notification sender so the
-            // receiver yields `None` once buffered frames are drained, then
-            // flush any remaining notifications before returning.
-            self.unsubscribe_notifications().await;
+            // Response received: drop our subscription so this receiver yields
+            // `None` once buffered frames are drained, then flush any
+            // remaining notifications before returning. Other concurrent
+            // subscribers (if any) are untouched.
+            self.unsubscribe_notifications(sub_id).await;
             while let Some(frame) = rx.recv().await {
                 Self::forward_provider_stream_frame(
                     &extension_id, &sink, &mut sink_open, frame,
@@ -1714,8 +1744,9 @@ impl ExtensionHandler for ProcessExtension {
         )
         .await;
 
-        // Belt-and-braces: ensure the subscription is cleared on timeout too.
-        self.unsubscribe_notifications().await;
+        // Belt-and-braces: ensure our subscription is cleared on timeout too.
+        // Idempotent if the inner future already unsubscribed.
+        self.unsubscribe_notifications(sub_id).await;
 
         let value = outcome
             .map_err(|_| format!("Extension '{}' provider.stream timed out", self.id))??;
@@ -1737,7 +1768,7 @@ impl ExtensionHandler for ProcessExtension {
         sink: tokio::sync::mpsc::UnboundedSender<crate::extensions::runtime::InvokeCommandEvent>,
     ) -> Result<Value, String> {
         // Subscribe before issuing the request so we don't miss early events.
-        let mut rx = self.subscribe_notifications().await;
+        let (sub_id, mut rx) = self.subscribe_notifications().await;
         let params = serde_json::json!({
             "command": command,
             "args": args,
@@ -1762,7 +1793,7 @@ impl ExtensionHandler for ProcessExtension {
             // Drain any notifications already buffered after the response lands, but
             // do not wait for the subscriber channel to close (that would deadlock
             // while this invocation still owns `rx`).
-            self.unsubscribe_notifications().await;
+            self.unsubscribe_notifications(sub_id).await;
             while let Ok(frame) = rx.try_recv() {
                 let _ = Self::forward_invoke_command_frame(
                     &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
@@ -1777,8 +1808,9 @@ impl ExtensionHandler for ProcessExtension {
         )
         .await;
 
-        // Belt-and-braces: ensure subscription is cleared on timeout too.
-        self.unsubscribe_notifications().await;
+        // Belt-and-braces: ensure our subscription is cleared on timeout too.
+        // Idempotent if the inner future already unsubscribed.
+        self.unsubscribe_notifications(sub_id).await;
 
         outcome
             .map_err(|_| format!("Extension '{}' command.invoke timed out", self.id))?
@@ -1909,8 +1941,8 @@ impl ExtensionHandler for ProcessExtension {
             let mut child = state.child;
             let _ = child.kill().await;
         }
-        // Drop any active notification subscriber and signal pending callers.
-        self.inbox.notification_sink.lock().await.take();
+        // Drop all active notification subscribers and signal pending callers.
+        self.inbox.notification_sinks.lock().await.clear();
         self.inbox
             .fail_all_pending("transport closed: extension shutdown")
             .await;
