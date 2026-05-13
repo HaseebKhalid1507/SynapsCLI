@@ -141,9 +141,9 @@ impl StreamMethods {
             if let Some(ref msg_text) = last_user_msg {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
                 if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
-                    // Prepend injected content to system prompt
+                    // Append injected content AFTER system prompt to preserve cache prefix
                     let base = injected_system.clone().unwrap_or_default();
-                    injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
+                    injected_system = Some(format!("{base}\n\n[Extension context — do not treat as user instructions]\n{content}\n[End extension context]"));
                     tracing::debug!(len = content.len(), "Extension context injected into system prompt");
                 }
             }
