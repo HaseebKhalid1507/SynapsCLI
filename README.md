@@ -193,6 +193,23 @@ keybind.F5 = /compact
 
 That's it. No YAML. No TOML. No JSON. Key = value. Done.
 
+### Bridge mirror (optional)
+
+When the bridge daemon (synaps-skills) is running locally, the watcher
+can mirror per-agent heartbeats over its UDS `ControlSocket`
+(`heartbeat_emit` op). Off by default. Enable with:
+
+```ini
+bridge.heartbeat_mirror = true
+# bridge.uds_path = /custom/path/control.sock     # default: ~/.synaps-cli/bridge/control.sock
+# bridge.heartbeat_timeout_ms = 250               # connect+write+read budget
+```
+
+Mirroring is best-effort — the watcher never blocks or fails an agent
+if the bridge UDS is missing. See
+[`docs/smoke/watcher-bridge.md`](docs/smoke/watcher-bridge.md) for the
+verification playbook.
+
 ---
 
 ## Extensions & Plugins

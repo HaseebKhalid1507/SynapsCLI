@@ -274,13 +274,22 @@ fn render_toasts(frame: &mut ratatui::Frame<'_>, provider: &super::toast::ToastP
             .border_style(Style::default().fg(THEME.load().border_active))
             .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(Clear, rect);
-        frame.render_widget(
+        // Rich lines carry their own per-span styling — don't override fg.
+        // Plain lines get the default help_fg color.
+        // Rich content also needs trim=false to preserve pixel art spacing.
+        let paragraph = if toast.has_rich_lines() {
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(Style::default().bg(THEME.load().bg))
+        } else {
             Paragraph::new(lines)
                 .block(block)
                 .wrap(Wrap { trim: true })
-                .style(Style::default().fg(THEME.load().help_fg)),
-            rect,
-        );
+                .style(Style::default().fg(THEME.load().help_fg))
+        };
+        frame.render_widget(paragraph, rect);
     }
 }
 

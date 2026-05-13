@@ -187,11 +187,16 @@ pub async fn run(
             // ── Async extension loader progress ──
             event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
                 if let Some(event) = event {
-                    handle_extension_loader_event(&mut app, &runtime, event).await;
+                    handle_extension_loader_event(&mut app, &runtime, event, &ext_mgr_shared).await;
                 } else {
                     app.extension_loader_running = false;
                     app.toasts.dismiss("extension-loader");
                 }
+            }
+
+            // ── Widget events from background extension notification watchers ──
+            Some(widget_event) = app.widget_rx.recv() => {
+                handle_widget_event(&mut app, widget_event);
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -1801,6 +1806,73 @@ pub async fn run(
     Ok(())
 }
 
+fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::ExtensionWidgetEvent) {
+    use synaps_cli::extensions::widgets::WidgetEvent;
+    match event.event {
+        WidgetEvent::Upsert { id, lines, styled_lines, position, title, ttl_secs } => {
+            let pos = match position.as_str() {
+                "top_left"      => toast::ToastPosition::TOP_LEFT,
+                "top_center"    => toast::ToastPosition::TOP_CENTER,
+                "top_right"     => toast::ToastPosition::TOP_RIGHT,
+                "middle_left"   => toast::ToastPosition::MIDDLE_LEFT,
+                "center"        => toast::ToastPosition::CENTER,
+                "middle_right"  => toast::ToastPosition::MIDDLE_RIGHT,
+                "bottom_left"   => toast::ToastPosition::BOTTOM_LEFT,
+                "bottom_center" => toast::ToastPosition::BOTTOM_CENTER,
+                "bottom_right"  => toast::ToastPosition::BOTTOM_RIGHT,
+                _               => toast::ToastPosition::TOP_RIGHT,
+            };
+            let ttl = ttl_secs.map(std::time::Duration::from_secs);
+            let mut t = toast::Toast::new(
+                format!("widget:{}", id),
+                lines.first().cloned().unwrap_or_default(),
+            )
+            .lines(lines)
+            .at(pos)
+            .ttl(ttl);
+            // Convert styled_lines → rich ratatui Lines if present.
+            if let Some(styled) = styled_lines {
+                use ratatui::style::Style;
+                use ratatui::text::{Line, Span};
+                let rich: Vec<Line<'static>> = styled.into_iter().map(|spans| {
+                    Line::from(spans.into_iter().map(|s| {
+                        let mut style = Style::default();
+                        if let Some(ref fg) = s.fg {
+                            if let Some(c) = parse_hex_color(fg) {
+                                style = style.fg(c);
+                            }
+                        }
+                        if let Some(ref bg) = s.bg {
+                            if let Some(c) = parse_hex_color(bg) {
+                                style = style.bg(c);
+                            }
+                        }
+                        Span::styled(s.text, style)
+                    }).collect::<Vec<_>>())
+                }).collect();
+                t = t.rich(rich);
+            }
+            if let Some(title) = title {
+                t = t.titled(title);
+            }
+            app.toasts.upsert(t);
+        }
+        WidgetEvent::Dismiss { id } => {
+            app.toasts.dismiss(&format!("widget:{}", id));
+        }
+    }
+}
+
+/// Parse a CSS-style hex color string (e.g. "#ff0000") into a ratatui Color.
+fn parse_hex_color(s: &str) -> Option<ratatui::style::Color> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(ratatui::style::Color::Rgb(r, g, b))
+}
+
 fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>, persistent: bool) {
     app.toasts.upsert(toast::Toast::new("extension-loader", "")
         .titled(title)
@@ -1814,6 +1886,7 @@ async fn handle_extension_loader_event(
     app: &mut App,
     runtime: &Runtime,
     event: synaps_cli::extensions::loader::ExtensionLoaderEvent,
+    ext_mgr: &std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
 ) {
     use synaps_cli::extensions::loader::ExtensionLoaderEvent;
     match event {
@@ -1854,6 +1927,35 @@ async fn handle_extension_loader_event(
                 ]
             };
             handle_extension_loader_toast(app, "Extensions", lines, false);
+
+            // Spawn a background notification watcher for each loaded extension.
+            // The watcher forwards widget.* notifications to the TUI via widget_tx.
+            let handlers = ext_mgr.read().await.handlers();
+            for (ext_id, handler) in handlers {
+                let widget_tx = app.widget_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let (_sub_id, mut rx) = handler.subscribe_notifications().await;
+                        while let Some(frame) = rx.recv().await {
+                            if synaps_cli::extensions::widgets::is_widget_method(&frame.method) {
+                                if let Ok(event) = synaps_cli::extensions::widgets::parse_widget_event(
+                                    &frame.method,
+                                    &frame.params,
+                                ) {
+                                    let _ = widget_tx.send(
+                                        synaps_cli::extensions::widgets::ExtensionWidgetEvent {
+                                            extension_id: ext_id.clone(),
+                                            event,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        // rx closed (EOF/restart) — resubscribe after a brief delay
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                });
+            }
         }
     }
 }

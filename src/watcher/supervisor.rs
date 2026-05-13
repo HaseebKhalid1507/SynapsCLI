@@ -340,6 +340,18 @@ pub(crate) async fn run_supervisor() {
 
     log("starting supervisor");
 
+    // Load global SynapsConfig once for bridge mirror settings; failures here
+    // are non-fatal — we just default the BridgeConfig.
+    let synaps_cfg = synaps_cli::load_config();
+    let bridge_cfg = std::sync::Arc::new(synaps_cfg.bridge.clone());
+    if bridge_cfg.heartbeat_mirror {
+        log(&format!(
+            "bridge heartbeat mirror ENABLED (uds={}, timeout={}ms)",
+            bridge_cfg.resolved_uds_path().display(),
+            bridge_cfg.heartbeat_timeout_ms
+        ));
+    }
+
     let socket_path = watcher_dir().join("watcher.sock");
     let pid_path = watcher_dir().join("watcher.pid");
 
@@ -492,8 +504,39 @@ pub(crate) async fn run_supervisor() {
                         }
                         Ok(None) => {
                             let agent_dir = AgentConfig::agent_dir(&agent.config_path);
+                            let stale_threshold = agent.config.heartbeat.stale_threshold_secs;
+                            let fresh = check_heartbeat(&agent_dir, stale_threshold);
+
+                            // Best-effort: mirror heartbeat to bridge UDS. Never blocks
+                            // the supervisor loop or fails the agent.
+                            if bridge_cfg.heartbeat_mirror {
+                                let bridge_cfg_for_task = bridge_cfg.clone();
+                                let agent_name = name.clone();
+                                let session_count = agent.session_count;
+                                let pid = agent.pid;
+                                tokio::spawn(async move {
+                                    let details = serde_json::json!({
+                                        "session_count": session_count,
+                                        "pid": pid,
+                                    });
+                                    if let Err(e) = bridge_client::mirror_heartbeat(
+                                        &bridge_cfg_for_task,
+                                        &agent_name,
+                                        fresh,
+                                        details,
+                                    ).await {
+                                        tracing::debug!(
+                                            target: "watcher::bridge",
+                                            agent = %agent_name,
+                                            error = %e,
+                                            "bridge heartbeat mirror failed (non-fatal)"
+                                        );
+                                    }
+                                });
+                            }
+
                             if agent.last_start.map(|s| s.elapsed().as_secs()).unwrap_or(0) > 60
-                                && !check_heartbeat(&agent_dir, agent.config.heartbeat.stale_threshold_secs)
+                                && !fresh
                             {
                                 log(&format!("[{}] heartbeat stale — killing", name));
                                 let _ = child.kill().await;

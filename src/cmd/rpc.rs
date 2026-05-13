@@ -29,7 +29,7 @@ use synaps_cli::{
     Runtime, Session, SessionEvent, StreamEvent,
     core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
     core::rpc_dispatch::{
-        accumulate_usage, build_user_content, map_stream_event, parse_frame, MAX_FRAME_BYTES,
+        accumulate_usage, build_user_content, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES,
     },
     engine::setup::{self, EngineOpts},
 };
@@ -544,6 +544,39 @@ async fn handle_get_state(
         .await;
 }
 
+/// Handle the `ToolsList` command.
+///
+/// Reads the current tool schema from the runtime's shared `ToolRegistry`
+/// (built-ins + any MCP / extension tools loaded at boot time) and returns
+/// `{ ok: true, tools: [{name, description, input_schema}, ...] }`.
+///
+/// The response uses the existing [`RpcEvent::Response`] frame with
+/// `command: "tools_list"`, which the bridge Phase 8
+/// `SynapsRpcSessionRouter.listTools()` validates as:
+///   `response.ok === true && Array.isArray(response.tools)`.
+async fn handle_tools_list(
+    id: Option<String>,
+    state: Arc<Mutex<RpcState>>,
+    writer_tx: mpsc::Sender<RpcEvent>,
+) {
+    let schema = {
+        let st = state.lock().await;
+        let registry = st.runtime.tools_shared();
+        let guard = registry.read().await;
+        guard.tools_schema().as_ref().clone()
+    };
+
+    let body = build_tools_list_body(&schema);
+    let response_id = id.unwrap_or_default();
+    let _ = writer_tx
+        .send(RpcEvent::Response {
+            id: response_id,
+            command: "tools_list".to_string(),
+            body,
+        })
+        .await;
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 /// Run the `synaps rpc` headless server.
@@ -710,6 +743,9 @@ pub async fn run(
                     }
                     RpcCommand::GetState { id } => {
                         handle_get_state(id, state.clone(), writer_tx.clone()).await;
+                    }
+                    RpcCommand::ToolsList { id } => {
+                        handle_tools_list(id, state.clone(), writer_tx.clone()).await;
                     }
                     RpcCommand::Shutdown => {
                         tracing::info!("Shutdown received; draining and exiting");
