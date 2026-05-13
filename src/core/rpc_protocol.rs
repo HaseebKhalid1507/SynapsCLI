@@ -186,6 +186,21 @@ pub enum RpcCommand {
         id: String,
     },
 
+    /// Enumerate all tools currently registered in this rpc session's tool
+    /// registry (built-ins + any MCP / extension tools loaded at boot).
+    ///
+    /// The `id` field follows the same optional-correlation convention used by
+    /// other commands: when present it is echoed in the `Response` frame so the
+    /// bridge can match the reply to its pending probe.  The bridge Phase 8
+    /// router sends `{"type":"tools_list"}` without an `id`; both forms are
+    /// accepted.
+    #[serde(rename = "tools_list")]
+    ToolsList {
+        /// Optional correlation id; echoed in the corresponding `Response`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+
     /// Instruct the rpc child to exit cleanly.
     ///
     /// No `id` field — the child does not send a `Response` for shutdown.
@@ -359,4 +374,84 @@ pub enum AssistantEvent {
         /// The serialised tool result string.
         result: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{from_str, json, to_string};
+
+    // ── RpcCommand::ToolsList round-trip ────────────────────────────────────
+
+    #[test]
+    fn tools_list_no_id_serialises() {
+        let cmd = RpcCommand::ToolsList { id: None };
+        let json = to_string(&cmd).expect("serialise");
+        let val: serde_json::Value = from_str(&json).unwrap();
+        assert_eq!(val["type"], "tools_list");
+        assert!(val.get("id").is_none(), "absent id must be omitted (skip_serializing_if)");
+    }
+
+    #[test]
+    fn tools_list_with_id_serialises() {
+        let cmd = RpcCommand::ToolsList { id: Some("req-42".to_string()) };
+        let json = to_string(&cmd).expect("serialise");
+        let val: serde_json::Value = from_str(&json).unwrap();
+        assert_eq!(val["type"], "tools_list");
+        assert_eq!(val["id"], "req-42");
+    }
+
+    #[test]
+    fn tools_list_no_id_deserialises() {
+        let line = r#"{"type":"tools_list"}"#;
+        let cmd: RpcCommand = from_str(line).expect("deserialise");
+        match cmd {
+            RpcCommand::ToolsList { id } => assert!(id.is_none()),
+            other => panic!("expected ToolsList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tools_list_with_id_deserialises() {
+        let line = r#"{"type":"tools_list","id":"abc-123"}"#;
+        let cmd: RpcCommand = from_str(line).expect("deserialise");
+        match cmd {
+            RpcCommand::ToolsList { id } => assert_eq!(id.as_deref(), Some("abc-123")),
+            other => panic!("expected ToolsList, got {other:?}"),
+        }
+    }
+
+    // ── Response body shape expected by the bridge ──────────────────────────
+
+    /// The bridge validates: `response.ok === true && Array.isArray(response.tools)`.
+    /// Verify the flattened RpcEvent::Response body produces exactly that shape.
+    #[test]
+    fn tools_list_response_body_shape_matches_bridge_expectation() {
+        let tools_json = json!([
+            {
+                "name": "bash",
+                "description": "Run a bash command",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }
+        ]);
+        let ev = RpcEvent::Response {
+            id: "req-1".to_string(),
+            command: "tools_list".to_string(),
+            body: json!({ "ok": true, "tools": tools_json }),
+        };
+        let serialised = to_string(&ev).expect("serialise");
+        let val: serde_json::Value = from_str(&serialised).unwrap();
+
+        assert_eq!(val["type"], "response");
+        assert_eq!(val["id"], "req-1");
+        assert_eq!(val["command"], "tools_list");
+        // Bridge checks these two fields at the top level (flattened):
+        assert_eq!(val["ok"], true, "bridge needs ok=true at top level");
+        assert!(val["tools"].is_array(), "bridge needs tools array at top level");
+        assert_eq!(val["tools"][0]["name"], "bash");
+    }
 }

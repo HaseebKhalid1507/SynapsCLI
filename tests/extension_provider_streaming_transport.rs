@@ -33,7 +33,7 @@ async fn process_extension_dispatches_notifications_to_subscriber() {
         .await
         .expect("initialize fixture");
 
-    let mut rx = handler.subscribe_notifications().await;
+    let (_sub_id, mut rx) = handler.subscribe_notifications().await;
 
     let result = handler
         .call_tool("trigger", serde_json::json!({}))

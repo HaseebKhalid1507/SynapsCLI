@@ -175,6 +175,22 @@ pub fn build_user_content(message: &str, attachments: &[RpcAttachment]) -> Strin
     format!("[user attached files: {}]\n{}", parts.join(", "), message)
 }
 
+// ─── tools_list helper ───────────────────────────────────────────────────────
+
+/// Build the `tools_list` response body from a `ToolRegistry` schema snapshot.
+///
+/// The schema entries produced by [`ToolRegistry::tools_schema`] already have
+/// the shape `{name, description, input_schema}` that the bridge Phase 8
+/// `SynapsRpcSessionRouter.listTools()` expects. This function wraps them in
+/// the top-level `{ ok: true, tools: [...] }` envelope that the bridge
+/// validates (router.js line 112).
+pub fn build_tools_list_body(tools_schema: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "tools": tools_schema,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -695,6 +711,45 @@ mod tests {
             msg.contains("\"/tmp/a\\\\b\""),
             "backslash in path must be doubled: {msg}"
         );
+    }
+
+    // ── build_tools_list_body ────────────────────────────────────────────────
+
+    #[test]
+    fn build_tools_list_body_empty() {
+        let body = super::build_tools_list_body(&[]);
+        assert_eq!(body["ok"], true);
+        assert!(body["tools"].is_array());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_tools_list_body_with_entries() {
+        let schema = vec![
+            json!({"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}}),
+            json!({"name": "read", "description": "Read file", "input_schema": {"type": "object"}}),
+        ];
+        let body = super::build_tools_list_body(&schema);
+        assert_eq!(body["ok"], true);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "bash");
+        assert_eq!(tools[1]["name"], "read");
+    }
+
+    /// The bridge checks `response.ok === true && Array.isArray(response.tools)`.
+    /// Verify the body round-trips through serde and satisfies both conditions.
+    #[test]
+    fn build_tools_list_body_roundtrip_satisfies_bridge_contract() {
+        let schema = vec![
+            json!({"name": "bash", "description": "desc", "input_schema": {}}),
+        ];
+        let body = super::build_tools_list_body(&schema);
+        // Simulate serialise → deserialise (what the parent process and bridge each do).
+        let serialised = serde_json::to_string(&body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialised).unwrap();
+        assert_eq!(parsed["ok"], true, "bridge check: ok===true");
+        assert!(parsed["tools"].is_array(), "bridge check: Array.isArray(tools)");
     }
 
     // ── handle_compact lock-release invariant ────────────────────────────────
