@@ -146,7 +146,7 @@ impl HelperMethods {
             }
         }
 
-        // We only place a new marker if the last one is 4+ user messages away (e.g. 4 tool loops!)
+        // We only place a new marker if the last one is 4+ user messages away (aggressive caching for tool loops)
         let target_idx = user_indices[user_indices.len() - 1]; // We can just mark the latest
         let should_add = match existing_markers.last() {
             Some(&last_idx) => user_indices.len() as isize - user_indices.iter().position(|&x| x == last_idx).unwrap_or(0) as isize >= 4,
