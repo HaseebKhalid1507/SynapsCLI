@@ -101,7 +101,7 @@ impl ApiMethods {
             "model": model,
             "max_tokens": HelperMethods::max_tokens_for_model(model),
             "messages": cleaned_messages,
-            "tools": &*tools.tools_schema(),
+            "tools": &*tools_schema,
             "stream": true,
             "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
                 json!({ "type": "adaptive", "display": "summarized" })

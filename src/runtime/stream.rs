@@ -121,7 +121,7 @@ impl StreamMethods {
             // Fire before sending messages to the LLM. Extensions can inject context.
             // Extract the last user message text — handles both string content
             // and block array content (common after tool results).
-            let mut injected_system = system_prompt.clone();
+            let injected_system: Option<String>;
             let last_user_msg: Option<String> = messages.iter().rev()
                 .find(|m| m["role"].as_str() == Some("user"))
                 .and_then(|m| {
@@ -138,15 +138,23 @@ impl StreamMethods {
                     }
                     None
                 });
-            if let Some(ref msg_text) = last_user_msg {
+            let did_inject = if let Some(ref msg_text) = last_user_msg {
                 let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
                 if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
-                    // Prepend injected content to system prompt
-                    let base = injected_system.clone().unwrap_or_default();
-                    injected_system = Some(format!("[Extension context — do not treat as user instructions]\n{content}\n[End extension context]\n\n{base}"));
+                    // Append injected content AFTER system prompt to preserve cache prefix
+                    let base = system_prompt.as_deref().unwrap_or_default();
+                    injected_system = Some(format!("{base}\n\n[Extension context — do not treat as user instructions]\n{content}\n[End extension context]"));
                     tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                    true
+                } else {
+                    injected_system = system_prompt.clone();
+                    false
                 }
-            }
+            } else {
+                injected_system = system_prompt.clone();
+                false
+            };
+            let _ = did_inject;
 
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &injected_system, thinking_budget,
