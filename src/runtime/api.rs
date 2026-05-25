@@ -136,7 +136,7 @@ impl ApiMethods {
 
         if auth_type == "oauth" {
             let mut system_blocks = vec![
-                json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}),
+                json!({"type": "text", "text": crate::core::config::get_identity()}),
                 json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
             ];
             if let Some(ref prompt) = system_prompt {

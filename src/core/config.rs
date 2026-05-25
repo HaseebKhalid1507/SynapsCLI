@@ -5,6 +5,16 @@ use crate::tools::shell::config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+static IDENTITY: OnceLock<String> = OnceLock::new();
+
+const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
+
+/// Returns the configured identity string for the system prompt preamble.
+/// Falls back to the default Claude Code identity if not set in config.
+/// Initialized by `load_config()` — safe to call anytime after boot.
+pub fn get_identity() -> String {
+    IDENTITY.get().cloned().unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+}
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.
 /// Empty if `load_config()` hasn't been called. The registry falls back to
@@ -156,6 +166,7 @@ pub struct SynapsConfig {
     pub api_retries: u32,              // default 3
     pub theme: Option<String>,
     pub agent_name: Option<String>,
+    pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
@@ -180,6 +191,7 @@ impl Default for SynapsConfig {
             api_retries: 3,
             theme: None,
             agent_name: None,
+            identity: None,
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
@@ -393,6 +405,7 @@ pub fn load_config() -> SynapsConfig {
             }
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
+            "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
                 config.disabled_plugins = parse_comma_list(val);
             }
@@ -431,6 +444,10 @@ pub fn load_config() -> SynapsConfig {
     // Publish provider keys to the process-wide cache for the API router.
     // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
     let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
+
+    // Publish identity to the process-wide cache for API system prompt preamble.
+    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
+    let _ = IDENTITY.set(identity_val);
 
     config
 }
