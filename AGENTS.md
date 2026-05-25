@@ -1,6 +1,6 @@
 # AGENTS.md — SynapsCLI Developer & Agent Guide
 
-This is the onboarding doc for any agent (Claude Code, Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
+This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
 SynapsCLI is a terminal-native AI agent runtime written in Rust. ~45K LOC across 161 `.rs` files. Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
@@ -351,6 +351,29 @@ Mapping (`core/models.rs:68::thinking_level_for_budget`):
 ```
 
 `SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `core/config.rs::resolve_read_path()`.
+
+### Config Keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model` | string | — | Default model (e.g. `claude-sonnet-4-6`) |
+| `thinking` | string/int | — | Thinking budget: `low`, `medium`, `high`, `xhigh`, `adaptive`, or token count |
+| `context_window` | string/int | auto | `200k`, `1m`, or token count |
+| `identity` | string | SynapsCLI default | System prompt preamble injected as the first message in the system block. Defines who the agent is. |
+| `agent_name` | string | — | Display name for the agent in the TUI |
+| `theme` | string | — | TUI color theme (17 built-in + user TOML) |
+| `compaction_model` | string | claude-sonnet-4-6 | Model used for `/compact` |
+| `max_tool_output` | int | 30000 | Max bytes per tool output |
+| `bash_timeout` | int | 30 | Default bash timeout (seconds) |
+| `bash_max_timeout` | int | 300 | Max allowed bash timeout |
+| `subagent_timeout` | int | 300 | Default subagent timeout (seconds) |
+| `api_retries` | int | 3 | Max API retries on transient errors |
+| `favorite_models` | comma list | — | Pinned models in model picker |
+| `disabled_plugins` | comma list | — | Plugins to skip on boot |
+| `disabled_skills` | comma list | — | Skills to skip on boot |
+| `provider.<name>` | string | — | API key for provider (e.g. `provider.groq = gsk_...`) |
+| `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
+| `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
 
 ---
 

@@ -184,6 +184,7 @@ model = claude-sonnet-4-6
 thinking = high
 theme = neon-rain
 context_window = 200k
+identity = You are a senior engineer who writes clean, tested code.
 
 provider.groq = gsk_...
 provider.cerebras = csk-...
