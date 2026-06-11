@@ -69,7 +69,11 @@ pub async fn run(
         app.total_output_tokens = boot.total_output_tokens;
         app.session_cost = boot.session_cost;
         app.abort_context = boot.abort_context;
-        rebuild_display_messages(&app.api_messages.clone(), &mut app);
+        // mem::take avoids deep-cloning the full history just to satisfy
+        // the borrow checker (P5 in REVIEW.md).
+        let msgs = std::mem::take(&mut app.api_messages);
+        rebuild_display_messages(&msgs, &mut app);
+        app.api_messages = msgs;
         app.push_msg(ChatMessage::System(format!("resumed session {}", boot.session.id)));
         if let Some(ref info) = boot.continue_info {
             if let Some(ref via) = info.resolved_via {
