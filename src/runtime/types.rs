@@ -56,6 +56,9 @@ pub enum SessionEvent {
     },
     Done,
     Error(String),
+    /// Transient status line (e.g. retry notices) — display-only, never
+    /// persisted into message history or sent back to the API.
+    Notice(String),
 }
 
 #[derive(Debug, Clone)]

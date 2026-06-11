@@ -166,7 +166,8 @@ impl ApiMethods {
                 if attempt > 0 {
                     let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
                     tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(format!("\n⏳ API error, retrying ({}/{})...\n", attempt, max_retries))));
+                    // Display-only notice — never lands in message history.
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!("⏳ API error, retrying ({}/{})…", attempt, max_retries))));
                     tokio::time::sleep(delay).await;
 
                     if cancel.is_cancelled() {
@@ -200,13 +201,13 @@ impl ApiMethods {
                         let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
                         let error_text = resp.text().await.unwrap_or_default();
                         if !is_retryable || attempt == max_retries {
-                            return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+                            return Err(RuntimeError::ApiStatus(crate::core::error::humanize_api_error(status.as_u16(), &error_text)));
                         }
                         last_err = format!("{}: {}", status, error_text);
                     }
                     Err(e) => {
                         if attempt == max_retries {
-                            return Err(RuntimeError::Api(e));
+                            return Err(RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)));
                         }
                         last_err = e.to_string();
                     }
@@ -262,7 +263,9 @@ impl ApiMethods {
             if cancel.is_cancelled() {
                 break;
             }
-            let chunk = chunk?;
+            // A transport error mid-stream means connection loss — translate
+            // to an actionable message instead of a raw reqwest debug string.
+            let chunk = chunk.map_err(|e| RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)))?;
             byte_buffer.extend_from_slice(&chunk);
 
             // Process complete lines (delimited by \n) from the byte buffer

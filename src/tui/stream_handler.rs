@@ -123,6 +123,10 @@ pub(super) async fn handle_stream_event(
                 Some(runtime.context_window()),
             );
         }
+        StreamEvent::Session(SessionEvent::Notice(text)) => {
+            // Display-only retry/status notice — system line, not transcript.
+            app.push_msg(ChatMessage::System(text));
+        }
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
             app.subagents.clear();
