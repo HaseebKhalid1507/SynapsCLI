@@ -91,6 +91,22 @@ pub async fn run(
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }
 
+    // First-run guidance: no Anthropic credentials and no provider keys means
+    // the first message will fail — tell the user up front instead.
+    {
+        let has_anthropic = synaps_cli::auth::load_auth()
+            .ok()
+            .flatten()
+            .map(|a| a.anthropic.auth_type == "oauth" && !a.anthropic.access.is_empty())
+            .unwrap_or(false)
+            || std::env::var("ANTHROPIC_API_KEY").is_ok();
+        if !has_anthropic && config.provider_keys.is_empty() {
+            app.push_msg(ChatMessage::System(
+                "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or set ANTHROPIC_API_KEY in your environment\n   • or add `provider.<name> = <key>` to ~/.synaps-cli/config (groq, openrouter, …) and pick with /model".to_string(),
+            ));
+        }
+    }
+
     if mcp_server_count > 0 {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
     }
