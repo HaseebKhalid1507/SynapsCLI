@@ -43,6 +43,7 @@ pub(super) struct StreamSession {
     pub(super) hook_bus: Arc<crate::extensions::hooks::HookBus>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
 }
 
 pub(super) struct StreamMethods;
@@ -73,7 +74,7 @@ impl StreamMethods {
             watcher_exit_path, max_tool_output,
             bash_timeout, bash_max_timeout, subagent_timeout,
             session_manager, subagent_registry, event_queue, hook_bus, secret_prompt,
-            auto_approve_confirms,
+            auto_approve_confirms, telemetry_level,
         } = session;
         let mut messages = initial_messages;
 
@@ -159,6 +160,7 @@ impl StreamMethods {
             let response = match ApiMethods::call_api_stream_inner(
                 &auth, &client, &model, &tools_snapshot, &injected_system, thinking_budget,
                 &messages, tx.clone(), &cancel, api_retries, &options,
+                telemetry_level,
             ).await {
                 Ok(r) => r,
                 Err(e) => {

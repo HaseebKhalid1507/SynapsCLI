@@ -44,8 +44,9 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
         options: &ApiOptions,
+        telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options, telemetry_level).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -64,6 +65,7 @@ impl ApiMethods {
         cancel: &CancellationToken,
         max_retries: u32,
         options: &ApiOptions,
+        telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
         // Route to OpenAI-compat provider if the model id resolves to one.
         let tools_schema = tools.tools_schema();
@@ -214,10 +216,32 @@ impl ApiMethods {
             response.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
         };
 
+        // ═══ TELEMETRY: capture headers before consuming the response body ═══
+        use crate::runtime::telemetry::{self, TelemetryLevel};
+        let request_start = std::time::Instant::now();
+        let telem_request_id = if telemetry_level.enabled() {
+            telemetry::request_id_from_headers(response.headers())
+        } else {
+            None
+        };
+        let telem_ratelimit = if telemetry_level == TelemetryLevel::Full {
+            let rl = telemetry::ratelimit_from_headers(response.headers());
+            if rl.is_empty() { None } else { Some(rl) }
+        } else {
+            None
+        };
+
         let mut stream = response.bytes_stream();
         tracing::debug!("Stream opened");
         let mut accumulated_content: Vec<Value> = Vec::new();
         let mut current_text = String::new();
+
+        // ═══ TELEMETRY: accumulation state ═══
+        let mut telem_msg_id: Option<String> = None;
+        let mut telem_ttft: Option<u64> = None;
+        let mut telem_stop_reason: Option<String> = None;
+        let mut telem_usage = telemetry::UsageRecord::default();
+        let mut first_event_seen = false;
 
         // Tool use accumulation state
         let mut current_tool_name = String::new();
@@ -260,6 +284,12 @@ impl ApiMethods {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
+
+                // ═══ TELEMETRY: capture TTFT on first event ═══
+                if !first_event_seen && telemetry_level.enabled() {
+                    telem_ttft = Some(request_start.elapsed().as_millis() as u64);
+                    first_event_seen = true;
+                }
 
                 match event["type"].as_str() {
                     Some("content_block_start") => {
@@ -376,6 +406,14 @@ impl ApiMethods {
                         }
                     }
                     Some("message_delta") => {
+                        // ═══ TELEMETRY: capture stop_reason from delta ═══
+                        if telemetry_level.enabled() {
+                            if let Some(delta) = event.get("delta") {
+                                if let Some(sr) = delta["stop_reason"].as_str() {
+                                    telem_stop_reason = Some(sr.to_string());
+                                }
+                            }
+                        }
                         if let Some(usage) = event.get("usage") {
                             let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
                             let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
@@ -384,6 +422,19 @@ impl ApiMethods {
                             if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                                 HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                                 tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+                                // ═══ TELEMETRY: accumulate usage (message_delta carries final counts) ═══
+                                if telemetry_level.enabled() {
+                                    telem_usage.input = input_t;
+                                    telem_usage.output = output_t;
+                                    telem_usage.cache_read = cache_read;
+                                    telem_usage.cache_write = cache_create;
+                                    // TTL breakdown from cache_creation sub-object
+                                    if let Some(cc) = usage.get("cache_creation") {
+                                        telem_usage.cache_write_5m = cc["ephemeral_5m_input_tokens"].as_u64();
+                                        telem_usage.cache_write_1h = cc["ephemeral_1h_input_tokens"].as_u64();
+                                    }
+                                    telem_usage.compute_hit_pct();
+                                }
                                 let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens: input_t,
                                     output_tokens: output_t,
@@ -396,6 +447,12 @@ impl ApiMethods {
                     }
                     Some("message_start") => {
                         if let Some(msg) = event.get("message") {
+                            // ═══ TELEMETRY: capture msg_id ═══
+                            if telemetry_level.enabled() {
+                                if let Some(id) = msg["id"].as_str() {
+                                    telem_msg_id = Some(id.to_string());
+                                }
+                            }
                             if let Some(usage) = msg.get("usage") {
                                 let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
                                 let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
@@ -476,6 +533,44 @@ impl ApiMethods {
                 "type": "text",
                 "text": current_text
             }));
+        }
+
+        // ═══ TELEMETRY: write the record ═══
+        if telemetry_level.enabled() {
+            // Build context record — what we sent
+            let breakpoints: Vec<usize> = cleaned_messages.iter().enumerate()
+                .filter(|(_, m)| {
+                    if let Some(arr) = m["content"].as_array() {
+                        arr.last().and_then(|b| b.get("cache_control")).is_some()
+                    } else {
+                        false
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
+
+            let record = telemetry::TelemetryRecord {
+                ts: telemetry::TelemetryRecord::now_ms(),
+                request_id: telem_request_id,
+                msg_id: telem_msg_id,
+                model: model.to_string(),
+                attempt: 1, // TODO: thread attempt number from retry loop
+                ttft_ms: telem_ttft,
+                total_ms: request_start.elapsed().as_millis() as u64,
+                stop_reason: telem_stop_reason,
+                usage: telem_usage,
+                ratelimit: telem_ratelimit,
+                cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
+                context: telemetry::ContextRecord {
+                    messages: cleaned_messages.len(),
+                    tools: tools_schema.len(),
+                    system_bytes,
+                    breakpoints,
+                },
+            };
+            telemetry::write_record(&record);
         }
 
         Ok(json!({
