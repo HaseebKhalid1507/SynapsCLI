@@ -243,6 +243,9 @@ pub async fn run(
                 EngineStreamEvent::SteeringDelivered { message } => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
                 }
+                EngineStreamEvent::Notice(text) => {
+                    eprintln!("\x1b[2m{}\x1b[0m", text);
+                }
                 EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
                 EngineStreamEvent::Error(e) => {
                     eprintln!("\x1b[31m❌ {}\x1b[0m", e);
