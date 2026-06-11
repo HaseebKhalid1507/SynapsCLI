@@ -485,6 +485,10 @@ pub fn load_config() -> SynapsConfig {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
                     config.keybinds.insert(keybind_key.to_string(), val.to_string());
+                } else if key.contains('.') {
+                    // Dotted keys are namespaced (plugin/extension config, e.g.
+                    // `knowledge.jawz_notes`). Plugins define their own keys —
+                    // not ours to police. Silently preserved.
                 } else {
                     // Unknown top-level key — warn with a did-you-mean if close.
                     match did_you_mean(key) {
@@ -648,11 +652,13 @@ mod tests {
         let home = std::env::temp_dir().join(format!("synaps-warn-test-{}", std::process::id()));
         let dir = home.join(".synaps-cli");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "modle = claude-opus-4-6\nthinking = hgih\nbash_timeout = 0\n").unwrap();
+        std::fs::write(dir.join("config"), "modle = claude-opus-4-6\nthinking = hgih\nbash_timeout = 0\nknowledge.jawz_notes = ~/Jawz/notes\ncustom.plugin.key = 42\n").unwrap();
 
         with_home(&home, || {
             let config = load_config();
+            // Dotted (namespaced) keys must NOT warn — plugins own those.
             assert_eq!(config.warnings.len(), 3, "warnings: {:?}", config.warnings);
+            assert!(!config.warnings.iter().any(|w| w.contains("knowledge")), "{:?}", config.warnings);
             assert!(config.warnings.iter().any(|w| w.contains("did you mean 'model'")), "{:?}", config.warnings);
             assert!(config.warnings.iter().any(|w| w.contains("thinking")), "{:?}", config.warnings);
             assert!(config.warnings.iter().any(|w| w.contains("below minimum")), "{:?}", config.warnings);
