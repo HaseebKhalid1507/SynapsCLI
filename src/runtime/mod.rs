@@ -162,6 +162,13 @@ pub struct Runtime {
     bash_max_timeout: u64,
     subagent_timeout: u64,
     api_retries: u32,
+    /// Telemetry level for structured per-request API logging (opt-in).
+    telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
+    cache_diagnostics: bool,
+    /// Last Anthropic message id (`msg_...`) — threaded into the next
+    /// request's `diagnostics.previous_message_id` when diagnostics is on.
+    last_msg_id: Arc<Mutex<Option<String>>>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.
     hook_bus: Arc<crate::extensions::hooks::HookBus>,
@@ -214,6 +221,9 @@ impl Runtime {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            cache_diagnostics: false,
+            last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             reaper_handle: Some(reaper_handle),
@@ -312,6 +322,8 @@ impl Runtime {
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
+        self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.cache_diagnostics = config.cache_diagnostics;
     }
 
     pub fn thinking_budget(&self) -> u32 {
@@ -356,6 +368,22 @@ impl Runtime {
 
     pub fn set_api_retries(&mut self, v: u32) {
         self.api_retries = v;
+    }
+
+    pub fn telemetry_level(&self) -> crate::runtime::telemetry::TelemetryLevel {
+        self.telemetry_level
+    }
+
+    pub fn set_telemetry_level(&mut self, level: crate::runtime::telemetry::TelemetryLevel) {
+        self.telemetry_level = level;
+    }
+
+    pub fn cache_diagnostics(&self) -> bool {
+        self.cache_diagnostics
+    }
+
+    pub fn set_cache_diagnostics(&mut self, v: bool) {
+        self.cache_diagnostics = v;
     }
 
     pub fn thinking_level(&self) -> &str {
@@ -740,6 +768,11 @@ impl Clone for Runtime {
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
+            telemetry_level: self.telemetry_level,
+            cache_diagnostics: self.cache_diagnostics,
+            // Subagents start their own request chain — inheriting the parent's
+            // last msg_id would produce bogus `messages_changed` diagnostics.
+            last_msg_id: Arc::new(Mutex::new(None)),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
