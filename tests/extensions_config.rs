@@ -20,13 +20,22 @@ fn fixture_path() -> String {
 }
 
 fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
+    manifest_with_perms_and_args(perms, vec![])
+}
+
+/// Like `manifest_with_perms` but with extra fixture args. The host scrubs
+/// the environment of extension processes (env_clear), so fixture behavior
+/// must be controlled via argv, not env vars.
+fn manifest_with_perms_and_args(perms: Vec<&str>, extra_args: Vec<&str>) -> ExtensionManifest {
+    let mut args = vec![fixture_path()];
+    args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
-        args: vec![fixture_path()],
+        args,
         permissions: perms.into_iter().map(String::from).collect(),
         hooks: vec![],
         config: vec![],
@@ -36,7 +45,7 @@ fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_can_set_and_read_own_plugin_config_file() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     std::env::remove_var("CONFIG_FIXTURE_KEY");
@@ -61,15 +70,15 @@ async fn extension_can_set_and_read_own_plugin_config_file() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_can_read_config_without_write_permission() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     synaps_cli::extensions::config_store::write_plugin_config("config-test-ext", "backend", "auto")
         .unwrap();
-    std::env::set_var("CONFIG_FIXTURE_SET", "0");
 
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
-    let manifest = manifest_with_perms(vec!["config.subscribe"]);
+    // --no-set: read-only fixture mode (env vars don't survive env_clear)
+    let manifest = manifest_with_perms_and_args(vec!["config.subscribe"], vec!["--no-set"]);
 
     manager
         .load("config-test-ext", &manifest)
@@ -83,7 +92,7 @@ async fn extension_can_read_config_without_write_permission() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_without_write_permission_cannot_set_config() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     std::env::remove_var("CONFIG_FIXTURE_SET");

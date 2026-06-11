@@ -4,6 +4,11 @@ import os
 import sys
 
 LOG_PATH = os.environ.get("SYNAPS_COMPACTION_LOG")
+if not LOG_PATH:
+    # The host scrubs extension process environments (env_clear), so the
+    # env var doesn't survive a manager spawn. Fall back to the conventional
+    # location: <plugin_dir>/compaction.jsonl, one level above this script.
+    LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "compaction.jsonl")
 
 
 def read_message():

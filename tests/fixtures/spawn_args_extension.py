@@ -55,6 +55,10 @@ def main():
             send_response(msg, error={"code": -32601, "message": "method not found"})
         elif method == "sidecar.spawn_args":
             mode = os.environ.get("SPAWN_ARGS_MODE", "ok")
+            # argv override — host scrubs extension envs (env_clear)
+            for arg in sys.argv[1:]:
+                if arg.startswith("--mode="):
+                    mode = arg.split("=", 1)[1]
             if mode == "missing":
                 send_response(msg, error={"code": -32601, "message": "method not found"})
             elif mode == "invalid":

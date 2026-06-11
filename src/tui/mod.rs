@@ -2060,6 +2060,7 @@ fn pick_display_name_for_plugin(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    use serial_test::serial;
     use synaps_cli::skills::registry::LifecycleClaim;
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
@@ -2091,6 +2092,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_copies_legacy_into_namespaced_key() {
         let home = make_test_home("copy-into-namespaced");
         let cfg = home.join(".synaps-cli/config");
@@ -2109,6 +2111,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_skips_when_new_key_already_set() {
         let home = make_test_home("skip-existing");
         let cfg = home.join(".synaps-cli/config");
@@ -2130,6 +2133,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_is_noop_when_legacy_unset() {
         let home = make_test_home("noop-no-legacy");
         let cfg = home.join(".synaps-cli/config");
@@ -2147,6 +2151,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_skips_claim_without_settings_category() {
         let home = make_test_home("skip-no-category");
         let cfg = home.join(".synaps-cli/config");
@@ -2163,6 +2168,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_handles_multiple_claims_in_one_pass() {
         let home = make_test_home("multi-claim");
         let cfg = home.join(".synaps-cli/config");

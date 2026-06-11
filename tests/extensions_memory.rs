@@ -26,13 +26,21 @@ fn fixture_path() -> String {
 }
 
 fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
+    manifest_with_perms_and_args(perms, vec![])
+}
+
+/// argv variant — the host scrubs extension envs (env_clear), so fixture
+/// behavior must be parameterized via args.
+fn manifest_with_perms_and_args(perms: Vec<&str>, extra_args: Vec<&str>) -> ExtensionManifest {
+    let mut args = vec![fixture_path()];
+    args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
-        args: vec![fixture_path()],
+        args,
         permissions: perms.into_iter().map(String::from).collect(),
         hooks: vec![],
         config: vec![],
@@ -42,7 +50,7 @@ fn manifest_with_perms(perms: Vec<&str>) -> ExtensionManifest {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_can_append_and_query_within_its_namespace() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -79,7 +87,7 @@ async fn extension_can_append_and_query_within_its_namespace() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_without_permission_cannot_append() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -107,25 +115,21 @@ async fn extension_without_permission_cannot_append() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn extension_cannot_use_other_namespace() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
-    std::env::set_var("MEMORY_FIXTURE_NAMESPACE", "other-ext");
-    std::env::set_var("MEMORY_FIXTURE_CONTENT", "hello memory");
-    std::env::set_var("MEMORY_FIXTURE_TAG", "@test");
-
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
-    let manifest = manifest_with_perms(vec!["memory.read", "memory.write"]);
+    // --namespace=other-ext: foreign namespace via argv (env_clear-safe)
+    let manifest = manifest_with_perms_and_args(
+        vec!["memory.read", "memory.write"],
+        vec!["--namespace=other-ext"],
+    );
 
     let err = manager
         .load("memory-test-ext", &manifest)
         .await
         .expect_err("extension load should fail when using a foreign namespace");
-
-    std::env::remove_var("MEMORY_FIXTURE_NAMESPACE");
-    std::env::remove_var("MEMORY_FIXTURE_CONTENT");
-    std::env::remove_var("MEMORY_FIXTURE_TAG");
 
     assert!(
         err.contains("namespace must equal"),

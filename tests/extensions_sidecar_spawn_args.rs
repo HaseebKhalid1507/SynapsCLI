@@ -23,13 +23,23 @@ fn fixture_path() -> String {
 }
 
 fn manifest() -> ExtensionManifest {
+    manifest_with_mode(None)
+}
+
+/// argv-based mode: host scrubs extension envs (env_clear), so fixture
+/// behavior is selected via --mode=X argument.
+fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
+    let mut args = vec![fixture_path()];
+    if let Some(m) = mode {
+        args.push(format!("--mode={m}"));
+    }
     ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
-        args: vec![fixture_path()],
+        args,
         // Need at least one registration permission so the extension
         // is permitted to load with no hooks. `audio.input` matches
         // what the existing `extensions_info` fixture uses.
@@ -41,10 +51,9 @@ fn manifest() -> ExtensionManifest {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_returns_plugin_supplied_spawn_args() {
-    std::env::set_var("SPAWN_ARGS_MODE", "ok");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager.load("spawn-args-ext", &manifest()).await.unwrap();
+    manager.load("spawn-args-ext", &manifest_with_mode(Some("ok"))).await.unwrap();
 
     let spawn_args = manager
         .sidecar_spawn_args("spawn-args-ext")
@@ -62,16 +71,14 @@ async fn manager_returns_plugin_supplied_spawn_args() {
     );
     assert_eq!(spawn_args.language.as_deref(), Some("en"));
 
-    std::env::remove_var("SPAWN_ARGS_MODE");
     manager.shutdown_all().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_propagates_method_not_found_error() {
-    std::env::set_var("SPAWN_ARGS_MODE", "missing");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager.load("legacy-ext", &manifest()).await.unwrap();
+    manager.load("legacy-ext", &manifest_with_mode(Some("missing"))).await.unwrap();
 
     let err = manager.sidecar_spawn_args("legacy-ext").await.unwrap_err();
     assert!(
@@ -79,16 +86,14 @@ async fn manager_propagates_method_not_found_error() {
         "expected method-not-found error, got: {err}"
     );
 
-    std::env::remove_var("SPAWN_ARGS_MODE");
     manager.shutdown_all().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_rejects_invalid_response_payload() {
-    std::env::set_var("SPAWN_ARGS_MODE", "invalid");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager.load("invalid-ext", &manifest()).await.unwrap();
+    manager.load("invalid-ext", &manifest_with_mode(Some("invalid"))).await.unwrap();
 
     let err = manager
         .sidecar_spawn_args("invalid-ext")
@@ -99,22 +104,19 @@ async fn manager_rejects_invalid_response_payload() {
         "expected decode-error message, got: {err}"
     );
 
-    std::env::remove_var("SPAWN_ARGS_MODE");
     manager.shutdown_all().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_accepts_empty_object_as_defaults() {
-    std::env::set_var("SPAWN_ARGS_MODE", "minimal");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
-    manager.load("min-ext", &manifest()).await.unwrap();
+    manager.load("min-ext", &manifest_with_mode(Some("minimal"))).await.unwrap();
 
     let spawn_args = manager.sidecar_spawn_args("min-ext").await.unwrap();
     assert!(spawn_args.args.is_empty());
     assert_eq!(spawn_args.language, None);
 
-    std::env::remove_var("SPAWN_ARGS_MODE");
     manager.shutdown_all().await;
 }
 

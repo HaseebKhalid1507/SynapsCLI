@@ -462,7 +462,7 @@ async fn provider_capability_specs_are_validated() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_config_is_resolved_and_passed_to_initialize() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     synaps_cli::extensions::config_store::write_plugin_config(
@@ -535,7 +535,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_missing_required_config_fails_before_spawn() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     let plugin_dir = tempfile::tempdir().unwrap();
@@ -571,7 +571,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_provider_complete_routes_to_process() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     fs::write(home.path().join("config"), "extension.provider-test.prefix = echo\n").unwrap();
@@ -631,7 +631,7 @@ async fn extension_provider_complete_routes_to_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn provider_disabled_in_trust_state_blocks_route() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     fs::write(home.path().join("config"), "extension.provider-trust-test.prefix = echo\n").unwrap();
@@ -717,7 +717,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extension_provider_tool_use_is_executed_by_router_before_final_response() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -771,7 +771,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
 
 #[tokio::test(flavor = "current_thread")]
 async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -823,7 +823,7 @@ async fn installed_plugin_extension_is_discovered_loaded_fired_and_shutdown() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn installed_extension_receives_on_compaction_as_observe_only() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -916,7 +916,7 @@ async fn on_message_complete_is_observe_only() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn installed_extension_receives_on_message_complete() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -977,7 +977,7 @@ async fn installed_extension_receives_on_message_complete() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
 
@@ -1000,7 +1000,7 @@ async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn project_local_plugins_override_user_plugins_with_same_name() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
@@ -1070,7 +1070,7 @@ async fn project_local_plugins_override_user_plugins_with_same_name() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn audit_log_records_disabled_route() {
-    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap();
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     config::set_base_dir_for_tests(home.path().to_path_buf());
     fs::write(
