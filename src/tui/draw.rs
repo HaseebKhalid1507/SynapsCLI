@@ -487,7 +487,7 @@ pub(crate) fn draw(
             Span::styled(" \u{25cb} ready ", Style::default().fg(THEME.load().status_ready))
         };
         let version_span = Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            concat!("v", env!("CARGO_PKG_VERSION"), " "),
             Style::default().fg(THEME.load().muted),
         );
         let header = Paragraph::new(Line::from({
@@ -553,6 +553,7 @@ pub(crate) fn draw(
         let end = total.saturating_sub(app.scroll_back as usize);
         let start = end.saturating_sub(content_height);
         let visible: Vec<Line> = all_lines[start..end].to_vec();
+        let visible_is_empty = visible.is_empty();
 
         let msg_block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
@@ -561,7 +562,9 @@ pub(crate) fn draw(
             .padding(Padding::horizontal(1));
         // Compute inner rect before block is consumed by Paragraph
         let msg_inner = msg_block.inner(msg_area);
-        let messages_widget = Paragraph::new(visible.clone()).block(msg_block.clone());
+        // Move `visible` into the widget — the old `visible.clone()` deep-
+        // copied every Line/Span/String of the viewport per frame (P1/P4).
+        let messages_widget = Paragraph::new(visible).block(msg_block.clone());
         // Clear the message pane locally each frame. When a secure prompt is
         // active, do not paint the live transcript underneath it; raw sudo
         // prompts can otherwise appear in the chat/input area for one frame and
@@ -612,7 +615,7 @@ pub(crate) fn draw(
 
         // Empty state: SYNAPS with CRT dismiss animation
         let show_logo = app.messages.is_empty() || app.logo_dismiss_t.is_some();
-        if show_logo && visible.is_empty() {
+        if show_logo && visible_is_empty {
             let ascii_art: Vec<&str> = vec![
                 r" ███████ ██    ██ ███   ██  █████  ██████  ███████",
                 r" ██       ██  ██  ████  ██ ██   ██ ██   ██ ██    ",
@@ -673,13 +676,12 @@ pub(crate) fn draw(
                             let clamped_w = max_art_width.min(avail_w);
 
                             if build_t >= 1.0 {
-                                // Render char-by-char for consistent alignment
-                                let mut spans: Vec<Span> = Vec::with_capacity(clamped_w);
-                                for ch in line.chars().take(clamped_w) {
-                                    spans.push(Span::styled(ch.to_string(), art_style));
-                                }
+                                // Single same-style span per line — the old
+                                // per-char Span/String pair allocated O(chars)
+                                // every frame (REVIEW.md P4).
+                                let text: String = line.chars().take(clamped_w).collect();
                                 let area = ratatui::layout::Rect { x, y, width: clamped_w as u16, height: 1 };
-                                frame.render_widget(Paragraph::new(Line::from(spans)), area);
+                                frame.render_widget(Paragraph::new(Line::from(Span::styled(text, art_style))), area);
                             } else {
                                 // Diagonal assemby: Bottom-Right to Top-Left
                                 let mut built = String::with_capacity(clamped_w);
