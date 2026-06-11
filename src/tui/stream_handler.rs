@@ -165,6 +165,18 @@ pub(super) async fn handle_stream_event(
                 let is_text_user = role == "user" && last["content"].is_string();
                 let is_assistant = role == "assistant";
                 if is_text_user || is_assistant {
+                    // If we're dropping the user's own message (stream died
+                    // before any assistant content), recover it into the input
+                    // box instead of silently losing what they typed.
+                    if is_text_user && app.input.is_empty() {
+                        if let Some(text) = last["content"].as_str() {
+                            app.input = text.to_string();
+                            app.cursor_pos = app.input.chars().count();
+                            app.push_msg(ChatMessage::System(
+                                "your message was restored to the input box — press Enter to retry".to_string(),
+                            ));
+                        }
+                    }
                     app.api_messages.pop();
                 }
             }
