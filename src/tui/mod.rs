@@ -128,10 +128,20 @@ pub async fn run(
     // on_session_start hook already fired by engine::setup::boot()
 
     // ── Event loop ──
+    let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
-        let elapsed = last_frame.elapsed();
-        last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+        // Only draw when something actually changed. During streaming, coalesce
+        // redraws to ~30fps — deltas arrive far faster than the eye can read,
+        // and per-delta full-frame rebuilds are what used to burn a core.
+        // The 16ms tick branch guarantees a throttled frame flushes promptly.
+        let throttle = std::time::Duration::from_millis(33);
+        if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
+            app.needs_redraw = false;
+            last_draw = Instant::now();
+            let elapsed = last_frame.elapsed();
+            last_frame = Instant::now();
+            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+        }
 
         tokio::select! {
 
@@ -164,9 +174,7 @@ pub async fn run(
                             }
                         }
                         app.model_health.insert(key, (status, ms));
-                        let elapsed = last_frame.elapsed();
-                        last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                        app.request_redraw();
                     }
                     None => {
                         // All ping tasks done (tx dropped) — stop printing
@@ -181,6 +189,7 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                    app.request_redraw();
                 }
             }
 
@@ -192,11 +201,13 @@ pub async fn run(
                     app.extension_loader_running = false;
                     app.toasts.dismiss("extension-loader");
                 }
+                app.request_redraw();
             }
 
             // ── Widget events from background extension notification watchers ──
             Some(widget_event) = app.widget_rx.recv() => {
                 handle_widget_event(&mut app, widget_event);
+                app.request_redraw();
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -221,6 +232,7 @@ pub async fn run(
                 let (pid, sidecar_event) = sidecar_event;
                 if let Some(event) = sidecar_event {
                     self::sidecar::handle_event(&mut app, &pid, event);
+                    app.request_redraw();
                 }
             }
 
@@ -274,8 +286,12 @@ pub async fn run(
                 }
             }
 
-            // ── Tick: animations + spinner (~60fps) ──
+            // ── Tick: animations + spinner (~60fps when active) ──
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+                // Active animations/effects always need a redraw each tick
+                if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() {
+                    app.request_redraw();
+                }
                 secret_prompts.poll_requests(&secret_prompt_rx);
                 if app.toasts.tick() {
                     app.invalidate();
@@ -314,10 +330,12 @@ pub async fn run(
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
+                    app.request_redraw();
                 }
                 if let Some(ref mut t) = app.logo_dismiss_t {
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
+                    app.request_redraw();
                 }
                 if app.advance_animations() {
                     app.invalidate();
@@ -325,10 +343,7 @@ pub async fn run(
                 if let Some(msg) = app.check_gamba_exited() {
                     terminal.clear().ok();
                     app.push_msg(ChatMessage::System(msg));
-                    app.invalidate();
-                    let elapsed = last_frame.elapsed();
-                    last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                    app.invalidate(); // invalidate already sets needs_redraw
                 }
                 // Poll background compaction task
                 if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
@@ -441,12 +456,16 @@ pub async fn run(
                                 }
                                 _ => {}
                             }
+                            app.request_redraw();
                             continue;
                         }
                         let is_streaming = app.streaming;
                         let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
                         let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
                         drop(kb_guard);
+                        // Input events (keys, mouse, paste, resize) almost always
+                        // change visible state (cursor, input buffer, scroll).
+                        app.request_redraw();
                         match action {
                             InputAction::None => {}
                             InputAction::HelpFindOutcome => {}
@@ -1704,9 +1723,6 @@ pub async fn run(
                                     terminal.clear().ok();
                                     app.push_msg(ChatMessage::System(msg));
                                     app.invalidate();
-                                    let elapsed = last_frame.elapsed();
-                                    last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                                 }
                             }
                         }
@@ -1720,9 +1736,6 @@ pub async fn run(
                                 terminal.clear().ok();
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
-                                let elapsed = last_frame.elapsed();
-                                last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
