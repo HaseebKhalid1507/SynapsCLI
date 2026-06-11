@@ -18,6 +18,7 @@ mod api_sync;
 mod request;
 mod stream;
 mod helpers;
+mod sse;
 pub mod subagent;
 pub mod openai;
 pub mod telemetry;

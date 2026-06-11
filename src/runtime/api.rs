@@ -255,9 +255,10 @@ impl ApiMethods {
         let mut current_thinking_signature = String::new();
         let mut in_thinking = false;
 
-        // SSE can split across chunk boundaries, so buffer raw bytes
-        // to avoid UTF-8 corruption from lossy conversion at chunk edges
-        let mut byte_buffer: Vec<u8> = Vec::new();
+        // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
+        // buffer raw bytes and only parse complete lines. Zero-copy: lines are
+        // borrowed from the buffer, parsed in place (REVIEW.md P2).
+        let mut line_buffer = super::sse::SseLineBuffer::new();
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
@@ -266,19 +267,13 @@ impl ApiMethods {
             // A transport error mid-stream means connection loss — translate
             // to an actionable message instead of a raw reqwest debug string.
             let chunk = chunk.map_err(|e| RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)))?;
-            byte_buffer.extend_from_slice(&chunk);
+            line_buffer.extend(&chunk);
 
-            // Process complete lines (delimited by \n) from the byte buffer
-            while let Some(newline_pos) = byte_buffer.iter().position(|&b| b == b'\n') {
-                let line_bytes = byte_buffer[..newline_pos].to_vec();
-                byte_buffer.drain(..newline_pos + 1);
-                let line = String::from_utf8_lossy(&line_bytes).trim_end().to_string();
-
-                if !line.starts_with("data: ") {
+            // Process complete lines from the buffer (zero-copy borrows)
+            while let Some(line) = line_buffer.next_line() {
+                let Some(data_part) = line.strip_prefix("data: ") else {
                     continue;
-                }
-
-                let data_part = &line[6..];
+                };
                 if data_part.trim() == "[DONE]" {
                     continue;
                 }
@@ -481,8 +476,8 @@ impl ApiMethods {
             }
         }
 
-        // Process any remaining data in byte_buffer (final line without trailing newline)
-        let remaining = String::from_utf8_lossy(&byte_buffer).trim().to_string();
+        // Process any remaining buffered data (final line without trailing newline)
+        let remaining = line_buffer.take_remaining().unwrap_or_default();
         if let Some(data_part) = remaining.strip_prefix("data: ") {
             if data_part.trim() != "[DONE]" {
                 if let Ok(event) = serde_json::from_str::<Value>(data_part) {
