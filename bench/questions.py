@@ -1,3 +1,27 @@
+"""
+21 tool-heavy benchmark questions — v2 (realistic load).
+"""
+
+import json
+import os
+
+
+def _read(p, name):
+    try:
+        with open(os.path.join(p, name)) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def _exists(p, name):
+    return os.path.exists(os.path.join(p, name))
+
+
+def _lines(p, name):
+    s = _read(p, name)
+    return len(s.strip().splitlines()) if s else 0
+
 
 QUESTIONS = [
     # ── Phase 1: Scaffold a FastAPI project (heavy writes) ──────────
