@@ -1,345 +1,488 @@
-"""
-21 tool-heavy benchmark questions with deterministic, verifiable outcomes.
-
-Each question is a dict:
-  prompt    — what we send to the model
-  verify    — function(sandbox_path) -> bool, checks the expected file state
-  expects   — human-readable description of the expected outcome
-
-The questions simulate a realistic coding session: scaffold, inspect, edit,
-refactor, grep, fix. Heavy on write/edit/read/bash tool calls so the message
-history fills with tool_use/tool_result pairs — exactly what stresses the
-cache breakpoint strategy.
-
-Design rules:
-- Deterministic: every prompt has exactly one correct end state.
-- Tool-forcing: phrased so the model MUST use tools (no from-memory answers).
-- Cumulative: later questions depend on earlier file state, so history matters
-  and cache-prefix stability is actually exercised.
-"""
-
-import json
-import os
-
-
-def _read(p, name):
-    try:
-        with open(os.path.join(p, name)) as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
-
-
-def _exists(p, name):
-    return os.path.exists(os.path.join(p, name))
-
 
 QUESTIONS = [
-    # ── Phase 1: Scaffold (writes) ──────────────────────────────────
+    # ── Phase 1: Scaffold a FastAPI project (heavy writes) ──────────
+
     {
         "id": 1,
         "prompt": (
-            "Create a file called calc.py with four functions: "
-            "add(a, b) returns a+b, sub(a, b) returns a-b, "
-            "mul(a, b) returns a*b, div(a, b) returns a/b but raises "
-            "ValueError('division by zero') when b == 0. No other code."
+            "Create a FastAPI project with the following structure. "
+            "First create app/__init__.py (empty). "
+            "Then create app/models.py containing Pydantic models: "
+            "UserCreate(name: str, email: str, age: int), "
+            "UserResponse(id: int, name: str, email: str, age: int, created_at: str), "
+            "ItemCreate(title: str, description: str, price: float, owner_id: int), "
+            "ItemResponse(id: int, title: str, description: str, price: float, owner_id: int, created_at: str), "
+            "ErrorResponse(detail: str, code: int), and "
+            "PaginatedResponse(items: list, total: int, page: int, per_page: int). "
+            "Include proper type hints and Field validators: name must be 2-50 chars, "
+            "email must contain @, age must be 18-120, price must be > 0. "
+            "After creating the file, read it back and count the total lines."
         ),
         "verify": lambda p: (
-            (s := _read(p, "calc.py")) is not None
-            and all(f"def {f}(" in s for f in ("add", "sub", "mul", "div"))
-            and "ValueError" in s
+            (s := _read(p, "app/models.py")) is not None
+            and all(c in s for c in ("UserCreate", "UserResponse", "ItemCreate",
+                                      "ItemResponse", "ErrorResponse", "PaginatedResponse"))
+            and "Field(" in s
+            and _lines(p, "app/models.py") >= 35
         ),
-        "expects": "calc.py with add/sub/mul/div + ValueError guard",
+        "expects": "app/models.py with 6 Pydantic models + validators (35+ lines)",
     },
+
     {
         "id": 2,
         "prompt": (
-            "Create config.json containing exactly these keys: "
-            '"name" set to "bench", "version" set to "1.0.0", '
-            '"debug" set to false, and "max_retries" set to 3.'
+            "Create app/database.py that implements an in-memory database using "
+            "Python dicts. It should have: a Database class with __init__ that creates "
+            "empty dicts for users and items plus auto-increment counters; "
+            "create_user(data) that stores and returns a user dict with id and "
+            "created_at (ISO format); get_user(user_id) returning user or None; "
+            "list_users(page, per_page) with pagination returning (users_list, total); "
+            "create_item(data) similar to create_user; get_item(item_id); "
+            "list_items(owner_id=None, min_price=None, max_price=None, page=1, per_page=10) "
+            "with filtering and pagination; update_item(item_id, data) that merges fields; "
+            "delete_item(item_id) returning bool. "
+            "Add a module-level instance: db = Database(). "
+            "After creating, read the file back and verify it has all 8 methods by "
+            "running: python3 -c \"from app.database import db; print([m for m in dir(db) if not m.startswith('_')])\""
         ),
         "verify": lambda p: (
-            (s := _read(p, "config.json")) is not None
-            and json.loads(s)
-            == {"name": "bench", "version": "1.0.0", "debug": False, "max_retries": 3}
+            (s := _read(p, "app/database.py")) is not None
+            and all(m in s for m in ("create_user", "get_user", "list_users",
+                                      "create_item", "get_item", "list_items",
+                                      "update_item", "delete_item"))
+            and "class Database" in s
+            and _lines(p, "app/database.py") >= 50
         ),
-        "expects": "config.json with 4 exact keys",
+        "expects": "app/database.py: Database class with 8 methods, 50+ lines",
     },
+
     {
         "id": 3,
         "prompt": (
-            "Create a directory called src, and inside it create three files: "
-            "src/models.py with a class User that has __init__(self, name, email) "
-            "storing both as attributes; src/db.py with a function connect() that "
-            "returns the string 'connected'; and src/__init__.py that is empty."
+            "Create app/routes.py with FastAPI router endpoints. Import the models "
+            "and database. Create a router = APIRouter(). Implement these endpoints: "
+            "POST /users -> create user, GET /users/{id} -> get user (404 if missing), "
+            "GET /users -> list users with page/per_page query params (defaults 1, 10), "
+            "POST /items -> create item, GET /items/{id} -> get item (404 if missing), "
+            "GET /items -> list items with optional owner_id, min_price, max_price filters "
+            "plus pagination, PUT /items/{id} -> update item (404 if missing), "
+            "DELETE /items/{id} -> delete item (404 if missing). "
+            "Use proper HTTP status codes (201 for creates, 204 for delete, 404 for not found). "
+            "Use the ErrorResponse model for error responses. "
+            "After creating, read it back, then grep for 'def ' to count the endpoint functions."
         ),
         "verify": lambda p: (
-            _exists(p, "src/__init__.py")
-            and (m := _read(p, "src/models.py")) is not None
-            and "class User" in m
-            and (d := _read(p, "src/db.py")) is not None
-            and "def connect(" in d
-            and "connected" in d
+            (s := _read(p, "app/routes.py")) is not None
+            and all(ep in s for ep in ("POST", "GET", "PUT", "DELETE",
+                                        "/users", "/items"))
+            and s.count("def ") >= 8
+            and _lines(p, "app/routes.py") >= 60
         ),
-        "expects": "src/ package with models.py, db.py, empty __init__.py",
+        "expects": "app/routes.py: 8 endpoints, proper status codes, 60+ lines",
     },
+
     {
         "id": 4,
         "prompt": (
-            "Create a file named data.csv with a header row 'id,name,score' "
-            "and exactly five data rows: 1,alice,90 then 2,bob,85 then "
-            "3,carol,77 then 4,dave,92 then 5,eve,68."
+            "Create app/main.py that imports FastAPI, the router from routes, and "
+            "sets up the app with title='Benchmark API', version='1.0.0', "
+            "description='A benchmark FastAPI project'. Include the router, add "
+            "a root endpoint GET / returning {status: 'ok', version: '1.0.0'}, "
+            "add a GET /health endpoint returning {healthy: true, checks: {database: 'ok', "
+            "uptime: <float seconds since start>}} (track start time with a module-level "
+            "datetime.now()). Add CORS middleware allowing all origins. "
+            "Then create a requirements.txt with fastapi, uvicorn, pydantic, pytest, httpx. "
+            "After creating both files, run: python3 -c \"from app.main import app; "
+            "print(app.title, app.version)\" to verify it imports cleanly."
         ),
         "verify": lambda p: (
-            (s := _read(p, "data.csv")) is not None
-            and s.strip().splitlines()[0].strip() == "id,name,score"
-            and len(s.strip().splitlines()) == 6
-            and "4,dave,92" in s
+            (s := _read(p, "app/main.py")) is not None
+            and "FastAPI" in s and "1.0.0" in s and "CORS" in s.upper()
+            and (r := _read(p, "requirements.txt")) is not None
+            and "fastapi" in r and "pytest" in r
         ),
-        "expects": "data.csv: header + 5 exact rows",
+        "expects": "app/main.py (CORS, health, root) + requirements.txt",
     },
+
     {
         "id": 5,
         "prompt": (
-            "Create a Makefile with two targets: 'test' that runs "
-            "'python3 -m pytest' and 'clean' that runs 'rm -rf __pycache__'. "
-            "Then run 'ls' and tell me how many files (not directories) "
-            "are in the project root."
+            "Create a comprehensive seed script at scripts/seed.py that: "
+            "1) imports the database, 2) creates 10 users with realistic names/emails "
+            "(alice@example.com through jane@example.com, ages 22-55), "
+            "3) creates 20 items across those users with varied titles, descriptions "
+            "(at least 30 chars each), and prices ranging from $9.99 to $299.99, "
+            "4) prints a summary: 'Seeded X users and Y items', "
+            "5) prints the most expensive item's title and price, "
+            "6) prints the user with the most items. "
+            "After creating it, run it with bash and report the full output. "
+            "Then list all files in the project recursively with 'find . -type f | sort'."
         ),
         "verify": lambda p: (
-            (s := _read(p, "Makefile")) is not None
-            and "test:" in s
-            and "clean:" in s
-            and "pytest" in s
+            (s := _read(p, "scripts/seed.py")) is not None
+            and "create_user" in s and "create_item" in s
+            and _lines(p, "scripts/seed.py") >= 40
         ),
-        "expects": "Makefile with test+clean targets, ls executed",
+        "expects": "scripts/seed.py: 10 users, 20 items, runs and reports stats",
     },
 
-    # ── Phase 2: Inspect (reads + bash) ─────────────────────────────
+    # ── Phase 2: Deep inspection chains (read → compute → read → answer) ──
+
     {
         "id": 6,
         "prompt": (
-            "Read calc.py and tell me the exact number of 'def ' occurrences "
-            "in it. Reply with just the number in your final answer."
+            "I need a full code review of the database module. Read app/database.py, "
+            "then read app/models.py for context on the data shapes. "
+            "Then run: python3 -c \"from app.database import db; "
+            "db.create_user({'name':'test','email':'t@t.com','age':25}); "
+            "db.create_user({'name':'test2','email':'t2@t.com','age':30}); "
+            "print('users:', db.list_users(1,10)); "
+            "db.create_item({'title':'Widget','description':'A test widget for benchmarking','price':19.99,'owner_id':1}); "
+            "print('items:', db.list_items())\" "
+            "Report the exact output, then list all issues you see in database.py "
+            "(missing validation, edge cases, etc). Write your findings to REVIEW.md."
         ),
-        "verify": lambda p: True,  # answer checked via response text: "4"
-        "answer_contains": "4",
-        "expects": "reads calc.py, answers 4",
+        "verify": lambda p: (
+            (s := _read(p, "REVIEW.md")) is not None
+            and len(s) >= 200
+        ),
+        "expects": "REVIEW.md with code review findings (200+ chars)",
     },
+
     {
         "id": 7,
         "prompt": (
-            "Using grep or any search tool, find every file in this project "
-            "that contains the word 'return' and list their paths."
+            "Run the seed script (python3 scripts/seed.py), then write a query "
+            "script at scripts/query.py that imports the database, runs the seed, "
+            "and then: 1) finds all items priced over $100 and prints count + titles, "
+            "2) groups items by owner_id and prints owner_id: count for each, "
+            "3) computes the average price across all items (1 decimal), "
+            "4) finds the owner with highest total item value and prints their user info. "
+            "Run scripts/query.py and report the full output."
         ),
-        "verify": lambda p: True,  # calc.py, src/models.py (no), src/db.py
-        "answer_contains": "calc.py",
-        "expects": "greps project, finds calc.py and src/db.py",
+        "verify": lambda p: (
+            (s := _read(p, "scripts/query.py")) is not None
+            and "list_items" in s
+        ),
+        "expects": "scripts/query.py with 4 queries, executed with output",
     },
+
     {
         "id": 8,
         "prompt": (
-            "Run this exact command with bash and report the output: "
-            "python3 -c \"import json; print(json.load(open('config.json'))['max_retries'] * 7)\""
+            "Read every Python file in the app/ directory. Count: "
+            "1) total lines across all files, 2) total number of function definitions "
+            "(lines containing 'def '), 3) total number of class definitions, "
+            "4) every import statement. Run this bash one-liner to cross-check: "
+            "find app -name '*.py' -exec cat {} + | wc -l && "
+            "grep -r 'def ' app/ | wc -l && grep -r 'class ' app/ | wc -l. "
+            "Then create a file PROJECT_STATS.md with a markdown table of these metrics."
         ),
-        "verify": lambda p: True,
-        "answer_contains": "21",
-        "expects": "bash exec, answers 21",
+        "verify": lambda p: (
+            (s := _read(p, "PROJECT_STATS.md")) is not None
+            and "|" in s
+            and "def" in s.lower()
+        ),
+        "expects": "PROJECT_STATS.md with metrics table from reading all app/ files",
     },
+
     {
         "id": 9,
         "prompt": (
-            "Read data.csv and compute the average score of the five rows. "
-            "Reply with the number (1 decimal place is fine)."
+            "Read app/routes.py, then read app/database.py, then read app/models.py. "
+            "Trace the full request flow for POST /items: which route handler, which "
+            "model validates input, which database method stores it. "
+            "Then do the same for GET /items with filters. "
+            "Create a file ARCHITECTURE.md documenting both flows as step-by-step "
+            "numbered lists. Include the exact function signatures involved at each step. "
+            "After writing it, read it back to verify it's correct."
         ),
-        "verify": lambda p: True,
-        "answer_contains": "82.4",
-        "expects": "reads csv, answers 82.4",
+        "verify": lambda p: (
+            (s := _read(p, "ARCHITECTURE.md")) is not None
+            and "POST" in s and "GET" in s
+            and "create_item" in s
+            and len(s) >= 400
+        ),
+        "expects": "ARCHITECTURE.md with traced request flows (400+ chars)",
     },
+
     {
         "id": 10,
         "prompt": (
-            "Count the total lines across calc.py, src/models.py, and src/db.py "
-            "using wc -l. Report the three individual counts."
+            "Write a comprehensive bash script at scripts/analyze.sh that: "
+            "1) prints '=== Project Structure ===' then runs find . -type f | sort, "
+            "2) prints '=== Line Counts ===' then wc -l on every .py file, "
+            "3) prints '=== TODO/FIXME ===' then greps for TODO or FIXME across all files, "
+            "4) prints '=== Import Graph ===' then for each .py file in app/, "
+            "   extracts import lines and prints 'file: imports module', "
+            "5) prints '=== Validation Rules ===' then greps for Field( in models.py "
+            "   and prints each match. "
+            "Make it executable, run it with bash, capture the full output. "
+            "The output will be long — that's intentional."
         ),
-        "verify": lambda p: True,
-        "expects": "bash wc -l on 3 files",
+        "verify": lambda p: (
+            (s := _read(p, "scripts/analyze.sh")) is not None
+            and "find" in s and "wc" in s and "grep" in s
+        ),
+        "expects": "scripts/analyze.sh runs 5 analysis sections with output",
     },
 
-    # ── Phase 3: Edit (surgical changes) ────────────────────────────
+    # ── Phase 3: Multi-file refactors (read → plan → edit → verify chains) ──
+
     {
         "id": 11,
         "prompt": (
-            "Edit calc.py: add a fifth function pow(a, b) that returns a ** b. "
-            "Keep the existing four functions unchanged."
+            "Add comprehensive input validation to app/database.py. "
+            "First read app/models.py to understand the validation rules, "
+            "then read app/database.py. Add validation in create_user: "
+            "raise ValueError if name is empty or >50 chars, if email doesn't "
+            "contain @, if age is not 18-120. Add validation in create_item: "
+            "raise ValueError if title is empty, if price <= 0, if owner_id "
+            "doesn't exist in the users dict. Use surgical edits, not rewrites. "
+            "After editing, run: python3 -c \"from app.database import db; "
+            "try: db.create_user({'name':'','email':'bad','age':10}); "
+            "except ValueError as e: print('caught:', e)\" "
+            "to verify the validation works."
         ),
         "verify": lambda p: (
-            (s := _read(p, "calc.py")) is not None
-            and "def pow(" in s
-            and "def add(" in s
-            and "def div(" in s
+            (s := _read(p, "app/database.py")) is not None
+            and "ValueError" in s
+            and s.count("raise ValueError") >= 3
         ),
-        "expects": "calc.py gains pow(), keeps others",
+        "expects": "database.py: 3+ ValueError raises in create methods",
     },
+
     {
         "id": 12,
         "prompt": (
-            "Edit config.json: change debug to true and bump version to 1.1.0. "
-            "Leave the other keys untouched."
+            "The routes need proper error handling. Read app/routes.py, then "
+            "read app/database.py to see what exceptions it can raise. "
+            "Edit app/routes.py to wrap every create/update endpoint in try/except "
+            "that catches ValueError and returns a 422 with ErrorResponse. "
+            "Also add input length logging: before each create, print the request "
+            "body size to stderr. After editing, read the file back and count "
+            "the number of try/except blocks to confirm. Then run: "
+            "python3 -c \"from app.routes import router; print(len(router.routes), 'routes registered')\""
         ),
         "verify": lambda p: (
-            (s := _read(p, "config.json")) is not None
-            and json.loads(s)
-            == {"name": "bench", "version": "1.1.0", "debug": True, "max_retries": 3}
+            (s := _read(p, "app/routes.py")) is not None
+            and s.count("except") >= 3
+            and "422" in s
         ),
-        "expects": "config.json: debug=true, version=1.1.0",
+        "expects": "routes.py: 3+ try/except blocks with 422 responses",
     },
+
     {
         "id": 13,
         "prompt": (
-            "Edit src/models.py: add a method greeting(self) to the User class "
-            "that returns 'Hello, ' followed by the name attribute. "
-            "Then add a second class Admin that inherits from User and overrides "
-            "greeting to prepend 'Admin: ' to the parent's result."
+            "Extract the validation logic from database.py into a new module "
+            "app/validators.py. Read database.py first to identify all validation "
+            "code. Create validators.py with functions: validate_user(data) and "
+            "validate_item(data, existing_user_ids) that raise ValueError with "
+            "descriptive messages. Then edit database.py to import and use these "
+            "validators instead of inline checks. After refactoring, run the "
+            "validation test again: python3 -c \"from app.database import db; "
+            "try: db.create_user({'name':'','email':'bad','age':10}); "
+            "except ValueError as e: print('still works:', e)\" "
+            "Then read both files back to verify the refactor is clean."
         ),
         "verify": lambda p: (
-            (s := _read(p, "src/models.py")) is not None
-            and "def greeting(" in s
-            and "class Admin" in s
+            (v := _read(p, "app/validators.py")) is not None
+            and "validate_user" in v and "validate_item" in v
+            and (d := _read(p, "app/database.py")) is not None
+            and "from app.validators import" in d.replace("from .validators import", "from app.validators import")
         ),
-        "expects": "models.py: greeting() + Admin subclass",
+        "expects": "validators.py extracted, database.py imports it",
     },
+
     {
         "id": 14,
         "prompt": (
-            "Append a sixth row to data.csv: 6,frank,71 — then read the file "
-            "back and confirm the data row count (excluding header) in your answer."
+            "Add a logging system. Create app/logger.py with a configure_logging() "
+            "function that sets up Python's logging module with format "
+            "'%(asctime)s [%(levelname)s] %(name)s: %(message)s'. "
+            "Then edit app/database.py to add logging: log every create/update/delete "
+            "operation at INFO level with the entity type and id, and log validation "
+            "failures at WARNING level. Read database.py to plan the edits first, "
+            "then make the edits, then run the seed script and capture the log output. "
+            "After that, read database.py back to verify all log calls are present."
         ),
         "verify": lambda p: (
-            (s := _read(p, "data.csv")) is not None
-            and "6,frank,71" in s
-            and len(s.strip().splitlines()) == 7
+            (l := _read(p, "app/logger.py")) is not None
+            and "configure_logging" in l
+            and (d := _read(p, "app/database.py")) is not None
+            and d.count("log") >= 5
         ),
-        "answer_contains": "6",
-        "expects": "data.csv has 6 data rows, answer says 6",
+        "expects": "logger.py created, database.py has 5+ log calls",
     },
+
     {
         "id": 15,
         "prompt": (
-            "Rename the function 'connect' in src/db.py to 'open_connection' "
-            "and change its return string to 'connection open'. "
-            "Use a surgical edit, not a full rewrite."
+            "Add search functionality. Read app/database.py and app/routes.py first. "
+            "Then edit database.py to add a search_items(query, fields=None) method "
+            "that does case-insensitive substring matching across title and description "
+            "(or specified fields). Also add search_users(query) matching name and email. "
+            "Then edit routes.py to add GET /search?q=<query>&type=users|items|all "
+            "that returns combined results with the type labeled. "
+            "After all edits, run: python3 -c \"from app.database import db; "
+            "db.create_user({'name':'Alice Test','email':'alice@test.com','age':25}); "
+            "db.create_item({'title':'Test Widget','description':'A widget for testing purposes','price':9.99,'owner_id':1}); "
+            "print(db.search_items('widget')); print(db.search_users('alice'))\" "
+            "to verify it works."
         ),
         "verify": lambda p: (
-            (s := _read(p, "src/db.py")) is not None
-            and "def open_connection(" in s
-            and "connection open" in s
-            and "def connect(" not in s
+            (d := _read(p, "app/database.py")) is not None
+            and "search_items" in d and "search_users" in d
+            and (r := _read(p, "app/routes.py")) is not None
+            and "/search" in r
         ),
-        "expects": "db.py: connect renamed to open_connection",
+        "expects": "search methods in database.py, /search endpoint in routes.py",
     },
 
-    # ── Phase 4: Multi-file refactor (heavy tool churn) ─────────────
+    # ── Phase 4: Complex cross-cutting tasks ────────────────────────
+
     {
         "id": 16,
         "prompt": (
-            "Create tests/test_calc.py with pytest tests covering all five "
-            "functions in calc.py — at minimum one test per function, and the "
-            "div test must assert the ValueError on division by zero. "
-            "Create the tests directory if needed, then run the tests with "
-            "bash and report pass/fail counts."
+            "Create a full test suite at tests/test_database.py. "
+            "Read app/database.py and app/validators.py first to understand "
+            "what to test. Write tests covering: "
+            "- create_user happy path + all validation errors (empty name, bad email, bad age) "
+            "- get_user found + not found "
+            "- list_users pagination (create 15 users, verify page 1 has 10, page 2 has 5) "
+            "- create_item happy path + validation errors (bad price, missing owner) "
+            "- list_items filtering (by owner_id, by price range) "
+            "- update_item happy path + not found "
+            "- delete_item happy path + not found "
+            "- search_items and search_users "
+            "Each test must have a descriptive name. Use pytest fixtures for a fresh "
+            "Database instance. After creating, run: python3 -m pytest tests/test_database.py -v "
+            "and report the full output."
         ),
         "verify": lambda p: (
-            (s := _read(p, "tests/test_calc.py")) is not None
-            and "def test_" in s
-            and "ValueError" in s
+            (s := _read(p, "tests/test_database.py")) is not None
+            and s.count("def test_") >= 12
+            and "fixture" in s.lower() or "@pytest" in s
         ),
-        "answer_contains": "5",
-        "expects": "tests written and executed, 5+ passing",
+        "expects": "tests/test_database.py: 12+ tests, run with pytest output",
     },
+
     {
         "id": 17,
         "prompt": (
-            "Create a script stats.py that reads data.csv, computes min, max, "
-            "and mean of the score column, and prints them as "
-            "'min=X max=Y mean=Z' with mean to 1 decimal. Run it with bash "
-            "and report the exact output line."
+            "Create tests/test_routes.py that tests the API endpoints using "
+            "httpx and FastAPI's TestClient. Read app/routes.py and app/main.py first. "
+            "Write tests for: POST /users (valid + invalid), GET /users/{id} (found + 404), "
+            "POST /items (valid + invalid + nonexistent owner), GET /items with filters, "
+            "PUT /items/{id} (valid + 404), DELETE /items/{id} (valid + 404), "
+            "GET /search with various queries, GET / and GET /health. "
+            "Use a fixture that creates the TestClient. After creating, "
+            "run pytest tests/test_routes.py -v and report full output. "
+            "If any tests fail, read the error, fix the test or the code, and re-run."
         ),
         "verify": lambda p: (
-            (s := _read(p, "stats.py")) is not None and "data.csv" in s
+            (s := _read(p, "tests/test_routes.py")) is not None
+            and s.count("def test_") >= 10
+            and "TestClient" in s
         ),
-        "answer_contains": "min=68",
-        "expects": "stats.py runs: min=68 max=92 mean=80.5",
+        "expects": "tests/test_routes.py: 10+ integration tests with TestClient",
     },
+
     {
         "id": 18,
         "prompt": (
-            "Move the User and Admin classes from src/models.py into a new "
-            "file src/users.py, and make src/models.py a re-export shim: "
-            "from src.users import User, Admin. Verify the shim works by "
-            "running: python3 -c \"from src.models import User; "
-            "print(User('x','y').name)\""
+            "Create a data migration script at scripts/migrate.py that: "
+            "1) reads the current database state (run seed first), "
+            "2) adds a 'tags' field (list of strings) to every item — derive tags "
+            "   from the title/description using keyword extraction (split words, "
+            "   lowercase, filter out words < 4 chars), "
+            "3) adds an 'is_premium' boolean to every user (True if they own any item > $100), "
+            "4) creates a migration log file at data/migration_log.json recording: "
+            "   timestamp, items_updated count, users_updated count, sample of first "
+            "   3 items with their new tags, "
+            "5) prints a summary of all changes. "
+            "Run the script and verify the migration log was created by reading it back."
         ),
         "verify": lambda p: (
-            (u := _read(p, "src/users.py")) is not None
-            and "class User" in u
-            and "class Admin" in u
-            and (m := _read(p, "src/models.py")) is not None
-            and "import" in m
-            and "class User" not in m
+            (s := _read(p, "scripts/migrate.py")) is not None
+            and "tags" in s and "is_premium" in s
         ),
-        "answer_contains": "x",
-        "expects": "classes moved to users.py, models.py is a shim",
+        "expects": "scripts/migrate.py: adds tags+is_premium, creates migration log",
     },
 
-    # ── Phase 5: Cross-cutting finale (grep + fix + verify) ─────────
     {
         "id": 19,
         "prompt": (
-            "Find every Python file in this project containing the word "
-            "'class' using grep, then create an INVENTORY.md file listing "
-            "each class name and the file it lives in, one per line in the "
-            "format: ClassName - path/to/file.py"
+            "Perform a full security audit. Read every file in app/ one by one. "
+            "Then create SECURITY_AUDIT.md documenting: "
+            "1) Input validation gaps (any endpoint that doesn't validate, any "
+            "   field that could be exploited — SQL injection doesn't apply since "
+            "   we use dicts, but look for XSS in stored fields, missing length limits), "
+            "2) Authentication gaps (there's no auth at all — document what's needed), "
+            "3) Rate limiting gaps (none exists — recommend approach), "
+            "4) Data exposure risks (are any internal fields leaking?), "
+            "5) Specific code fixes with file:line references. "
+            "The audit should be at least 50 lines long. After writing it, "
+            "read it back and verify it references all 4 app/ source files."
         ),
         "verify": lambda p: (
-            (s := _read(p, "INVENTORY.md")) is not None
-            and "User" in s
-            and "Admin" in s
-            and "users.py" in s
+            (s := _read(p, "SECURITY_AUDIT.md")) is not None
+            and _lines(p, "SECURITY_AUDIT.md") >= 40
+            and all(f in s for f in ("models.py", "database.py", "routes.py"))
         ),
-        "expects": "INVENTORY.md lists User + Admin in src/users.py",
+        "expects": "SECURITY_AUDIT.md: 40+ lines referencing all source files",
     },
+
     {
         "id": 20,
         "prompt": (
-            "There is a deliberate bug being introduced now: run this with bash "
-            "first: echo 'def broken(: pass' >> calc.py — then run "
-            "python3 -m py_compile calc.py, observe the syntax error, fix it "
-            "by removing the bad line with an edit, and re-run py_compile to "
-            "confirm calc.py compiles clean again."
+            "There are bugs being introduced now. Run these bash commands: "
+            "echo '    def broken_method(self):' >> app/database.py && "
+            "echo '        return self.nonexistent_attr' >> app/database.py && "
+            "sed -i 's/def get_user/def getuser/' app/database.py && "
+            "echo 'import nonexistent_module' >> app/routes.py. "
+            "Now: 1) try to import the app and observe the errors, "
+            "2) read the affected files to understand what broke, "
+            "3) fix all three bugs (remove broken_method, restore get_user name, "
+            "   remove bad import) using surgical edits, "
+            "4) verify the fix by importing the app again, "
+            "5) run the database tests to confirm nothing else broke."
         ),
         "verify": lambda p: (
-            (s := _read(p, "calc.py")) is not None
-            and "def broken(:" not in s
-            and "def pow(" in s
+            (d := _read(p, "app/database.py")) is not None
+            and "def get_user(" in d
+            and "nonexistent_attr" not in d
+            and (r := _read(p, "app/routes.py")) is not None
+            and "import nonexistent_module" not in r
         ),
-        "expects": "bug injected, caught, removed; calc.py compiles",
+        "expects": "3 injected bugs found and fixed, tests pass",
     },
+
     {
         "id": 21,
         "prompt": (
-            "Final audit: run stats.py one more time, run the test suite one "
-            "more time, and read config.json. Then write a file called "
-            "AUDIT.txt containing exactly three lines: line 1 the stats output, "
-            "line 2 the number of passing tests, line 3 the version string "
-            "from config.json."
+            "Final comprehensive audit. "
+            "1) Read every .py file in app/ and count total lines, functions, classes. "
+            "2) Run the full test suite: python3 -m pytest tests/ -v "
+            "3) Run the analyze script: bash scripts/analyze.sh "
+            "4) Read config if any exists. "
+            "5) Create FINAL_REPORT.md with: "
+            "   - Project structure (list all files with line counts), "
+            "   - Test results summary (X passed, Y failed), "
+            "   - Code metrics (functions, classes, total lines), "
+            "   - Architecture summary (how the modules connect), "
+            "   - Top 3 recommended improvements. "
+            "The report should be thorough — at least 60 lines. "
+            "After creating it, read it back to verify completeness."
         ),
         "verify": lambda p: (
-            (s := _read(p, "AUDIT.txt")) is not None
-            and len(s.strip().splitlines()) == 3
-            and "1.1.0" in s
+            (s := _read(p, "FINAL_REPORT.md")) is not None
+            and _lines(p, "FINAL_REPORT.md") >= 50
+            and "test" in s.lower()
+            and "routes" in s.lower()
         ),
-        "expects": "AUDIT.txt: 3 lines, version 1.1.0 present",
+        "expects": "FINAL_REPORT.md: 50+ lines, tests + metrics + recommendations",
     },
 ]
 

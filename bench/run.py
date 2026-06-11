@@ -26,6 +26,38 @@ from questions import QUESTIONS
 
 API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-sonnet-4-6"
+AUTH_JSON = os.path.expanduser("~/.synaps-cli/auth.json")
+
+# OAuth requests must present the claude-code beta headers and lead the
+# system prompt with the CLI identity block (mirrors runtime/api.rs).
+OAUTH_BETAS = "claude-code-20250219,oauth-2025-04-20"
+OAUTH_IDENTITY = (
+    "You are Claude Code, Anthropic's official CLI for Claude."
+)
+
+
+def resolve_auth():
+    """Returns (headers_dict, mode). Prefers API key, falls back to OAuth."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return {"x-api-key": key}, "api-key"
+    try:
+        with open(AUTH_JSON) as f:
+            a = json.load(f).get("anthropic", {})
+        if a.get("type") == "oauth" and a.get("access"):
+            exp = a.get("expires", 0)
+            if exp and exp / 1000.0 < time.time():
+                sys.exit(
+                    "OAuth token expired. Open synaps once to refresh it, "
+                    "or set ANTHROPIC_API_KEY."
+                )
+            return {
+                "authorization": f"Bearer {a['access']}",
+                "anthropic-beta": OAUTH_BETAS,
+            }, "oauth"
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    sys.exit("No auth: set ANTHROPIC_API_KEY or login via synaps (OAuth).")
 
 SYSTEM_PROMPT = (
     "You are a precise coding assistant operating inside a sandbox project "
@@ -183,7 +215,7 @@ STRATEGIES = {
 
 # ── API call ────────────────────────────────────────────────────────
 
-def call_api(api_key, model, messages, strategy_fn, max_retries=4):
+def call_api(auth_headers, mode, model, messages, strategy_fn, max_retries=4):
     """One non-streaming call. Returns (response_json, elapsed_s)."""
     # Deep-copy so markers never contaminate canonical history
     msgs = json.loads(json.dumps(messages))
@@ -192,16 +224,20 @@ def call_api(api_key, model, messages, strategy_fn, max_retries=4):
     tools = json.loads(json.dumps(TOOLS))
     tools[-1]["cache_control"] = {"type": "ephemeral"}
 
+    system_blocks = []
+    if mode == "oauth":
+        # OAuth path requires the CLI identity preamble (mirrors api.rs)
+        system_blocks.append({"type": "text", "text": OAUTH_IDENTITY})
+    system_blocks.append({
+        "type": "text",
+        "text": SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"},
+    })
+
     body = {
         "model": model,
         "max_tokens": 4096,
-        "system": [
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
+        "system": system_blocks,
         "tools": tools,
         "messages": msgs,
     }
@@ -213,15 +249,12 @@ def call_api(api_key, model, messages, strategy_fn, max_retries=4):
             delay = 2 ** attempt
             print(f"    retry {attempt}/{max_retries} in {delay}s ({last_err})")
             time.sleep(delay)
-        req = urllib.request.Request(
-            API_URL,
-            data=data,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-        )
+        headers = {
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        headers.update(auth_headers)
+        req = urllib.request.Request(API_URL, data=data, headers=headers)
         t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
@@ -249,22 +282,35 @@ def extract_usage(resp):
     }
 
 
-# Sonnet 4.x pricing per MTok (USD)
-PRICE = {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write": 3.75}
+# Pricing per MTok (USD) — keyed by model substring, falls back to Sonnet.
+PRICING = {
+    "fable":  {"input": 10.0, "output": 50.0, "cache_read": 1.0,  "cache_write": 12.5},
+    "opus":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "sonnet": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "haiku":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
+}
 
 
-def turn_cost(u):
+def get_price(model):
+    for key, price in PRICING.items():
+        if key in model:
+            return price
+    return PRICING["sonnet"]
+
+
+def turn_cost(u, model="claude-sonnet-4-6"):
+    p = get_price(model)
     return (
-        u["input"] * PRICE["input"]
-        + u["output"] * PRICE["output"]
-        + u["cache_read"] * PRICE["cache_read"]
-        + u["cache_write"] * PRICE["cache_write"]
+        u["input"] * p["input"]
+        + u["output"] * p["output"]
+        + u["cache_read"] * p["cache_read"]
+        + u["cache_write"] * p["cache_write"]
     ) / 1_000_000
 
 
 # ── Agent loop per question ─────────────────────────────────────────
 
-def run_question(api_key, model, messages, q, sandbox, strategy_fn, log):
+def run_question(auth_headers, mode, model, messages, q, sandbox, strategy_fn, log):
     """Run one question through the tool loop. Appends to messages in place."""
     messages.append({"role": "user", "content": q["prompt"]})
     turn_usage = []
@@ -272,7 +318,7 @@ def run_question(api_key, model, messages, q, sandbox, strategy_fn, log):
     final_text = ""
 
     while True:
-        resp, elapsed = call_api(api_key, model, messages, strategy_fn)
+        resp, elapsed = call_api(auth_headers, mode, model, messages, strategy_fn)
         api_calls += 1
         u = extract_usage(resp)
         u["elapsed_s"] = round(elapsed, 2)
@@ -304,7 +350,7 @@ def run_question(api_key, model, messages, q, sandbox, strategy_fn, log):
                      "cache_write_5m", "cache_write_1h")}
     total_in = agg["input"] + agg["cache_read"] + agg["cache_write"]
     hit_pct = round(100.0 * agg["cache_read"] / total_in, 1) if total_in else 0.0
-    cost = round(sum(turn_cost(t) for t in turn_usage), 6)
+    cost = round(sum(turn_cost(t, model) for t in turn_usage), 6)
 
     passed = bool(q["verify"](sandbox))
     if passed and "answer_contains" in q:
@@ -340,9 +386,7 @@ def main():
                     help="run only first N questions (0 = all)")
     args = ap.parse_args()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.exit("ANTHROPIC_API_KEY not set")
+    auth_headers, mode = resolve_auth()
 
     qs = QUESTIONS[: args.limit] if args.limit else QUESTIONS
     strategy_fn = STRATEGIES[args.strategy]
@@ -370,7 +414,8 @@ def main():
         for q in qs:
             try:
                 records.append(run_question(
-                    api_key, args.model, messages, q, sandbox, strategy_fn, log))
+                    auth_headers, mode, args.model, messages, q, sandbox,
+                    strategy_fn, log))
             except RuntimeError as e:
                 print(f"  Q{q['id']:2d} [ERROR] {e}")
                 log.write(json.dumps({"q": q["id"], "error": str(e)}) + "\n")
