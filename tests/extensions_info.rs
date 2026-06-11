@@ -17,13 +17,19 @@ fn fixture_path() -> String {
 }
 
 fn manifest() -> ExtensionManifest {
+    manifest_with_args(vec![])
+}
+
+fn manifest_with_args(extra_args: Vec<&str>) -> ExtensionManifest {
+    let mut args = vec![fixture_path()];
+    args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
-        args: vec![fixture_path()],
+        args,
         permissions: vec!["audio.input".to_string(), "config.subscribe".to_string()],
         hooks: vec![],
         config: vec![],
@@ -55,16 +61,15 @@ async fn manager_caches_plugin_info_after_initialize() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn info_get_is_best_effort_and_missing_method_does_not_fail_load() {
-    std::env::set_var("INFO_FIXTURE_DISABLE", "1");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager
-        .load("legacy-ext", &manifest())
+        // --no-info: env vars don't survive the host's env_clear
+        .load("legacy-ext", &manifest_with_args(vec!["--no-info"]))
         .await
         .expect("extension load should tolerate missing info.get");
 
     assert!(manager.plugin_info("legacy-ext").is_none());
 
-    std::env::remove_var("INFO_FIXTURE_DISABLE");
     manager.shutdown_all().await;
 }

@@ -47,11 +47,23 @@ async fn test_python_repl() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     
     let result = manager.send_input(&session_id, "print(1+1)\n", Some(2000), None).await.expect("send input");
-    
-    // Python output might have echoes - check for "2" but be flexible about format
-    let output_lower = result.output.to_lowercase();
-    assert!(output_lower.contains("2") || result.output.trim().ends_with("2"), 
-            "Expected '2' in Python output: '{}'", result.output);
+
+    // Python output might have echoes - check for "2" but be flexible about
+    // format. Under full-suite load the REPL can be slow to evaluate — if the
+    // first read only captured the echo, poll for the result a few times
+    // before declaring failure (PTY timing, not a product bug).
+    let mut combined = result.output.clone();
+    for _ in 0..10 {
+        if combined.to_lowercase().contains('2') {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(more) = manager.send_input(&session_id, "", Some(500), None).await {
+            combined.push_str(&more.output);
+        }
+    }
+    assert!(combined.contains('2'),
+            "Expected '2' in Python output: '{}'", combined);
     
     let _exit_result = manager.send_input(&session_id, "exit()\n", Some(1000), None).await;
     

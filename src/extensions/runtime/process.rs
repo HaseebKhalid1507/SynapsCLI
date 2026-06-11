@@ -567,6 +567,12 @@ pub struct ProcessExtension {
     call_lock: Arc<Mutex<()>>,
     next_id: AtomicU64,
     restart_count: AtomicUsize,
+    /// Lifetime restart total — never reset. `restart_count` tracks
+    /// *consecutive* failures (reset on successful restart, H-8) for the
+    /// exhaustion budget; this one feeds health/reporting so a previously
+    /// crashed extension still reads Degraded instead of pretending it
+    /// never crashed.
+    total_restarts: AtomicUsize,
     /// Restart policy controlling exponential backoff and budget.
     pub(crate) restart_policy: RestartPolicy,
     /// Shared mailbox between the reader task and request callers. Persists
@@ -601,6 +607,7 @@ impl ProcessExtension {
             call_lock: Arc::new(Mutex::new(())),
             next_id: AtomicU64::new(1),
             restart_count: AtomicUsize::new(0),
+            total_restarts: AtomicUsize::new(0),
             restart_policy: RestartPolicy::default(),
             inbox,
         })
@@ -946,7 +953,9 @@ impl ProcessExtension {
     }
 
     pub fn restart_count(&self) -> usize {
-        self.restart_count.load(Ordering::Relaxed)
+        // Lifetime total — reporting/tests expect total restarts, not the
+        // consecutive-failure budget counter (which resets on success).
+        self.total_restarts.load(Ordering::Relaxed)
     }
 
     /// Public for tests: set the permission set used by inbound RPC handlers
@@ -1296,6 +1305,7 @@ impl ProcessExtension {
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.total_restarts.fetch_add(1, Ordering::Relaxed);
         let max_attempts = self.restart_policy.max_attempts;
         if attempted > max_attempts as usize {
             *state = None;
@@ -1342,9 +1352,12 @@ impl ProcessExtension {
         // Reset closed flag now that we have a fresh transport
         self.inbox.closed.store(false, std::sync::atomic::Ordering::Release);
         self.initialize_locked(state).await?;
-        // Reset counter on successful restart so transient failures hours apart
-        // don't accumulate toward the permanent disable threshold.
-        self.restart_count.store(0, Ordering::Relaxed);
+        // NOTE: the consecutive-failure counter is NOT reset here. A
+        // successful handshake isn't proof of recovery — a crash-looping
+        // extension can initialize fine and die on the next request
+        // (always_exit fixture). The reset happens in call_inner once the
+        // restarted process actually serves a call (preserves H-8 intent:
+        // transient failures hours apart don't accumulate toward disable).
         Ok(())
     }
 
@@ -1497,7 +1510,13 @@ impl ProcessExtension {
             .await;
 
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                // Process served a real call — it has genuinely recovered.
+                // Reset the consecutive-failure budget (H-8) so transient
+                // crashes hours apart don't accumulate toward disable.
+                self.restart_count.store(0, Ordering::Relaxed);
+                Ok(value)
+            }
             Err(first_error) => {
                 self.restart_locked(&mut state_guard).await?;
                 let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1508,6 +1527,11 @@ impl ProcessExtension {
                     retry_id,
                 )
                 .await
+                .map(|value| {
+                    // Retry succeeded post-restart — also a real recovery.
+                    self.restart_count.store(0, Ordering::Relaxed);
+                    value
+                })
                 .map_err(|retry_error| {
                     format!("{}; retry after restart failed: {}", first_error, retry_error)
                 })
@@ -1957,11 +1981,15 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn health(&self) -> ExtensionHealth {
-        let count = self.restart_count.load(Ordering::Relaxed);
+        // Exhaustion is judged on the consecutive-failure counter (resets on
+        // successful restart); Degraded is judged on lifetime restarts so a
+        // recovered-but-previously-crashed extension doesn't report Running.
+        let consecutive = self.restart_count.load(Ordering::Relaxed);
+        let lifetime = self.total_restarts.load(Ordering::Relaxed);
         let max = self.restart_policy.max_attempts as usize;
-        if count >= max {
+        if consecutive >= max {
             ExtensionHealth::Failed
-        } else if count > 0 {
+        } else if lifetime > 0 {
             // Within budget. If the state slot is currently empty, we're
             // mid-restart; otherwise the process is alive but has previously
             // crashed at least once.

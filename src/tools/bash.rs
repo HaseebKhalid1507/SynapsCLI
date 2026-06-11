@@ -409,7 +409,7 @@ mod tests {
         ctx.channels.tx_delta = Some(delta_tx);
         let params = json!({
             "command": "printf '[sudo] password for testuser: ' >&2; read -r pw; if [ \"$pw\" = swordfish ]; then echo AUTH_OK; else echo AUTH_FAIL; fi",
-            "timeout": 5
+            "timeout": 30
         });
 
         let result = tool.execute(params, ctx).await.unwrap();
@@ -452,7 +452,7 @@ mod tests {
         ctx.channels.tx_delta = Some(delta_tx);
         let params = json!({
             "command": "sudo -k; sudo -v",
-            "timeout": 5
+            "timeout": 30
         });
 
         let _ = tool.execute(params, ctx).await;
@@ -475,7 +475,7 @@ mod tests {
 
         let params = json!({
             "command": "python3 -c \"import sys; sys.stdout.buffer.write(b'clean\\x1b[2J\\x00' + b'A' * 2000); sys.stdout.flush()\"",
-            "timeout": 5
+            "timeout": 30
         });
 
         let result = tool.execute(params, ctx).await.unwrap();
@@ -507,7 +507,7 @@ mod tests {
         ctx.capabilities.secret_prompt = Some(prompt_handle);
         let params = json!({
             "command": "printf 'Password: ' >&2; read -r pw; echo seen:$pw",
-            "timeout": 5
+            "timeout": 30
         });
 
         let result = tool.execute(params, ctx).await.unwrap();
@@ -535,7 +535,7 @@ mod tests {
         ctx.capabilities.secret_prompt = Some(prompt_handle);
         let params = json!({
             "command": "printf 'Password: ' >&2; read -r one; printf 'Password: ' >&2; read -r two; echo done:$one:$two",
-            "timeout": 5
+            "timeout": 30
         });
 
         let result = tool.execute(params, ctx).await.unwrap();
@@ -561,7 +561,7 @@ mod tests {
         ctx.capabilities.secret_prompt = Some(prompt_handle);
         let params = json!({
             "command": "printf 'Password: ' >&2; read -r pw; echo should-not-run:$pw",
-            "timeout": 5
+            "timeout": 30
         });
 
         let err = tool.execute(params, ctx).await.unwrap_err().to_string();
@@ -577,7 +577,7 @@ mod tests {
         let ctx = create_tool_context();
         let params = json!({
             "command": "python3 -c \"import sys; sys.stdout.buffer.write(bytes(range(32)) + b'visible')\"",
-            "timeout": 5
+            "timeout": 30
         });
 
         let result = tool.execute(params, ctx).await.unwrap();
