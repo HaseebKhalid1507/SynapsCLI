@@ -22,8 +22,14 @@ mod watcher;
 mod cmd;
 
 #[derive(Parser)]
-#[command(name = "synaps", about = "Neural interface for Claude", version)]
+#[command(
+    name = "synaps",
+    about = "SynapsCLI — terminal-native AI agent runtime (TUI, headless, server, RPC)",
+    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide headless chat,\na WebSocket server, autonomous agents, and event injection into running sessions.",
+    version
+)]
 struct Cli {
+    /// Configuration profile (loads ~/.synaps-cli/<PROFILE>/config)
     #[arg(long, global = true)]
     profile: Option<String>,
 
@@ -135,6 +141,12 @@ enum Command {
         #[arg(long)]
         broadcast: bool,
     },
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[tokio::main]
@@ -165,6 +177,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        Some(Command::Completions { shell }) => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
         Some(Command::Rpc { continue_id, system, model, profile }) => {
             cmd::rpc::run(continue_id, system, model, profile).await?;
