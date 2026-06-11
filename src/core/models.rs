@@ -94,6 +94,7 @@ pub fn model_supports_1m(model: &str) -> bool {
         || m.contains("opus-4-8") || m.contains("opus-4-9")
         || m.contains("sonnet-4")
         || m.contains("opus-5") || m.contains("sonnet-5")
+        || m.contains("fable-5")
 }
 
 /// Returns the input context window size for a given model, in tokens.
@@ -166,6 +167,7 @@ mod tests {
     fn model_supports_1m_assumed_for_5x() {
         assert!(model_supports_1m("claude-opus-5-0"));
         assert!(model_supports_1m("claude-sonnet-5-1"));
+        assert!(model_supports_1m("claude-fable-5"));
     }
 
     #[test]
