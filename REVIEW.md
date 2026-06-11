@@ -174,18 +174,26 @@ Mechanical split into lifecycle/dispatch/state/shutdown. Effort: XS, do regardle
 
 | # | Fix | Category | Effort | Impact |
 |---|-----|----------|--------|--------|
-| 1 | Throttle render loop + dirty flag (P1) | Perf | S | 🔴 Kills the core burn |
-| 2 | Kill orphan children: PTY, MCP, extensions (B1-3) | Bug | M | 🔴 Process leaks |
-| 3 | Zero-copy SSE parsing (P2) | Perf | M | 🔴 Per-token alloc churn |
-| 4 | Parse API errors → human messages (U1-2) | Polish | S | 🔴 Every user hits this |
-| 5 | Don't lose user input on stream error (U12) | Polish | S | 🔴 Data loss |
-| 6 | Arc message history + tool I/O (P3,6,7) | Perf | M | 🟠 O(conversation) copies |
-| 7 | Config warnings + did-you-mean (U3) | Polish | M | 🟠 Silent misconfig |
-| 8 | First-run banner (U4) | Polish | S | 🟠 First impression |
-| 9 | Instrument: machete, tree -d, bloat, timings, llvm-cov (A1) | Arch | XS | 🟠 Unblocks decisions |
-| 10 | Feature-gate TUI + trim syntect (A2) | Arch | S | 🟠 Build time + binary |
-| 11 | 3-crate workspace split (A3) | Arch | M | 🟠 Dev velocity |
-| 12 | Fix per-char/per-frame allocs (P4,9) | Perf | S | 🟡 Render polish |
-| 13 | SSE fuzz tests (A5) | Arch | S | 🟡 Coverage theater → real |
-| 14 | Split process.rs + mod.rs (B1, A6) | Arch | S | 🟡 Reviewability |
-| 15 | Shell completions, help text (U9-10) | Polish | S | 🟡 Distribution polish |
+| ~~1~~ | ~~Throttle render loop + dirty flag (P1)~~ ✅ `68ed4c4` | Perf | S | 🔴 Done |
+| ~~2~~ | ~~Kill orphan children: PTY (B2)~~ ✅ `55246c4` — MCP/bash/ext already had kill_on_drop | Bug | M | 🔴 Done |
+| ~~3~~ | ~~Zero-copy SSE line parsing (P2a) + chunk tests (A5)~~ ✅ `fab4951` | Perf | M | 🔴 Done |
+| ~~4~~ | ~~Parse API errors → human messages (U1-2)~~ ✅ `544ec4e` | Polish | S | 🔴 Done |
+| ~~5~~ | ~~Don't lose user input on stream error (U12)~~ ✅ `c117804` | Polish | S | 🔴 Done |
+| 6 | Arc message history (P3) — **closed as analyzed**: launch-time clone is semantically required (TUI renders while runtime extends its copy; Arc::make_mut would copy on first append anyway). P7 also closed — schema already Arc'd. P6 (tool I/O Arc) remains valid | Perf | M | 🟠 Partial |
+| ~~7~~ | ~~Config warnings + did-you-mean (U3)~~ ✅ `6276318` + `6e8af3b` | Polish | M | 🟠 Done |
+| ~~8~~ | ~~First-run banner (U4)~~ ✅ `3764fdd` | Polish | S | 🟠 Done |
+| 9 | Instrument: machete, bloat, llvm-cov (A1) — partial: tree -d run (dup http stacks = reqwest 0.11 vs axum 0.7, fix = reqwest 0.12 migration) | Arch | XS | 🟠 Partial |
+| 10 | Feature-gate TUI + trim syntect (A2) | Arch | S | 🟠 Open |
+| 11 | 3-crate workspace split (A3) | Arch | M | 🟠 Open |
+| ~~12~~ | ~~Per-char/per-frame allocs (P4,9)~~ ✅ `40c2ce4` — viewport clone→move, art spans grouped, version const | Perf | S | 🟡 Done |
+| ~~13~~ | ~~SSE fuzz tests (A5)~~ ✅ `fab4951` — exhaustive re-chunking suite | Arch | S | 🟡 Done |
+| 14 | Split process.rs (2446 lines) + runtime/mod.rs (962) (B1, A6) | Arch | S | 🟡 Open |
+| 15 | ~~Shell completions, help text (U9-10)~~ ✅ `b73d468` + U5/U6/U13 same commit | Polish | S | 🟡 Done |
+
+### Remaining (next session)
+- **P2b**: typed SSE event structs (Map-alloc per event) — tests now exist as safety net
+- **P6**: Arc tool I/O through hooks/events
+- **A2/A3**: feature-gate TUI, workspace split — the build-speed play (cargo check is 1m33s warm)
+- **B1/A6**: split process.rs + runtime/mod.rs
+- **reqwest 0.12 migration**: dedups hyper/http/base64/bitflags trees
+- **Cache → single-last**: S204 handoff item
