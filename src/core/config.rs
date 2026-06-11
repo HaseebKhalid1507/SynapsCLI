@@ -177,6 +177,9 @@ pub struct SynapsConfig {
     pub bridge: BridgeConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
+    /// Non-fatal problems found while parsing the config file (unknown keys,
+    /// unparseable values). Surfaced once at startup — never block boot.
+    pub warnings: Vec<String>,
 }
 
 impl Default for SynapsConfig {
@@ -204,8 +207,44 @@ impl Default for SynapsConfig {
             bridge: BridgeConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
+            warnings: Vec::new(),
         }
     }
+}
+
+/// Known top-level config keys — used for unknown-key warnings + did-you-mean.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "model", "thinking", "compaction_model", "context_window", "max_tool_output",
+    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
+    "telemetry", "cache_diagnostics", "theme", "agent_name", "identity",
+    "disabled_plugins", "favorite_models", "disabled_skills",
+];
+
+/// Simple Levenshtein distance for did-you-mean suggestions.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Closest known key within edit distance 2, for typo suggestions.
+fn did_you_mean(key: &str) -> Option<&'static str> {
+    KNOWN_CONFIG_KEYS
+        .iter()
+        .map(|k| (*k, levenshtein(key, k)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(k, _)| k)
 }
 
 
@@ -372,7 +411,12 @@ pub fn load_config() -> SynapsConfig {
         let val = val.trim();
         match key {
             "model" => config.model = Some(val.to_string()),
-            "thinking" => config.thinking_budget = parse_thinking_budget(val),
+            "thinking" => {
+                config.thinking_budget = parse_thinking_budget(val);
+                if config.thinking_budget.is_none() {
+                    config.warnings.push(format!("thinking = {val} — expected low|medium|high|xhigh|adaptive or a token count; thinking disabled"));
+                }
+            }
             "compaction_model" => config.compaction_model = Some(val.to_string()),
             "context_window" => {
                 let parsed = match val {
@@ -380,16 +424,22 @@ pub fn load_config() -> SynapsConfig {
                     "1m" | "1M" => Some(1_000_000),
                     _ => val.parse::<u64>().ok(),
                 };
+                if parsed.is_none() {
+                    config.warnings.push(format!("context_window = {val} — expected 200k, 1m, or a token count; ignored"));
+                }
                 config.context_window = parsed;
             }
             "max_tool_output" => {
-                if let Ok(size) = val.parse::<usize>() {
-                    config.max_tool_output = size;
+                match val.parse::<usize>() {
+                    Ok(size) => config.max_tool_output = size,
+                    Err(_) => config.warnings.push(format!("max_tool_output = {val} — not a number; using {}", config.max_tool_output)),
                 }
             }
             "bash_timeout" => {
-                if let Ok(timeout) = val.parse::<u64>() {
-                    config.bash_timeout = timeout;
+                match val.parse::<u64>() {
+                    Ok(t) if t >= 1 => config.bash_timeout = t,
+                    Ok(_) => config.warnings.push(format!("bash_timeout = {val} — below minimum (1s); using {}", config.bash_timeout)),
+                    Err(_) => config.warnings.push(format!("bash_timeout = {val} — not a number; using {}", config.bash_timeout)),
                 }
             }
             "bash_max_timeout" => {
@@ -435,8 +485,13 @@ pub fn load_config() -> SynapsConfig {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
                     config.keybinds.insert(keybind_key.to_string(), val.to_string());
+                } else {
+                    // Unknown top-level key — warn with a did-you-mean if close.
+                    match did_you_mean(key) {
+                        Some(suggestion) => config.warnings.push(format!("unknown key '{key}' (did you mean '{suggestion}'?)")),
+                        None => config.warnings.push(format!("unknown key '{key}' — ignored")),
+                    }
                 }
-                // Other unknown keys silently ignored
             }
         }
     }
@@ -571,6 +626,42 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_levenshtein_basics() {
+        assert_eq!(levenshtein("model", "model"), 0);
+        assert_eq!(levenshtein("modle", "model"), 2);
+        assert_eq!(levenshtein("them", "theme"), 1);
+    }
+
+    #[test]
+    fn test_did_you_mean_close_typos() {
+        assert_eq!(did_you_mean("modle"), Some("model"));
+        assert_eq!(did_you_mean("them"), Some("theme"));
+        assert_eq!(did_you_mean("thinkng"), Some("thinking"));
+        assert_eq!(did_you_mean("completely_unrelated_key"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_warnings_unknown_key_and_bad_values() {
+        let home = std::env::temp_dir().join(format!("synaps-warn-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "modle = claude-opus-4-6\nthinking = hgih\nbash_timeout = 0\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.warnings.len(), 3, "warnings: {:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("did you mean 'model'")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("thinking")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("below minimum")), "{:?}", config.warnings);
+            // Bad values fall back to defaults
+            assert_eq!(config.bash_timeout, 30);
+            assert_eq!(config.thinking_budget, None);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn test_parse_thinking_budget() {

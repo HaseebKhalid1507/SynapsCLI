@@ -86,6 +86,11 @@ pub async fn run(
     app.keybinds = Some(keybind_registry.clone());
     app.last_turn_context_window = runtime.context_window();
 
+    // Surface config parse warnings once at startup (unknown keys, bad values).
+    for w in &config.warnings {
+        app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
+    }
+
     if mcp_server_count > 0 {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
     }
