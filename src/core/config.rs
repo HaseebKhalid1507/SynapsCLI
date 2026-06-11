@@ -164,6 +164,8 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub telemetry: String,             // off | basic | full (default off)
+    pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
     pub theme: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -189,6 +191,8 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            telemetry: "off".to_string(),
+            cache_diagnostics: false,
             theme: None,
             agent_name: None,
             identity: None,
@@ -402,6 +406,10 @@ pub fn load_config() -> SynapsConfig {
                 if let Ok(retries) = val.parse::<u32>() {
                     config.api_retries = retries;
                 }
+            }
+            "telemetry" => config.telemetry = val.to_string(),
+            "cache_diagnostics" => {
+                config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
