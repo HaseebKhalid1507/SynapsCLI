@@ -736,6 +736,7 @@ impl Runtime {
             session_manager, subagent_registry, event_queue, secret_prompt,
             hook_bus: self.hook_bus.clone(),
             auto_approve_confirms,
+            telemetry_level: self.telemetry_level,
         };
 
         tokio::spawn(async move {
