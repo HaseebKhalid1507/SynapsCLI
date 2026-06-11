@@ -168,6 +168,8 @@ pub struct Runtime {
     cache_diagnostics: bool,
     /// Last Anthropic message id (`msg_...`) — threaded into the next
     /// request's `diagnostics.previous_message_id` when diagnostics is on.
+    /// Reserved for the cache-diagnosis beta wiring (handoff item).
+    #[allow(dead_code)]
     last_msg_id: Arc<Mutex<Option<String>>>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.

@@ -105,7 +105,7 @@ impl StreamMethods {
                         let creds = crate::auth::ensure_fresh_token(&client)
                             .await
                             .map_err(|e| RuntimeError::Auth(format!(
-                                "Token refresh failed mid-stream: {}. Run `login` to re-authenticate.", e
+                                "Token refresh failed mid-stream: {}. Run `synaps login` to re-authenticate.", e
                             )))?;
 
                         let mut auth_w = auth.write().await;

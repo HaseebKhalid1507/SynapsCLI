@@ -1,23 +1,28 @@
 //! `synaps status` — show account usage and reset times.
 
-use synaps_cli::config;
-
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let auth_path = config::base_dir().join("auth.json");
-    let content = std::fs::read_to_string(&auth_path)
-        .map_err(|_| "Not logged in — run `synaps login` first")?;
-    let auth: serde_json::Value = serde_json::from_str(&content)?;
-    let access = auth["anthropic"]["access"].as_str()
-        .ok_or("No OAuth token found — run `synaps login`")?;
-
+    // Refresh-if-needed via the shared auth machinery (honors profiles,
+    // fs4 file locking, and persists the rotated token). Previously this
+    // read auth.json raw from the base dir — expired tokens produced a
+    // useless HTTP 401 even though the user was logged in.
     let client = reqwest::Client::new();
+    let creds = synaps_cli::auth::ensure_fresh_token(&client)
+        .await
+        .map_err(|e| format!("Not logged in ({}). Run `synaps login` first.", e))?;
+    let access = creds.access;
+
     let resp = client.get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", access))
         .header("anthropic-beta", "oauth-2025-04-20")
         .send().await?;
 
     if !resp.status().is_success() {
-        eprintln!("Failed to fetch usage: HTTP {}", resp.status());
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            eprintln!("Token rejected (401) — run `synaps login` to re-authenticate.");
+        } else {
+            eprintln!("Failed to fetch usage: HTTP {}", status);
+        }
         std::process::exit(1);
     }
 

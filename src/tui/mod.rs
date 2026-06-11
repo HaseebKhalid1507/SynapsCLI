@@ -138,7 +138,7 @@ pub async fn run(
     // Legacy sidecar key migration
     migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
-    if !no_extensions {
+    if !boot.no_extensions {
         app.extension_loader_running = true;
         app.toasts.upsert(toast::Toast::new("extension-loader", "Discovering extensions…")
             .titled("Extensions")
