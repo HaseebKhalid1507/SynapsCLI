@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-12
+
+### Fixed
+- **AUR build failure on LTO-enabled systems** — the rustls migration (0.2.0) introduced `ring`, whose C/asm objects are GCC-LTO-incompatible with `rust-lld`: makepkg's `-flto=auto` produced bitcode the linker can't read, failing every `ring_core_*` symbol. PKGBUILD now sets `options=(!lto)`; stale `openssl` runtime dependency dropped (TLS is rustls since 0.2.0). Binaries unchanged from 0.2.0.
+
 ## [0.2.0] — 2026-06-12
 
 ### Performance
