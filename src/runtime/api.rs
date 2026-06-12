@@ -58,6 +58,12 @@ struct ParseState {
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
+    // ── Cache-TTL split captured from message_start ──
+    // Live API shape (probed 2024+): message_start carries the full
+    // `cache_creation` sub-object; message_delta carries ONLY the aggregate.
+    // The delta arm falls back to these when its own sub-object is absent.
+    msg_start_cache_5m: Option<u64>,
+    msg_start_cache_1h: Option<u64>,
 }
 
 impl ParseState {
@@ -77,6 +83,8 @@ impl ParseState {
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
+            msg_start_cache_5m: None,
+            msg_start_cache_1h: None,
         }
     }
 
@@ -269,9 +277,16 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 let output_t = usage.output_tokens;
                 let cache_read = usage.cache_read_input_tokens;
                 let cache_create = usage.cache_creation_input_tokens;
-                // TTL breakdown from the cache_creation sub-object (when present).
-                let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
-                let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
+                // TTL breakdown: prefer the delta's own cache_creation
+                // sub-object (future-proof), but in live traffic message_delta
+                // carries ONLY the aggregate — the split arrives on
+                // message_start. Fall back to the values captured there.
+                let cache_create_5m = usage.cache_creation.as_ref()
+                    .and_then(|cc| cc.ephemeral_5m_input_tokens)
+                    .or(state.msg_start_cache_5m);
+                let cache_create_1h = usage.cache_creation.as_ref()
+                    .and_then(|cc| cc.ephemeral_1h_input_tokens)
+                    .or(state.msg_start_cache_1h);
 
                 // ═══ Silent-downgrade detector (spec §3.4.1) ═══
                 // The failure mode that doesn't 400: the API accepts the
@@ -338,6 +353,11 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 let cache_create = usage.cache_creation_input_tokens;
                 let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
                 let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
+                // Capture the split for the message_delta arm: live deltas
+                // carry only the aggregate, so this is the only place the
+                // 5m/1h breakdown exists in streaming traffic.
+                state.msg_start_cache_5m = cache_create_5m;
+                state.msg_start_cache_1h = cache_create_1h;
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
@@ -882,6 +902,9 @@ mod tests {
 
     #[test]
     fn message_delta_captures_usage_stop_reason_telemetry() {
+        // Future-proof path: if a delta ever carries its own cache_creation
+        // sub-object, it takes precedence over the message_start capture.
+        // (Live deltas don't — see live_split_from_start_survives_to_delta_emission.)
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
@@ -904,6 +927,46 @@ mod tests {
         assert!(matches!(
             &events[0],
             StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, cache_creation_5m: Some(60), cache_creation_1h: Some(40), model: None })
+        ));
+    }
+
+    #[test]
+    fn live_split_from_start_survives_to_delta_emission() {
+        // LIVE API shape (streaming probe): message_start carries the full
+        // cache_creation split; message_delta carries ONLY the aggregate.
+        // Regression: reading the split exclusively in the delta arm made it
+        // permanently None in live traffic — telemetry lost the 5m/1h keys
+        // and the downgrade detector could never latch or fire.
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_live","usage":{"input_tokens":4,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":1282,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":1277}}}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":4,"output_tokens":42,"cache_read_input_tokens":0,"cache_creation_input_tokens":1282}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        // Telemetry carries the split captured at message_start.
+        assert_eq!(state.telem_usage.cache_write, 1282);
+        assert_eq!(state.telem_usage.cache_write_5m, Some(5));
+        assert_eq!(state.telem_usage.cache_write_1h, Some(1277));
+        // The delta-arm Usage emission (final counts) carries the split too.
+        let events = drain(&mut rx);
+        let last_usage = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
+            .next_back()
+            .expect("delta must emit a Usage event");
+        assert!(matches!(
+            last_usage,
+            StreamEvent::Session(SessionEvent::Usage {
+                output_tokens: 42,
+                cache_creation_input_tokens: 1282,
+                cache_creation_5m: Some(5),
+                cache_creation_1h: Some(1277),
+                ..
+            })
         ));
     }
 
@@ -1278,8 +1341,17 @@ mod tests {
     }
 
     // ── Silent-downgrade detector (spec §3.4.1) ─────────────────────────────
+    //
+    // Fixtures mirror the LIVE API shape (streaming probe): message_start
+    // carries the full `cache_creation` sub-object; message_delta carries
+    // ONLY the aggregate. The detector runs in the delta arm and must work
+    // off the split captured at message_start.
 
-    const DOWNGRADE_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}"#;
+    /// Aggregate-only delta — what message_delta actually looks like live.
+    const LIVE_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100}}"#;
+
+    /// Downgraded turn: 1h bucket = 0, all writes landed in 5m.
+    const DOWNGRADE_START: &str = r#"data: {"type":"message_start","message":{"id":"msg_dg","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}"#;
 
     fn count_downgrade_notices(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> usize {
         drain(rx)
@@ -1289,7 +1361,7 @@ mod tests {
     }
 
     /// A turn where the 1h bucket is honored (healthy turn 1: prefix write).
-    const HONORED_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#;
+    const HONORED_START: &str = r#"data: {"type":"message_start","message":{"id":"msg_ok","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}}"#;
 
     #[test]
     fn downgrade_detector_silent_for_healthy_hybrid_session() {
@@ -1302,17 +1374,19 @@ mod tests {
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
-        // Turn 1: 1h prefix written → latch set, no notice.
-        feed(&[HONORED_DELTA], &mut state, &ctx);
+        // Turn 1: 1h prefix written (split on message_start) → latch set, no notice.
+        feed(&[HONORED_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 1 (1h honored)");
         assert!(honored.load(std::sync::atomic::Ordering::Relaxed), "latch set on 1h write");
         // Turn 2: prefix cached → 1h == 0, 5m > 0. Healthy. SILENCE.
-        feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
-        assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 2 (healthy hybrid signature)");
+        let (mut state_t2, tx_t2, mut rx_t2) = harness();
+        let ctx_t2 = make_ctx_ttl(&tx_t2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state_t2, &ctx_t2);
+        assert_eq!(count_downgrade_notices(&mut rx_t2), 0, "turn 2 (healthy hybrid signature)");
         // Later request in the same session (new ctx, same latches): still silent.
         let (mut state2, tx2, mut rx2) = harness();
         let ctx2 = make_ctx_ttl(&tx2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
-        feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
+        feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state2, &ctx2);
         assert_eq!(count_downgrade_notices(&mut rx2), 0, "later request, same session");
     }
 
@@ -1326,15 +1400,17 @@ mod tests {
             let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let ctx = make_ctx_ttl(&tx, ttl, &notified, &honored);
             // First occurrence: 1h bucket = 0, 5m bucket > 0 → exactly one Notice.
-            feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+            feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
             assert_eq!(count_downgrade_notices(&mut rx), 1, "first occurrence under {ttl:?}");
             // Second occurrence (same session/latch): nothing.
-            feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
-            assert_eq!(count_downgrade_notices(&mut rx), 0, "second occurrence under {ttl:?}");
+            let (mut state_b, tx_b, mut rx_b) = harness();
+            let ctx_b = make_ctx_ttl(&tx_b, ttl, &notified, &honored);
+            feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state_b, &ctx_b);
+            assert_eq!(count_downgrade_notices(&mut rx_b), 0, "second occurrence under {ttl:?}");
             // Latch persists across requests in the session (new ctx, same latches).
             let (mut state2, tx2, mut rx2) = harness();
             let ctx2 = make_ctx_ttl(&tx2, ttl, &notified, &honored);
-            feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
+            feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state2, &ctx2);
             assert_eq!(count_downgrade_notices(&mut rx2), 0, "next request, same session");
             // Mode is never auto-flipped — ctx still carries the configured TTL.
             assert_eq!(ctx2.cache_ttl, ttl);
@@ -1345,7 +1421,7 @@ mod tests {
     fn downgrade_detector_silent_under_default_5m() {
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx); // FiveMinutes
-        feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+        feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0, "5m mode never warns");
     }
 
@@ -1355,11 +1431,7 @@ mod tests {
         let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
-        feed(
-            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#],
-            &mut state,
-            &ctx,
-        );
+        feed(&[HONORED_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0);
         assert!(!latch.load(std::sync::atomic::Ordering::Relaxed), "latch untouched when honored");
     }
