@@ -222,24 +222,26 @@ pub(super) fn handle_event(
                 app.suppress_paste_until = None;
             }
             const MAX_PASTE_CHARS: usize = 100_000;
-            if !streaming || !app.input.is_empty() {
-                let text = if text.chars().count() > MAX_PASTE_CHARS {
-                    let truncated: String = text.chars().take(MAX_PASTE_CHARS).collect();
-                    app.push_msg(ChatMessage::System(
-                        format!("Paste truncated to {} chars (was {})", MAX_PASTE_CHARS, text.chars().count())
-                    ));
-                    truncated
-                } else {
-                    text
-                };
-                if app.input_before_paste.is_none() {
-                    app.input_before_paste = Some(app.input.clone());
-                }
-                let byte_pos = app.cursor_byte_pos();
-                app.input.insert_str(byte_pos, &text);
-                app.cursor_pos += text.chars().count();
-                app.pasted_char_count += text.chars().count();
+            // Paste is allowed regardless of streaming state — typing into the
+            // input during streaming already works (queued submit), so paste
+            // must behave the same. Previously gated on !streaming, which
+            // silently ate pastes into an empty input mid-stream.
+            let text = if text.chars().count() > MAX_PASTE_CHARS {
+                let truncated: String = text.chars().take(MAX_PASTE_CHARS).collect();
+                app.push_msg(ChatMessage::System(
+                    format!("Paste truncated to {} chars (was {})", MAX_PASTE_CHARS, text.chars().count())
+                ));
+                truncated
+            } else {
+                text
+            };
+            if app.input_before_paste.is_none() {
+                app.input_before_paste = Some(app.input.clone());
             }
+            let byte_pos = app.cursor_byte_pos();
+            app.input.insert_str(byte_pos, &text);
+            app.cursor_pos += text.chars().count();
+            app.pasted_char_count += text.chars().count();
             InputAction::None
         }
         _ => InputAction::None,
