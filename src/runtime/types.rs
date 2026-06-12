@@ -52,6 +52,11 @@ pub enum SessionEvent {
         output_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        /// Cache-write TTL split (`usage.cache_creation` sub-object).
+        /// `None` when the API omits the breakdown — cost accounting then
+        /// falls back to billing the aggregate at the 5m rate (fail-cheap).
+        cache_creation_5m: Option<u64>,
+        cache_creation_1h: Option<u64>,
         model: Option<String>,
     },
     Done,

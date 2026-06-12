@@ -145,6 +145,9 @@ impl Tool for SubagentTool {
                 let mut total_output_tokens = 0u64;
                 let mut total_cache_read = 0u64;
                 let mut total_cache_creation = 0u64;
+                // TTL split: None only if no turn ever reported one; otherwise summed.
+                let mut total_cache_5m: Option<u64> = None;
+                let mut total_cache_1h: Option<u64> = None;
 
                 let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
                 tokio::pin!(timeout_fut);
@@ -247,12 +250,19 @@ impl Tool for SubagentTool {
                                 crate::StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens, output_tokens,
                                     cache_read_input_tokens, cache_creation_input_tokens,
+                                    cache_creation_5m, cache_creation_1h,
                                     model: _,
                                 }) => {
                                     total_input_tokens += input_tokens;
                                     total_output_tokens += output_tokens;
                                     total_cache_read += cache_read_input_tokens;
                                     total_cache_creation += cache_creation_input_tokens;
+                                    if let Some(v) = cache_creation_5m {
+                                        total_cache_5m = Some(total_cache_5m.unwrap_or(0) + v);
+                                    }
+                                    if let Some(v) = cache_creation_1h {
+                                        total_cache_1h = Some(total_cache_1h.unwrap_or(0) + v);
+                                    }
                                 }
                                 crate::StreamEvent::Session(SessionEvent::Error(e)) => {
                                     return Err(e);
@@ -279,6 +289,8 @@ impl Tool for SubagentTool {
                                 output_tokens: total_output_tokens,
                                 cache_read: total_cache_read,
                                 cache_creation: total_cache_creation,
+                                cache_creation_5m: total_cache_5m,
+                                cache_creation_1h: total_cache_1h,
                                 tool_count,
                             });
                         }
@@ -292,6 +304,8 @@ impl Tool for SubagentTool {
                     output_tokens: total_output_tokens,
                     cache_read: total_cache_read,
                     cache_creation: total_cache_creation,
+                    cache_creation_5m: total_cache_5m,
+                    cache_creation_1h: total_cache_1h,
                     tool_count,
                 })
             });
@@ -332,6 +346,10 @@ impl Tool for SubagentTool {
                         output_tokens: sa_result.output_tokens,
                         cache_read_input_tokens: sa_result.cache_read,
                         cache_creation_input_tokens: sa_result.cache_creation,
+                        // TTL split aggregated across the subagent's turns —
+                        // forwarded so the parent bills 1h writes at 2.0x, not 1.25x.
+                        cache_creation_5m: sa_result.cache_creation_5m,
+                        cache_creation_1h: sa_result.cache_creation_1h,
                         model: Some(sa_result.model),
                     }));
                     let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {

@@ -84,16 +84,22 @@ impl ServerState {
     /// which uses engine::pricing::calculate_cost (handles cache tokens
     /// correctly and tracks every model the engine knows about — opus,
     /// sonnet, haiku, plus future ones added to engine pricing).
+    #[allow(clippy::too_many_arguments)]
     async fn add_usage(
         &self,
         input_tokens: u64,
         output_tokens: u64,
         cache_read: u64,
         cache_creation: u64,
+        cache_creation_5m: Option<u64>,
+        cache_creation_1h: Option<u64>,
         model: &str,
     ) {
         let mut conv = self.conv.write().await;
-        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model);
+        conv.add_usage(
+            input_tokens, output_tokens, cache_read, cache_creation,
+            cache_creation_5m, cache_creation_1h, model,
+        );
     }
 
     /// Save the conversation to disk.
@@ -739,6 +745,8 @@ async fn apply_engine_event_side_effects(
             output_tokens,
             cache_read,
             cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
             ..
         } => {
             state
@@ -747,6 +755,8 @@ async fn apply_engine_event_side_effects(
                     *output_tokens,
                     *cache_read,
                     *cache_creation,
+                    *cache_creation_5m,
+                    *cache_creation_1h,
                     model,
                 )
                 .await;
@@ -807,10 +817,14 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
         EngineStreamEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
             ..
         } => Some(ServerMessage::Usage {
             input_tokens,
             output_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
         }),
         EngineStreamEvent::Done => Some(ServerMessage::Done),
         EngineStreamEvent::Error(message) => Some(ServerMessage::Error { message }),

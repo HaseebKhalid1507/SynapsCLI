@@ -119,6 +119,15 @@ struct EventCtx<'t> {
     tx: &'t mpsc::UnboundedSender<StreamEvent>,
     telemetry_level: TelemetryLevel,
     request_start: std::time::Instant,
+    /// Requested cache TTL — used by the silent-downgrade detector.
+    cache_ttl: crate::core::config::CacheTtl,
+    /// Once-per-session latch for the downgrade notice (shared via Runtime).
+    ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped latch: set once any response shows a nonzero 1h cache
+    /// write. A healthy Hybrid session writes the 1h prefix on turn 1 and
+    /// then only the 5m tail on later turns — without this latch that
+    /// signature is indistinguishable from a genuine downgrade (spec §3.4.1).
+    saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -260,6 +269,36 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 let output_t = usage.output_tokens;
                 let cache_read = usage.cache_read_input_tokens;
                 let cache_create = usage.cache_creation_input_tokens;
+                // TTL breakdown from the cache_creation sub-object (when present).
+                let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
+                let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
+
+                // ═══ Silent-downgrade detector (spec §3.4.1) ═══
+                // The failure mode that doesn't 400: the API accepts the
+                // request but quietly honors only 5m. Fire ONE notice per
+                // session and keep requesting what the user configured —
+                // auto-downgrade would change pricing behavior behind the
+                // user's back and mask the account-level problem.
+                //
+                // The saw_1h_honored latch prevents the Hybrid false
+                // positive: turn 2+ of a healthy Hybrid session has
+                // 1h == 0 (prefix cached) and 5m > 0 (tail rewrite) — the
+                // exact downgrade signature. Turn 1's prefix write sets the
+                // latch; a genuinely downgraded account never does.
+                if cache_create_1h.unwrap_or(0) > 0 {
+                    ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if ctx.cache_ttl != crate::core::config::CacheTtl::FiveMinutes
+                    && cache_create_1h.unwrap_or(0) == 0
+                    && cache_create_5m.unwrap_or(0) > 0
+                    && !ctx.saw_1h_honored.load(std::sync::atomic::Ordering::Relaxed)
+                    && !ctx.ttl_downgrade_notified.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Notice(
+                        "⚠ 1h cache TTL not honored — check account/beta support (cache_ttl config)".to_string(),
+                    )));
+                }
+
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
@@ -269,11 +308,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         state.telem_usage.output = output_t;
                         state.telem_usage.cache_read = cache_read;
                         state.telem_usage.cache_write = cache_create;
-                        // TTL breakdown from cache_creation sub-object
-                        if let Some(cc) = usage.cache_creation {
-                            state.telem_usage.cache_write_5m = cc.ephemeral_5m_input_tokens;
-                            state.telem_usage.cache_write_1h = cc.ephemeral_1h_input_tokens;
-                        }
+                        state.telem_usage.cache_write_5m = cache_create_5m;
+                        state.telem_usage.cache_write_1h = cache_create_1h;
                         state.telem_usage.compute_hit_pct();
                     }
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
@@ -281,6 +317,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         output_tokens: output_t,
                         cache_read_input_tokens: cache_read,
                         cache_creation_input_tokens: cache_create,
+                        cache_creation_5m: cache_create_5m,
+                        cache_creation_1h: cache_create_1h,
                         model: None,
                     }));
                 }
@@ -298,6 +336,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 let output_t = usage.output_tokens;
                 let cache_read = usage.cache_read_input_tokens;
                 let cache_create = usage.cache_creation_input_tokens;
+                let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
+                let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
@@ -306,6 +346,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         output_tokens: output_t,
                         cache_read_input_tokens: cache_read,
                         cache_creation_input_tokens: cache_create,
+                        cache_creation_5m: cache_create_5m,
+                        cache_creation_1h: cache_create_1h,
                         model: None,
                     }));
                 }
@@ -331,6 +373,18 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
 pub struct ApiOptions {
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
+    /// Prompt-cache TTL strategy (spec: cache-ttl). Default `FiveMinutes`
+    /// emits payloads byte-identical to the pre-feature release.
+    pub cache_ttl: crate::core::config::CacheTtl,
+    /// One-time-per-session latch for the silent-downgrade notice (1h
+    /// requested, only 5m honored). Shared via Arc so every request in the
+    /// session sees the same latch; the configured mode is NEVER auto-flipped.
+    pub ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped "1h was honored at least once" latch (spec §3.4.1).
+    /// Set on any response with a nonzero 1h cache-write bucket; suppresses
+    /// the downgrade notice on healthy Hybrid turns where the 1h prefix is
+    /// already cached (1h == 0, 5m > 0). Shared via Arc like the notice latch.
+    pub saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(super) struct ApiMethods;
@@ -398,7 +452,7 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
         let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
@@ -434,29 +488,10 @@ impl ApiMethods {
         }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
-        if let Some(tool_list) = body["tools"].as_array_mut() {
-            if let Some(last_tool) = tool_list.last_mut() {
-                last_tool["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
+        HelperMethods::mark_last_tool(&mut body, options.cache_ttl);
 
-        if auth_type == "oauth" {
-            let mut system_blocks = vec![
-                json!({"type": "text", "text": crate::core::config::get_identity()}),
-                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
-            ];
-            if let Some(ref prompt) = system_prompt {
-                system_blocks.push(json!({"type": "text", "text": prompt}));
-            }
-            // Prompt caching: mark the last system block so entire system prompt is cached
-            if let Some(last) = system_blocks.last_mut() {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
-            body["system"] = json!(system_blocks);
-        } else if let Some(ref prompt) = system_prompt {
-            body["system"] = json!([
-                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
-            ]);
+        if let Some(system) = HelperMethods::build_system_blocks(&auth_type, system_prompt, options.cache_ttl) {
+            body["system"] = system;
         }
 
         tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
@@ -543,6 +578,9 @@ impl ApiMethods {
             tx: &tx,
             telemetry_level,
             request_start,
+            cache_ttl: options.cache_ttl,
+            ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
+            saw_1h_honored: options.saw_1h_honored.clone(),
         };
 
         // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -640,6 +678,27 @@ mod tests {
             tx,
             telemetry_level: TelemetryLevel::Full,
             request_start: std::time::Instant::now(),
+            cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
+            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Harness variant with a configured TTL + shared latches — for the
+    /// silent-downgrade detector tests.
+    fn make_ctx_ttl<'a>(
+        tx: &'a mpsc::UnboundedSender<StreamEvent>,
+        ttl: crate::core::config::CacheTtl,
+        latch: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        honored: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> EventCtx<'a> {
+        EventCtx {
+            tx,
+            telemetry_level: TelemetryLevel::Full,
+            request_start: std::time::Instant::now(),
+            cache_ttl: ttl,
+            ttl_downgrade_notified: latch.clone(),
+            saw_1h_honored: honored.clone(),
         }
     }
 
@@ -844,7 +903,7 @@ mod tests {
         let events = drain(&mut rx);
         assert!(matches!(
             &events[0],
-            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, model: None })
+            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, cache_creation_5m: Some(60), cache_creation_1h: Some(40), model: None })
         ));
     }
 
@@ -1216,5 +1275,107 @@ mod tests {
             events.last().unwrap(),
             StreamEvent::Llm(LlmEvent::Text(t)) if t == "tail ✨"
         ));
+    }
+
+    // ── Silent-downgrade detector (spec §3.4.1) ─────────────────────────────
+
+    const DOWNGRADE_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}"#;
+
+    fn count_downgrade_notices(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> usize {
+        drain(rx)
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Notice(t)) if t.contains("1h cache TTL not honored")))
+            .count()
+    }
+
+    /// A turn where the 1h bucket is honored (healthy turn 1: prefix write).
+    const HONORED_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#;
+
+    #[test]
+    fn downgrade_detector_silent_for_healthy_hybrid_session() {
+        // The false positive the saw_1h_honored latch exists to kill: a
+        // healthy Hybrid session's turn 2+ has 1h == 0 (prefix cached) and
+        // 5m > 0 (tail rewrite) — the exact downgrade signature. Turn 1's
+        // prefix write must latch saw_1h_honored and keep the detector
+        // silent for the rest of the session.
+        let (mut state, tx, mut rx) = harness();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        // Turn 1: 1h prefix written → latch set, no notice.
+        feed(&[HONORED_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 1 (1h honored)");
+        assert!(honored.load(std::sync::atomic::Ordering::Relaxed), "latch set on 1h write");
+        // Turn 2: prefix cached → 1h == 0, 5m > 0. Healthy. SILENCE.
+        feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 2 (healthy hybrid signature)");
+        // Later request in the same session (new ctx, same latches): still silent.
+        let (mut state2, tx2, mut rx2) = harness();
+        let ctx2 = make_ctx_ttl(&tx2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
+        assert_eq!(count_downgrade_notices(&mut rx2), 0, "later request, same session");
+    }
+
+    #[test]
+    fn downgrade_detector_fires_once_when_1h_never_honored() {
+        // Genuinely downgraded account: the 1h bucket never goes nonzero —
+        // the notice fires on turn 1, exactly once per session, in both modes.
+        for ttl in [crate::core::config::CacheTtl::OneHour, crate::core::config::CacheTtl::Hybrid] {
+            let (mut state, tx, mut rx) = harness();
+            let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ctx = make_ctx_ttl(&tx, ttl, &notified, &honored);
+            // First occurrence: 1h bucket = 0, 5m bucket > 0 → exactly one Notice.
+            feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+            assert_eq!(count_downgrade_notices(&mut rx), 1, "first occurrence under {ttl:?}");
+            // Second occurrence (same session/latch): nothing.
+            feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+            assert_eq!(count_downgrade_notices(&mut rx), 0, "second occurrence under {ttl:?}");
+            // Latch persists across requests in the session (new ctx, same latches).
+            let (mut state2, tx2, mut rx2) = harness();
+            let ctx2 = make_ctx_ttl(&tx2, ttl, &notified, &honored);
+            feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
+            assert_eq!(count_downgrade_notices(&mut rx2), 0, "next request, same session");
+            // Mode is never auto-flipped — ctx still carries the configured TTL.
+            assert_eq!(ctx2.cache_ttl, ttl);
+        }
+    }
+
+    #[test]
+    fn downgrade_detector_silent_under_default_5m() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx); // FiveMinutes
+        feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "5m mode never warns");
+    }
+
+    #[test]
+    fn downgrade_detector_silent_when_1h_honored() {
+        let (mut state, tx, mut rx) = harness();
+        let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(count_downgrade_notices(&mut rx), 0);
+        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed), "latch untouched when honored");
+    }
+
+    #[test]
+    fn downgrade_detector_silent_when_split_absent() {
+        // cache_creation sub-object missing entirely → no basis to judge; stay quiet.
+        let (mut state, tx, mut rx) = harness();
+        let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(count_downgrade_notices(&mut rx), 0);
     }
 }

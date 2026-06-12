@@ -297,6 +297,8 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
                 output_tokens: *completion_tokens as u64,
                 cache_read_input_tokens: *cached_tokens as u64,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
                 model: None,
             }))
         }

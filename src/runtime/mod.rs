@@ -168,6 +168,16 @@ pub struct Runtime {
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
+    /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
+    /// every request via `ApiOptions`.
+    cache_ttl: crate::core::config::CacheTtl,
+    /// One-time-per-session latch for the silent 1h-downgrade notice
+    /// (spec §3.4.1). Shared into `ApiOptions` for every request.
+    ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped "1h honored at least once" latch (spec §3.4.1) —
+    /// suppresses the downgrade notice on healthy Hybrid turns where the 1h
+    /// prefix is already cached. Shared into `ApiOptions` for every request.
+    saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Last Anthropic message id (`msg_...`) — threaded into the next
     /// request's `diagnostics.previous_message_id` when diagnostics is on.
     /// Reserved for the cache-diagnosis beta wiring (handoff item).
@@ -227,6 +237,9 @@ impl Runtime {
             api_retries: 3,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             cache_diagnostics: false,
+            cache_ttl: crate::core::config::CacheTtl::default(),
+            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
@@ -328,6 +341,7 @@ impl Runtime {
         self.api_retries = config.api_retries;
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
+        self.cache_ttl = config.cache_ttl;
     }
 
     pub fn thinking_budget(&self) -> u32 {
@@ -390,6 +404,17 @@ impl Runtime {
         self.cache_diagnostics = v;
     }
 
+    pub fn cache_ttl(&self) -> crate::core::config::CacheTtl {
+        self.cache_ttl
+    }
+
+    /// Change the cache TTL strategy mid-session. The next request re-marks
+    /// with the new TTL; the old prefix expires naturally (single-last
+    /// strategy never prunes old markers, so no invalidation logic needed).
+    pub fn set_cache_ttl(&mut self, ttl: crate::core::config::CacheTtl) {
+        self.cache_ttl = ttl;
+    }
+
     pub fn thinking_level(&self) -> &str {
         crate::core::models::thinking_level_for_budget(self.thinking_budget)
     }
@@ -440,6 +465,9 @@ impl Runtime {
                 self.api_retries,
                 &api::ApiOptions {
                     use_1m_context: self.context_window_override == Some(1_000_000),
+                    cache_ttl: self.cache_ttl,
+                    ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
+                    saw_1h_honored: self.saw_1h_honored.clone(),
                 },
             ).await?;
             
@@ -729,6 +757,9 @@ impl Runtime {
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
             use_1m_context: self.context_window_override == Some(1_000_000),
+            cache_ttl: self.cache_ttl,
+            ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
+            saw_1h_honored: self.saw_1h_honored.clone(),
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -775,6 +806,12 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             telemetry_level: self.telemetry_level,
             cache_diagnostics: self.cache_diagnostics,
+            cache_ttl: self.cache_ttl,
+            // Subagents are their own session — fresh latches so a downgrade
+            // in the subagent's chain surfaces its own (single) notice and
+            // honored-state isn't inherited from the parent.
+            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
