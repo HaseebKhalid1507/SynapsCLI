@@ -315,8 +315,11 @@ pub async fn run(
 
             // ── Tick: animations + spinner (~60fps when active) ──
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
-                // Active animations/effects always need a redraw each tick
-                if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() {
+                // Active animations/effects always need a redraw each tick.
+                // messages.is_empty() = idle logo screen — its color gradient
+                // is time-based and needs ticking too (S206 regression: the
+                // dirty-flag loop froze it until first keystroke).
+                if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.messages.is_empty() {
                     app.request_redraw();
                 }
                 secret_prompts.poll_requests(&secret_prompt_rx);
