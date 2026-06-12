@@ -490,6 +490,7 @@ impl ApiMethods {
                                     "signature": current_thinking_signature
                                 }));
                             }
+                            in_thinking = false;
                         } else if in_tool_use {
                             let input = parse_tool_input(&current_tool_input_json);
                             accumulated_content.push(json!({
@@ -503,6 +504,7 @@ impl ApiMethods {
                                 tool_id: current_tool_id.clone(),
                                 input,
                             }));
+                            in_tool_use = false;
                         }
                     }
                 }
