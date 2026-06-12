@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use reqwest::Client;
 use futures::StreamExt;
 use crate::{Result, RuntimeError, ToolRegistry};
+use crate::runtime::telemetry::{self, TelemetryLevel};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
 
@@ -18,6 +19,305 @@ fn parse_tool_input(raw: &str) -> Value {
     match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => json!({ "__parse_error": format!("invalid tool input JSON: {}", e) }),
+    }
+}
+
+/// All mutable state for one SSE stream parse. Mutated exclusively through
+/// `process_event()` + `finalize()` — single write path makes duplicate-site
+/// drift structurally impossible.
+struct ParseState {
+    // ── Output accumulation (stays Value — outgoing message format) ──
+    accumulated_content: Vec<Value>,
+    current_text: String,
+    // ── Tool-use block accumulation ──
+    current_tool_name: String,
+    current_tool_id: String,
+    current_tool_input_json: String,
+    in_tool_use: bool,
+    // ── Thinking block accumulation ──
+    current_thinking: String,
+    current_thinking_signature: String,
+    in_thinking: bool,
+    // ── Telemetry captures ──
+    telem_msg_id: Option<String>,
+    telem_ttft: Option<u64>,
+    telem_stop_reason: Option<String>,
+    telem_usage: telemetry::UsageRecord,
+    first_event_seen: bool,
+}
+
+impl ParseState {
+    fn new() -> Self {
+        Self {
+            accumulated_content: Vec::new(),
+            current_text: String::new(),
+            current_tool_name: String::new(),
+            current_tool_id: String::new(),
+            current_tool_input_json: String::new(),
+            in_tool_use: false,
+            current_thinking: String::new(),
+            current_thinking_signature: String::new(),
+            in_thinking: false,
+            telem_msg_id: None,
+            telem_ttft: None,
+            telem_stop_reason: None,
+            telem_usage: telemetry::UsageRecord::default(),
+            first_event_seen: false,
+        }
+    }
+
+    /// End-of-stream flush of any partial thinking/tool/text block.
+    /// Idempotent: clears `in_*` and `current_text` so a second call is a no-op.
+    fn finalize(&mut self) {
+        if self.in_thinking {
+            // Never emit an empty `thinking` field — Anthropic rejects such
+            // blocks on the next turn (see content_block_stop arm).
+            if !self.current_thinking.is_empty() {
+                self.accumulated_content.push(json!({
+                    "type": "thinking",
+                    "thinking": self.current_thinking,
+                    "signature": self.current_thinking_signature
+                }));
+            }
+            self.in_thinking = false;
+        } else if self.in_tool_use {
+            let input = parse_tool_input(&self.current_tool_input_json);
+            self.accumulated_content.push(json!({
+                "type": "tool_use",
+                "id": self.current_tool_id,
+                "name": self.current_tool_name,
+                "input": input
+            }));
+            self.in_tool_use = false;
+        } else if !self.current_text.is_empty() {
+            self.accumulated_content.push(json!({
+                "type": "text",
+                "text": self.current_text
+            }));
+        }
+        self.current_text.clear();
+    }
+}
+
+/// Immutable per-stream context — not state. `tx` deliberately lives here and
+/// not in `ParseState`: read/write separation is the point.
+struct EventCtx<'t> {
+    tx: &'t mpsc::UnboundedSender<StreamEvent>,
+    telemetry_level: TelemetryLevel,
+    request_start: std::time::Instant,
+}
+
+/// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
+/// marker, parses JSON, dispatches to `process_event`. Both the main loop and
+/// the tail-flush path call this — one write path for every parse site.
+fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
+    let Some(data_part) = line.strip_prefix("data: ") else {
+        return;
+    };
+    if data_part.trim() == "[DONE]" {
+        return;
+    }
+    let event = match serde_json::from_str::<Value>(data_part) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    process_event(&event, state, ctx);
+}
+
+/// Handle one parsed SSE event. Moved verbatim from the main-loop match in
+/// `call_api_stream_inner`; the TTFT capture rides along so the main and tail
+/// paths are uniform.
+#[allow(clippy::collapsible_match)]
+fn process_event(event: &Value, state: &mut ParseState, ctx: &EventCtx) {
+    // ═══ TELEMETRY: capture TTFT on first event ═══
+    if !state.first_event_seen && ctx.telemetry_level.enabled() {
+        state.telem_ttft = Some(ctx.request_start.elapsed().as_millis() as u64);
+        state.first_event_seen = true;
+    }
+
+    match event["type"].as_str() {
+        Some("content_block_start") => {
+            if let Some(content_block) = event.get("content_block") {
+                match content_block["type"].as_str() {
+                    Some("thinking") => {
+                        state.current_thinking.clear();
+                        state.current_thinking_signature.clear();
+                        state.in_thinking = true;
+                    }
+                    Some("tool_use") => {
+                        // Start accumulating a tool_use block
+                        state.current_tool_name = content_block["name"].as_str().unwrap_or("").to_string();
+                        state.current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
+                        state.current_tool_input_json.clear();
+                        state.in_tool_use = true;
+                        let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart {
+                            tool_name: state.current_tool_name.clone(),
+                            tool_id: state.current_tool_id.clone(),
+                        }));
+                    }
+                    Some("text") => {
+                        if !state.current_text.is_empty() {
+                            state.accumulated_content.push(json!({
+                                "type": "text",
+                                "text": state.current_text
+                            }));
+                            state.current_text.clear();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("content_block_delta") => {
+            if let Some(delta) = event.get("delta") {
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(text) = delta["text"].as_str() {
+                            state.current_text.push_str(text);
+                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Text(text.to_string())));
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        // Anthropic sends thinking text in delta.thinking
+                        if let Some(text) = delta["thinking"].as_str() {
+                            state.current_thinking.push_str(text);
+                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Thinking(text.to_string())));
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(sig) = delta["signature"].as_str() {
+                            state.current_thinking_signature = sig.to_string();
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(json_chunk) = delta["partial_json"].as_str() {
+                            state.current_tool_input_json.push_str(json_chunk);
+                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                                tool_id: state.current_tool_id.clone(),
+                                delta: json_chunk.to_string(),
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("content_block_stop") => {
+            if state.in_thinking {
+                // Flush thinking block with signature so it's echoed back in tool loops.
+                // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
+                // such blocks on the next turn with
+                // `messages.N.content.M.thinking: each thinking block must contain thinking`.
+                // Empty blocks happen when the stream produced only a signature delta
+                // (or none at all) before the block_stop arrived.
+                if !state.current_thinking.is_empty() {
+                    state.accumulated_content.push(json!({
+                        "type": "thinking",
+                        "thinking": state.current_thinking,
+                        "signature": state.current_thinking_signature
+                    }));
+                }
+                state.in_thinking = false;
+            } else if state.in_tool_use {
+                // Parse the accumulated JSON input
+                let input = parse_tool_input(&state.current_tool_input_json);
+
+                state.accumulated_content.push(json!({
+                    "type": "tool_use",
+                    "id": state.current_tool_id,
+                    "name": state.current_tool_name,
+                    "input": input
+                }));
+
+                // Emit the tool_use to the UI as soon as it's fully parsed,
+                // so the call appears during the assistant's stream — before
+                // we hand off to the tool executor. Without this the call
+                // only becomes visible immediately prior to its result.
+                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
+                    tool_name: state.current_tool_name.clone(),
+                    tool_id: state.current_tool_id.clone(),
+                    input: input.clone(),
+                }));
+
+                state.in_tool_use = false;
+            } else if !state.current_text.is_empty() {
+                // Flush text block so ordering is preserved
+                state.accumulated_content.push(json!({
+                    "type": "text",
+                    "text": state.current_text
+                }));
+                state.current_text.clear();
+            }
+        }
+        Some("message_delta") => {
+            // ═══ TELEMETRY: capture stop_reason from delta ═══
+            if ctx.telemetry_level.enabled() {
+                if let Some(delta) = event.get("delta") {
+                    if let Some(sr) = delta["stop_reason"].as_str() {
+                        state.telem_stop_reason = Some(sr.to_string());
+                    }
+                }
+            }
+            if let Some(usage) = event.get("usage") {
+                let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+                let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+                let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+                    // ═══ TELEMETRY: accumulate usage (message_delta carries final counts) ═══
+                    if ctx.telemetry_level.enabled() {
+                        state.telem_usage.input = input_t;
+                        state.telem_usage.output = output_t;
+                        state.telem_usage.cache_read = cache_read;
+                        state.telem_usage.cache_write = cache_create;
+                        // TTL breakdown from cache_creation sub-object
+                        if let Some(cc) = usage.get("cache_creation") {
+                            state.telem_usage.cache_write_5m = cc["ephemeral_5m_input_tokens"].as_u64();
+                            state.telem_usage.cache_write_1h = cc["ephemeral_1h_input_tokens"].as_u64();
+                        }
+                        state.telem_usage.compute_hit_pct();
+                    }
+                    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens: input_t,
+                        output_tokens: output_t,
+                        cache_read_input_tokens: cache_read,
+                        cache_creation_input_tokens: cache_create,
+                        model: None,
+                    }));
+                }
+            }
+        }
+        Some("message_start") => {
+            if let Some(msg) = event.get("message") {
+                // ═══ TELEMETRY: capture msg_id ═══
+                if ctx.telemetry_level.enabled() {
+                    if let Some(id) = msg["id"].as_str() {
+                        state.telem_msg_id = Some(id.to_string());
+                    }
+                }
+                if let Some(usage) = msg.get("usage") {
+                    let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
+                    let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
+                    let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                    let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                        HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+                        tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+                        let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
+                            input_tokens: input_t,
+                            output_tokens: output_t,
+                            cache_read_input_tokens: cache_read,
+                            cache_creation_input_tokens: cache_create,
+                            model: None,
+                        }));
+                    }
+                }
+            }
+        }
+        Some("message_stop") => {}
+        _ => {}
     }
 }
 
@@ -218,7 +518,6 @@ impl ApiMethods {
         };
 
         // ═══ TELEMETRY: capture headers before consuming the response body ═══
-        use crate::runtime::telemetry::{self, TelemetryLevel};
         let request_start = std::time::Instant::now();
         let telem_request_id = if telemetry_level.enabled() {
             telemetry::request_id_from_headers(response.headers())
@@ -234,26 +533,13 @@ impl ApiMethods {
 
         let mut stream = response.bytes_stream();
         tracing::debug!("Stream opened");
-        let mut accumulated_content: Vec<Value> = Vec::new();
-        let mut current_text = String::new();
 
-        // ═══ TELEMETRY: accumulation state ═══
-        let mut telem_msg_id: Option<String> = None;
-        let mut telem_ttft: Option<u64> = None;
-        let mut telem_stop_reason: Option<String> = None;
-        let mut telem_usage = telemetry::UsageRecord::default();
-        let mut first_event_seen = false;
-
-        // Tool use accumulation state
-        let mut current_tool_name = String::new();
-        let mut current_tool_id = String::new();
-        let mut current_tool_input_json = String::new();
-        let mut in_tool_use = false;
-
-        // Thinking accumulation state
-        let mut current_thinking = String::new();
-        let mut current_thinking_signature = String::new();
-        let mut in_thinking = false;
+        let mut state = ParseState::new();
+        let ctx = EventCtx {
+            tx: &tx,
+            telemetry_level,
+            request_start,
+        };
 
         // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
         // buffer raw bytes and only parse complete lines. Zero-copy: lines are
@@ -271,269 +557,19 @@ impl ApiMethods {
 
             // Process complete lines from the buffer (zero-copy borrows)
             while let Some(line) = line_buffer.next_line() {
-                let Some(data_part) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                if data_part.trim() == "[DONE]" {
-                    continue;
-                }
-
-                let event = match serde_json::from_str::<Value>(data_part) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                // ═══ TELEMETRY: capture TTFT on first event ═══
-                if !first_event_seen && telemetry_level.enabled() {
-                    telem_ttft = Some(request_start.elapsed().as_millis() as u64);
-                    first_event_seen = true;
-                }
-
-                match event["type"].as_str() {
-                    Some("content_block_start") => {
-                        if let Some(content_block) = event.get("content_block") {
-                            match content_block["type"].as_str() {
-                                Some("thinking") => {
-                                    current_thinking.clear();
-                                    current_thinking_signature.clear();
-                                    in_thinking = true;
-                                }
-                                Some("tool_use") => {
-                                    // Start accumulating a tool_use block
-                                    current_tool_name = content_block["name"].as_str().unwrap_or("").to_string();
-                                    current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
-                                    current_tool_input_json.clear();
-                                    in_tool_use = true;
-                                    let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart {
-                                        tool_name: current_tool_name.clone(),
-                                        tool_id: current_tool_id.clone(),
-                                    }));
-                                }
-                                Some("text") => {
-                                    if !current_text.is_empty() {
-                                        accumulated_content.push(json!({
-                                            "type": "text",
-                                            "text": current_text
-                                        }));
-                                        current_text.clear();
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some("content_block_delta") => {
-                        if let Some(delta) = event.get("delta") {
-                            match delta["type"].as_str() {
-                                Some("text_delta") => {
-                                    if let Some(text) = delta["text"].as_str() {
-                                        current_text.push_str(text);
-                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Text(text.to_string())));
-                                    }
-                                }
-                                Some("thinking_delta") => {
-                                    // Anthropic sends thinking text in delta.thinking
-                                    if let Some(text) = delta["thinking"].as_str() {
-                                        current_thinking.push_str(text);
-                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::Thinking(text.to_string())));
-                                    }
-                                }
-                                Some("signature_delta") => {
-                                    if let Some(sig) = delta["signature"].as_str() {
-                                        current_thinking_signature = sig.to_string();
-                                    }
-                                }
-                                Some("input_json_delta") => {
-                                    if let Some(json_chunk) = delta["partial_json"].as_str() {
-                                        current_tool_input_json.push_str(json_chunk);
-                                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
-                                            tool_id: current_tool_id.clone(),
-                                            delta: json_chunk.to_string(),
-                                        }));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some("content_block_stop") => {
-                        if in_thinking {
-                            // Flush thinking block with signature so it's echoed back in tool loops.
-                            // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
-                            // such blocks on the next turn with
-                            // `messages.N.content.M.thinking: each thinking block must contain thinking`.
-                            // Empty blocks happen when the stream produced only a signature delta
-                            // (or none at all) before the block_stop arrived.
-                            if !current_thinking.is_empty() {
-                                accumulated_content.push(json!({
-                                    "type": "thinking",
-                                    "thinking": current_thinking,
-                                    "signature": current_thinking_signature
-                                }));
-                            }
-                            in_thinking = false;
-                        } else if in_tool_use {
-                            // Parse the accumulated JSON input
-                            let input = parse_tool_input(&current_tool_input_json);
-
-                            accumulated_content.push(json!({
-                                "type": "tool_use",
-                                "id": current_tool_id,
-                                "name": current_tool_name,
-                                "input": input
-                            }));
-
-                            // Emit the tool_use to the UI as soon as it's fully parsed,
-                            // so the call appears during the assistant's stream — before
-                            // we hand off to the tool executor. Without this the call
-                            // only becomes visible immediately prior to its result.
-                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
-                                tool_name: current_tool_name.clone(),
-                                tool_id: current_tool_id.clone(),
-                                input: input.clone(),
-                            }));
-
-                            in_tool_use = false;
-                        } else if !current_text.is_empty() {
-                            // Flush text block so ordering is preserved
-                            accumulated_content.push(json!({
-                                "type": "text",
-                                "text": current_text
-                            }));
-                            current_text.clear();
-                        }
-                    }
-                    Some("message_delta") => {
-                        // ═══ TELEMETRY: capture stop_reason from delta ═══
-                        if telemetry_level.enabled() {
-                            if let Some(delta) = event.get("delta") {
-                                if let Some(sr) = delta["stop_reason"].as_str() {
-                                    telem_stop_reason = Some(sr.to_string());
-                                }
-                            }
-                        }
-                        if let Some(usage) = event.get("usage") {
-                            let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-                            let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                            if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                                HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                                tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                // ═══ TELEMETRY: accumulate usage (message_delta carries final counts) ═══
-                                if telemetry_level.enabled() {
-                                    telem_usage.input = input_t;
-                                    telem_usage.output = output_t;
-                                    telem_usage.cache_read = cache_read;
-                                    telem_usage.cache_write = cache_create;
-                                    // TTL breakdown from cache_creation sub-object
-                                    if let Some(cc) = usage.get("cache_creation") {
-                                        telem_usage.cache_write_5m = cc["ephemeral_5m_input_tokens"].as_u64();
-                                        telem_usage.cache_write_1h = cc["ephemeral_1h_input_tokens"].as_u64();
-                                    }
-                                    telem_usage.compute_hit_pct();
-                                }
-                                let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
-                                    input_tokens: input_t,
-                                    output_tokens: output_t,
-                                    cache_read_input_tokens: cache_read,
-                                    cache_creation_input_tokens: cache_create,
-                                    model: None,
-                                }));
-                            }
-                        }
-                    }
-                    Some("message_start") => {
-                        if let Some(msg) = event.get("message") {
-                            // ═══ TELEMETRY: capture msg_id ═══
-                            if telemetry_level.enabled() {
-                                if let Some(id) = msg["id"].as_str() {
-                                    telem_msg_id = Some(id.to_string());
-                                }
-                            }
-                            if let Some(usage) = msg.get("usage") {
-                                let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-                                let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                                let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                                let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                                if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Usage {
-                                        input_tokens: input_t,
-                                        output_tokens: output_t,
-                                        cache_read_input_tokens: cache_read,
-                                        cache_creation_input_tokens: cache_create,
-                                        model: None,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                    Some("message_stop") => {}
-                    _ => {}
-                }
+                process_data_line(line, &mut state, &ctx);
             }
         }
 
-        // Process any remaining buffered data (final line without trailing newline)
+        // Process any remaining buffered data (final line without trailing
+        // newline) — same seam as the main loop, so all event types in a
+        // partial final line are handled.
         let remaining = line_buffer.take_remaining().unwrap_or_default();
-        if let Some(data_part) = remaining.strip_prefix("data: ") {
-            if data_part.trim() != "[DONE]" {
-                if let Ok(event) = serde_json::from_str::<Value>(data_part) {
-                    if event["type"].as_str() == Some("content_block_stop") {
-                        if in_thinking {
-                            if !current_thinking.is_empty() {
-                                accumulated_content.push(json!({
-                                    "type": "thinking",
-                                    "thinking": current_thinking,
-                                    "signature": current_thinking_signature
-                                }));
-                            }
-                            in_thinking = false;
-                        } else if in_tool_use {
-                            let input = parse_tool_input(&current_tool_input_json);
-                            accumulated_content.push(json!({
-                                "type": "tool_use",
-                                "id": current_tool_id.clone(),
-                                "name": current_tool_name.clone(),
-                                "input": input.clone()
-                            }));
-                            let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolUse {
-                                tool_name: current_tool_name.clone(),
-                                tool_id: current_tool_id.clone(),
-                                input,
-                            }));
-                            in_tool_use = false;
-                        }
-                    }
-                }
-            }
-        }
+        process_data_line(&remaining, &mut state, &ctx);
 
-        // Return accumulated content in the expected format
-        if in_thinking {
-            if !current_thinking.is_empty() {
-                accumulated_content.push(json!({
-                    "type": "thinking",
-                    "thinking": current_thinking,
-                    "signature": current_thinking_signature
-                }));
-            }
-        } else if in_tool_use {
-            let input = parse_tool_input(&current_tool_input_json);
-            accumulated_content.push(json!({
-                "type": "tool_use",
-                "id": current_tool_id,
-                "name": current_tool_name,
-                "input": input
-            }));
-        } else if !current_text.is_empty() {
-            accumulated_content.push(json!({
-                "type": "text",
-                "text": current_text
-            }));
-        }
+        // Flush any partial block and return accumulated content
+        state.finalize();
+
 
         // ═══ TELEMETRY: write the record ═══
         if telemetry_level.enabled() {
@@ -554,13 +590,13 @@ impl ApiMethods {
             let record = telemetry::TelemetryRecord {
                 ts: telemetry::TelemetryRecord::now_ms(),
                 request_id: telem_request_id,
-                msg_id: telem_msg_id,
+                msg_id: state.telem_msg_id,
                 model: model.to_string(),
                 attempt: 1, // TODO: thread attempt number from retry loop
-                ttft_ms: telem_ttft,
+                ttft_ms: state.telem_ttft,
                 total_ms: request_start.elapsed().as_millis() as u64,
-                stop_reason: telem_stop_reason,
-                usage: telem_usage,
+                stop_reason: state.telem_stop_reason,
+                usage: state.telem_usage,
                 ratelimit: telem_ratelimit,
                 cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
                 context: telemetry::ContextRecord {
@@ -574,7 +610,447 @@ impl ApiMethods {
         }
 
         Ok(json!({
-            "content": accumulated_content
+            "content": state.accumulated_content
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::telemetry::TelemetryLevel;
+
+    /// Test harness: fresh ParseState + unbounded channel + EventCtx (Full
+    /// telemetry so capture paths run). Returns (state, rx, ctx-parts).
+    fn harness() -> (
+        ParseState,
+        mpsc::UnboundedSender<StreamEvent>,
+        mpsc::UnboundedReceiver<StreamEvent>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (ParseState::new(), tx, rx)
+    }
+
+    fn make_ctx(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
+        EventCtx {
+            tx,
+            telemetry_level: TelemetryLevel::Full,
+            request_start: std::time::Instant::now(),
+        }
+    }
+
+    fn feed(lines: &[&str], state: &mut ParseState, ctx: &EventCtx) {
+        for line in lines {
+            process_data_line(line, state, ctx);
+        }
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn text_deltas_accumulate_then_flush_on_block_stop() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello, "}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.accumulated_content.len(), 1);
+        assert_eq!(state.accumulated_content[0], json!({"type":"text","text":"Hello, world"}));
+        assert!(state.current_text.is_empty());
+        let events = drain(&mut rx);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(LlmEvent::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Hello, ", "world"]);
+    }
+
+    #[test]
+    fn second_text_block_start_flushes_prior_text() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first"}}"#,
+                // New text block starts while current_text is non-empty —
+                // the L312–320 branch flushes the prior text block.
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"second"}}"#,
+                r#"data: {"type":"content_block_stop","index":1}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.accumulated_content.len(), 2);
+        assert_eq!(state.accumulated_content[0], json!({"type":"text","text":"first"}));
+        assert_eq!(state.accumulated_content[1], json!({"type":"text","text":"second"}));
+    }
+
+    #[test]
+    fn tool_use_full_lifecycle() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"get_weather"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"Tokyo\"}"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert!(!state.in_tool_use, "flag must clear on block_stop");
+        assert_eq!(state.accumulated_content.len(), 1);
+        assert_eq!(
+            state.accumulated_content[0],
+            json!({"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Tokyo"}})
+        );
+        let events = drain(&mut rx);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, tool_id })
+                if tool_name == "get_weather" && tool_id == "toolu_01"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Llm(LlmEvent::ToolUseDelta { tool_id, .. }) if tool_id == "toolu_01"
+        ));
+        assert!(matches!(
+            events.last().unwrap(),
+            StreamEvent::Llm(LlmEvent::ToolUse { tool_name, input, .. })
+                if tool_name == "get_weather" && input == &json!({"city":"Tokyo"})
+        ));
+    }
+
+    #[test]
+    fn tool_use_invalid_json_yields_parse_error_object() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_02","name":"run"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\": truncated"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        let input = &state.accumulated_content[0]["input"];
+        let err = input["__parse_error"].as_str().expect("__parse_error key present");
+        assert!(err.starts_with("invalid tool input JSON:"));
+    }
+
+    #[test]
+    fn tool_use_empty_input_yields_empty_object() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_03","name":"noop"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.accumulated_content[0]["input"], json!({}));
+    }
+
+    #[test]
+    fn thinking_lifecycle_with_signature() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_abc"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert!(!state.in_thinking);
+        assert_eq!(
+            state.accumulated_content[0],
+            json!({"type":"thinking","thinking":"pondering","signature":"sig_abc"})
+        );
+        let events = drain(&mut rx);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Llm(LlmEvent::Thinking(t)) if t == "pondering"
+        ));
+    }
+
+    #[test]
+    fn empty_thinking_block_never_emitted() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                // Only a signature delta — no thinking text. Anthropic rejects
+                // empty thinking blocks; the guard must suppress the push.
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.accumulated_content.is_empty());
+        assert!(!state.in_thinking);
+    }
+
+    #[test]
+    fn message_delta_captures_usage_stop_reason_telemetry() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":300,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":60,"ephemeral_1h_input_tokens":40}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.telem_stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(state.telem_usage.input, 100);
+        assert_eq!(state.telem_usage.output, 50);
+        assert_eq!(state.telem_usage.cache_read, 300);
+        assert_eq!(state.telem_usage.cache_write, 100);
+        assert_eq!(state.telem_usage.cache_write_5m, Some(60));
+        assert_eq!(state.telem_usage.cache_write_1h, Some(40));
+        // hit_pct = 300 / (100 + 300 + 100) * 100 = 60.0
+        assert_eq!(state.telem_usage.hit_pct, 60.0);
+        let events = drain(&mut rx);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, model: None })
+        ));
+    }
+
+    #[test]
+    fn message_start_captures_msg_id_and_usage() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_xyz","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.telem_msg_id.as_deref(), Some("msg_xyz"));
+        let events = drain(&mut rx);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Session(SessionEvent::Usage { input_tokens: 10, output_tokens: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn all_zero_usage_emits_no_event() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_zero","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            "all-zero usage must not emit a Usage event"
+        );
+        // stop_reason still captured — the gate only guards the Usage emit.
+        assert_eq!(state.telem_stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn ttft_set_once_on_first_event() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        assert!(state.telem_ttft.is_none());
+        feed(
+            &[r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#],
+            &mut state,
+            &ctx,
+        );
+        let first = state.telem_ttft;
+        assert!(first.is_some());
+        assert!(state.first_event_seen);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.telem_ttft, first, "TTFT must not be overwritten by later events");
+    }
+
+    /// Regression test for the double-emit bug fixed in the slice-2 pre-work
+    /// micro-commit: a content_block_stop arriving via the tail path (partial
+    /// final line) must clear in_tool_use so finalize() cannot re-push.
+    #[test]
+    fn tail_path_then_finalize_no_double_emit() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        // Main loop: tool_use opened and input streamed.
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_tail","name":"ls"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        // Tail path: final content_block_stop arrives as a partial last line
+        // (no trailing newline) — same seam, same call.
+        process_data_line(r#"data: {"type":"content_block_stop","index":0}"#, &mut state, &ctx);
+        // End-of-stream flush.
+        state.finalize();
+
+        let tool_blocks: Vec<&Value> = state
+            .accumulated_content
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect();
+        assert_eq!(tool_blocks.len(), 1, "tool_use block must be emitted exactly once");
+        let tool_events = drain(&mut rx)
+            .into_iter()
+            .filter(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUse { .. })))
+            .count();
+        assert_eq!(tool_events, 1);
+    }
+
+    #[test]
+    fn finalize_flushes_partial_text() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"dangling"}}"#],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        assert_eq!(state.accumulated_content, vec![json!({"type":"text","text":"dangling"})]);
+    }
+
+    #[test]
+    fn finalize_flushes_partial_thinking() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"cut off"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"thinking","thinking":"cut off","signature":""})]
+        );
+
+        // Empty-thinking suppression in finalize too: open block, no text.
+        let (mut state2, tx2, _rx2) = harness();
+        let ctx2 = make_ctx(&tx2);
+        feed(
+            &[r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#],
+            &mut state2,
+            &ctx2,
+        );
+        state2.finalize();
+        assert!(state2.accumulated_content.is_empty(), "empty thinking must be suppressed");
+    }
+
+    #[test]
+    fn finalize_flushes_partial_tool() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_cut","name":"grep"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"x\"}"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"tool_use","id":"toolu_cut","name":"grep","input":{"pattern":"x"}})]
+        );
+    }
+
+    #[test]
+    fn finalize_is_idempotent() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_i","name":"once"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        let after_first = state.accumulated_content.clone();
+        state.finalize();
+        assert_eq!(state.accumulated_content, after_first, "second finalize must be a no-op");
+
+        // Same for partial text.
+        let (mut state2, tx2, _rx2) = harness();
+        let ctx2 = make_ctx(&tx2);
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"t"}}"#],
+            &mut state2,
+            &ctx2,
+        );
+        state2.finalize();
+        state2.finalize();
+        assert_eq!(state2.accumulated_content.len(), 1);
+    }
+
+    #[test]
+    fn done_marker_and_non_data_lines_skipped() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                "data: [DONE]",
+                ": keepalive",
+                "event: foo",
+                "",
+                "data: not json at all",
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(state.current_text, "ok");
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1, "only the valid data line may produce events");
     }
 }
