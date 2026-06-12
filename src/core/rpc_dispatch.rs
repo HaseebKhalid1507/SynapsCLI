@@ -132,6 +132,16 @@ pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
 
 // ─── Usage accumulator ────────────────────────────────────────────────────────
 
+/// Option-accumulate for the cache-TTL split buckets: stay `None` until a
+/// split value arrives, then sum. `None` means "split never reported" —
+/// distinct from an explicit zero. Shared by every Usage accumulator that
+/// tracks the 5m/1h breakdown (RPC dispatch, subagent loops).
+pub fn merge_split(acc: &mut Option<u64>, v: Option<u64>) {
+    if let Some(v) = v {
+        *acc = Some(acc.unwrap_or(0) + v);
+    }
+}
+
 /// Accumulate a [`SessionEvent::Usage`] payload into a [`TurnUsage`] counter.
 ///
 /// Non-Usage session events are silently ignored so callers can pass any
@@ -153,12 +163,8 @@ pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
         acc.cache_read_input_tokens += cache_read_input_tokens;
         acc.cache_creation_input_tokens += cache_creation_input_tokens;
         // Option-accumulate: stay None until a split arrives, then sum.
-        if let Some(v) = cache_creation_5m {
-            acc.cache_creation_5m = Some(acc.cache_creation_5m.unwrap_or(0) + v);
-        }
-        if let Some(v) = cache_creation_1h {
-            acc.cache_creation_1h = Some(acc.cache_creation_1h.unwrap_or(0) + v);
-        }
+        merge_split(&mut acc.cache_creation_5m, *cache_creation_5m);
+        merge_split(&mut acc.cache_creation_1h, *cache_creation_1h);
         if acc.model.is_none() {
             acc.model = model.clone();
         }

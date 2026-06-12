@@ -269,12 +269,8 @@ impl Tool for SubagentStartTool {
                                         total_output_tokens   += output_tokens;
                                         total_cache_read      += cache_read_input_tokens;
                                         total_cache_creation  += cache_creation_input_tokens;
-                                        if let Some(v) = cache_creation_5m {
-                                            total_cache_5m = Some(total_cache_5m.unwrap_or(0) + v);
-                                        }
-                                        if let Some(v) = cache_creation_1h {
-                                            total_cache_1h = Some(total_cache_1h.unwrap_or(0) + v);
-                                        }
+                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_5m, cache_creation_5m);
+                                        crate::core::rpc_dispatch::merge_split(&mut total_cache_1h, cache_creation_1h);
                                     }
                                     crate::StreamEvent::Session(SessionEvent::Error(e)) => return Err(e),
                                     crate::StreamEvent::Session(SessionEvent::Done) => break,
