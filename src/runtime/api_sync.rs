@@ -79,7 +79,7 @@ impl ApiMethods {
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages);
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
 
@@ -109,29 +109,10 @@ impl ApiMethods {
         }
 
         // Prompt caching: mark the last tool so all tool schemas are cached
-        if let Some(tools) = body["tools"].as_array_mut() {
-            if let Some(last_tool) = tools.last_mut() {
-                last_tool["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
+        HelperMethods::mark_last_tool(&mut body, options.cache_ttl);
 
-        if auth_type == "oauth" {
-            let mut system_blocks = vec![
-                json!({"type": "text", "text": crate::core::config::get_identity()}),
-                json!({"type": "text", "text": "You are a helpful AI assistant with access to tools. Use them when needed."}),
-            ];
-            if let Some(ref prompt) = system_prompt {
-                system_blocks.push(json!({"type": "text", "text": prompt}));
-            }
-            // Prompt caching: mark the last system block so entire system prompt is cached
-            if let Some(last) = system_blocks.last_mut() {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
-            body["system"] = json!(system_blocks);
-        } else if let Some(ref prompt) = system_prompt {
-            body["system"] = json!([
-                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
-            ]);
+        if let Some(system) = HelperMethods::build_system_blocks(&auth_type, system_prompt, options.cache_ttl) {
+            body["system"] = system;
         }
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503)
@@ -151,16 +132,11 @@ impl ApiMethods {
                     .header(auth_header.0.clone(), auth_header.1.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
-                let mut betas: Vec<&str> = Vec::new();
-                if auth_type == "oauth" {
-                    betas.push("claude-code-20250219");
-                    betas.push("oauth-2025-04-20");
-                }
-                if options.use_1m_context && crate::core::models::model_supports_1m(model) {
-                    betas.push("context-1m-2025-08-07");
-                }
-                if !betas.is_empty() {
-                    req = req.header("anthropic-beta", betas.join(","));
+                // One builder, two transports — the auth-aware beta gating
+                // (incl. extended-cache-ttl) must not diverge between the
+                // streaming and sync paths (spec §3.4 required refactor).
+                if let Some(beta) = Self::build_beta_header(&auth_type, options, model) {
+                    req = req.header("anthropic-beta", beta);
                 }
 
                 match req.json(&body).send().await {

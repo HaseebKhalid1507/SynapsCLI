@@ -143,6 +143,8 @@ pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
+        cache_creation_5m,
+        cache_creation_1h,
         model,
     } = event
     {
@@ -150,6 +152,13 @@ pub fn accumulate_usage(acc: &mut TurnUsage, event: &SessionEvent) {
         acc.output_tokens += output_tokens;
         acc.cache_read_input_tokens += cache_read_input_tokens;
         acc.cache_creation_input_tokens += cache_creation_input_tokens;
+        // Option-accumulate: stay None until a split arrives, then sum.
+        if let Some(v) = cache_creation_5m {
+            acc.cache_creation_5m = Some(acc.cache_creation_5m.unwrap_or(0) + v);
+        }
+        if let Some(v) = cache_creation_1h {
+            acc.cache_creation_1h = Some(acc.cache_creation_1h.unwrap_or(0) + v);
+        }
         if acc.model.is_none() {
             acc.model = model.clone();
         }
@@ -501,6 +510,8 @@ mod tests {
                 output_tokens: 2,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
                 model: None,
             }),
         ];
@@ -521,6 +532,8 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
             model: None,
         }
     }
@@ -533,6 +546,8 @@ mod tests {
             output_tokens: 50,
             cache_read_input_tokens: 10,
             cache_creation_input_tokens: 5,
+            cache_creation_5m: Some(3),
+            cache_creation_1h: Some(2),
             model: Some("claude-3-5".to_string()),
         };
         accumulate_usage(&mut acc, &ev);
@@ -540,6 +555,8 @@ mod tests {
         assert_eq!(acc.output_tokens, 50);
         assert_eq!(acc.cache_read_input_tokens, 10);
         assert_eq!(acc.cache_creation_input_tokens, 5);
+        assert_eq!(acc.cache_creation_5m, Some(3));
+        assert_eq!(acc.cache_creation_1h, Some(2));
         assert_eq!(acc.model.as_deref(), Some("claude-3-5"));
     }
 
@@ -550,6 +567,8 @@ mod tests {
             output_tokens: 5,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m: Some(4),
+            cache_creation_1h: None,
             model: Some("first-model".to_string()),
         };
         let ev = SessionEvent::Usage {
@@ -557,6 +576,8 @@ mod tests {
             output_tokens: 8,
             cache_read_input_tokens: 2,
             cache_creation_input_tokens: 1,
+            cache_creation_5m: Some(1),
+            cache_creation_1h: Some(7),
             model: Some("second-model".to_string()),
         };
         accumulate_usage(&mut acc, &ev);
@@ -564,6 +585,9 @@ mod tests {
         assert_eq!(acc.output_tokens, 13);
         assert_eq!(acc.cache_read_input_tokens, 2);
         assert_eq!(acc.cache_creation_input_tokens, 1);
+        // Split: Option-accumulate — Some once any split arrives.
+        assert_eq!(acc.cache_creation_5m, Some(5));
+        assert_eq!(acc.cache_creation_1h, Some(7));
         // Model must NOT be overwritten once set (first-wins semantics)
         assert_eq!(acc.model.as_deref(), Some("first-model"));
     }
@@ -576,6 +600,8 @@ mod tests {
             output_tokens: 1,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
             model: Some("my-model".to_string()),
         };
         accumulate_usage(&mut acc, &ev);

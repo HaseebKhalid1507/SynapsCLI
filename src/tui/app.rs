@@ -2,7 +2,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 use chrono::Local;
 use synaps_cli::Session;
-use synaps_cli::pricing::calculate_cost;
+use synaps_cli::pricing::calculate_cost_optional_split;
 
 
 #[derive(Clone)]
@@ -392,12 +392,15 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_usage(
         &mut self,
         input_tokens: u64,
         output_tokens: u64,
         cache_read: u64,
         cache_creation: u64,
+        cache_creation_5m: Option<u64>,
+        cache_creation_1h: Option<u64>,
         model: &str,
         context_window_override: Option<u64>,
     ) {
@@ -419,7 +422,11 @@ impl App {
             .unwrap_or_else(|| synaps_cli::models::context_window_for_model(model));
         self.api_call_count += 1;
         // Delegate cost calculation to the single source of truth in `pricing`.
-        self.session_cost += calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation);
+        // Split-aware: 1h cache writes bill at 2.0x when the TTL split arrived.
+        self.session_cost += calculate_cost_optional_split(
+            model, input_tokens, output_tokens, cache_read,
+            cache_creation, cache_creation_5m, cache_creation_1h,
+        );
     }
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {

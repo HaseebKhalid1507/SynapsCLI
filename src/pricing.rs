@@ -15,8 +15,9 @@
 //! | Haiku   | $1.00  | $5.00  |
 //!
 //! Cache pricing (relative to input price):
-//! - Cache reads:    0.10× input price  (prompt-cache hit)
-//! - Cache creation: 1.25× input price  (5-minute TTL write)
+//! - Cache reads:       0.10× input price  (prompt-cache hit)
+//! - Cache write (5m):  1.25× input price  (5-minute TTL, the default)
+//! - Cache write (1h):  2.00× input price  (1-hour TTL, opt-in via `cache_ttl`)
 
 /// Returns `(input_price_per_mtok, output_price_per_mtok)` for the given model
 /// string. Matching is substring-based so it works with full model IDs like
@@ -34,7 +35,12 @@ fn model_prices(model: &str) -> (f64, f64) {
     }
 }
 
-/// Calculate the USD cost of a single model turn.
+/// Calculate the USD cost of a single model turn (no cache-write TTL split).
+///
+/// Thin wrapper over [`calculate_cost_split`]: the aggregate `cache_creation`
+/// count is billed at the 5m write rate (1.25×). When the user opted into 1h
+/// caching but the TTL split didn't arrive, this under-bills (fail-cheap, not
+/// fail-expensive — cost display is informational, not invoiced).
 ///
 /// # Arguments
 /// * `model`           – Model identifier string (e.g. `"claude-sonnet-4-5"`).
@@ -52,11 +58,51 @@ pub fn calculate_cost(
     cache_read: u64,
     cache_creation: u64,
 ) -> f64 {
+    calculate_cost_split(model, input_tokens, output_tokens, cache_read, cache_creation, 0)
+}
+
+/// Calculate the USD cost of a single model turn with the cache-write TTL
+/// split made first-class.
+///
+/// Cache pricing relative to input price:
+/// reads 0.10× | 5m write 1.25× | 1h write 2.0×.
+pub fn calculate_cost_split(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_write_5m: u64,
+    cache_write_1h: u64,
+) -> f64 {
     let (input_price, output_price) = model_prices(model);
-    (input_tokens    as f64 / 1_000_000.0) * input_price
+    (input_tokens     as f64 / 1_000_000.0) * input_price
         + (cache_read     as f64 / 1_000_000.0) * input_price * 0.1
-        + (cache_creation as f64 / 1_000_000.0) * input_price * 1.25
+        + (cache_write_5m as f64 / 1_000_000.0) * input_price * 1.25
+        + (cache_write_1h as f64 / 1_000_000.0) * input_price * 2.0
         + (output_tokens  as f64 / 1_000_000.0) * output_price
+}
+
+/// Split-aware cost for callers holding an aggregate plus an *optional* TTL
+/// split (the shape of `SessionEvent::Usage`). When either split bucket is
+/// present the split rates apply; when both are `None`, the aggregate is
+/// billed at the 5m rate — fail-cheap, never fail-expensive.
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_cost_optional_split(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    cache_creation_5m: Option<u64>,
+    cache_creation_1h: Option<u64>,
+) -> f64 {
+    match (cache_creation_5m, cache_creation_1h) {
+        (None, None) => calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation),
+        (c5, c1) => calculate_cost_split(
+            model, input_tokens, output_tokens, cache_read,
+            c5.unwrap_or(0), c1.unwrap_or(0),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +149,37 @@ mod tests {
         // 1M cache-write tokens for Sonnet: 1.25 × $3 = $3.75
         let cost = calculate_cost("claude-sonnet-4-5", 0, 0, 0, 1_000_000);
         assert!((cost - 3.75).abs() < 1e-9, "expected $3.75, got ${cost}");
+    }
+
+    #[test]
+    fn cache_write_1h_bills_at_double_input_rate() {
+        // 1M 1h cache-write tokens for Sonnet: 2.0 × $3 = $6.00 (spec §5)
+        let cost = calculate_cost_split("claude-sonnet-4-5", 0, 0, 0, 0, 1_000_000);
+        assert!((cost - 6.0).abs() < 1e-9, "expected $6.00, got ${cost}");
+    }
+
+    #[test]
+    fn split_mixes_5m_and_1h_rates() {
+        // Sonnet: 1M @ 1.25× ($3.75) + 1M @ 2.0× ($6.00) = $9.75
+        let cost = calculate_cost_split("claude-sonnet-4-5", 0, 0, 0, 1_000_000, 1_000_000);
+        assert!((cost - 9.75).abs() < 1e-9, "expected $9.75, got ${cost}");
+    }
+
+    #[test]
+    fn wrapper_equals_split_with_zero_1h() {
+        // calculate_cost(m,i,o,r,w) == calculate_cost_split(m,i,o,r,w,0)
+        let cases: &[(&str, u64, u64, u64, u64)] = &[
+            ("claude-sonnet-4-5", 1000, 2000, 3000, 4000),
+            ("claude-opus-4-5", 0, 0, 0, 1_000_000),
+            ("claude-haiku-4-5", 123, 456, 789, 1011),
+            ("gpt-99-turbo", 50, 60, 70, 80),
+            ("claude-fable-5", 0, 0, 0, 0),
+        ];
+        for &(m, i, o, r, w) in cases {
+            let a = calculate_cost(m, i, o, r, w);
+            let b = calculate_cost_split(m, i, o, r, w, 0);
+            assert!((a - b).abs() < 1e-12, "{m}: {a} != {b}");
+        }
     }
 
     #[test]

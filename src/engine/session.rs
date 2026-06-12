@@ -4,7 +4,7 @@
 //! messages, token counts, cost, abort context.
 
 use crate::{Session, Runtime};
-use crate::pricing::calculate_cost;
+use crate::pricing::calculate_cost_optional_split;
 use serde_json::Value;
 
 /// Conversation state tracked by the engine.
@@ -93,12 +93,20 @@ impl ConversationState {
     }
 
     /// Add usage from a model turn.
+    ///
+    /// `cache_creation_5m` / `cache_creation_1h` are the cache-write TTL
+    /// split. When either is present the cost uses the split rates
+    /// (5m: 1.25×, 1h: 2.0×); when both are `None` the aggregate
+    /// `cache_creation` is billed at the 5m rate (fail-cheap fallback).
+    #[allow(clippy::too_many_arguments)]
     pub fn add_usage(
         &mut self,
         input_tokens: u64,
         output_tokens: u64,
         cache_read: u64,
         cache_creation: u64,
+        cache_creation_5m: Option<u64>,
+        cache_creation_1h: Option<u64>,
         model: &str,
     ) {
         self.total_input_tokens += input_tokens;
@@ -106,7 +114,10 @@ impl ConversationState {
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
 
-        self.session_cost += calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation);
+        self.session_cost += calculate_cost_optional_split(
+            model, input_tokens, output_tokens, cache_read,
+            cache_creation, cache_creation_5m, cache_creation_1h,
+        );
     }
 
     /// Estimate current token count (for compaction decisions).
