@@ -125,65 +125,21 @@ impl HelperMethods {
         }
     }
 
-    /// Annotate a cache breakpoint on the conversation prefix.
-    /// To maximize cache hits, we must place stationary boundaries. Modifying an old marker
-    /// breaks the cache for that prefix. We retain up to 2 conversational markers.
+    /// Annotate a cache breakpoint on the last message (single-last strategy).
+    /// Per S204 benchmarks, single-last matches sliding-4 performance (96–97% hit
+    /// vs 96.7%) — a single stationary marker on the most recent message maximizes
+    /// the stable cacheable prefix. With no old markers to prune, the
+    /// prefix-invalidation bug class is eliminated entirely.
     pub(super) fn annotate_cache_breakpoint(messages: &mut [Value]) {
-        let user_indices: Vec<usize> = messages.iter().enumerate()
-            .filter(|(_, m)| m["role"].as_str() == Some("user"))
-            .map(|(i, _)| i)
-            .collect();
+        let Some(last) = messages.last_mut() else { return };
 
-        if user_indices.is_empty() { return; }
-
-        // Find existing markers
-        let mut existing_markers = Vec::new();
-        for &idx in &user_indices {
-            if let Some(content) = messages[idx]["content"].as_array() {
-                if content.last().and_then(|b| b.get("cache_control")).is_some() {
-                    existing_markers.push(idx);
-                }
-            }
+        // Coerce raw string content into a block array so we can attach cache_control.
+        if let Some(text) = last["content"].as_str().map(str::to_owned) {
+            last["content"] = json!([{"type": "text", "text": text}]);
         }
 
-        // We only place a new marker if the last one is 4+ user messages away (aggressive caching for tool loops)
-        let target_idx = user_indices[user_indices.len() - 1]; // We can just mark the latest
-        let should_add = match existing_markers.last() {
-            Some(&last_idx) => user_indices.len() as isize - user_indices.iter().position(|&x| x == last_idx).unwrap_or(0) as isize >= 4,
-            None => true,
-        };
-
-        if should_add && !existing_markers.contains(&target_idx) {
-            existing_markers.push(target_idx);
-
-            // Convert raw string content to block array to allow adding cache_control
-            if messages[target_idx]["content"].is_string() {
-                if let Some(text) = messages[target_idx]["content"].as_str() {
-                    messages[target_idx]["content"] = json!([{"type": "text", "text": text}]);
-                }
-            }
-
-            if let Some(content) = messages[target_idx]["content"].as_array_mut() {
-                if let Some(last_block) = content.last_mut() {
-                    last_block["cache_control"] = json!({"type": "ephemeral"});
-                }
-            }
-        }
-
-        // Enforce max 2 conversational markers to avoid Anthropic's 4-marker limit
-        if existing_markers.len() > 2 {
-            let keep = &existing_markers[existing_markers.len() - 2..];
-            for (i, msg) in messages.iter_mut().enumerate() {
-                if !keep.contains(&i) && msg["role"].as_str() == Some("user") {
-                    if let Some(content) = msg["content"].as_array_mut() {
-                        if let Some(last_block) = content.last_mut() {
-                            if last_block.get("cache_control").is_some() {
-                                last_block.as_object_mut().map(|obj| obj.remove("cache_control"));
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(block) = last["content"].as_array_mut().and_then(|c| c.last_mut()) {
+            block["cache_control"] = json!({"type": "ephemeral"});
         }
     }
 
@@ -425,5 +381,80 @@ mod tests {
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
+    }
+
+    // --- annotate_cache_breakpoint (single-last strategy) ---
+
+    fn has_marker(msg: &Value) -> bool {
+        msg["content"]
+            .as_array()
+            .map(|c| c.iter().any(|b| b.get("cache_control").is_some()))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn cache_empty_messages_is_noop() {
+        let mut msgs: Vec<Value> = vec![];
+        HelperMethods::annotate_cache_breakpoint(&mut msgs);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn cache_single_user_string_content_coerced_and_marked() {
+        let mut msgs = vec![json!({"role": "user", "content": "hello"})];
+        HelperMethods::annotate_cache_breakpoint(&mut msgs);
+        let content = msgs[0]["content"].as_array().expect("coerced to block array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_only_last_message_gets_marker() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "one"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "two"}]}),
+            json!({"role": "user", "content": "three"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "four"}]}),
+            json!({"role": "user", "content": "five"}),
+        ];
+        HelperMethods::annotate_cache_breakpoint(&mut msgs);
+        for msg in &msgs[..4] {
+            assert!(!has_marker(msg), "earlier message must not have cache_control");
+        }
+        assert!(has_marker(&msgs[4]));
+        // Earlier string contents must remain untouched strings.
+        assert!(msgs[0]["content"].is_string());
+        assert!(msgs[2]["content"].is_string());
+    }
+
+    #[test]
+    fn cache_marks_trailing_assistant_message() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
+        ];
+        HelperMethods::annotate_cache_breakpoint(&mut msgs);
+        assert!(!has_marker(&msgs[0]));
+        assert!(has_marker(&msgs[1]), "single-last marks ANY trailing role");
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_only_final_block_of_multi_block_content_marked() {
+        let mut msgs = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+                {"type": "text", "text": "third"},
+            ]
+        })];
+        HelperMethods::annotate_cache_breakpoint(&mut msgs);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert!(content[0].get("cache_control").is_none());
+        assert!(content[1].get("cache_control").is_none());
+        assert_eq!(content[2]["cache_control"]["type"], "ephemeral");
     }
 }
