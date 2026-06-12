@@ -129,7 +129,9 @@ pub(super) async fn handle_stream_event(
         }
         StreamEvent::Session(SessionEvent::Notice(text)) => {
             // Display-only retry/status notice — system line, not transcript.
-            app.push_msg(ChatMessage::System(text));
+            // Notice text can echo API error bodies; strip control chars
+            // (esp. ESC) so a hostile payload can't inject terminal escapes.
+            app.push_msg(ChatMessage::System(sanitize_notice(&text)));
         }
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
@@ -187,4 +189,33 @@ pub(super) async fn handle_stream_event(
         }
     }
     StreamAction::Continue
+}
+
+/// Strip ASCII control characters (except `\n` and `\t`) from notice text
+/// before it reaches the render path. Notices can carry raw API error bodies;
+/// an embedded ESC (0x1b) would otherwise inject terminal escape sequences.
+fn sanitize_notice(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_ascii_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_notice;
+
+    #[test]
+    fn test_sanitize_notice_strips_ansi_escape_payload() {
+        let payload = "API retry \x1b[2J\x1b]0;pwned\x07 in 2s\nline two\tend";
+        let clean = sanitize_notice(payload);
+        assert_eq!(clean, "API retry [2J]0;pwned in 2s\nline two\tend");
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\x07'));
+    }
+
+    #[test]
+    fn test_sanitize_notice_passes_normal_text() {
+        let s = "retrying (attempt 2/5) — overloaded";
+        assert_eq!(sanitize_notice(s), s);
+    }
 }

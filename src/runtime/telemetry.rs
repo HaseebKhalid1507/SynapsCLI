@@ -223,18 +223,12 @@ pub fn write_record(record: &TelemetryRecord) {
     }
 
     use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW_FLAG: i32 = 0o400000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW_FLAG: i32 = 0x0100;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const O_NOFOLLOW_FLAG: i32 = 0;
 
     let result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(O_NOFOLLOW_FLAG)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path);
     if let Ok(mut f) = result {
         use std::io::Write;
