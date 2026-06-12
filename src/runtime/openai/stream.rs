@@ -565,6 +565,8 @@ impl CodexSseDecoder {
                 output_tokens: output,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
                 model: None,
             }));
         }

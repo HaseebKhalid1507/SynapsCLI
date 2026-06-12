@@ -259,6 +259,8 @@ impl Tool for SubagentStartTool {
                                     crate::StreamEvent::Session(SessionEvent::Usage {
                                         input_tokens, output_tokens,
                                         cache_read_input_tokens, cache_creation_input_tokens,
+                                        // Subagents report aggregates only — split intentionally unused.
+                                        cache_creation_5m: _, cache_creation_1h: _,
                                         model: _,
                                     }) => {
                                         total_input_tokens    += input_tokens;

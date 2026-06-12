@@ -302,6 +302,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         output_tokens: output_t,
                         cache_read_input_tokens: cache_read,
                         cache_creation_input_tokens: cache_create,
+                        cache_creation_5m: cache_create_5m,
+                        cache_creation_1h: cache_create_1h,
                         model: None,
                     }));
                 }
@@ -319,6 +321,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 let output_t = usage.output_tokens;
                 let cache_read = usage.cache_read_input_tokens;
                 let cache_create = usage.cache_creation_input_tokens;
+                let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
+                let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
@@ -327,6 +331,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         output_tokens: output_t,
                         cache_read_input_tokens: cache_read,
                         cache_creation_input_tokens: cache_create,
+                        cache_creation_5m: cache_create_5m,
+                        cache_creation_1h: cache_create_1h,
                         model: None,
                     }));
                 }
@@ -873,7 +879,7 @@ mod tests {
         let events = drain(&mut rx);
         assert!(matches!(
             &events[0],
-            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, model: None })
+            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, cache_creation_5m: Some(60), cache_creation_1h: Some(40), model: None })
         ));
     }
 

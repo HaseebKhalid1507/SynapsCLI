@@ -42,6 +42,9 @@ pub enum EngineStreamEvent {
         output_tokens: u64,
         cache_read: u64,
         cache_creation: u64,
+        /// Cache-write TTL split — `None` when the API omitted the breakdown.
+        cache_creation_5m: Option<u64>,
+        cache_creation_1h: Option<u64>,
         model: Option<String>,
     },
     /// Internal bookkeeping — no visual output.
@@ -165,6 +168,8 @@ pub fn process_stream_event(
             output_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
             model,
         }) => {
             (EngineStreamEvent::Usage {
@@ -172,6 +177,8 @@ pub fn process_stream_event(
                 output_tokens,
                 cache_read: cache_read_input_tokens,
                 cache_creation: cache_creation_input_tokens,
+                cache_creation_5m,
+                cache_creation_1h,
                 model,
             }, StreamCompletion::Continue)
         }
