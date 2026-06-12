@@ -7,8 +7,22 @@ use reqwest::Client;
 use futures::StreamExt;
 use crate::{Result, RuntimeError, ToolRegistry};
 use crate::runtime::telemetry::{self, TelemetryLevel};
+use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
 use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
 use super::helpers::HelperMethods;
+
+/// Truncate to at most `max` bytes without slicing mid-UTF-8-codepoint.
+/// Used for forensic logging of unknown event lines.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Parse accumulated tool input JSON. On failure, returns a JSON object with
 /// `__parse_error` key so the tool executor can report it back to the model.
@@ -117,92 +131,77 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
     if data_part.trim() == "[DONE]" {
         return;
     }
-    let event = match serde_json::from_str::<Value>(data_part) {
+    let event = match serde_json::from_str::<AnthropicEvent>(data_part) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return, // malformed JSON: skip the line, never panic
     };
-    process_event(&event, state, ctx);
+    process_event(event, data_part, state, ctx);
 }
 
-/// Handle one parsed SSE event. Moved verbatim from the main-loop match in
-/// `call_api_stream_inner`; the TTFT capture rides along so the main and tail
-/// paths are uniform.
-#[allow(clippy::collapsible_match)]
-fn process_event(event: &Value, state: &mut ParseState, ctx: &EventCtx) {
+/// Handle one parsed SSE event. The TTFT capture rides along so the main and
+/// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
+/// discards the tag on Unknown events, so the raw line is the only forensics.
+fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
     // ═══ TELEMETRY: capture TTFT on first event ═══
     if !state.first_event_seen && ctx.telemetry_level.enabled() {
         state.telem_ttft = Some(ctx.request_start.elapsed().as_millis() as u64);
         state.first_event_seen = true;
     }
 
-    match event["type"].as_str() {
-        Some("content_block_start") => {
-            if let Some(content_block) = event.get("content_block") {
-                match content_block["type"].as_str() {
-                    Some("thinking") => {
-                        state.current_thinking.clear();
-                        state.current_thinking_signature.clear();
-                        state.in_thinking = true;
-                    }
-                    Some("tool_use") => {
-                        // Start accumulating a tool_use block
-                        state.current_tool_name = content_block["name"].as_str().unwrap_or("").to_string();
-                        state.current_tool_id = content_block["id"].as_str().unwrap_or("").to_string();
-                        state.current_tool_input_json.clear();
-                        state.in_tool_use = true;
-                        let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart {
-                            tool_name: state.current_tool_name.clone(),
-                            tool_id: state.current_tool_id.clone(),
-                        }));
-                    }
-                    Some("text") => {
-                        if !state.current_text.is_empty() {
-                            state.accumulated_content.push(json!({
-                                "type": "text",
-                                "text": state.current_text
-                            }));
-                            state.current_text.clear();
-                        }
-                    }
-                    _ => {}
+    match event {
+        AnthropicEvent::ContentBlockStart { content_block } => match content_block {
+            ContentBlock::Thinking => {
+                state.current_thinking.clear();
+                state.current_thinking_signature.clear();
+                state.in_thinking = true;
+            }
+            ContentBlock::ToolUse { id, name } => {
+                // Start accumulating a tool_use block
+                state.current_tool_name = name.into_owned();
+                state.current_tool_id = id.into_owned();
+                state.current_tool_input_json.clear();
+                state.in_tool_use = true;
+                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseStart {
+                    tool_name: state.current_tool_name.clone(),
+                    tool_id: state.current_tool_id.clone(),
+                }));
+            }
+            ContentBlock::Text => {
+                if !state.current_text.is_empty() {
+                    state.accumulated_content.push(json!({
+                        "type": "text",
+                        "text": state.current_text
+                    }));
+                    state.current_text.clear();
                 }
             }
-        }
-        Some("content_block_delta") => {
-            if let Some(delta) = event.get("delta") {
-                match delta["type"].as_str() {
-                    Some("text_delta") => {
-                        if let Some(text) = delta["text"].as_str() {
-                            state.current_text.push_str(text);
-                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Text(text.to_string())));
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        // Anthropic sends thinking text in delta.thinking
-                        if let Some(text) = delta["thinking"].as_str() {
-                            state.current_thinking.push_str(text);
-                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Thinking(text.to_string())));
-                        }
-                    }
-                    Some("signature_delta") => {
-                        if let Some(sig) = delta["signature"].as_str() {
-                            state.current_thinking_signature = sig.to_string();
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if let Some(json_chunk) = delta["partial_json"].as_str() {
-                            state.current_tool_input_json.push_str(json_chunk);
-                            let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
-                                tool_id: state.current_tool_id.clone(),
-                                delta: json_chunk.to_string(),
-                            }));
-                        }
-                    }
-                    _ => {}
-                }
+            // Unknown block type: no state change, mirrors the old `_ => {}`.
+            ContentBlock::Unknown => {}
+        },
+        AnthropicEvent::ContentBlockDelta { delta } => match delta {
+            Delta::TextDelta { text } => {
+                state.current_text.push_str(&text);
+                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
             }
-        }
-        Some("content_block_stop") => {
+            Delta::ThinkingDelta { thinking } => {
+                // Anthropic sends thinking text in delta.thinking
+                state.current_thinking.push_str(&thinking);
+                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+            }
+            Delta::SignatureDelta { signature } => {
+                state.current_thinking_signature = signature.into_owned();
+            }
+            Delta::InputJsonDelta { partial_json } => {
+                state.current_tool_input_json.push_str(&partial_json);
+                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::ToolUseDelta {
+                    tool_id: state.current_tool_id.clone(),
+                    delta: partial_json.into_owned(),
+                }));
+            }
+            // Unknown delta subtype: no state change, mirrors the old `_ => {}`.
+            Delta::Unknown => {}
+        },
+        AnthropicEvent::ContentBlockStop => {
             if state.in_thinking {
                 // Flush thinking block with signature so it's echoed back in tool loops.
                 // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
@@ -249,20 +248,18 @@ fn process_event(event: &Value, state: &mut ParseState, ctx: &EventCtx) {
                 state.current_text.clear();
             }
         }
-        Some("message_delta") => {
+        AnthropicEvent::MessageDelta { delta, usage } => {
             // ═══ TELEMETRY: capture stop_reason from delta ═══
             if ctx.telemetry_level.enabled() {
-                if let Some(delta) = event.get("delta") {
-                    if let Some(sr) = delta["stop_reason"].as_str() {
-                        state.telem_stop_reason = Some(sr.to_string());
-                    }
+                if let Some(sr) = delta.and_then(|d| d.stop_reason) {
+                    state.telem_stop_reason = Some(sr.into_owned());
                 }
             }
-            if let Some(usage) = event.get("usage") {
-                let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-                let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            if let Some(usage) = usage {
+                let input_t = usage.input_tokens;
+                let output_t = usage.output_tokens;
+                let cache_read = usage.cache_read_input_tokens;
+                let cache_create = usage.cache_creation_input_tokens;
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
                     tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
@@ -273,9 +270,9 @@ fn process_event(event: &Value, state: &mut ParseState, ctx: &EventCtx) {
                         state.telem_usage.cache_read = cache_read;
                         state.telem_usage.cache_write = cache_create;
                         // TTL breakdown from cache_creation sub-object
-                        if let Some(cc) = usage.get("cache_creation") {
-                            state.telem_usage.cache_write_5m = cc["ephemeral_5m_input_tokens"].as_u64();
-                            state.telem_usage.cache_write_1h = cc["ephemeral_1h_input_tokens"].as_u64();
+                        if let Some(cc) = usage.cache_creation {
+                            state.telem_usage.cache_write_5m = cc.ephemeral_5m_input_tokens;
+                            state.telem_usage.cache_write_1h = cc.ephemeral_1h_input_tokens;
                         }
                         state.telem_usage.compute_hit_pct();
                     }
@@ -289,35 +286,42 @@ fn process_event(event: &Value, state: &mut ParseState, ctx: &EventCtx) {
                 }
             }
         }
-        Some("message_start") => {
-            if let Some(msg) = event.get("message") {
-                // ═══ TELEMETRY: capture msg_id ═══
-                if ctx.telemetry_level.enabled() {
-                    if let Some(id) = msg["id"].as_str() {
-                        state.telem_msg_id = Some(id.to_string());
-                    }
+        AnthropicEvent::MessageStart { message } => {
+            // ═══ TELEMETRY: capture msg_id ═══
+            if ctx.telemetry_level.enabled() {
+                if let Some(id) = message.id {
+                    state.telem_msg_id = Some(id.into_owned());
                 }
-                if let Some(usage) = msg.get("usage") {
-                    let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
-                    let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                    let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                    let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                    if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                        HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                        tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                        let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
-                            input_tokens: input_t,
-                            output_tokens: output_t,
-                            cache_read_input_tokens: cache_read,
-                            cache_creation_input_tokens: cache_create,
-                            model: None,
-                        }));
-                    }
+            }
+            if let Some(usage) = message.usage {
+                let input_t = usage.input_tokens;
+                let output_t = usage.output_tokens;
+                let cache_read = usage.cache_read_input_tokens;
+                let cache_create = usage.cache_creation_input_tokens;
+                if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
+                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+                    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens: input_t,
+                        output_tokens: output_t,
+                        cache_read_input_tokens: cache_read,
+                        cache_creation_input_tokens: cache_create,
+                        model: None,
+                    }));
                 }
             }
         }
-        Some("message_stop") => {}
-        _ => {}
+        AnthropicEvent::MessageStop => {}
+        AnthropicEvent::Unknown => {
+            // #[serde(other)] discarded the tag — the raw line is the only
+            // forensics. Covers `ping`, `error`, and future event types.
+            // TODO(follow-up): promote Anthropic `error` events to a real arm
+            // surfacing SessionEvent::Notice.
+            tracing::trace!(
+                "Unknown SSE event type: {}",
+                truncate_at_char_boundary(raw, 200)
+            );
+        }
     }
 }
 
@@ -1052,5 +1056,147 @@ mod tests {
         assert_eq!(state.current_text, "ok");
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1, "only the valid data line may produce events");
+    }
+
+    // ───────────────────── slice 3: typed-path additions ─────────────────────
+
+    /// Snapshot of every observable ParseState field, for bit-identical
+    /// no-state-change assertions.
+    fn snapshot(s: &ParseState) -> (Vec<Value>, String, String, String, String, bool, String, String, bool, Option<String>, Option<String>) {
+        (
+            s.accumulated_content.clone(),
+            s.current_text.clone(),
+            s.current_tool_name.clone(),
+            s.current_tool_id.clone(),
+            s.current_tool_input_json.clone(),
+            s.in_tool_use,
+            s.current_thinking.clone(),
+            s.current_thinking_signature.clone(),
+            s.in_thinking,
+            s.telem_msg_id.clone(),
+            s.telem_stop_reason.clone(),
+        )
+    }
+
+    #[test]
+    fn unknown_event_type_no_state_change() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        // Establish some non-trivial state first.
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre"}}"#],
+            &mut state,
+            &ctx,
+        );
+        drain(&mut rx);
+        let before = snapshot(&state);
+        feed(
+            &[
+                r#"data: {"type":"ping"}"#,
+                r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                r#"data: {"type":"fnord","payload":[1,2,3]}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(snapshot(&state), before, "Unknown events must not mutate state");
+        assert!(drain(&mut rx).is_empty(), "Unknown events must emit zero events");
+    }
+
+    #[test]
+    fn malformed_json_line_skipped() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        let before = snapshot(&state);
+        feed(
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_de"#, // truncated mid-string
+                r#"data: {"#,
+                r#"data: }{"#,
+                "data: \u{1f4a5}", // raw non-JSON multi-byte
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(snapshot(&state), before, "malformed lines must be skipped without state change");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn multibyte_utf8_text_delta_end_to_end() {
+        // Raw multi-byte (borrow fast path) and \uXXXX-escaped (owned path)
+        // variants of the same text must produce byte-identical output
+        // through the full seam.
+        let expected = "✨ héllo";
+        for data_line in [
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"✨ héllo\"}}",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\u2728 h\u00e9llo"}}"#,
+        ] {
+            let (mut state, tx, mut rx) = harness();
+            let ctx = make_ctx(&tx);
+            feed(
+                &[data_line, r#"data: {"type":"content_block_stop","index":0}"#],
+                &mut state,
+                &ctx,
+            );
+            assert_eq!(
+                state.accumulated_content,
+                vec![json!({"type":"text","text":expected})],
+                "accumulated text must be byte-identical for {data_line}"
+            );
+            let events = drain(&mut rx);
+            assert!(
+                matches!(
+                    &events[0],
+                    StreamEvent::Llm(LlmEvent::Text(t)) if t.as_bytes() == expected.as_bytes()
+                ),
+                "emitted text must be byte-identical for {data_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_with_unknown_delta_subtype_ignored_gracefully() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"keep"}}"#],
+            &mut state,
+            &ctx,
+        );
+        drain(&mut rx);
+        let before = snapshot(&state);
+        feed(
+            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"x":1}}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(snapshot(&state), before, "unknown delta subtype must not mutate state");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn tail_partial_line_typed_parse() {
+        // Tail path shape: take_remaining() yields an owned String the typed
+        // event borrows from — the lifetime path slice 3 had to keep sound.
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#],
+            &mut state,
+            &ctx,
+        );
+        let remaining: String =
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tail ✨"}}"#
+                .to_string();
+        process_data_line(&remaining, &mut state, &ctx);
+        drop(remaining); // event Cow must not outlive this — compile-time proof it didn't
+        state.finalize();
+        assert_eq!(state.accumulated_content, vec![json!({"type":"text","text":"tail ✨"})]);
+        let events = drain(&mut rx);
+        assert!(matches!(
+            events.last().unwrap(),
+            StreamEvent::Llm(LlmEvent::Text(t)) if t == "tail ✨"
+        ));
     }
 }

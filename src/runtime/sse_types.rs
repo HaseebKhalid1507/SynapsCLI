@@ -2,7 +2,6 @@
 //! `Cow<'a, str>` borrows from the line buffer on the escape-free fast
 //! path, allocates only when JSON escapes force it. NOT &'a str — serde
 //! hard-errors on escaped strings for &str targets.
-#![allow(dead_code)] // TODO(slice 3): remove
 
 use serde::Deserialize;
 use std::borrow::Cow;
