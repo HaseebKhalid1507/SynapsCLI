@@ -58,12 +58,26 @@ struct ParseState {
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
-    // ── Cache-TTL split captured from message_start ──
+    // ── Usage captured from message_start (single-emission protocol) ──
     // Live API shape (probed 2024+): message_start carries the full
-    // `cache_creation` sub-object; message_delta carries ONLY the aggregate.
-    // The delta arm falls back to these when its own sub-object is absent.
+    // `cache_creation` sub-object; message_delta carries ONLY the aggregate
+    // (but repeats input/cache_read/cache_create and brings the final
+    // output count). The start arm CAPTURES ONLY — the delta arm emits THE
+    // single authoritative Usage event, falling back to these values for
+    // anything the delta doesn't carry. Emitting from both arms double-counts
+    // input/cache in every accumulating consumer (the pre-cache-ttl
+    // double-billing bug).
+    msg_start_input: Option<u64>,
+    msg_start_output: Option<u64>,
+    msg_start_cache_read: Option<u64>,
+    msg_start_cache_create: Option<u64>,
     msg_start_cache_5m: Option<u64>,
     msg_start_cache_1h: Option<u64>,
+    /// Set once the authoritative Usage event has been emitted. The residual
+    /// path (stream died between start and delta) checks this so dead streams
+    /// still bill what message_start reported — exactly one emission per
+    /// request in all paths.
+    usage_emitted: bool,
 }
 
 impl ParseState {
@@ -83,8 +97,13 @@ impl ParseState {
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
+            msg_start_input: None,
+            msg_start_output: None,
+            msg_start_cache_read: None,
+            msg_start_cache_create: None,
             msg_start_cache_5m: None,
             msg_start_cache_1h: None,
+            usage_emitted: false,
         }
     }
 
@@ -136,6 +155,11 @@ struct EventCtx<'t> {
     /// then only the 5m tail on later turns — without this latch that
     /// signature is indistinguishable from a genuine downgrade (spec §3.4.1).
     saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True iff at least one 1h cache marker was actually emitted in THIS
+    /// request. Degenerate case (hybrid + API key + no system prompt + zero
+    /// tools): no 1h marker exists anywhere in the payload, so a 1h bucket of
+    /// zero proves nothing — the detector must stay disarmed.
+    request_has_1h_marker: bool,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -273,10 +297,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 }
             }
             if let Some(usage) = usage {
-                let input_t = usage.input_tokens;
-                let output_t = usage.output_tokens;
-                let cache_read = usage.cache_read_input_tokens;
-                let cache_create = usage.cache_creation_input_tokens;
+                // Effective values: the delta's own fields where nonzero,
+                // falling back to the message_start capture. Live deltas
+                // repeat all aggregates (and carry the final output count),
+                // but be defensive — a sparse delta must not zero out what
+                // the start already reported.
+                let input_t = if usage.input_tokens > 0 { usage.input_tokens } else { state.msg_start_input.unwrap_or(0) };
+                let output_t = if usage.output_tokens > 0 { usage.output_tokens } else { state.msg_start_output.unwrap_or(0) };
+                let cache_read = if usage.cache_read_input_tokens > 0 { usage.cache_read_input_tokens } else { state.msg_start_cache_read.unwrap_or(0) };
+                let cache_create = if usage.cache_creation_input_tokens > 0 { usage.cache_creation_input_tokens } else { state.msg_start_cache_create.unwrap_or(0) };
                 // TTL breakdown: prefer the delta's own cache_creation
                 // sub-object (future-proof), but in live traffic message_delta
                 // carries ONLY the aggregate — the split arrives on
@@ -299,16 +328,30 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 // positive: turn 2+ of a healthy Hybrid session has
                 // 1h == 0 (prefix cached) and 5m > 0 (tail rewrite) — the
                 // exact downgrade signature. Turn 1's prefix write sets the
-                // latch; a genuinely downgraded account never does.
+                // latch (in the message_start arm, so a stream that dies
+                // before its delta still latches); a genuinely downgraded
+                // account never does.
+                //
+                // cache_read == 0 guard: a fresh process against a still-warm
+                // 1h prefix sees cache_read > 0, 1h == 0 (prefix CACHED, not
+                // written), 5m > 0 (tail) — healthy, not a downgrade. A
+                // genuinely downgraded account goes cold within 5m, so real
+                // downgrades still fire on the first cold turn.
+                //
+                // request_has_1h_marker: if this request carried no 1h marker
+                // at all, a zero 1h bucket proves nothing — stay silent.
                 if cache_create_1h.unwrap_or(0) > 0 {
                     ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 if ctx.cache_ttl != crate::core::config::CacheTtl::FiveMinutes
+                    && ctx.request_has_1h_marker
                     && cache_create_1h.unwrap_or(0) == 0
                     && cache_create_5m.unwrap_or(0) > 0
+                    && cache_read == 0
                     && !ctx.saw_1h_honored.load(std::sync::atomic::Ordering::Relaxed)
                     && !ctx.ttl_downgrade_notified.swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
+                    tracing::warn!("1h cache TTL not honored — check account/beta support (cache_ttl config)");
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Notice(
                         "⚠ 1h cache TTL not honored — check account/beta support (cache_ttl config)".to_string(),
                     )));
@@ -327,6 +370,11 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         state.telem_usage.cache_write_1h = cache_create_1h;
                         state.telem_usage.compute_hit_pct();
                     }
+                    // THE single authoritative Usage emission for this
+                    // request. The message_start arm captures only — every
+                    // downstream consumer is an accumulator, so a second
+                    // emission double-bills input/cache.
+                    state.usage_emitted = true;
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
                         input_tokens: input_t,
                         output_tokens: output_t,
@@ -347,29 +395,25 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 }
             }
             if let Some(usage) = message.usage {
-                let input_t = usage.input_tokens;
-                let output_t = usage.output_tokens;
-                let cache_read = usage.cache_read_input_tokens;
-                let cache_create = usage.cache_creation_input_tokens;
-                let cache_create_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
-                let cache_create_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
-                // Capture the split for the message_delta arm: live deltas
-                // carry only the aggregate, so this is the only place the
-                // 5m/1h breakdown exists in streaming traffic.
-                state.msg_start_cache_5m = cache_create_5m;
-                state.msg_start_cache_1h = cache_create_1h;
-                if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
-                    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
-                        input_tokens: input_t,
-                        output_tokens: output_t,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_create,
-                        cache_creation_5m: cache_create_5m,
-                        cache_creation_1h: cache_create_1h,
-                        model: None,
-                    }));
+                // CAPTURE ONLY — no Usage emission from this arm. Live
+                // message_delta repeats all aggregates and carries the final
+                // output count, so emitting here too double-counts
+                // input/cache_read/cache_create in every accumulating
+                // consumer (TUI, engine, server, RPC, subagents). The delta
+                // arm emits the single authoritative event; the residual
+                // path covers streams that die before their delta.
+                state.msg_start_input = Some(usage.input_tokens);
+                state.msg_start_output = Some(usage.output_tokens);
+                state.msg_start_cache_read = Some(usage.cache_read_input_tokens);
+                state.msg_start_cache_create = Some(usage.cache_creation_input_tokens);
+                state.msg_start_cache_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
+                state.msg_start_cache_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
+                // Latch 1h-honored HERE, not only in the delta arm: a stream
+                // that dies between start and delta on turn 1 must not lose
+                // the latch — that would arm a false downgrade notice on a
+                // later healthy turn (1h == 0 because the prefix is cached).
+                if state.msg_start_cache_1h.unwrap_or(0) > 0 {
+                    ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -385,6 +429,44 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             );
         }
     }
+}
+
+/// Residual Usage emission for dead streams: if message_start reported usage
+/// but the stream terminated before message_delta could emit the single
+/// authoritative event, bill what the start reported. Idempotent via
+/// `usage_emitted` — exactly one emission per request in all paths.
+fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
+    if state.usage_emitted {
+        return;
+    }
+    let input_t = state.msg_start_input.unwrap_or(0);
+    let output_t = state.msg_start_output.unwrap_or(0);
+    let cache_read = state.msg_start_cache_read.unwrap_or(0);
+    let cache_create = state.msg_start_cache_create.unwrap_or(0);
+    if input_t == 0 && output_t == 0 && cache_read == 0 && cache_create == 0 {
+        return; // never saw usage (or all-zero) — nothing to bill
+    }
+    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
+    tracing::debug!("Token Usage (residual, dead stream): {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+    if ctx.telemetry_level.enabled() {
+        state.telem_usage.input = input_t;
+        state.telem_usage.output = output_t;
+        state.telem_usage.cache_read = cache_read;
+        state.telem_usage.cache_write = cache_create;
+        state.telem_usage.cache_write_5m = state.msg_start_cache_5m;
+        state.telem_usage.cache_write_1h = state.msg_start_cache_1h;
+        state.telem_usage.compute_hit_pct();
+    }
+    state.usage_emitted = true;
+    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
+        input_tokens: input_t,
+        output_tokens: output_t,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_create,
+        cache_creation_5m: state.msg_start_cache_5m,
+        cache_creation_1h: state.msg_start_cache_1h,
+        model: None,
+    }));
 }
 
 /// Options that modify API request behavior beyond the core parameters.
@@ -514,6 +596,22 @@ impl ApiMethods {
             body["system"] = system;
         }
 
+        // Did THIS request actually carry at least one 1h marker? Arms the
+        // silent-downgrade detector. Mirrors cache_control_value(): OneHour
+        // puts 1h on every site (message tail, tools, system); Hybrid puts 1h
+        // only on stable-prefix sites (tools, system). Degenerate hybrid +
+        // API-key + no system prompt + zero tools → no 1h marker anywhere →
+        // detector must stay disarmed (zero 1h bucket proves nothing).
+        let has_tool_marker = body["tools"].as_array().is_some_and(|t| !t.is_empty());
+        let has_system_marker = body.get("system").is_some();
+        let request_has_1h_marker = match options.cache_ttl {
+            crate::core::config::CacheTtl::FiveMinutes => false,
+            crate::core::config::CacheTtl::OneHour => {
+                !cleaned_messages.is_empty() || has_tool_marker || has_system_marker
+            }
+            crate::core::config::CacheTtl::Hybrid => has_tool_marker || has_system_marker,
+        };
+
         tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503)
@@ -601,6 +699,7 @@ impl ApiMethods {
             cache_ttl: options.cache_ttl,
             ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
             saw_1h_honored: options.saw_1h_honored.clone(),
+            request_has_1h_marker,
         };
 
         // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -614,7 +713,15 @@ impl ApiMethods {
             }
             // A transport error mid-stream means connection loss — translate
             // to an actionable message instead of a raw reqwest debug string.
-            let chunk = chunk.map_err(|e| RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)))?;
+            // Bill any start-captured usage first: the API already processed
+            // the input even if the stream died on us.
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    emit_residual_usage(&mut state, &ctx);
+                    return Err(RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)));
+                }
+            };
             line_buffer.extend(&chunk);
 
             // Process complete lines from the buffer (zero-copy borrows)
@@ -631,6 +738,11 @@ impl ApiMethods {
 
         // Flush any partial block and return accumulated content
         state.finalize();
+
+        // Dead-stream billing: if the stream terminated before message_delta
+        // (cancel, transport death mid-stream), emit the one Usage event from
+        // the message_start capture. No-op when the delta already emitted.
+        emit_residual_usage(&mut state, &ctx);
 
 
         // ═══ TELEMETRY: write the record ═══
@@ -701,6 +813,7 @@ mod tests {
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_has_1h_marker: true,
         }
     }
 
@@ -719,6 +832,9 @@ mod tests {
             cache_ttl: ttl,
             ttl_downgrade_notified: latch.clone(),
             saw_1h_honored: honored.clone(),
+            // Default armed: most detector tests model a request that DID
+            // carry a 1h marker. The no-marker test overrides this.
+            request_has_1h_marker: true,
         }
     }
 
@@ -972,21 +1088,120 @@ mod tests {
 
     #[test]
     fn message_start_captures_msg_id_and_usage() {
+        // CAPTURE ONLY: message_start must emit NO Usage event — live deltas
+        // repeat all aggregates, so emitting from both arms double-billed
+        // input/cache in every accumulating consumer (pre-cache-ttl bug).
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
             &[
-                r#"data: {"type":"message_start","message":{"id":"msg_xyz","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"data: {"type":"message_start","message":{"id":"msg_xyz","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#,
             ],
             &mut state,
             &ctx,
         );
         assert_eq!(state.telem_msg_id.as_deref(), Some("msg_xyz"));
+        assert_eq!(state.msg_start_input, Some(10));
+        assert_eq!(state.msg_start_output, Some(1));
+        assert_eq!(state.msg_start_cache_read, Some(7));
+        assert_eq!(state.msg_start_cache_create, Some(3));
+        assert!(!state.usage_emitted);
         let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            "message_start must capture only — emitting here double-counts"
+        );
+    }
+
+    // ── One-emission invariant (the double-billing regression pin) ──────────
+
+    /// Exact live API shapes (probed): message_start carries the split +
+    /// aggregates + output placeholder; message_delta repeats ALL aggregates
+    /// with the final output and NO split sub-object.
+    const PROBED_LIVE_START: &str = r#"data: {"type":"message_start","message":{"id":"msg_probe","usage":{"input_tokens":3,"cache_creation_input_tokens":1103,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":6,"ephemeral_1h_input_tokens":1097},"output_tokens":1}}}"#;
+    const PROBED_LIVE_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":3,"cache_creation_input_tokens":1103,"cache_read_input_tokens":0,"output_tokens":11}}"#;
+
+    #[test]
+    fn one_usage_emission_per_request_live_shapes() {
+        // THE invariant: exactly ONE SessionEvent::Usage per request. Every
+        // downstream consumer accumulates — two emissions = ~2x billing on
+        // input/cache_read/cache_creation. This bug PREDATES cache-ttl
+        // (verified at ffa83a8).
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&[PROBED_LIVE_START, PROBED_LIVE_DELTA], &mut state, &ctx);
+        let events = drain(&mut rx);
+        let usages: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
+            .collect();
+        assert_eq!(usages.len(), 1, "exactly ONE Usage event per request");
         assert!(matches!(
-            &events[0],
-            StreamEvent::Session(SessionEvent::Usage { input_tokens: 10, output_tokens: 1, .. })
+            usages[0],
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 11, // delta's FINAL output, not start's placeholder
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 1103,
+                cache_creation_5m: Some(6),    // start-captured split
+                cache_creation_1h: Some(1097), // survives to the delta emission
+                model: None,
+            })
         ));
+        // Residual path must be a no-op after the delta emitted.
+        emit_residual_usage(&mut state, &ctx);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "residual emission must be a no-op when the delta already emitted"
+        );
+    }
+
+    #[test]
+    fn dead_stream_residual_bills_start_capture() {
+        // Stream death between message_start and message_delta: the API
+        // already processed the input — bill what start reported, once.
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&[PROBED_LIVE_START], &mut state, &ctx);
+        assert!(drain(&mut rx).iter().all(|e| !matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))));
+        emit_residual_usage(&mut state, &ctx);
+        let events = drain(&mut rx);
+        let usages: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
+            .collect();
+        assert_eq!(usages.len(), 1, "dead stream bills exactly once");
+        assert!(matches!(
+            usages[0],
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 1, // start's placeholder — all we ever saw
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 1103,
+                cache_creation_5m: Some(6),
+                cache_creation_1h: Some(1097),
+                model: None,
+            })
+        ));
+        // Idempotent: a second residual call emits nothing.
+        emit_residual_usage(&mut state, &ctx);
+        assert!(drain(&mut rx).is_empty(), "residual must be idempotent");
+    }
+
+    #[test]
+    fn dead_stream_before_delta_still_latches_1h_honored() {
+        // B3: turn 1 writes the 1h prefix, stream dies before the delta. The
+        // latch must be set at message_start, or a later healthy turn
+        // (1h == 0, prefix cached) triggers a false downgrade notice.
+        let (mut state, tx, _rx) = harness();
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        feed(&[HONORED_START], &mut state, &ctx); // no delta — stream died
+        assert!(
+            honored.load(std::sync::atomic::Ordering::Relaxed),
+            "saw_1h_honored must latch at message_start, not only at the delta"
+        );
     }
 
     #[test]
@@ -1449,5 +1664,52 @@ mod tests {
             &ctx,
         );
         assert_eq!(count_downgrade_notices(&mut rx), 0);
+    }
+
+    #[test]
+    fn downgrade_detector_silent_on_warm_restart() {
+        // Fresh process + still-warm 1h prefix: turn 1 has cache_read > 0
+        // (prefix CACHED, not written), 1h == 0, 5m > 0 (tail) — healthy,
+        // but fresh latches make it look like a downgrade. The
+        // cache_read == 0 guard keeps it silent. A genuinely downgraded
+        // account goes cold within 5m, so real downgrades still fire on the
+        // first cold turn.
+        let (mut state, tx, mut rx) = harness();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_warm","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":5000,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":5000,"cache_creation_input_tokens":100}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "warm restart is healthy — no notice");
+        assert!(!notified.load(std::sync::atomic::Ordering::Relaxed), "notice latch untouched");
+    }
+
+    #[test]
+    fn downgrade_detector_silent_without_1h_marker() {
+        // Degenerate request (hybrid + API key + no system prompt + zero
+        // tools): no 1h marker anywhere in the payload → a zero 1h bucket
+        // proves nothing. Detector must stay disarmed — even on the exact
+        // cold downgrade signature.
+        let (mut state, tx, mut rx) = harness();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = EventCtx {
+            tx: &tx,
+            telemetry_level: TelemetryLevel::Full,
+            request_start: std::time::Instant::now(),
+            cache_ttl: crate::core::config::CacheTtl::Hybrid,
+            ttl_downgrade_notified: notified.clone(),
+            saw_1h_honored: honored.clone(),
+            request_has_1h_marker: false,
+        };
+        feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "no 1h marker in request → silent");
+        assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
