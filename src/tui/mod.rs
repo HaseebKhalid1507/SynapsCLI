@@ -156,10 +156,12 @@ pub async fn run(
     let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
-        // redraws to ~30fps — deltas arrive far faster than the eye can read,
+        // redraws to ~60fps — deltas arrive far faster than the eye can read,
         // and per-delta full-frame rebuilds are what used to burn a core.
-        // The 16ms tick branch guarantees a throttled frame flushes promptly.
-        let throttle = std::time::Duration::from_millis(33);
+        // 16ms matches the tick branch, which guarantees a throttled frame
+        // flushes promptly. (Was 33ms/30fps; draw-path alloc surgery in
+        // 40c2ce4 made 60fps affordable.)
+        let throttle = std::time::Duration::from_millis(16);
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
             app.needs_redraw = false;
             last_draw = Instant::now();
