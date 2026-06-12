@@ -434,8 +434,41 @@ pub(super) async fn handle_command(
                 }
             }
             if !arg.is_empty() && ["low", "medium", "med", "high", "xhigh"].contains(&arg) {
+                // Persist like the settings modal does — normalize the "med"
+                // shorthand to the canonical config value.
+                let level = if arg == "med" { "medium" } else { arg };
+                let _ = synaps_cli::config::write_config_value("thinking", level);
                 app.push_msg(ChatMessage::System(
-                    format!("thinking set to: {}", runtime.thinking_level())
+                    format!("thinking set to: {} (saved to config)", runtime.thinking_level())
+                ));
+            }
+        }
+        "context" => {
+            // Mirrors the settings cycler (settings/defs.rs `context_window`).
+            let window = match arg {
+                "200k" | "200K" => Some(Some(200_000u64)),
+                "1m" | "1M" => Some(Some(1_000_000u64)),
+                "auto" => Some(None),
+                "" => {
+                    app.push_msg(ChatMessage::System(
+                        format!("context window: {} tokens", runtime.context_window())
+                    ));
+                    None
+                }
+                _ => {
+                    app.push_msg(ChatMessage::Error(
+                        "usage: /context 200k|1m|auto".to_string()
+                    ));
+                    None
+                }
+            };
+            if let Some(window) = window {
+                runtime.set_context_window(window);
+                app.last_turn_context_window = runtime.context_window();
+                let canonical = arg.to_ascii_lowercase();
+                let _ = synaps_cli::config::write_config_value("context_window", &canonical);
+                app.push_msg(ChatMessage::System(
+                    format!("context window set to: {} (saved to config)", canonical)
                 ));
             }
         }
@@ -1123,7 +1156,7 @@ mod tests {
     fn commands() -> Vec<String> {
         vec![
             "clear".into(), "compact".into(), "chain".into(), "model".into(),
-            "models".into(), "system".into(), "thinking".into(), "sessions".into(), "resume".into(),
+            "models".into(), "system".into(), "thinking".into(), "context".into(), "sessions".into(), "resume".into(),
             "saveas".into(), "theme".into(), "gamba".into(), "help".into(),
             "quit".into(), "exit".into(), "settings".into(), "plugins".into(),
             "status".into(),
