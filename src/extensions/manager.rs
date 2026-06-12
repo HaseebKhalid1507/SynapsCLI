@@ -1264,6 +1264,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn resolve_config_prefers_plugin_namespaced_config_before_legacy_global_key() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {
@@ -1289,6 +1290,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(synaps_base_dir)]
     fn resolve_config_keeps_legacy_global_extension_key_as_fallback() {
         let dir = tempfile::tempdir().unwrap();
         with_temp_base_dir(dir.path(), || {

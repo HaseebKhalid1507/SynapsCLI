@@ -2,18 +2,22 @@
 import json
 import sys
 
+# Hello-first handshake: the host waits for our Hello before it sends Init
+# (so it can reject incompatible protocol versions up front). Announce
+# immediately on startup, then enter the request loop.
+print(json.dumps({
+    "type": "hello",
+    "protocol_version": 2,
+    "extension": "mock-sidecar",
+    "capabilities": ["insert-text", "status"],
+}), flush=True)
+
 for line in sys.stdin:
     if not line.strip():
         continue
     msg = json.loads(line)
     typ = msg.get("type")
     if typ == "init":
-        print(json.dumps({
-            "type": "hello",
-            "protocol_version": 2,
-            "extension": "mock-sidecar",
-            "capabilities": ["insert-text", "status"],
-        }), flush=True)
         print(json.dumps({"type": "status", "state": "ready"}), flush=True)
     elif typ == "trigger":
         name = msg.get("name")

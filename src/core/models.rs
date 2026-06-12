@@ -3,6 +3,7 @@
 
 pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-4-6",         "Sonnet 4.6 — balanced (default)"),
+    ("claude-fable-5",            "Fable 5 — latest"),
     ("claude-opus-4-7",           "Opus 4.7 — most capable"),
     ("claude-opus-4-6",           "Opus 4.6 — previous flagship"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fast"),
@@ -36,7 +37,7 @@ pub fn model_supports_adaptive_thinking(model: &str) -> bool {
         return true;
     }
     // 5.x and beyond — assume adaptive by default.
-    if m.contains("opus-5") || m.contains("sonnet-5") || m.contains("haiku-5") {
+    if m.contains("opus-5") || m.contains("sonnet-5") || m.contains("haiku-5") || m.contains("fable-5") {
         return true;
     }
     false
@@ -93,6 +94,7 @@ pub fn model_supports_1m(model: &str) -> bool {
         || m.contains("opus-4-8") || m.contains("opus-4-9")
         || m.contains("sonnet-4")
         || m.contains("opus-5") || m.contains("sonnet-5")
+        || m.contains("fable-5")
 }
 
 /// Returns the input context window size for a given model, in tokens.
@@ -165,6 +167,7 @@ mod tests {
     fn model_supports_1m_assumed_for_5x() {
         assert!(model_supports_1m("claude-opus-5-0"));
         assert!(model_supports_1m("claude-sonnet-5-1"));
+        assert!(model_supports_1m("claude-fable-5"));
     }
 
     #[test]

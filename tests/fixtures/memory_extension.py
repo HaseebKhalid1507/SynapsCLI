@@ -79,6 +79,11 @@ def run_initialize(request):
     namespace = os.environ.get("MEMORY_FIXTURE_NAMESPACE", plugin_id)
     content = os.environ.get("MEMORY_FIXTURE_CONTENT", "hello memory")
     tag = os.environ.get("MEMORY_FIXTURE_TAG", "@test")
+    # argv overrides: the host scrubs extension envs (env_clear), so tests
+    # that need a non-default namespace pass --namespace=X as an argument.
+    for arg in sys.argv[1:]:
+        if arg.startswith("--namespace="):
+            namespace = arg.split("=", 1)[1]
 
     append_resp = call_synaps(
         "memory.append",

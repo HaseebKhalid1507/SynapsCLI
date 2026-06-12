@@ -57,6 +57,9 @@ impl Drop for BackgroundTasks {
 pub struct EngineBoot {
     pub runtime: Runtime,
     pub config: crate::SynapsConfig,
+    /// Echo of EngineOpts.no_extensions — callers gate extension discovery
+    /// on this so the flag has one source of truth.
+    pub no_extensions: bool,
     pub session: Session,
     pub api_messages: Vec<serde_json::Value>,
     pub total_input_tokens: u64,
@@ -202,6 +205,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     Ok(EngineBoot {
         runtime,
         config,
+        no_extensions: opts.no_extensions,
         session: sb.session,
         api_messages: sb.api_messages,
         total_input_tokens: sb.total_input_tokens,

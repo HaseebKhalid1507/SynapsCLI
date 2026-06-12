@@ -767,6 +767,7 @@ async fn apply_engine_event_side_effects(
         | EngineStreamEvent::SubagentUpdate { .. }
         | EngineStreamEvent::SubagentDone { .. }
         | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Notice(_)
         | EngineStreamEvent::Done
         | EngineStreamEvent::Noop => {}
     }
@@ -818,6 +819,7 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
         | EngineStreamEvent::SubagentUpdate { .. }
         | EngineStreamEvent::SubagentDone { .. }
         | EngineStreamEvent::SteeringDelivered { .. }
+        | EngineStreamEvent::Notice(_)
         | EngineStreamEvent::Noop => None,
     }
 }

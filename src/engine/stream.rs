@@ -46,6 +46,8 @@ pub enum EngineStreamEvent {
     },
     /// Internal bookkeeping — no visual output.
     Noop,
+    /// Display-only status notice (e.g. API retry). Not part of the transcript.
+    Notice(String),
     /// Stream completed.
     Done,
     /// Stream errored.
@@ -193,6 +195,11 @@ pub fn process_stream_event(
             } else {
                 (EngineStreamEvent::Done, StreamCompletion::Done)
             }
+        }
+        StreamEvent::Session(SessionEvent::Notice(text)) => {
+            // Display-only status (e.g. retry notice) — surface as a system
+            // line, never recorded into message history.
+            (EngineStreamEvent::Notice(text), StreamCompletion::Continue)
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
             subagents.clear();

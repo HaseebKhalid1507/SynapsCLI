@@ -4,11 +4,12 @@
 //! consumer share a single source of truth. Update this file — and only this
 //! file — whenever Anthropic changes its pricing.
 //!
-//! Prices are in USD per million tokens (as of 2026-04).
+//! Prices are in USD per million tokens (as of 2026-06).
 //! Source: <https://www.anthropic.com/pricing>
 //!
 //! | Model   | Input  | Output |
 //! |---------|--------|--------|
+//! | Fable   | $10.00 | $50.00 |
 //! | Opus    | $5.00  | $25.00 |
 //! | Sonnet  | $3.00  | $15.00 |
 //! | Haiku   | $1.00  | $5.00  |
@@ -25,6 +26,7 @@
 #[inline]
 fn model_prices(model: &str) -> (f64, f64) {
     match model {
+        m if m.contains("fable")  => (10.0, 50.0),
         m if m.contains("opus")   => (5.0, 25.0),
         m if m.contains("sonnet") => (3.0, 15.0),
         m if m.contains("haiku")  => (1.0,  5.0),
@@ -60,6 +62,13 @@ pub fn calculate_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_pricing() {
+        // 1M input + 1M output, no cache → $10 + $50 = $60
+        let cost = calculate_cost("claude-fable-5", 1_000_000, 1_000_000, 0, 0);
+        assert!((cost - 60.0).abs() < 1e-9, "expected $60, got ${cost}");
+    }
 
     #[test]
     fn opus_pricing() {

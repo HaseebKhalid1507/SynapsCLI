@@ -55,7 +55,7 @@ pub async fn run(
     }
 
     // Extension discovery
-    if !no_extensions {
+    if !boot.no_extensions {
         let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
         synaps_cli::extensions::loader::spawn_discover_and_load(
             std::sync::Arc::clone(&boot.ext_manager),
@@ -242,6 +242,9 @@ pub async fn run(
                 }
                 EngineStreamEvent::SteeringDelivered { message } => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                }
+                EngineStreamEvent::Notice(text) => {
+                    eprintln!("\x1b[2m{}\x1b[0m", text);
                 }
                 EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
                 EngineStreamEvent::Error(e) => {
