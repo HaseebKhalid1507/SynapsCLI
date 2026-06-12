@@ -174,6 +174,10 @@ pub struct Runtime {
     /// One-time-per-session latch for the silent 1h-downgrade notice
     /// (spec §3.4.1). Shared into `ApiOptions` for every request.
     ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped "1h honored at least once" latch (spec §3.4.1) —
+    /// suppresses the downgrade notice on healthy Hybrid turns where the 1h
+    /// prefix is already cached. Shared into `ApiOptions` for every request.
+    saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Last Anthropic message id (`msg_...`) — threaded into the next
     /// request's `diagnostics.previous_message_id` when diagnostics is on.
     /// Reserved for the cache-diagnosis beta wiring (handoff item).
@@ -235,6 +239,7 @@ impl Runtime {
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager,
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
@@ -462,6 +467,7 @@ impl Runtime {
                     use_1m_context: self.context_window_override == Some(1_000_000),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
+                    saw_1h_honored: self.saw_1h_honored.clone(),
                 },
             ).await?;
             
@@ -753,6 +759,7 @@ impl Runtime {
             use_1m_context: self.context_window_override == Some(1_000_000),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
+            saw_1h_honored: self.saw_1h_honored.clone(),
         };
 
         let session = crate::runtime::stream::StreamSession {
@@ -800,9 +807,11 @@ impl Clone for Runtime {
             telemetry_level: self.telemetry_level,
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
-            // Subagents are their own session — a fresh latch so a downgrade
-            // in the subagent's chain surfaces its own (single) notice.
+            // Subagents are their own session — fresh latches so a downgrade
+            // in the subagent's chain surfaces its own (single) notice and
+            // honored-state isn't inherited from the parent.
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),

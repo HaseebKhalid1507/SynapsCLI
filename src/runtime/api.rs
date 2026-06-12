@@ -123,6 +123,11 @@ struct EventCtx<'t> {
     cache_ttl: crate::core::config::CacheTtl,
     /// Once-per-session latch for the downgrade notice (shared via Runtime).
     ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped latch: set once any response shows a nonzero 1h cache
+    /// write. A healthy Hybrid session writes the 1h prefix on turn 1 and
+    /// then only the 5m tail on later turns — without this latch that
+    /// signature is indistinguishable from a genuine downgrade (spec §3.4.1).
+    saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -274,9 +279,19 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 // session and keep requesting what the user configured —
                 // auto-downgrade would change pricing behavior behind the
                 // user's back and mask the account-level problem.
+                //
+                // The saw_1h_honored latch prevents the Hybrid false
+                // positive: turn 2+ of a healthy Hybrid session has
+                // 1h == 0 (prefix cached) and 5m > 0 (tail rewrite) — the
+                // exact downgrade signature. Turn 1's prefix write sets the
+                // latch; a genuinely downgraded account never does.
+                if cache_create_1h.unwrap_or(0) > 0 {
+                    ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if ctx.cache_ttl != crate::core::config::CacheTtl::FiveMinutes
                     && cache_create_1h.unwrap_or(0) == 0
                     && cache_create_5m.unwrap_or(0) > 0
+                    && !ctx.saw_1h_honored.load(std::sync::atomic::Ordering::Relaxed)
                     && !ctx.ttl_downgrade_notified.swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Notice(
@@ -365,6 +380,11 @@ pub struct ApiOptions {
     /// requested, only 5m honored). Shared via Arc so every request in the
     /// session sees the same latch; the configured mode is NEVER auto-flipped.
     pub ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-scoped "1h was honored at least once" latch (spec §3.4.1).
+    /// Set on any response with a nonzero 1h cache-write bucket; suppresses
+    /// the downgrade notice on healthy Hybrid turns where the 1h prefix is
+    /// already cached (1h == 0, 5m > 0). Shared via Arc like the notice latch.
+    pub saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(super) struct ApiMethods;
@@ -560,6 +580,7 @@ impl ApiMethods {
             request_start,
             cache_ttl: options.cache_ttl,
             ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
+            saw_1h_honored: options.saw_1h_honored.clone(),
         };
 
         // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -659,15 +680,17 @@ mod tests {
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Harness variant with a configured TTL + shared latch — for the
+    /// Harness variant with a configured TTL + shared latches — for the
     /// silent-downgrade detector tests.
     fn make_ctx_ttl<'a>(
         tx: &'a mpsc::UnboundedSender<StreamEvent>,
         ttl: crate::core::config::CacheTtl,
         latch: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        honored: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> EventCtx<'a> {
         EventCtx {
             tx,
@@ -675,6 +698,7 @@ mod tests {
             request_start: std::time::Instant::now(),
             cache_ttl: ttl,
             ttl_downgrade_notified: latch.clone(),
+            saw_1h_honored: honored.clone(),
         }
     }
 
@@ -1264,21 +1288,52 @@ mod tests {
             .count()
     }
 
+    /// A turn where the 1h bucket is honored (healthy turn 1: prefix write).
+    const HONORED_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#;
+
     #[test]
-    fn downgrade_detector_fires_once_per_session() {
+    fn downgrade_detector_silent_for_healthy_hybrid_session() {
+        // The false positive the saw_1h_honored latch exists to kill: a
+        // healthy Hybrid session's turn 2+ has 1h == 0 (prefix cached) and
+        // 5m > 0 (tail rewrite) — the exact downgrade signature. Turn 1's
+        // prefix write must latch saw_1h_honored and keep the detector
+        // silent for the rest of the session.
+        let (mut state, tx, mut rx) = harness();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        // Turn 1: 1h prefix written → latch set, no notice.
+        feed(&[HONORED_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 1 (1h honored)");
+        assert!(honored.load(std::sync::atomic::Ordering::Relaxed), "latch set on 1h write");
+        // Turn 2: prefix cached → 1h == 0, 5m > 0. Healthy. SILENCE.
+        feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
+        assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 2 (healthy hybrid signature)");
+        // Later request in the same session (new ctx, same latches): still silent.
+        let (mut state2, tx2, mut rx2) = harness();
+        let ctx2 = make_ctx_ttl(&tx2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
+        assert_eq!(count_downgrade_notices(&mut rx2), 0, "later request, same session");
+    }
+
+    #[test]
+    fn downgrade_detector_fires_once_when_1h_never_honored() {
+        // Genuinely downgraded account: the 1h bucket never goes nonzero —
+        // the notice fires on turn 1, exactly once per session, in both modes.
         for ttl in [crate::core::config::CacheTtl::OneHour, crate::core::config::CacheTtl::Hybrid] {
             let (mut state, tx, mut rx) = harness();
-            let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let ctx = make_ctx_ttl(&tx, ttl, &latch);
+            let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ctx = make_ctx_ttl(&tx, ttl, &notified, &honored);
             // First occurrence: 1h bucket = 0, 5m bucket > 0 → exactly one Notice.
             feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
             assert_eq!(count_downgrade_notices(&mut rx), 1, "first occurrence under {ttl:?}");
             // Second occurrence (same session/latch): nothing.
             feed(&[DOWNGRADE_DELTA], &mut state, &ctx);
             assert_eq!(count_downgrade_notices(&mut rx), 0, "second occurrence under {ttl:?}");
-            // Latch persists across requests in the session (new ctx, same latch).
+            // Latch persists across requests in the session (new ctx, same latches).
             let (mut state2, tx2, mut rx2) = harness();
-            let ctx2 = make_ctx_ttl(&tx2, ttl, &latch);
+            let ctx2 = make_ctx_ttl(&tx2, ttl, &notified, &honored);
             feed(&[DOWNGRADE_DELTA], &mut state2, &ctx2);
             assert_eq!(count_downgrade_notices(&mut rx2), 0, "next request, same session");
             // Mode is never auto-flipped — ctx still carries the configured TTL.
@@ -1298,7 +1353,8 @@ mod tests {
     fn downgrade_detector_silent_when_1h_honored() {
         let (mut state, tx, mut rx) = harness();
         let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch);
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
         feed(
             &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":80}}}"#],
             &mut state,
@@ -1313,7 +1369,8 @@ mod tests {
         // cache_creation sub-object missing entirely → no basis to judge; stay quiet.
         let (mut state, tx, mut rx) = harness();
         let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch);
+        let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
         feed(
             &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100}}"#],
             &mut state,

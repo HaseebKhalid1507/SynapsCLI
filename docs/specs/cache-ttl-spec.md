@@ -1,6 +1,6 @@
 # Spec: Configurable Prompt-Cache TTL (`cache_ttl`)
 
-**Status:** v2 — amended per adversarial review (APPROVED WITH AMENDMENTS A1–A8); verified against source @ dev HEAD `ffa83a8`
+**Status:** v3 — post-implementation review fix: §3.4.1 amended with the saw-1h-honored condition (the v2 detector condition false-positived every healthy Hybrid session). Previously: v2 — amended per adversarial review (APPROVED WITH AMENDMENTS A1–A8); verified against source @ dev HEAD `ffa83a8`
 **Author:** Zero (architect pass; verification sweep completed against actual code, not the brief; reviewer amendments applied without relitigation)
 **Scope:** `synaps` (Cargo package `synaps`, lib `synaps_cli`), Anthropic runtime path only
 
@@ -255,10 +255,22 @@ pricing changes are how trust dies.
 The failure mode that *doesn't* 400: the API accepts the request but quietly
 honors only 5m. Detection: when `cache_ttl ∈ {OneHour, Hybrid}` and a
 response's `cache_creation` split shows the **1h bucket = 0 while the 5m
-bucket > 0**, emit a one-time-per-session `SessionEvent::Notice` —
+bucket > 0**, *and the session has never seen a nonzero 1h bucket*, emit a
+one-time-per-session `SessionEvent::Notice` —
 *"1h cache TTL not honored — check account/beta support."* The split is
-already parsed (`sse_types.rs:114–116`); this is a comparison and a latch,
-nothing more.
+already parsed (`sse_types.rs:114–116`); this is a comparison and two
+latches, nothing more.
+
+**Saw-1h-honored condition (v3 amendment):** the naive `1h == 0 && 5m > 0`
+test is the steady-state signature of a *healthy* Hybrid session — on turn 2+
+the 1h prefix is cached (zero 1h writes) while the 5m tail rewrites every
+turn — so it false-positives every Hybrid session. The detector therefore
+requires a second session-scoped latch, `saw_1h_honored`, set whenever a
+response's 1h bucket is **> 0**. A healthy session sets it on turn 1 (prefix
+write) and the detector stays silent thereafter; a genuinely downgraded
+account never sets it, so the notice still fires on turn 1. Like the notice
+latch, it is shared across all requests in a session and reset fresh for
+cloned (subagent) runtimes.
 
 **Latching rule:** never auto-flip the configured mode mid-session. The notice
 fires once and the runtime keeps requesting what the user configured —
