@@ -19,6 +19,7 @@ mod request;
 mod stream;
 mod helpers;
 mod sse;
+mod sse_types;
 pub mod subagent;
 pub mod openai;
 pub mod telemetry;
