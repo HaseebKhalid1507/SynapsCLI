@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Configurable prompt-cache TTL (`cache_ttl` config key)** — `5m` (default, unchanged behavior), `1h`, or `hybrid` (1h on the stable tools/system prefix, 5m on the per-turn message tail). Long-gap sessions (> 5 min between turns) can now keep their cache warm instead of paying full input price every turn. Invalid values fall back to 5m with a boot warning. Spec: `docs/specs/cache-ttl-spec.md` (v4)
+  - Pricing is TTL-aware: 1h cache writes billed at 2.0× input (5m stays 1.25×); when the API reports no 5m/1h split, aggregate writes are billed at the 5m rate (fail-cheap)
+  - `extended-cache-ttl-2025-04-11` beta header sent only on API-key auth — 1h is live-verified working bare over OAuth, whose beta set is left untouched
+  - Silent-downgrade detector: if 1h is configured but the account never honors it, a one-time-per-session notice fires; the configured mode is never auto-flipped
+  - RPC protocol: `agent_end.usage` gains optional `cache_creation_5m` / `cache_creation_1h` fields (omitted when unknown — additive, existing consumers unaffected); same split flows through server-mode `Usage` messages and subagent aggregation
+
+### Fixed
+- **Cache-TTL usage split was read from the wrong SSE event** — live `message_delta` frames carry only the aggregate; the 5m/1h breakdown arrives on `message_start`. The split is now captured at `message_start` with a delta-arm fallback, restoring telemetry split keys, the downgrade detector, and correct 1h write pricing in streaming sessions
+
 ## [0.2.1] — 2026-06-12
 
 ### Fixed
