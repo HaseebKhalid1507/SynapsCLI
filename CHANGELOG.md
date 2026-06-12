@@ -4,7 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Recent (Dev Branch)
+## [0.2.0] — 2026-06-12
+
+### Performance
+- **Typed SSE pipeline — per-token DOM allocation eliminated** — the streaming hot loop no longer builds a `serde_json::Value` per event
+  - New `runtime/sse.rs::SseLineBuffer` — zero-copy line buffering: lines borrowed as `&str`, memchr (SIMD) newline search, O(1) read-cursor advance with periodic compaction (was two copies + an O(n) drain per line); UTF-8 splits across chunk boundaries handled by construction, with an exhaustive every-offset re-chunking test suite
+  - Typed `AnthropicEvent` wire model with `Cow<'a, str>` borrowing — text deltas borrow from the line buffer on the escape-free fast path, own only when JSON escapes force decoding
+  - `ParseState` + `process_event` consolidate the three parse sites (main loop, tail-flush, end-of-stream finalize) into a single write path — duplicate-site drift now structurally impossible; 15 behavioral seam tests pin the contract
+- **Dirty-flag render loop + streaming redraw coalescing** — the TUI burned a full core during streaming (unconditional full-frame draw on every 16ms tick and every SSE delta); `needs_redraw` flag draws only on actual state change, idle costs zero draws
+- **Streaming raised 30→60fps** — redraw coalescing throttle tightened now that frames are cheap
+- **Draw-path allocation elimination** — viewport `Paragraph` moves the line Vec instead of deep-cloning every frame; ASCII-art rendering collapses same-style runs from one Span-per-char to one Span-per-line; per-frame version `format!` → `concat!` const
+- **`mem::take` at session resume** — `rebuild_display_messages` no longer deep-copies the entire message history (potentially MBs) to dodge the borrow checker
+- **Cache strategy: sliding-4 → single-last** — one stationary `cache_control` marker on the last message replaces ~57 lines of sliding-breakpoint logic
+  - Bench evidence: equivalent hit rate (96–97% both strategies); live-verified 99% hit on warm turn
+  - Prefix-invalidation bug class (mutating old markers) eliminated by construction; 5 new unit tests on a previously untested function
+
+### Fixed
+- **SSE double-emit on partial final line** — when the final `content_block_stop` arrived without a trailing newline, the tail-flush pushed the block but left `in_thinking`/`in_tool_use` set, so the end-of-stream flush pushed it again — duplicated content block sent to the model on the next turn
+- **PTY zombie reaping** — `PtyHandle::Drop` killed the child but never `wait()`ed; every timed-out or dropped shell session left a zombie. Now reaped with bounded-retry `try_wait()` (all other child-process sites already used `kill_on_drop`)
+- **Extension crash-loop health lied** — `restart_count` reset on successful handshake, so an extension that initialized fine and died on the next request never hit the exhaustion limit and reported Running. Consecutive-failure counter now resets only when the restarted process actually serves a call; new `total_restarts` (never reset) feeds health so recovered extensions report Degraded
+- **Integration test rot from `env_clear`** — security-hardened extension spawns silently broke 20+ test fixtures parameterized via env vars; fixtures moved to argv parameters, plus poison-cascade and parallel-env-race cleanup — full suite green, 3 consecutive runs
+- **Hardcoded Claude Code identity removed from API preamble** — replaced with a configurable `identity` config key + proper SynapsCLI default
+- **Dotted (namespaced) config keys exempt from unknown-key warnings**
+
+### Added
+- **claude-fable-5 support** — known-models entry with adaptive thinking, pricing ($10/$50 per MTok), and 1M context opt-in
+- **Telemetry module** — structured per-request API records: `TelemetryLevel` (off/basic/full), usage with cache TTL breakdown, rate-limit headers, cache-diagnosis records; JSONL writer to `~/.cache/synaps/api-log.jsonl` (0600 + `O_NOFOLLOW`), wired into config keys and the Anthropic SSE stream
+- **Cache strategy benchmark suite (`bench/`)** — 21 tool-heavy questions with deterministic outcomes across 4 swappable breakpoint strategies (none / single-last / last-3 / sliding-4); per-turn JSONL logging of tokens, cache read/write, hit %, cost, latency; `compare.py` for side-by-side runs
+- **`synaps completions <shell>`** — shell completions via clap_complete (bash, zsh, fish, elvish, powershell)
+- **First-run banner** — boot with no OAuth, no `ANTHROPIC_API_KEY`, and no provider keys shows a getting-started banner with the three setup paths instead of a silent TUI
+
+### Changed
+- **reqwest 0.11 → 0.12 — duplicate HTTP stack collapsed** — reqwest 0.11 was the sole consumer of hyper 0.14/http 0.2/h2 0.3 alongside axum's hyper 1.x; the old stack (plus native-tls/OpenSSL) is gone, TLS is now rustls with native root certs — explicit in the manifest, smaller binary, zero source changes
+- **Humanized API + network errors** — raw JSON dumps and reqwest debug strings replaced with actionable text (529 → "overloaded, wait", 401 → "run synaps login", context overflow → "run /compact"); retry notices ("⏳ API error, retrying…") are now display-only system lines instead of fake assistant content persisted into session history
+- **Input recovery on stream error** — when a stream dies after retries, the user's popped message is restored to the input box instead of silently destroyed
+- **Config parse warnings with did-you-mean** — unknown keys suggest corrections via levenshtein (`modle` → did you mean `model`?); unparseable values warn and fall back to defaults instead of silently misbehaving
+- **Login/status polish** — token-refresh errors now say `synaps login` (was a nonexistent command); `synaps status` refreshes the OAuth token before the request instead of 401ing on expired tokens; `--help` rewritten with real about text and `--profile` documented
+
+### Earlier in this cycle
 - **Engine refactor + `chat` headless mode** — `daemon`, `run`, and `client` subcommands deleted; `chat` is now fully-featured headless mode with MCP, extensions, skills, sessions, compaction, and the event bus (same engine as the TUI, stdin/stdout rendering)
   - New `engine/` module: `setup.rs` (boot), `commands.rs` (headless slash commands), `stream.rs` (StreamEvent consumer), `session.rs` (ConversationState)
   - `chatui/` module deleted — `tui/` is the sole frontend
