@@ -404,8 +404,13 @@ jobs:
           arch=('x86_64' 'aarch64')
           url="https://github.com/HaseebKhalid1507/SynapsCLI"
           license=('Apache-2.0')
-          depends=('gcc-libs' 'oniguruma' 'openssl')
+          depends=('gcc-libs' 'oniguruma')
           makedepends=('cargo' 'oniguruma')
+          # ring's C/asm objects are GCC-LTO-incompatible with rust-lld:
+          # makepkg's -flto=auto produces bitcode rust-lld can't read ->
+          # undefined ring_core_* symbols at link. Standard fix for
+          # ring-dependent Rust packages.
+          options=(!lto)
           source=("\$url/archive/refs/tags/v\$pkgver.tar.gz")
           sha256sums=('${SHA256}')
 
@@ -443,7 +448,7 @@ jobs:
           	makedepends = oniguruma
           	depends = gcc-libs
           	depends = oniguruma
-          	depends = openssl
+          	options = !lto
           	source = https://github.com/HaseebKhalid1507/SynapsCLI/archive/refs/tags/v${VERSION}.tar.gz
           	sha256sums = ${SHA256}
 
