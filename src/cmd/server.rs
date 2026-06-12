@@ -769,6 +769,16 @@ async fn apply_engine_event_side_effects(
                 })
                 .await;
         }
+        // Notices are displayable — persist them so reconnecting clients see
+        // e.g. the cache-TTL downgrade warning in history.
+        EngineStreamEvent::Notice(text) => {
+            state
+                .push_history(HistoryEntry::System {
+                    content: text.clone(),
+                    time: ts.to_string(),
+                })
+                .await;
+        }
         // Variants without server-side side effects.
         EngineStreamEvent::ToolStart { .. }
         | EngineStreamEvent::ToolDelta { .. }
@@ -777,7 +787,6 @@ async fn apply_engine_event_side_effects(
         | EngineStreamEvent::SubagentUpdate { .. }
         | EngineStreamEvent::SubagentDone { .. }
         | EngineStreamEvent::SteeringDelivered { .. }
-        | EngineStreamEvent::Notice(_)
         | EngineStreamEvent::Done
         | EngineStreamEvent::Noop => {}
     }
@@ -828,12 +837,14 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
         }),
         EngineStreamEvent::Done => Some(ServerMessage::Done),
         EngineStreamEvent::Error(message) => Some(ServerMessage::Error { message }),
+        // Was silently dropped — the cache-TTL downgrade warning (and any
+        // future advisory) never reached server-mode clients.
+        EngineStreamEvent::Notice(text) => Some(ServerMessage::Notice { text }),
         // Server protocol doesn't expose these (yet).
         EngineStreamEvent::SubagentStart { .. }
         | EngineStreamEvent::SubagentUpdate { .. }
         | EngineStreamEvent::SubagentDone { .. }
         | EngineStreamEvent::SteeringDelivered { .. }
-        | EngineStreamEvent::Notice(_)
         | EngineStreamEvent::Noop => None,
     }
 }

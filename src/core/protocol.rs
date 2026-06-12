@@ -84,6 +84,11 @@ pub enum ServerMessage {
     #[serde(rename = "done")]
     Done,
 
+    /// Out-of-band advisory notice (e.g. cache-TTL downgrade warning).
+    /// Additive variant — old clients ignore unknown message types.
+    #[serde(rename = "notice")]
+    Notice { text: String },
+
     /// Error occurred
     #[serde(rename = "error")]
     Error { message: String },
