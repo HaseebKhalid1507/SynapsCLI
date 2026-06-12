@@ -76,6 +76,21 @@ pub fn thinking_level_for_budget(budget: u32) -> &'static str {
     }
 }
 
+/// Inverse of `thinking_level_for_budget` — maps a level name back to its
+/// canonical budget. Returns None for unrecognized labels (callers should
+/// leave the current budget untouched). Used by /resume to restore the
+/// session's serialized thinking level.
+pub fn budget_for_thinking_level(level: &str) -> Option<u32> {
+    match level {
+        "adaptive" | "off" => Some(0),
+        "low" => Some(2048),
+        "medium" => Some(4096),
+        "high" => Some(16384),
+        "xhigh" => Some(32768),
+        _ => None,
+    }
+}
+
 /// Default legacy-model thinking budget used when the "adaptive" sentinel
 /// (0) leaks into the non-adaptive request path. Matches the "high" tier.
 pub const DEFAULT_LEGACY_ADAPTIVE_FALLBACK: u32 = 16384;
@@ -136,6 +151,16 @@ mod tests {
         for (_, desc) in KNOWN_MODELS {
             assert!(!desc.is_empty(), "empty description");
         }
+    }
+
+    #[test]
+    fn budget_for_thinking_level_round_trips() {
+        for budget in [0u32, 2048, 4096, 16384, 32768] {
+            let level = thinking_level_for_budget(budget);
+            assert_eq!(budget_for_thinking_level(level), Some(budget), "level {}", level);
+        }
+        assert_eq!(budget_for_thinking_level("off"), Some(0));
+        assert_eq!(budget_for_thinking_level("custom(8192)"), None);
     }
 
     #[test]

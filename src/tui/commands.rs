@@ -338,19 +338,30 @@ pub(super) async fn handle_command(
     }
 
     // ── Engine-level commands (shared with headless) ──
+    // NOTE: this intercept runs BEFORE the match below — any arm there for a
+    // command the engine claims (model/thinking with args, compact, quit) is
+    // unreachable for the intercepted case.
     if let Some(result) = synaps_cli::engine::commands::handle_engine_command(cmd, arg, runtime) {
-        use synaps_cli::engine::commands::CommandResult;
+        use synaps_cli::engine::commands::{persist_to_config, thinking_config_value, CommandResult};
         return match result {
             CommandResult::Quit => CommandAction::Quit,
-            CommandResult::ModelChanged { model } => {
-                app.push_msg(ChatMessage::System(format!("model → {}", model)));
+            CommandResult::ModelChanged { .. } => {
+                // Use the runtime's cleaned model string, not the raw arg.
+                let applied = runtime.model().to_string();
+                app.session.model = applied.clone();
+                let status = persist_to_config("model", &applied);
+                app.push_msg(ChatMessage::System(format!("model set to: {} {}", applied, status)));
                 CommandAction::None
             }
             CommandResult::ThinkingChanged { level, budget } => {
-                app.push_msg(ChatMessage::System(format!("thinking → {} ({})", level, budget)));
+                app.session.thinking_level = level.clone();
+                let status = persist_to_config("thinking", &thinking_config_value(&level, budget));
+                app.push_msg(ChatMessage::System(format!("thinking set to: {} ({}) {}", level, budget, status)));
                 CommandAction::None
             }
-            CommandResult::Compact => CommandAction::Compact { custom_instructions: None },
+            CommandResult::Compact { custom_instructions } => {
+                CommandAction::Compact { custom_instructions }
+            }
             CommandResult::Error(e) => {
                 app.push_msg(ChatMessage::Error(e));
                 CommandAction::None
@@ -376,20 +387,9 @@ pub(super) async fn handle_command(
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         "model" | "models" => {
-            if arg.is_empty() {
-                return CommandAction::OpenModels;
-            } else {
-                runtime.set_model(arg.to_string());
-                // Persist like the interactive picker (InputAction::ModelsApply)
-                // does — /model <name> previously only set the model in-memory,
-                // so it silently reverted on next launch.
-                let applied = runtime.model().to_string();
-                let _ = synaps_cli::config::write_config_value("model", &applied);
-                app.session.model = applied.clone();
-                app.push_msg(ChatMessage::System(
-                    format!("model set to: {} (saved to config)", applied)
-                ));
-            }
+            // Non-empty args are intercepted by handle_engine_command above
+            // (set + persist); only the empty-arg picker case reaches here.
+            return CommandAction::OpenModels;
         }
         "system" => {
             if arg.is_empty() {
@@ -417,31 +417,11 @@ pub(super) async fn handle_command(
             }
         }
         "thinking" => {
-            match arg {
-                "low" => { runtime.set_thinking_budget(2048); }
-                "medium" | "med" => { runtime.set_thinking_budget(4096); }
-                "high" => { runtime.set_thinking_budget(16384); }
-                "xhigh" => { runtime.set_thinking_budget(32768); }
-                "" => {
-                    app.push_msg(ChatMessage::System(
-                        format!("thinking: {} ({})", runtime.thinking_level(), runtime.thinking_budget())
-                    ));
-                }
-                _ => {
-                    app.push_msg(ChatMessage::Error(
-                        "usage: /thinking low|medium|high|xhigh".to_string()
-                    ));
-                }
-            }
-            if !arg.is_empty() && ["low", "medium", "med", "high", "xhigh"].contains(&arg) {
-                // Persist like the settings modal does — normalize the "med"
-                // shorthand to the canonical config value.
-                let level = if arg == "med" { "medium" } else { arg };
-                let _ = synaps_cli::config::write_config_value("thinking", level);
-                app.push_msg(ChatMessage::System(
-                    format!("thinking set to: {} (saved to config)", runtime.thinking_level())
-                ));
-            }
+            // Non-empty args are intercepted by handle_engine_command above
+            // (set + persist); only the empty-arg status case reaches here.
+            app.push_msg(ChatMessage::System(
+                format!("thinking: {} ({})", runtime.thinking_level(), runtime.thinking_budget())
+            ));
         }
         "context" => {
             // Mirrors the settings cycler (settings/defs.rs `context_window`).
@@ -466,9 +446,9 @@ pub(super) async fn handle_command(
                 runtime.set_context_window(window);
                 app.last_turn_context_window = runtime.context_window();
                 let canonical = arg.to_ascii_lowercase();
-                let _ = synaps_cli::config::write_config_value("context_window", &canonical);
+                let status = synaps_cli::engine::commands::persist_to_config("context_window", &canonical);
                 app.push_msg(ChatMessage::System(
-                    format!("context window set to: {} (saved to config)", canonical)
+                    format!("context window set to: {} {}", canonical, status)
                 ));
             }
         }
@@ -501,6 +481,14 @@ pub(super) async fn handle_command(
                 match resolve_session(arg) {
                     Ok(session) => {
                         runtime.set_model(session.model.clone());
+                        // Restore the session's thinking level alongside model
+                        // and system prompt (it's serialized round-trip, was
+                        // just never re-applied).
+                        if let Some(budget) =
+                            synaps_cli::models::budget_for_thinking_level(&session.thinking_level)
+                        {
+                            runtime.set_thinking_budget(budget);
+                        }
                         if let Some(ref sp) = session.system_prompt {
                             runtime.set_system_prompt(sp.clone());
                         }
@@ -588,11 +576,8 @@ pub(super) async fn handle_command(
             }
             return CommandAction::OpenPlugins;
         }
-        "compact" => {
-            return CommandAction::Compact {
-                custom_instructions: if arg.is_empty() { None } else { Some(arg.to_string()) },
-            };
-        }
+        // NOTE: /compact is intercepted by handle_engine_command above
+        // (CommandResult::Compact carries the custom instructions).
         "chain" => {
             let mut parts = arg.splitn(2, char::is_whitespace);
             let sub = parts.next().unwrap_or("").trim();

@@ -879,7 +879,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
                         .to_string(),
                 });
             }
-            CommandResult::Compact => {
+            CommandResult::Compact { .. } => {
                 let _ = broadcast.send(ServerMessage::System {
                     message: "/compact not yet wired in server mode".to_string(),
                 });
