@@ -117,10 +117,10 @@ pub async fn run(
                     CommandResult::ThinkingChanged { level, budget } => {
                         eprintln!("thinking → {} ({})", level, budget);
                     }
-                    CommandResult::Compact => {
+                    CommandResult::Compact { custom_instructions } => {
                         eprintln!("compacting...");
                         if let Ok(summary) = compact_conversation(
-                            &conv.api_messages, &runtime, None
+                            &conv.api_messages, &runtime, custom_instructions.as_deref()
                         ).await {
                             conv.api_messages = vec![json!({
                                 "role": "user",

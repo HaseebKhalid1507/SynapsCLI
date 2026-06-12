@@ -1438,9 +1438,9 @@ pub async fn run(
                             InputAction::ModelsApply(model) => {
                                 runtime.set_model(model.clone());
                                 let applied = runtime.model().to_string();
-                                let _ = synaps_cli::config::write_config_value("model", &applied);
+                                let status = synaps_cli::engine::commands::persist_to_config("model", &applied);
                                 app.session.model = applied.clone();
-                                app.push_msg(ChatMessage::System(format!("model set to: {}", applied)));
+                                app.push_msg(ChatMessage::System(format!("model set to: {} {}", applied, status)));
                             }
                             InputAction::ModelsExpandProvider(provider_key) => {
                                 if provider_key.contains(':') {
