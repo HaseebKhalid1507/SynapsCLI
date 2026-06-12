@@ -10,8 +10,8 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
 /// Returns the configured identity string for the system prompt preamble.
-/// Falls back to the default Claude Code identity if not set in config.
-/// Initialized by `load_config()` — safe to call anytime after boot.
+/// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set
+/// in config. Initialized by `load_config()` — safe to call anytime after boot.
 pub fn get_identity() -> String {
     IDENTITY.get().cloned().unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
 }
@@ -152,6 +152,36 @@ impl BridgeConfig {
     }
 }
 
+/// Prompt-cache TTL strategy for Anthropic requests.
+///
+/// Controls the `cache_control` value emitted at every cache marker site:
+/// - `FiveMinutes` (default): bare `{"type": "ephemeral"}` — byte-identical
+///   to historical payloads; the default path can never invalidate existing
+///   cached prefixes.
+/// - `OneHour`: `{"type": "ephemeral", "ttl": "1h"}` on all markers.
+/// - `Hybrid`: 1h on the stable prefix (tools + system, written rarely),
+///   bare 5m on the message-tail marker (written every turn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtl {
+    #[default]
+    FiveMinutes,
+    OneHour,
+    Hybrid,
+}
+
+impl CacheTtl {
+    /// Parse a config value (case-insensitive). Returns `None` for unknown
+    /// values so the caller can warn and fall back to the default.
+    pub fn parse(val: &str) -> Option<CacheTtl> {
+        match val.to_ascii_lowercase().as_str() {
+            "5m" | "5min" | "default" => Some(CacheTtl::FiveMinutes),
+            "1h" | "60m" | "1hr" => Some(CacheTtl::OneHour),
+            "hybrid" => Some(CacheTtl::Hybrid),
+            _ => None,
+        }
+    }
+}
+
 /// Parsed configuration from the config file.
 #[derive(Debug, Clone)]
 pub struct SynapsConfig {
@@ -166,6 +196,8 @@ pub struct SynapsConfig {
     pub api_retries: u32,              // default 3
     pub telemetry: String,             // off | basic | full (default off)
     pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
+    /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
+    pub cache_ttl: CacheTtl,
     pub theme: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -196,6 +228,7 @@ impl Default for SynapsConfig {
             api_retries: 3,
             telemetry: "off".to_string(),
             cache_diagnostics: false,
+            cache_ttl: CacheTtl::default(),
             theme: None,
             agent_name: None,
             identity: None,
@@ -216,7 +249,7 @@ impl Default for SynapsConfig {
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model", "thinking", "compaction_model", "context_window", "max_tool_output",
     "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
-    "telemetry", "cache_diagnostics", "theme", "agent_name", "identity",
+    "telemetry", "cache_diagnostics", "cache_ttl", "theme", "agent_name", "identity",
     "disabled_plugins", "favorite_models", "disabled_skills",
 ];
 
@@ -461,6 +494,14 @@ pub fn load_config() -> SynapsConfig {
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "cache_ttl" => {
+                match CacheTtl::parse(val) {
+                    Some(ttl) => config.cache_ttl = ttl,
+                    None => config.warnings.push(format!(
+                        "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                    )),
+                }
+            }
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
@@ -666,6 +707,65 @@ mod tests {
             assert_eq!(config.bash_timeout, 30);
             assert_eq!(config.thinking_budget, None);
         });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── cache_ttl parse table (spec §3.1) ──
+
+    #[test]
+    fn test_cache_ttl_parse_table() {
+        // 5m aliases
+        assert_eq!(CacheTtl::parse("5m"), Some(CacheTtl::FiveMinutes));
+        assert_eq!(CacheTtl::parse("5min"), Some(CacheTtl::FiveMinutes));
+        assert_eq!(CacheTtl::parse("default"), Some(CacheTtl::FiveMinutes));
+        // 1h aliases
+        assert_eq!(CacheTtl::parse("1h"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("60m"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("1hr"), Some(CacheTtl::OneHour));
+        // hybrid
+        assert_eq!(CacheTtl::parse("hybrid"), Some(CacheTtl::Hybrid));
+        // case-insensitive
+        assert_eq!(CacheTtl::parse("1H"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("HYBRID"), Some(CacheTtl::Hybrid));
+        assert_eq!(CacheTtl::parse("Default"), Some(CacheTtl::FiveMinutes));
+        // garbage → None (caller warns + defaults)
+        assert_eq!(CacheTtl::parse("2h"), None);
+        assert_eq!(CacheTtl::parse(""), None);
+        assert_eq!(CacheTtl::parse("forever"), None);
+    }
+
+    #[test]
+    fn test_cache_ttl_default_is_five_minutes() {
+        assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
+        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtl::FiveMinutes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_ttl_config_parse_and_garbage_warning() {
+        let home = std::env::temp_dir().join(format!("synaps-cachettl-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid value parses, no warning.
+        std::fs::write(dir.join("config"), "cache_ttl = hybrid\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.cache_ttl, CacheTtl::Hybrid);
+            assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        });
+
+        // Garbage value → 5m default + boot warning (never blocks boot).
+        std::fs::write(dir.join("config"), "cache_ttl = 2h\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
+            assert!(
+                config.warnings.iter().any(|w| w.contains("cache_ttl")),
+                "warnings: {:?}", config.warnings
+            );
+        });
+
         let _ = std::fs::remove_dir_all(&home);
     }
 
