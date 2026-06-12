@@ -13,6 +13,10 @@ pub struct SubagentResult {
     pub output_tokens: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// TTL split of `cache_creation` across the subagent's turns.
+    /// `None` only if no turn ever reported a split; otherwise the sum.
+    pub cache_creation_5m: Option<u64>,
+    pub cache_creation_1h: Option<u64>,
     pub tool_count: u32,
 }
 
