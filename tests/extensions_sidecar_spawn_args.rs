@@ -22,10 +22,6 @@ fn fixture_path() -> String {
         .to_string()
 }
 
-fn manifest() -> ExtensionManifest {
-    manifest_with_mode(None)
-}
-
 /// argv-based mode: host scrubs extension envs (env_clear), so fixture
 /// behavior is selected via --mode=X argument.
 fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
