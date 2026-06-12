@@ -47,6 +47,8 @@ pub fn humanize_api_error(status: u16, body: &str) -> String {
         403 => format!("Access denied ({}). Your account may not have access to this model.", detail),
         404 => format!("Model or endpoint not found ({}). Check the model name with /model.", detail),
         413 => "Request too large. Run /compact to shrink the conversation, or reduce tool output sizes.".to_string(),
+        400 if detail.contains("extended-cache-ttl") =>
+            format!("Bad request ({}) — your account may not support 1h cache TTL; set cache_ttl = 5m in config.", detail),
         400 if detail.contains("prompt is too long") || detail.contains("max_tokens") || detail.contains("context") =>
             format!("Context window exceeded ({}). Run /compact to shrink the conversation.", detail),
         500 | 502 | 503 => format!("Anthropic server error ({} {}). Retries exhausted — usually transient, try again shortly.", status, detail),
@@ -90,6 +92,12 @@ mod tests {
     fn test_humanize_400_context_suggests_compact() {
         let msg = humanize_api_error(400, r#"{"error":{"message":"prompt is too long: 250000 tokens"}}"#);
         assert!(msg.contains("/compact"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_400_cache_ttl_names_config_key() {
+        let msg = humanize_api_error(400, r#"{"error":{"message":"The extended-cache-ttl-2025-04-11 beta is not enabled for this account"}}"#);
+        assert!(msg.contains("cache_ttl = 5m"), "got: {msg}");
     }
 
     #[test]

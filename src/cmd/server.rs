@@ -747,7 +747,7 @@ async fn apply_engine_event_side_effects(
             cache_creation,
             cache_creation_5m,
             cache_creation_1h,
-            ..
+            model: _event_model,
         } => {
             state
                 .add_usage(
@@ -826,9 +826,11 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
         EngineStreamEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_read: _cache_read,
+            cache_creation: _cache_creation,
             cache_creation_5m,
             cache_creation_1h,
-            ..
+            model: _model,
         } => Some(ServerMessage::Usage {
             input_tokens,
             output_tokens,
