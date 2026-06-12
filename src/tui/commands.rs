@@ -380,8 +380,14 @@ pub(super) async fn handle_command(
                 return CommandAction::OpenModels;
             } else {
                 runtime.set_model(arg.to_string());
+                // Persist like the interactive picker (InputAction::ModelsApply)
+                // does — /model <name> previously only set the model in-memory,
+                // so it silently reverted on next launch.
+                let applied = runtime.model().to_string();
+                let _ = synaps_cli::config::write_config_value("model", &applied);
+                app.session.model = applied.clone();
                 app.push_msg(ChatMessage::System(
-                    format!("model set to: {}", runtime.model())
+                    format!("model set to: {} (saved to config)", applied)
                 ));
             }
         }
