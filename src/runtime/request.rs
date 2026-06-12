@@ -107,12 +107,15 @@ mod beta_header_tests {
             cache_ttl: CacheTtl::OneHour,
             ..Default::default()
         };
-        // claude-sonnet-4-6 supports 1M (skip if model table says otherwise).
-        if crate::core::models::model_supports_1m(MODEL) {
-            assert_eq!(
-                ApiMethods::build_beta_header("api_key", &options, MODEL).as_deref(),
-                Some("context-1m-2025-08-07,extended-cache-ttl-2025-04-11"),
-            );
-        }
+        // claude-sonnet-4-6 supports 1M — precondition assert so this test
+        // fails LOUDLY (not silently no-ops) if the model table changes.
+        assert!(
+            crate::core::models::model_supports_1m(MODEL),
+            "fixture model fell out of the 1M table — pick a 1M-capable fixture"
+        );
+        assert_eq!(
+            ApiMethods::build_beta_header("api_key", &options, MODEL).as_deref(),
+            Some("context-1m-2025-08-07,extended-cache-ttl-2025-04-11"),
+        );
     }
 }

@@ -182,7 +182,12 @@ impl ApiMethods {
             result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
         };
 
-        // Log usage for cache analysis
+        // Log usage for cache analysis.
+        // Deliberately aggregates-only: the 5m/1h split parsing and the
+        // silent-downgrade detector live in the streaming path (api.rs) ONLY.
+        // This sync path is near-dead (compaction/title calls); duplicating
+        // the detector here would double the maintenance surface for traffic
+        // that barely exists. Fail-cheap by design.
         if let Some(usage) = json.get("usage") {
             let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
             let output_t = usage["output_tokens"].as_u64().unwrap_or(0);

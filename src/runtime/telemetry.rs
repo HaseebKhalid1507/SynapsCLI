@@ -210,6 +210,18 @@ pub fn write_record(record: &TelemetryRecord) {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    // Size-capped rotation: at >50MB, rename to <path>.1 (clobbering any old
+    // .1) before appending. One generation is enough — this is a diagnostic
+    // log, not an audit trail. Errors silently dropped (best-effort contract).
+    const MAX_BYTES: u64 = 50 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_BYTES {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".1");
+            let _ = std::fs::rename(&path, std::path::PathBuf::from(rotated));
+        }
+    }
+
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(target_os = "linux")]
     const O_NOFOLLOW_FLAG: i32 = 0o400000;
