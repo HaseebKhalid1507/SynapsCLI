@@ -89,6 +89,12 @@ pub struct TurnUsage {
     /// Tokens written into the prompt cache during this turn.
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// 5-minute-TTL share of cache writes. Optional, omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m: Option<u64>,
+    /// 1-hour-TTL share of cache writes. Optional, omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<u64>,
     /// The model identifier used for this turn, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

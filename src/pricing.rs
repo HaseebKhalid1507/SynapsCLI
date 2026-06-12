@@ -82,6 +82,29 @@ pub fn calculate_cost_split(
         + (output_tokens  as f64 / 1_000_000.0) * output_price
 }
 
+/// Split-aware cost for callers holding an aggregate plus an *optional* TTL
+/// split (the shape of `SessionEvent::Usage`). When either split bucket is
+/// present the split rates apply; when both are `None`, the aggregate is
+/// billed at the 5m rate — fail-cheap, never fail-expensive.
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_cost_optional_split(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    cache_creation_5m: Option<u64>,
+    cache_creation_1h: Option<u64>,
+) -> f64 {
+    match (cache_creation_5m, cache_creation_1h) {
+        (None, None) => calculate_cost(model, input_tokens, output_tokens, cache_read, cache_creation),
+        (c5, c1) => calculate_cost_split(
+            model, input_tokens, output_tokens, cache_read,
+            c5.unwrap_or(0), c1.unwrap_or(0),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

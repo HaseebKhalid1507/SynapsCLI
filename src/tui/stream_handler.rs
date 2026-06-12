@@ -111,6 +111,8 @@ pub(super) async fn handle_stream_event(
             output_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
             model: usage_model,
         }) => {
             let model_for_pricing = usage_model.as_deref().unwrap_or(runtime.model());
@@ -119,6 +121,8 @@ pub(super) async fn handle_stream_event(
                 output_tokens,
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
+                cache_creation_5m,
+                cache_creation_1h,
                 model_for_pricing,
                 Some(runtime.context_window()),
             );

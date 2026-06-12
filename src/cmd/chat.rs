@@ -236,9 +236,9 @@ pub async fn run(
                 EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
                     eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
                 }
-                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, model } => {
+                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
                     let model_name = model.as_deref().unwrap_or(runtime.model());
-                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model_name);
+                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
                 }
                 EngineStreamEvent::SteeringDelivered { message } => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);

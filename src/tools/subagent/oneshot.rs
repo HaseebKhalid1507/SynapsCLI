@@ -247,6 +247,8 @@ impl Tool for SubagentTool {
                                 crate::StreamEvent::Session(SessionEvent::Usage {
                                     input_tokens, output_tokens,
                                     cache_read_input_tokens, cache_creation_input_tokens,
+                                    // Subagents report aggregates only — split intentionally unused.
+                                    cache_creation_5m: _, cache_creation_1h: _,
                                     model: _,
                                 }) => {
                                     total_input_tokens += input_tokens;
@@ -332,6 +334,9 @@ impl Tool for SubagentTool {
                         output_tokens: sa_result.output_tokens,
                         cache_read_input_tokens: sa_result.cache_read,
                         cache_creation_input_tokens: sa_result.cache_creation,
+                        // Aggregated across the subagent's turns — no split available.
+                        cache_creation_5m: None,
+                        cache_creation_1h: None,
                         model: Some(sa_result.model),
                     }));
                     let _ = tx.send(crate::StreamEvent::Agent(AgentEvent::SubagentDone {

@@ -73,6 +73,11 @@ pub enum ServerMessage {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        /// Cache-write TTL split — optional, omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_creation_5m: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_creation_1h: Option<u64>,
     },
 
     /// Streaming complete for this turn
@@ -291,6 +296,8 @@ mod tests {
         let msg = ServerMessage::Usage {
             input_tokens: 150,
             output_tokens: 75,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
         };
 
         // Serialize to JSON
@@ -300,13 +307,19 @@ mod tests {
         assert_eq!(json_value["type"], "usage");
         assert_eq!(json_value["input_tokens"], 150);
         assert_eq!(json_value["output_tokens"], 75);
+        // Split fields are skip-if-none: absent from the wire when unknown,
+        // so pre-existing protocol consumers see an unchanged shape.
+        assert!(json_value.get("cache_creation_5m").is_none());
+        assert!(json_value.get("cache_creation_1h").is_none());
 
         // Deserialize back and verify
         let deserialized: ServerMessage = serde_json::from_value(json_value).unwrap();
         match deserialized {
-            ServerMessage::Usage { input_tokens, output_tokens } => {
+            ServerMessage::Usage { input_tokens, output_tokens, cache_creation_5m, cache_creation_1h } => {
                 assert_eq!(input_tokens, 150);
                 assert_eq!(output_tokens, 75);
+                assert_eq!(cache_creation_5m, None);
+                assert_eq!(cache_creation_1h, None);
             }
             _ => panic!("Expected Usage variant"),
         }
