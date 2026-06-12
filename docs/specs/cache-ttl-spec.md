@@ -261,6 +261,36 @@ one-time-per-session `SessionEvent::Notice` —
 already parsed (`sse_types.rs:114–116`); this is a comparison and two
 latches, nothing more.
 
+**Where the split is actually read (v4 amendment, from `534ea80`):** live
+streaming traffic carries the `cache_creation` sub-object **only on
+`message_start`** — `message_delta` usage is aggregate-only. The streaming
+parser therefore captures the split in the `message_start` arm
+(`ParseState.msg_start_cache_5m/_1h`) and the `message_delta` arm — where the
+detector, the `saw_1h_honored` latch, and the telemetry/`SessionEvent::Usage`
+emission all live — uses the delta's own sub-object when present
+(future-proof) and otherwise falls back to the `message_start` capture. Any
+implementation that reads the split exclusively in the delta arm has a dead
+live path: the split is permanently `None`, the detector can never latch or
+fire, and 1h writes get billed at the 5m rate. Synthetic fixtures must mirror
+the live shape (start carries the split, delta omits it) or they will mask
+this. The sync transport has no start/delta dichotomy — the non-streaming
+response body carries `usage.cache_creation` directly.
+
+**Where the split is actually read (v4 amendment, from `534ea80`):** live
+streaming traffic carries the `cache_creation` sub-object **only on
+`message_start`** — `message_delta` usage is aggregate-only. The streaming
+parser therefore captures the split in the `message_start` arm
+(`ParseState.msg_start_cache_5m/_1h`) and the `message_delta` arm — where the
+detector, the `saw_1h_honored` latch, and the telemetry/`SessionEvent::Usage`
+emission all live — uses the delta's own sub-object when present
+(future-proof) and otherwise falls back to the `message_start` capture. Any
+implementation that reads the split exclusively in the delta arm has a dead
+live path: the split is permanently `None`, the detector can never latch or
+fire, and 1h writes get billed at the 5m rate. Synthetic fixtures must mirror
+the live shape (start carries the split, delta omits it) or they will mask
+this. The sync transport has no start/delta dichotomy — the non-streaming
+response body carries `usage.cache_creation` directly.
+
 **Saw-1h-honored condition (v3 amendment):** the naive `1h == 0 && 5m > 0`
 test is the steady-state signature of a *healthy* Hybrid session — on turn 2+
 the 1h prefix is cached (zero 1h writes) while the 5m tail rewrites every
@@ -305,8 +335,10 @@ fail-expensive — cost display is informational, not invoiced).
 
 1. `SessionEvent::Usage` (types.rs:53) gains
    `cache_creation_5m: Option<u64>`, `cache_creation_1h: Option<u64>` —
-   populated at both emission sites in api.rs (`message_delta` at :249+ already
-   has `usage.cache_creation` in scope; `message_start` likewise). `None` when
+   populated at both emission sites in api.rs. *(v4 correction: the v3 text
+   said `message_delta` "already has `usage.cache_creation` in scope" — true
+   at the type level, but live deltas never carry the sub-object; the delta
+   emission must use the `message_start` capture per §3.4.1.)* `None` when
    the API omits the sub-object.
 2. `EngineStreamEvent::Usage` (engine/stream.rs:166) mirrors the two fields.
 3. `SessionState::add_usage` (engine/session.rs:109) — **change the existing
