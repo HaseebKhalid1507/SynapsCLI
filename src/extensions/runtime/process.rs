@@ -1527,10 +1527,9 @@ impl ProcessExtension {
                     retry_id,
                 )
                 .await
-                .map(|value| {
+                .inspect(|_| {
                     // Retry succeeded post-restart — also a real recovery.
                     self.restart_count.store(0, Ordering::Relaxed);
-                    value
                 })
                 .map_err(|retry_error| {
                     format!("{}; retry after restart failed: {}", first_error, retry_error)

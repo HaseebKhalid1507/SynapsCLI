@@ -1060,9 +1060,27 @@ mod tests {
 
     // ───────────────────── slice 3: typed-path additions ─────────────────────
 
+    /// Tuple of every observable ParseState field, in declaration order:
+    /// (accumulated_content, current_text, current_tool_name, current_tool_id,
+    /// current_tool_input_json, in_tool_use, current_thinking,
+    /// current_thinking_signature, in_thinking, telem_msg_id, telem_stop_reason).
+    type StateSnapshot = (
+        Vec<Value>,
+        String,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+
     /// Snapshot of every observable ParseState field, for bit-identical
     /// no-state-change assertions.
-    fn snapshot(s: &ParseState) -> (Vec<Value>, String, String, String, String, bool, String, String, bool, Option<String>, Option<String>) {
+    fn snapshot(s: &ParseState) -> StateSnapshot {
         (
             s.accumulated_content.clone(),
             s.current_text.clone(),
