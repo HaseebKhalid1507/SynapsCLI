@@ -63,7 +63,9 @@ def main():
         if method == "initialize":
             send_response(msg, {"protocol_version": 1, "capabilities": {"capabilities": [{"kind": "fixture", "name": "Fixture Capability", "permissions": []}]}})
         elif method == "info.get":
-            if os.environ.get("INFO_FIXTURE_DISABLE", "0") == "1":
+            # argv check: host scrubs extension envs (env_clear), so the
+            # disable flag must arrive as an argument, not an env var.
+            if "--no-info" in sys.argv or os.environ.get("INFO_FIXTURE_DISABLE", "0") == "1":
                 send_response(msg, error={"code": -32601, "message": "method not found"})
             else:
                 send_response(msg, info_payload())

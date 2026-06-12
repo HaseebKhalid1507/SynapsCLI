@@ -58,9 +58,14 @@ def call_synaps(method, params):
 
 
 def run_initialize(request):
+    # Args take precedence over env: the host scrubs the environment of
+    # extension processes (env_clear in process.rs), so env-based fixture
+    # control never reaches us when spawned by the manager.
     key = os.environ.get("CONFIG_FIXTURE_KEY", "backend")
     value = os.environ.get("CONFIG_FIXTURE_VALUE", "cpu")
     do_set = os.environ.get("CONFIG_FIXTURE_SET", "1") != "0"
+    if "--no-set" in sys.argv:
+        do_set = False
 
     if do_set:
         set_resp = call_synaps("config.set", {"key": key, "value": value})

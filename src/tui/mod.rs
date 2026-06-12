@@ -69,7 +69,11 @@ pub async fn run(
         app.total_output_tokens = boot.total_output_tokens;
         app.session_cost = boot.session_cost;
         app.abort_context = boot.abort_context;
-        rebuild_display_messages(&app.api_messages.clone(), &mut app);
+        // mem::take avoids deep-cloning the full history just to satisfy
+        // the borrow checker (P5 in REVIEW.md).
+        let msgs = std::mem::take(&mut app.api_messages);
+        rebuild_display_messages(&msgs, &mut app);
+        app.api_messages = msgs;
         app.push_msg(ChatMessage::System(format!("resumed session {}", boot.session.id)));
         if let Some(ref info) = boot.continue_info {
             if let Some(ref via) = info.resolved_via {
@@ -85,6 +89,27 @@ pub async fn run(
     };
     app.keybinds = Some(keybind_registry.clone());
     app.last_turn_context_window = runtime.context_window();
+
+    // Surface config parse warnings once at startup (unknown keys, bad values).
+    for w in &config.warnings {
+        app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
+    }
+
+    // First-run guidance: no Anthropic credentials and no provider keys means
+    // the first message will fail — tell the user up front instead.
+    {
+        let has_anthropic = synaps_cli::auth::load_auth()
+            .ok()
+            .flatten()
+            .map(|a| a.anthropic.auth_type == "oauth" && !a.anthropic.access.is_empty())
+            .unwrap_or(false)
+            || std::env::var("ANTHROPIC_API_KEY").is_ok();
+        if !has_anthropic && config.provider_keys.is_empty() {
+            app.push_msg(ChatMessage::System(
+                "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or set ANTHROPIC_API_KEY in your environment\n   • or add `provider.<name> = <key>` to ~/.synaps-cli/config (groq, openrouter, …) and pick with /model".to_string(),
+            ));
+        }
+    }
 
     if mcp_server_count > 0 {
         tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
@@ -113,7 +138,7 @@ pub async fn run(
     // Legacy sidecar key migration
     migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
-    if !no_extensions {
+    if !boot.no_extensions {
         app.extension_loader_running = true;
         app.toasts.upsert(toast::Toast::new("extension-loader", "Discovering extensions…")
             .titled("Extensions")
@@ -128,10 +153,22 @@ pub async fn run(
     // on_session_start hook already fired by engine::setup::boot()
 
     // ── Event loop ──
+    let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
-        let elapsed = last_frame.elapsed();
-        last_frame = Instant::now();
-        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+        // Only draw when something actually changed. During streaming, coalesce
+        // redraws to ~60fps — deltas arrive far faster than the eye can read,
+        // and per-delta full-frame rebuilds are what used to burn a core.
+        // 16ms matches the tick branch, which guarantees a throttled frame
+        // flushes promptly. (Was 33ms/30fps; draw-path alloc surgery in
+        // 40c2ce4 made 60fps affordable.)
+        let throttle = std::time::Duration::from_millis(16);
+        if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
+            app.needs_redraw = false;
+            last_draw = Instant::now();
+            let elapsed = last_frame.elapsed();
+            last_frame = Instant::now();
+            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+        }
 
         tokio::select! {
 
@@ -164,9 +201,7 @@ pub async fn run(
                             }
                         }
                         app.model_health.insert(key, (status, ms));
-                        let elapsed = last_frame.elapsed();
-                        last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                        app.request_redraw();
                     }
                     None => {
                         // All ping tasks done (tx dropped) — stop printing
@@ -181,6 +216,7 @@ pub async fn run(
                     if let Some(state) = app.models.as_mut() {
                         models::set_expanded_models(state, &provider_key, models_result);
                     }
+                    app.request_redraw();
                 }
             }
 
@@ -192,11 +228,13 @@ pub async fn run(
                     app.extension_loader_running = false;
                     app.toasts.dismiss("extension-loader");
                 }
+                app.request_redraw();
             }
 
             // ── Widget events from background extension notification watchers ──
             Some(widget_event) = app.widget_rx.recv() => {
                 handle_widget_event(&mut app, widget_event);
+                app.request_redraw();
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -221,6 +259,7 @@ pub async fn run(
                 let (pid, sidecar_event) = sidecar_event;
                 if let Some(event) = sidecar_event {
                     self::sidecar::handle_event(&mut app, &pid, event);
+                    app.request_redraw();
                 }
             }
 
@@ -274,8 +313,12 @@ pub async fn run(
                 }
             }
 
-            // ── Tick: animations + spinner (~60fps) ──
+            // ── Tick: animations + spinner (~60fps when active) ──
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+                // Active animations/effects always need a redraw each tick
+                if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() {
+                    app.request_redraw();
+                }
                 secret_prompts.poll_requests(&secret_prompt_rx);
                 if app.toasts.tick() {
                     app.invalidate();
@@ -314,10 +357,12 @@ pub async fn run(
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
+                    app.request_redraw();
                 }
                 if let Some(ref mut t) = app.logo_dismiss_t {
                     *t += 0.04;
                     if *t >= 1.0 { app.logo_dismiss_t = None; }
+                    app.request_redraw();
                 }
                 if app.advance_animations() {
                     app.invalidate();
@@ -325,10 +370,7 @@ pub async fn run(
                 if let Some(msg) = app.check_gamba_exited() {
                     terminal.clear().ok();
                     app.push_msg(ChatMessage::System(msg));
-                    app.invalidate();
-                    let elapsed = last_frame.elapsed();
-                    last_frame = Instant::now();
-                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                    app.invalidate(); // invalidate already sets needs_redraw
                 }
                 // Poll background compaction task
                 if app.compact_task.as_ref().is_some_and(|t| t.is_finished()) {
@@ -441,12 +483,16 @@ pub async fn run(
                                 }
                                 _ => {}
                             }
+                            app.request_redraw();
                             continue;
                         }
                         let is_streaming = app.streaming;
                         let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
                         let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
                         drop(kb_guard);
+                        // Input events (keys, mouse, paste, resize) almost always
+                        // change visible state (cursor, input buffer, scroll).
+                        app.request_redraw();
                         match action {
                             InputAction::None => {}
                             InputAction::HelpFindOutcome => {}
@@ -1704,9 +1750,6 @@ pub async fn run(
                                     terminal.clear().ok();
                                     app.push_msg(ChatMessage::System(msg));
                                     app.invalidate();
-                                    let elapsed = last_frame.elapsed();
-                                    last_frame = Instant::now();
-                                    let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                                 }
                             }
                         }
@@ -1720,9 +1763,6 @@ pub async fn run(
                                 terminal.clear().ok();
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
-                                let elapsed = last_frame.elapsed();
-                                last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
@@ -2022,6 +2062,7 @@ fn pick_display_name_for_plugin(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    use serial_test::serial;
     use synaps_cli::skills::registry::LifecycleClaim;
 
     fn make_test_home(subdir: &str) -> std::path::PathBuf {
@@ -2053,6 +2094,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_copies_legacy_into_namespaced_key() {
         let home = make_test_home("copy-into-namespaced");
         let cfg = home.join(".synaps-cli/config");
@@ -2071,6 +2113,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_skips_when_new_key_already_set() {
         let home = make_test_home("skip-existing");
         let cfg = home.join(".synaps-cli/config");
@@ -2092,6 +2135,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_is_noop_when_legacy_unset() {
         let home = make_test_home("noop-no-legacy");
         let cfg = home.join(".synaps-cli/config");
@@ -2109,6 +2153,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_skips_claim_without_settings_category() {
         let home = make_test_home("skip-no-category");
         let cfg = home.join(".synaps-cli/config");
@@ -2125,6 +2170,7 @@ mod migration_tests {
     }
 
     #[test]
+    #[serial]
     fn migrate_handles_multiple_claims_in_one_pass() {
         let home = make_test_home("multi-claim");
         let cfg = home.join(".synaps-cli/config");

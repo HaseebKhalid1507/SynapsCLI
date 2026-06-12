@@ -5,6 +5,16 @@ use crate::tools::shell::config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+static IDENTITY: OnceLock<String> = OnceLock::new();
+
+const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
+
+/// Returns the configured identity string for the system prompt preamble.
+/// Falls back to the default Claude Code identity if not set in config.
+/// Initialized by `load_config()` — safe to call anytime after boot.
+pub fn get_identity() -> String {
+    IDENTITY.get().cloned().unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+}
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.
 /// Empty if `load_config()` hasn't been called. The registry falls back to
@@ -154,8 +164,11 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub telemetry: String,             // off | basic | full (default off)
+    pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
     pub theme: Option<String>,
     pub agent_name: Option<String>,
+    pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
@@ -164,6 +177,9 @@ pub struct SynapsConfig {
     pub bridge: BridgeConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
+    /// Non-fatal problems found while parsing the config file (unknown keys,
+    /// unparseable values). Surfaced once at startup — never block boot.
+    pub warnings: Vec<String>,
 }
 
 impl Default for SynapsConfig {
@@ -178,8 +194,11 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            telemetry: "off".to_string(),
+            cache_diagnostics: false,
             theme: None,
             agent_name: None,
+            identity: None,
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
@@ -188,8 +207,44 @@ impl Default for SynapsConfig {
             bridge: BridgeConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
+            warnings: Vec::new(),
         }
     }
+}
+
+/// Known top-level config keys — used for unknown-key warnings + did-you-mean.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "model", "thinking", "compaction_model", "context_window", "max_tool_output",
+    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
+    "telemetry", "cache_diagnostics", "theme", "agent_name", "identity",
+    "disabled_plugins", "favorite_models", "disabled_skills",
+];
+
+/// Simple Levenshtein distance for did-you-mean suggestions.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Closest known key within edit distance 2, for typo suggestions.
+fn did_you_mean(key: &str) -> Option<&'static str> {
+    KNOWN_CONFIG_KEYS
+        .iter()
+        .map(|k| (*k, levenshtein(key, k)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(k, _)| k)
 }
 
 
@@ -356,7 +411,12 @@ pub fn load_config() -> SynapsConfig {
         let val = val.trim();
         match key {
             "model" => config.model = Some(val.to_string()),
-            "thinking" => config.thinking_budget = parse_thinking_budget(val),
+            "thinking" => {
+                config.thinking_budget = parse_thinking_budget(val);
+                if config.thinking_budget.is_none() {
+                    config.warnings.push(format!("thinking = {val} — expected low|medium|high|xhigh|adaptive or a token count; thinking disabled"));
+                }
+            }
             "compaction_model" => config.compaction_model = Some(val.to_string()),
             "context_window" => {
                 let parsed = match val {
@@ -364,16 +424,22 @@ pub fn load_config() -> SynapsConfig {
                     "1m" | "1M" => Some(1_000_000),
                     _ => val.parse::<u64>().ok(),
                 };
+                if parsed.is_none() {
+                    config.warnings.push(format!("context_window = {val} — expected 200k, 1m, or a token count; ignored"));
+                }
                 config.context_window = parsed;
             }
             "max_tool_output" => {
-                if let Ok(size) = val.parse::<usize>() {
-                    config.max_tool_output = size;
+                match val.parse::<usize>() {
+                    Ok(size) => config.max_tool_output = size,
+                    Err(_) => config.warnings.push(format!("max_tool_output = {val} — not a number; using {}", config.max_tool_output)),
                 }
             }
             "bash_timeout" => {
-                if let Ok(timeout) = val.parse::<u64>() {
-                    config.bash_timeout = timeout;
+                match val.parse::<u64>() {
+                    Ok(t) if t >= 1 => config.bash_timeout = t,
+                    Ok(_) => config.warnings.push(format!("bash_timeout = {val} — below minimum (1s); using {}", config.bash_timeout)),
+                    Err(_) => config.warnings.push(format!("bash_timeout = {val} — not a number; using {}", config.bash_timeout)),
                 }
             }
             "bash_max_timeout" => {
@@ -391,8 +457,13 @@ pub fn load_config() -> SynapsConfig {
                     config.api_retries = retries;
                 }
             }
+            "telemetry" => config.telemetry = val.to_string(),
+            "cache_diagnostics" => {
+                config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
+            }
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
+            "identity" => config.identity = Some(val.to_string()),
             "disabled_plugins" => {
                 config.disabled_plugins = parse_comma_list(val);
             }
@@ -414,8 +485,17 @@ pub fn load_config() -> SynapsConfig {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
                     config.keybinds.insert(keybind_key.to_string(), val.to_string());
+                } else if key.contains('.') {
+                    // Dotted keys are namespaced (plugin/extension config, e.g.
+                    // `knowledge.jawz_notes`). Plugins define their own keys —
+                    // not ours to police. Silently preserved.
+                } else {
+                    // Unknown top-level key — warn with a did-you-mean if close.
+                    match did_you_mean(key) {
+                        Some(suggestion) => config.warnings.push(format!("unknown key '{key}' (did you mean '{suggestion}'?)")),
+                        None => config.warnings.push(format!("unknown key '{key}' — ignored")),
+                    }
                 }
-                // Other unknown keys silently ignored
             }
         }
     }
@@ -431,6 +511,10 @@ pub fn load_config() -> SynapsConfig {
     // Publish provider keys to the process-wide cache for the API router.
     // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
     let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
+
+    // Publish identity to the process-wide cache for API system prompt preamble.
+    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
+    let _ = IDENTITY.set(identity_val);
 
     config
 }
@@ -546,6 +630,44 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_levenshtein_basics() {
+        assert_eq!(levenshtein("model", "model"), 0);
+        assert_eq!(levenshtein("modle", "model"), 2);
+        assert_eq!(levenshtein("them", "theme"), 1);
+    }
+
+    #[test]
+    fn test_did_you_mean_close_typos() {
+        assert_eq!(did_you_mean("modle"), Some("model"));
+        assert_eq!(did_you_mean("them"), Some("theme"));
+        assert_eq!(did_you_mean("thinkng"), Some("thinking"));
+        assert_eq!(did_you_mean("completely_unrelated_key"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_warnings_unknown_key_and_bad_values() {
+        let home = std::env::temp_dir().join(format!("synaps-warn-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "modle = claude-opus-4-6\nthinking = hgih\nbash_timeout = 0\nknowledge.jawz_notes = ~/Jawz/notes\ncustom.plugin.key = 42\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            // Dotted (namespaced) keys must NOT warn — plugins own those.
+            assert_eq!(config.warnings.len(), 3, "warnings: {:?}", config.warnings);
+            assert!(!config.warnings.iter().any(|w| w.contains("knowledge")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("did you mean 'model'")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("thinking")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("below minimum")), "{:?}", config.warnings);
+            // Bad values fall back to defaults
+            assert_eq!(config.bash_timeout, 30);
+            assert_eq!(config.thinking_budget, None);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn test_parse_thinking_budget() {

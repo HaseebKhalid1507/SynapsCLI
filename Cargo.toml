@@ -1,6 +1,6 @@
 [package]
 name = "synaps"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ rust-version = "1.80"
 [dependencies]
 arc-swap = "1"
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 bytes = "1"
 memchr = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -65,6 +65,7 @@ dirs = "5"
 libc = "0.2"
 zeroize = "1.8.2"
 tempfile = "3"
+clap_complete = "4.5.67"
 
 [dev-dependencies]
 serial_test = "3.4.0"
@@ -88,6 +89,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Dev profile: line-tables-only keeps backtraces useful while cutting
+# debuginfo codegen/link time substantially (REVIEW.md A1 quick win).
+[profile.dev]
+debug = "line-tables-only"
 
 # The profile that 'dist' will build with
 [profile.dist]

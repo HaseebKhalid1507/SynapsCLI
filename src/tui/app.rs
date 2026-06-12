@@ -86,6 +86,7 @@ pub(crate) struct App {
     /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
     /// trio into a single invariant-preserving field — impossible to desync.
     pub(crate) line_cache: Option<(usize, Vec<Line<'static>>)>,
+    pub(crate) needs_redraw: bool,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
@@ -220,6 +221,7 @@ impl App {
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
             line_cache: None,
+            needs_redraw: true,
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
@@ -429,6 +431,7 @@ impl App {
         if self.scroll_pinned {
             self.scroll_back = 0;
         }
+        // New visible content — rebuild lines + redraw on next loop pass.
         self.invalidate();
     }
 
@@ -436,6 +439,13 @@ impl App {
     /// Call this after any mutation that changes how `messages` renders.
     pub(crate) fn invalidate(&mut self) {
         self.line_cache = None;
+        self.needs_redraw = true;
+    }
+
+    /// Request a redraw without invalidating the line cache (e.g. for
+    /// panel-only changes like spinner/timer updates, scroll, cursor blink).
+    pub(crate) fn request_redraw(&mut self) {
+        self.needs_redraw = true;
     }
 
     /// Advance spinner/animation state.

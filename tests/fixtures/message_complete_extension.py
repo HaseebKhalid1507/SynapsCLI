@@ -4,6 +4,10 @@ import os
 import sys
 
 LOG_PATH = os.environ.get("SYNAPS_MESSAGE_COMPLETE_LOG")
+if not LOG_PATH:
+    # Host scrubs extension envs (env_clear) — fall back to the conventional
+    # location: <plugin_dir>/message-complete.jsonl above this script.
+    LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "message-complete.jsonl")
 
 
 def read_message():

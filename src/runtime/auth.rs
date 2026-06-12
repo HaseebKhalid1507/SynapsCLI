@@ -47,7 +47,7 @@ impl AuthMethods {
         let creds = crate::auth::ensure_fresh_token(client)
             .await
             .map_err(|e| RuntimeError::Auth(format!(
-                "Token refresh failed: {}. Run `login` to re-authenticate.", e
+                "Token refresh failed: {}. Run `synaps login` to re-authenticate.", e
             )))?;
 
         // Update shared auth state so all clones (including spawned stream tasks)

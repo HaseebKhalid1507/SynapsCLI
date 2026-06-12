@@ -238,6 +238,16 @@ impl Drop for PtyHandle {
     fn drop(&mut self) {
         if self.alive.load(Ordering::SeqCst) {
             let _ = self.killer.kill();
+            // Reap the child after kill — without a wait(), the SIGKILL'd
+            // child lingers as a zombie until the parent process exits.
+            // SIGKILL takes effect near-instantly; bound the reap attempts
+            // so Drop can never hang on a pathological child.
+            for _ in 0..5 {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break, // reaped (or unreapable)
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
         }
     }
 }
