@@ -255,9 +255,65 @@ pub fn latest_session() -> std::io::Result<Session> {
 }
 
 /// List all sessions, sorted by most recently updated.
-/// Uses a lightweight struct to skip deserializing the full message history.
+///
+/// Reads only the metadata HEADER of each session file (see
+/// [`read_session_header`]) — never the message history. Used by the session
+/// resolvers (by name/id). For the capped `/sessions` display prefer
+/// [`list_recent_sessions`], which reads only the N most-recent headers.
 pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
-    /// Lightweight struct for listing — skips api_messages entirely.
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut sessions: Vec<SessionInfo> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            if let Some(info) = parse_session_header(&path) {
+                sessions.push(info);
+            }
+        }
+    }
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+    Ok(sessions)
+}
+
+/// The `limit` most-recently-modified sessions (by file mtime), most-recent
+/// first. Sorts the directory entries by mtime WITHOUT parsing, then reads only
+/// the top `limit` headers — so `/sessions` is O(limit) reads instead of
+/// O(#sessions). mtime is an exact proxy for `updated_at` (the file is rewritten
+/// on every save).
+pub fn list_recent_sessions(limit: usize) -> std::io::Result<Vec<SessionInfo>> {
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                files.push((mtime, path));
+            }
+        }
+    }
+    files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    files.truncate(limit);
+    let mut sessions: Vec<SessionInfo> = Vec::new();
+    for (_, path) in files {
+        if let Some(info) = parse_session_header(&path) {
+            sessions.push(info);
+        }
+    }
+    Ok(sessions)
+}
+
+/// Read + parse just the metadata header of one session file into a
+/// [`SessionInfo`] (no message history). `message_count` is left 0 — it isn't
+/// parsed in the header read; use [`Session::info`] when an exact count matters.
+fn parse_session_header(path: &std::path::Path) -> Option<SessionInfo> {
     #[derive(Deserialize)]
     struct SessionMetadata {
         id: String,
@@ -270,39 +326,59 @@ pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
         updated_at: DateTime<Utc>,
         #[serde(default)]
         session_cost: f64,
-        #[serde(default)]
-        api_messages: Vec<serde::de::IgnoredAny>,
     }
+    let header = read_session_header(path)?;
+    let meta: SessionMetadata = serde_json::from_str(&header).ok()?;
+    Some(SessionInfo {
+        id: meta.id,
+        title: meta.title,
+        name: meta.name,
+        model: meta.model,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        session_cost: meta.session_cost,
+        message_count: 0,
+    })
+}
 
-    let dir = sessions_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+/// Read just the metadata header of a session file — everything BEFORE the
+/// (potentially multi-MB) `"api_messages"` array — and return it as a complete,
+/// parseable JSON object string. Reads in bounded chunks and STOPS as soon as
+/// the `api_messages` key is found, so it never reads or tokenizes the message
+/// history. Falls back to the whole file if the key isn't found (small/new
+/// sessions). This is what keeps `list_sessions()` O(#sessions) instead of
+/// O(total bytes on disk).
+fn read_session_header(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    const KEY: &[u8] = b"\"api_messages\"";
+    const MAX_HEADER: usize = 256 * 1024; // safety cap if the key is never found
 
-    let mut sessions: Vec<SessionInfo> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&content) {
-                    sessions.push(SessionInfo {
-                        id: meta.id,
-                        title: meta.title,
-                        name: meta.name,
-                        model: meta.model,
-                        created_at: meta.created_at,
-                        updated_at: meta.updated_at,
-                        session_cost: meta.session_cost,
-                        message_count: meta.api_messages.len(),
-                    });
-                }
-            }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    let mut cut: Option<usize> = None;
+    while buf.len() <= MAX_HEADER {
+        let n = file.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(KEY.len()).position(|w| w == KEY) {
+            cut = Some(pos);
+            break;
         }
     }
 
-    sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
-    Ok(sessions)
+    let end = cut.unwrap_or(buf.len());
+    let trimmed = String::from_utf8_lossy(&buf[..end]);
+    let mut s = trimmed.trim_end().to_string();
+    if s.ends_with(',') {
+        s.pop();
+    }
+    if !s.ends_with('}') {
+        s.push('}');
+    }
+    Some(s)
 }
 
 fn sessions_dir() -> PathBuf {

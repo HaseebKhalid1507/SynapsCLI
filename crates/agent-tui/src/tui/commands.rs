@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
+use synaps_cli::{Runtime, Session, list_recent_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -454,7 +454,7 @@ pub(super) async fn handle_command(
             }
         }
         "sessions" => {
-            match list_sessions() {
+            match list_recent_sessions(20) {
                 Ok(sessions) if sessions.is_empty() => {
                     app.push_msg(ChatMessage::System("no saved sessions".to_string()));
                 }
