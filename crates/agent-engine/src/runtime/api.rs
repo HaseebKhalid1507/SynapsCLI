@@ -614,6 +614,15 @@ impl ApiMethods {
 
         tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
+        // Serialize the body once up-front; each retry attempt reuses the same
+        // bytes via a cheap `Bytes::clone()` (refcount bump, no copy). Previously
+        // we called `req.json(&body).send()` per attempt, which re-ran
+        // `serde_json::to_vec(&body)` over the entire conversation on every
+        // 429 retry — wasted work since the payload is identical.
+        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+            .map_err(|e| RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e)))?
+            .into();
+
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
         //
         // 429 (rate-limit) gets its own higher budget: OAuth windows can last
@@ -656,7 +665,7 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.json(&body).send().await {
+                match req.body(body_bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
