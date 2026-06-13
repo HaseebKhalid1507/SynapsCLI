@@ -84,43 +84,6 @@ pub(crate) fn order_sidecar_pills(
     keys.into_iter().map(|(p, _)| p.clone()).collect()
 }
 
-/// Build sidecar pill spans for all active sidecars, ordered by
-/// importance (desc) then display_name alphabetical (Phase 8 8B.3).
-///
-/// Each segment is preceded by a vertical separator so the caller can
-/// concatenate the result onto a status line. Returns an empty vec
-/// when no sidecars are active.
-///
-/// Used in tests; render_frame uses the `SidecarPillSnap` projection instead.
-#[allow(dead_code)]
-pub(crate) fn sidecar_pill_spans(
-    app: &super::app::App,
-    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
-) -> Vec<Span<'static>> {
-    if app.sidecars.is_empty() {
-        return Vec::new();
-    }
-    let claims = registry.lifecycle_claims();
-    let inputs: Vec<(String, Option<String>)> = app
-        .sidecars
-        .iter()
-        .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
-        .collect();
-    let order = order_sidecar_pills(&inputs, &claims);
-    let mut spans = Vec::with_capacity(order.len() * 2);
-    for pid in &order {
-        let Some(state) = app.sidecars.get(pid) else {
-            continue;
-        };
-        spans.push(Span::styled(
-            "\u{2502}",
-            Style::default().fg(THEME.load().border),
-        ));
-        spans.push(sidecar_pill_segment(state, app.spinner_frame));
-    }
-    spans
-}
-
 /// Pure helper backing [`sidecar_pill_span`] — returns the rendered
 /// text only. Lives separately so tests can exercise the label logic
 /// without spawning a real sidecar process or mounting the full App.
@@ -150,23 +113,6 @@ pub(crate) fn sidecar_pill_text(
 #[cfg(test)]
 mod sidecar_pill_tests {
     use super::*;
-    use synaps_cli::Session;
-
-    fn fresh_app() -> super::super::app::App {
-        super::super::app::App::new(Session::new("test", "medium", None))
-    }
-
-    fn empty_registry() -> std::sync::Arc<synaps_cli::skills::registry::CommandRegistry> {
-        std::sync::Arc::new(
-            synaps_cli::skills::registry::CommandRegistry::new_with_plugins(&[], vec![], vec![]),
-        )
-    }
-
-    #[test]
-    fn pill_returns_empty_when_no_sidecars() {
-        let app = fresh_app();
-        assert!(sidecar_pill_spans(&app, &empty_registry()).is_empty());
-    }
 
     #[test]
     fn pill_uses_display_name_when_set() {
@@ -282,51 +228,6 @@ mod sidecar_pill_tests {
 use super::app::{App, SPINNER_FRAMES};
 use super::markdown::format_tokens;
 use super::theme::THEME;
-
-/// Render toasts from a live [`ToastProvider`] reference. Kept for potential
-/// future use; `render_frame` uses [`render_toasts_from_snap`] instead.
-#[allow(dead_code)]
-fn render_toasts(frame: &mut ratatui::Frame<'_>, provider: &super::toast::ToastProvider) {
-    let area = frame.area();
-    for toast in provider.visible() {
-        let lines = super::toast::toast_lines(toast);
-        let content_width = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-            .max()
-            .unwrap_or(1) as u16;
-        let width = content_width
-            .saturating_add(4)
-            .clamp(18, area.width.min(64));
-        let height = (lines.len() as u16)
-            .saturating_add(2)
-            .clamp(3, area.height.max(1));
-        let rect = super::toast::toast_rect(area, width, height, toast.position);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(THEME.load().border_active))
-            .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(Clear, rect);
-        // Rich lines carry their own per-span styling — don't override fg.
-        // Plain lines get the default help_fg color.
-        // Rich content also needs trim=false to preserve pixel art spacing.
-        let paragraph = if toast.has_rich_lines() {
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: false })
-                .alignment(ratatui::layout::Alignment::Center)
-                .style(Style::default().bg(THEME.load().bg))
-        } else {
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: true })
-                .style(Style::default().fg(THEME.load().help_fg))
-        };
-        frame.render_widget(paragraph, rect);
-    }
-}
 
 /// Generate a bash execution trace animation string and its pulsing color.
 /// Returns (trace_string, Color) for use in Span styling.
@@ -474,7 +375,7 @@ pub(crate) fn render_active_tasks_line<'a>(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Step 1 split: build_render_model + render_frame
+// Render split: build_render_model (main task) + render_frame (render thread)
 // ══════════════════════════════════════════════════════════════════════════════
 
 use super::render_model::{
@@ -729,7 +630,6 @@ pub(crate) fn build_render_model(
         visible_range: (start, end),
         selection,
         messages_empty: app.messages.is_empty(),
-        msg_inner_rect: msg_inner,
         logo_build_t: app.logo_build_t,
         logo_dismiss_t: app.logo_dismiss_t,
         subagents,
@@ -758,10 +658,9 @@ pub(crate) fn build_render_model(
 
 /// Render one frame from a [`RenderModel`] snapshot.
 ///
-/// This is the **render-side step**.  In Step 2 it runs on the dedicated
-/// render `std::thread` — the thread maintains its own monotonic clock for
-/// tachyonfx effect timing so main-loop pressure never compresses animation
-/// time.
+/// Runs on the dedicated render `std::thread`, which maintains its own
+/// monotonic clock for tachyonfx effect timing so main-loop pressure never
+/// compresses animation time.
 ///
 /// **Invariant**: this function takes NO `&App` and accesses NO `App` field.
 /// All data comes from `model`.  If it compiles without `App`, snapshot

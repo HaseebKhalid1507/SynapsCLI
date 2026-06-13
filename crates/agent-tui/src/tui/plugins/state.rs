@@ -22,18 +22,10 @@ pub enum RightRow<'a> {
     },
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Focus {
     Left,
     Right,
-}
-
-impl Clone for Focus {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Left => Self::Left,
-            Self::Right => Self::Right,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
