@@ -614,22 +614,30 @@ impl ApiMethods {
 
         tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-        // Retry loop for transient API errors (429, 529, 500, 502, 503)
+        // Retry loop for transient API errors (429, 529, 500, 502, 503).
+        //
+        // 429 (rate-limit) gets its own higher budget: OAuth windows can last
+        // minutes, so we honour the `retry-after` / reset headers and keep
+        // trying rather than dying after 3 attempts. Other transient errors
+        // (500/502/503/529) stay on the user-configured `max_retries` budget.
+        const MAX_429_RETRIES: u32 = 8;
         let response = {
             let mut last_err = String::new();
+            let mut last_status: Option<u16> = None;
+            let mut last_reset_hint: Option<String> = None;
+            #[allow(unused_assignments)]
             let mut response = None;
+            // Separate counters so 429s don't burn the tight server-error budget.
+            let mut non_429_attempts: u32 = 0;
+            let mut attempt: u32 = 0; // total attempts (0-based, for delay calc)
 
-            for attempt in 0..=max_retries {
+            loop {
                 if attempt > 0 {
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1)); // 1s, 2s, 4s
-                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    // Display-only notice — never lands in message history.
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!("⏳ API error, retrying ({}/{})…", attempt, max_retries))));
-                    tokio::time::sleep(delay).await;
-
-                    if cancel.is_cancelled() {
-                        return Err(RuntimeError::Canceled);
-                    }
+                    // Sleep was already computed and stored in last_err context;
+                    // delay is recomputed here from the empty header map if we
+                    // came from a network error path (no headers available).
+                    // For header-aware delays we sleep in the error arm below.
+                    // Nothing to do here — sleep already happened.
                 }
 
                 // Rebuild request (consumed on send)
@@ -655,23 +663,101 @@ impl ApiMethods {
                             response = Some(resp);
                             break;
                         }
+
+                        let is_429    = status.as_u16() == 429;
                         let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+
+                        // Capture headers before consuming the body.
+                        let (delay, from_hdr) = telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
+                        let reset_hint = if from_hdr {
+                            Some(format!("{}s", delay.as_secs()))
+                        } else {
+                            None
+                        };
+
                         let error_text = resp.text().await.unwrap_or_default();
-                        if !is_retryable || attempt == max_retries {
-                            return Err(RuntimeError::ApiStatus(crate::core::error::humanize_api_error(status.as_u16(), &error_text)));
+
+                        // Decide whether we've exhausted retries for this error class.
+                        let retry_exhausted = if is_429 {
+                            attempt >= MAX_429_RETRIES
+                        } else {
+                            non_429_attempts >= max_retries
+                        };
+
+                        if !is_retryable || retry_exhausted {
+                            let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
+                            return Err(RuntimeError::ApiStatus(
+                                crate::core::error::humanize_api_error_with_reset(
+                                    status.as_u16(),
+                                    &error_text,
+                                    hint,
+                                )
+                            ));
                         }
+
+                        last_status = Some(status.as_u16());
+                        last_reset_hint = reset_hint.clone();
                         last_err = format!("{}: {}", status, error_text);
+
+                        if !is_429 {
+                            non_429_attempts += 1;
+                        }
+
+                        // Emit user-visible notice with specific timing when known.
+                        let budget = if is_429 { MAX_429_RETRIES } else { max_retries };
+                        let retry_num = if is_429 { attempt + 1 } else { non_429_attempts };
+                        let notice = if is_429 {
+                            if let Some(ref hint) = reset_hint {
+                                format!("⚠ Rate limited — resuming in {} ({}/{})", hint, retry_num, budget)
+                            } else {
+                                format!("⚠ Rate limited — retrying ({}/{})", retry_num, budget)
+                            }
+                        } else {
+                            format!("⏳ API error, retrying ({}/{})…", retry_num, budget)
+                        };
+                        tracing::warn!("API retry after {:?}: {} — {}", delay, notice, last_err);
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+
+                        tokio::time::sleep(delay).await;
+
+                        if cancel.is_cancelled() {
+                            return Err(RuntimeError::Canceled);
+                        }
                     }
                     Err(e) => {
-                        if attempt == max_retries {
+                        non_429_attempts += 1;
+                        if non_429_attempts > max_retries {
                             return Err(RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)));
                         }
                         last_err = e.to_string();
+                        last_status = None;
+                        // No headers on network error — plain exponential back-off.
+                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
+                        tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                            format!("⏳ API error, retrying ({}/{})…", non_429_attempts, max_retries)
+                        )));
+                        tokio::time::sleep(delay).await;
+                        if cancel.is_cancelled() {
+                            return Err(RuntimeError::Canceled);
+                        }
                     }
                 }
+
+                attempt += 1;
             }
 
-            response.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
+            response.ok_or_else(|| {
+                let hint = last_reset_hint.as_deref();
+                let status = last_status.unwrap_or(0);
+                if status == 429 {
+                    RuntimeError::ApiStatus(
+                        crate::core::error::humanize_api_error_with_reset(429, &last_err, hint)
+                    )
+                } else {
+                    RuntimeError::Tool(format!("API failed after retries: {}", last_err))
+                }
+            })?
         };
 
         // ═══ TELEMETRY: capture headers before consuming the response body ═══

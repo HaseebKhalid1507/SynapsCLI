@@ -115,18 +115,19 @@ impl ApiMethods {
             body["system"] = system;
         }
 
-        // Retry loop for transient API errors (429, 529, 500, 502, 503)
+        // Retry loop for transient API errors (429, 529, 500, 502, 503).
+        // 429 gets a higher budget (MAX_429_RETRIES) and honours rate-limit
+        // headers for delay; other errors use the user-configured max_retries.
+        const MAX_429_RETRIES: u32 = 8;
         let json: Value = {
             let mut last_err = String::new();
-
+            let mut last_reset_hint: Option<String> = None;
+            #[allow(unused_assignments)]
             let mut result_json = None;
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
-                    tracing::warn!("API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    tokio::time::sleep(delay).await;
-                }
+            let mut non_429_attempts: u32 = 0;
+            let mut attempt: u32 = 0;
 
+            loop {
                 let mut req = client
                     .post("https://api.anthropic.com/v1/messages")
                     .header(auth_header.0.clone(), auth_header.1.clone())
@@ -155,31 +156,71 @@ impl ApiMethods {
                                     break;
                                 }
                                 Err(e) => {
-                                    if attempt == max_retries {
+                                    non_429_attempts += 1;
+                                    if non_429_attempts > max_retries {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
+                                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
+                                    tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                                    tokio::time::sleep(delay).await;
                                 }
                             }
                         } else {
+                            let is_429 = status.as_u16() == 429;
                             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
+                            let reset_hint = if from_hdr { Some(format!("{}s", delay.as_secs())) } else { None };
                             let error_text = resp.text().await.unwrap_or_default();
-                            if !is_retryable || attempt == max_retries {
-                                return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+
+                            let retry_exhausted = if is_429 {
+                                attempt >= MAX_429_RETRIES
+                            } else {
+                                non_429_attempts >= max_retries
+                            };
+
+                            if !is_retryable || retry_exhausted {
+                                let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
+                                return Err(RuntimeError::Tool(
+                                    crate::core::error::humanize_api_error_with_reset(status.as_u16(), &error_text, hint)
+                                ));
                             }
+
+                            last_reset_hint = reset_hint.clone();
                             last_err = format!("{}: {}", status, error_text);
+                            if !is_429 { non_429_attempts += 1; }
+
+                            let budget = if is_429 { MAX_429_RETRIES } else { max_retries };
+                            let retry_num = if is_429 { attempt + 1 } else { non_429_attempts };
+                            let notice = if is_429 {
+                                if let Some(ref hint) = reset_hint {
+                                    format!("⚠ Rate limited — resuming in {} ({}/{})", hint, retry_num, budget)
+                                } else {
+                                    format!("⚠ Rate limited — retrying ({}/{})", retry_num, budget)
+                                }
+                            } else {
+                                format!("⏳ API error, retrying ({}/{})…", retry_num, budget)
+                            };
+                            tracing::warn!("API retry after {:?}: {}", delay, notice);
+                            tokio::time::sleep(delay).await;
                         }
                     }
                     Err(e) => {
-                        if attempt == max_retries {
+                        non_429_attempts += 1;
+                        if non_429_attempts > max_retries {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
+                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
+                        tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                        tokio::time::sleep(delay).await;
                     }
                 }
+
+                attempt += 1;
             }
 
-            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after retries: {}", last_err)))?
         };
 
         // Log usage for cache analysis.
@@ -284,17 +325,18 @@ impl ApiMethods {
             ]);
         }
 
-        // Retry loop for transient errors
+        // Retry loop for transient errors (compaction path).
+        // Same header-aware 429 handling as the main call_api loop.
+        const MAX_429_RETRIES_COMPACT: u32 = 8;
         let json: Value = {
             let mut last_err = String::new();
+            let mut last_reset_hint: Option<String> = None;
+            #[allow(unused_assignments)]
             let mut result_json = None;
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    let delay = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
-                    tracing::warn!("Compaction API retry {}/{} after {:?}: {}", attempt, max_retries, delay, last_err);
-                    tokio::time::sleep(delay).await;
-                }
+            let mut non_429_attempts: u32 = 0;
+            let mut attempt: u32 = 0;
 
+            loop {
                 let mut req = client
                     .post("https://api.anthropic.com/v1/messages")
                     .header(auth_header_name.clone(), auth_header_value.clone())
@@ -319,31 +361,60 @@ impl ApiMethods {
                                     break;
                                 }
                                 Err(e) => {
-                                    if attempt == max_retries {
+                                    non_429_attempts += 1;
+                                    if non_429_attempts > max_retries {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
+                                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
+                                    tracing::warn!("Compaction retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                                    tokio::time::sleep(delay).await;
                                 }
                             }
                         } else {
+                            let is_429 = status.as_u16() == 429;
                             let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
+                            let reset_hint = if from_hdr { Some(format!("{}s", delay.as_secs())) } else { None };
                             let error_text = resp.text().await.unwrap_or_default();
-                            if !is_retryable || attempt == max_retries {
-                                return Err(RuntimeError::Tool(format!("API Error ({}): {}", status, error_text)));
+
+                            let retry_exhausted = if is_429 {
+                                attempt >= MAX_429_RETRIES_COMPACT
+                            } else {
+                                non_429_attempts >= max_retries
+                            };
+
+                            if !is_retryable || retry_exhausted {
+                                let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
+                                return Err(RuntimeError::Tool(
+                                    crate::core::error::humanize_api_error_with_reset(status.as_u16(), &error_text, hint)
+                                ));
                             }
+
+                            last_reset_hint = reset_hint;
                             last_err = format!("{}: {}", status, error_text);
+                            if !is_429 { non_429_attempts += 1; }
+
+                            tracing::warn!("Compaction API retry after {:?}: {}: {}", delay, status, last_err);
+                            tokio::time::sleep(delay).await;
                         }
                     }
                     Err(e) => {
-                        if attempt == max_retries {
+                        non_429_attempts += 1;
+                        if non_429_attempts > max_retries {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
+                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
+                        tracing::warn!("Compaction API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                        tokio::time::sleep(delay).await;
                     }
                 }
+
+                attempt += 1;
             }
 
-            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after {} retries: {}", max_retries, last_err)))?
+            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after retries: {}", last_err)))?
         };
 
         // Log usage
