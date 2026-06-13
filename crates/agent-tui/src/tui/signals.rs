@@ -14,58 +14,43 @@
 //! existing tokio `UnboundedSender`.  Sending from a std thread is safe and
 //! wakes the tokio receiver — **when the event loop is free to receive it**.
 //!
-//! # Second problem: blocked write() in draw()
+//! # Watchdog retired (#116 — render thread)
 //!
-//! The main tokio task calls `draw()` synchronously (no `spawn_blocking`).
-//! If the terminal's read side stops draining output (e.g. the PTY master
-//! closes while the kernel buffer is full), the `write()` inside crossterm
-//! blocks indefinitely, preventing the `select!` from ever running.  The
-//! channel send from the signal thread is correct, but the receiver is never
-//! polled.
+//! Historically the main tokio task called `draw()` synchronously.  If the
+//! terminal's read side stopped draining output (PTY master closed while the
+//! kernel buffer was full), the `write()` inside crossterm blocked
+//! indefinitely, preventing the `select!` from ever running — so the signal
+//! send below landed in a channel no one was polling.  To guarantee the
+//! process still died, the signal thread spawned a **watchdog** std thread
+//! that force-`exit(1)`d after a timeout.
 //!
-//! Fix: after sending on the channel, the signal thread also spawns a
-//! **watchdog** std thread that calls `std::process::exit(1)` after
-//! `WATCHDOG_TIMEOUT_SECS` if the process hasn't exited via the normal loop
-//! path.  The watchdog does NOT call `emergency_teardown_terminal()` —
-//! crossterm holds a `parking_lot::Mutex` (`TERMINAL_MODE_PRIOR_RAW_MODE`)
-//! during draw; calling it from a concurrent thread deadlocks.  Terminal
-//! state resets on process exit anyway.
+//! As of #116, `draw()` runs on a dedicated render thread (see
+//! `render_thread.rs`).  The main task never blocks on stdout, so the
+//! `select!` is always free to receive a signal, and the bounded teardown in
+//! `mod.rs` always runs.  The watchdog was therefore **removed** — shutdown is
+//! self-bounding via `SAVE_TIMEOUT_SECS` + `HOOKS_TIMEOUT_SECS` (plus the
+//! render thread's own teardown-ack budget).
 //!
-//! # Watchdog / teardown timeout invariant
+//! # Teardown timeout budgets
 //!
 //! The post-loop teardown in `mod.rs` is split into two sequential budgets:
 //!   - `SAVE_TIMEOUT_SECS`  : save_session + append_record (data safety first)
 //!   - `HOOKS_TIMEOUT_SECS` : on_session_end hook emit (concurrent, fail-open)
 //!
 //! `TEARDOWN_TIMEOUT_SECS` = their sum (total teardown budget).
-//! `WATCHDOG_TIMEOUT_SECS` = teardown budget + a margin so the watchdog only
-//! fires when the process is genuinely stuck — never during a legitimate slow
-//! teardown.
-//!
-//! A compile-time assert enforces `WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS`
-//! so the invariant cannot be silently violated by a future edit.
 
-// ── Teardown / watchdog timing constants ─────────────────────────────────────
+// ── Teardown timing constants ────────────────────────────────────────────────
 //
-// These constants are the single source of truth for all shutdown budgets.
-// Both sites (watchdog sleep below, teardown timeout in mod.rs) reference them
-// to prevent the kind of drift that previously violated the invariant.
+// These constants are the single source of truth for the shutdown budget,
+// referenced by the bounded teardown in mod.rs.
 //
 // Breakdown:
 //   SAVE_TIMEOUT_SECS  — budget for save_session() + append_record()
 //   HOOKS_TIMEOUT_SECS — budget for concurrent on_session_end hook emit
 //   TEARDOWN_TIMEOUT_SECS — sum of the above; total teardown budget for mod.rs
-//   WATCHDOG_TIMEOUT_SECS — must exceed TEARDOWN_TIMEOUT_SECS by a margin
 pub(crate) const SAVE_TIMEOUT_SECS:     u64 = 2;
 pub(crate) const HOOKS_TIMEOUT_SECS:    u64 = 5;
 pub(crate) const TEARDOWN_TIMEOUT_SECS: u64 = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS;
-pub(crate) const WATCHDOG_TIMEOUT_SECS: u64 = TEARDOWN_TIMEOUT_SECS + 3; // margin
-
-// Compile-time invariant: watchdog must always outlast the full teardown.
-const _: () = assert!(
-    WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS,
-    "WATCHDOG_TIMEOUT_SECS must exceed TEARDOWN_TIMEOUT_SECS"
-);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
@@ -156,37 +141,11 @@ pub(crate) fn spawn_shutdown_signal_task(
                 // crossterm holds a parking_lot::Mutex (TERMINAL_MODE_PRIOR_RAW_MODE)
                 // during draw operations; taking it from a signal thread deadlocks.
 
-                // Send on the tokio channel — wakes the event loop when it is free.
+                // Send on the tokio channel — wakes the event loop, which is
+                // always free to receive now that draw() runs on the render
+                // thread (#116).  The bounded teardown in mod.rs guarantees the
+                // process exits, so no watchdog is needed any more.
                 let _ = tx.send(shutdown);
-
-                // Fallback: if the main async task is blocked in a synchronous
-                // write() to the PTY (happens when the terminal read-side stops
-                // draining output and the buffer fills), the select! branch above
-                // never gets scheduled.  Spawn a watchdog that forces exit after
-                // WATCHDOG_TIMEOUT_SECS if the process hasn't already exited via
-                // normal teardown.
-                //
-                // WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS (compile-time
-                // asserted above), so the watchdog never races a valid teardown.
-                //
-                // exit(1) — not exit(0) — because a watchdog-forced exit means
-                // something was stuck; reporting clean exit (0) to systemd/supervisors
-                // would hide data-loss and obscure the root cause.
-                std::thread::Builder::new()
-                    .name("signal-watchdog".into())
-                    .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
-                        // Do NOT call emergency_teardown_terminal() here — it also
-                        // acquires crossterm's TERMINAL_MODE_PRIOR_RAW_MODE mutex,
-                        // which the main thread may hold during draw().  Just force
-                        // exit; the terminal will reset on process death anyway.
-                        tracing::warn!(
-                            watchdog_secs = WATCHDOG_TIMEOUT_SECS,
-                            "signal watchdog: clean exit timed out, forcing exit(1)"
-                        );
-                        std::process::exit(1);
-                    })
-                    .ok();
 
                 // One signal is enough; the event loop handles the rest.
                 break;
@@ -237,13 +196,6 @@ mod tests {
         for sig in [ShutdownSignal::Interrupt, ShutdownSignal::Terminate, ShutdownSignal::Hangup] {
             assert!(!signal_label(sig).is_empty());
         }
-    }
-
-    #[test]
-    fn watchdog_exceeds_teardown_budget() {
-        // Runtime version of the compile-time assert — belt-and-suspenders.
-        assert!(WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS);
-        assert_eq!(TEARDOWN_TIMEOUT_SECS, SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS);
     }
 
     #[test]

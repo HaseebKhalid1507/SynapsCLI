@@ -1,5 +1,8 @@
+//! Core streaming event types shared across agent-core (rpc_dispatch) and
+//! the engine layer (runtime, engine). Defined here so `agent-core` is a
+//! clean leaf with no upward dependencies into the engine layer.
+
 use serde_json::Value;
-use serde::Deserialize;
 
 /// Top-level stream event — grouped into concern-specific sub-enums.
 #[derive(Debug, Clone)]
@@ -14,17 +17,12 @@ pub enum LlmEvent {
     Thinking(String),
     Text(String),
     /// A tool-use block has begun streaming. `tool_id` is the call id the
-    /// model will reference in its eventual `tool_use` content block —
-    /// chat UIs use it to route subsequent `ToolUseDelta` chunks and the
-    /// final `ToolUse` finalize event to the correct on-screen block when
-    /// multiple tools run in parallel.
+    /// model will reference in its eventual `tool_use` content block.
     ToolUseStart {
         tool_name: String,
         tool_id: String,
     },
-    /// Streaming chunk of a tool's input JSON. `tool_id` matches the
-    /// `ToolUseStart` it belongs to; with parallel tool calls the model
-    /// may interleave deltas from different tools.
+    /// Streaming chunk of a tool's input JSON.
     ToolUseDelta {
         tool_id: String,
         delta: String,
@@ -52,17 +50,14 @@ pub enum SessionEvent {
         output_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
-        /// Cache-write TTL split (`usage.cache_creation` sub-object).
-        /// `None` when the API omits the breakdown — cost accounting then
-        /// falls back to billing the aggregate at the 5m rate (fail-cheap).
+        /// Cache-write TTL split. `None` when the API omits the breakdown.
         cache_creation_5m: Option<u64>,
         cache_creation_1h: Option<u64>,
         model: Option<String>,
     },
     Done,
     Error(String),
-    /// Transient status line (e.g. retry notices) — display-only, never
-    /// persisted into message history or sent back to the API.
+    /// Transient status line — display-only, never persisted.
     Notice(String),
 }
 
@@ -87,30 +82,4 @@ pub enum AgentEvent {
     SteeringDelivered {
         message: String,
     },
-}
-
-/// Shared mutable auth state. Lives behind `Arc<RwLock<_>>` so the spawned
-/// streaming task and the parent Runtime always see the same (freshest) token.
-#[derive(Debug, Clone)]
-pub(super) struct AuthState {
-    pub(super) auth_token: String,
-    pub(super) auth_type: String,
-    pub(super) refresh_token: Option<String>,
-    pub(super) token_expires: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct PiAuth {
-    pub(super) anthropic: AnthropicAuth,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub(super) struct AnthropicAuth {
-    #[serde(rename = "type")]
-    pub(super) auth_type: String,
-    pub(super) refresh: Option<String>,
-    pub(super) access: Option<String>,
-    pub(super) expires: Option<u64>,
-    pub(super) key: Option<String>,
 }

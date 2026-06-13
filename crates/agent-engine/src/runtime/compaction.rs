@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 /// Instructs the model to summarize, not continue the conversation.
 pub const COMPACTION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
-use crate::runtime::Runtime;
+use super::Runtime;
 use crate::error::Result;
 
 

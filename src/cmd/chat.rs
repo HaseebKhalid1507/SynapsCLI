@@ -13,7 +13,7 @@ use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::{CancellationToken, flush_stdout};
-use synaps_cli::core::compaction::compact_conversation;
+use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::json;
 use std::io::{self, Write, BufRead};

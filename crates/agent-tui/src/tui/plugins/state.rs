@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 
-use synaps_cli::skills::state::{PluginsState, InstalledPlugin, CachedPlugin};
+use synaps_cli::skills::state::{CachedPlugin, InstalledPlugin, PluginsState};
 
 use super::progress::InstallProgressHandle;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum LeftRow {
     Installed,
     Marketplace(String),
@@ -16,21 +16,52 @@ pub enum LeftRow {
 
 pub enum RightRow<'a> {
     Installed(&'a InstalledPlugin),
-    Browseable { plugin: &'a CachedPlugin, installed: bool },
+    Browseable {
+        plugin: &'a CachedPlugin,
+        installed: bool,
+    },
 }
 
-pub enum Focus { Left, Right }
+pub enum Focus {
+    Left,
+    Right,
+}
 
-#[derive(Debug)]
+impl Clone for Focus {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Left => Self::Left,
+            Self::Right => Self::Right,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum RightMode {
     List,
-    Detail { row_idx: usize },
-    AddMarketplaceEditor { buffer: String, error: Option<String> },
-    TrustPrompt { plugin_name: String, host: String, pending_source: String, summary: Vec<String> },
-    Confirm { prompt: String, on_yes: ConfirmAction, summary: Vec<String> },
+    Detail {
+        row_idx: usize,
+    },
+    AddMarketplaceEditor {
+        buffer: String,
+        error: Option<String>,
+    },
+    TrustPrompt {
+        plugin_name: String,
+        host: String,
+        pending_source: String,
+        summary: Vec<String>,
+    },
+    Confirm {
+        prompt: String,
+        on_yes: ConfirmAction,
+        summary: Vec<String>,
+    },
     /// Background `git clone --progress` is running. The handle points at
     /// the same `InstallProgress` the worker thread is updating.
-    Installing { progress: InstallProgressHandle },
+    Installing {
+        progress: InstallProgressHandle,
+    },
     PendingInstallConfirm {
         plugin_name: String,
         source_url: String,
@@ -52,9 +83,9 @@ pub enum RightMode {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    Uninstall(String),       // plugin name
+    Uninstall(String), // plugin name
     EnablePlugin(String),
     RemoveMarketplace(String),
 }
@@ -101,6 +132,23 @@ pub struct PluginsModalState {
     /// polls this to know when to render the spinner and when to reap the
     /// task and finish the install.
     pub pending_install: Option<PendingInstallTask>,
+}
+
+impl Clone for PluginsModalState {
+    /// Clone for snapshotting into `RenderModel`. `pending_install` (which
+    /// holds a `JoinHandle`) is deliberately dropped — the snapshot is
+    /// render-only and the main loop retains the authoritative state.
+    fn clone(&self) -> Self {
+        Self {
+            file: self.file.clone(),
+            selected_left: self.selected_left,
+            selected_right: self.selected_right,
+            focus: self.focus.clone(),
+            mode: self.mode.clone(),
+            row_error: self.row_error.clone(),
+            pending_install: None,
+        }
+    }
 }
 
 impl PluginsModalState {
@@ -152,11 +200,15 @@ impl PluginsModalState {
     /// loop tick to decide when to actually reap the JoinHandle and
     /// transition out of the Installing overlay.
     pub fn install_ready_to_reap(&self) -> bool {
-        let Some(p) = self.pending_install.as_ref() else { return false };
+        let Some(p) = self.pending_install.as_ref() else {
+            return false;
+        };
         if !p.join.is_finished() {
             return false;
         }
-        let Ok(prog) = p.progress.lock() else { return true };
+        let Ok(prog) = p.progress.lock() else {
+            return true;
+        };
         prog.started_at.elapsed().as_millis() as u64 >= Self::min_install_display_ms()
     }
 
@@ -201,13 +253,18 @@ impl PluginsModalState {
     pub fn right_rows(&self) -> Vec<RightRow<'_>> {
         let left = self.left_rows();
         match left.get(self.selected_left) {
-            Some(LeftRow::Installed) => self.file.installed.iter()
-                .map(RightRow::Installed).collect(),
+            Some(LeftRow::Installed) => self
+                .file
+                .installed
+                .iter()
+                .map(RightRow::Installed)
+                .collect(),
             Some(LeftRow::Marketplace(mname)) => {
                 let Some(m) = self.file.marketplaces.iter().find(|m| &m.name == mname) else {
                     return Vec::new();
                 };
-                m.cached_plugins.iter()
+                m.cached_plugins
+                    .iter()
                     .map(|p| RightRow::Browseable {
                         plugin: p,
                         installed: self.file.installed.iter().any(|i| i.name == p.name),
@@ -220,59 +277,63 @@ impl PluginsModalState {
 
     pub fn move_left_down(&mut self) {
         let n = self.left_rows().len();
-        if self.selected_left + 1 < n { self.selected_left += 1; self.selected_right = 0; }
+        if self.selected_left + 1 < n {
+            self.selected_left += 1;
+            self.selected_right = 0;
+        }
     }
     pub fn move_left_up(&mut self) {
-        if self.selected_left > 0 { self.selected_left -= 1; self.selected_right = 0; }
+        if self.selected_left > 0 {
+            self.selected_left -= 1;
+            self.selected_right = 0;
+        }
     }
     pub fn move_right_down(&mut self) {
         let n = self.right_rows().len();
-        if self.selected_right + 1 < n { self.selected_right += 1; }
+        if self.selected_right + 1 < n {
+            self.selected_right += 1;
+        }
     }
     pub fn move_right_up(&mut self) {
-        if self.selected_right > 0 { self.selected_right -= 1; }
+        if self.selected_right > 0 {
+            self.selected_right -= 1;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synaps_cli::skills::state::{PluginsState, Marketplace, CachedPlugin, InstalledPlugin};
+    use synaps_cli::skills::state::{CachedPlugin, InstalledPlugin, Marketplace, PluginsState};
 
     fn mk_state() -> PluginsModalState {
         let file = PluginsState {
-            marketplaces: vec![
-                Marketplace {
-                    name: "pi".into(),
-                    url: "https://github.com/m/pi".into(),
+            marketplaces: vec![Marketplace {
+                name: "pi".into(),
+                url: "https://github.com/m/pi".into(),
+                description: None,
+                last_refreshed: None,
+                cached_plugins: vec![CachedPlugin {
+                    name: "web".into(),
+                    source: "https://github.com/m/web.git".into(),
+                    version: None,
                     description: None,
-                    last_refreshed: None,
-                    cached_plugins: vec![
-                        CachedPlugin {
-                            name: "web".into(),
-                            source: "https://github.com/m/web.git".into(),
-                            version: None,
-                            description: None,
-                            index: None,
-                        },
-                    ],
-                    repo_url: None,
-                },
-            ],
-            installed: vec![
-                InstalledPlugin {
-                    name: "tools".into(),
-                    marketplace: None,
-                    source_url: "https://github.com/x/tools.git".into(),
-                    installed_commit: "aaa".into(),
-                    latest_commit: Some("aaa".into()),
-                    installed_at: "now".into(),
-                    source_subdir: None,
-                    checksum_algorithm: None,
-                    checksum_value: None,
-                    setup_status: Default::default(),
-                },
-            ],
+                    index: None,
+                }],
+                repo_url: None,
+            }],
+            installed: vec![InstalledPlugin {
+                name: "tools".into(),
+                marketplace: None,
+                source_url: "https://github.com/x/tools.git".into(),
+                installed_commit: "aaa".into(),
+                latest_commit: Some("aaa".into()),
+                installed_at: "now".into(),
+                source_subdir: None,
+                checksum_algorithm: None,
+                checksum_value: None,
+                setup_status: Default::default(),
+            }],
             trusted_hosts: vec![],
         };
         PluginsModalState::new(file)
@@ -302,7 +363,9 @@ mod tests {
         s.selected_left = 1; // pi
         let rows = s.right_rows();
         assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0], RightRow::Browseable { plugin, installed: false } if plugin.name == "web"));
+        assert!(
+            matches!(&rows[0], RightRow::Browseable { plugin, installed: false } if plugin.name == "web")
+        );
     }
 
     #[test]
@@ -317,7 +380,9 @@ mod tests {
     fn move_down_clamps_in_left_pane() {
         let mut s = mk_state();
         let last = s.left_rows().len() - 1;
-        for _ in 0..100 { s.move_left_down(); }
+        for _ in 0..100 {
+            s.move_left_down();
+        }
         assert_eq!(s.selected_left, last);
     }
 
@@ -361,9 +426,10 @@ mod tests {
             crate::tui::plugins::progress::InstallProgress::new("test"),
         ));
         // Spawn a task that finishes immediately.
-        let join = tokio::task::spawn_blocking(|| -> Result<(String, std::path::PathBuf), String> {
-            Ok(("sha".into(), std::path::PathBuf::from("/tmp/x")))
-        });
+        let join =
+            tokio::task::spawn_blocking(|| -> Result<(String, std::path::PathBuf), String> {
+                Ok(("sha".into(), std::path::PathBuf::from("/tmp/x")))
+            });
         s.pending_install = Some(PendingInstallTask {
             join,
             progress: progress.clone(),

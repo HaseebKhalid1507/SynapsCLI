@@ -9,7 +9,7 @@
 use crate::core::rpc_protocol::{
     AssistantEvent, RpcAttachment, RpcCommand, RpcEvent, TurnUsage,
 };
-use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+use crate::core::stream_types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 // ─── Frame parsing ────────────────────────────────────────────────────────────
 
@@ -212,7 +212,7 @@ pub fn build_tools_list_body(tools_schema: &[serde_json::Value]) -> serde_json::
 mod tests {
     use super::*;
     use crate::core::rpc_protocol::{AssistantEvent, RpcCommand, RpcEvent, RpcAttachment, TurnUsage};
-    use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+    use crate::core::stream_types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
     use serde_json::json;
 
     // ── parse_frame ──────────────────────────────────────────────────────────
