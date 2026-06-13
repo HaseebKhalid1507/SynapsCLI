@@ -191,7 +191,7 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
                     app.push_msg(msg);
                 }
             }
-            InvokeCommandEvent::Task(task) => app.active_tasks.apply(task),
+            InvokeCommandEvent::Task(task) => std::sync::Arc::make_mut(&mut app.active_tasks).apply(task),
         }
     }
 

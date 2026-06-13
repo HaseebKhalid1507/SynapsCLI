@@ -62,8 +62,8 @@ pub(crate) struct RenderModel {
     pub(crate) subagents: Vec<SubagentSnap>,
 
     // ── Active-task progress bar ──────────────────────────────────────────────
-    /// Cloned snapshot of `app.active_tasks`.
-    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Arc snapshot of `app.active_tasks` — refcount bump, not a deep clone.
+    pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
 
     // ── Input box ────────────────────────────────────────────────────────────
     pub(crate) input: String,

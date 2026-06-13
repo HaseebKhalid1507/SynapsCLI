@@ -683,6 +683,25 @@ pub(crate) fn build_render_model(
     });
     let plugins = app.plugins.clone();
     let models = app.models.clone();
+    // ── help_find visible_height write-back ───────────────────────────────────
+    // `help_find::render` computes visible_height from the terminal geometry
+    // and calls `set_visible_height` on its &mut state.  Because the render
+    // runs on a separate thread it was previously mutating a throwaway clone,
+    // so the modal's scroll window was wrong on first open at a non-default size.
+    // Fix: mirror the geometry computation here on the main side and call
+    // `set_visible_height` on the authoritative App state before snapshotting.
+    if let Some(ref mut hf) = app.help_find {
+        let area_w = term_size.width;
+        let area_h = term_size.height;
+        let _modal_w = ((area_w as u32 * 8 / 10) as u16).max(50).min(area_w);
+        let modal_h = ((area_h as u32 * 8 / 10) as u16).max(14).min(area_h);
+        // block.inner subtracts 1px border on each side → -2 height
+        // padded_rect(inner, 2, 1) subtracts 1px vertical pad each side → -2 height
+        let inner_h = modal_h.saturating_sub(2).saturating_sub(2);
+        // Layout [Length(2), Min(1), Length(1)]: chunk[1] = inner_h - 3
+        let visible_h = inner_h.saturating_sub(3) as usize;
+        hf.set_visible_height(visible_h.max(1));
+    }
     let help_find = app.help_find.clone();
 
     // ── 12. Secret prompt ─────────────────────────────────────────────────────
@@ -714,7 +733,7 @@ pub(crate) fn build_render_model(
         logo_build_t: app.logo_build_t,
         logo_dismiss_t: app.logo_dismiss_t,
         subagents,
-        active_tasks: app.active_tasks.clone(),
+        active_tasks: std::sync::Arc::clone(&app.active_tasks),
         input: app.input.clone(),
         cursor_pos: app.cursor_pos,
         ghost_hint,
@@ -1596,8 +1615,8 @@ pub(crate) fn render_frame(
         if let Some(ref state) = model.plugins {
             super::plugins::render(frame, frame.area(), state);
         }
-        if let Some(ref mut state) = model.help_find.clone() {
-            super::help_find::render(frame, frame.area(), state);
+        if let Some(mut state) = model.help_find.clone() {
+            super::help_find::render(frame, frame.area(), &mut state);
         }
     })?;
     Ok(())
