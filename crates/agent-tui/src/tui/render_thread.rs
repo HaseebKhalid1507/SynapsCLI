@@ -80,6 +80,22 @@ pub(crate) enum RenderCmd {
     /// exits and similar full-screen takeover events where ratatui's diff
     /// cannot know the screen is dirty.
     Clear,
+
+    /// Pause rendering so the main thread can safely change terminal modes
+    /// (e.g. for casino / gamba takeover).  The render thread finishes any
+    /// in-flight draw, sends `()` on `ack` to prove it is idle, then parks
+    /// ignoring further publishes until it receives `Resume`.
+    ///
+    /// Main MUST wait on `ack` before touching the terminal.  A bounded
+    /// timeout (~2 s) applies — if the ack doesn't arrive the render thread
+    /// is wedged and the casino will reset the terminal anyway, so we
+    /// proceed regardless.
+    Pause { ack: mpsc::SyncSender<()> },
+
+    /// Resume rendering after a `Pause`.  The render thread exits the paused
+    /// state and forces a full repaint (equivalent to `Clear`) so ratatui
+    /// repaints from scratch after the casino scribbled on the screen.
+    Resume,
 }
 
 // ── Latest-wins frame slot ────────────────────────────────────────────────────
@@ -142,6 +158,30 @@ impl RenderHandle {
     /// dirty.
     pub(crate) fn send_clear(&self) {
         let _ = self.cmd_tx.send(RenderCmd::Clear);
+        self.wake();
+    }
+
+    /// Pause the render thread before a terminal-mode handoff (e.g. casino).
+    ///
+    /// Sends `Pause`, then blocks (up to ~2 s) for the ack that proves the
+    /// render thread is idle and out of `terminal.draw()`.  Returns `true` if
+    /// the ack arrived; `false` if the render thread is wedged (caller should
+    /// proceed anyway — the casino will reset the terminal).
+    ///
+    /// After this returns `true` it is safe for the main thread to call
+    /// `disable_raw_mode()`, `LeaveAlternateScreen`, etc.
+    pub(crate) fn pause(&self) -> bool {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+        let _ = self.cmd_tx.send(RenderCmd::Pause { ack: ack_tx });
+        self.wake();
+        ack_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+    }
+
+    /// Resume the render thread after the terminal has been restored by the
+    /// main thread.  Triggers a forced full repaint so ratatui redraws from
+    /// scratch (the casino may have left the screen in any state).
+    pub(crate) fn resume(&self) {
+        let _ = self.cmd_tx.send(RenderCmd::Resume);
         self.wake();
     }
 
@@ -332,6 +372,12 @@ fn render_thread_body(
     let mut exit_fx:      Option<Effect> = None;
     let mut pending_clear = false;
 
+    // When the main thread sends Pause, we enter a "paused" state: we ack
+    // immediately (proving we're idle), then park and drop incoming frames
+    // until we receive Resume.  While paused, the main thread owns the
+    // terminal exclusively.
+    let mut paused = false;
+
     loop {
         // Park until the main task publishes a frame or sends a command.
         // Spurious wakeups are safe: the inner loops below re-check state.
@@ -350,6 +396,21 @@ fn render_thread_body(
                 Ok(RenderCmd::Clear) => {
                     pending_clear = true;
                 }
+                Ok(RenderCmd::Pause { ack }) => {
+                    // We are between draws here (command drain happens before
+                    // the render step).  Drop any pending frame from the slot
+                    // so nothing is rendered while paused, then ack — this
+                    // proves to the main thread that we are idle.
+                    inner.lock().take();
+                    let _ = ack.send(());
+                    paused = true;
+                }
+                Ok(RenderCmd::Resume) => {
+                    paused = false;
+                    // Force a full repaint: the casino may have left the
+                    // screen in any state; ratatui must redraw from scratch.
+                    pending_clear = true;
+                }
                 Ok(RenderCmd::Teardown { ack }) => {
                     // Full terminal restoration — must happen before ack.
                     do_teardown(&mut terminal);
@@ -364,6 +425,13 @@ fn render_thread_body(
                     return;
                 }
             }
+        }
+
+        // While paused, drain and discard any published frames, then re-park.
+        // We must NOT call terminal.draw() while the main thread owns stdout.
+        if paused {
+            inner.lock().take();
+            continue;
         }
 
         // ── 2. Apply pending clear before rendering ───────────────────────────

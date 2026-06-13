@@ -432,7 +432,9 @@ pub async fn run(
                     app.invalidate();
                 }
                 if let Some(msg) = app.check_gamba_exited() {
-                    render_handle.send_clear();
+                    // check_gamba_exited() already called restore_terminal();
+                    // resume the render thread now that we own the terminal again.
+                    render_handle.resume();
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate(); // invalidate already sets needs_redraw
                 }
@@ -613,13 +615,18 @@ pub async fn run(
                                     }
                                     CommandAction::LaunchGamba => {
                                         drop(event_reader);
+                                        // Pause the render thread BEFORE touching the terminal —
+                                        // eliminates the stdout race between terminal.draw() and our mode changes.
+                                        render_handle.pause();
                                         match app.launch_gamba() {
                                             Ok(()) => {}
                                             Err(msg) => {
-                                                render_handle.send_clear();
+                                                // launch failed — restore and resume
+                                                render_handle.resume();
                                                 app.push_msg(ChatMessage::Error(msg));
                                             }
                                         }
+                                        // If gamba launched OK, resume is sent by reclaim/check_gamba_exited.
                                         event_reader = EventStream::new();
                                     }
                                     CommandAction::OpenModels => {
@@ -1455,13 +1462,18 @@ pub async fn run(
                                         }
                                         CommandAction::LaunchGamba => {
                                             drop(event_reader);
+                                            // Pause the render thread BEFORE touching the terminal —
+                                            // eliminates the stdout race between terminal.draw() and our mode changes.
+                                            render_handle.pause();
                                             match app.launch_gamba() {
                                                 Ok(()) => {}
                                                 Err(msg) => {
-                                                    render_handle.send_clear();
+                                                    // launch failed — restore and resume
+                                                    render_handle.resume();
                                                     app.push_msg(ChatMessage::Error(msg));
                                                 }
                                             }
+                                            // If gamba launched OK, resume is sent by reclaim/check_gamba_exited.
                                             event_reader = EventStream::new();
                                         }
                                         CommandAction::StartStream => {}
@@ -1820,9 +1832,10 @@ pub async fn run(
                                 stream = None;
                                 cancel_token = None;
                                 steer_tx = None;
-                                // Reclaim gamba if running
+                                // Reclaim gamba if running — resume render thread
+                                // after reclaim restores the terminal.
                                 if let Some(msg) = app.reclaim_gamba() {
-                                    render_handle.send_clear();
+                                    render_handle.resume();
                                     app.push_msg(ChatMessage::System(msg));
                                     app.invalidate();
                                 }
@@ -1833,9 +1846,10 @@ pub async fn run(
                             drop(stream.take());
                             drop(cancel_token.take());
                             drop(steer_tx.take());
-                            // Reclaim gamba if running
+                            // Reclaim gamba if running — resume render thread
+                            // after reclaim restores the terminal.
                             if let Some(msg) = app.reclaim_gamba() {
-                                render_handle.send_clear();
+                                render_handle.resume();
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
                             }
