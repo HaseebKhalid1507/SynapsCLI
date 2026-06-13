@@ -49,6 +49,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Once;
 use std::time::Instant;
 
 use ratatui::backend::CrosstermBackend;
@@ -176,12 +177,50 @@ impl RenderHandle {
 
 impl Drop for RenderHandle {
     fn drop(&mut self) {
-        // If teardown() was not called (e.g. panic path), drop cmd_tx so the
-        // render thread's cmd_rx disconnects and it can exit its loop.
-        // join_handle is dropped here; if the thread is still running it
-        // becomes a detached thread — the OS cleans it up on process exit.
+        // If teardown() was not called (e.g. panic path on the main task),
+        // we need to wake the render thread so it can observe the disconnect
+        // and run do_teardown() itself.
+        //
+        // Order matters:
+        //  1. Disconnect cmd_rx by replacing our sender with one whose receiver
+        //     is immediately dropped.  The render thread's cmd_rx will then
+        //     return Disconnected on the next try_recv, triggering do_teardown().
+        //  2. Unpark the render thread so it wakes from park() immediately and
+        //     processes the disconnect — instead of sleeping forever in raw mode.
+        //  3. Drop the JoinHandle last (detaches the thread; OS reaps on exit).
+        //
+        // If teardown() already ran it consumed join_handle via .take(), so
+        // the drop below is a no-op and the thread has already exited cleanly.
+        let (dead_tx, _dead_rx) = mpsc::channel::<RenderCmd>();
+        // _dead_rx is dropped at end of block, so dead_tx is already the sole
+        // sender of a disconnected channel.  Swap it in and drop the real tx.
+        let _old_tx = std::mem::replace(&mut self.cmd_tx, dead_tx);
+        drop(_old_tx);  // now render thread's cmd_rx sees Disconnected
+        self.slot.render_thread.unpark();
         drop(self.join_handle.take());
     }
+}
+
+// ── Panic hook (installed once per process) ───────────────────────────────
+
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Install the process-wide panic hook that restores the terminal before the
+/// default hook prints the panic message.  Safe to call multiple times —
+/// internally guarded by a [`Once`].
+///
+/// The hook chains to whatever hook was previously installed (usually the
+/// default Rust hook that prints the backtrace), so existing behaviour is
+/// preserved.
+fn install_panic_hook_once() {
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore the terminal first so the panic message is readable.
+            super::lifecycle::emergency_teardown_terminal();
+            prev(info);
+        }));
+    });
 }
 
 // ── Thread spawn ─────────────────────────────────────────────────────────────
@@ -200,6 +239,7 @@ impl Drop for RenderHandle {
 pub(crate) fn spawn_render_thread(
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 ) -> (RenderHandle, Arc<AtomicBool>, Arc<AtomicBool>) {
+    install_panic_hook_once();
     // Shared inner slot — same Arc goes into the FrameSlot (main) and the
     // thread closure (render side).  No circular dependency.
     let inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>> =
@@ -223,7 +263,40 @@ pub(crate) fn spawn_render_thread(
             // the bootstrap for the unpark/park synchronisation.
             let _ = thread_tx.send(std::thread::current());
 
-            render_thread_body(terminal, inner_thread, cmd_rx, boot_done_thread, exit_done_thread);
+            // Wrap the entire body in catch_unwind so a panic in render_frame
+            // (or anywhere in the render loop) does NOT leave the terminal in
+            // raw mode.  Whether the body returns normally OR unwinds, we ALWAYS
+            // ensure terminal cleanup and signal exit_done so the main loop wakes.
+            //
+            // We use a Cell/Option to regain the terminal after catch_unwind so
+            // we can call do_teardown() ourselves even on the panic path.
+            let mut terminal_opt = Some(terminal);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Safety: we're the only thread touching terminal_opt here.
+                let term = terminal_opt.take().expect("terminal already taken");
+                render_thread_body(term, inner_thread, cmd_rx, boot_done_thread, Arc::clone(&exit_done_thread));
+                // render_thread_body returned normally — it already called
+                // do_teardown() before returning.  terminal was consumed.
+            }));
+
+            if let Err(payload) = result {
+                // Log the panic payload.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic payload>");
+                tracing::error!(panic = msg, "render thread panicked — restoring terminal");
+                // The panic hook already called emergency_teardown_terminal().
+                // If terminal_opt still has a value (panic before take()), call
+                // do_teardown() to also run show_cursor() and the full sequence.
+                if let Some(mut term) = terminal_opt {
+                    do_teardown(&mut term);
+                }
+                // Signal the main loop that the render thread is done so it
+                // doesn't block forever waiting for the exit effect.
+                exit_done_thread.store(true, Ordering::Release);
+            }
         })
         .expect("failed to spawn render thread");
 
