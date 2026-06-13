@@ -23,6 +23,7 @@ mod sse_types;
 pub mod subagent;
 pub mod openai;
 pub mod telemetry;
+pub mod compaction;
 
 pub use types::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 use types::AuthState;
@@ -432,7 +433,7 @@ impl Runtime {
     pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
         self.refresh_if_needed().await?;
 
-        use crate::core::compaction::COMPACTION_SYSTEM_PROMPT;
+        use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
 
         ApiMethods::call_api_simple(
             &self.auth,
