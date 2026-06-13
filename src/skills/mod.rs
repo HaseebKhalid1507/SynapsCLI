@@ -58,7 +58,7 @@ pub struct LoadedSkill {
 pub const BUILTIN_COMMANDS: &[&str] = &[
     "clear", "compact", "chain", "model", "models", "system", "thinking", "sessions",
     "resume", "saveas", "theme", "gamba", "help", "quit", "exit",
-    "settings", "plugins", "extensions", "status", "ping", "keybinds",
+    "settings", "plugins", "extensions", "status", "stats", "ping", "keybinds",
     "sidecar",
 ];
 

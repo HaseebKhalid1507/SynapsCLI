@@ -1025,7 +1025,9 @@ pub(crate) fn draw(
             let total_input = app.total_input_tokens + app.total_cache_read_tokens + app.total_cache_creation_tokens;
             if total_input > 0 && app.total_cache_read_tokens > 0 {
                 let rate = (app.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
-                format!(" {}%↺", rate)
+                // Append a subtle 1h marker when the hybrid-TTL experiment is active.
+                let ttl_hint = if app.total_cache_write_1h > 0 { "·1h" } else { "" };
+                format!(" {}%↺{}", rate, ttl_hint)
             } else {
                 String::new()
             }
