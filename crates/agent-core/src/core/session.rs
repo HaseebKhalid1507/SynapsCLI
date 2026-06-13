@@ -403,11 +403,22 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 }
 
 /// Find a session by its assigned name (not partial ID).
+/// Iterates session headers one file at a time and returns on first match,
+/// avoiding a full directory scan when the named session appears early.
 pub fn find_session_by_name(name: &str) -> std::io::Result<Session> {
-    let sessions = list_sessions()?;
-    for s in &sessions {
-        if s.name.as_deref() == Some(name) {
-            return Session::load(&s.id);
+    let dir = sessions_dir();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            if let Some(info) = parse_session_header(&path) {
+                if info.name.as_deref() == Some(name) {
+                    return Session::load(&info.id);
+                }
+            }
         }
     }
     Err(std::io::Error::new(

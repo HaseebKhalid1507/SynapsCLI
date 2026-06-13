@@ -41,16 +41,6 @@ pub fn load_chain(name: &str) -> io::Result<ChainPointer> {
 pub fn save_chain(name: &str, head: &str) -> io::Result<()> {
     validate_chain_name(name)?;
 
-    // Soft guard: warn if a session uses the same name.
-    if let Ok(sessions) = crate::session::list_sessions() {
-        if sessions.iter().any(|s| s.name.as_deref() == Some(name)) {
-            tracing::warn!(
-                "chain name '{}' also used by a session — resolver prefers chains",
-                name
-            );
-        }
-    }
-
     let dir = chains_dir();
     std::fs::create_dir_all(&dir)?;
     let path = chain_path(name);
