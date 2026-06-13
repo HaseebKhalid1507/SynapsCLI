@@ -15,6 +15,7 @@ rust-version = "1.80"
 [dependencies]
 agent-core = { path = "crates/agent-core" }
 agent-engine = { path = "crates/agent-engine" }
+agent-tui = { path = "crates/agent-tui" }
 arc-swap = "1"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
@@ -115,4 +116,4 @@ assets = [
 ]
 
 [workspace]
-members = ["crates/agent-core", "crates/agent-engine"]
+members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]

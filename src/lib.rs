@@ -6,11 +6,11 @@ pub use agent_core::pricing;
 // agent-engine is now a separate crate; re-export its modules as if they lived here
 pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help};
 
+// agent-tui is now a separate crate; re-export tui + toast so bin/cmd still resolve
+pub use agent_tui::{tui, toast};
+
 // Allow intra-crate self-reference via `synaps_cli::` (used in src/tui/**).
 extern crate self as synaps_cli;
-
-pub mod tui;
-pub mod toast;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
