@@ -292,8 +292,14 @@ pub async fn run(
 
             // ── Widget events from background extension notification watchers ──
             Some(widget_event) = app.widget_rx.recv() => {
-                handle_widget_event(&mut app, widget_event);
-                app.request_redraw();
+                // Only redraw when the widget's VISIBLE content actually changed.
+                // Plugins (d20/jawz-widget/synaps-tasks) re-send unchanged widgets
+                // on a poll loop; redrawing on every one pinned the render loop at
+                // ~30% CPU at idle (#119). The dirty-check in upsert/dismiss makes an
+                // idle session genuinely idle.
+                if handle_widget_event(&mut app, widget_event) {
+                    app.request_redraw();
+                }
             }
 
             // ── Sidecar events — multiplexed across all hosted sidecars (Phase 8 8B) ──
@@ -2030,7 +2036,7 @@ pub async fn run(
 fn handle_widget_event(
     app: &mut App,
     event: synaps_cli::extensions::widgets::ExtensionWidgetEvent,
-) {
+) -> bool {
     use synaps_cli::extensions::widgets::WidgetEvent;
     match event.event {
         WidgetEvent::Upsert {
@@ -2094,10 +2100,10 @@ fn handle_widget_event(
             if let Some(title) = title {
                 t = t.titled(title);
             }
-            app.toasts.upsert(t);
+            app.toasts.upsert(t)
         }
         WidgetEvent::Dismiss { id } => {
-            app.toasts.dismiss(&format!("widget:{}", id));
+            app.toasts.dismiss(&format!("widget:{}", id))
         }
     }
 }

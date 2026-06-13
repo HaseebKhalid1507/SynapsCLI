@@ -96,19 +96,35 @@ impl ToastProvider {
         Self { toasts: VecDeque::new(), max_visible: 5 }
     }
 
-    pub(crate) fn upsert(&mut self, toast: Toast) {
+    /// Insert or update a toast by id. Returns `true` if the VISIBLE content
+    /// changed (new toast, or title/lines/rich_lines/position differ) — i.e.
+    /// whether a redraw is actually warranted. An identical re-send (e.g. a
+    /// widget plugin polling on a timer) still refreshes the entry's TTL so it
+    /// stays alive, but returns `false` so it does NOT trigger a wasteful redraw.
+    /// (This is the #119 idle-burn fix: plugins re-sending unchanged widgets no
+    /// longer pin the render loop at ~30% CPU.)
+    pub(crate) fn upsert(&mut self, toast: Toast) -> bool {
         if let Some(existing) = self.toasts.iter_mut().find(|t| t.id == toast.id) {
-            *existing = toast;
-            return;
+            let changed = existing.title != toast.title
+                || existing.lines != toast.lines
+                || existing.rich_lines != toast.rich_lines
+                || existing.position != toast.position;
+            *existing = toast; // always replace — refreshes created_at/ttl
+            return changed;
         }
         self.toasts.push_back(toast);
         while self.toasts.len() > self.max_visible {
             self.toasts.pop_front();
         }
+        true
     }
 
-    pub(crate) fn dismiss(&mut self, id: &str) {
+    /// Remove a toast by id. Returns `true` if a toast was actually removed
+    /// (so the caller only redraws when something changed).
+    pub(crate) fn dismiss(&mut self, id: &str) -> bool {
+        let before = self.toasts.len();
         self.toasts.retain(|toast| toast.id != id);
+        before != self.toasts.len()
     }
 
     pub(crate) fn tick(&mut self) -> bool {
