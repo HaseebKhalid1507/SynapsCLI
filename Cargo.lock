@@ -96,6 +96,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "parking_lot",
  "ratatui",
  "reqwest",
  "serde",

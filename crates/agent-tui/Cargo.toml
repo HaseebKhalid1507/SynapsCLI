@@ -41,7 +41,7 @@ reqwest      = { version = "0.12", default-features = false, features = ["json",
 # TUI render crates
 ratatui       = "0.29"
 crossterm     = { version = "0.28", features = ["event-stream"] }
-tachyonfx     = "0.9"
+tachyonfx     = { version = "0.9", features = ["sendable"] }
 syntect       = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
 arc-swap      = "1"
 unicode-width = "0.2.0"
@@ -49,6 +49,9 @@ arboard       = "3"
 
 # Signal handling (tui/signals.rs)
 signal-hook  = { version = "0.3", features = ["iterator"] }
+
+# Render-thread synchronisation (tui/render_thread.rs)
+parking_lot  = "0.12"
 
 [dev-dependencies]
 serial_test = "3.4.0"
