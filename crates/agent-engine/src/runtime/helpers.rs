@@ -93,63 +93,76 @@ impl HelperMethods {
     ///   4. Remove the marked messages, and merge any resulting consecutive
     ///      same-role messages so we don't violate Anthropic's alternation rule.
     pub(super) fn sanitize_thinking_blocks(messages: &mut Vec<Value>) {
-        // Pass 1: filter blocks within each assistant message.
-        let mut to_remove: Vec<usize> = Vec::new();
-        for (i, msg) in messages.iter_mut().enumerate() {
-            if msg["role"].as_str() != Some("assistant") {
-                continue;
-            }
-            let content = match msg["content"].as_array_mut() {
-                Some(c) => c,
-                None => continue,
-            };
-            content.retain(|block| {
-                match block["type"].as_str() {
-                    Some("thinking") => block["thinking"]
-                        .as_str()
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false),
-                    Some("redacted_thinking") => block["data"]
-                        .as_str()
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false),
-                    Some("text") => block["text"]
-                        .as_str()
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false),
-                    _ => true,
+        // Equivalent to the original 3-pass implementation
+        // (filter-empty-blocks → drop-empty-assistants → merge-adjacent-same-role),
+        // fused into a single forward pass.
+        //
+        // Correctness vs the 3-pass original (case-by-case):
+        //   * Non-assistant messages: untouched in both. Here we don't enter the
+        //     retain branch and push the message through. ✓
+        //   * Assistant with non-array `content`: original `as_array_mut()` is
+        //     `None` → `continue` (no retain, no removal). Here `as_array_mut()`
+        //     also `None` → fall through to the merge stage unchanged. ✓
+        //   * Assistant whose block filter empties `content`: original marks for
+        //     removal in pass 2. Here we `continue` and skip the push. ✓
+        //   * Adjacency merge: original walks the post-removal vec and merges
+        //     consecutive same-role pairs. Here, each kept message is compared
+        //     against `out.last()` (the previous kept message), which IS the
+        //     post-removal predecessor — same pairing, same order. ✓
+        //
+        // Wins vs original:
+        //   * No O(N) `Vec::remove` shifts (was O(N²) worst-case).
+        //   * `coerce_content_to_blocks` is fed via `mem::take` instead of
+        //     `Value::clone()` — no recursive subtree clones during merges.
+        //   * Single allocation: `Vec::with_capacity(messages.len())`.
+        let original = std::mem::take(messages);
+        let mut out: Vec<Value> = Vec::with_capacity(original.len());
+        for mut msg in original {
+            if msg["role"].as_str() == Some("assistant") {
+                if let Some(content) = msg["content"].as_array_mut() {
+                    content.retain(|block| {
+                        match block["type"].as_str() {
+                            Some("thinking") => block["thinking"]
+                                .as_str()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false),
+                            Some("redacted_thinking") => block["data"]
+                                .as_str()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false),
+                            Some("text") => block["text"]
+                                .as_str()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false),
+                            _ => true,
+                        }
+                    });
+                    if content.is_empty() {
+                        // No salvageable content. The API rejects empty content
+                        // arrays and empty text placeholders alike, so drop the
+                        // whole message (matches Pass 2 of the original).
+                        continue;
+                    }
                 }
-            });
-            if content.is_empty() {
-                // No salvageable content. The API rejects empty content arrays
-                // and empty text placeholders alike, so we must drop the whole message.
-                to_remove.push(i);
             }
-        }
 
-        // Pass 2: drop the empty assistant messages (back-to-front so indices stay valid).
-        for &i in to_remove.iter().rev() {
-            messages.remove(i);
-        }
-
-        // Pass 3: merge any consecutive same-role messages that now sit adjacent.
-        // Dropping an assistant message between two user messages would otherwise
-        // violate Anthropic's strict role-alternation rule.
-        let mut i = 0;
-        while i + 1 < messages.len() {
-            let same_role = messages[i]["role"] == messages[i + 1]["role"];
-            if same_role {
-                // Coerce both contents to arrays, then concatenate.
-                let next = messages.remove(i + 1);
-                let next_blocks = Self::coerce_content_to_blocks(next["content"].clone());
-                let current_blocks = Self::coerce_content_to_blocks(messages[i]["content"].clone());
-                let mut merged = current_blocks;
-                merged.extend(next_blocks);
-                messages[i]["content"] = Value::Array(merged);
-            } else {
-                i += 1;
+            // Adjacency merge: if the previous kept message shares this role,
+            // concatenate content blocks rather than push (matches Pass 3 of
+            // the original; preserves Anthropic's role-alternation rule).
+            if let Some(last) = out.last_mut() {
+                if last["role"] == msg["role"] {
+                    let next_content = std::mem::take(&mut msg["content"]);
+                    let prev_content = std::mem::take(&mut last["content"]);
+                    let mut merged = Self::coerce_content_to_blocks(prev_content);
+                    merged.extend(Self::coerce_content_to_blocks(next_content));
+                    last["content"] = Value::Array(merged);
+                    continue;
+                }
             }
+
+            out.push(msg);
         }
+        *messages = out;
     }
 
     /// Normalize a `content` value to a Vec of content blocks. Anthropic accepts
