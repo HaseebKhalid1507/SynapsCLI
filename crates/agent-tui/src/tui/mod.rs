@@ -1894,7 +1894,6 @@ pub async fn run(
     //   SAVE_TIMEOUT_SECS  — session save + index record (data safety first)
     //   HOOKS_TIMEOUT_SECS — on_session_end hook emit (concurrent, fail-open)
     //   TEARDOWN_TIMEOUT_SECS = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
-    //   WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS (compile-time asserted)
     //
     // Session save ALWAYS runs first in its own timeout so slow extension
     // handlers cannot starve it.  Even if the hook budget is exhausted, the
@@ -1985,8 +1984,9 @@ pub async fn run(
     //
     // The render thread owns the Terminal.  We send it a Teardown command and
     // wait for the ack within the combined SAVE + HOOKS budget already spent
-    // above.  If the ack doesn't arrive, the signal watchdog (signals.rs
-    // WATCHDOG_TIMEOUT_SECS) fires as the residual backstop.
+    // above.  If the ack doesn't arrive the thread is wedged (dead PTY); we
+    // skip the join and let process exit reap it — see RenderHandle::teardown.
+    // This self-bounding teardown replaced the old signal watchdog (#116).
     //
     // The render thread's do_teardown() calls emergency_teardown_terminal()
     // (disable_raw_mode + LeaveAlternateScreen + etc.) and show_cursor(), then
