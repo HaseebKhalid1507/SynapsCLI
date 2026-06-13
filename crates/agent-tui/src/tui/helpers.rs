@@ -145,4 +145,8 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
             _ => {}
         }
     }
+    // Cap the rendered scrollback so a long --continue doesn't markdown-render
+    // hundreds of messages on the first frame (the slow-boot cause). Full
+    // history stays in api_messages for the model. See App::cap_resumed_display.
+    app.cap_resumed_display(120);
 }

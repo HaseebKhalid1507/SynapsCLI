@@ -453,6 +453,31 @@ impl App {
         self.invalidate();
     }
 
+    /// Cap the rendered scrollback after resuming a session.
+    ///
+    /// `render_lines` markdown-renders + syntax-highlights EVERY display message
+    /// on the first frame. On `--continue` of a long session (hundreds of
+    /// messages) that made boot crawl. This keeps only the most recent `cap`
+    /// display messages and prepends a notice — the FULL history is untouched in
+    /// `api_messages`, so the model still sees everything; only the visible
+    /// scrollback is trimmed. (Proper fix is viewport virtualization — #98.)
+    pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
+        if self.messages.len() <= cap {
+            return;
+        }
+        let omitted = self.messages.len() - cap;
+        self.messages.drain(0..omitted);
+        self.messages.insert(
+            0,
+            TimestampedMsg {
+                msg: ChatMessage::System(format!(
+                    "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
+                )),
+                time: Local::now().format("%H:%M").to_string(),
+            },
+        );
+    }
+
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
     /// Call this after any mutation that changes how `messages` renders.
     pub(crate) fn invalidate(&mut self) {
