@@ -107,3 +107,39 @@ NOT used by core — leave in root.
 tracing, reqwest (rides via auth — R4, accepted), uuid, base64, rand, sha2, chrono, thiserror, dirs.
 
 **Gates:** `cargo check -p agent-core` standalone → workspace check → test --no-run → build → clippy → test.
+
+---
+
+## RESULTS — A3 Complete (S208 overnight)
+
+3-crate split shipped on branch refactor/a3-crate-split. Commits:
+- fb7ccfe step 0 (core clean leaf)
+- 9cc979d agent-core
+- ac36622 agent-engine
+- 740d041 agent-tui
+
+**Final layering (clean DAG):** bin(synaps) → agent-tui → agent-engine → agent-core
+Root `synaps` package = the bin/glue crate (lib.rs 67 lines facade + main + cmd + watcher + bin).
+
+**BENCHMARK (incremental cargo check, warm):**
+| Edit | Re-checks | Time |
+|------|-----------|------|
+| hot TUI file (agent-tui/src/tui/draw.rs) | agent-tui + bin ONLY | **2.79s** |
+| leaf agent-core/src/core/error.rs | full stack core→engine→tui→bin | 18.24s |
+
+**R3 REFUTED empirically:** a TUI edit does NOT re-check agent-engine (it stays cached).
+The build-speed win is real where it matters — the hot TUI edit loop is 2.79s (was ~1m33s
+warm full check on the monolith, where every edit recompiled all 75K LOC). ~6.5x vs full-stack.
+
+**Verification:** full workspace test SERIAL all green every step — agent_core 182,
+agent_engine 824, agent_tui 231, main 15, hidden 75, all integration tests. 0 failures.
+cargo build = 0 warnings. (clippy: 24 pre-existing lints in helpers.rs/commands.rs, predate A3.)
+
+**Deliberately NOT done (out of scope, documented):**
+- Bin NOT relocated to crates/agent-runtime/ — root `synaps` package already serves as the
+  glue bin; physically moving it risks cargo-dist/release config + the published "synaps"
+  binary name + the synaps_cli lib name (used everywhere) for ZERO build-speed gain. Keep as-is.
+- clippy pre-existing lints not fixed (separate cleanup, not introduced by A3).
+- engine NOT further split into providers+services — R3 refuted means no justification (per plan).
+
+**Status:** complete + verified on branch. Pending Haseeb review + merge to dev.
