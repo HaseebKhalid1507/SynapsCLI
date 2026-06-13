@@ -1,44 +1,44 @@
 //! Chat TUI binary — event loop, terminal setup, module wiring.
 
-mod theme;
-mod highlight;
-mod markdown;
 mod app;
-mod render;
-mod gamba;
-mod draw;
-mod toast;
 mod commands;
-mod input;
-mod stream_handler;
-mod settings;
-mod plugins;
-mod models;
+mod draw;
+mod gamba;
 mod help_find;
 mod helpers;
+mod highlight;
+mod input;
 mod lifecycle;
-mod viewport;
+mod lightbox;
+mod markdown;
+mod models;
+mod plugins;
+mod render;
+mod render_model;
+mod settings;
 mod sidecar;
 mod signals;
-mod lightbox;
+mod stream_handler;
+mod theme;
+mod toast;
+mod viewport;
 
 use app::{App, ChatMessage};
-use draw::{draw, boot_effect, quit_effect};
 use commands::CommandAction;
-use input::InputAction;
-use stream_handler::StreamAction;
+use draw::{boot_effect, build_render_model, quit_effect, render_frame};
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
+use input::InputAction;
 use lifecycle::{setup_terminal, teardown_terminal};
+use stream_handler::StreamAction;
 
-use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session};
-use synaps_cli::runtime::compaction::compact_conversation;
-use synaps_cli::core::session_index::SessionIndexRecord;
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use serde_json::json;
 use std::time::Instant;
+use synaps_cli::core::session_index::SessionIndexRecord;
+use synaps_cli::runtime::compaction::compact_conversation;
+use synaps_cli::{CancellationToken, Result, Runtime, Session, StreamEvent};
 use tachyonfx::{Effect, Shader};
-
 
 pub async fn run(
     continue_session: Option<Option<String>>,
@@ -52,7 +52,8 @@ pub async fn run(
         system,
         profile,
         no_extensions,
-    }).await?;
+    })
+    .await?;
 
     let mut runtime = boot.runtime;
     let mut config = boot.config;
@@ -74,14 +75,23 @@ pub async fn run(
         let msgs = std::mem::take(&mut app.api_messages);
         rebuild_display_messages(&msgs, &mut app);
         app.api_messages = msgs;
-        app.push_msg(ChatMessage::System(format!("resumed session {}", boot.session.id)));
+        app.push_msg(ChatMessage::System(format!(
+            "resumed session {}",
+            boot.session.id
+        )));
         if let Some(ref info) = boot.continue_info {
             if let Some(ref via) = info.resolved_via {
-                app.push_msg(ChatMessage::System(format!("  ↳ resolved via {} '{}'", via, info.query)));
+                app.push_msg(ChatMessage::System(format!(
+                    "  ↳ resolved via {} '{}'",
+                    via, info.query
+                )));
             }
         }
         if app.abort_context.is_some() {
-            app.push_msg(ChatMessage::System("⚠ abort context from previous session will be injected into next message".to_string()));
+            app.push_msg(ChatMessage::System(
+                "⚠ abort context from previous session will be injected into next message"
+                    .to_string(),
+            ));
         }
         app
     } else {
@@ -112,7 +122,10 @@ pub async fn run(
     }
 
     if mcp_server_count > 0 {
-        tracing::info!("{} MCP servers available (use connect_mcp_server to activate)", mcp_server_count);
+        tracing::info!(
+            "{} MCP servers available (use connect_mcp_server to activate)",
+            mcp_server_count
+        );
     }
 
     // ── Terminal setup ──
@@ -120,7 +133,8 @@ pub async fn run(
     let mut event_reader = EventStream::new();
     let (shutdown_signal_tx, mut shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
-    let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> = None;
+    let mut stream: Option<std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>> =
+        None;
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
@@ -140,10 +154,12 @@ pub async fn run(
 
     if !boot.no_extensions {
         app.extension_loader_running = true;
-        app.toasts.upsert(toast::Toast::new("extension-loader", "Discovering extensions…")
-            .titled("Extensions")
-            .at(toast::ToastPosition::TOP_CENTER)
-            .ttl(None));
+        app.toasts.upsert(
+            toast::Toast::new("extension-loader", "Discovering extensions…")
+                .titled("Extensions")
+                .at(toast::ToastPosition::TOP_CENTER)
+                .ttl(None),
+        );
         synaps_cli::extensions::loader::spawn_discover_and_load(
             std::sync::Arc::clone(&ext_mgr_shared),
             app.extension_loader_tx.clone(),
@@ -171,11 +187,21 @@ pub async fn run(
             // CrosstermBackend writes to the real PTY fd; on EIO/EPIPE the very
             // next frame fails. Discarding the error (the old `let _ =`) was the
             // primary reason the process survived indefinitely after PTY close.
-            if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
-                tracing::warn!(err = %e, "terminal write failed — PTY likely closed, exiting");
-                // PART 3: don't teardown here — fall through to the unified bounded-teardown
-                // path below the loop, which saves the session and exits cleanly (rc=0).
-                break;
+            let term_size = terminal.size().unwrap_or_default();
+            if let Some(model) = build_render_model(
+                &mut app,
+                &runtime,
+                elapsed,
+                &registry,
+                &secret_prompts,
+                term_size,
+            ) {
+                if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
+                    tracing::warn!(err = %e, "terminal write failed — PTY likely closed, exiting");
+                    // PART 3: don't teardown here — fall through to the unified bounded-teardown
+                    // path below the loop, which saves the session and exits cleanly (rc=0).
+                    break;
+                }
             }
         }
 
@@ -654,9 +680,12 @@ pub async fn run(
                                         app.spinner_frame = 0;
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
-                                        if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
-                                            tracing::warn!(err = %e, "terminal write failed (skill stream start) — PTY closed, exiting");
-                                            break;
+                                        let term_size = terminal.size().unwrap_or_default();
+                                        if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
+                                            if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
+                                                tracing::warn!(err = %e, "terminal write failed (skill stream start) — PTY closed, exiting");
+                                                break;
+                                            }
                                         }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
@@ -1370,9 +1399,12 @@ pub async fn run(
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
-                                    tracing::warn!(err = %e, "terminal write failed (submit stream start) — PTY closed, exiting");
-                                    break;
+                                let term_size = terminal.size().unwrap_or_default();
+                                if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
+                                    if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
+                                        tracing::warn!(err = %e, "terminal write failed (submit stream start) — PTY closed, exiting");
+                                        break;
+                                    }
                                 }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
@@ -1819,9 +1851,12 @@ pub async fn run(
                             app.spinner_frame = 0;
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
-                                tracing::warn!(err = %e, "terminal write failed (agent stream start) — PTY closed, exiting");
-                                break;
+                            let term_size = terminal.size().unwrap_or_default();
+                            if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
+                                if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
+                                    tracing::warn!(err = %e, "terminal write failed (agent stream start) — PTY closed, exiting");
+                                    break;
+                                }
                             }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
@@ -1847,9 +1882,12 @@ pub async fn run(
                     if do_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
-                            tracing::warn!(err = %e, "terminal write failed (stream event redraw) — PTY closed, exiting");
-                            break;
+                        let term_size = terminal.size().unwrap_or_default();
+                        if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
+                            if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
+                                tracing::warn!(err = %e, "terminal write failed (stream event redraw) — PTY closed, exiting");
+                                break;
+                            }
                         }
                     }
                 }
@@ -1869,7 +1907,7 @@ pub async fn run(
     // handlers cannot starve it.  Even if the hook budget is exhausted, the
     // session data on disk is already safe before hooks are attempted.
     {
-        let session_id   = app.session.id.clone();
+        let session_id = app.session.id.clone();
         let api_messages = app.api_messages.clone();
 
         // ── STEP 1: Save session data — own bounded timeout, highest priority ──
@@ -1915,7 +1953,8 @@ pub async fn run(
         // value is always Continue and handlers touch disjoint state.
         let transcript = Some(api_messages);
         let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
-            &session_id, transcript,
+            &session_id,
+            transcript,
         );
         match tokio::time::timeout(
             std::time::Duration::from_secs(signals::HOOKS_TIMEOUT_SECS),
@@ -1939,9 +1978,10 @@ pub async fn run(
 
     // Let extension shutdown continue in the background; exit should not hang on
     // extension post/session-end cleanup or slow child-process teardown.
-    let _extension_shutdown = synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
-        std::sync::Arc::clone(&ext_mgr_shared),
-    );
+    let _extension_shutdown =
+        synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
+            std::sync::Arc::clone(&ext_mgr_shared),
+        );
     // Stop the signal-listener thread (signal-hook handle, not a JoinHandle).
     shutdown_signal_task.close();
 
@@ -1960,21 +2000,31 @@ pub async fn run(
     Ok(())
 }
 
-fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::ExtensionWidgetEvent) {
+fn handle_widget_event(
+    app: &mut App,
+    event: synaps_cli::extensions::widgets::ExtensionWidgetEvent,
+) {
     use synaps_cli::extensions::widgets::WidgetEvent;
     match event.event {
-        WidgetEvent::Upsert { id, lines, styled_lines, position, title, ttl_secs } => {
+        WidgetEvent::Upsert {
+            id,
+            lines,
+            styled_lines,
+            position,
+            title,
+            ttl_secs,
+        } => {
             let pos = match position.as_str() {
-                "top_left"      => toast::ToastPosition::TOP_LEFT,
-                "top_center"    => toast::ToastPosition::TOP_CENTER,
-                "top_right"     => toast::ToastPosition::TOP_RIGHT,
-                "middle_left"   => toast::ToastPosition::MIDDLE_LEFT,
-                "center"        => toast::ToastPosition::CENTER,
-                "middle_right"  => toast::ToastPosition::MIDDLE_RIGHT,
-                "bottom_left"   => toast::ToastPosition::BOTTOM_LEFT,
+                "top_left" => toast::ToastPosition::TOP_LEFT,
+                "top_center" => toast::ToastPosition::TOP_CENTER,
+                "top_right" => toast::ToastPosition::TOP_RIGHT,
+                "middle_left" => toast::ToastPosition::MIDDLE_LEFT,
+                "center" => toast::ToastPosition::CENTER,
+                "middle_right" => toast::ToastPosition::MIDDLE_RIGHT,
+                "bottom_left" => toast::ToastPosition::BOTTOM_LEFT,
                 "bottom_center" => toast::ToastPosition::BOTTOM_CENTER,
-                "bottom_right"  => toast::ToastPosition::BOTTOM_RIGHT,
-                _               => toast::ToastPosition::TOP_RIGHT,
+                "bottom_right" => toast::ToastPosition::BOTTOM_RIGHT,
+                _ => toast::ToastPosition::TOP_RIGHT,
             };
             let ttl = ttl_secs.map(std::time::Duration::from_secs);
             let mut t = toast::Toast::new(
@@ -1988,22 +2038,30 @@ fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::Ex
             if let Some(styled) = styled_lines {
                 use ratatui::style::Style;
                 use ratatui::text::{Line, Span};
-                let rich: Vec<Line<'static>> = styled.into_iter().map(|spans| {
-                    Line::from(spans.into_iter().map(|s| {
-                        let mut style = Style::default();
-                        if let Some(ref fg) = s.fg {
-                            if let Some(c) = parse_hex_color(fg) {
-                                style = style.fg(c);
-                            }
-                        }
-                        if let Some(ref bg) = s.bg {
-                            if let Some(c) = parse_hex_color(bg) {
-                                style = style.bg(c);
-                            }
-                        }
-                        Span::styled(s.text, style)
-                    }).collect::<Vec<_>>())
-                }).collect();
+                let rich: Vec<Line<'static>> = styled
+                    .into_iter()
+                    .map(|spans| {
+                        Line::from(
+                            spans
+                                .into_iter()
+                                .map(|s| {
+                                    let mut style = Style::default();
+                                    if let Some(ref fg) = s.fg {
+                                        if let Some(c) = parse_hex_color(fg) {
+                                            style = style.fg(c);
+                                        }
+                                    }
+                                    if let Some(ref bg) = s.bg {
+                                        if let Some(c) = parse_hex_color(bg) {
+                                            style = style.bg(c);
+                                        }
+                                    }
+                                    Span::styled(s.text, style)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
                 t = t.rich(rich);
             }
             if let Some(title) = title {
@@ -2020,7 +2078,9 @@ fn handle_widget_event(app: &mut App, event: synaps_cli::extensions::widgets::Ex
 /// Parse a CSS-style hex color string (e.g. "#ff0000") into a ratatui Color.
 fn parse_hex_color(s: &str) -> Option<ratatui::style::Color> {
     let s = s.strip_prefix('#')?;
-    if s.len() != 6 { return None; }
+    if s.len() != 6 {
+        return None;
+    }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
@@ -2028,11 +2088,17 @@ fn parse_hex_color(s: &str) -> Option<ratatui::style::Color> {
 }
 
 fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>, persistent: bool) {
-    app.toasts.upsert(toast::Toast::new("extension-loader", "")
-        .titled(title)
-        .lines(lines)
-        .at(toast::ToastPosition::TOP_CENTER)
-        .ttl(if persistent { None } else { Some(std::time::Duration::from_secs(5)) }));
+    app.toasts.upsert(
+        toast::Toast::new("extension-loader", "")
+            .titled(title)
+            .lines(lines)
+            .at(toast::ToastPosition::TOP_CENTER)
+            .ttl(if persistent {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(5))
+            }),
+    );
     app.invalidate();
 }
 
@@ -2040,26 +2106,51 @@ async fn handle_extension_loader_event(
     app: &mut App,
     runtime: &Runtime,
     event: synaps_cli::extensions::loader::ExtensionLoaderEvent,
-    ext_mgr: &std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
+    ext_mgr: &std::sync::Arc<
+        tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
+    >,
 ) {
     use synaps_cli::extensions::loader::ExtensionLoaderEvent;
     match event {
         ExtensionLoaderEvent::Started => {
-            handle_extension_loader_toast(app, "Extensions", vec!["Discovering extensions…".into()], true);
-        }
-        ExtensionLoaderEvent::Loaded { plugin, loaded, failed } => {
             handle_extension_loader_toast(
                 app,
                 "Extensions",
-                vec![format!("Loaded {loaded} extension{}", if loaded == 1 { "" } else { "s" }), format!("Latest: {plugin}"), format!("Failures: {failed}")],
+                vec!["Discovering extensions…".into()],
                 true,
             );
         }
-        ExtensionLoaderEvent::Failed { failure, loaded, failed } => {
+        ExtensionLoaderEvent::Loaded {
+            plugin,
+            loaded,
+            failed,
+        } => {
             handle_extension_loader_toast(
                 app,
                 "Extensions",
-                vec![format!("Loaded {loaded}, failed {failed}"), format!("⚠ {}", failure.plugin)],
+                vec![
+                    format!(
+                        "Loaded {loaded} extension{}",
+                        if loaded == 1 { "" } else { "s" }
+                    ),
+                    format!("Latest: {plugin}"),
+                    format!("Failures: {failed}"),
+                ],
+                true,
+            );
+        }
+        ExtensionLoaderEvent::Failed {
+            failure,
+            loaded,
+            failed,
+        } => {
+            handle_extension_loader_toast(
+                app,
+                "Extensions",
+                vec![
+                    format!("Loaded {loaded}, failed {failed}"),
+                    format!("⚠ {}", failure.plugin),
+                ],
                 true,
             );
             app.push_msg(ChatMessage::System(format!(
@@ -2071,12 +2162,25 @@ async fn handle_extension_loader_event(
         ExtensionLoaderEvent::Finished { loaded, failed } => {
             app.extension_loader_running = false;
             let handler_count = runtime.hook_bus().handler_count().await;
-            tracing::info!(extensions = loaded.len(), failures = failed.len(), handlers = handler_count, "Extension discovery complete");
+            tracing::info!(
+                extensions = loaded.len(),
+                failures = failed.len(),
+                handlers = handler_count,
+                "Extension discovery complete"
+            );
             let lines = if failed.is_empty() {
-                vec![format!("✓ Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" })]
+                vec![format!(
+                    "✓ Loaded {} extension{}",
+                    loaded.len(),
+                    if loaded.len() == 1 { "" } else { "s" }
+                )]
             } else {
                 vec![
-                    format!("Loaded {} extension{}", loaded.len(), if loaded.len() == 1 { "" } else { "s" }),
+                    format!(
+                        "Loaded {} extension{}",
+                        loaded.len(),
+                        if loaded.len() == 1 { "" } else { "s" }
+                    ),
                     format!("{} failed — see transcript", failed.len()),
                 ]
             };
@@ -2092,10 +2196,12 @@ async fn handle_extension_loader_event(
                         let (_sub_id, mut rx) = handler.subscribe_notifications().await;
                         while let Some(frame) = rx.recv().await {
                             if synaps_cli::extensions::widgets::is_widget_method(&frame.method) {
-                                if let Ok(event) = synaps_cli::extensions::widgets::parse_widget_event(
-                                    &frame.method,
-                                    &frame.params,
-                                ) {
+                                if let Ok(event) =
+                                    synaps_cli::extensions::widgets::parse_widget_event(
+                                        &frame.method,
+                                        &frame.params,
+                                    )
+                                {
                                     let _ = widget_tx.send(
                                         synaps_cli::extensions::widgets::ExtensionWidgetEvent {
                                             extension_id: ext_id.clone(),
@@ -2133,11 +2239,10 @@ fn migrate_sidecar_toggle_key_to_claimed_plugins(
         return;
     }
     for claim in claims {
-        let Some(ref cat) = claim.settings_category else { continue };
-        let new_key = format!(
-            "plugins.{}.{}._lifecycle_toggle_key",
-            claim.plugin, cat
-        );
+        let Some(ref cat) = claim.settings_category else {
+            continue;
+        };
+        let new_key = format!("plugins.{}.{}._lifecycle_toggle_key", claim.plugin, cat);
         if synaps_cli::config::read_config_value(&new_key).is_some() {
             continue;
         }
@@ -2234,7 +2339,8 @@ mod migration_tests {
         std::fs::write(
             &cfg,
             "sidecar_toggle_key = F2\nplugins.sample-sidecar.capture._lifecycle_toggle_key = F12\n",
-        ).unwrap();
+        )
+        .unwrap();
         with_home(&home, || {
             migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
                 "sample-sidecar",
@@ -2244,7 +2350,11 @@ mod migration_tests {
             let v = synaps_cli::config::read_config_value(
                 "plugins.sample-sidecar.capture._lifecycle_toggle_key",
             );
-            assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
+            assert_eq!(
+                v.as_deref(),
+                Some("F12"),
+                "must not overwrite a user-set value"
+            );
         });
     }
 
@@ -2262,7 +2372,8 @@ mod migration_tests {
             )]);
             assert!(synaps_cli::config::read_config_value(
                 "plugins.sample-sidecar.capture._lifecycle_toggle_key"
-            ).is_none());
+            )
+            .is_none());
         });
     }
 
@@ -2297,13 +2408,15 @@ mod migration_tests {
             assert_eq!(
                 synaps_cli::config::read_config_value(
                     "plugins.sample-sidecar.capture._lifecycle_toggle_key"
-                ).as_deref(),
+                )
+                .as_deref(),
                 Some("C-V")
             );
             assert_eq!(
                 synaps_cli::config::read_config_value(
                     "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
-                ).as_deref(),
+                )
+                .as_deref(),
                 Some("C-V")
             );
         });

@@ -2,19 +2,33 @@
 //! Persists changes to ~/.synaps-cli/config and mutates Runtime where possible.
 
 pub(crate) mod defs;
-pub(crate) mod schema;
 pub(crate) mod draw;
 pub(crate) mod input;
 pub(crate) mod plugin_editor;
+pub(crate) mod schema;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
 
 const BUILTIN_THEMES: &[&str] = &[
-    "default", "neon-rain", "amber", "phosphor", "solarized-dark", "blood",
-    "ocean", "rose-pine", "nord", "dracula", "monokai",
-    "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
-    "forest", "lavender",
+    "default",
+    "neon-rain",
+    "amber",
+    "phosphor",
+    "solarized-dark",
+    "blood",
+    "ocean",
+    "rose-pine",
+    "nord",
+    "dracula",
+    "monokai",
+    "gruvbox",
+    "catppuccin",
+    "tokyo-night",
+    "sunset",
+    "ice",
+    "forest",
+    "lavender",
 ];
 
 pub(crate) fn theme_options() -> Vec<String> {
@@ -25,7 +39,9 @@ pub(crate) fn theme_options() -> Vec<String> {
             for e in entries.flatten() {
                 if let Some(name) = e.path().file_stem().and_then(|s| s.to_str()) {
                     let s = name.to_string();
-                    if !opts.contains(&s) { opts.push(s); }
+                    if !opts.contains(&s) {
+                        opts.push(s);
+                    }
                 }
             }
         }
@@ -35,11 +51,13 @@ pub(crate) fn theme_options() -> Vec<String> {
 
 use schema::SettingDef;
 
+#[derive(Clone)]
 pub(crate) struct PluginRow {
     pub name: String,
     pub skill_count: usize,
 }
 
+#[derive(Clone)]
 /// Snapshot of live runtime + persisted config values, used to display current
 /// values in the modal and seed text editors.
 pub(crate) struct RuntimeSnapshot {
@@ -58,7 +76,8 @@ pub(crate) struct RuntimeSnapshot {
     pub provider_keys: std::collections::BTreeMap<String, String>,
     /// Cached ping results for models. Key format: "provider/model" (or bare
     /// model id for Anthropic). Empty until `/ping` has been run.
-    pub model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+    pub model_health:
+        std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     /// Plugin-declared settings categories snapshotted from the registry
     /// at modal-open time. Each entry contributes a category row in the
     /// left pane and a list of fields in the right pane. Path B Phase 4.
@@ -81,7 +100,10 @@ impl RuntimeSnapshot {
     pub fn from_runtime_with_health(
         runtime: &synaps_cli::Runtime,
         registry: &synaps_cli::skills::registry::CommandRegistry,
-        model_health: std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
+        model_health: std::collections::HashMap<
+            String,
+            (synaps_cli::runtime::openai::ping::PingStatus, u64),
+        >,
     ) -> Self {
         let config = synaps_cli::config::load_config();
         // Build the plugin list from *all* discovered plugins on disk (not
@@ -99,7 +121,10 @@ impl RuntimeSnapshot {
             .into_iter()
             .map(|p| {
                 let skill_count = registry_map.get(&p.name).copied().unwrap_or(0);
-                PluginRow { name: p.name, skill_count }
+                PluginRow {
+                    name: p.name,
+                    skill_count,
+                }
             })
             .collect();
         plugins.sort_by(|a, b| a.name.cmp(&b.name));
@@ -137,11 +162,27 @@ pub(super) enum Focus {
     Right,
 }
 
+#[derive(Clone)]
 pub(super) enum ActiveEditor {
-    Text { buffer: String, setting_key: &'static str, numeric: bool, error: Option<String> },
-    Picker { setting_key: &'static str, options: Vec<String>, cursor: usize },
-    CustomModel { buffer: String, setting_key: &'static str },
-    ApiKey { provider_id: String, buffer: String },
+    Text {
+        buffer: String,
+        setting_key: &'static str,
+        numeric: bool,
+        error: Option<String>,
+    },
+    Picker {
+        setting_key: &'static str,
+        options: Vec<String>,
+        cursor: usize,
+    },
+    CustomModel {
+        buffer: String,
+        setting_key: &'static str,
+    },
+    ApiKey {
+        provider_id: String,
+        buffer: String,
+    },
     /// Text editor for a plugin-declared `text` field. Path B Phase 4.
     /// Commits via `InputOutcome::PluginApply` to the plugin config namespace.
     PluginText {
@@ -160,6 +201,7 @@ pub(super) enum ActiveEditor {
     },
 }
 
+#[derive(Clone)]
 pub(super) struct SettingsState {
     pub category_idx: usize,
     pub setting_idx: usize,
@@ -189,7 +231,10 @@ impl SettingsState {
         if cat == schema::Category::Plugins || cat == schema::Category::Providers {
             return Vec::new();
         }
-        schema::ALL_SETTINGS.iter().filter(|s| s.category == cat).collect()
+        schema::ALL_SETTINGS
+            .iter()
+            .filter(|s| s.category == cat)
+            .collect()
     }
 
     pub fn current_setting(&self) -> Option<&'static SettingDef> {
@@ -213,7 +258,8 @@ impl SettingsState {
         if !self.is_plugin_category(snap) {
             return None;
         }
-        snap.plugin_categories.get(self.category_idx - schema::visible_categories(&snap.lifecycle_claims).len())
+        snap.plugin_categories
+            .get(self.category_idx - schema::visible_categories(&snap.lifecycle_claims).len())
     }
 
     /// Plugin field at `setting_idx` within the current plugin category.
@@ -280,4 +326,3 @@ mod wireup_tests {
             .contains(&schema::Category::Sidecar));
     }
 }
-
