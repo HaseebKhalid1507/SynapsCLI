@@ -144,7 +144,7 @@ pub async fn run(
                     eprintln!("session cleared → {}", &conv.session.id[..8]);
                 }
                 "sessions" => {
-                    match synaps_cli::list_sessions() {
+                    match synaps_cli::list_recent_sessions(20) {
                         Ok(sessions) => {
                             for s in sessions.iter().take(20) {
                                 let marker = if s.id == conv.session.id { "→ " } else { "  " };
