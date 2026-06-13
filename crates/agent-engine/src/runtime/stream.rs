@@ -172,6 +172,29 @@ impl StreamMethods {
 
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
+                // Defense-in-depth (task #130): a response with zero content
+                // blocks is degenerate. Never push an empty assistant turn (it
+                // poisons history) and never treat it as a clean end-of-turn —
+                // that silent swallow is the "stopping" bug. The Anthropic path
+                // already converts this to an Err in classify_stream_outcome;
+                // this guards any other provider path that yields Ok(empty).
+                //
+                // EXCEPT on user cancellation: a cancelled stream legitimately
+                // returns empty content, and that is a clean stop — not an
+                // error. Surfacing the scary message there would make every
+                // cancel look like a crash.
+                if content.is_empty() {
+                    if !cancel.is_cancelled() {
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                            "model returned an empty response — likely context-window \
+                             exceeded or API overload. Try /compact or start a fresh \
+                             session.".to_string(),
+                        )));
+                    }
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    return Ok(());
+                }
+
                 let mut tool_uses = Vec::new();
 
                 // Process response content

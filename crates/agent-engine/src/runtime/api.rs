@@ -78,6 +78,47 @@ struct ParseState {
     /// still bill what message_start reported — exactly one emission per
     /// request in all paths.
     usage_emitted: bool,
+    /// Captured from an in-stream Anthropic `error` event. When set, the stream
+    /// produced a failure (e.g. `overloaded_error`, `request_too_large`) the API
+    /// delivered inside a 200 response. `classify_stream_outcome` turns this into
+    /// either a retry (transient) or a terminal `Err` so the turn never silently
+    /// ends with empty content (the "stopping" bug, task #130).
+    stream_error: Option<StreamError>,
+}
+
+/// A failure surfaced as an in-stream Anthropic `error` event under a 200
+/// response. `retryable` follows Anthropic's error taxonomy: transient classes
+/// (`overloaded_error`, `api_error`, `rate_limit_error`) are retried with
+/// backoff; everything else (`request_too_large`, `invalid_request_error`,
+/// auth/permission) is terminal — retrying a context-overflow never helps.
+#[derive(Debug, Clone)]
+struct StreamError {
+    /// Human-facing, actionable message (already names the error type + body).
+    message: String,
+    /// True for transient classes that a backoff retry can clear.
+    retryable: bool,
+}
+
+impl StreamError {
+    /// Anthropic error `type`s that a retry can plausibly clear. Mirrors the
+    /// HTTP-status retry set (429 rate_limit, 500 api_error, 529 overloaded).
+    fn is_retryable_type(error_type: &str) -> bool {
+        matches!(
+            error_type,
+            "overloaded_error" | "api_error" | "rate_limit_error"
+        )
+    }
+}
+
+/// The decided fate of a finished stream — pure, unit-tested (task #130).
+#[derive(Debug)]
+enum StreamOutcome {
+    /// A valid turn — hand the assistant content envelope back to the caller.
+    Done(Value),
+    /// A transient in-stream error — caller should back off and re-send.
+    Retry(String),
+    /// A terminal failure — surface as a visible `Err`, never a silent stop.
+    Fail(String),
 }
 
 impl ParseState {
@@ -104,6 +145,7 @@ impl ParseState {
             msg_start_cache_5m: None,
             msg_start_cache_1h: None,
             usage_emitted: false,
+            stream_error: None,
         }
     }
 
@@ -418,11 +460,39 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageStop => {}
+        AnthropicEvent::Error { error } => {
+            // Anthropic delivers some failures (overloaded, context-overflow)
+            // as an in-stream `error` event under a 200 response. Capture +
+            // CLASSIFY it so the stream either retries (transient) or surfaces
+            // a visible, accurate error — never the silent "stopping" swallow
+            // (task #130). First error wins — later frames don't clobber it.
+            if state.stream_error.is_none() {
+                let (kind, body) = match &error {
+                    Some(e) => (
+                        e.error_type.as_deref().unwrap_or("error"),
+                        e.message.as_deref(),
+                    ),
+                    None => ("error", None),
+                };
+                let retryable = StreamError::is_retryable_type(kind);
+                let message = match body {
+                    Some(m) => format!("API stream error ({kind}): {m}"),
+                    None => format!("API stream error ({kind})"),
+                };
+                // Gap-1 forensics: the raw frame is the ground truth for the
+                // next occurrence — log it once, verbatim (bounded).
+                tracing::warn!(
+                    retryable,
+                    raw = %truncate_at_char_boundary(raw, 400),
+                    "SSE error event: {message}"
+                );
+                state.stream_error = Some(StreamError { message, retryable });
+            }
+        }
         AnthropicEvent::Unknown => {
             // #[serde(other)] discarded the tag — the raw line is the only
-            // forensics. Covers `ping`, `error`, and future event types.
-            // TODO(follow-up): promote Anthropic `error` events to a real arm
-            // surfacing SessionEvent::Notice.
+            // forensics. Covers `ping` and future event types (`error` is now
+            // a real arm above).
             tracing::trace!(
                 "Unknown SSE event type: {}",
                 truncate_at_char_boundary(raw, 200)
@@ -469,7 +539,47 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
     }));
 }
 
-/// Options that modify API request behavior beyond the core parameters.
+/// Decide the fate of a finished stream. Pure (no I/O) so it is unit tested
+/// directly — the silent-stop fix (task #130) lives here.
+///
+///   * An in-stream `error` event → `Retry` (transient class) or `Fail`
+///     (terminal class, e.g. `request_too_large` context overflow). A user
+///     cancellation downgrades any error to a clean (empty) `Done`.
+///   * A degenerate empty stream (no content AND no stop_reason) that was NOT
+///     cancelled → `Fail`. An empty streamed response with no stop reason is
+///     never valid; swallowing it as an empty assistant turn is exactly what
+///     made the agent silently stop mid-flow.
+///   * Otherwise → `Done` with the assistant content envelope. A cancelled
+///     stream legitimately yields empty content, so it passes through.
+fn classify_stream_outcome(
+    stream_error: Option<StreamError>,
+    content: Vec<Value>,
+    has_stop_reason: bool,
+    cancelled: bool,
+) -> StreamOutcome {
+    if let Some(e) = stream_error {
+        if cancelled {
+            // The user pulled the plug — don't surface a scary error or burn a
+            // retry. Return whatever (likely empty) content we have.
+            return StreamOutcome::Done(json!({ "content": content }));
+        }
+        return if e.retryable {
+            StreamOutcome::Retry(e.message)
+        } else {
+            StreamOutcome::Fail(e.message)
+        };
+    }
+    if !cancelled && content.is_empty() && !has_stop_reason {
+        return StreamOutcome::Fail(
+            "empty response from API — the model returned no content and no stop \
+             reason. This usually means the context window was exceeded or the \
+             API was overloaded. Try /compact or start a fresh session."
+                .to_string(),
+        );
+    }
+    StreamOutcome::Done(json!({ "content": content }))
+}
+
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
@@ -623,22 +733,30 @@ impl ApiMethods {
             .map_err(|e| RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e)))?
             .into();
 
-        // Retry loop for transient API errors (429, 529, 500, 502, 503).
+        // ═══ UNIFIED RETRY (task #130) ════════════════════════════════════════
+        // ONE budget governs every transient failure — whether it surfaces as an
+        // HTTP status (429 / 5xx, pre-stream), a transport drop, OR an in-stream
+        // `error` event (overloaded_error / api_error / rate_limit_error,
+        // mid-stream under a 200). They are the same class of problem: "re-send
+        // the identical request after backoff." Sharing these counters across the
+        // send phase AND the stream phase is what stops the budget from
+        // multiplying (the two-loop smell) — a request that flaps between an HTTP
+        // 5xx and an in-stream error draws down a SINGLE `max_retries` budget.
         //
-        // 429 (rate-limit) gets its own higher budget: OAuth windows can last
-        // minutes, so we honour the `retry-after` / reset headers and keep
-        // trying rather than dying after 3 attempts. Other transient errors
-        // (500/502/503/529) stay on the user-configured `max_retries` budget.
+        // 429 (rate-limit) keeps its own higher budget: OAuth windows can last
+        // minutes, so we honour the reset headers rather than dying after a few
+        // tries. Other transients (HTTP 5xx + in-stream errors) share `max_retries`.
         const MAX_429_RETRIES: u32 = 8;
+        let mut last_err = String::new();
+        let mut last_status: Option<u16> = None;
+        let mut last_reset_hint: Option<String> = None;
+        let mut non_429_attempts: u32 = 0; // shared server-error budget
+        let mut attempt: u32 = 0;          // total attempts (for backoff calc)
+
+        loop {
         let response = {
-            let mut last_err = String::new();
-            let mut last_status: Option<u16> = None;
-            let mut last_reset_hint: Option<String> = None;
             #[allow(unused_assignments)]
             let mut response = None;
-            // Separate counters so 429s don't burn the tight server-error budget.
-            let mut non_429_attempts: u32 = 0;
-            let mut attempt: u32 = 0; // total attempts (0-based, for delay calc)
 
             loop {
                 if attempt > 0 {
@@ -839,6 +957,12 @@ impl ApiMethods {
         // the message_start capture. No-op when the delta already emitted.
         emit_residual_usage(&mut state, &ctx);
 
+        // Capture the failure signals BEFORE the telemetry block — it moves
+        // `state.telem_stop_reason` into the record when telemetry is enabled.
+        let stream_error = state.stream_error.take();
+        let has_stop_reason = state.telem_stop_reason.is_some();
+        let cancelled = cancel.is_cancelled();
+
 
         // ═══ TELEMETRY: write the record ═══
         if telemetry_level.enabled() {
@@ -878,9 +1002,44 @@ impl ApiMethods {
             telemetry::write_record(&record);
         }
 
-        Ok(json!({
-            "content": state.accumulated_content
-        }))
+        match classify_stream_outcome(
+            stream_error,
+            std::mem::take(&mut state.accumulated_content),
+            has_stop_reason,
+            cancelled,
+        ) {
+            StreamOutcome::Done(v) => return Ok(v),
+            StreamOutcome::Fail(msg) => return Err(RuntimeError::ApiStatus(msg)),
+            StreamOutcome::Retry(msg) => {
+                // Transient in-stream error (overloaded_error / api_error /
+                // rate_limit_error). Draws from the SAME shared server-error
+                // budget as HTTP 5xx — one unified retry policy, no budget
+                // multiplication across the send and stream phases.
+                if non_429_attempts >= max_retries || cancel.is_cancelled() {
+                    // Budget exhausted (or user cancelled) — surface terminally
+                    // rather than silently. Still loud, never the silent stop.
+                    return Err(RuntimeError::ApiStatus(msg));
+                }
+                let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.min(6)));
+                non_429_attempts += 1;
+                attempt += 1;
+                last_err = msg.clone();
+                last_status = None;
+                tracing::warn!(
+                    "in-stream API error, retrying {}/{} after {:?}: {}",
+                    non_429_attempts, max_retries, delay, msg
+                );
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                    format!("⏳ API stream error — retrying ({}/{})…", non_429_attempts, max_retries),
+                )));
+                tokio::time::sleep(delay).await;
+                if cancel.is_cancelled() {
+                    return Err(RuntimeError::Canceled);
+                }
+                // fall through to the outer `loop` head: rebuild request + re-stream.
+            }
+        }
+        } // end UNIFIED RETRY LOOP (task #130)
     }
 }
 
@@ -1543,7 +1702,6 @@ mod tests {
         feed(
             &[
                 r#"data: {"type":"ping"}"#,
-                r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
                 r#"data: {"type":"fnord","payload":[1,2,3]}"#,
             ],
             &mut state,
@@ -1551,6 +1709,146 @@ mod tests {
         );
         assert_eq!(snapshot(&state), before, "Unknown events must not mutate state");
         assert!(drain(&mut rx).is_empty(), "Unknown events must emit zero events");
+        assert!(state.stream_error.is_none(), "ping/unknown must not set a stream error");
+    }
+
+    #[test]
+    fn error_event_sets_stream_error() {
+        // An in-stream Anthropic `error` event (200-status soft failure:
+        // overloaded, context overflow) MUST be captured — not silently
+        // dropped as an Unknown event. This is the root of task #130: a
+        // dropped error event left the stream empty and the turn ended
+        // silently. The captured message must name the error type so the
+        // surfaced error is actionable.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#],
+            &mut state,
+            &ctx,
+        );
+        let err = state.stream_error.expect("error event must set stream_error");
+        assert!(err.message.contains("overloaded_error"), "must carry the error type: {}", err.message);
+        assert!(err.message.contains("Overloaded"), "must carry the error message: {}", err.message);
+        assert!(err.retryable, "overloaded_error is a transient/retryable class");
+    }
+
+    #[test]
+    fn error_event_without_payload_still_sets_stream_error() {
+        // A bare `{"type":"error"}` with no inner payload must still register
+        // a failure — an error event is never a no-op.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&[r#"data: {"type":"error"}"#], &mut state, &ctx);
+        assert!(
+            state.stream_error.is_some(),
+            "error event with no payload must still set a stream error"
+        );
+    }
+
+    #[test]
+    fn context_overflow_error_is_terminal_not_retryable() {
+        // `request_too_large` / `invalid_request_error` is the context-overflow
+        // (#130) class — retrying never helps, so it must classify terminal.
+        for kind in ["request_too_large", "invalid_request_error", "authentication_error"] {
+            let (mut state, tx, _rx) = harness();
+            let ctx = make_ctx(&tx);
+            let line = format!(
+                r#"data: {{"type":"error","error":{{"type":"{kind}","message":"nope"}}}}"#
+            );
+            feed(&[line.as_str()], &mut state, &ctx);
+            let err = state.stream_error.expect("error captured");
+            assert!(!err.retryable, "{kind} must be terminal, not retryable");
+        }
+    }
+
+    // ── classify_stream_outcome: the silent-stop decision (task #130) ──
+
+    #[test]
+    fn outcome_retries_on_transient_error_event() {
+        let r = classify_stream_outcome(
+            Some(StreamError { message: "overloaded".to_string(), retryable: true }),
+            vec![],
+            false,
+            false,
+        );
+        assert!(matches!(r, StreamOutcome::Retry(_)), "transient error must retry, got {r:?}");
+    }
+
+    #[test]
+    fn outcome_fails_on_terminal_error_event() {
+        let r = classify_stream_outcome(
+            Some(StreamError { message: "request_too_large".to_string(), retryable: false }),
+            vec![],
+            false,
+            false,
+        );
+        match r {
+            StreamOutcome::Fail(m) => assert!(m.contains("request_too_large")),
+            other => panic!("terminal error must Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_fails_on_degenerate_empty_stream() {
+        // Empty content + no stop_reason + not cancelled = the silent stop.
+        let r = classify_stream_outcome(None, vec![], false, false);
+        match r {
+            StreamOutcome::Fail(m) => assert!(
+                m.contains("context window") || m.contains("overloaded"),
+                "error must be actionable: {m}"
+            ),
+            other => panic!("empty+no-stop must Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_done_when_empty_but_cancelled() {
+        // User cancellation legitimately yields empty content — not an error,
+        // and never a retry (don't fight the user's cancel).
+        let r = classify_stream_outcome(None, vec![], false, true);
+        assert!(matches!(r, StreamOutcome::Done(_)), "cancellation is a clean Done");
+
+        // A cancel during a retryable error must ALSO downgrade to Done.
+        let r2 = classify_stream_outcome(
+            Some(StreamError { message: "overloaded".to_string(), retryable: true }),
+            vec![],
+            false,
+            true,
+        );
+        assert!(matches!(r2, StreamOutcome::Done(_)), "cancel beats a retryable error");
+    }
+
+    #[test]
+    fn outcome_done_when_empty_but_has_stop_reason() {
+        // A real end_turn with no content (rare but valid — e.g. a pause turn)
+        // carries a stop_reason and must pass through.
+        let r = classify_stream_outcome(None, vec![], true, false);
+        assert!(matches!(r, StreamOutcome::Done(_)), "empty-but-stop_reason is valid");
+    }
+
+    #[test]
+    fn outcome_done_passes_content_through() {
+        let content = vec![json!({"type":"text","text":"hi"})];
+        let r = classify_stream_outcome(None, content.clone(), true, false);
+        match r {
+            StreamOutcome::Done(v) => assert_eq!(v["content"], json!(content)),
+            other => panic!("non-empty content is always Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_error_event_beats_nonempty_content() {
+        // If the stream errored, surface/retry it even if partial content
+        // accumulated — a partial answer after an error frame is not a turn.
+        let content = vec![json!({"type":"text","text":"partial"})];
+        let r = classify_stream_outcome(
+            Some(StreamError { message: "boom".to_string(), retryable: false }),
+            content,
+            true,
+            false,
+        );
+        assert!(matches!(r, StreamOutcome::Fail(_)), "error event wins over partial content");
     }
 
     #[test]

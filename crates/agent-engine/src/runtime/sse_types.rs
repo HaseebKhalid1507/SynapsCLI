@@ -29,11 +29,30 @@ pub(super) enum AnthropicEvent<'a> {
         usage: Option<UsagePayload>,
     },
     MessageStop,
+    /// Anthropic streams some failures as a 200 response carrying an in-stream
+    /// `error` event (e.g. `overloaded_error`, or a context-overflow rejection)
+    /// rather than an HTTP error status. Capturing it as a real arm is what
+    /// turns the "silent stop" (empty stream → empty turn) into a visible,
+    /// actionable error. See `process_data_line` + `build_response_or_error`.
+    Error {
+        #[serde(borrow, default)]
+        error: Option<ApiError<'a>>,
+    },
     /// Unit variant required: serde's #[serde(other)] only supports unit
     /// variants under internal tagging. Payload discarded — matches the
-    /// current `_ => {}`. Covers `ping`, `error`, and future event types.
+    /// current `_ => {}`. Covers `ping` and future event types.
     #[serde(other)]
     Unknown,
+}
+
+/// Inner payload of an Anthropic in-stream `error` event:
+/// `{"type":"error","error":{"type":"overloaded_error","message":"..."}}`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ApiError<'a> {
+    #[serde(borrow, default, rename = "type")]
+    pub error_type: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub message: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,13 +360,36 @@ mod tests {
     fn unknown_event_type_is_unit_unknown() {
         for data in [
             r#"{"type":"ping"}"#,
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
             r#"{"type":"fnord","payload":[1,2,3]}"#,
         ] {
             assert!(
                 matches!(parse(data), AnthropicEvent::Unknown),
                 "expected Unknown for {data}"
             );
+        }
+    }
+
+    #[test]
+    fn error_event_parses_to_error_variant_with_payload() {
+        // The `error` tag is a real variant now (task #130) — it must NOT fall
+        // through to Unknown, and its type/message must be extractable so the
+        // surfaced failure is actionable.
+        let data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        match parse(data) {
+            AnthropicEvent::Error { error } => {
+                let e = error.expect("error payload present");
+                assert_eq!(e.error_type.as_deref(), Some("overloaded_error"));
+                assert_eq!(e.message.as_deref(), Some("Overloaded"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_error_event_parses_to_error_variant_without_payload() {
+        match parse(r#"{"type":"error"}"#) {
+            AnthropicEvent::Error { error } => assert!(error.is_none()),
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
