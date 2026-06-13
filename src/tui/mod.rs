@@ -28,7 +28,6 @@ use commands::CommandAction;
 use input::InputAction;
 use stream_handler::StreamAction;
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
-use signals::ShutdownAction;
 use lifecycle::{setup_terminal, teardown_terminal};
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session};
@@ -186,21 +185,20 @@ pub async fn run(
             signal = shutdown_signal_rx.recv() => {
                 if let Some(signal) = signal {
                     tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
-                    // Use the pure shutdown_action() policy so the decision is
-                    // testable.  All OS signals currently map to ImmediateExit — see
-                    // signals.rs for rationale.  AnimatedExit is reserved for UI-driven
-                    // quit actions that own their own animation timing.
-                    match signals::shutdown_action(signal) {
-                        ShutdownAction::ImmediateExit => {
-                            tracing::info!("immediate exit on {:?}", signal);
-                            // Fall through to unified bounded-teardown below the loop.
-                            break;
-                        }
-                        ShutdownAction::AnimatedExit => {
-                            app.push_msg(ChatMessage::System(format!("shutting down ({})", signals::signal_label(signal))));
-                            exit_fx = Some(quit_effect());
-                        }
-                    }
+                    // All OS signals map to ImmediateExit (see signals.rs).
+                    // The /quit command sets exit_fx directly and does NOT go
+                    // through this path, so removing AnimatedExit from signals
+                    // does not affect interactive quit.
+                    let signals::ShutdownAction::ImmediateExit = signals::shutdown_action(signal);
+                    tracing::info!("immediate exit on {:?}", signal);
+                    // Cancel any in-flight stream so the tool/subagent is not
+                    // orphaned for the full watchdog window.
+                    if let Some(ref ct) = cancel_token { ct.cancel(); }
+                    // Abort any in-flight compaction so it doesn't hold state
+                    // open past the teardown budget.
+                    if let Some(ref h) = app.compact_task { h.abort(); }
+                    // Fall through to unified bounded-teardown below the loop.
+                    break;
                 }
             }
 
@@ -656,7 +654,10 @@ pub async fn run(
                                         app.spinner_frame = 0;
                                         let elapsed = last_frame.elapsed();
                                         last_frame = Instant::now();
-                                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                                        if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
+                                            tracing::warn!(err = %e, "terminal write failed (skill stream start) — PTY closed, exiting");
+                                            break;
+                                        }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -1369,7 +1370,10 @@ pub async fn run(
                                 app.spinner_frame = 0;
                                 let elapsed = last_frame.elapsed();
                                 last_frame = Instant::now();
-                                let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                                if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
+                                    tracing::warn!(err = %e, "terminal write failed (submit stream start) — PTY closed, exiting");
+                                    break;
+                                }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -1815,7 +1819,10 @@ pub async fn run(
                             app.spinner_frame = 0;
                             let elapsed = last_frame.elapsed();
                             last_frame = Instant::now();
-                            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                            if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
+                                tracing::warn!(err = %e, "terminal write failed (agent stream start) — PTY closed, exiting");
+                                break;
+                            }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking("…".to_string()));
@@ -1840,53 +1847,94 @@ pub async fn run(
                     if do_draw {
                         let elapsed = last_frame.elapsed();
                         last_frame = Instant::now();
-                        let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+                        if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
+                            tracing::warn!(err = %e, "terminal write failed (stream event redraw) — PTY closed, exiting");
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    // ── PART 2: Bounded teardown — must complete within 3s; otherwise hard-exit.
+    // ── PART 2: Bounded teardown — two sequential budgets.
     //
-    // save_session() and hook_bus().emit() are unbounded awaits that can hang
-    // when extensions misbehave or the runtime is in a degraded state.  Wrap
-    // them in a single timeout so the process ALWAYS exits within ~3s of
-    // deciding to shut down.
+    // All timing constants are defined in signals.rs (single source of truth):
+    //   SAVE_TIMEOUT_SECS  — session save + index record (data safety first)
+    //   HOOKS_TIMEOUT_SECS — on_session_end hook emit (concurrent, fail-open)
+    //   TEARDOWN_TIMEOUT_SECS = SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
+    //   WATCHDOG_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS (compile-time asserted)
     //
-    // Cross-reference: the signal watchdog in signals.rs sleeps for 5 s before
-    // calling process::exit().  5 s > 3 s means the watchdog never fires during
-    // a legitimate teardown — it is a true last resort for genuine hangs.
-    // Invariant: watchdog_timeout (5 s) > teardown_timeout (3 s).
+    // Session save ALWAYS runs first in its own timeout so slow extension
+    // handlers cannot starve it.  Even if the hook budget is exhausted, the
+    // session data on disk is already safe before hooks are attempted.
     {
         let session_id   = app.session.id.clone();
         let api_messages = app.api_messages.clone();
-        let teardown_fut = async {
+
+        // ── STEP 1: Save session data — own bounded timeout, highest priority ──
+        let save_fut = async {
             app.save_session().await;
 
-            // ═══ HOOK: on_session_end ═══
             let mut index_record = SessionIndexRecord::end(&session_id);
             index_record.turns = Some(api_messages.len());
             if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
                 tracing::warn!("failed to append session end index record: {}", err);
             }
-            let transcript = Some(api_messages);
-            let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
-                &session_id, transcript,
-            );
-            let _ = runtime.hook_bus().emit(&hook_event).await;
         };
 
-        match tokio::time::timeout(std::time::Duration::from_secs(3), teardown_fut).await {
-            Ok(()) => {
-                tracing::debug!("clean teardown completed");
-            }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(signals::SAVE_TIMEOUT_SECS),
+            save_fut,
+        )
+        .await
+        {
+            Ok(()) => tracing::debug!("session save completed"),
             Err(_elapsed) => {
-                tracing::warn!("teardown timed out after 3s — forcing exit");
+                tracing::warn!(
+                    budget_secs = signals::SAVE_TIMEOUT_SECS,
+                    "session save timed out — data may be incomplete"
+                );
                 lifecycle::emergency_teardown_terminal();
-                std::process::exit(0);
+                std::process::exit(1);
             }
         }
+
+        // ── STEP 2: Fire on_session_end hook — own bounded timeout, after save ──
+        //
+        // emit_concurrent() dispatches all on_session_end handlers simultaneously
+        // under one shared timeout window instead of N×5 s serial.  This is safe
+        // because on_session_end only allows `Continue` results — handlers are
+        // independent fire-and-forget notification calls (deck, d20, jawz-widget,
+        // synaps-tasks each write to their own stores; no ordering dependency).
+        //
+        // Ordering-safety evidence: HookKind::OnSessionEnd::allowed_action_names()
+        // returns &["continue"] exclusively; allows_result() permits only Continue;
+        // emit_concurrent() merges injections (N/A here) and treats timeouts as
+        // continue (fail-open).  Serial ordering cannot matter when the return
+        // value is always Continue and handlers touch disjoint state.
+        let transcript = Some(api_messages);
+        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
+            &session_id, transcript,
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(signals::HOOKS_TIMEOUT_SECS),
+            runtime.hook_bus().emit_concurrent(&hook_event),
+        )
+        .await
+        {
+            Ok(_) => tracing::debug!("on_session_end hooks completed"),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    budget_secs = signals::HOOKS_TIMEOUT_SECS,
+                    "on_session_end hooks timed out — extensions may not have flushed"
+                );
+                // Session is already saved above — no data loss here.
+                // Fall through to normal teardown.
+            }
+        }
+
+        tracing::debug!("clean teardown completed");
     }
 
     // Let extension shutdown continue in the background; exit should not hang on
@@ -1902,8 +1950,11 @@ pub async fn run(
 
     teardown_terminal(&mut terminal);
     // Prevent ratatui's Drop impl from calling show_cursor() + eprintln! on a
-    // dead PTY (which would panic and exit rc=101).  We have already done full
-    // teardown above; forgetting the Terminal is safe here.
+    // dead PTY — ratatui's Terminal<CrosstermBackend> Drop calls show_cursor()
+    // which panics on a closed PTY.  We have already done full teardown above
+    // via teardown_terminal(); forgetting the Terminal here is safe.  If
+    // ratatui's Drop impl ever adds hidden-cursor cleanup beyond show_cursor(),
+    // revisit this before removing the forget().
     std::mem::forget(terminal);
 
     Ok(())

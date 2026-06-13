@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Manual integration repro for TUI signal shutdown (needs a real debug build + PTY).
 NOT a cargo test. Run: python3 tests/repro_signal_shutdown.py
-Verifies SIGTERM / SIGHUP / SIGINT each cause clean exit (<2s) while the terminal
+Verifies SIGTERM / SIGHUP / SIGINT each cause clean exit (<2.5s) while the terminal
 is ALIVE — the systemd-credibility case. Exit 0 = all pass, nonzero = a signal hung.
 
 "Alive terminal" means the PTY master is being drained (a real terminal always
 reads its output).  We drain in a background thread to mirror that.
+
+RC semantics (FIX 3):
+  - DRAINED interactive path → rc=0 (clean session save + hooks completed)
+  - watchdog/forced path     → rc=1 (process was stuck; supervisors should alert)
+  This test asserts rc=0 because the PTY is alive and drained — teardown should
+  always complete cleanly within the save+hooks budget.
 """
 import os, pty, time, signal, subprocess, struct, fcntl, termios, sys, threading, select as sel
 BIN = os.path.expanduser("~/Projects/agent-runtime/target/debug/synaps")
@@ -44,6 +50,9 @@ def trial(name, signum):
     except OSError: pass
     status = f"EXIT rc={rc}" if exited else "HUNG (needed SIGKILL)"
     print(f"  {name:8} -> {status}")
+    # Drained interactive path: must exit cleanly with rc=0.
+    # rc=1 would indicate the watchdog fired, meaning teardown was stuck —
+    # that's a bug on the drained path and should fail this test.
     return exited and rc == 0   # clean exit only
 
 ok = True

@@ -286,23 +286,51 @@ pub async fn run(
         .await?;
 
     // ── Graceful teardown ──
-    // Mirrors cmd/chat.rs end-of-session sequence:
-    //   1. Save the session to disk (was previously skipped on shutdown).
-    //   2. Fire on_session_end hook so extensions get a clean exit
-    //      notification (jawz-shutdown, stelline harvest, etc.).
-    //   3. Call BackgroundTasks::shutdown() to unregister the session
-    //      socket + run/<id>.json file. Drop alone aborts tasks but
-    //      leaves stale registry entries.
+    // Mirrors tui/mod.rs teardown with the same two-budget pattern:
+    //   STEP 1: save_session first (own timeout) — data safety before hooks.
+    //   STEP 2: on_session_end hook emit (own timeout, concurrent) — after save.
+    //
+    // Without timeouts here a hung extension handler would block `systemctl stop`
+    // until systemd's 90 s SIGKILL fires.
+    //
+    // Timing constants mirror signals.rs (SAVE_TIMEOUT=2s, HOOKS_TIMEOUT=5s).
+    const SAVE_TIMEOUT_SECS:  u64 = 2;
+    const HOOKS_TIMEOUT_SECS: u64 = 5;
+
     eprintln!("\n↓ graceful shutdown — saving session, firing hooks, unregistering.");
-    state.save_session().await;
+
+    // STEP 1: Save session — bounded, highest priority.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SAVE_TIMEOUT_SECS),
+        state.save_session(),
+    )
+    .await
+    {
+        Ok(()) => eprintln!("  ✓ session saved"),
+        Err(_) => eprintln!("  ⚠ session save timed out after {}s", SAVE_TIMEOUT_SECS),
+    }
+
+    // STEP 2: Fire on_session_end hook — bounded, after save, concurrent dispatch.
     {
         let runtime = state.runtime.lock().await;
         let hook = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
             &session_id,
             None, // server doesn't preserve a transcript blob — extensions can read api_messages from disk
         );
-        let _ = runtime.hook_bus().emit(&hook).await;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(HOOKS_TIMEOUT_SECS),
+            runtime.hook_bus().emit_concurrent(&hook),
+        )
+        .await
+        {
+            Ok(_) => eprintln!("  ✓ on_session_end hooks fired"),
+            Err(_) => eprintln!(
+                "  ⚠ on_session_end hooks timed out after {}s — extensions may not have flushed",
+                HOOKS_TIMEOUT_SECS
+            ),
+        }
     }
+
     state.background.shutdown();
 
     Ok(())
