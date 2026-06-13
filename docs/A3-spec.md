@@ -82,3 +82,28 @@ both live in `agent-engine`, so they stay put.
 ## Open question deferred to data
 If a pure-TUI edit rebuilds `engine` too often (R3), revisit splitting `engine →
 providers + services` — but only with measured justification, not on spec.
+
+---
+
+## Step 1 Addendum — agent-core extraction map (verified S208)
+
+Recon turned every stone before extraction:
+
+**Membership (all verified clean leaves):** `src/core/` (13 submodules) + `src/memory/` + `src/pricing.rs`.
+
+**Hidden back-edge caught:** `epoch_millis()` is defined in ROOT `lib.rs:56`; core calls
+`crate::epoch_millis()` at `core/auth/openai_codex.rs:150` + `core/auth/mod.rs:81`. The Step 0
+leaf grep MISSED this (it only matched `crate::<module>::` paths, not bare root fns). Fix:
+move `epoch_millis` into `agent-core`, re-export from root. epoch_secs/truncate_str/flush_* are
+NOT used by core — leave in root.
+
+**Facade structure (zero call-site edits):**
+- `agent-core/src/lib.rs` replicates root `lib.rs:16-24` (`pub use core::config;` etc.) so internal
+  `crate::config`/`crate::models`/`crate::session` paths resolve inside the crate.
+- root `lib.rs`: `pub mod core/memory/pricing` → `pub use agent_core::{core,memory,pricing}`;
+  `epoch_millis` body → `pub use agent_core::epoch_millis`. Lines 16-37 stay (resolve via the alias).
+
+**External deps (iterate via `cargo check -p agent-core`):** serde, serde_json, tokio, toml, bytes,
+tracing, reqwest (rides via auth — R4, accepted), uuid, base64, rand, sha2, chrono, thiserror, dirs.
+
+**Gates:** `cargo check -p agent-core` standalone → workspace check → test --no-run → build → clippy → test.
