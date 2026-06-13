@@ -146,19 +146,30 @@ impl RenderHandle {
 
     /// Perform a clean, bounded teardown of the render thread.
     ///
-    /// Sends `Teardown`, waits for the ack (up to `timeout`), then joins the
-    /// thread.  Returns `true` if the ack arrived within the timeout.
+    /// Sends `Teardown`, waits for the ack (up to `timeout`).  If the ack
+    /// arrives the thread is exiting cleanly, so we join it (quick).  If it
+    /// does NOT arrive within the budget the thread is wedged — almost always
+    /// because its own teardown `write()` is blocked on a dead PTY consumer —
+    /// so we deliberately do **not** join (that would hang the process on
+    /// exit).  The wedged thread is reaped when the process exits.  This
+    /// self-bounding behaviour is what replaced the old signal watchdog (#116).
+    ///
+    /// Returns `true` if the ack arrived within the timeout.
     pub(crate) fn teardown(mut self, timeout: std::time::Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
         let _ = self.cmd_tx.send(RenderCmd::Teardown { ack: ack_tx });
         self.wake();
         let acked = ack_rx.recv_timeout(timeout).is_ok();
-        if let Some(handle) = self.join_handle.take() {
-            // join() may block briefly if the thread hasn't exited yet.
-            // The signal watchdog (signals.rs) is the final backstop if it
-            // hangs past WATCHDOG_TIMEOUT_SECS.
-            let _ = handle.join();
+        if acked {
+            if let Some(handle) = self.join_handle.take() {
+                // Acked → the thread restored the terminal and is returning;
+                // join is quick.
+                let _ = handle.join();
+            }
         }
+        // If NOT acked, the render thread is wedged (e.g. blocked on a dead
+        // PTY). Skip the join — blocking here would hang shutdown forever.
+        // Dropping the handle detaches the thread; it dies on process exit.
         acked
     }
 }
