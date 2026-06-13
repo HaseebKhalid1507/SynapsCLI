@@ -186,10 +186,10 @@ pub async fn run(
             signal = shutdown_signal_rx.recv() => {
                 if let Some(signal) = signal {
                     tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
-                    // FIX B: use the pure shutdown_action() policy so the decision is
-                    // testable. SIGTERM/SIGHUP → ImmediateExit (terminal may already be
-                    // gone; systemd is counting down — no animation). Ctrl-C (Interrupt)
-                    // → AnimatedExit (live interactive terminal, show the quit effect).
+                    // Use the pure shutdown_action() policy so the decision is
+                    // testable.  All OS signals currently map to ImmediateExit — see
+                    // signals.rs for rationale.  AnimatedExit is reserved for UI-driven
+                    // quit actions that own their own animation timing.
                     match signals::shutdown_action(signal) {
                         ShutdownAction::ImmediateExit => {
                             tracing::info!("immediate exit on {:?}", signal);
@@ -1853,6 +1853,11 @@ pub async fn run(
     // when extensions misbehave or the runtime is in a degraded state.  Wrap
     // them in a single timeout so the process ALWAYS exits within ~3s of
     // deciding to shut down.
+    //
+    // Cross-reference: the signal watchdog in signals.rs sleeps for 5 s before
+    // calling process::exit().  5 s > 3 s means the watchdog never fires during
+    // a legitimate teardown — it is a true last resort for genuine hangs.
+    // Invariant: watchdog_timeout (5 s) > teardown_timeout (3 s).
     {
         let session_id   = app.session.id.clone();
         let api_messages = app.api_messages.clone();
