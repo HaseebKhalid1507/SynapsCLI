@@ -3,16 +3,14 @@ pub use agent_core::core;
 pub use agent_core::memory;
 pub use agent_core::pricing;
 
-pub mod runtime;
-pub mod tools;
-pub mod mcp;
-pub mod skills;
-pub mod events;
-pub mod extensions;
-pub mod help;
-pub mod sidecar;
+// agent-engine is now a separate crate; re-export its modules as if they lived here
+pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help};
+
+// Allow intra-crate self-reference via `synaps_cli::` (used in src/tui/**).
+extern crate self as synaps_cli;
+
+pub mod tui;
 pub mod toast;
-pub mod engine;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -42,6 +40,9 @@ pub use tokio_util::sync::CancellationToken;
 /// Re-export epoch_millis from agent-core (moved there for the leaf crate split).
 pub use agent_core::epoch_millis;
 
+/// Re-export truncate_str from agent-core.
+pub use agent_core::truncate_str;
+
 /// Flush stdout, ignoring errors (pipe closed, etc.)
 #[inline]
 pub fn flush_stdout() {
@@ -63,17 +64,4 @@ pub fn epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before Unix epoch")
         .as_secs()
-}
-
-/// Truncate a string to at most `max` bytes at a valid UTF-8 boundary.
-#[inline]
-pub fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }

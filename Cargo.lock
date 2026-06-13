@@ -22,7 +22,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "toml",
@@ -32,6 +34,53 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "agent-engine"
+version = "0.2.1"
+dependencies = [
+ "agent-core",
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "fs4",
+ "futures",
+ "globset",
+ "libc",
+ "memchr",
+ "notify",
+ "portable-pty",
+ "rand 0.9.4",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "signal-hook",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.21.0",
+ "tokio-util",
+ "toml",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2527,6 +2576,7 @@ name = "synaps"
 version = "0.2.1"
 dependencies = [
  "agent-core",
+ "agent-engine",
  "anyhow",
  "arboard",
  "arc-swap",

@@ -34,3 +34,16 @@ pub fn epoch_millis() -> u64 {
 // Expose Result + RuntimeError at crate root so `crate::Result<T>` resolves
 // inside agent-core modules (mirrors root lib.rs lines 28-29).
 pub use error::{Result, RuntimeError};
+
+/// Truncate a string to at most `max` bytes at a valid UTF-8 boundary.
+#[inline]
+pub fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}

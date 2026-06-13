@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-const BUILTIN_HELP_JSON: &str = include_str!("../assets/help.json");
+const BUILTIN_HELP_JSON: &str = include_str!("../../../assets/help.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HelpTopicKind {
