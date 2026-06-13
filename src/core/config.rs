@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use crate::tools::shell::config::ShellConfig;
+use crate::core::shell_config::ShellConfig;
 
 static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
