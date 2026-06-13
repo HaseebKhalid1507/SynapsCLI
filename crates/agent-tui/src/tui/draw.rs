@@ -115,6 +115,26 @@ mod sidecar_pill_tests {
     use super::*;
 
     #[test]
+    fn toast_dims_never_panics_on_tiny_terminal() {
+        // Regression: a pane resized to 11x2 used to panic in render_toasts_from_snap
+        // because the width clamp was clamp(18, 11) — min > max.
+        let cases = [
+            (50u16, 5usize, 11u16, 2u16), // the reported crash: 11 cols, 2 rows
+            (0, 0, 1, 1),                 // 1x1 — absolute minimum
+            (200, 50, 0, 0),             // 0x0 — degenerate
+            (10, 1, 5, 1),               // narrow + single row
+            (100, 20, 200, 100),         // big — normal case
+        ];
+        for (cw, lc, aw, ah) in cases {
+            let (w, h) = toast_dims(cw, lc, aw, ah); // must not panic
+            assert!(w >= 1, "width {w} too small for area {aw}x{ah}");
+            assert!(w <= aw.min(64).max(1), "width {w} exceeds area {aw}");
+            assert!(h >= 1, "height {h} too small for area {aw}x{ah}");
+            assert!(h <= ah.max(1), "height {h} exceeds area {ah}");
+        }
+    }
+
+    #[test]
     fn pill_uses_display_name_when_set() {
         // Idle, unarmed pill should show the display name.
         let text = sidecar_pill_text(
@@ -1521,6 +1541,20 @@ pub(crate) fn render_frame(
     Ok(())
 }
 
+/// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.
+///
+/// Returns `(width, height)`. The minimums (18 wide, 3 tall) are capped by the
+/// available space so `clamp`'s `min` can never exceed its `max` — which used
+/// to panic (`min > max`) when a tmux pane was resized smaller than the minimum.
+/// On a cramped terminal the toast simply renders smaller instead of crashing.
+fn toast_dims(content_width: u16, line_count: usize, area_w: u16, area_h: u16) -> (u16, u16) {
+    let max_w = area_w.min(64).max(1);
+    let width = content_width.saturating_add(4).clamp(18u16.min(max_w), max_w);
+    let max_h = area_h.max(1);
+    let height = (line_count as u16).saturating_add(2).clamp(3u16.min(max_h), max_h);
+    (width, height)
+}
+
 /// Render toasts from a pre-cloned snapshot vec (used by `render_frame`).
 fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toast::Toast]) {
     let area = frame.area();
@@ -1532,12 +1566,9 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
             .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
             .max()
             .unwrap_or(1) as u16;
-        let width = content_width
-            .saturating_add(4)
-            .clamp(18, area.width.min(64));
-        let height = (lines.len() as u16)
-            .saturating_add(2)
-            .clamp(3, area.height.max(1));
+        // Dimensions are clamped to always fit a terminal of ANY size — see
+        // toast_dims (a tiny tmux resize used to panic here with min > max).
+        let (width, height) = toast_dims(content_width, lines.len(), area.width, area.height);
         let rect = super::toast::toast_rect(area, width, height, toast.position);
         let block = Block::default()
             .borders(Borders::ALL)
