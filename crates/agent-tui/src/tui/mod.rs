@@ -195,13 +195,17 @@ pub async fn run(
         // 40c2ce4 made 60fps affordable.)
         let throttle = std::time::Duration::from_millis(16);
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
-            app.needs_redraw = false;
-            last_draw = Instant::now();
             // Step 2: terminal lives on the render thread — get size via the
             // crossterm TTY syscall directly (doesn't need the Terminal object).
-            let term_size = crossterm::terminal::size()
-                .map(|(w, h)| ratatui::layout::Size { width: w, height: h })
-                .unwrap_or_default();
+            // Skip the frame entirely if the reported size is 0×0 (terminal not
+            // yet ready, or a transient resize event) — publishing a 0×0 model
+            // would produce layout artifacts.
+            let term_size = match crossterm::terminal::size() {
+                Ok((w, h)) if w > 0 && h > 0 => ratatui::layout::Size { width: w, height: h },
+                _ => continue,
+            };
+            app.needs_redraw = false;
+            last_draw = Instant::now();
             if let Some(model) = build_render_model(
                 &mut app,
                 &runtime,

@@ -345,7 +345,7 @@ fn render_thread_body(
                 }
                 Ok(RenderCmd::SpawnExitFx { fx }) => {
                     exit_fx = Some(fx);
-                    exit_done.store(false, Ordering::Relaxed);
+                    exit_done.store(false, Ordering::Release);
                 }
                 Ok(RenderCmd::Clear) => {
                     pending_clear = true;

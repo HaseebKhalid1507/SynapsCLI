@@ -546,7 +546,15 @@ pub(crate) fn build_render_model(
         let lines = app.render_lines(content_width);
         app.line_cache = Some((content_width, lines));
     }
-    let all_lines_vec: &[ratatui::text::Line<'static>] = &app.line_cache.as_ref().unwrap().1;
+    // SAFETY: the branch above guarantees line_cache is Some; the fallback
+    // rebuild handles any hypothetical race where it was taken between here
+    // and there (not possible today, but avoids a panic on the main task).
+    if app.line_cache.is_none() {
+        let lines = app.render_lines(content_width);
+        app.line_cache = Some((content_width, lines));
+    }
+    let all_lines_vec: &[ratatui::text::Line<'static>] =
+        app.line_cache.as_ref().map_or(&[], |(_, v)| v.as_slice());
     let total = all_lines_vec.len();
     // Wrap in Arc for zero-copy clone into the model.
     let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = all_lines_vec.to_vec().into();
