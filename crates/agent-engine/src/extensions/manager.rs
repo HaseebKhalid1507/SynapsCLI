@@ -24,9 +24,10 @@ fn project_plugins_disabled() -> bool {
 }
 
 
-fn installed_plugin_setup_failure(plugin_name: &str) -> Option<String> {
-    let state_path = crate::skills::state::PluginsState::default_path();
-    let state = crate::skills::state::PluginsState::load_from(&state_path).ok()?;
+fn installed_plugin_setup_failure_in(
+    state: &crate::skills::state::PluginsState,
+    plugin_name: &str,
+) -> Option<String> {
     let plugin = state.installed.iter().find(|p| p.name == plugin_name)?;
     match &plugin.setup_status {
         crate::skills::state::SetupStatus::Failed { message, .. } => Some(message.clone()),
@@ -903,12 +904,18 @@ impl ExtensionManager {
 
         let mut loaded = Vec::new();
         let disabled_plugins = crate::config::load_config().disabled_plugins;
+        // Hoist plugins.json read out of the per-plugin loop — was N reads + parses
+        // of the same file (one per discovered plugin). Read it once here.
+        let plugins_state = {
+            let state_path = crate::skills::state::PluginsState::default_path();
+            crate::skills::state::PluginsState::load_from(&state_path).unwrap_or_default()
+        };
         for (plugin_name, plugin_dir) in plugin_dirs {
             if disabled_plugins.iter().any(|d| d == &plugin_name) {
                 tracing::debug!(plugin = %plugin_name, "Extension disabled via disabled_plugins config");
                 continue;
             }
-            if let Some(message) = installed_plugin_setup_failure(&plugin_name) {
+            if let Some(message) = installed_plugin_setup_failure_in(&plugins_state, &plugin_name) {
                 tracing::warn!(plugin = %plugin_name, error = %message, "Skipping extension with failed post-install setup");
                 failed.push(ExtensionLoadFailure::new(
                     plugin_name,
