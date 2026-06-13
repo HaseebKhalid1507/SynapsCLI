@@ -84,6 +84,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-tui"
+version = "0.2.1"
+dependencies = [
+ "agent-core",
+ "agent-engine",
+ "anyhow",
+ "arboard",
+ "arc-swap",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "signal-hook",
+ "syntect",
+ "tachyonfx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-width 0.2.0",
+ "uuid",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2577,6 +2608,7 @@ version = "0.2.1"
 dependencies = [
  "agent-core",
  "agent-engine",
+ "agent-tui",
  "anyhow",
  "arboard",
  "arc-swap",
