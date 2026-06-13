@@ -102,11 +102,6 @@ pub(crate) struct RenderModel {
     /// Pre-computed `protected_bottom_rows` for `scrub_crossterm_terminal_edges`.
     pub(crate) protected_bottom_rows: u16,
 
-    // ── Effect timing ─────────────────────────────────────────────────────────
-    /// Per-frame delta for tachyonfx effects.  In Step 1 this is computed by
-    /// `build_render_model` and consumed by `render_frame` on the same task.
-    /// In Step 2 it moves to the render thread's local clock.
-    pub(crate) elapsed: std::time::Duration,
 }
 
 // ── Projection types ─────────────────────────────────────────────────────────

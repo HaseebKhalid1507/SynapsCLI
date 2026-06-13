@@ -15,6 +15,7 @@ mod models;
 mod plugins;
 mod render;
 mod render_model;
+mod render_thread;
 mod settings;
 mod sidecar;
 mod signals;
@@ -25,20 +26,21 @@ mod viewport;
 
 use app::{App, ChatMessage};
 use commands::CommandAction;
-use draw::{boot_effect, build_render_model, quit_effect, render_frame};
+use draw::{boot_effect, build_render_model, quit_effect};
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
 use input::InputAction;
-use lifecycle::{setup_terminal, teardown_terminal};
+use lifecycle::setup_terminal;
+use render_thread::spawn_render_thread;
 use stream_handler::StreamAction;
 
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use synaps_cli::core::session_index::SessionIndexRecord;
 use synaps_cli::runtime::compaction::compact_conversation;
 use synaps_cli::{CancellationToken, Result, Runtime, Session, StreamEvent};
-use tachyonfx::{Effect, Shader};
 
 pub async fn run(
     continue_session: Option<Option<String>>,
@@ -128,8 +130,20 @@ pub async fn run(
         );
     }
 
-    // ── Terminal setup ──
-    let mut terminal = setup_terminal()?;
+    // ── Terminal setup + render thread ──
+    //
+    // The Terminal is moved into the render thread immediately after creation.
+    // The main task never touches it again.  All terminal I/O (draw, clear,
+    // teardown) goes through `render_handle`.
+    //
+    // Terminal size for build_render_model: we call crossterm::terminal::size()
+    // directly — it reads the TTY fd without needing the Terminal object.
+    // See render_thread.rs module comment for the design rationale.
+    let terminal = setup_terminal()?;
+    let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal);
+    // Boot effect is sent via the command channel so the render thread owns it.
+    render_handle.send_boot_fx(boot_effect());
+
     let mut event_reader = EventStream::new();
     let (shutdown_signal_tx, mut shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown_signal_task = signals::spawn_shutdown_signal_task(shutdown_signal_tx);
@@ -141,9 +155,6 @@ pub async fn run(
     let mut secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
     let mut cancel_token: Option<CancellationToken> = None;
     let mut steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
-    let mut boot_fx: Option<Effect> = Some(boot_effect());
-    let mut exit_fx: Option<Effect> = None;
-    let mut last_frame = Instant::now();
 
     // ── Engine-managed background tasks (inbox watcher, socket, extensions) ──
     let background = boot.background;
@@ -169,6 +180,11 @@ pub async fn run(
     // on_session_start hook already fired by engine::setup::boot()
 
     // ── Event loop ──
+    // Track whether the render thread currently has an active boot or exit
+    // effect.  The render thread owns the actual Effect values; we track
+    // "has been sent and not yet done" on the main side for the tick throttle.
+    let mut boot_fx_sent  = true;  // boot_effect() is sent at startup above
+    let mut exit_fx_sent  = false;
     let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
@@ -181,27 +197,19 @@ pub async fn run(
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
             app.needs_redraw = false;
             last_draw = Instant::now();
-            let elapsed = last_frame.elapsed();
-            last_frame = Instant::now();
-            // FIX A: treat a draw() I/O error as "terminal is dead → exit now."
-            // CrosstermBackend writes to the real PTY fd; on EIO/EPIPE the very
-            // next frame fails. Discarding the error (the old `let _ =`) was the
-            // primary reason the process survived indefinitely after PTY close.
-            let term_size = terminal.size().unwrap_or_default();
+            // Step 2: terminal lives on the render thread — get size via the
+            // crossterm TTY syscall directly (doesn't need the Terminal object).
+            let term_size = crossterm::terminal::size()
+                .map(|(w, h)| ratatui::layout::Size { width: w, height: h })
+                .unwrap_or_default();
             if let Some(model) = build_render_model(
                 &mut app,
                 &runtime,
-                elapsed,
                 &registry,
                 &secret_prompts,
                 term_size,
             ) {
-                if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
-                    tracing::warn!(err = %e, "terminal write failed — PTY likely closed, exiting");
-                    // PART 3: don't teardown here — fall through to the unified bounded-teardown
-                    // path below the loop, which saves the session and exits cleanly (rc=0).
-                    break;
-                }
+                render_handle.slot.publish(model);
             }
         }
 
@@ -212,9 +220,9 @@ pub async fn run(
                 if let Some(signal) = signal {
                     tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
                     // All OS signals map to ImmediateExit (see signals.rs).
-                    // The /quit command sets exit_fx directly and does NOT go
-                    // through this path, so removing AnimatedExit from signals
-                    // does not affect interactive quit.
+                    // The /quit command sends SpawnExitFx to the render thread
+                    // and does NOT go through this path, so removing AnimatedExit
+                    // from signals does not affect interactive quit.
                     let signals::ShutdownAction::ImmediateExit = signals::shutdown_action(signal);
                     tracing::info!("immediate exit on {:?}", signal);
                     // Cancel any in-flight stream so the tool/subagent is not
@@ -361,12 +369,16 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 // Active animations/effects always need a redraw each tick.
                 // messages.is_empty() = idle logo screen — its color gradient
                 // is time-based and needs ticking too (S206 regression: the
                 // dirty-flag loop froze it until first keystroke).
-                if boot_fx.is_some() || exit_fx.is_some() || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.messages.is_empty() {
+                // Update local effect-sent flags from the render thread's done signals.
+                if boot_fx_sent && boot_done.load(Ordering::Acquire) {
+                    boot_fx_sent = false;
+                }
+                if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.messages.is_empty() {
                     app.request_redraw();
                 }
                 secret_prompts.poll_requests(&secret_prompt_rx);
@@ -398,10 +410,8 @@ pub async fn run(
                 }
                 let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
                 if message_animation_needs_clear {
-                    if let Ok(size) = terminal.size() {
-                        if size.width > 0 && size.height > 0 {
-                            terminal.clear().ok();
-                        }
+                    if crossterm::terminal::size().map_or(false, |(w, h)| w > 0 && h > 0) {
+                        render_handle.send_clear();
                     }
                 }
                 if let Some(ref mut t) = app.logo_build_t {
@@ -418,7 +428,7 @@ pub async fn run(
                     app.invalidate();
                 }
                 if let Some(msg) = app.check_gamba_exited() {
-                    terminal.clear().ok();
+                    render_handle.send_clear();
                     app.push_msg(ChatMessage::System(msg));
                     app.invalidate(); // invalidate already sets needs_redraw
                 }
@@ -507,7 +517,7 @@ pub async fn run(
                     app.status_text = None;
                     app.invalidate();
                 }
-                if exit_fx.as_ref().is_some_and(|fx| fx.done()) {
+                if exit_done.load(Ordering::Acquire) {
                     break;
                 }
                 continue;
@@ -547,7 +557,8 @@ pub async fn run(
                             InputAction::None => {}
                             InputAction::HelpFindOutcome => {}
                             InputAction::Quit => {
-                                exit_fx = Some(quit_effect());
+                                render_handle.send_exit_fx(quit_effect());
+                                exit_fx_sent = true;
                             }
                             InputAction::Abort => {
                                 if let Some(ref ct) = cancel_token { ct.cancel(); }
@@ -593,14 +604,15 @@ pub async fn run(
                                     CommandAction::None => {}
                                     CommandAction::StartStream => {} // reserved for future use
                                     CommandAction::Quit => {
-                                        exit_fx = Some(quit_effect());
+                                        render_handle.send_exit_fx(quit_effect());
+                                        exit_fx_sent = true;
                                     }
                                     CommandAction::LaunchGamba => {
                                         drop(event_reader);
                                         match app.launch_gamba() {
                                             Ok(()) => {}
                                             Err(msg) => {
-                                                terminal.clear().ok();
+                                                render_handle.send_clear();
                                                 app.push_msg(ChatMessage::Error(msg));
                                             }
                                         }
@@ -678,14 +690,9 @@ pub async fn run(
                                         app.status_text = Some("connecting…".to_string());
                                         app.streaming = true;
                                         app.spinner_frame = 0;
-                                        let elapsed = last_frame.elapsed();
-                                        last_frame = Instant::now();
-                                        let term_size = terminal.size().unwrap_or_default();
-                                        if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
-                                            if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
-                                                tracing::warn!(err = %e, "terminal write failed (skill stream start) — PTY closed, exiting");
-                                                break;
-                                            }
+                                        let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                                            render_handle.slot.publish(model);
                                         }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
@@ -1397,14 +1404,9 @@ pub async fn run(
                                 app.status_text = Some("connecting…".to_string());
                                 app.streaming = true;
                                 app.spinner_frame = 0;
-                                let elapsed = last_frame.elapsed();
-                                last_frame = Instant::now();
-                                let term_size = terminal.size().unwrap_or_default();
-                                if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
-                                    if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
-                                        tracing::warn!(err = %e, "terminal write failed (submit stream start) — PTY closed, exiting");
-                                        break;
-                                    }
+                                let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                                if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                                    render_handle.slot.publish(model);
                                 }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
@@ -1444,14 +1446,15 @@ pub async fn run(
                                             }
                                         }
                                         CommandAction::Quit => {
-                                            exit_fx = Some(quit_effect());
+                                            render_handle.send_exit_fx(quit_effect());
+                                            exit_fx_sent = true;
                                         }
                                         CommandAction::LaunchGamba => {
                                             drop(event_reader);
                                             match app.launch_gamba() {
                                                 Ok(()) => {}
                                                 Err(msg) => {
-                                                    terminal.clear().ok();
+                                                    render_handle.send_clear();
                                                     app.push_msg(ChatMessage::Error(msg));
                                                 }
                                             }
@@ -1815,7 +1818,7 @@ pub async fn run(
                                 steer_tx = None;
                                 // Reclaim gamba if running
                                 if let Some(msg) = app.reclaim_gamba() {
-                                    terminal.clear().ok();
+                                    render_handle.send_clear();
                                     app.push_msg(ChatMessage::System(msg));
                                     app.invalidate();
                                 }
@@ -1828,7 +1831,7 @@ pub async fn run(
                             drop(steer_tx.take());
                             // Reclaim gamba if running
                             if let Some(msg) = app.reclaim_gamba() {
-                                terminal.clear().ok();
+                                render_handle.send_clear();
                                 app.push_msg(ChatMessage::System(msg));
                                 app.invalidate();
                             }
@@ -1849,14 +1852,9 @@ pub async fn run(
                             app.status_text = Some("connecting…".to_string());
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            let elapsed = last_frame.elapsed();
-                            last_frame = Instant::now();
-                            let term_size = terminal.size().unwrap_or_default();
-                            if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
-                                if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
-                                    tracing::warn!(err = %e, "terminal write failed (agent stream start) — PTY closed, exiting");
-                                    break;
-                                }
+                            let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                            if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                                render_handle.slot.publish(model);
                             }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
@@ -1880,14 +1878,9 @@ pub async fn run(
                     }
 
                     if do_draw {
-                        let elapsed = last_frame.elapsed();
-                        last_frame = Instant::now();
-                        let term_size = terminal.size().unwrap_or_default();
-                        if let Some(model) = build_render_model(&mut app, &runtime, elapsed, &registry, &secret_prompts, term_size) {
-                            if let Err(e) = render_frame(&mut terminal, &model, &mut boot_fx, &mut exit_fx) {
-                                tracing::warn!(err = %e, "terminal write failed (stream event redraw) — PTY closed, exiting");
-                                break;
-                            }
+                        let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                            render_handle.slot.publish(model);
                         }
                     }
                 }
@@ -1988,14 +1981,29 @@ pub async fn run(
     // Shut down background tasks (inbox watcher, socket, session registry)
     background.shutdown();
 
-    teardown_terminal(&mut terminal);
-    // Prevent ratatui's Drop impl from calling show_cursor() + eprintln! on a
-    // dead PTY — ratatui's Terminal<CrosstermBackend> Drop calls show_cursor()
-    // which panics on a closed PTY.  We have already done full teardown above
-    // via teardown_terminal(); forgetting the Terminal here is safe.  If
-    // ratatui's Drop impl ever adds hidden-cursor cleanup beyond show_cursor(),
-    // revisit this before removing the forget().
-    std::mem::forget(terminal);
+    // ── Render-thread teardown ───────────────────────────────────────────────
+    //
+    // The render thread owns the Terminal.  We send it a Teardown command and
+    // wait for the ack within the combined SAVE + HOOKS budget already spent
+    // above.  If the ack doesn't arrive, the signal watchdog (signals.rs
+    // WATCHDOG_TIMEOUT_SECS) fires as the residual backstop.
+    //
+    // The render thread's do_teardown() calls emergency_teardown_terminal()
+    // (disable_raw_mode + LeaveAlternateScreen + etc.) and show_cursor(), then
+    // sends the ack and exits its loop.  The Terminal is dropped when the
+    // thread exits — that's safe because crossterm teardown was already done.
+    let teardown_budget = std::time::Duration::from_secs(
+        signals::TEARDOWN_TIMEOUT_SECS.saturating_sub(signals::SAVE_TIMEOUT_SECS),
+    )
+    .max(std::time::Duration::from_secs(2));
+    let acked = render_handle.teardown(teardown_budget);
+    if !acked {
+        tracing::warn!("render thread did not ack teardown within budget — watchdog is backstop");
+        // emergency_teardown_terminal is a no-op if the terminal is already
+        // restored, so calling it here is safe even if the render thread did
+        // eventually finish teardown after the timeout.
+        lifecycle::emergency_teardown_terminal();
+    }
 
     Ok(())
 }

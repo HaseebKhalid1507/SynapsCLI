@@ -492,7 +492,6 @@ use super::render_model::{
 pub(crate) fn build_render_model(
     app: &mut App,
     runtime: &synaps_cli::Runtime,
-    elapsed: std::time::Duration,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     secret_prompts: &synaps_cli::tools::SecretPromptQueue,
     term_size: ratatui::layout::Size,
@@ -727,15 +726,15 @@ pub(crate) fn build_render_model(
         help_find,
         secret_prompt,
         protected_bottom_rows,
-        elapsed,
     }))
 }
 
 /// Render one frame from a [`RenderModel`] snapshot.
 ///
-/// This is the **render-side step**.  In Step 1 it runs synchronously on the
-/// main task immediately after `build_render_model`.  In Step 2 it will move
-/// to a dedicated `std::thread`.
+/// This is the **render-side step**.  In Step 2 it runs on the dedicated
+/// render `std::thread` — the thread maintains its own monotonic clock for
+/// tachyonfx effect timing so main-loop pressure never compresses animation
+/// time.
 ///
 /// **Invariant**: this function takes NO `&App` and accesses NO `App` field.
 /// All data comes from `model`.  If it compiles without `App`, snapshot
@@ -745,14 +744,20 @@ pub(crate) fn render_frame(
     model: &RenderModel,
     boot_fx: &mut Option<Effect>,
     exit_fx: &mut Option<Effect>,
+    last_frame: &mut std::time::Instant,
 ) -> io::Result<()> {
+    // Render-thread-local clock: elapsed since the last call to render_frame.
+    // This is the correct place to measure effect timing — independent of main
+    // loop pressure.  If the main task is busy, the render thread still ticks
+    // effects at its own cadence.
+    let elapsed = last_frame.elapsed();
+    *last_frame = std::time::Instant::now();
+
     super::viewport::scrub_crossterm_terminal_edges(
         terminal,
         model.protected_bottom_rows,
         Style::default().bg(THEME.load().bg),
     )?;
-
-    let elapsed = model.elapsed;
 
     terminal.draw(|frame| {
         // ── Layout ────────────────────────────────────────────────────────────
