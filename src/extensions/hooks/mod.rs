@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::future::join_all;
 use tokio::sync::RwLock;
 
 use self::events::{HookEvent, HookKind, HookResult};
@@ -254,6 +255,102 @@ impl HookBus {
         }
 
         // Merge accumulated injections from all handlers
+        if !injections.is_empty() {
+            HookResult::Inject {
+                content: injections.join("\n\n"),
+            }
+        } else {
+            HookResult::Continue
+        }
+    }
+
+    /// Emit a hook event to all registered handlers **concurrently**.
+    ///
+    /// All handlers race under a single shared timeout (`per_handler_timeout`).
+    /// Results are collected and the first `Block` wins; injections are merged.
+    ///
+    /// **When to use this over `emit()`:**
+    ///
+    /// Only safe for hook kinds whose handlers are order-independent — i.e.
+    /// where no handler's result depends on another's execution.  Currently
+    /// that applies to:
+    ///   - `on_session_end`: only `Continue` is a valid result; handlers are
+    ///     fire-and-forget notification calls (deck, d20, jawz-widget,
+    ///     synaps-tasks all write to their own stores independently).
+    ///
+    /// **Do NOT use for** `before_tool_call` / `before_message` hooks where
+    /// `Block` / `Modify` / `Inject` semantics require a defined winner when
+    /// two handlers disagree.
+    ///
+    /// With N extensions and a 5 s per-handler timeout, serial emit takes up
+    /// to N×5 s; concurrent emit collapses that to a single 5 s window
+    /// regardless of N — critical for teardown budgets.
+    pub async fn emit_concurrent(&self, event: &HookEvent) -> HookResult {
+        // Snapshot handler list (same as emit()).
+        let registrations = {
+            let handlers = self.handlers.read().await;
+            match handlers.get(&event.kind) {
+                Some(regs) if !regs.is_empty() => regs.clone(),
+                _ => return HookResult::Continue, // fast path: no handlers
+            }
+        };
+
+        // Dispatch all handlers simultaneously.
+        let futures: Vec<_> = registrations
+            .iter()
+            .filter(|reg| {
+                // Apply tool filter before spawning.
+                if let Some(ref filter) = reg.tool_filter {
+                    match (&event.tool_name, &event.tool_runtime_name) {
+                        (Some(api), Some(runtime)) => filter == api || filter == runtime,
+                        (Some(api), None) => filter == api,
+                        (None, Some(runtime)) => filter == runtime,
+                        (None, None) => false,
+                    }
+                } else {
+                    true
+                }
+            })
+            .filter(|reg| {
+                reg.matcher.as_ref().map_or(true, |m| m.matches(event))
+            })
+            .map(|reg| {
+                let handler = reg.handler.clone();
+                let event_clone = event.clone();
+                async move {
+                    tokio::time::timeout(HANDLER_TIMEOUT, handler.handle(&event_clone)).await
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let mut injections: Vec<String> = Vec::new();
+        for result in results {
+            match result {
+                Ok(HookResult::Continue) => {}
+                Ok(HookResult::Block { reason }) => {
+                    return HookResult::Block { reason };
+                }
+                Ok(HookResult::Inject { content }) => {
+                    injections.push(content);
+                }
+                Ok(HookResult::Modify { input }) => {
+                    return HookResult::Modify { input };
+                }
+                Ok(HookResult::Confirm { message }) => {
+                    return HookResult::Confirm { message };
+                }
+                Err(_timeout) => {
+                    tracing::warn!(
+                        hook = %event.kind.as_str(),
+                        timeout_secs = HANDLER_TIMEOUT.as_secs(),
+                        "Hook handler timed out in concurrent emit — skipping"
+                    );
+                }
+            }
+        }
+
         if !injections.is_empty() {
             HookResult::Inject {
                 content: injections.join("\n\n"),
