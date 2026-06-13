@@ -31,7 +31,7 @@ use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
 use lifecycle::{setup_terminal, teardown_terminal};
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session};
-use synaps_cli::core::compaction::compact_conversation;
+use synaps_cli::runtime::compaction::compact_conversation;
 use synaps_cli::core::session_index::SessionIndexRecord;
 use crossterm::event::EventStream;
 use futures::StreamExt;

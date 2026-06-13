@@ -327,7 +327,7 @@ async fn handle_compact(
 
     // 2. Long-running LLM call — no lock held.
     let summary_result =
-        synaps_cli::core::compaction::compact_conversation(&msgs, &runtime, None).await;
+        synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None).await;
 
     match summary_result {
         Ok(summary) => {
