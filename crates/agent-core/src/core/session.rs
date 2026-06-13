@@ -219,11 +219,39 @@ pub fn find_session(partial_id: &str) -> std::io::Result<Session> {
 
 /// Load the most recently updated session
 pub fn latest_session() -> std::io::Result<Session> {
-    let sessions = list_sessions()?;
-    sessions.into_iter()
-        .max_by_key(|s| s.updated_at)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found"))
-        .and_then(|info| Session::load(&info.id))
+    // Find the most-recently-modified session file by FILE mtime — without
+    // reading or JSON-parsing any of them. The previous impl called
+    // list_sessions(), which read + serde-tokenized EVERY session file to sort
+    // by the in-file `updated_at`; with hundreds of multi-MB sessions (221 files
+    // / 76MB here) that made `--continue` boot take ~11s. mtime is a free, exact
+    // proxy for "the session I was last in", and we then load ONLY that one.
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no sessions found",
+        ));
+    }
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                    newest = Some((mtime, path));
+                }
+            }
+        }
+    }
+    let path = newest.map(|(_, p)| p).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no sessions found")
+    })?;
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad session filename"))?;
+    Session::load(id)
 }
 
 /// List all sessions, sorted by most recently updated.
