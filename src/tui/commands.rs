@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use chrono;
 use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
 
 use super::app::{App, ChatMessage};
@@ -736,6 +737,11 @@ pub(super) async fn handle_command(
         "status" => {
             return CommandAction::Status;
         }
+        "stats" => {
+            let receipt = build_stats_receipt(app, runtime);
+            app.push_msg(ChatMessage::System(receipt));
+            return CommandAction::None;
+        }
         "ping" => {
             return CommandAction::Ping;
         }
@@ -885,6 +891,107 @@ pub(super) async fn handle_command(
     CommandAction::None
 }
 
+/// Build the /stats session receipt string.
+///
+/// Returns a multi-line string ready to be pushed as `ChatMessage::System`.
+/// Exported for unit testing.
+pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
+    use synaps_cli::pricing::calculate_cost_split;
+
+    let model = runtime.model().to_string();
+
+    // ── Session identity ──────────────────────────────────────────────────
+    let session_id = &app.session.id;
+    let created_at = app.session.created_at;
+    let now = chrono::Utc::now();
+    let elapsed = now.signed_duration_since(created_at);
+    let duration_str = {
+        let secs = elapsed.num_seconds().max(0) as u64;
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        if h > 0 {
+            format!("{}h {:02}m {:02}s", h, m, s)
+        } else if m > 0 {
+            format!("{}m {:02}s", m, s)
+        } else {
+            format!("{}s", s)
+        }
+    };
+    // Count user/assistant exchanges (each user msg is one turn).
+    let turn_count = app.messages.iter().filter(|m| matches!(m.msg, ChatMessage::User(_))).count();
+
+    // ── Token totals ──────────────────────────────────────────────────────
+    let input   = app.total_input_tokens;
+    let output  = app.total_output_tokens;
+    let c_read  = app.total_cache_read_tokens;
+    let c_write = app.total_cache_creation_tokens;
+    let c5      = app.total_cache_write_5m;
+    let c1      = app.total_cache_write_1h;
+
+    // ── Cache hit-rate (mirrors the footer formula) ───────────────────────
+    let total_input_all = input + c_read + c_write;
+    let hit_rate_str = if total_input_all > 0 && c_read > 0 {
+        let pct = (c_read as f64 / total_input_all as f64 * 100.0) as u32;
+        format!("{}%", pct)
+    } else {
+        "0%".to_string()
+    };
+
+    // ── Cache savings ─────────────────────────────────────────────────────
+    // What the cache-read tokens WOULD have cost at full input rate minus what
+    // they actually cost at 0.1× — computed via calculate_cost_split directly.
+    // Savings = cost_if_uncached − actual_read_cost
+    //         = cost_split(model, c_read, 0, 0, 0, 0) − cost_split(model, 0, 0, c_read, 0, 0)
+    let savings = if c_read > 0 {
+        let full_price = calculate_cost_split(&model, c_read, 0, 0, 0, 0);
+        let actual     = calculate_cost_split(&model, 0, 0, c_read, 0, 0);
+        full_price - actual
+    } else {
+        0.0
+    };
+
+    // ── Cost ─────────────────────────────────────────────────────────────
+    let session_cost = app.session_cost;
+
+    // ── Format ───────────────────────────────────────────────────────────
+    let mut lines = vec![
+        "─── Session Stats ───────────────────────────────".to_string(),
+        format!("  Session  {:>12}  model: {}", &session_id[..session_id.len().min(12)], model),
+        format!("  Duration {:>12}  turns: {}", duration_str, turn_count),
+        String::new(),
+        "  Tokens".to_string(),
+        format!("    input        {:>10}", fmt_tokens(input)),
+        format!("    output       {:>10}", fmt_tokens(output)),
+        format!("    cache read   {:>10}", fmt_tokens(c_read)),
+    ];
+
+    if c5 > 0 || c1 > 0 {
+        lines.push(format!("    cache write  {:>10}  (5m: {} / 1h: {})",
+            fmt_tokens(c_write), fmt_tokens(c5), fmt_tokens(c1)));
+    } else {
+        lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
+    }
+
+    lines.push(String::new());
+    lines.push(format!("  Cache  hit rate {:>9}  saved: ${:.4}", hit_rate_str, savings));
+    lines.push(String::new());
+    lines.push(format!("  Cost   ${:.4}", session_cost));
+    lines.push("─────────────────────────────────────────────────".to_string());
+    lines.join("\n")
+}
+
+/// Format a token count with K/M suffix.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Handle a slash command while streaming (limited set).
 pub(super) fn handle_streaming_command(
     cmd: &str,
@@ -905,7 +1012,7 @@ pub(super) fn handle_streaming_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_distance, execute_command_action, execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
+    use super::{build_stats_receipt, edit_distance, execute_command_action, execute_interactive_plugin_command_events, fuzzy_match, handle_command, resolve_prefix, CommandAction, ExtensionsMemoryAction, ExtensionsTrustAction};
     use super::command_output_event_to_chat_message;
     use crate::tui::app::ChatMessage;
     use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -1144,7 +1251,7 @@ mod tests {
             "models".into(), "system".into(), "thinking".into(), "context".into(), "sessions".into(), "resume".into(),
             "saveas".into(), "theme".into(), "gamba".into(), "help".into(),
             "quit".into(), "exit".into(), "settings".into(), "plugins".into(),
-            "status".into(),
+            "status".into(), "stats".into(),
         ]
     }
 
@@ -1648,5 +1755,59 @@ mod tests {
         assert!(matches!(action, CommandAction::None));
         let pushed = app.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
         assert!(pushed, "expected `unknown /sidecar subcommand` error");
+    }
+
+    // ── /stats unit tests ─────────────────────────────────────────────────
+
+    /// Cache savings = (full_input_price − read_price) for the cache-read tokens.
+    /// For Sonnet at $3/Mtok: 1M read tokens saved = $3.00 − $0.30 = $2.70.
+    #[test]
+    fn cache_savings_formula_sonnet() {
+        use synaps_cli::pricing::calculate_cost_split;
+        let model = "claude-sonnet-4-5";
+        let c_read: u64 = 1_000_000;
+        let full_price = calculate_cost_split(model, c_read, 0, 0, 0, 0); // at input rate
+        let actual     = calculate_cost_split(model, 0, 0, c_read, 0, 0); // at 0.1× rate
+        let savings = full_price - actual;
+        // $3.00 − $0.30 = $2.70
+        assert!((savings - 2.70).abs() < 1e-9, "expected $2.70, got ${savings}");
+    }
+
+    /// Zero cache reads → zero savings.
+    #[test]
+    fn cache_savings_zero_when_no_reads() {
+        use synaps_cli::pricing::calculate_cost_split;
+        let model = "claude-sonnet-4-5";
+        let full_price = calculate_cost_split(model, 0, 0, 0, 0, 0);
+        let actual     = calculate_cost_split(model, 0, 0, 0, 0, 0);
+        let savings = full_price - actual;
+        assert_eq!(savings, 0.0);
+    }
+
+    /// /stats receipt contains expected section headers.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_receipt_contains_expected_sections() {
+        let session = synaps_cli::Session::new("claude-sonnet-4-5", "medium", None);
+        let mut app = crate::tui::app::App::new(session);
+        // Inject some usage so the receipt shows non-zero numbers.
+        app.total_input_tokens = 1000;
+        app.total_output_tokens = 500;
+        app.total_cache_read_tokens = 2000;
+        app.total_cache_creation_tokens = 800;
+        app.total_cache_write_5m = 600;
+        app.total_cache_write_1h = 200;
+        app.session_cost = 0.0042;
+
+        let runtime = synaps_cli::Runtime::new().await.unwrap();
+        let receipt = build_stats_receipt(&app, &runtime);
+
+        assert!(receipt.contains("Session Stats"), "missing header");
+        assert!(receipt.contains("Tokens"), "missing Tokens section");
+        assert!(receipt.contains("Cache"), "missing Cache section");
+        assert!(receipt.contains("Cost"), "missing Cost section");
+        assert!(receipt.contains("saved:"), "missing savings line");
+        assert!(receipt.contains("5m:"), "missing 5m split");
+        assert!(receipt.contains("1h:"), "missing 1h split");
     }
 }

@@ -66,6 +66,11 @@ pub(crate) struct App {
     pub(crate) total_output_tokens: u64,
     pub(crate) total_cache_read_tokens: u64,
     pub(crate) total_cache_creation_tokens: u64,
+    /// Per-TTL-bucket accumulators for cache writes.  Populated by
+    /// `add_usage` when the API returns the 5m/1h split in `SessionEvent::Usage`.
+    /// Zero when no split has arrived (e.g. cache_ttl=default, no writes yet).
+    pub(crate) total_cache_write_5m: u64,
+    pub(crate) total_cache_write_1h: u64,
     /// Most recent turn's actual context occupancy (what the API ingested
     /// this request): uncached input + cache read + cache creation. Unlike
     /// `total_*_tokens` which accumulate for cost tracking, this is reassigned
@@ -210,6 +215,8 @@ impl App {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            total_cache_write_5m: 0,
+            total_cache_write_1h: 0,
             last_turn_context: 0,
             last_turn_context_window: synaps_cli::models::context_window_for_model(
                 synaps_cli::models::default_model(),
@@ -410,6 +417,9 @@ impl App {
         self.total_output_tokens += output_tokens;
         self.total_cache_read_tokens += cache_read;
         self.total_cache_creation_tokens += cache_creation;
+        // Accumulate per-TTL-bucket write totals for /stats and footer display.
+        if let Some(c5) = cache_creation_5m { self.total_cache_write_5m += c5; }
+        if let Some(c1) = cache_creation_1h { self.total_cache_write_1h += c1; }
         // Per-turn context occupancy (bar numerator): what the API actually
         // ingested this request. Output tokens are generated, not ingested,
         // so they don't count toward current-window use. Reassigned, not accumulated.
