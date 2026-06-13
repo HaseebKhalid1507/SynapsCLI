@@ -1,4 +1,35 @@
 //! Process signal handling for the chat TUI.
+//!
+//! # Why signal-hook instead of tokio's async signal streams?
+//!
+//! Tokio's `tokio::signal::unix::signal` / `ctrl_c` streams install the OS
+//! handler correctly (proven: SigCgt mask shows all three signals caught,
+//! SigPnd clears on delivery) but their `.recv().await` **never resolves** in
+//! synaps's TUI runtime.  The exact same pattern works in a standalone binary,
+//! so some aspect of this process's runtime state breaks tokio's async signal
+//! driver.  Rather than chase that, we sidestep it entirely.
+//!
+//! A **dedicated `std::thread`** runs `signal_hook::iterator::Signals::forever()`
+//! in a plain blocking loop.  When a signal arrives the thread sends on the
+//! existing tokio `UnboundedSender`.  Sending from a std thread is safe and
+//! wakes the tokio receiver — **when the event loop is free to receive it**.
+//!
+//! # Second problem: blocked write() in draw()
+//!
+//! The main tokio task calls `draw()` synchronously (no `spawn_blocking`).
+//! If the terminal's read side stops draining output (e.g. the PTY master
+//! closes while the kernel buffer is full), the `write()` inside crossterm
+//! blocks indefinitely, preventing the `select!` from ever running.  The
+//! channel send from the signal thread is correct, but the receiver is never
+//! polled.
+//!
+//! Fix: after sending on the channel, the signal thread also spawns a
+//! **watchdog** std thread that calls `std::process::exit(0)` after 2 s if
+//! the process hasn't exited via the normal loop path.  The watchdog does NOT
+//! call `emergency_teardown_terminal()` — crossterm holds a
+//! `parking_lot::Mutex` (`TERMINAL_MODE_PRIOR_RAW_MODE`) during draw; calling
+//! it from a concurrent thread deadlocks.  Terminal state resets on process
+//! exit anyway.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
@@ -9,9 +40,9 @@ pub(crate) enum ShutdownSignal {
 
 /// What the event loop should do in response to a shutdown signal.
 ///
-/// `ImmediateExit` — skip the exit animation and break immediately. Used for
+/// `ImmediateExit` — skip the exit animation and break immediately.  Used for
 /// SIGTERM / SIGHUP where the terminal may already be gone and systemd is
-/// counting down. `AnimatedExit` — play the 830ms quit effect (interactive
+/// counting down.  `AnimatedExit` — play the 830 ms quit effect (interactive
 /// Ctrl-C on a live terminal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownAction {
@@ -22,12 +53,12 @@ pub(crate) enum ShutdownAction {
 /// Pure policy: map a signal to the shutdown action the event loop should take.
 ///
 /// Extracted as a free function so it can be unit-tested without a real
-/// terminal. The loop in `mod.rs` delegates to this instead of hardcoding the
-/// decision inline.
+/// terminal.  The loop in `mod.rs` delegates to this instead of hardcoding
+/// the decision inline.
 pub(crate) fn shutdown_action(signal: ShutdownSignal) -> ShutdownAction {
     match signal {
         // SIGTERM and SIGHUP arrive from systemd, tmux kill-pane, SSH drops,
-        // etc. The terminal is likely already gone — exit now, no animation.
+        // etc.  The terminal is likely already gone — exit now, no animation.
         ShutdownSignal::Terminate | ShutdownSignal::Hangup => ShutdownAction::ImmediateExit,
         // Interactive Ctrl-C from a live terminal — show the quit animation.
         ShutdownSignal::Interrupt => ShutdownAction::AnimatedExit,
@@ -42,49 +73,105 @@ pub(crate) fn signal_label(signal: ShutdownSignal) -> &'static str {
     }
 }
 
+/// A handle that can stop the signal-listener thread.
+///
+/// Dropping or calling `.close()` unregisters the signal hooks and causes the
+/// blocking `Signals::forever()` iterator to return, letting the thread exit
+/// cleanly.
+pub(crate) struct SignalHandle {
+    #[cfg(unix)]
+    inner: signal_hook::iterator::Handle,
+}
+
+impl SignalHandle {
+    pub(crate) fn close(self) {
+        #[cfg(unix)]
+        self.inner.close();
+    }
+}
+
+/// Spawn a **std::thread** that delivers OS signals over the existing tokio
+/// mpsc channel.
+///
+/// Returns a `SignalHandle` whose `.close()` method stops the thread.  The
+/// caller in `mod.rs` should call `handle.close()` instead of `.abort()`-ing
+/// a tokio `JoinHandle`.
+///
+/// On non-Unix targets a minimal tokio `ctrl_c` fallback is used instead.
+#[cfg(unix)]
 pub(crate) fn spawn_shutdown_signal_task(
     tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    super::lifecycle::emergency_teardown_terminal();
-                    let _ = tx.send(ShutdownSignal::Interrupt);
-                }
-                _ = async {
-                    if let Some(signal) = sigterm.as_mut() {
-                        signal.recv().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    super::lifecycle::emergency_teardown_terminal();
-                    let _ = tx.send(ShutdownSignal::Terminate);
-                }
-                _ = async {
-                    if let Some(signal) = sighup.as_mut() {
-                        signal.recv().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    super::lifecycle::emergency_teardown_terminal();
-                    let _ = tx.send(ShutdownSignal::Hangup);
-                }
-            }
-        }
+) -> SignalHandle {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
 
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            super::lifecycle::emergency_teardown_terminal();
-            let _ = tx.send(ShutdownSignal::Interrupt);
-        }
-    })
+    let mut signals = Signals::new([SIGTERM, SIGHUP, SIGINT])
+        .expect("failed to register signal hooks");
+    let handle = signals.handle();
+
+    std::thread::Builder::new()
+        .name("signal-listener".into())
+        .spawn(move || {
+            tracing::debug!("signal-listener thread started");
+            for sig in signals.forever() {
+                tracing::debug!(sig, "signal-listener: received signal");
+                let shutdown = match sig {
+                    SIGINT  => ShutdownSignal::Interrupt,
+                    SIGTERM => ShutdownSignal::Terminate,
+                    SIGHUP  => ShutdownSignal::Hangup,
+                    _       => continue,
+                };
+
+                // IMPORTANT: do NOT call emergency_teardown_terminal() here.
+                // crossterm holds a parking_lot::Mutex (TERMINAL_MODE_PRIOR_RAW_MODE)
+                // during draw operations; taking it from a signal thread deadlocks.
+
+                // Send on the tokio channel — wakes the event loop when it is free.
+                let _ = tx.send(shutdown);
+
+                // Fallback: if the main async task is blocked in a synchronous
+                // write() to the PTY (happens when the terminal read-side stops
+                // draining output and the buffer fills), the select! branch above
+                // never gets scheduled.  Spawn a watchdog that forces exit after
+                // 2 s if the process hasn't already exited via normal teardown.
+                // emergency_teardown_terminal() is safe to call here because
+                // the watchdog thread only starts after the signal is received,
+                // at which point the main thread's draw call may still be blocked
+                // but we are willing to abandon it.
+                std::thread::Builder::new()
+                    .name("signal-watchdog".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(2000));
+                        // Do NOT call emergency_teardown_terminal() here — it also
+                        // acquires crossterm's TERMINAL_MODE_PRIOR_RAW_MODE mutex,
+                        // which the main thread may hold during draw().  Just force
+                        // exit; the terminal will reset on process death anyway.
+                        tracing::warn!("signal watchdog: clean exit timed out, forcing exit");
+                        std::process::exit(0);
+                    })
+                    .ok();
+
+                // One signal is enough; the event loop handles the rest.
+                break;
+            }
+            tracing::debug!("signal-listener thread exiting");
+        })
+        .expect("failed to spawn signal-listener thread");
+
+    SignalHandle { inner: handle }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_shutdown_signal_task(
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
+) -> SignalHandle {
+    // Non-Unix: fall back to tokio ctrl_c (the only signal available).
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        super::lifecycle::emergency_teardown_terminal();
+        let _ = tx.send(ShutdownSignal::Interrupt);
+    });
+    SignalHandle {}
 }
 
 #[cfg(test)]
@@ -98,7 +185,7 @@ mod tests {
         assert_eq!(signal_label(ShutdownSignal::Hangup), "hangup");
     }
 
-    // FIX B: verify the signal→action policy is correct and stays correct.
+    // Verify the signal→action policy is correct and stays correct.
     // SIGTERM/SIGHUP must exit immediately (no animation on a dead terminal).
     // Ctrl-C (Interrupt) may play the animation since the terminal is live.
     #[test]
@@ -110,5 +197,12 @@ mod tests {
     #[test]
     fn interrupt_is_animated() {
         assert_eq!(shutdown_action(ShutdownSignal::Interrupt), ShutdownAction::AnimatedExit);
+    }
+
+    #[test]
+    fn all_signals_have_labels() {
+        for sig in [ShutdownSignal::Interrupt, ShutdownSignal::Terminate, ShutdownSignal::Hangup] {
+            assert!(!signal_label(sig).is_empty());
+        }
     }
 }
