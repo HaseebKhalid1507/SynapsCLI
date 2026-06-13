@@ -24,12 +24,20 @@
 //! polled.
 //!
 //! Fix: after sending on the channel, the signal thread also spawns a
-//! **watchdog** std thread that calls `std::process::exit(0)` after 2 s if
+//! **watchdog** std thread that calls `std::process::exit(0)` after 5 s if
 //! the process hasn't exited via the normal loop path.  The watchdog does NOT
 //! call `emergency_teardown_terminal()` — crossterm holds a
 //! `parking_lot::Mutex` (`TERMINAL_MODE_PRIOR_RAW_MODE`) during draw; calling
 //! it from a concurrent thread deadlocks.  Terminal state resets on process
 //! exit anyway.
+//!
+//! # Watchdog / teardown timeout invariant
+//!
+//! The post-loop teardown in `mod.rs` is given a 3 s budget (see the
+//! `tokio::time::timeout(Duration::from_secs(3), …)` call there).  The
+//! watchdog here is set to **5 s**, strictly longer, so it only fires when
+//! the process is genuinely stuck — never during a legitimate slow teardown.
+//! **Invariant: watchdog_timeout (5 s) > teardown_timeout (3 s).**
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
@@ -40,13 +48,15 @@ pub(crate) enum ShutdownSignal {
 
 /// What the event loop should do in response to a shutdown signal.
 ///
-/// `ImmediateExit` — skip the exit animation and break immediately.  Used for
-/// SIGTERM / SIGHUP where the terminal may already be gone and systemd is
-/// counting down.  `AnimatedExit` — play the 830 ms quit effect (interactive
-/// Ctrl-C on a live terminal).
+/// Currently all OS signals map to `ImmediateExit`: break out of the event
+/// loop immediately and fall through to the bounded teardown path.  An
+/// `AnimatedExit` path exists in the event loop for UI-driven quit actions
+/// that manage their own animation timing, but it is not triggered by signal
+/// delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownAction {
     ImmediateExit,
+    #[allow(dead_code)] // reserved for UI-driven quit with managed animation timing
     AnimatedExit,
 }
 
@@ -57,11 +67,13 @@ pub(crate) enum ShutdownAction {
 /// the decision inline.
 pub(crate) fn shutdown_action(signal: ShutdownSignal) -> ShutdownAction {
     match signal {
-        // SIGTERM and SIGHUP arrive from systemd, tmux kill-pane, SSH drops,
-        // etc.  The terminal is likely already gone — exit now, no animation.
-        ShutdownSignal::Terminate | ShutdownSignal::Hangup => ShutdownAction::ImmediateExit,
-        // Interactive Ctrl-C from a live terminal — show the quit animation.
-        ShutdownSignal::Interrupt => ShutdownAction::AnimatedExit,
+        // All OS signals exit immediately — no animation.  For SIGTERM/SIGHUP
+        // the terminal may already be gone.  For Ctrl-C (Interrupt) we exit
+        // cleanly via the event loop rather than relying on animation timing,
+        // which is unreliable relative to the watchdog.
+        ShutdownSignal::Terminate | ShutdownSignal::Hangup | ShutdownSignal::Interrupt => {
+            ShutdownAction::ImmediateExit
+        }
     }
 }
 
@@ -112,7 +124,6 @@ pub(crate) fn spawn_shutdown_signal_task(
     std::thread::Builder::new()
         .name("signal-listener".into())
         .spawn(move || {
-            tracing::debug!("signal-listener thread started");
             for sig in signals.forever() {
                 tracing::debug!(sig, "signal-listener: received signal");
                 let shutdown = match sig {
@@ -133,15 +144,16 @@ pub(crate) fn spawn_shutdown_signal_task(
                 // write() to the PTY (happens when the terminal read-side stops
                 // draining output and the buffer fills), the select! branch above
                 // never gets scheduled.  Spawn a watchdog that forces exit after
-                // 2 s if the process hasn't already exited via normal teardown.
-                // emergency_teardown_terminal() is safe to call here because
-                // the watchdog thread only starts after the signal is received,
-                // at which point the main thread's draw call may still be blocked
-                // but we are willing to abandon it.
+                // 5 s if the process hasn't already exited via normal teardown.
+                //
+                // 5 s is strictly longer than the 3 s teardown timeout in mod.rs
+                // (see `tokio::time::timeout(Duration::from_secs(3), …)` there),
+                // so the watchdog never races a valid teardown.
+                // Invariant: watchdog_timeout (5 s) > teardown_timeout (3 s).
                 std::thread::Builder::new()
                     .name("signal-watchdog".into())
                     .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(2000));
+                        std::thread::sleep(std::time::Duration::from_millis(5000));
                         // Do NOT call emergency_teardown_terminal() here — it also
                         // acquires crossterm's TERMINAL_MODE_PRIOR_RAW_MODE mutex,
                         // which the main thread may hold during draw().  Just force
@@ -154,7 +166,6 @@ pub(crate) fn spawn_shutdown_signal_task(
                 // One signal is enough; the event loop handles the rest.
                 break;
             }
-            tracing::debug!("signal-listener thread exiting");
         })
         .expect("failed to spawn signal-listener thread");
 
@@ -186,8 +197,9 @@ mod tests {
     }
 
     // Verify the signal→action policy is correct and stays correct.
-    // SIGTERM/SIGHUP must exit immediately (no animation on a dead terminal).
-    // Ctrl-C (Interrupt) may play the animation since the terminal is live.
+    // All OS signals map to ImmediateExit — the event loop breaks immediately
+    // without playing an animation.  This is reliable regardless of system
+    // load and never races the watchdog.
     #[test]
     fn terminate_and_hangup_are_immediate() {
         assert_eq!(shutdown_action(ShutdownSignal::Terminate), ShutdownAction::ImmediateExit);
@@ -195,8 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_is_animated() {
-        assert_eq!(shutdown_action(ShutdownSignal::Interrupt), ShutdownAction::AnimatedExit);
+    fn interrupt_is_immediate() {
+        assert_eq!(shutdown_action(ShutdownSignal::Interrupt), ShutdownAction::ImmediateExit);
     }
 
     #[test]
