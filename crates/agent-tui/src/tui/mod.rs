@@ -195,8 +195,8 @@ pub async fn run(
         // 40c2ce4 made 60fps affordable.)
         let throttle = std::time::Duration::from_millis(16);
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
-            // Step 2: terminal lives on the render thread — get size via the
-            // crossterm TTY syscall directly (doesn't need the Terminal object).
+            // Terminal lives on the render thread — get size via the crossterm
+            // TTY syscall directly (doesn't need the Terminal object).
             // Skip the frame entirely if the reported size is 0×0 (terminal not
             // yet ready, or a transient resize event) — publishing a 0×0 model
             // would produce layout artifacts.
@@ -213,7 +213,7 @@ pub async fn run(
                 &secret_prompts,
                 term_size,
             ) {
-                render_handle.slot.publish(model);
+                render_handle.publish(model);
             }
         }
 
@@ -703,7 +703,7 @@ pub async fn run(
                                         app.spinner_frame = 0;
                                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
                                         if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
-                                            render_handle.slot.publish(model);
+                                            render_handle.publish(model);
                                         }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
@@ -1417,7 +1417,7 @@ pub async fn run(
                                 app.spinner_frame = 0;
                                 let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
                                 if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
-                                    render_handle.slot.publish(model);
+                                    render_handle.publish(model);
                                 }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
@@ -1806,9 +1806,10 @@ pub async fn run(
                     // FIX C (defense in depth): EventStream yields Err or None when
                     // crossterm detects the PTY is gone. Break cleanly here.
                     // NOTE: on some kernels crossterm's EPOLL loop can spin without ever
-                    // yielding Err/None on a dead PTY (the confirmed busy-loop bug). FIX A
-                    // (draw() I/O error → break) is the backstop for that case and fires
-                    // on the very next render regardless of EventStream behaviour.
+                    // yielding Err/None on a dead PTY (the confirmed busy-loop bug). The
+                    // render thread's I/O error path is the backstop: it logs the error
+                    // and keeps rendering until the main loop tears down (does NOT break
+                    // the render loop on a single I/O error).
                     Some(Err(_)) | None => break,
                 }
             }
@@ -1872,7 +1873,7 @@ pub async fn run(
                             app.spinner_frame = 0;
                             let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
                             if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
-                                render_handle.slot.publish(model);
+                                render_handle.publish(model);
                             }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
@@ -1898,7 +1899,7 @@ pub async fn run(
                     if do_draw {
                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
                         if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
-                            render_handle.slot.publish(model);
+                            render_handle.publish(model);
                         }
                     }
                 }

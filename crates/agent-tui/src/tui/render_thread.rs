@@ -128,12 +128,18 @@ impl FrameSlot {
 
 /// Handle to the render thread, held by the main task.
 pub(crate) struct RenderHandle {
-    pub(crate) slot:   FrameSlot,
+    slot:              FrameSlot,
     pub(crate) cmd_tx: mpsc::Sender<RenderCmd>,
     join_handle:       Option<std::thread::JoinHandle<()>>,
 }
 
 impl RenderHandle {
+    /// Publish a new frame snapshot to the render thread (latest-wins).
+    /// Replaces any unread frame and wakes the render thread via `unpark()`.
+    pub(crate) fn publish(&self, model: std::sync::Arc<super::render_model::RenderModel>) {
+        self.slot.publish(model);
+    }
+
     /// Wake the render thread (in addition to an unpark from publish).
     /// Used after sending a command so the thread wakes and processes it.
     fn wake(&self) {
