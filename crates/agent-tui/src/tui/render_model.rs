@@ -1,16 +1,13 @@
 //! Owned, `Send`-safe snapshot of everything `draw()` reads.
 //!
 //! Built on the main task each frame in [`super::draw::build_render_model`].
-//! In Step 1 it is consumed synchronously by [`super::draw::render_frame`] on
-//! the same task — no channel, no threading.  Step 2 will ship it over a
-//! latest-wins slot to a dedicated render `std::thread`.
+//! Shipped over a latest-wins slot to a dedicated render `std::thread` which
+//! calls [`super::draw::render_frame`] — the two-step split is fully in place.
 //!
 //! **Invariant**: zero borrows back into `App`.  If `render_frame` compiles
 //! without an `&App` parameter, the snapshot is proven complete.
 
 use std::sync::Arc;
-
-use ratatui::layout::Rect;
 
 use super::models::ModelsModalState;
 use super::plugins::PluginsModalState;
@@ -38,7 +35,7 @@ pub(crate) struct RenderModel {
     /// Pre-rendered, width-keyed line cache.  `Arc` so snapshot clone is a
     /// refcount bump, not a deep copy.
     pub(crate) lines: Arc<[ratatui::text::Line<'static>]>,
-    /// Content width the cache was built at (for diagnostic / assert use in Step 2).
+    /// Content width the cache was built at (diagnostic / assert use by the render thread).
     #[allow(dead_code)]
     pub(crate) lines_width: usize,
     /// Final scroll offset, already clamped on the main side.
@@ -49,10 +46,6 @@ pub(crate) struct RenderModel {
     pub(crate) selection: Option<(u16, u16, u16, u16)>,
     /// `true` when there are no messages — drives logo visibility.
     pub(crate) messages_empty: bool,
-    /// Inner content rect saved for mouse-coordinate mapping on next event.
-    /// Computed deterministically on the main side; consumed by `input.rs`.
-    #[allow(dead_code)]
-    pub(crate) msg_inner_rect: Rect,
 
     // ── Logo / boot animation ─────────────────────────────────────────────────
     pub(crate) logo_build_t: Option<f64>,
@@ -62,8 +55,8 @@ pub(crate) struct RenderModel {
     pub(crate) subagents: Vec<SubagentSnap>,
 
     // ── Active-task progress bar ──────────────────────────────────────────────
-    /// Cloned snapshot of `app.active_tasks`.
-    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Arc snapshot of `app.active_tasks` — refcount bump, not a deep clone.
+    pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
 
     // ── Input box ────────────────────────────────────────────────────────────
     pub(crate) input: String,
@@ -90,9 +83,9 @@ pub(crate) struct RenderModel {
     pub(crate) settings: Option<(SettingsState, RuntimeSnapshot)>,
     pub(crate) plugins: Option<PluginsModalState>,
     pub(crate) models: Option<ModelsModalState>,
-    /// Cloned snapshot of `HelpFindState`.  `help_find::render` takes
-    /// `&mut HelpFindState`; in Step 1 we clone per-frame and let render
-    /// mutate its local copy.  The authoritative state stays on `App`.
+    /// Snapshot of `HelpFindState`.  `help_find::render` takes
+    /// `&mut HelpFindState`; `visible_height` is pre-computed on the main side
+    /// before snapshotting so the modal's scroll window is authoritative.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
 
     // ── Secret prompt modal ───────────────────────────────────────────────────
@@ -109,7 +102,7 @@ pub(crate) struct RenderModel {
 /// Render-safe projection of `SidecarUiState` — strips the `Child` process.
 #[derive(Clone)]
 pub(crate) struct SidecarPillSnap {
-    /// Plugin id — retained for Step 2 ordering / debug; not read by renderer.
+    /// Plugin id — retained for ordering / debug; not read by renderer.
     #[allow(dead_code)]
     pub(crate) plugin_id: String,
     pub(crate) display_name: Option<String>,

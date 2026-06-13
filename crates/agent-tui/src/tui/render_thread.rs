@@ -49,6 +49,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Once;
 use std::time::Instant;
 
 use ratatui::backend::CrosstermBackend;
@@ -79,6 +80,22 @@ pub(crate) enum RenderCmd {
     /// exits and similar full-screen takeover events where ratatui's diff
     /// cannot know the screen is dirty.
     Clear,
+
+    /// Pause rendering so the main thread can safely change terminal modes
+    /// (e.g. for casino / gamba takeover).  The render thread finishes any
+    /// in-flight draw, sends `()` on `ack` to prove it is idle, then parks
+    /// ignoring further publishes until it receives `Resume`.
+    ///
+    /// Main MUST wait on `ack` before touching the terminal.  A bounded
+    /// timeout (~2 s) applies — if the ack doesn't arrive the render thread
+    /// is wedged and the casino will reset the terminal anyway, so we
+    /// proceed regardless.
+    Pause { ack: mpsc::SyncSender<()> },
+
+    /// Resume rendering after a `Pause`.  The render thread exits the paused
+    /// state and forces a full repaint (equivalent to `Clear`) so ratatui
+    /// repaints from scratch after the casino scribbled on the screen.
+    Resume,
 }
 
 // ── Latest-wins frame slot ────────────────────────────────────────────────────
@@ -111,12 +128,18 @@ impl FrameSlot {
 
 /// Handle to the render thread, held by the main task.
 pub(crate) struct RenderHandle {
-    pub(crate) slot:   FrameSlot,
+    slot:              FrameSlot,
     pub(crate) cmd_tx: mpsc::Sender<RenderCmd>,
     join_handle:       Option<std::thread::JoinHandle<()>>,
 }
 
 impl RenderHandle {
+    /// Publish a new frame snapshot to the render thread (latest-wins).
+    /// Replaces any unread frame and wakes the render thread via `unpark()`.
+    pub(crate) fn publish(&self, model: std::sync::Arc<super::render_model::RenderModel>) {
+        self.slot.publish(model);
+    }
+
     /// Wake the render thread (in addition to an unpark from publish).
     /// Used after sending a command so the thread wakes and processes it.
     fn wake(&self) {
@@ -141,6 +164,30 @@ impl RenderHandle {
     /// dirty.
     pub(crate) fn send_clear(&self) {
         let _ = self.cmd_tx.send(RenderCmd::Clear);
+        self.wake();
+    }
+
+    /// Pause the render thread before a terminal-mode handoff (e.g. casino).
+    ///
+    /// Sends `Pause`, then blocks (up to ~2 s) for the ack that proves the
+    /// render thread is idle and out of `terminal.draw()`.  Returns `true` if
+    /// the ack arrived; `false` if the render thread is wedged (caller should
+    /// proceed anyway — the casino will reset the terminal).
+    ///
+    /// After this returns `true` it is safe for the main thread to call
+    /// `disable_raw_mode()`, `LeaveAlternateScreen`, etc.
+    pub(crate) fn pause(&self) -> bool {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+        let _ = self.cmd_tx.send(RenderCmd::Pause { ack: ack_tx });
+        self.wake();
+        ack_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+    }
+
+    /// Resume the render thread after the terminal has been restored by the
+    /// main thread.  Triggers a forced full repaint so ratatui redraws from
+    /// scratch (the casino may have left the screen in any state).
+    pub(crate) fn resume(&self) {
+        let _ = self.cmd_tx.send(RenderCmd::Resume);
         self.wake();
     }
 
@@ -176,12 +223,50 @@ impl RenderHandle {
 
 impl Drop for RenderHandle {
     fn drop(&mut self) {
-        // If teardown() was not called (e.g. panic path), drop cmd_tx so the
-        // render thread's cmd_rx disconnects and it can exit its loop.
-        // join_handle is dropped here; if the thread is still running it
-        // becomes a detached thread — the OS cleans it up on process exit.
+        // If teardown() was not called (e.g. panic path on the main task),
+        // we need to wake the render thread so it can observe the disconnect
+        // and run do_teardown() itself.
+        //
+        // Order matters:
+        //  1. Disconnect cmd_rx by replacing our sender with one whose receiver
+        //     is immediately dropped.  The render thread's cmd_rx will then
+        //     return Disconnected on the next try_recv, triggering do_teardown().
+        //  2. Unpark the render thread so it wakes from park() immediately and
+        //     processes the disconnect — instead of sleeping forever in raw mode.
+        //  3. Drop the JoinHandle last (detaches the thread; OS reaps on exit).
+        //
+        // If teardown() already ran it consumed join_handle via .take(), so
+        // the drop below is a no-op and the thread has already exited cleanly.
+        let (dead_tx, _dead_rx) = mpsc::channel::<RenderCmd>();
+        // _dead_rx is dropped at end of block, so dead_tx is already the sole
+        // sender of a disconnected channel.  Swap it in and drop the real tx.
+        let _old_tx = std::mem::replace(&mut self.cmd_tx, dead_tx);
+        drop(_old_tx);  // now render thread's cmd_rx sees Disconnected
+        self.slot.render_thread.unpark();
         drop(self.join_handle.take());
     }
+}
+
+// ── Panic hook (installed once per process) ───────────────────────────────
+
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Install the process-wide panic hook that restores the terminal before the
+/// default hook prints the panic message.  Safe to call multiple times —
+/// internally guarded by a [`Once`].
+///
+/// The hook chains to whatever hook was previously installed (usually the
+/// default Rust hook that prints the backtrace), so existing behaviour is
+/// preserved.
+fn install_panic_hook_once() {
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore the terminal first so the panic message is readable.
+            super::lifecycle::emergency_teardown_terminal();
+            prev(info);
+        }));
+    });
 }
 
 // ── Thread spawn ─────────────────────────────────────────────────────────────
@@ -200,6 +285,7 @@ impl Drop for RenderHandle {
 pub(crate) fn spawn_render_thread(
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 ) -> (RenderHandle, Arc<AtomicBool>, Arc<AtomicBool>) {
+    install_panic_hook_once();
     // Shared inner slot — same Arc goes into the FrameSlot (main) and the
     // thread closure (render side).  No circular dependency.
     let inner: Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>> =
@@ -223,7 +309,40 @@ pub(crate) fn spawn_render_thread(
             // the bootstrap for the unpark/park synchronisation.
             let _ = thread_tx.send(std::thread::current());
 
-            render_thread_body(terminal, inner_thread, cmd_rx, boot_done_thread, exit_done_thread);
+            // Wrap the entire body in catch_unwind so a panic in render_frame
+            // (or anywhere in the render loop) does NOT leave the terminal in
+            // raw mode.  Whether the body returns normally OR unwinds, we ALWAYS
+            // ensure terminal cleanup and signal exit_done so the main loop wakes.
+            //
+            // We use a Cell/Option to regain the terminal after catch_unwind so
+            // we can call do_teardown() ourselves even on the panic path.
+            let mut terminal_opt = Some(terminal);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Safety: we're the only thread touching terminal_opt here.
+                let term = terminal_opt.take().expect("terminal already taken");
+                render_thread_body(term, inner_thread, cmd_rx, boot_done_thread, Arc::clone(&exit_done_thread));
+                // render_thread_body returned normally — it already called
+                // do_teardown() before returning.  terminal was consumed.
+            }));
+
+            if let Err(payload) = result {
+                // Log the panic payload.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic payload>");
+                tracing::error!(panic = msg, "render thread panicked — restoring terminal");
+                // The panic hook already called emergency_teardown_terminal().
+                // If terminal_opt still has a value (panic before take()), call
+                // do_teardown() to also run show_cursor() and the full sequence.
+                if let Some(mut term) = terminal_opt {
+                    do_teardown(&mut term);
+                }
+                // Signal the main loop that the render thread is done so it
+                // doesn't block forever waiting for the exit effect.
+                exit_done_thread.store(true, Ordering::Release);
+            }
         })
         .expect("failed to spawn render thread");
 
@@ -259,6 +378,12 @@ fn render_thread_body(
     let mut exit_fx:      Option<Effect> = None;
     let mut pending_clear = false;
 
+    // When the main thread sends Pause, we enter a "paused" state: we ack
+    // immediately (proving we're idle), then park and drop incoming frames
+    // until we receive Resume.  While paused, the main thread owns the
+    // terminal exclusively.
+    let mut paused = false;
+
     loop {
         // Park until the main task publishes a frame or sends a command.
         // Spurious wakeups are safe: the inner loops below re-check state.
@@ -272,9 +397,24 @@ fn render_thread_body(
                 }
                 Ok(RenderCmd::SpawnExitFx { fx }) => {
                     exit_fx = Some(fx);
-                    exit_done.store(false, Ordering::Relaxed);
+                    exit_done.store(false, Ordering::Release);
                 }
                 Ok(RenderCmd::Clear) => {
+                    pending_clear = true;
+                }
+                Ok(RenderCmd::Pause { ack }) => {
+                    // We are between draws here (command drain happens before
+                    // the render step).  Drop any pending frame from the slot
+                    // so nothing is rendered while paused, then ack — this
+                    // proves to the main thread that we are idle.
+                    inner.lock().take();
+                    let _ = ack.send(());
+                    paused = true;
+                }
+                Ok(RenderCmd::Resume) => {
+                    paused = false;
+                    // Force a full repaint: the casino may have left the
+                    // screen in any state; ratatui must redraw from scratch.
                     pending_clear = true;
                 }
                 Ok(RenderCmd::Teardown { ack }) => {
@@ -291,6 +431,13 @@ fn render_thread_body(
                     return;
                 }
             }
+        }
+
+        // While paused, drain and discard any published frames, then re-park.
+        // We must NOT call terminal.draw() while the main thread owns stdout.
+        if paused {
+            inner.lock().take();
+            continue;
         }
 
         // ── 2. Apply pending clear before rendering ───────────────────────────
