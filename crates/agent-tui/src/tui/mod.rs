@@ -1133,12 +1133,15 @@ pub async fn run(
                                         }
                                     }
                                     CommandAction::ExtensionsAudit { tail } => {
-                                        match synaps_cli::extensions::audit::read_audit_entries() {
+                                        // Use bounded tail read — only the last N entries are
+                                        // deserialised regardless of how large audit.jsonl has grown.
+                                        let read_result = match tail {
+                                            Some(n) => synaps_cli::extensions::audit::read_audit_entries_tail(n),
+                                            None => synaps_cli::extensions::audit::read_audit_entries(),
+                                        };
+                                        match read_result {
                                             Ok(entries) => {
-                                                let slice: Vec<_> = match tail {
-                                                    Some(n) if entries.len() > n => entries[entries.len() - n..].to_vec(),
-                                                    _ => entries,
-                                                };
+                                                let slice = entries;
                                                 if slice.is_empty() {
                                                     app.push_msg(ChatMessage::System("No audit entries yet.".to_string()));
                                                 } else {
