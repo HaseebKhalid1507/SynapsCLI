@@ -152,6 +152,66 @@ pub(crate) fn read_audit_entries_from(
     Ok(entries)
 }
 
+/// Read only the last `n` entries from the audit log.  Reads the whole file
+/// but collects lines into a fixed-capacity ring so only the tail N lines are
+/// ever parsed by serde — O(file_size) bytes read but O(N) deserialisation.
+/// Missing file → empty Vec.  Malformed tail lines are skipped with a warn.
+pub fn read_audit_entries_tail(n: usize) -> Result<Vec<ProviderAuditEntry>, String> {
+    read_audit_entries_tail_from(&crate::config::base_dir(), n)
+}
+
+/// `read_audit_entries_tail` under an explicit base dir (test helper).
+pub(crate) fn read_audit_entries_tail_from(
+    base: &Path,
+    n: usize,
+) -> Result<Vec<ProviderAuditEntry>, String> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let path = audit_file_path_for(base);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "failed to read audit.jsonl at {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+    // Collect the last N non-empty lines without parsing them yet — avoids
+    // deserialising the entire history when only the tail is needed.
+    let tail_lines: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let mut entries = Vec::with_capacity(tail_lines.len());
+    for raw in tail_lines {
+        let line = raw.trim();
+        match serde_json::from_str::<ProviderAuditEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    target: "synaps::extensions::audit",
+                    "skipping malformed audit.jsonl tail line at {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
