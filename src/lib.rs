@@ -1,16 +1,18 @@
-pub mod core;
+// agent-core is now a separate crate; re-export its modules as if they lived here
+pub use agent_core::core;
+pub use agent_core::memory;
+pub use agent_core::pricing;
+
 pub mod runtime;
 pub mod tools;
 pub mod mcp;
 pub mod skills;
 pub mod events;
 pub mod extensions;
-pub mod memory;
 pub mod help;
 pub mod sidecar;
 pub mod toast;
 pub mod engine;
-pub mod pricing;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -37,6 +39,9 @@ pub use watcher_types::{
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;
 
+/// Re-export epoch_millis from agent-core (moved there for the leaf crate split).
+pub use agent_core::epoch_millis;
+
 /// Flush stdout, ignoring errors (pipe closed, etc.)
 #[inline]
 pub fn flush_stdout() {
@@ -49,15 +54,6 @@ pub fn flush_stdout() {
 pub fn flush_stderr() {
     use std::io::Write;
     let _ = std::io::stderr().flush();
-}
-
-/// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
-#[inline]
-pub fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_millis() as u64
 }
 
 /// Current time as Unix epoch seconds.

@@ -9,6 +9,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-core"
+version = "0.2.1"
+dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "dirs",
+ "fs4",
+ "rand 0.9.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2500,6 +2526,7 @@ dependencies = [
 name = "synaps"
 version = "0.2.1"
 dependencies = [
+ "agent-core",
  "anyhow",
  "arboard",
  "arc-swap",
