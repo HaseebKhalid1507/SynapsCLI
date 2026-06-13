@@ -69,7 +69,14 @@ pub async fn register(
     tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
     config: &crate::SynapsConfig,
 ) -> (Arc<CommandRegistry>, Arc<std::sync::RwLock<keybinds::KeybindRegistry>>) {
-    let (mut plugins, mut skills) = loader::load_all(&loader::default_roots());
+    // The fs-walk (read_dir + read_to_string + canonicalize across multiple roots)
+    // is fully synchronous std::fs; do it on a blocking pool so we don't park a
+    // tokio worker during boot. Behavior is identical — same inputs, same output.
+    let (mut plugins, mut skills) = tokio::task::spawn_blocking(|| {
+        loader::load_all(&loader::default_roots())
+    })
+    .await
+    .expect("skills::loader::load_all panicked");
     skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
 
     // Filter disabled plugins from commands, keybinds, and help too — not just skills
