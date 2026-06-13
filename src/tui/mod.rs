@@ -28,6 +28,7 @@ use commands::CommandAction;
 use input::InputAction;
 use stream_handler::StreamAction;
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
+use signals::ShutdownAction;
 use lifecycle::{setup_terminal, teardown_terminal};
 
 use synaps_cli::{Runtime, StreamEvent, Result, CancellationToken, Session};
@@ -167,17 +168,38 @@ pub async fn run(
             last_draw = Instant::now();
             let elapsed = last_frame.elapsed();
             last_frame = Instant::now();
-            let _ = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts);
+            // FIX A: treat a draw() I/O error as "terminal is dead → exit now."
+            // CrosstermBackend writes to the real PTY fd; on EIO/EPIPE the very
+            // next frame fails. Discarding the error (the old `let _ =`) was the
+            // primary reason the process survived indefinitely after PTY close.
+            if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
+                tracing::warn!(err = %e, "terminal write failed — PTY likely closed, exiting");
+                lifecycle::teardown_terminal(&mut terminal);
+                break;
+            }
         }
 
         tokio::select! {
 
-            // ── OS shutdown signals: Ctrl-C from terminal, SIGTERM from tmux kill-pane/session ──
+            // ── OS shutdown signals: Ctrl-C from terminal, SIGTERM from systemd/tmux/SSH ──
             signal = shutdown_signal_rx.recv() => {
                 if let Some(signal) = signal {
                     tracing::info!(signal = signals::signal_label(signal), "chat UI shutdown signal received");
-                    app.push_msg(ChatMessage::System(format!("shutting down ({})", signals::signal_label(signal))));
-                    exit_fx = Some(quit_effect());
+                    // FIX B: use the pure shutdown_action() policy so the decision is
+                    // testable. SIGTERM/SIGHUP → ImmediateExit (terminal may already be
+                    // gone; systemd is counting down — no animation). Ctrl-C (Interrupt)
+                    // → AnimatedExit (live interactive terminal, show the quit effect).
+                    match signals::shutdown_action(signal) {
+                        ShutdownAction::ImmediateExit => {
+                            tracing::info!("immediate exit on {:?}", signal);
+                            lifecycle::teardown_terminal(&mut terminal);
+                            break;
+                        }
+                        ShutdownAction::AnimatedExit => {
+                            app.push_msg(ChatMessage::System(format!("shutting down ({})", signals::signal_label(signal))));
+                            exit_fx = Some(quit_effect());
+                        }
+                    }
                 }
             }
 
@@ -1725,6 +1747,12 @@ pub async fn run(
                             }
                         }
                     }
+                    // FIX C (defense in depth): EventStream yields Err or None when
+                    // crossterm detects the PTY is gone. Break cleanly here.
+                    // NOTE: on some kernels crossterm's EPOLL loop can spin without ever
+                    // yielding Err/None on a dead PTY (the confirmed busy-loop bug). FIX A
+                    // (draw() I/O error → break) is the backstop for that case and fires
+                    // on the very next render regardless of EventStream behaviour.
                     Some(Err(_)) | None => break,
                 }
             }
