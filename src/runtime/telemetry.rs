@@ -11,7 +11,7 @@
 //! pipeline. All errors are silently dropped (matching `log_usage`).
 
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -191,6 +191,76 @@ pub fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<S
     header_string(headers, "request-id")
 }
 
+/// Maximum delay we'll honour from any rate-limit header. A pathological reset
+/// timestamp far in the future would otherwise stall the turn indefinitely.
+pub const RETRY_DELAY_CAP: Duration = Duration::from_secs(60);
+
+/// Compute how long to wait before the next retry, consulting response headers.
+///
+/// Priority order:
+///   1. `retry-after` (integer seconds, or an HTTP-date — integer is what
+///      Anthropic sends in practice, HTTP-date is handled as a best-effort
+///      fallback).
+///   2. `anthropic-ratelimit-tokens-reset` / `anthropic-ratelimit-requests-reset`
+///      (RFC 3339 UTC timestamp) — take the *minimum* of whichever is present.
+///   3. Classic exponential back-off: `1s * 2^(attempt-1)` (1 s, 2 s, 4 s …).
+///
+/// The returned duration is capped at [`RETRY_DELAY_CAP`] so a far-future
+/// reset timestamp never hangs the turn forever. `attempt` is 1-based (first
+/// retry = 1).
+///
+/// Returns `(delay, from_header)` — the bool is `true` when a header was
+/// used (callers can emit a more informative notice message).
+pub fn retry_delay_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    attempt: u32,
+) -> (Duration, bool) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // ── 1. retry-after (integer seconds preferred) ──────────────────────────
+    if let Some(ra) = header_string(headers, "retry-after") {
+        let ra = ra.trim();
+        // Integer form: "30"
+        if let Ok(secs) = ra.parse::<u64>() {
+            let d = Duration::from_secs(secs).min(RETRY_DELAY_CAP);
+            return (d, true);
+        }
+        // HTTP-date form: "Wed, 11 Jun 2025 01:46:00 GMT" — parse via chrono.
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(ra) {
+            let reset_secs = dt.timestamp().max(0) as u64;
+            let wait = reset_secs.saturating_sub(now_secs);
+            let d = Duration::from_secs(wait).min(RETRY_DELAY_CAP);
+            return (d, true);
+        }
+    }
+
+    // ── 2. anthropic-ratelimit-*-reset (RFC 3339) ───────────────────────────
+    let mut min_wait: Option<u64> = None;
+    for name in &[
+        "anthropic-ratelimit-tokens-reset",
+        "anthropic-ratelimit-requests-reset",
+    ] {
+        if let Some(ts) = header_string(headers, name) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts.trim()) {
+                let reset_secs = dt.timestamp().max(0) as u64;
+                let wait = reset_secs.saturating_sub(now_secs);
+                min_wait = Some(min_wait.map_or(wait, |prev| prev.min(wait)));
+            }
+        }
+    }
+    if let Some(wait) = min_wait {
+        let d = Duration::from_secs(wait).min(RETRY_DELAY_CAP);
+        return (d, true);
+    }
+
+    // ── 3. Exponential back-off fallback ────────────────────────────────────
+    let d = Duration::from_millis(1000 * 2u64.pow(attempt.saturating_sub(1)));
+    (d, false)
+}
+
 /// Default telemetry log path: `~/.cache/synaps/api-log.jsonl`.
 fn default_log_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -334,5 +404,111 @@ mod tests {
         headers.insert("anthropic-ratelimit-requests-limit", "not-a-number".parse().unwrap());
         let r = ratelimit_from_headers(&headers);
         assert_eq!(r.requests_limit, None);
+    }
+}
+
+#[cfg(test)]
+mod retry_delay_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn integer_retry_after() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "45".parse().unwrap());
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert_eq!(d, Duration::from_secs(45));
+        assert!(from_hdr);
+    }
+
+    #[test]
+    fn integer_retry_after_capped() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "300".parse().unwrap()); // 5 min — beyond cap
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert_eq!(d, RETRY_DELAY_CAP);
+        assert!(from_hdr);
+    }
+
+    #[test]
+    fn rfc3339_reset_future() {
+        let future_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 30;
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(future_secs as i64, 0).unwrap();
+        let ts = dt.to_rfc3339();
+
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("anthropic-ratelimit-tokens-reset", ts.parse().unwrap());
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert!(d.as_secs() >= 28 && d.as_secs() <= 32, "unexpected delay: {:?}", d);
+        assert!(from_hdr);
+    }
+
+    #[test]
+    fn rfc3339_reset_beyond_cap() {
+        let future_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(future_secs as i64, 0).unwrap();
+        let ts = dt.to_rfc3339();
+
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("anthropic-ratelimit-tokens-reset", ts.parse().unwrap());
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert_eq!(d, RETRY_DELAY_CAP);
+        assert!(from_hdr);
+    }
+
+    #[test]
+    fn no_headers_exponential_fallback() {
+        let h = reqwest::header::HeaderMap::new();
+        let (d1, hdr1) = retry_delay_from_headers(&h, 1);
+        let (d2, hdr2) = retry_delay_from_headers(&h, 2);
+        let (d3, hdr3) = retry_delay_from_headers(&h, 3);
+        assert_eq!(d1, Duration::from_secs(1));
+        assert_eq!(d2, Duration::from_secs(2));
+        assert_eq!(d3, Duration::from_secs(4));
+        assert!(!hdr1 && !hdr2 && !hdr3);
+    }
+
+    #[test]
+    fn prefers_retry_after_over_rfc3339() {
+        let future_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 30;
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(future_secs as i64, 0).unwrap();
+        let ts = dt.to_rfc3339();
+
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "10".parse().unwrap());
+        h.insert("anthropic-ratelimit-tokens-reset", ts.parse().unwrap());
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert_eq!(d, Duration::from_secs(10));
+        assert!(from_hdr);
+    }
+
+    #[test]
+    fn min_of_multiple_ratelimit_reset_headers() {
+        // tokens-reset is sooner; requests-reset is later — should pick tokens.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tokens_dt = chrono::DateTime::<chrono::Utc>::from_timestamp((now + 15) as i64, 0).unwrap();
+        let requests_dt = chrono::DateTime::<chrono::Utc>::from_timestamp((now + 45) as i64, 0).unwrap();
+
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("anthropic-ratelimit-tokens-reset", tokens_dt.to_rfc3339().parse().unwrap());
+        h.insert("anthropic-ratelimit-requests-reset", requests_dt.to_rfc3339().parse().unwrap());
+        let (d, from_hdr) = retry_delay_from_headers(&h, 1);
+        assert!(d.as_secs() >= 13 && d.as_secs() <= 17, "should be ~15s, got {:?}", d);
+        assert!(from_hdr);
     }
 }

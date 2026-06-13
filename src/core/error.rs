@@ -26,6 +26,13 @@ pub enum RuntimeError {
 /// well-known statuses to guidance. Falls back to a trimmed version of the raw
 /// body for unknown cases.
 pub fn humanize_api_error(status: u16, body: &str) -> String {
+    humanize_api_error_with_reset(status, body, None)
+}
+
+/// Like [`humanize_api_error`] but surfaces a known rate-limit reset time in
+/// the 429 message so the failure is honest rather than cryptic.
+/// `reset_hint` is a human-readable duration string, e.g. `"47s"`.
+pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option<&str>) -> String {
     // Pull the server's message out of the JSON envelope if present.
     let api_msg = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -42,7 +49,17 @@ pub fn humanize_api_error(status: u16, body: &str) -> String {
 
     match status {
         529 => "Anthropic is overloaded right now. Retries exhausted — wait a minute and try again.".to_string(),
-        429 => format!("Rate limited by Anthropic ({}). Wait for the limit to reset, or switch models with /model.", detail),
+        429 => {
+            if let Some(reset) = reset_hint {
+                format!(
+                    "Rate limit exhausted — retries used up while waiting for reset (next window in {}). \
+                     Try again shortly, or switch models with /model. ({})",
+                    reset, detail
+                )
+            } else {
+                format!("Rate limited by Anthropic ({}). Wait for the limit to reset, or switch models with /model.", detail)
+            }
+        }
         401 => "Authentication rejected. Run `synaps login` to re-authenticate, or check ANTHROPIC_API_KEY.".to_string(),
         403 => format!("Access denied ({}). Your account may not have access to this model.", detail),
         404 => format!("Model or endpoint not found ({}). Check the model name with /model.", detail),
