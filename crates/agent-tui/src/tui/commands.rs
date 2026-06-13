@@ -1,6 +1,6 @@
 //! Slash command handling — dispatches /clear, /model, /system, etc.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use chrono;
 use synaps_cli::{Runtime, Session, list_sessions, resolve_session};
@@ -191,7 +191,7 @@ pub(crate) async fn execute_interactive_plugin_command_by_parts(
                     app.push_msg(msg);
                 }
             }
-            InvokeCommandEvent::Task(task) => app.active_tasks.apply(task),
+            InvokeCommandEvent::Task(task) => std::sync::Arc::make_mut(&mut app.active_tasks).apply(task),
         }
     }
 
@@ -299,7 +299,7 @@ pub(super) async fn handle_command(
     arg: &str,
     app: &mut App,
     runtime: &mut Runtime,
-    system_prompt_path: &PathBuf,
+    system_prompt_path: &Path,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> CommandAction {

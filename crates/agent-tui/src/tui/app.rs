@@ -164,7 +164,8 @@ pub(crate) struct App {
     /// multiple plugin-claimed sidecars can be hosted concurrently.
     pub(crate) sidecars: std::collections::HashMap<String, super::sidecar::SidecarUiState>,
     /// Generic extension-provided active tasks rendered in the sticky progress area.
-    pub(crate) active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks,
+    /// Stored behind `Arc` so the per-frame snapshot is a refcount bump, not a deep clone.
+    pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
     /// Overlay toast provider used by core and extension-adjacent features.
     pub(crate) toasts: super::toast::ToastProvider,
     /// Channel for async extension loader progress events.
@@ -262,7 +263,7 @@ impl App {
             visible_line_range: None,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
-            active_tasks: synaps_cli::extensions::active_tasks::ActiveTasks::new(),
+            active_tasks: std::sync::Arc::new(synaps_cli::extensions::active_tasks::ActiveTasks::new()),
             toasts: super::toast::ToastProvider::new(),
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
