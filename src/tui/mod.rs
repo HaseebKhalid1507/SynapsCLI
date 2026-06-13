@@ -174,7 +174,8 @@ pub async fn run(
             // primary reason the process survived indefinitely after PTY close.
             if let Err(e) = draw(&mut terminal, &mut app, &runtime, &mut boot_fx, &mut exit_fx, elapsed, &registry, &secret_prompts) {
                 tracing::warn!(err = %e, "terminal write failed — PTY likely closed, exiting");
-                lifecycle::teardown_terminal(&mut terminal);
+                // PART 3: don't teardown here — fall through to the unified bounded-teardown
+                // path below the loop, which saves the session and exits cleanly (rc=0).
                 break;
             }
         }
@@ -192,7 +193,7 @@ pub async fn run(
                     match signals::shutdown_action(signal) {
                         ShutdownAction::ImmediateExit => {
                             tracing::info!("immediate exit on {:?}", signal);
-                            lifecycle::teardown_terminal(&mut terminal);
+                            // Fall through to unified bounded-teardown below the loop.
                             break;
                         }
                         ShutdownAction::AnimatedExit => {
@@ -1846,20 +1847,41 @@ pub async fn run(
         }
     }
 
-    // Save session on exit
-    app.save_session().await;
-
-    // ═══ HOOK: on_session_end ═══
+    // ── PART 2: Bounded teardown — must complete within 3s; otherwise hard-exit.
+    //
+    // save_session() and hook_bus().emit() are unbounded awaits that can hang
+    // when extensions misbehave or the runtime is in a degraded state.  Wrap
+    // them in a single timeout so the process ALWAYS exits within ~3s of
+    // deciding to shut down.
     {
-        let mut index_record = SessionIndexRecord::end(&app.session.id);
-        index_record.turns = Some(app.api_messages.len());
-        if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
-            tracing::warn!("failed to append session end index record: {}", err);
-        }
+        let session_id   = app.session.id.clone();
+        let api_messages = app.api_messages.clone();
+        let teardown_fut = async {
+            app.save_session().await;
 
-        let transcript = Some(app.api_messages.clone());
-        let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&app.session.id, transcript);
-        let _ = runtime.hook_bus().emit(&hook_event).await;
+            // ═══ HOOK: on_session_end ═══
+            let mut index_record = SessionIndexRecord::end(&session_id);
+            index_record.turns = Some(api_messages.len());
+            if let Err(err) = synaps_cli::core::session_index::append_record(&index_record) {
+                tracing::warn!("failed to append session end index record: {}", err);
+            }
+            let transcript = Some(api_messages);
+            let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
+                &session_id, transcript,
+            );
+            let _ = runtime.hook_bus().emit(&hook_event).await;
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_secs(3), teardown_fut).await {
+            Ok(()) => {
+                tracing::debug!("clean teardown completed");
+            }
+            Err(_elapsed) => {
+                tracing::warn!("teardown timed out after 3s — forcing exit");
+                lifecycle::emergency_teardown_terminal();
+                std::process::exit(0);
+            }
+        }
     }
 
     // Let extension shutdown continue in the background; exit should not hang on
@@ -1867,12 +1889,17 @@ pub async fn run(
     let _extension_shutdown = synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
         std::sync::Arc::clone(&ext_mgr_shared),
     );
-    shutdown_signal_task.abort();
+    // Stop the signal-listener thread (signal-hook handle, not a JoinHandle).
+    shutdown_signal_task.close();
 
     // Shut down background tasks (inbox watcher, socket, session registry)
     background.shutdown();
 
     teardown_terminal(&mut terminal);
+    // Prevent ratatui's Drop impl from calling show_cursor() + eprintln! on a
+    // dead PTY (which would panic and exit rc=101).  We have already done full
+    // teardown above; forgetting the Terminal is safe here.
+    std::mem::forget(terminal);
 
     Ok(())
 }

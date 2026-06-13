@@ -47,6 +47,7 @@ fs4 = "0.13"
 toml = "0.8"
 notify = "6.1"
 globset = "0.4"
+signal-hook = { version = "0.3", features = ["iterator"] }
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
