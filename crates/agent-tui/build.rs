@@ -55,7 +55,7 @@ fn synaps_repo_hash() -> Option<String> {
         .filter(|s| !s.is_empty())?;
 
     let dirty = Command::new("git")
-        .args(["-C", &manifest, "status", "--porcelain"])
+        .args(["-C", &manifest, "status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())
