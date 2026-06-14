@@ -4,6 +4,10 @@ use chrono::Local;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 
+/// Sentinel placeholder pushed into a `Thinking` block while the model is
+/// deciding whether to think. Using ellipsis + zero-width space makes it
+/// visually identical to "…" but never equal to real model output.
+pub(crate) const THINKING_PLACEHOLDER: &str = "\u{2026}\u{200B}";
 
 #[derive(Clone)]
 pub(crate) enum ChatMessage {
@@ -453,7 +457,49 @@ impl App {
         self.invalidate();
     }
 
-    /// Cap the rendered scrollback after resuming a session.
+    /// Insert a freshly created `ToolResult` directly beneath its matching
+    /// `ToolUse` / `ToolUseStart` block (matched by `tool_id`) so parallel tool
+    /// calls render as **input → its output** pairs, instead of all inputs
+    /// stacked then all outputs stacked. Falls back to appending at the end
+    /// when no matching tool_use exists (legacy providers without tool_ids).
+    pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
+        let use_idx = if tool_id.is_empty() {
+            None
+        } else {
+            // Invariant: each tool_id should appear at most once. Assert in
+            // debug builds so duplicate IDs surface immediately.
+            debug_assert!(
+                self.messages.iter().filter(|m| matches!(
+                    &m.msg,
+                    ChatMessage::ToolUse { tool_id: tid, .. }
+                    | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                        if tid == &tool_id
+                )).count() <= 1,
+                "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
+            );
+            self.messages.iter().position(|m| matches!(
+                &m.msg,
+                ChatMessage::ToolUse { tool_id: tid, .. }
+                | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                    if tid == &tool_id
+            ))
+        };
+        let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
+        match use_idx {
+            Some(i) => {
+                let at = (i + 1).min(self.messages.len());
+                self.messages.insert(at, TimestampedMsg {
+                    msg,
+                    time: Local::now().format("%H:%M").to_string(),
+                });
+                if self.scroll_pinned {
+                    self.scroll_back = 0;
+                }
+                self.invalidate();
+            }
+            None => self.push_msg(msg),
+        }
+    }
     ///
     /// `render_lines` markdown-renders + syntax-highlights EVERY display message
     /// on the first frame. On `--continue` of a long session (hundreds of
@@ -508,7 +554,7 @@ impl App {
 
     fn render_lines_uses_spinner(&self) -> bool {
         self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
-            ChatMessage::Thinking(text) => text == "…",
+            ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
             ChatMessage::ToolUseStart { .. } => true,
             ChatMessage::ToolUse { .. } => {
                 idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
@@ -533,9 +579,15 @@ impl App {
     /// being streamed/executed. Completed historical tool results must render as
     /// done even while a later tool call is active.
     pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
-        self.tool_start_time.is_some()
-            && idx == self.messages.len().saturating_sub(1)
-            && matches!(self.messages.get(idx).map(|m| &m.msg), Some(ChatMessage::ToolResult { elapsed_ms: None, .. }))
+        if self.tool_start_time.is_none() {
+            return false;
+        }
+        match self.messages.get(idx).map(|m| &m.msg) {
+            Some(ChatMessage::ToolResult { tool_id, elapsed_ms: None, .. }) => {
+                self.tool_start_times.contains_key(tool_id)
+            }
+            _ => false,
+        }
     }
 
     /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
@@ -648,6 +700,7 @@ impl App {
     /// Begin streaming a new tool call. Records start time per-tool so
     /// elapsed-ms is correct under parallel execution.
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
+        self.drop_empty_thinking();
         let now = std::time::Instant::now();
         self.tool_start_time = Some(now);
         if !tool_id.is_empty() {
@@ -681,6 +734,7 @@ impl App {
     /// `ToolUseStart` in place — keeping its position so on-screen order
     /// matches the order the model emitted the calls.
     pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
+        self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
         if !tool_id.is_empty() {
@@ -710,7 +764,7 @@ impl App {
                 }
             }
         }
-        self.push_msg(ChatMessage::ToolResult { tool_id, content: delta, elapsed_ms: None });
+        self.push_tool_result(tool_id, delta, None);
     }
 
     /// Finalize a tool result. Replaces any in-flight `ToolResult` for
@@ -741,7 +795,7 @@ impl App {
                 }
             }
         }
-        self.push_msg(ChatMessage::ToolResult { tool_id, content: result, elapsed_ms: elapsed });
+        self.push_tool_result(tool_id, result, elapsed);
     }
 
     /// Capture all assistant output since the last user message as abort context.
@@ -915,6 +969,9 @@ impl App {
     }
 
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
+        // Model produced real output — clear any empty thinking placeholder
+        // so its spinner stops.
+        self.drop_empty_thinking();
         if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.messages.last_mut() {
             existing.push_str(text);
         } else {
@@ -925,16 +982,47 @@ impl App {
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
         if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.messages.last_mut() {
-            existing.push_str(text);
+            // First real delta replaces the sentinel placeholder rather than
+            // appending to it (otherwise content reads "…​<thinking>").
+            if existing == THINKING_PLACEHOLDER {
+                *existing = text.to_string();
+            } else {
+                existing.push_str(text);
+            }
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
         }
         self.invalidate();
     }
 
+    /// Remove a trailing thinking block that never received content — the
+    /// sentinel placeholder, or one left empty. Called when the model starts
+    /// producing real output or the turn ends, so the thinking spinner can't
+    /// run forever on an empty thinking step.
+    ///
+    /// Scans backward past trailing System/Notice messages so a placeholder
+    /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
+    /// found and removed (FIX 4).
+    pub(crate) fn drop_empty_thinking(&mut self) {
+        // Walk from the tail, skipping System messages, to find the first
+        // non-System message. If it's an empty/placeholder Thinking, drop it.
+        let candidate_idx = self.messages.iter().rposition(|m| {
+            !matches!(&m.msg, ChatMessage::System(_))
+        });
+        if let Some(idx) = candidate_idx {
+            if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
+                if t == THINKING_PLACEHOLDER || t.is_empty() {
+                    self.messages.remove(idx);
+                    self.invalidate();
+                }
+            }
+        }
+    }
+
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {
         let descriptions: &[(&str, &str)] = &[
             ("default",        "cool teal on dark blue-gray"),
+            ("night-city",     "premium neon-noir — cyberpunk/blade runner"),
             ("neon-rain",      "cyberpunk hot pink + cyan"),
             ("amber",          "warm CRT retro terminal"),
             ("phosphor",       "green monochrome CRT"),
@@ -1014,6 +1102,107 @@ mod tests {
     }
 
     #[test]
+    fn empty_thinking_placeholder_is_dropped_when_agent_moves_on() {
+        // Spinner is driven by a Thinking(THINKING_PLACEHOLDER) block. If thinking stays
+        // empty, producing text/tools must remove it so the spinner stops.
+        let mut app = test_app();
+
+        // Case 1: text follows empty thinking.
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        assert!(app.render_lines_uses_spinner(), "placeholder should animate while present");
+        app.append_or_update_text("here is the answer");
+        assert!(
+            !matches!(app.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            "empty thinking must be gone once text arrives"
+        );
+        assert!(!app.render_lines_uses_spinner(), "spinner must stop after agent moves on");
+
+        // Case 2: a tool follows empty thinking.
+        let mut app = test_app();
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        app.on_tool_use_start("t1".to_string(), "bash".to_string());
+        let thinking_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
+            .count();
+        assert_eq!(thinking_count, 0, "empty thinking must be gone once a tool runs");
+
+        // Case 3: real thinking content is preserved.
+        let mut app = test_app();
+
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        app.append_or_update_thinking("actually reasoning");
+        app.append_or_update_text("done");
+        assert!(
+            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            "non-empty thinking must survive and not keep the … prefix"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_pair_with_their_inputs() {
+        let mut app = test_app();
+        // Model fans out four tool calls — all inputs arrive first.
+        for id in ["t1", "t2", "t3", "t4"] {
+            app.on_tool_use_finalized(id.to_string(), "bash".to_string(), "{}".to_string());
+        }
+        // Results return out of completion order; each must slot under its input.
+        for id in ["t2", "t1", "t4", "t3"] {
+            app.on_tool_result(id.to_string(), format!("out-{id}"));
+        }
+        let seq: Vec<(String, bool)> = app
+            .messages
+            .iter()
+            .filter_map(|m| match &m.msg {
+                ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
+                ChatMessage::ToolResult { tool_id, .. } => Some((tool_id.clone(), true)),
+                _ => None,
+            })
+            .collect();
+        let expected = vec![
+            ("t1".to_string(), false), ("t1".to_string(), true),
+            ("t2".to_string(), false), ("t2".to_string(), true),
+            ("t3".to_string(), false), ("t3".to_string(), true),
+            ("t4".to_string(), false), ("t4".to_string(), true),
+        ];
+        assert_eq!(seq, expected, "parallel tool calls must render as input→output pairs");
+    }
+
+    #[test]
+    fn tool_block_has_gutter_and_background() {
+        let mut app = test_app();
+        app.on_tool_use_finalized("t1".to_string(), "bash".to_string(), "{}".to_string());
+        app.on_tool_result("t1".to_string(), "hello\nworld".to_string());
+        let lines = app.render_lines(80);
+        // No borders / shade glyphs.
+        for l in &lines {
+            let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            assert!(
+                !s.chars().any(|c| matches!(c,
+                    '\u{256D}' | '\u{256E}' | '\u{2570}' | '\u{256F}' | '\u{2502}'
+                    | '\u{2591}' | '\u{2592}' | '\u{2593}')),
+                "no borders or shade glyphs: {s:?}"
+            );
+        }
+        // Panel lines carry a gutter bar ▎ and a unified background.
+        let panel_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{258E}')))
+            .expect("a panel line with a gutter");
+        assert!(
+            panel_line.spans.iter().any(|s| s.style.bg.is_some()),
+            "panel cells (incl. text) must share a background"
+        );
+        // The inset left margin stays transparent.
+        if let Some(first) = panel_line.spans.first() {
+            if !first.content.is_empty() && first.content.chars().all(|c| c == ' ') {
+                assert!(first.style.bg.is_none(), "left margin must stay transparent");
+            }
+        }
+    }
+
+    #[test]
     fn active_tool_result_is_only_latest_incomplete_result() {
         let mut app = test_app();
         app.push_msg(ChatMessage::ToolUse {
@@ -1036,10 +1225,40 @@ mod tests {
             content: "second output".to_string(),
             elapsed_ms: None,
         });
+        // Only call_2 is still in tool_start_times (call_1 is done)
         app.tool_start_time = Some(std::time::Instant::now());
+        app.tool_start_times.insert("call_2".to_string(), std::time::Instant::now());
 
-        assert!(!app.is_active_tool_result(1), "completed historical result must render done while later tool runs");
-        assert!(app.is_active_tool_result(3), "latest incomplete result is the actively running tool result");
+        assert!(!app.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
+        assert!(app.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
+
+        // Bonus: with BOTH in-flight (parallel), BOTH must be active
+        let mut app2 = test_app();
+        app2.push_msg(ChatMessage::ToolUse {
+            tool_id: "p1".to_string(),
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app2.push_msg(ChatMessage::ToolResult {
+            tool_id: "p1".to_string(),
+            content: "".to_string(),
+            elapsed_ms: None,
+        });
+        app2.push_msg(ChatMessage::ToolUse {
+            tool_id: "p2".to_string(),
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app2.push_msg(ChatMessage::ToolResult {
+            tool_id: "p2".to_string(),
+            content: "".to_string(),
+            elapsed_ms: None,
+        });
+        app2.tool_start_time = Some(std::time::Instant::now());
+        app2.tool_start_times.insert("p1".to_string(), std::time::Instant::now());
+        app2.tool_start_times.insert("p2".to_string(), std::time::Instant::now());
+        assert!(app2.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
+        assert!(app2.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
 
     #[test]
@@ -1096,6 +1315,7 @@ mod tests {
             elapsed_ms: None,
         });
         app.tool_start_time = Some(std::time::Instant::now());
+        app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
         app.line_cache = Some((80, app.render_lines(80)));
         app.spinner_frame = 2;
 
@@ -1373,5 +1593,55 @@ mod tests {
         });
         assert!(a_elapsed.is_some(), "call_a must record elapsed_ms from its own start_time");
         assert!(b_elapsed.is_some(), "call_b must record elapsed_ms from its own start_time");
+    }
+
+    // ── FIX 9 regression tests ───────────────────────────────────────────────
+
+    /// Test A: a REAL "…" (plain ellipsis) in model output must survive — only
+    /// the sentinel THINKING_PLACEHOLDER (ellipsis + ZWSP) triggers the drop.
+    #[test]
+    fn real_ellipsis_thinking_content_is_not_dropped() {
+        let mut app = test_app();
+        // Push the sentinel placeholder (what the stream start inserts)
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        // First delta is a plain "…" (model literally output ellipsis)
+        app.append_or_update_thinking("…");
+        // More text follows
+        app.append_or_update_text("answer");
+        // The Thinking block must survive with "…" content, not be dropped
+        assert!(
+            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
+            "real ellipsis thinking content must survive — sentinel and real output are distinct"
+        );
+    }
+
+    /// Test B: THINKING_PLACEHOLDER stranded by a System/Notice message on top
+    /// must be cleaned up by drop_empty_thinking.
+    #[test]
+    fn placeholder_stranded_by_system_message_is_dropped() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        // A Notice arrives on top (as happens in stream_handler::SessionEvent::Notice)
+        app.push_msg(ChatMessage::System("retrying…".to_string()));
+        // Now trigger the drop (e.g. text arrives / turn ends)
+        app.drop_empty_thinking();
+        let has_placeholder = app.messages.iter().any(|m| matches!(
+            &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
+        ));
+        assert!(!has_placeholder, "placeholder stranded under a System message must be removed by drop_empty_thinking");
+    }
+
+    /// Test C: aborting a stream must not leave a frozen placeholder spinner.
+    #[test]
+    fn abort_path_clears_thinking_placeholder() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+        // Simulate what the abort handler does: drop + push error
+        app.drop_empty_thinking();
+        app.push_msg(ChatMessage::Error("aborted".to_string()));
+        let has_placeholder = app.messages.iter().any(|m| matches!(
+            &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
+        ));
+        assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
     }
 }
