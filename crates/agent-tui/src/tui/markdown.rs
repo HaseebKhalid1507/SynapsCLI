@@ -433,7 +433,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
 
                 // Calculate block width: use a reasonable portion of available width
                 let block_inner_width = width.saturating_sub(UnicodeWidthStr::width(prefix) + 4); // prefix + "  " + borders
-                let rule_width = block_inner_width.min(60).max(20);
+                let rule_width = block_inner_width.clamp(20, 60);
 
                 // Top rule with optional language tag
                 lines.push(Line::from("")); // breathing room above code block

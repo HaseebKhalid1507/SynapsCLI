@@ -116,32 +116,29 @@ pub(super) async fn execute_command_action(
     app: &mut App,
     runtime: &Runtime,
 ) {
-    match action {
-        CommandAction::PluginCommand { command, arg } => {
-            match synaps_cli::skills::commands::execute_plugin_command_with_tools(
-                &command,
-                &arg,
-                runtime.tools_shared(),
-            ).await {
-                Ok(output) => {
-                    let mut lines = vec![format!(
-                        "plugin command /{}:{} exited with {}",
-                        command.plugin,
-                        command.name,
-                        output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
-                    )];
-                    if !output.stdout.trim().is_empty() {
-                        lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
-                    }
-                    if !output.stderr.trim().is_empty() {
-                        lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
-                    }
-                    app.push_msg(ChatMessage::System(lines.join("\n")));
+    if let CommandAction::PluginCommand { command, arg } = action {
+        match synaps_cli::skills::commands::execute_plugin_command_with_tools(
+            &command,
+            &arg,
+            runtime.tools_shared(),
+        ).await {
+            Ok(output) => {
+                let mut lines = vec![format!(
+                    "plugin command /{}:{} exited with {}",
+                    command.plugin,
+                    command.name,
+                    output.status.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                )];
+                if !output.stdout.trim().is_empty() {
+                    lines.push(format!("stdout:\n{}", output.stdout.trim_end()));
                 }
-                Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
+                if !output.stderr.trim().is_empty() {
+                    lines.push(format!("stderr:\n{}", output.stderr.trim_end()));
+                }
+                app.push_msg(ChatMessage::System(lines.join("\n")));
             }
+            Err(e) => app.push_msg(ChatMessage::Error(format!("plugin command failed: {}", e))),
         }
-        _ => {}
     }
 }
 

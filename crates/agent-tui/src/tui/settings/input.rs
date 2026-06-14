@@ -358,7 +358,7 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         *error = Some("must be a number".to_string());
                         return InputOutcome::None;
                     }
-                    InputOutcome::Apply { key: *setting_key, value: buffer.clone() }
+                    InputOutcome::Apply { key: setting_key, value: buffer.clone() }
                 }
                 KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
                 KeyCode::Char(c) => {

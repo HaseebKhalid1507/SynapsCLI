@@ -579,7 +579,7 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(format!("{}  {} ", m, icon), Style::default().fg(sev_color).bg(event_bg)),
                         Span::styled(format!("[{}]", source), Style::default().fg(theme.event_source).bg(event_bg).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("{}", " ".repeat(gap)), Style::default().bg(event_bg)),
+                        Span::styled(" ".repeat(gap).to_string(), Style::default().bg(event_bg)),
                         Span::styled(ts_str, Style::default().fg(theme.muted).bg(event_bg)),
                     ]));
                     // Content
