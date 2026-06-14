@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-06-14
+
+### Fixed
+- **Shell installer failed on systems without `xz`** — release tarballs shipped only as `.tar.xz`, but minimal environments (slim containers, bare CI images) lack `xz`/`xz-utils`, so extraction died with `xz: Cannot exec`. Release archives are now `.tar.gz` (gzip is universal), and the generated installer extracts with `tar xzf`.
+- **`/gamba` did nothing on `.deb` installs** — the Debian package shipped only `/usr/bin/synaps`, omitting the `hidden` companion binary, so the casino command hit its "nothing here" path. The `.deb` now ships both binaries (parity with the tarball, Homebrew, and crates.io channels).
+
 ## [0.3.4] — 2026-06-14
 
 ### Performance
