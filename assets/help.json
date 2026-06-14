@@ -504,6 +504,26 @@
     "related": ["/help doctor", "/help models"]
   },
   {
+    "id": "stats-command",
+    "command": "/stats",
+    "title": "Session stats",
+    "summary": "Print a session receipt: tokens, cost, cache hit-rate, and savings.",
+    "category": "Diagnostics",
+    "topic": "Command",
+    "protected": true,
+    "common": true,
+    "aliases": [],
+    "keywords": ["stats", "tokens", "cost", "cache", "usage", "savings"],
+    "lines": [
+      "/stats shows a formatted session receipt with:",
+      "  - session ID, model, duration, turn count",
+      "  - token totals (input, output, cache read/write + 5m/1h split)",
+      "  - cache hit-rate % and dollar savings vs uncached",
+      "  - total session cost"
+    ],
+    "related": ["/help status", "/help ping"]
+  },
+  {
     "id": "quit-command",
     "command": "/quit",
     "title": "Quit",

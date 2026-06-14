@@ -157,6 +157,8 @@ async fn spawn_prompt(
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
             model: None,
         };
 
@@ -325,7 +327,7 @@ async fn handle_compact(
 
     // 2. Long-running LLM call — no lock held.
     let summary_result =
-        synaps_cli::core::compaction::compact_conversation(&msgs, &runtime, None).await;
+        synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None).await;
 
     match summary_result {
         Ok(summary) => {

@@ -1,0 +1,87 @@
+[package]
+name = "agent-engine"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
+license = "Apache-2.0"
+
+[lib]
+name = "agent_engine"
+path = "src/lib.rs"
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+
+# Async runtime + utilities
+tokio              = { version = "1.0", features = ["full"] }
+tokio-util         = "0.7"
+tokio-stream       = "0.1"
+futures            = "0.3"
+async-trait        = "0.1.89"
+
+# HTTP / SSE / networking
+reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+bytes              = "1"
+memchr             = "2"
+
+# Serialisation
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+toml               = "0.8"
+
+# Tracing / logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
+
+# Identifiers / time
+uuid               = { version = "1.0", features = ["v4"] }
+chrono             = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror          = "1.0"
+anyhow             = "1.0"
+
+# Regex / text
+regex              = "1"
+
+# Crypto / auth
+sha2               = "0.10"
+rand               = "0.9"
+base64             = "0.22"
+
+# URL handling
+url                = "2"
+urlencoding        = "2"
+
+# File / system
+dirs               = "5"
+fs4                = "0.13"
+notify             = "6.1"
+globset            = "0.4"
+libc               = "0.2"
+zeroize            = "1.8.2"
+tempfile           = "3"
+
+# Signals / process
+signal-hook        = { version = "0.3", features = ["iterator"] }
+
+# PTY / shell
+portable-pty       = "0.9"
+
+# Terminal (skills/keybinds use crossterm)
+crossterm          = { version = "0.28", features = ["event-stream"] }
+
+# Server
+axum               = { version = "0.7", features = ["ws"] }
+tower              = "0.4"
+tower-http         = { version = "0.5", features = ["cors"] }
+tokio-tungstenite  = "0.21"
+
+# Misc
+arc-swap           = "1"
+
+[dev-dependencies]
+serial_test = "3.4.0"
+tempfile    = "3"

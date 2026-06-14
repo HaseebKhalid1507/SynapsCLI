@@ -17,7 +17,7 @@
 
 use clap::{Parser, Subcommand};
 
-mod tui;
+use synaps_cli::tui;
 mod watcher;
 mod cmd;
 

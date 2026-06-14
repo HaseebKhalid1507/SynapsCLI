@@ -122,9 +122,19 @@ Events intentionally **not** forwarded: `ToolResultDelta` (no wire variant),
   "output_tokens": 567,
   "cache_read_input_tokens": 0,
   "cache_creation_input_tokens": 0,
+  "cache_creation_5m": 0,
+  "cache_creation_1h": 0,
   "model": "claude-opus-4-5"
 }
 ```
+
+`cache_creation_5m` / `cache_creation_1h` split `cache_creation_input_tokens`
+by cache-write TTL (5-minute vs 1-hour; see the `cache_ttl` config key). Both
+are **optional** and **skipped entirely when unknown** — they appear only when
+the API reported a `cache_creation` sub-object (Anthropic native path). When
+absent, consumers must not assume a split; bill aggregate writes at the 5m
+rate. When turns are accumulated, each field is `null`/absent only if it was
+never reported; otherwise it is the sum of the reported values.
 
 ---
 

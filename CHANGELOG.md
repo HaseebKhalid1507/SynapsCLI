@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-13
+
+### Added
+- **Workspace architecture split (A3)** — the monolith is now three library crates (`agent-core`, `agent-engine`, `agent-tui`) behind the `synaps` binary. Cleaner boundaries, faster incremental builds, independent test surfaces. No user-facing CLI changes.
+- **Dedicated render thread** — the terminal is driven from its own thread off an immutable `RenderModel` snapshot, decoupling draw latency from the event loop and closing a class of resize/teardown races. The signal watchdog is retired now that rendering is isolated.
+- **`/stats` command** — per-session token + cost receipt with a cache-split footer.
+- **`/context` command** — inspect live context-window usage.
+- **Configurable prompt-cache TTL (`cache_ttl` config key)** — `5m` (default, unchanged behavior), `1h`, or `hybrid` (1h on the stable tools/system prefix, 5m on the per-turn message tail). Long-gap sessions (> 5 min between turns) can keep their cache warm instead of paying full input price every turn. Invalid values fall back to 5m with a boot warning. Spec: `docs/specs/cache-ttl-spec.md` (v4)
+  - Pricing is TTL-aware: 1h cache writes billed at 2.0× input (5m stays 1.25×); when the API reports no 5m/1h split, aggregate writes are billed at the 5m rate (fail-cheap)
+  - `extended-cache-ttl-2025-04-11` beta header sent only on API-key auth — 1h is live-verified working bare over OAuth, whose beta set is left untouched
+  - Silent-downgrade detector: if 1h is configured but the account never honors it, a one-time-per-session notice fires; the configured mode is never auto-flipped
+  - RPC protocol: `agent_end.usage` gains optional `cache_creation_5m` / `cache_creation_1h` fields (omitted when unknown — additive, existing consumers unaffected); same split flows through server-mode `Usage` messages and subagent aggregation
+- **`/model <name>` and `/thinking` persist to config** — in-session changes survive restarts.
+- **Paste while streaming** — input can be pasted mid-turn without dropping characters.
+- **Build commit in the TUI header** — the version now shows the exact git commit the binary was built from (e.g. `v0.3.0 · 88e08e0`), with a `-dirty` marker for builds from a modified tree.
+
+### Changed
+- **Honest billing** — reported cost now reflects exactly one Usage event per request and TTL-aware cache-write pricing. Figures will differ from 0.2.1 (more accurate, not more expensive).
+- **Signal shutdown overhaul** — SIGINT/SIGTERM handling rebuilt around the real root causes: clean teardown ordering, bounded budgets, and no watchdog.
+
+### Fixed
+- **The "stopping" bug (#130)** — in large conversations the agent could silently end a turn after running tools, never landing the synthesizing reply. Anthropic delivers some failures (e.g. `overloaded_error`) as an in-stream `error` event under a 200 response; the SSE parser had no `error` arm and dropped it, leaving an empty stream that was treated as a clean end-of-turn. The parser now surfaces these as visible, actionable errors; an empty model response is never swallowed; and the retry budget is unified so HTTP 5xx, transport drops, and in-stream errors all draw from one policy (429 keeps its dedicated budget). Prompt caching is unaffected — retries re-send the byte-identical request, hitting cache.
+- **Cache-TTL usage split was read from the wrong SSE event** — live `message_delta` frames carry only the aggregate; the 5m/1h breakdown arrives on `message_start`. The split is now captured at `message_start` with a delta-arm fallback, restoring telemetry split keys, the downgrade detector, and correct 1h write pricing in streaming sessions.
+- **Signal delivery + shutdown** — busy-loop and unkillable-process on a dead PTY fixed (three-layer); SIGINT clean-exit path restored.
+- **Toast renderer panic** on small-terminal resize (`min > max`).
+- **Idle logo gradient** frozen until the first keystroke.
+- **Retry backoff** is now header-aware (honours `retry-after`/reset) with a higher 429 budget.
+- **`/model`, `/thinking`, `/compact` side effects** now run on the live engine dispatch path.
+- **Server-mode clients** now receive `Notice` events.
+
+### Performance
+- **Boot:** `--continue` no longer parses every session file (~11s → ~1s); the skills fs-walk moved off the async runtime; `plugins.json` read hoisted out of the extension-load loop.
+- **Sessions:** `/sessions` reads headers + recent-only instead of parsing 76MB; `save_chain`'s 76MB collision scan dropped.
+- **Runtime:** request body serialized once across retries; `sanitize_thinking_blocks` O(N²) → single tail pass.
+- **TUI:** dirty-checked widget events killed the ~30% idle CPU burn (#119); heavy `App` structures Arc-projected; `/extensions` audit bounded to a tail read.
+
 ## [0.2.1] — 2026-06-12
 
 ### Fixed

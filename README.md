@@ -185,6 +185,7 @@ thinking = high
 theme = neon-rain
 context_window = 200k
 identity = You are a senior engineer who writes clean, tested code.
+cache_ttl = hybrid          # prompt-cache TTL: 5m (default) | 1h | hybrid
 
 provider.groq = gsk_...
 provider.cerebras = csk-...
