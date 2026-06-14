@@ -754,29 +754,26 @@ impl App {
         for tmsg in self.messages.iter().rev() {
             match &tmsg.msg {
                 ChatMessage::User(_) => break, // stop at the last user message
-                ChatMessage::Thinking(t) => {
-                    if !t.is_empty() {
+                ChatMessage::Thinking(t)
+                    if !t.is_empty() => {
                         // Truncate thinking to avoid bloating context
                         let preview: String = t.chars().take(500).collect();
                         parts.push(format!("[thinking]: {}", preview));
                     }
-                }
-                ChatMessage::Text(t) => {
-                    if !t.is_empty() {
+                ChatMessage::Text(t)
+                    if !t.is_empty() => {
                         parts.push(format!("[response]: {}", t));
                     }
-                }
                 ChatMessage::ToolUse { tool_name, input, .. } => {
                     // Truncate input to keep context lean
                     let input_preview: String = input.chars().take(200).collect();
                     parts.push(format!("[tool_use]: {} — {}", tool_name, input_preview));
                 }
-                ChatMessage::ToolResult { content, .. } => {
-                    if !content.is_empty() {
+                ChatMessage::ToolResult { content, .. }
+                    if !content.is_empty() => {
                         let preview: String = content.chars().take(300).collect();
                         parts.push(format!("[tool_result]: {}", preview));
                     }
-                }
                 _ => {}
             }
         }
@@ -985,7 +982,7 @@ impl App {
                 match synaps_cli::config::write_config_value("theme", name) {
                     Ok(_) => {
                         let new_theme = super::theme::load_theme_by_name(name)
-                            .unwrap_or_else(super::theme::Theme::default);
+                            .unwrap_or_default();
                         super::theme::set_theme(new_theme);
                         self.push_msg(ChatMessage::System(
                             format!("Theme applied: {}", name)

@@ -558,6 +558,7 @@ fn summarize_plugin_dir(path: &std::path::Path) -> Vec<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_installed_plugin(
     state: &mut PluginsModalState,
     plugin_name: String,
@@ -604,6 +605,7 @@ fn expected_update_checksum(state: &PluginsState, installed: &InstalledPlugin) -
 ///   modal renders an animated gauge.
 /// - `state.pending_install` holds the JoinHandle and the metadata we
 ///   need to resume the install pipeline once the clone finishes.
+#[allow(clippy::too_many_arguments)]
 fn run_install_flow(
     state: &mut PluginsModalState,
     plugin_name: String,

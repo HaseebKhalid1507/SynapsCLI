@@ -276,11 +276,10 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputActi
         }
 
         // Left-drag extends the selection
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if app.selection_anchor.is_some() {
+        MouseEventKind::Drag(MouseButton::Left)
+            if app.selection_anchor.is_some() => {
                 app.selection_end = Some((mouse.column, mouse.row));
             }
-        }
 
         // Left-release finalizes the selection
         MouseEventKind::Up(MouseButton::Left) => {

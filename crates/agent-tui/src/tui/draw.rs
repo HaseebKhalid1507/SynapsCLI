@@ -128,7 +128,7 @@ mod sidecar_pill_tests {
         for (cw, lc, aw, ah) in cases {
             let (w, h) = toast_dims(cw, lc, aw, ah); // must not panic
             assert!(w >= 1, "width {w} too small for area {aw}x{ah}");
-            assert!(w <= aw.min(64).max(1), "width {w} exceeds area {aw}");
+            assert!(w <= aw.clamp(1, 64), "width {w} exceeds area {aw}");
             assert!(h >= 1, "height {h} too small for area {aw}x{ah}");
             assert!(h <= ah.max(1), "height {h} exceeds area {ah}");
         }
@@ -565,8 +565,8 @@ pub(crate) fn build_render_model(
             if prefix_matches.len() == 1 {
                 let cmd = prefix_matches[0];
                 if cmd.as_str() != partial {
-                    let ghost_text = if cmd.starts_with(partial) {
-                        cmd[partial.len()..].to_string()
+                    let ghost_text = if let Some(rest) = cmd.strip_prefix(partial) {
+                        rest.to_string()
                     } else {
                         format!(" → /{}", cmd)
                     };
@@ -1477,7 +1477,7 @@ pub(crate) fn render_frame(
         // ── Secret prompt modal ───────────────────────────────────────────────
         if let Some(ref prompt) = model.secret_prompt {
             let area = frame.area();
-            let width = area.width.min(62).max(30);
+            let width = area.width.clamp(30, 62);
             let height = 7u16;
             let x = area.x + area.width.saturating_sub(width) / 2;
             let y = area.y + area.height.saturating_sub(height) / 2;
@@ -1548,7 +1548,7 @@ pub(crate) fn render_frame(
 /// to panic (`min > max`) when a tmux pane was resized smaller than the minimum.
 /// On a cramped terminal the toast simply renders smaller instead of crashing.
 fn toast_dims(content_width: u16, line_count: usize, area_w: u16, area_h: u16) -> (u16, u16) {
-    let max_w = area_w.min(64).max(1);
+    let max_w = area_w.clamp(1, 64);
     let width = content_width.saturating_add(4).clamp(18u16.min(max_w), max_w);
     let max_h = area_h.max(1);
     let height = (line_count as u16).saturating_add(2).clamp(3u16.min(max_h), max_h);

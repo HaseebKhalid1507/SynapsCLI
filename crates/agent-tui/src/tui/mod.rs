@@ -419,11 +419,10 @@ pub async fn run(
                     app.invalidate();
                 }
                 let message_animation_needs_clear = app.needs_clear_for_animation_redraw();
-                if message_animation_needs_clear {
-                    if crossterm::terminal::size().map_or(false, |(w, h)| w > 0 && h > 0) {
+                if message_animation_needs_clear
+                    && crossterm::terminal::size().is_ok_and(|(w, h)| w > 0 && h > 0) {
                         render_handle.send_clear();
                     }
-                }
                 if let Some(ref mut t) = app.logo_build_t {
                     *t += 0.025;
                     if *t >= 1.0 { app.logo_build_t = None; }
@@ -559,9 +558,14 @@ pub async fn run(
                             continue;
                         }
                         let is_streaming = app.streaming;
-                        let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
-                        let action = input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard);
-                        drop(kb_guard);
+                        // Scope the registry read guard to this block so it is
+                        // provably released before any later `.await`
+                        // (clippy::await_holding_lock) — the guard never spans a
+                        // yield point.
+                        let action = {
+                            let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
+                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard)
+                        };
                         // Input events (keys, mouse, paste, resize) almost always
                         // change visible state (cursor, input buffer, scroll).
                         app.request_redraw();
