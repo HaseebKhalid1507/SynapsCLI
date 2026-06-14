@@ -282,26 +282,46 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
 }
 
 /// Format a tool name for display. Returns (icon, display_name, optional_server_tag).
-/// MCP tools like "ext__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
+/// MCP tools like "ext__byteray__read_pseudocode" become ("⟫", "read_pseudocode", Some("byteray"))
 pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
     if tool_name.starts_with("ext__") {
         let parts: Vec<&str> = tool_name.splitn(3, "__").collect();
         let server = parts.get(1).unwrap_or(&"mcp").to_string();
         let tool = parts.get(2).unwrap_or(&tool_name).to_string();
-        ("\u{00bb}", tool, Some(server)) // »
+        ("\u{27EB}", tool, Some(server)) // ⟫
     } else {
         let icon = match tool_name {
-            "bash" => "$",
-            "read" => ">",
-            "write" => "<",
-            "edit" => "~",
-            "grep" => "/",
-            "find" => "?",
-            "ls" => "=",
-            "subagent" => "*",
-            _ => "-",
+            "bash" => "\u{276F}",     // ❯  the deck / shell
+            "read" => "\u{25A4}",     // ▤  data in
+            "write" => "\u{270E}",    // ✎  mutation
+            "edit" => "\u{2726}",     // ✦  surgical
+            "grep" => "\u{2315}",     // ⌕  scan
+            "find" => "\u{2756}",     // ❖  locate
+            "ls" => "\u{2263}",       // ≣  listing
+            "subagent" => "\u{25C8}", // ◈  spawn
+            _ => "\u{2022}",          // •
         };
         (icon, tool_name.to_string(), None)
+    }
+}
+
+/// Per-tool gutter/accent colour, read from the active theme so it can be
+/// overridden per theme. Defaults to the Night City neon set.
+pub(crate) fn tool_accent(tool_name: &str) -> Color {
+    let t = THEME.load();
+    if tool_name.starts_with("ext__") {
+        return t.tool_ext;
+    }
+    match tool_name {
+        "bash" => t.tool_bash,
+        "read" => t.tool_read,
+        "write" => t.tool_write,
+        "edit" => t.tool_edit,
+        "grep" => t.tool_grep,
+        "find" => t.tool_find,
+        "ls" => t.tool_ls,
+        "subagent" => t.tool_subagent,
+        _ => t.tool_generic,
     }
 }
 

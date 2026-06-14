@@ -12,6 +12,7 @@ pub(crate) use input::{handle_event, InputOutcome};
 
 const BUILTIN_THEMES: &[&str] = &[
     "default",
+    "night-city",
     "neon-rain",
     "amber",
     "phosphor",

@@ -453,7 +453,38 @@ impl App {
         self.invalidate();
     }
 
-    /// Cap the rendered scrollback after resuming a session.
+    /// Insert a freshly created `ToolResult` directly beneath its matching
+    /// `ToolUse` / `ToolUseStart` block (matched by `tool_id`) so parallel tool
+    /// calls render as **input → its output** pairs, instead of all inputs
+    /// stacked then all outputs stacked. Falls back to appending at the end
+    /// when no matching tool_use exists (legacy providers without tool_ids).
+    pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
+        let use_idx = if tool_id.is_empty() {
+            None
+        } else {
+            self.messages.iter().position(|m| matches!(
+                &m.msg,
+                ChatMessage::ToolUse { tool_id: tid, .. }
+                | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                    if tid == &tool_id
+            ))
+        };
+        let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
+        match use_idx {
+            Some(i) => {
+                let at = (i + 1).min(self.messages.len());
+                self.messages.insert(at, TimestampedMsg {
+                    msg,
+                    time: Local::now().format("%H:%M").to_string(),
+                });
+                if self.scroll_pinned {
+                    self.scroll_back = 0;
+                }
+                self.invalidate();
+            }
+            None => self.push_msg(msg),
+        }
+    }
     ///
     /// `render_lines` markdown-renders + syntax-highlights EVERY display message
     /// on the first frame. On `--continue` of a long session (hundreds of
@@ -648,6 +679,7 @@ impl App {
     /// Begin streaming a new tool call. Records start time per-tool so
     /// elapsed-ms is correct under parallel execution.
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
+        self.drop_empty_thinking();
         let now = std::time::Instant::now();
         self.tool_start_time = Some(now);
         if !tool_id.is_empty() {
@@ -681,6 +713,7 @@ impl App {
     /// `ToolUseStart` in place — keeping its position so on-screen order
     /// matches the order the model emitted the calls.
     pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
+        self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
         if !tool_id.is_empty() {
@@ -710,7 +743,7 @@ impl App {
                 }
             }
         }
-        self.push_msg(ChatMessage::ToolResult { tool_id, content: delta, elapsed_ms: None });
+        self.push_tool_result(tool_id, delta, None);
     }
 
     /// Finalize a tool result. Replaces any in-flight `ToolResult` for
@@ -741,7 +774,7 @@ impl App {
                 }
             }
         }
-        self.push_msg(ChatMessage::ToolResult { tool_id, content: result, elapsed_ms: elapsed });
+        self.push_tool_result(tool_id, result, elapsed);
     }
 
     /// Capture all assistant output since the last user message as abort context.
@@ -915,6 +948,9 @@ impl App {
     }
 
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
+        // Model produced real output — clear any empty thinking placeholder
+        // so its spinner stops.
+        self.drop_empty_thinking();
         if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.messages.last_mut() {
             existing.push_str(text);
         } else {
@@ -925,16 +961,36 @@ impl App {
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
         if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.messages.last_mut() {
-            existing.push_str(text);
+            // First real delta replaces the "…" spinner placeholder rather than
+            // appending to it (otherwise content reads "…<thinking>").
+            if existing == "\u{2026}" {
+                *existing = text.to_string();
+            } else {
+                existing.push_str(text);
+            }
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
         }
         self.invalidate();
     }
 
+    /// Remove a trailing thinking block that never received content — the "…"
+    /// spinner placeholder, or one left empty. Called when the model starts
+    /// producing real output or the turn ends, so the thinking spinner can't
+    /// run forever on an empty thinking step.
+    pub(crate) fn drop_empty_thinking(&mut self) {
+        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(t), .. }) = self.messages.last() {
+            if t == "\u{2026}" || t.trim().is_empty() {
+                self.messages.pop();
+                self.invalidate();
+            }
+        }
+    }
+
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {
         let descriptions: &[(&str, &str)] = &[
             ("default",        "cool teal on dark blue-gray"),
+            ("night-city",     "premium neon-noir — cyberpunk/blade runner"),
             ("neon-rain",      "cyberpunk hot pink + cyan"),
             ("amber",          "warm CRT retro terminal"),
             ("phosphor",       "green monochrome CRT"),
@@ -1011,6 +1067,106 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Session::new("test-model", "low", None))
+    }
+
+    #[test]
+    fn empty_thinking_placeholder_is_dropped_when_agent_moves_on() {
+        // Spinner is driven by a Thinking("…") placeholder. If thinking stays
+        // empty, producing text/tools must remove it so the spinner stops.
+        let mut app = test_app();
+
+        // Case 1: text follows empty thinking.
+        app.push_msg(ChatMessage::Thinking("\u{2026}".to_string()));
+        assert!(app.render_lines_uses_spinner(), "placeholder should animate while present");
+        app.append_or_update_text("here is the answer");
+        assert!(
+            !matches!(app.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            "empty thinking must be gone once text arrives"
+        );
+        assert!(!app.render_lines_uses_spinner(), "spinner must stop after agent moves on");
+
+        // Case 2: a tool follows empty thinking.
+        let mut app = test_app();
+        app.push_msg(ChatMessage::Thinking("\u{2026}".to_string()));
+        app.on_tool_use_start("t1".to_string(), "bash".to_string());
+        let thinking_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
+            .count();
+        assert_eq!(thinking_count, 0, "empty thinking must be gone once a tool runs");
+
+        // Case 3: real thinking content is preserved.
+        let mut app = test_app();
+        app.push_msg(ChatMessage::Thinking("\u{2026}".to_string()));
+        app.append_or_update_thinking("actually reasoning");
+        app.append_or_update_text("done");
+        assert!(
+            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            "non-empty thinking must survive and not keep the … prefix"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_pair_with_their_inputs() {
+        let mut app = test_app();
+        // Model fans out four tool calls — all inputs arrive first.
+        for id in ["t1", "t2", "t3", "t4"] {
+            app.on_tool_use_finalized(id.to_string(), "bash".to_string(), "{}".to_string());
+        }
+        // Results return out of completion order; each must slot under its input.
+        for id in ["t2", "t1", "t4", "t3"] {
+            app.on_tool_result(id.to_string(), format!("out-{id}"));
+        }
+        let seq: Vec<(String, bool)> = app
+            .messages
+            .iter()
+            .filter_map(|m| match &m.msg {
+                ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
+                ChatMessage::ToolResult { tool_id, .. } => Some((tool_id.clone(), true)),
+                _ => None,
+            })
+            .collect();
+        let expected = vec![
+            ("t1".to_string(), false), ("t1".to_string(), true),
+            ("t2".to_string(), false), ("t2".to_string(), true),
+            ("t3".to_string(), false), ("t3".to_string(), true),
+            ("t4".to_string(), false), ("t4".to_string(), true),
+        ];
+        assert_eq!(seq, expected, "parallel tool calls must render as input→output pairs");
+    }
+
+    #[test]
+    fn tool_block_has_gutter_and_background() {
+        let mut app = test_app();
+        app.on_tool_use_finalized("t1".to_string(), "bash".to_string(), "{}".to_string());
+        app.on_tool_result("t1".to_string(), "hello\nworld".to_string());
+        let lines = app.render_lines(80);
+        // No borders / shade glyphs.
+        for l in &lines {
+            let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            assert!(
+                !s.chars().any(|c| matches!(c,
+                    '\u{256D}' | '\u{256E}' | '\u{2570}' | '\u{256F}' | '\u{2502}'
+                    | '\u{2591}' | '\u{2592}' | '\u{2593}')),
+                "no borders or shade glyphs: {s:?}"
+            );
+        }
+        // Panel lines carry a gutter bar ▎ and a unified background.
+        let panel_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{258E}')))
+            .expect("a panel line with a gutter");
+        assert!(
+            panel_line.spans.iter().any(|s| s.style.bg.is_some()),
+            "panel cells (incl. text) must share a background"
+        );
+        // The inset left margin stays transparent.
+        if let Some(first) = panel_line.spans.first() {
+            if !first.content.is_empty() && first.content.chars().all(|c| c == ' ') {
+                assert!(first.style.bg.is_none(), "left margin must stay transparent");
+            }
+        }
     }
 
     #[test]
