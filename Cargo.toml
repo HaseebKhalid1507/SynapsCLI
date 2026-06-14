@@ -103,6 +103,7 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/synaps", "usr/bin/", "755"],
+    ["target/release/hidden", "usr/bin/", "755"],
 ]
 
 [workspace]
