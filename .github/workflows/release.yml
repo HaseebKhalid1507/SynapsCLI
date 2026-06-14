@@ -309,10 +309,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish to crates.io
+      - name: Publish to crates.io (workspace, dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify --allow-dirty
+        run: |
+          set -uo pipefail
+          # Publish in dependency order — each lib must be live on crates.io
+          # before the crate that depends on it. Verify is ON (no --no-verify):
+          # it catches packaging bugs like a missing include_str! asset before
+          # the (permanent) upload. Idempotent: an already-published version is
+          # skipped, so re-runs and manual pre-publishes don't hard-fail.
+          for crate in synaps-core synaps-engine synaps-tui synaps; do
+            echo "::group::publish $crate"
+            out=$(cargo publish -p "$crate" 2>&1) || true
+            echo "$out"
+            if echo "$out" | grep -qiE "already (uploaded|exists)"; then
+              echo "↳ $crate already published — skipping"
+            elif echo "$out" | grep -qE "^error[:\[]|could not"; then
+              echo "::error::publish failed for $crate"; exit 1
+            fi
+            echo "::endgroup::"
+            if [ "$crate" != "synaps" ]; then sleep 30; fi
+          done
 
   # ── Update Homebrew tap ──
   publish-homebrew:
