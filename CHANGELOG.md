@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-14
+
+### Fixed
+- **`cargo install synaps` from crates.io was broken in 0.3.0** — after the A3 workspace split, `synaps-engine` embedded its help data via `include_str!("../../../assets/help.json")`, a file at the *workspace root, outside the crate*. `cargo publish` only packages files inside the crate, so the published `synaps-engine`/`synaps` 0.3.0 could not compile (`No such file: assets/help.json`). The asset now lives inside the crate at `crates/agent-engine/assets/help.json`, and the crates.io publish job runs **with verification** (no `--no-verify`) so this class of packaging bug is caught before the permanent upload. Binary installs (GitHub release, Homebrew, AUR, shell installer) were never affected — they bundle the full workspace. The broken 0.3.0 crates are yanked.
+
 ## [0.3.0] — 2026-06-13
 
 ### Added
