@@ -1,0 +1,59 @@
+[package]
+name = "agent-tui"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Terminal UI layer — ratatui, crossterm, syntect, tachyonfx"
+license = "Apache-2.0"
+
+[lib]
+name = "agent_tui"
+path = "src/lib.rs"
+
+[dependencies]
+agent-core   = { path = "../agent-core" }
+agent-engine = { path = "../agent-engine" }
+
+# Async runtime + utilities
+tokio        = { version = "1.0", features = ["full"] }
+tokio-util   = "0.7"
+futures      = "0.3"
+async-trait  = "0.1.89"
+
+# Serialisation
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+
+# Tracing
+tracing      = "0.1"
+
+# Time / ids
+chrono       = { version = "0.4", features = ["serde"] }
+uuid         = { version = "1.0", features = ["v4"] }
+
+# Error handling
+thiserror    = "1.0"
+anyhow       = "1.0"
+
+# HTTP client (tui/helpers.rs fetch_usage)
+reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+
+# TUI render crates
+ratatui       = "0.29"
+crossterm     = { version = "0.28", features = ["event-stream"] }
+tachyonfx     = { version = "0.9", features = ["sendable"] }
+syntect       = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
+arc-swap      = "1"
+unicode-width = "0.2.0"
+arboard       = "3"
+
+# Signal handling (tui/signals.rs)
+signal-hook  = { version = "0.3", features = ["iterator"] }
+
+# Render-thread synchronisation (tui/render_thread.rs)
+parking_lot  = "0.12"
+
+[dev-dependencies]
+serial_test = "3.4.0"
+tempfile    = "3"
+sha2        = "0.10"

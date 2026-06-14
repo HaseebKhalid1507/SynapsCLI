@@ -1,0 +1,1159 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use crate::core::shell_config::ShellConfig;
+
+static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
+static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+static IDENTITY: OnceLock<String> = OnceLock::new();
+
+const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
+
+/// Returns the configured identity string for the system prompt preamble.
+/// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set
+/// in config. Initialized by `load_config()` — safe to call anytime after boot.
+pub fn get_identity() -> String {
+    IDENTITY.get().cloned().unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+}
+
+/// Provider API keys parsed from `provider.<name> = ...` lines in config.
+/// Empty if `load_config()` hasn't been called. The registry falls back to
+/// env vars, so e.g. `GROQ_API_KEY` works even with an empty map.
+pub fn get_provider_keys() -> BTreeMap<String, String> {
+    PROVIDER_KEYS.get().cloned().unwrap_or_default()
+}
+
+/// Returns the active profile name, if any.
+/// Reads from `SYNAPS_PROFILE` environment variable if not already set programmatically.
+pub fn get_profile() -> Option<String> {
+    PROFILE_NAME.get_or_init(|| std::env::var("SYNAPS_PROFILE").ok()).clone()
+}
+
+/// Sets the active profile name. Must be called before any `get_profile()` call
+/// (i.e., before config resolution begins). Uses OnceLock — first write wins,
+/// subsequent calls are no-ops. No env var mutation (unsafe under tokio).
+pub fn set_profile(name: Option<String>) {
+    let _ = PROFILE_NAME.set(name);
+}
+
+pub fn base_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("SYNAPS_BASE_DIR") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".synaps-cli")
+}
+
+/// Overrides the Synaps base directory. Intended for tests and embedded harnesses.
+#[doc(hidden)]
+pub fn set_base_dir_for_tests(path: PathBuf) {
+    std::env::set_var("SYNAPS_BASE_DIR", path);
+}
+
+/// Resolves a path for reading. Checks the profile folder first, then falls back to the default folder.
+pub fn resolve_read_path(filename: &str) -> PathBuf {
+    let base = base_dir();
+    
+    if let Some(profile) = get_profile() {
+        let profile_path = base.join(&profile).join(filename);
+        if profile_path.exists() {
+            return profile_path;
+        }
+    }
+    
+    base.join(filename)
+}
+
+/// Resolves a path for reading with an extended arbitrary path tree.
+pub fn resolve_read_path_extended(path: &str) -> PathBuf {
+    let base = base_dir();
+    
+    if let Some(profile) = get_profile() {
+        let profile_path = base.join(&profile).join(path);
+        if profile_path.exists() {
+            return profile_path;
+        }
+    }
+    
+    base.join(path)
+}
+
+/// Resolves a path for writing. Unconditionally writes to the profile folder if a profile is active.
+pub fn resolve_write_path(filename: &str) -> PathBuf {
+    let mut base = base_dir();
+    
+    if let Some(profile) = get_profile() {
+        base.push(profile);
+    }
+    
+    let _ = std::fs::create_dir_all(&base);
+    base.join(filename)
+}
+
+/// Gets the absolute directory for the current profile (or root if default).
+pub fn get_active_config_dir() -> PathBuf {
+    let mut base = base_dir();
+    if let Some(profile) = get_profile() {
+        base.push(profile);
+    }
+    base
+}
+
+/// Server security configuration parsed from `server.*` keys.
+#[derive(Debug, Clone, Default)]
+pub struct ServerConfig {
+    /// Comma-separated list of allowed Origin headers. Empty = allow all (localhost-only protection).
+    pub allowed_origins: Vec<String>,
+    /// Pre-shared authentication token. If set, clients must provide it on WebSocket upgrade
+    /// via `?token=X` query param or `Authorization: Bearer X` header. If None, auto-generated on boot.
+    pub token: Option<String>,
+    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless/agent mode).
+    pub auto_approve_confirms: bool,
+    /// Maximum inbound message size in bytes. Defaults to context_window * 4 (rough token→byte estimate).
+    /// None means no artificial cap.
+    pub max_message_size: Option<usize>,
+}
+
+/// Bridge daemon configuration parsed from `bridge.*` keys.
+///
+/// Controls best-effort mirroring of watcher heartbeats over the bridge
+/// daemon's UDS `ControlSocket` (`heartbeat_emit` op). All keys are optional
+/// and the feature is OFF by default.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    /// Path to the bridge daemon's UDS control socket.
+    /// When `None`, defaults to `base_dir().join("bridge/control.sock")`.
+    pub uds_path: Option<PathBuf>,
+    /// When true, every watcher heartbeat tick mirrors a `heartbeat_emit`
+    /// JSON-RPC call over the UDS socket. Errors are logged at debug only.
+    pub heartbeat_mirror: bool,
+    /// Per-call timeout in milliseconds (covers connect + write + read).
+    pub heartbeat_timeout_ms: u64,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            uds_path: None,
+            heartbeat_mirror: false,
+            heartbeat_timeout_ms: 250,
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Resolve the UDS path, falling back to the default under `base_dir()`.
+    pub fn resolved_uds_path(&self) -> PathBuf {
+        self.uds_path
+            .clone()
+            .unwrap_or_else(|| base_dir().join("bridge/control.sock"))
+    }
+}
+
+/// Prompt-cache TTL strategy for Anthropic requests.
+///
+/// Controls the `cache_control` value emitted at every cache marker site:
+/// - `FiveMinutes` (default): bare `{"type": "ephemeral"}` — byte-identical
+///   to historical payloads; the default path can never invalidate existing
+///   cached prefixes.
+/// - `OneHour`: `{"type": "ephemeral", "ttl": "1h"}` on all markers.
+/// - `Hybrid`: 1h on the stable prefix (tools + system, written rarely),
+///   bare 5m on the message-tail marker (written every turn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtl {
+    #[default]
+    FiveMinutes,
+    OneHour,
+    Hybrid,
+}
+
+impl CacheTtl {
+    /// Parse a config value (case-insensitive). Returns `None` for unknown
+    /// values so the caller can warn and fall back to the default.
+    pub fn parse(val: &str) -> Option<CacheTtl> {
+        match val.to_ascii_lowercase().as_str() {
+            "5m" | "5min" | "default" => Some(CacheTtl::FiveMinutes),
+            "1h" | "60m" | "1hr" => Some(CacheTtl::OneHour),
+            "hybrid" => Some(CacheTtl::Hybrid),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed configuration from the config file.
+#[derive(Debug, Clone)]
+pub struct SynapsConfig {
+    pub model: Option<String>,
+    pub thinking_budget: Option<u32>,
+    pub context_window: Option<u64>,   // override auto-detected context window (tokens)
+    pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
+    pub max_tool_output: usize,        // default 30000
+    pub bash_timeout: u64,             // default 30
+    pub bash_max_timeout: u64,         // default 300
+    pub subagent_timeout: u64,         // default 300
+    pub api_retries: u32,              // default 3
+    pub telemetry: String,             // off | basic | full (default off)
+    pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
+    /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
+    pub cache_ttl: CacheTtl,
+    pub theme: Option<String>,
+    pub agent_name: Option<String>,
+    pub identity: Option<String>,
+    pub disabled_plugins: Vec<String>,
+    pub favorite_models: Vec<String>,
+    pub disabled_skills: Vec<String>,
+    pub shell: ShellConfig,
+    pub server: ServerConfig,
+    pub bridge: BridgeConfig,
+    pub provider_keys: BTreeMap<String, String>,
+    pub keybinds: std::collections::HashMap<String, String>,
+    /// Non-fatal problems found while parsing the config file (unknown keys,
+    /// unparseable values). Surfaced once at startup — never block boot.
+    pub warnings: Vec<String>,
+}
+
+impl Default for SynapsConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            thinking_budget: None,
+            context_window: None,
+            compaction_model: None,
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            api_retries: 3,
+            telemetry: "off".to_string(),
+            cache_diagnostics: false,
+            cache_ttl: CacheTtl::default(),
+            theme: None,
+            agent_name: None,
+            identity: None,
+            disabled_plugins: Vec::new(),
+            favorite_models: Vec::new(),
+            disabled_skills: Vec::new(),
+            shell: ShellConfig::default(),
+            server: ServerConfig::default(),
+            bridge: BridgeConfig::default(),
+            provider_keys: BTreeMap::new(),
+            keybinds: std::collections::HashMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Known top-level config keys — used for unknown-key warnings + did-you-mean.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "model", "thinking", "compaction_model", "context_window", "max_tool_output",
+    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
+    "telemetry", "cache_diagnostics", "cache_ttl", "theme", "agent_name", "identity",
+    "disabled_plugins", "favorite_models", "disabled_skills",
+];
+
+/// Simple Levenshtein distance for did-you-mean suggestions.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Closest known key within edit distance 2, for typo suggestions.
+fn did_you_mean(key: &str) -> Option<&'static str> {
+    KNOWN_CONFIG_KEYS
+        .iter()
+        .map(|k| (*k, levenshtein(key, k)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(k, _)| k)
+}
+
+
+fn parse_thinking_budget(val: &str) -> Option<u32> {
+    match val {
+        "low" => Some(2048),
+        "medium" => Some(4096),
+        "high" => Some(16384),
+        "xhigh" => Some(32768),
+        "adaptive" => Some(0), // sentinel: model decides depth
+        _ => val.parse::<u32>().ok(),
+    }
+}
+
+fn parse_comma_list(val: &str) -> Vec<String> {
+    val.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn write_comma_list(key: &str, values: &[String]) -> std::io::Result<()> {
+    write_config_value(key, &values.join(", "))
+}
+
+/// Parse shell.* configuration keys and update the ShellConfig.
+fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) {
+    match key {
+        "shell.max_sessions" => {
+            if let Ok(sessions) = val.parse::<usize>() {
+                shell_config.max_sessions = sessions;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_sessions: '{}', using default", val);
+            }
+        }
+        "shell.idle_timeout" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.idle_timeout = std::time::Duration::from_secs(timeout);
+            } else {
+                eprintln!("Warning: invalid value for shell.idle_timeout: '{}', using default", val);
+            }
+        }
+        "shell.readiness_timeout_ms" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.readiness_timeout_ms = timeout;
+            } else {
+                eprintln!("Warning: invalid value for shell.readiness_timeout_ms: '{}', using default", val);
+            }
+        }
+        "shell.max_readiness_timeout_ms" => {
+            if let Ok(timeout) = val.parse::<u64>() {
+                shell_config.max_readiness_timeout_ms = timeout;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_readiness_timeout_ms: '{}', using default", val);
+            }
+        }
+        "shell.default_rows" => {
+            if let Ok(rows) = val.parse::<u16>() {
+                shell_config.default_rows = rows;
+            } else {
+                eprintln!("Warning: invalid value for shell.default_rows: '{}', using default", val);
+            }
+        }
+        "shell.default_cols" => {
+            if let Ok(cols) = val.parse::<u16>() {
+                shell_config.default_cols = cols;
+            } else {
+                eprintln!("Warning: invalid value for shell.default_cols: '{}', using default", val);
+            }
+        }
+        "shell.readiness_strategy" => {
+            let val_lower = val.to_lowercase();
+            match val_lower.as_str() {
+                "timeout" | "prompt" | "hybrid" => {
+                    shell_config.readiness_strategy = val.to_string();
+                }
+                _ => {
+                    eprintln!("Warning: invalid value for shell.readiness_strategy: '{}', using default", val);
+                }
+            }
+        }
+        "shell.max_output" => {
+            if let Ok(max_output) = val.parse::<usize>() {
+                shell_config.max_output = max_output;
+            } else {
+                eprintln!("Warning: invalid value for shell.max_output: '{}', using default", val);
+            }
+        }
+        _ => {
+            // Unknown shell.* keys are preserved (not rejected)
+        }
+    }
+}
+
+/// Parse server.* configuration keys and update the ServerConfig.
+#[allow(clippy::collapsible_match)]
+fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &str) {
+    match key {
+        "server.allowed_origins" => {
+            server_config.allowed_origins = parse_comma_list(val);
+        }
+        "server.token" => {
+            if !val.is_empty() {
+                server_config.token = Some(val.to_string());
+            }
+        }
+        "server.auto_approve_confirms" => {
+            server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
+        }
+        "server.max_message_size" => {
+            if let Ok(size) = val.parse::<usize>() {
+                server_config.max_message_size = Some(size);
+            } else {
+                eprintln!("Warning: invalid value for server.max_message_size: '{}', ignored", val);
+            }
+        }
+        _ => {
+            // Unknown server.* keys preserved (not rejected)
+        }
+    }
+}
+
+/// Parse bridge.* configuration keys and update the BridgeConfig.
+fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &str) {
+    match key {
+        "bridge.uds_path" => {
+            if val.is_empty() {
+                bridge_config.uds_path = None;
+            } else {
+                bridge_config.uds_path = Some(PathBuf::from(val));
+            }
+        }
+        "bridge.heartbeat_mirror" => {
+            bridge_config.heartbeat_mirror = matches!(val, "true" | "1" | "yes");
+        }
+        "bridge.heartbeat_timeout_ms" => {
+            if let Ok(ms) = val.parse::<u64>() {
+                bridge_config.heartbeat_timeout_ms = ms;
+            } else {
+                eprintln!("Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default", val);
+            }
+        }
+        _ => {
+            // Unknown bridge.* keys preserved (not rejected)
+        }
+    }
+}
+
+/// Parse the config file at ~/.synaps-cli/config (or profile variant).
+/// Returns default config if file doesn't exist or can't be read.
+pub fn load_config() -> SynapsConfig {
+    let path = resolve_read_path("config");
+    let mut config = SynapsConfig::default();
+    
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return config;
+    };
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((key, val)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let val = val.trim();
+        match key {
+            "model" => config.model = Some(val.to_string()),
+            "thinking" => {
+                config.thinking_budget = parse_thinking_budget(val);
+                if config.thinking_budget.is_none() {
+                    config.warnings.push(format!("thinking = {val} — expected low|medium|high|xhigh|adaptive or a token count; thinking disabled"));
+                }
+            }
+            "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "context_window" => {
+                let parsed = match val {
+                    "200k" | "200K" => Some(200_000),
+                    "1m" | "1M" => Some(1_000_000),
+                    _ => val.parse::<u64>().ok(),
+                };
+                if parsed.is_none() {
+                    config.warnings.push(format!("context_window = {val} — expected 200k, 1m, or a token count; ignored"));
+                }
+                config.context_window = parsed;
+            }
+            "max_tool_output" => {
+                match val.parse::<usize>() {
+                    Ok(size) => config.max_tool_output = size,
+                    Err(_) => config.warnings.push(format!("max_tool_output = {val} — not a number; using {}", config.max_tool_output)),
+                }
+            }
+            "bash_timeout" => {
+                match val.parse::<u64>() {
+                    Ok(t) if t >= 1 => config.bash_timeout = t,
+                    Ok(_) => config.warnings.push(format!("bash_timeout = {val} — below minimum (1s); using {}", config.bash_timeout)),
+                    Err(_) => config.warnings.push(format!("bash_timeout = {val} — not a number; using {}", config.bash_timeout)),
+                }
+            }
+            "bash_max_timeout" => {
+                if let Ok(timeout) = val.parse::<u64>() {
+                    config.bash_max_timeout = timeout;
+                }
+            }
+            "subagent_timeout" => {
+                if let Ok(timeout) = val.parse::<u64>() {
+                    config.subagent_timeout = timeout;
+                }
+            }
+            "api_retries" => {
+                if let Ok(retries) = val.parse::<u32>() {
+                    config.api_retries = retries;
+                }
+            }
+            "telemetry" => config.telemetry = val.to_string(),
+            "cache_diagnostics" => {
+                config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
+            }
+            "cache_ttl" => {
+                match CacheTtl::parse(val) {
+                    Some(ttl) => config.cache_ttl = ttl,
+                    None => config.warnings.push(format!(
+                        "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                    )),
+                }
+            }
+            "theme" => config.theme = Some(val.to_string()),
+            "agent_name" => config.agent_name = Some(val.to_string()),
+            "identity" => config.identity = Some(val.to_string()),
+            "disabled_plugins" => {
+                config.disabled_plugins = parse_comma_list(val);
+            }
+            "favorite_models" => {
+                config.favorite_models = parse_comma_list(val);
+            }
+            "disabled_skills" => {
+                config.disabled_skills = parse_comma_list(val);
+            }
+            _ => {
+                // Handle namespaced keys
+                if key.starts_with("shell.") {
+                    parse_shell_config_key(&mut config.shell, key, val);
+                } else if key.starts_with("server.") {
+                    parse_server_config_key(&mut config.server, key, val);
+                } else if key.starts_with("bridge.") {
+                    parse_bridge_config_key(&mut config.bridge, key, val);
+                } else if let Some(provider_key) = key.strip_prefix("provider.") {
+                    config.provider_keys.insert(provider_key.to_string(), val.to_string());
+                } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
+                    config.keybinds.insert(keybind_key.to_string(), val.to_string());
+                } else if key.contains('.') {
+                    // Dotted keys are namespaced (plugin/extension config, e.g.
+                    // `knowledge.jawz_notes`). Plugins define their own keys —
+                    // not ours to police. Silently preserved.
+                } else {
+                    // Unknown top-level key — warn with a did-you-mean if close.
+                    match did_you_mean(key) {
+                        Some(suggestion) => config.warnings.push(format!("unknown key '{key}' (did you mean '{suggestion}'?)")),
+                        None => config.warnings.push(format!("unknown key '{key}' — ignored")),
+                    }
+                }
+            }
+        }
+    }
+
+    // Derive max_message_size from context_window if not explicitly set.
+    // Rough estimate: 1 token ≈ 4 bytes. Context window in tokens → bytes.
+    if config.server.max_message_size.is_none() {
+        if let Some(ctx_tokens) = config.context_window {
+            config.server.max_message_size = Some((ctx_tokens as usize) * 4);
+        }
+    }
+
+    // Publish provider keys to the process-wide cache for the API router.
+    // First writer wins (OnceLock) — subsequent load_config calls are no-ops.
+    let _ = PROVIDER_KEYS.set(config.provider_keys.clone());
+
+    // Publish identity to the process-wide cache for API system prompt preamble.
+    let identity_val = config.identity.clone().unwrap_or_else(|| DEFAULT_IDENTITY.to_string());
+    let _ = IDENTITY.set(identity_val);
+
+    config
+}
+
+/// Read a single config value by exact key from the active config file.
+pub fn read_config_value(key: &str) -> Option<String> {
+    let path = resolve_read_path("config");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if k.trim() == key.trim() {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
+/// Replaces the first existing line that matches the key, or appends if absent.
+/// Preserves comments and unknown keys. Writes atomically via temp file + rename.
+pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let path = resolve_write_path("config");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let key_trimmed = key.trim();
+    let replacement = format!("{} = {}", key_trimmed, value);
+
+    let mut found = false;
+    let mut new_lines: Vec<String> = existing.lines().map(|line| {
+        if found { return line.to_string(); }
+        let t = line.trim_start();
+        if t.starts_with('#') || t.is_empty() { return line.to_string(); }
+        if let Some((k, _)) = t.split_once('=') {
+            if k.trim() == key_trimmed {
+                found = true;
+                return replacement.clone();
+            }
+        }
+        line.to_string()
+    }).collect();
+
+    if !found {
+        new_lines.push(replacement);
+    }
+
+    let mut out = new_lines.join("\n");
+    if !out.ends_with('\n') { out.push('\n'); }
+
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out)?;
+    // Config may contain API keys — restrict to owner-only
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Add a favorite model id (`provider/model`) to config, preserving sort/dedup.
+pub fn add_favorite_model(id: &str) -> std::io::Result<()> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let mut values = load_config().favorite_models;
+    if !values.iter().any(|v| v == trimmed) {
+        values.push(trimmed.to_string());
+        values.sort();
+    }
+    write_comma_list("favorite_models", &values)
+}
+
+/// Remove a favorite model id (`provider/model`) from config.
+pub fn remove_favorite_model(id: &str) -> std::io::Result<()> {
+    let mut values = load_config().favorite_models;
+    values.retain(|v| v != id.trim());
+    write_comma_list("favorite_models", &values)
+}
+
+/// Return whether a model id is marked as favorite.
+pub fn is_favorite_model(id: &str) -> bool {
+    load_config().favorite_models.iter().any(|v| v == id.trim())
+}
+
+/// Resolve the system prompt from CLI flag, config file, or default.
+/// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
+pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
+    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal. \
+        You have access to bash, read, and write tools. \
+        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
+
+    if let Some(val) = explicit {
+        let path = std::path::Path::new(val);
+        if path.exists() && path.is_file() {
+            return std::fs::read_to_string(path).unwrap_or_else(|_| val.to_string());
+        }
+        return val.to_string();
+    }
+
+    let system_path = resolve_read_path("system.md");
+    if system_path.exists() {
+        return std::fs::read_to_string(&system_path).unwrap_or_default();
+    }
+
+    DEFAULT_PROMPT.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn test_levenshtein_basics() {
+        assert_eq!(levenshtein("model", "model"), 0);
+        assert_eq!(levenshtein("modle", "model"), 2);
+        assert_eq!(levenshtein("them", "theme"), 1);
+    }
+
+    #[test]
+    fn test_did_you_mean_close_typos() {
+        assert_eq!(did_you_mean("modle"), Some("model"));
+        assert_eq!(did_you_mean("them"), Some("theme"));
+        assert_eq!(did_you_mean("thinkng"), Some("thinking"));
+        assert_eq!(did_you_mean("completely_unrelated_key"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_warnings_unknown_key_and_bad_values() {
+        let home = std::env::temp_dir().join(format!("synaps-warn-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "modle = claude-opus-4-6\nthinking = hgih\nbash_timeout = 0\nknowledge.jawz_notes = ~/Jawz/notes\ncustom.plugin.key = 42\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            // Dotted (namespaced) keys must NOT warn — plugins own those.
+            assert_eq!(config.warnings.len(), 3, "warnings: {:?}", config.warnings);
+            assert!(!config.warnings.iter().any(|w| w.contains("knowledge")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("did you mean 'model'")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("thinking")), "{:?}", config.warnings);
+            assert!(config.warnings.iter().any(|w| w.contains("below minimum")), "{:?}", config.warnings);
+            // Bad values fall back to defaults
+            assert_eq!(config.bash_timeout, 30);
+            assert_eq!(config.thinking_budget, None);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── cache_ttl parse table (spec §3.1) ──
+
+    #[test]
+    fn test_cache_ttl_parse_table() {
+        // 5m aliases
+        assert_eq!(CacheTtl::parse("5m"), Some(CacheTtl::FiveMinutes));
+        assert_eq!(CacheTtl::parse("5min"), Some(CacheTtl::FiveMinutes));
+        assert_eq!(CacheTtl::parse("default"), Some(CacheTtl::FiveMinutes));
+        // 1h aliases
+        assert_eq!(CacheTtl::parse("1h"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("60m"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("1hr"), Some(CacheTtl::OneHour));
+        // hybrid
+        assert_eq!(CacheTtl::parse("hybrid"), Some(CacheTtl::Hybrid));
+        // case-insensitive
+        assert_eq!(CacheTtl::parse("1H"), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("HYBRID"), Some(CacheTtl::Hybrid));
+        assert_eq!(CacheTtl::parse("Default"), Some(CacheTtl::FiveMinutes));
+        // garbage → None (caller warns + defaults)
+        assert_eq!(CacheTtl::parse("2h"), None);
+        assert_eq!(CacheTtl::parse(""), None);
+        assert_eq!(CacheTtl::parse("forever"), None);
+    }
+
+    #[test]
+    fn test_cache_ttl_default_is_five_minutes() {
+        assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
+        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtl::FiveMinutes);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_ttl_config_parse_and_garbage_warning() {
+        let home = std::env::temp_dir().join(format!("synaps-cachettl-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid value parses, no warning.
+        std::fs::write(dir.join("config"), "cache_ttl = hybrid\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.cache_ttl, CacheTtl::Hybrid);
+            assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        });
+
+        // Garbage value → 5m default + boot warning (never blocks boot).
+        std::fs::write(dir.join("config"), "cache_ttl = 2h\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
+            assert!(
+                config.warnings.iter().any(|w| w.contains("cache_ttl")),
+                "warnings: {:?}", config.warnings
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_parse_thinking_budget() {
+        assert_eq!(parse_thinking_budget("low"), Some(2048));
+        assert_eq!(parse_thinking_budget("medium"), Some(4096));
+        assert_eq!(parse_thinking_budget("high"), Some(16384));
+        assert_eq!(parse_thinking_budget("xhigh"), Some(32768));
+        assert_eq!(parse_thinking_budget("8192"), Some(8192));
+        assert_eq!(parse_thinking_budget("invalid"), None);
+    }
+
+    #[test]
+    fn test_base_dir() {
+        let path = base_dir();
+        assert!(path.to_string_lossy().ends_with(".synaps-cli"));
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_explicit() {
+        let result = resolve_system_prompt(Some("test prompt"));
+        assert_eq!(result, "test prompt");
+    }
+
+    #[test]
+    fn test_resolve_system_prompt_none() {
+        let result = resolve_system_prompt(None);
+        assert!(result.contains("helpful AI agent"));
+    }
+
+    // Note: test_load_config_nonexistent_file removed — HOME env var mutation
+    // is not thread-safe and races with shell config tests. Coverage provided
+    // by shell::config::tests::test_shell_config_from_file.
+
+    #[test]
+    fn test_synaps_config_default() {
+        let config = SynapsConfig::default();
+        assert_eq!(config.model, None);
+        assert_eq!(config.thinking_budget, None);
+        assert_eq!(config.max_tool_output, 30000);
+        assert_eq!(config.bash_timeout, 30);
+        assert_eq!(config.bash_max_timeout, 300);
+        assert_eq!(config.subagent_timeout, 300);
+        assert_eq!(config.api_retries, 3);
+        assert_eq!(config.theme, None);
+        assert!(config.disabled_plugins.is_empty());
+        assert!(config.favorite_models.is_empty());
+        assert!(config.disabled_skills.is_empty());
+        assert_eq!(config.shell.max_sessions, 5);
+        assert_eq!(config.shell.idle_timeout.as_secs(), 600);
+        // Server config defaults
+        assert!(config.server.allowed_origins.is_empty());
+        assert_eq!(config.server.token, None);
+        assert!(!config.server.auto_approve_confirms);
+        assert_eq!(config.server.max_message_size, None);
+        // Bridge config defaults
+        assert!(config.bridge.uds_path.is_none());
+        assert!(!config.bridge.heartbeat_mirror);
+        assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_bridge_keys() {
+        let home = make_test_home("bridge-keys");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "\
+bridge.uds_path = /tmp/some/control.sock\n\
+bridge.heartbeat_mirror = true\n\
+bridge.heartbeat_timeout_ms = 750\n\
+").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(
+                config.bridge.uds_path,
+                Some(std::path::PathBuf::from("/tmp/some/control.sock")),
+            );
+            assert!(config.bridge.heartbeat_mirror);
+            assert_eq!(config.bridge.heartbeat_timeout_ms, 750);
+            assert_eq!(
+                config.bridge.resolved_uds_path(),
+                std::path::PathBuf::from("/tmp/some/control.sock"),
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_bridge_config_defaults() {
+        let cfg = BridgeConfig::default();
+        assert!(cfg.uds_path.is_none());
+        assert!(!cfg.heartbeat_mirror);
+        assert_eq!(cfg.heartbeat_timeout_ms, 250);
+        // resolved path falls under base_dir()/bridge/control.sock
+        let resolved = cfg.resolved_uds_path();
+        assert!(resolved.ends_with("bridge/control.sock"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_bridge_heartbeat_mirror_defaults_off_when_unset() {
+        let home = make_test_home("bridge-default-off");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert!(!config.bridge.heartbeat_mirror);
+            assert!(config.bridge.uds_path.is_none());
+            assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_server_keys() {
+        let home = make_test_home("server-keys");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "\
+server.allowed_origins = http://localhost:3000, http://localhost:5193\n\
+server.token = my-secret-token\n\
+server.auto_approve_confirms = true\n\
+server.max_message_size = 65536\n\
+context_window = 200k\n\
+").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.server.allowed_origins, vec![
+                "http://localhost:3000".to_string(),
+                "http://localhost:5193".to_string(),
+            ]);
+            assert_eq!(config.server.token, Some("my-secret-token".to_string()));
+            assert!(config.server.auto_approve_confirms);
+            // Explicit max_message_size takes precedence over context_window derivation
+            assert_eq!(config.server.max_message_size, Some(65536));
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn test_server_max_message_size_derived_from_context_window() {
+        let home = make_test_home("server-derive");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "context_window = 200k\n").unwrap();
+
+        with_home(&home, || {
+            let config = load_config();
+            // 200_000 tokens * 4 bytes/token = 800_000 bytes
+            assert_eq!(config.server.max_message_size, Some(800_000));
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn make_test_home(subdir: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(format!("/tmp/synaps-write-test-{}", subdir));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".synaps-cli")).unwrap();
+        dir
+    }
+
+    fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
+        let original = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        f();
+        if let Some(h) = original {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_replaces_existing_key() {
+        let home = make_test_home("replace");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\nthinking = low\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        assert!(contents.contains("thinking = low"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_appends_when_missing() {
+        let home = make_test_home("append");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("theme", "dracula").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-opus-4-6"));
+        assert!(contents.contains("theme = dracula"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_preserves_comments() {
+        let home = make_test_home("comments");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "# user comment\nmodel = claude-opus-4-6\n# another\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("# user comment"));
+        assert!(contents.contains("# another"));
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_preserves_unknown_keys() {
+        let home = make_test_home("unknown");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "custom_thing = 42\nmodel = claude-opus-4-6\n").unwrap();
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("custom_thing = 42"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn write_config_value_creates_file_if_absent() {
+        let home = make_test_home("create");
+        let cfg = home.join(".synaps-cli/config");
+        assert!(!cfg.exists());
+
+        with_home(&home, || {
+            write_config_value("model", "claude-sonnet-4-6").unwrap();
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn load_config_parses_theme_key() {
+        let dir = std::path::PathBuf::from("/tmp/synaps-config-test-theme/.synaps-cli");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("config"), "theme = dracula\n").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-theme");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-theme");
+
+        assert_eq!(config.theme.as_deref(), Some("dracula"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_disable_lists() {
+        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-disable-lists/.synaps-cli");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let config_path = test_dir.join("config");
+
+        let config_content = r#"
+# Test config with disable lists
+favorite_models = claude/claude-opus-4-7, groq/llama-3.3-70b-versatile
+
+disabled_plugins = foo, bar
+disabled_skills = baz, plug:qual
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-disable-lists");
+
+        let config = load_config();
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-disable-lists");
+
+        assert_eq!(config.disabled_plugins, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(config.favorite_models, vec![
+            "claude/claude-opus-4-7".to_string(),
+            "groq/llama-3.3-70b-versatile".to_string(),
+        ]);
+        assert_eq!(config.disabled_skills, vec!["baz".to_string(), "plug:qual".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn favorite_model_helpers_round_trip_through_config_file() {
+        let home = make_test_home("favorite-models");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-7\n").unwrap();
+
+        with_home(&home, || {
+            add_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            add_favorite_model("claude/claude-opus-4-7").unwrap();
+            add_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            assert!(is_favorite_model("groq/llama-3.3-70b-versatile"));
+            remove_favorite_model("groq/llama-3.3-70b-versatile").unwrap();
+            assert!(!is_favorite_model("groq/llama-3.3-70b-versatile"));
+            assert!(is_favorite_model("claude/claude-opus-4-7"));
+        });
+
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("model = claude-opus-4-7"));
+        assert!(contents.contains("favorite_models = claude/claude-opus-4-7"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_new_keys() {
+        // Create a temporary config directory with the new keys
+        let test_dir = std::path::PathBuf::from("/tmp/synaps-config-test-new-keys/.synaps-cli");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let config_path = test_dir.join("config");
+        
+        let config_content = r#"
+# Test config with new keys
+model = claude-haiku
+thinking = medium
+max_tool_output = 50000
+bash_timeout = 45
+bash_max_timeout = 600
+subagent_timeout = 120
+api_retries = 5
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+        
+        // Temporarily override the config path for this test
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/tmp/synaps-config-test-new-keys");
+        
+        let config = load_config();
+        
+        // Restore original HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all("/tmp/synaps-config-test-new-keys");
+        
+        assert_eq!(config.model, Some("claude-haiku".to_string()));
+        assert_eq!(config.thinking_budget, Some(4096)); // medium = 4096
+        assert_eq!(config.max_tool_output, 50000);
+        assert_eq!(config.bash_timeout, 45);
+        assert_eq!(config.bash_max_timeout, 600);
+        assert_eq!(config.subagent_timeout, 120);
+        assert_eq!(config.api_retries, 5);
+    }
+}

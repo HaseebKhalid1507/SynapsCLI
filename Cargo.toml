@@ -1,6 +1,6 @@
 [package]
 name = "synaps"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
 license = "Apache-2.0"
@@ -13,6 +13,9 @@ exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
 rust-version = "1.80"
 
 [dependencies]
+agent-core = { path = "crates/agent-core" }
+agent-engine = { path = "crates/agent-engine" }
+agent-tui = { path = "crates/agent-tui" }
 arc-swap = "1"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
@@ -34,10 +37,6 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
-tachyonfx = "0.9"
-syntect = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
-
-# Auth / OAuth deps
 sha2 = "0.10"
 rand = "0.9"
 base64 = "0.22"
@@ -47,14 +46,11 @@ fs4 = "0.13"
 toml = "0.8"
 notify = "6.1"
 globset = "0.4"
+signal-hook = { version = "0.3", features = ["iterator"] }
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
-tokio-tungstenite = "0.21"
 unicode-width = "0.2.0"
-arboard = "3"
 
 # Shell / PTY deps
 portable-pty = "0.9"
@@ -62,8 +58,6 @@ regex = "1"
 
 # Hidden deps
 dirs = "5"
-libc = "0.2"
-zeroize = "1.8.2"
 tempfile = "3"
 clap_complete = "4.5.67"
 
@@ -110,3 +104,7 @@ priority = "optional"
 assets = [
     ["target/release/synaps", "usr/bin/", "755"],
 ]
+
+[workspace]
+members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]
+resolver = "2"

@@ -1,16 +1,16 @@
-pub mod core;
-pub mod runtime;
-pub mod tools;
-pub mod mcp;
-pub mod skills;
-pub mod events;
-pub mod extensions;
-pub mod memory;
-pub mod help;
-pub mod sidecar;
-pub mod toast;
-pub mod engine;
-pub mod pricing;
+// agent-core is now a separate crate; re-export its modules as if they lived here
+pub use agent_core::core;
+pub use agent_core::memory;
+pub use agent_core::pricing;
+
+// agent-engine is now a separate crate; re-export its modules as if they lived here
+pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help};
+
+// agent-tui is now a separate crate; re-export tui + toast so bin/cmd still resolve
+pub use agent_tui::{tui, toast};
+
+// Allow intra-crate self-reference via `synaps_cli::` (used in src/tui/**).
+extern crate self as synaps_cli;
 
 // Re-export core modules at crate root for backward compatibility
 pub use core::config;
@@ -25,7 +25,7 @@ pub use core::chain;
 
 pub use runtime::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 pub use tools::{Tool, ToolContext, ToolRegistry};
-pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, resolve_session, find_session_by_name, validate_name};
+pub use session::{Session, SessionInfo, find_session, latest_session, list_sessions, list_recent_sessions, resolve_session, find_session_by_name, validate_name};
 pub use error::{RuntimeError, Result};
 pub use config::{SynapsConfig, load_config, resolve_system_prompt};
 pub use watcher_types::{
@@ -36,6 +36,12 @@ pub use watcher_types::{
 // Re-export for convenience
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;
+
+/// Re-export epoch_millis from agent-core (moved there for the leaf crate split).
+pub use agent_core::epoch_millis;
+
+/// Re-export truncate_str from agent-core.
+pub use agent_core::truncate_str;
 
 /// Flush stdout, ignoring errors (pipe closed, etc.)
 #[inline]
@@ -51,15 +57,6 @@ pub fn flush_stderr() {
     let _ = std::io::stderr().flush();
 }
 
-/// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
-#[inline]
-pub fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_millis() as u64
-}
-
 /// Current time as Unix epoch seconds.
 #[inline]
 pub fn epoch_secs() -> u64 {
@@ -67,17 +64,4 @@ pub fn epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before Unix epoch")
         .as_secs()
-}
-
-/// Truncate a string to at most `max` bytes at a valid UTF-8 boundary.
-#[inline]
-pub fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }

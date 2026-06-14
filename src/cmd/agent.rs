@@ -260,13 +260,28 @@ pub async fn run(config_path: String, trigger_context: String) {
         log(agent_name, &format!("WARNING: failed to register session: {}", e));
     }
 
-    // Setup signal handling for graceful shutdown
+    // Setup signal handling for graceful shutdown — catch both SIGINT (Ctrl-C)
+    // and SIGTERM (supervisor/systemd stop) so a headless agent is not ignored
+    // when its parent process sends SIGTERM.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let int_flag = interrupted.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        int_flag.store(true, Ordering::Release);
-    });
+    {
+        let int_flag = interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            int_flag.store(true, Ordering::Release);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let int_flag = interrupted.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut stream) = signal(SignalKind::terminate()) {
+                stream.recv().await;
+                int_flag.store(true, Ordering::Release);
+            }
+        });
+    }
 
     // Session tracking
     let mut total_tokens: u64 = 0;

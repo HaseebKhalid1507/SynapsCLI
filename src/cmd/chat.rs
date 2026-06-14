@@ -13,7 +13,7 @@ use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::{CancellationToken, flush_stdout};
-use synaps_cli::core::compaction::compact_conversation;
+use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
 use serde_json::json;
 use std::io::{self, Write, BufRead};
@@ -117,10 +117,10 @@ pub async fn run(
                     CommandResult::ThinkingChanged { level, budget } => {
                         eprintln!("thinking → {} ({})", level, budget);
                     }
-                    CommandResult::Compact => {
+                    CommandResult::Compact { custom_instructions } => {
                         eprintln!("compacting...");
                         if let Ok(summary) = compact_conversation(
-                            &conv.api_messages, &runtime, None
+                            &conv.api_messages, &runtime, custom_instructions.as_deref()
                         ).await {
                             conv.api_messages = vec![json!({
                                 "role": "user",
@@ -144,7 +144,7 @@ pub async fn run(
                     eprintln!("session cleared → {}", &conv.session.id[..8]);
                 }
                 "sessions" => {
-                    match synaps_cli::list_sessions() {
+                    match synaps_cli::list_recent_sessions(20) {
                         Ok(sessions) => {
                             for s in sessions.iter().take(20) {
                                 let marker = if s.id == conv.session.id { "→ " } else { "  " };
@@ -236,9 +236,9 @@ pub async fn run(
                 EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
                     eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
                 }
-                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, model } => {
+                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
                     let model_name = model.as_deref().unwrap_or(runtime.model());
-                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, model_name);
+                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
                 }
                 EngineStreamEvent::SteeringDelivered { message } => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);

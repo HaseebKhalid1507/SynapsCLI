@@ -243,6 +243,8 @@ mod rpc_event {
                 output_tokens: 50,
                 cache_read_input_tokens: 10,
                 cache_creation_input_tokens: 5,
+                cache_creation_5m: Some(3),
+                cache_creation_1h: Some(2),
                 model: Some("claude-3-5-haiku-20241022".into()),
             },
         };
@@ -353,6 +355,8 @@ mod rpc_event {
                 output_tokens: 5,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
                 model: None,
             },
         };
