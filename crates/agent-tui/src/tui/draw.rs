@@ -488,23 +488,29 @@ pub(crate) fn build_render_model(
     let content_width = msg_area.width.saturating_sub(2) as usize;
 
     // ── 3. Line-cache maintenance ──────────────────────────────────────────────
-    let needs_rebuild = app
+    let needs_full_rebuild = app
         .line_cache
         .as_ref()
-        .map_or(true, |(w, _)| *w != content_width);
-    if needs_rebuild {
-        let lines = app.render_lines(content_width);
-        app.line_cache = Some((content_width, lines));
+        .map_or(true, |c| c.width != content_width);
+    if needs_full_rebuild {
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, content_width))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+        app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+        app.dirty_from = None;
     }
-    // SAFETY: the branch above guarantees line_cache is Some; the fallback
-    // rebuild handles any hypothetical race where it was taken between here
-    // and there (not possible today, but avoids a panic on the main task).
+    // Paranoia fallback: guarantee Some
     if app.line_cache.is_none() {
-        let lines = app.render_lines(content_width);
-        app.line_cache = Some((content_width, lines));
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, content_width))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+        app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+        app.dirty_from = None;
     }
     let all_lines_vec: &[ratatui::text::Line<'static>] =
-        app.line_cache.as_ref().map_or(&[], |(_, v)| v.as_slice());
+        app.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
     let total = all_lines_vec.len();
     // Wrap in Arc for zero-copy clone into the model.
     let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = all_lines_vec.to_vec().into();
