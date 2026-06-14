@@ -188,12 +188,13 @@ pub async fn run(
     let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
-        // redraws to ~60fps — deltas arrive far faster than the eye can read,
-        // and per-delta full-frame rebuilds are what used to burn a core.
-        // 16ms matches the tick branch, which guarantees a throttled frame
-        // flushes promptly. (Was 33ms/30fps; draw-path alloc surgery in
-        // 40c2ce4 made 60fps affordable.)
-        let throttle = std::time::Duration::from_millis(16);
+        // redraws to ~10fps — deltas (and the spinner) arrive far faster than the
+        // eye can read, and rebuilding/republishing the whole RenderModel per
+        // frame is what burns a core (#131: ~60-69% of a core at 60fps; the
+        // spinner only needs ~10fps). The `!app.streaming` short-circuit below
+        // still renders the final/idle frame immediately, so end-of-turn state
+        // never lags. (Was 16ms/60fps; before that 33ms/30fps.)
+        let throttle = std::time::Duration::from_millis(100);
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
             // Terminal lives on the render thread — get size via the crossterm
             // TTY syscall directly (doesn't need the Terminal object).
