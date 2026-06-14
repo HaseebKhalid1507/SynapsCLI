@@ -1644,4 +1644,35 @@ mod tests {
         ));
         assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
     }
+
+    #[test]
+    fn render_lines_equals_concat_of_render_message_lines() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::User("hello world".to_string()));
+        app.push_msg(ChatMessage::Thinking("some reasoning".to_string()));
+        app.push_msg(ChatMessage::Text("here is the answer".to_string()));
+        app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_1".to_string(),
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_1".to_string(),
+            content: "file1.txt\nfile2.txt".to_string(),
+            elapsed_ms: Some(42),
+        });
+
+        let w = 80;
+        let flat = app.render_lines(w);
+        let concat: Vec<ratatui::text::Line<'static>> = (0..app.messages.len())
+            .flat_map(|i| app.render_message_lines(i, w))
+            .collect();
+
+        // Compare by rendered string content (Line doesn't impl PartialEq for spans reliably)
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&flat), to_str(&concat),
+            "render_lines must equal concat of render_message_lines for each index");
+    }
 }
