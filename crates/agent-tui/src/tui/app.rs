@@ -1,4 +1,3 @@
-use ratatui::text::Line;
 use serde_json::Value;
 use chrono::Local;
 use synaps_cli::Session;
