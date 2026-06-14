@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agent-engine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "agent-core",
  "agent-engine",
@@ -2605,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "synaps"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "agent-core",
  "agent-engine",
