@@ -435,7 +435,10 @@ pub async fn run(
                     app.request_redraw();
                 }
                 if app.advance_animations() {
-                    app.invalidate();
+                    // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
+                    // active tool animation). Mark just the last slot dirty instead of
+                    // full invalidation — O(1) instead of O(n) per frame.
+                    app.invalidate_last();
                 }
                 if let Some(msg) = app.check_gamba_exited() {
                     // check_gamba_exited() already called restore_terminal();
