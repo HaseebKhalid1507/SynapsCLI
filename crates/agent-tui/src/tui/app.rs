@@ -44,6 +44,18 @@ pub(crate) struct TimestampedMsg {
     pub(crate) time: String,
 }
 
+/// Per-message render cache. Parallel to `App.messages`: each slot holds the
+/// rendered `Vec<Line>` for that message. `flat` is their concatenation, which
+/// is what downstream (draw/selection) consumes. The `width` at which these
+/// were rendered is stored so stale entries can be detected on terminal resize.
+pub(crate) struct LineCache {
+    pub(crate) width: usize,
+    /// Rendered lines per message — index parallel to App.messages.
+    pub(crate) per_msg: Vec<Vec<ratatui::text::Line<'static>>>,
+    /// Concatenation of per_msg; what downstream code consumes.
+    pub(crate) flat: Vec<ratatui::text::Line<'static>>,
+}
+
 pub(crate) struct App {
     pub(crate) messages: Vec<TimestampedMsg>,
     pub(crate) input: String,
@@ -91,10 +103,13 @@ pub(crate) struct App {
     pub(crate) session: Session,
     pub(crate) agent_name: String,
     /// Cached wrapped+highlighted message lines.
-    /// `None` means "stale — rebuild on next draw". `Some((w, lines))` means
-    /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
-    /// trio into a single invariant-preserving field — impossible to desync.
-    pub(crate) line_cache: Option<(usize, Vec<Line<'static>>)>,
+    /// `None` means "stale — rebuild on next draw". `Some(cache)` means
+    /// "valid at cache.width". Replaced the old `(usize, Vec<Line>)` tuple
+    /// with a structured type that supports per-message incremental updates.
+    pub(crate) line_cache: Option<LineCache>,
+    /// Lowest message index whose rendered lines are stale. `None` = fully clean.
+    /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
+    pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
@@ -233,6 +248,7 @@ impl App {
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
             line_cache: None,
+            dirty_from: None,
             needs_redraw: true,
             show_full_output: false,
             logo_dismiss_t: None,
@@ -912,7 +928,7 @@ impl App {
         let (sc, sr, ec, er) = self.selection_range()?;
         let rect = self.msg_area_rect?;
         let (vis_start, vis_end) = self.visible_line_range?;
-        let (_, ref all_lines) = self.line_cache.as_ref()?;
+        let all_lines = &self.line_cache.as_ref()?.flat;
 
         let content_x = rect.x;
         let content_y = rect.y;
@@ -1283,7 +1299,12 @@ mod tests {
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.line_cache = Some((80, app.render_lines(80)));
+        app.line_cache = Some({
+            let w = 80;
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
         app.subagents.push(SubagentState {
             id: 1,
             name: "tester".to_string(),
@@ -1316,7 +1337,12 @@ mod tests {
         });
         app.tool_start_time = Some(std::time::Instant::now());
         app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.line_cache = Some((80, app.render_lines(80)));
+        app.line_cache = Some({
+            let w = 80;
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
         app.spinner_frame = 2;
 
         let invalidate_messages = app.advance_animations();
@@ -1674,5 +1700,41 @@ mod tests {
         };
         assert_eq!(to_str(&flat), to_str(&concat),
             "render_lines must equal concat of render_message_lines for each index");
+    }
+
+    #[test]
+    fn line_cache_build_produces_flat_equal_to_render_lines() {
+        // This test verifies that the LineCache struct's build path (per_msg concat -> flat)
+        // produces the same flat output as render_lines(width).
+        let mut app = test_app();
+        app.push_msg(ChatMessage::User("hi".to_string()));
+        app.push_msg(ChatMessage::Text("hello back".to_string()));
+        app.push_msg(ChatMessage::ToolUse {
+            tool_id: "t1".to_string(),
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            tool_id: "t1".to_string(),
+            content: "output".to_string(),
+            elapsed_ms: Some(10),
+        });
+
+        let w = 80;
+        let expected_flat = app.render_lines(w);
+
+        // Build a LineCache manually using the new struct
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, w))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+        let cache = LineCache { width: w, per_msg, flat };
+
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
+            "LineCache.flat must equal render_lines output");
+        assert!(cache.width == w);
     }
 }
