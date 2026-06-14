@@ -9,113 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agent-core"
-version = "0.3.0"
-dependencies = [
- "axum",
- "base64",
- "bytes",
- "chrono",
- "dirs",
- "fs4",
- "rand 0.9.4",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
-name = "agent-engine"
-version = "0.3.0"
-dependencies = [
- "agent-core",
- "anyhow",
- "arc-swap",
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "crossterm",
- "dirs",
- "fs4",
- "futures",
- "globset",
- "libc",
- "memchr",
- "notify",
- "portable-pty",
- "rand 0.9.4",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "signal-hook",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.21.0",
- "tokio-util",
- "toml",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "agent-tui"
-version = "0.3.0"
-dependencies = [
- "agent-core",
- "agent-engine",
- "anyhow",
- "arboard",
- "arc-swap",
- "async-trait",
- "chrono",
- "crossterm",
- "futures",
- "parking_lot",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "signal-hook",
- "syntect",
- "tachyonfx",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "unicode-width 0.2.0",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2607,9 +2500,6 @@ dependencies = [
 name = "synaps"
 version = "0.3.0"
 dependencies = [
- "agent-core",
- "agent-engine",
- "agent-tui",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -2636,6 +2526,9 @@ dependencies = [
  "serial_test",
  "sha2",
  "signal-hook",
+ "synaps-core",
+ "synaps-engine",
+ "synaps-tui",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2648,6 +2541,113 @@ dependencies = [
  "unicode-width 0.2.0",
  "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "synaps-core"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "dirs",
+ "fs4",
+ "rand 0.9.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "synaps-engine"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "fs4",
+ "futures",
+ "globset",
+ "libc",
+ "memchr",
+ "notify",
+ "portable-pty",
+ "rand 0.9.4",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "signal-hook",
+ "synaps-core",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.21.0",
+ "tokio-util",
+ "toml",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "synaps-tui"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "arc-swap",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "futures",
+ "parking_lot",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "signal-hook",
+ "synaps-core",
+ "synaps-engine",
+ "syntect",
+ "tachyonfx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-width 0.2.0",
  "uuid",
 ]
 
