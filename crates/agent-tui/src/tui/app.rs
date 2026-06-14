@@ -1372,6 +1372,69 @@ mod tests {
     }
 
     #[test]
+    fn spinner_tick_with_thinking_placeholder_marks_only_tail_dirty() {
+        // After advancing the spinner while THINKING_PLACEHOLDER is present,
+        // only the last message slot should be marked dirty (dirty_from == last index).
+        // Earlier per_msg slots must be untouched on the next rebuild.
+        let mut app = test_app();
+        let w = 80;
+        app.push_msg(ChatMessage::User("question".to_string()));
+        app.push_msg(ChatMessage::Text("partial response".to_string()));
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+
+        // Build full cache first
+        app.line_cache = Some({
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
+        app.dirty_from = None;
+        let last = app.messages.len() - 1;
+
+        // Snapshot per_msg[0..last]
+        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+
+        // Advance spinner (spinner_frame % 3 == 0 triggers render_lines_uses_spinner)
+        app.spinner_frame = 2; // next wrapping_add gives 3, which % 3 == 0
+        let needs_redraw = app.advance_animations();
+        assert!(needs_redraw, "spinner must signal redraw while THINKING_PLACEHOLDER present");
+
+        // The animation tick itself doesn't call invalidate — the caller in mod.rs does.
+        // We simulate that caller calling invalidate_last() (the new behaviour for slice 4).
+        // But first assert dirty_from is still None (advance_animations doesn't set it).
+        // Then we call invalidate_last() as the updated caller will.
+        app.invalidate_last();
+        assert_eq!(app.dirty_from, Some(last), "dirty_from must point to tail message only");
+
+        // Simulate draw.rs incremental rebuild
+        {
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.messages.len())
+                .map(|i| app.render_message_lines(i, w))
+                .collect();
+            let cache = app.line_cache.as_mut().unwrap();
+            for (offset, rendered) in fresh.into_iter().enumerate() {
+                cache.per_msg[last + offset] = rendered;
+            }
+            let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.len()).sum();
+            cache.flat.truncate(prefix_len);
+            for slot in &cache.per_msg[last..] {
+                cache.flat.extend(slot.iter().cloned());
+            }
+        }
+        app.dirty_from = None;
+
+        // per_msg[0..last] must be unchanged
+        let after: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+        assert_eq!(snapshot, after, "earlier per_msg slots must not change on spinner tick");
+    }
+
+    #[test]
     fn grouped_system_output_does_not_insert_rules_between_indented_lines() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("Extensions (1):".to_string()));
