@@ -18,7 +18,7 @@
       "  /model          Choose or inspect models",
       "  /settings       Configure providers and preferences",
       "  /plugins        Manage extensions",
-      "  /doctor         Diagnose local setup",
+      "  /help doctor    Diagnose local setup",
       "",
       "Guides",
       "  /help models    Models, providers, and routing",

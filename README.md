@@ -127,7 +127,7 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 ## Features
 
-**⚡ Fast.** ~73K lines of Rust. Sub-100ms cold start. Single binary, no runtime dependencies.
+**⚡ Fast.** ~81K lines of Rust across a 3-crate workspace. Sub-100ms cold start. Single binary, no runtime dependencies.
 
 **🌐 Any model.** Claude, GPT-4, Gemini, Llama, Qwen, Mistral, DeepSeek — 17 providers including free tiers (Groq, Cerebras, NVIDIA NIM). Swap mid-session with `/model`.
 
@@ -143,7 +143,7 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 **🤖 Autonomous mode.** `synaps watcher` supervises long-running agents with heartbeats, crash recovery, cost limits, and session handoff.
 
-**🎨 18 themes.** From `neon-rain` to `tokyo-night`. Hot-swap with `/theme`.
+**🎨 17 themes.** From `neon-rain` to `tokyo-night`. Hot-swap with `/theme`.
 
 ---
 
