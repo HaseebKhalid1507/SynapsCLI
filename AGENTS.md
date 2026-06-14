@@ -2,7 +2,14 @@
 
 This is the onboarding doc for any agent (Cursor, Aider, or SynapsCLI itself) touching this codebase. Read this first. If you only read one file, read this one.
 
-SynapsCLI is a terminal-native AI agent runtime written in Rust. ~75K LOC across 236 `.rs` files (counts drift — verify with `find src -name '*.rs' | xargs wc -l`). Single crate (`synaps-cli`) producing **one binary** (`synaps`) with subcommands. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
+SynapsCLI is a terminal-native AI agent runtime written in Rust. ~81K LOC across the workspace (counts drift — verify with `find src crates -name '*.rs' -not -path '*/target/*' | xargs wc -l`). **Cargo workspace** with three library crates + a root binary crate:
+
+- `synaps-core` (`crates/agent-core/`) — config, session, auth, models, memory, pricing, protocol primitives
+- `synaps-engine` (`crates/agent-engine/`) — runtime, tools, MCP, skills, events, extensions, sidecar, watcher
+- `synaps-tui` (`crates/agent-tui/`) — the ratatui TUI
+- `synaps` (`src/main.rs`) — the binary; CLI dispatch
+
+Each crate has `extern crate self as synaps_cli;` and re-exports its dependencies, so internal `synaps_cli::` paths still resolve for contributors navigating older references. Talks to Anthropic's API natively, plus any OpenAI-compatible provider (Groq, Cerebras, NVIDIA, local Ollama, etc.) via the built-in provider engine. Streams SSE, dispatches tools, renders a TUI.
 
 ---
 
@@ -11,15 +18,15 @@ SynapsCLI is a terminal-native AI agent runtime written in Rust. ~75K LOC across
 ```bash
 cargo build --release                    # full release build (lto, single codegen unit, strip)
 cargo build                              # dev build — faster compile, slower runtime
-cargo test --lib                         # most tests
-cargo test --lib -- --test-threads=1     # required for PTY tests in src/tools/shell/pty.rs
-cargo test --lib extensions::            # extension system tests
+cargo test --workspace                   # all crates + integration tests
+cargo test -p synaps-engine              # single crate
+cargo test -p synaps-engine -- --test-threads=1  # required for PTY tests (TTY fd contention)
 cargo test --test extensions_e2e         # end-to-end with real extension process
-cargo clippy --all-targets               # linting
+cargo clippy --all-targets -- -D warnings  # linting (CI gate)
 ```
 
 **Minimum Rust:** 1.80 (edition 2021).
-**Config path:** `~/.synaps-cli/config` (plain `key = value`, see `src/core/config.rs`).
+**Config path:** `~/.synaps-cli/config` (plain `key = value`, see `crates/agent-core/src/core/config.rs`).
 **Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
 
 - `synaps` (no args) — interactive TUI (the main product)
@@ -34,8 +41,8 @@ cargo clippy --all-targets               # linting
 - `synaps status` — check account usage
 
 **Test quirks:**
-- PTY tests (`src/tools/shell/pty.rs`, `src/tools/shell/session.rs`) have historically been flaky under parallel execution due to TTY fd contention. Recent runs pass in parallel consistently — but if you see `shell::` failures, retry with `--test-threads=1` before suspecting your change.
-- `cargo test --lib` does NOT run the integration tests in `tests/` (e.g. `extensions_e2e`, the `extension_provider_*` suite). "Lib tests pass" ≠ "all tests pass". Run `cargo test` for everything.
+- PTY tests (`crates/agent-engine/src/tools/shell/pty.rs`, `crates/agent-engine/src/tools/shell/session.rs`) have historically been flaky under parallel execution due to TTY fd contention. Recent runs pass in parallel consistently — but if you see `shell::` failures, retry with `--test-threads=1` before suspecting your change.
+- `cargo test --workspace` runs everything including integration tests in `tests/` (e.g. `extensions_e2e`, the `extension_provider_*` suite). "Lib green" can still mean broken — always run the full suite.
 - Tests use `tempfile` crate. No fixtures checked in.
 
 ---
@@ -44,14 +51,10 @@ cargo clippy --all-targets               # linting
 
 ```
 src/
-├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, config, models, etc.
-├── main.rs               — unified CLI entry point, subcommand dispatch
-├── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc)
-├── engine/               — shared headless engine used by chat and agent
-│   ├── setup.rs          — boot sequence (config, runtime, extensions, session)
-│   ├── commands.rs       — slash-command handling for headless mode
-│   ├── stream.rs         — StreamEvent consumer for headless rendering
-│   └── session.rs        — ConversationState (messages, history)
+└── main.rs               — CLI entry point, subcommand dispatch
+
+crates/agent-core/src/    (crate: synaps-core)
+├── lib.rs                — crate root; re-exports config, models, session, auth, etc.
 ├── core/                 — shared primitives
 │   ├── config.rs         — SynapsConfig, load/write, profile resolution
 │   ├── models.rs         — KNOWN_MODELS, thinking_level_for_budget, context_window_for_model
@@ -62,6 +65,17 @@ src/
 │   ├── error.rs          — SynapsError type
 │   ├── logging.rs        — tracing subscriber setup
 │   └── watcher_types.rs  — shared types for watcher IPC
+├── memory/               — session memory store (mod.rs, store.rs)
+└── pricing.rs            — unified pricing table (all providers + models)
+
+crates/agent-engine/src/  (crate: synaps-engine)
+├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, etc.
+├── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc)
+├── engine/               — shared headless engine used by chat and agent
+│   ├── setup.rs          — boot sequence (config, runtime, extensions, session)
+│   ├── commands.rs       — slash-command handling for headless mode
+│   ├── stream.rs         — StreamEvent consumer for headless rendering
+│   └── session.rs        — ConversationState (messages, history)
 ├── runtime/              — THE BRAIN
 │   ├── mod.rs            — Runtime struct, orchestration loop
 │   ├── api.rs            — Anthropic API body construction + SSE parsing
@@ -81,7 +95,6 @@ src/
 │       ├── translate.rs  — Anthropic↔OpenAI message/tool/event translation
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       └── ping.rs       — /ping health check (parallel, non-blocking)
-├── memory/               — session memory store (mod.rs, store.rs)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
@@ -96,25 +109,6 @@ src/
 │   ├── secret_prompt.rs  — secure sudo password prompt handling
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
-├── tui/                  — the TUI (module, entered via default `synaps` subcommand)
-│   ├── mod.rs            — event loop + apply_setting()
-│   ├── app.rs            — App state, record_cost(), line cache
-│   ├── input.rs          — key handling, process_submit()
-│   ├── draw.rs           — render dispatch
-│   ├── render.rs         — message rendering
-│   ├── markdown.rs       — markdown → styled lines
-│   ├── highlight.rs      — syntect-backed syntax highlighting
-│   ├── stream_handler.rs — StreamEvent → UI mutation
-│   ├── commands.rs       — slash-command dispatch (STREAMING_COMMANDS, handle_command)
-│   ├── theme/            — 17 built-in palettes + user TOML loader
-│   ├── settings/         — /settings modal (schema, input, draw)
-│   ├── plugins/          — /plugins modal
-│   └── gamba.rs          — easter egg. Don't touch.
-├── watcher/              — supervisor daemon
-│   ├── mod.rs            — subsystem entry (invoked by `synaps watcher`)
-│   ├── supervisor.rs     — per-agent lifecycle, limits, retries
-│   ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
-│   └── display.rs        — `watcher status` renderer
 ├── mcp/                  — Model Context Protocol client
 │   ├── connection.rs     — JSON-RPC over stdio to MCP servers
 │   ├── lazy.rs           — lazy server spawn (don't pay until connect_mcp_server called)
@@ -127,14 +121,37 @@ src/
 │   ├── manifest.rs       — ExtensionManifest from plugin.json
 │   ├── manager.rs        — ExtensionManager lifecycle
 │   └── runtime/process.rs — JSON-RPC over stdio ProcessExtension
-└── skills/               — skill discovery + command registry
-    ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
-    ├── manifest.rs       — plugin.json / marketplace.json parsers
-    ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
-    ├── marketplace.rs    — plugin install from marketplace
-    └── tool.rs           — load_skill Tool impl
+├── sidecar/              — sidecar process support
+├── skills/               — skill discovery + command registry
+│   ├── loader.rs         — walks .synaps-cli/{plugins,skills} roots
+│   ├── manifest.rs       — plugin.json / marketplace.json parsers
+│   ├── registry.rs       — CommandRegistry: built-ins + skill names → tab-complete
+│   ├── marketplace.rs    — plugin install from marketplace
+│   └── tool.rs           — load_skill Tool impl
+└── watcher/              — supervisor daemon
+    ├── mod.rs            — subsystem entry (invoked by `synaps watcher`)
+    ├── supervisor.rs     — per-agent lifecycle, limits, retries
+    ├── ipc.rs            — Unix socket protocol (deploy, status, stop)
+    └── display.rs        — `watcher status` renderer
+
+crates/agent-tui/src/     (crate: synaps-tui)
+└── tui/                  — the TUI (module, entered via default `synaps` subcommand)
+    ├── mod.rs            — event loop + apply_setting()
+    ├── app.rs            — App state, record_cost(), line cache
+    ├── input.rs          — key handling, process_submit()
+    ├── draw.rs           — render dispatch
+    ├── render.rs         — message rendering
+    ├── markdown.rs       — markdown → styled lines
+    ├── highlight.rs      — syntect-backed syntax highlighting
+    ├── stream_handler.rs — StreamEvent → UI mutation
+    ├── commands.rs       — slash-command dispatch (STREAMING_COMMANDS, handle_command)
+    ├── theme/            — 17 built-in palettes + user TOML loader
+    ├── settings/         — /settings modal (schema, input, draw)
+    ├── plugins/          — /plugins modal
+    └── gamba.rs          — easter egg. Don't touch.
 
 bench/                    — cache strategy benchmark suite (Python; see bench/README.md)
+tests/                    — integration tests (extensions_e2e, extension_provider_*, etc.)
 ```
 
 The tree above is curated, not exhaustive — `extensions/`, `skills/`, and `tui/` have grown more files than listed. When in doubt, `ls` the directory.
@@ -145,23 +162,23 @@ The tree above is curated, not exhaustive — `extensions/`, `skills/`, and `tui
 
 This is the single most important flow to understand.
 
-1. **User input** → `tui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
+1. **User input** → `crates/agent-tui/src/tui/input.rs::process_submit()` builds a user message, pushes it into `App.messages`, kicks off a stream.
 2. **Stream kickoff** → `Runtime::run_stream_with_messages()` in `runtime/mod.rs`.
 3. **Auth refresh** → `runtime/auth.rs` refreshes the OAuth token if near expiry, before the request is built.
 4. **API body build** → `runtime/api.rs::call_api_stream()`. Steps:
    - **Provider routing** → `openai::try_route(model, ...)` checks if the model has a provider prefix (e.g. `groq/llama-3.3-70b`). If yes, routes through `openai/stream.rs` instead of Anthropic. If no, falls through to Anthropic.
    - Clone messages, strip UI-only fields.
    - `HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages)` — see caching section below.
-   - Look up thinking config based on model: adaptive (`{type: "adaptive"}` + `output_config.effort`) for Opus 4.7+ / Sonnet 4.7+ / 5.x / Fable 5, else legacy (`{type: "enabled", budget_tokens: N}`). Gated by `model_supports_adaptive_thinking()` in `core/models.rs`.
+   - Look up thinking config based on model: adaptive (`{type: "adaptive"}` + `output_config.effort`) for Opus 4.7+ / Sonnet 4.7+ / 5.x / Fable 5, else legacy (`{type: "enabled", budget_tokens: N}`). Gated by `model_supports_adaptive_thinking()` in `crates/agent-core/src/core/models.rs`.
    - Serialize tool schemas (`ToolRegistry::schemas_json()`).
    - POST to `https://api.anthropic.com/v1/messages` with `stream: true`.
    - **Retries** — transient errors (429/5xx/529) retry with backoff up to `api_retries` (default 3).
 5. **SSE parse** → line-by-line in `api.rs`. Before the body is consumed, response headers (request-id, rate-limits) are captured for telemetry when `telemetry != off`. Emits `StreamEvent`s — a two-level enum: `StreamEvent::{Llm, Session, Agent}` wrapping `LlmEvent::{Thinking, Text, ToolUseStart, ToolUseDelta, ToolUse, ToolResult, Usage, ...}` (see `runtime/types.rs` for the full shape).
 6. **Tool dispatch** → `runtime/stream.rs` collects `ToolUse` blocks, executes them in parallel via `tokio::spawn`, feeds `tool_result` blocks back into the next turn. Extension hooks (`before_tool_call` / `after_tool_call`) fire around each execution — a slow extension stalls dispatch.
 7. **Loop** → steps 4–6 repeat until `stop_reason != "tool_use"` (typically `"end_turn"`).
-8. **UI update** → `tui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`. Headless mode has its own consumer in `engine/stream.rs` — **new event variants must be handled in BOTH** or headless silently drops them.
+8. **UI update** → `crates/agent-tui/src/tui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`. Headless mode has its own consumer in `crates/agent-engine/src/engine/stream.rs` — **new event variants must be handled in BOTH** or headless silently drops them.
 
-`StreamEvent` (in `runtime/types.rs`) is the wire format between Runtime and any UI. Add new event variants here if you need to surface something new — then update both consumers (`tui/stream_handler.rs` AND `engine/stream.rs`).
+`StreamEvent` (in `crates/agent-engine/src/runtime/types.rs`) is the wire format between Runtime and any UI. Add new event variants here if you need to surface something new — then update both consumers (`crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs`).
 
 ---
 
@@ -169,7 +186,7 @@ This is the single most important flow to understand.
 
 ### Adding a New Tool
 
-1. Create `src/tools/my_tool.rs` with a struct implementing the `Tool` trait:
+1. Create `crates/agent-engine/src/tools/my_tool.rs` with a struct implementing the `Tool` trait:
    ```rust
    #[async_trait::async_trait]
    pub trait Tool: Send + Sync {
@@ -179,9 +196,9 @@ This is the single most important flow to understand.
        async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String>;
    }
    ```
-   See `src/tools/mod.rs::Tool`.
-2. Re-export in `src/tools/mod.rs` (`pub use my_tool::MyTool;`).
-3. Register in `src/tools/registry.rs::ToolRegistry::new()` — add to the `vec![]`.
+   See `crates/agent-engine/src/tools/mod.rs::Tool`.
+2. Re-export in `crates/agent-engine/src/tools/mod.rs` (`pub use my_tool::MyTool;`).
+3. Register in `crates/agent-engine/src/tools/registry.rs::ToolRegistry::new()` — add to the `vec![]`.
 4. If it streams output, use `ctx.tx_delta` (UnboundedSender<String>) to push deltas.
 5. If it's restricted (e.g. watcher-only), gate on `ctx.watcher_exit_path.is_some()` or similar.
 
@@ -191,26 +208,26 @@ The tool's `parameters()` JSON schema is what the model sees. Be precise — bad
 
 The old "5-site sync" pain point was solved by the `define_settings!` macro. Now it's 2–3 sites:
 
-1. **`src/tui/settings/defs.rs`** — add an entry to the `define_settings!` invocation: key, label, category, `EditorKind` (`Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`), help text, and the apply closure (`|runtime, app, value| { ... }`). The macro generates both `ALL_SETTINGS` (schema) and `apply_setting_dispatch()` — they cannot drift.
-2. **`src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default.
-3. **`src/skills/mod.rs::BUILTIN_COMMANDS`** — only if it also gets a slash command (e.g. `/foo`); then handle it in `tui/commands.rs::handle_command()` too.
+1. **`crates/agent-tui/src/tui/settings/defs.rs`** — add an entry to the `define_settings!` invocation: key, label, category, `EditorKind` (`Cycler(&[...])`, `Text { numeric }`, `ModelPicker`, or `ThemePicker`), help text, and the apply closure (`|runtime, app, value| { ... }`). The macro generates both `ALL_SETTINGS` (schema) and `apply_setting_dispatch()` — they cannot drift.
+2. **`crates/agent-core/src/core/config.rs::load_config()`** — add a branch to parse the key from the config file, plus the field on `SynapsConfig` and its default.
+3. **`crates/agent-engine/src/skills/mod.rs::BUILTIN_COMMANDS`** — only if it also gets a slash command (e.g. `/foo`); then handle it in `tui/commands.rs::handle_command()` too.
 
-`apply_setting()` itself lives in `src/tui/helpers.rs` and delegates to the generated dispatch — you should rarely need to touch it. Step 2 is the un-tested one: forget the `load_config()` branch and the setting silently won't persist across restarts.
+`apply_setting()` itself lives in `crates/agent-tui/src/tui/helpers.rs` and delegates to the generated dispatch — you should rarely need to touch it. Step 2 is the un-tested one: forget the `load_config()` branch and the setting silently won't persist across restarts.
 
 ### Adding a New Model
 
-1. `src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple (Anthropic models only).
-2. For OpenAI-compatible provider models: add to `src/runtime/openai/registry.rs` in the provider's `models` array as `(model_id, label, tier)`.
+1. `crates/agent-core/src/core/models.rs::KNOWN_MODELS` — add `(id, description)` tuple (Anthropic models only).
+2. For OpenAI-compatible provider models: add to `crates/agent-engine/src/runtime/openai/registry.rs` in the provider's `models` array as `(model_id, label, tier)`.
 3. If it supports adaptive thinking: update `model_supports_adaptive_thinking()`.
 4. If it supports 1M context opt-in: update `model_supports_1m()`. If context window differs: `context_window_for_model()`.
-5. Pricing: see `src/pricing.rs` for the unified pricing table. `record_cost()` in `src/tui/app.rs` uses it. Default falls back to Sonnet pricing.
+5. Pricing: see `crates/agent-core/src/pricing.rs` for the unified pricing table. `record_cost()` in `crates/agent-tui/src/tui/app.rs` uses it. Default falls back to Sonnet pricing.
 6. There are existing tests in `core/models.rs` — extend them.
 
 Worked example: `claude-fable-5` (commits e824fdc, 497c1ef, 59c6be3) touched all of: KNOWN_MODELS, `model_supports_adaptive_thinking()`, `model_supports_1m()`, and pricing ($10/$50 per MTok).
 
 ### Adding a New Provider
 
-All OpenAI-compatible providers live in `src/runtime/openai/registry.rs`.
+All OpenAI-compatible providers live in `crates/agent-engine/src/runtime/openai/registry.rs`.
 
 1. Add a `ProviderSpec` entry to the `providers()` function:
    ```rust
@@ -244,15 +261,15 @@ The agent loop (`runtime/stream.rs`) is **provider-blind** — both paths return
 
 ### Adding a New Theme
 
-1. Add a `Theme::my_theme()` method in `src/tui/theme/palettes/` (one file per palette) returning a populated `Theme` struct (all ~30 color fields).
-2. Register in `src/tui/theme/mod.rs::Theme::builtin()` — add a `match` arm.
-3. Add the theme name to the list returned by `src/tui/settings/mod.rs::theme_options()`.
+1. Add a `Theme::my_theme()` method in `crates/agent-tui/src/tui/theme/palettes/` (one file per palette) returning a populated `Theme` struct (all ~30 color fields).
+2. Register in `crates/agent-tui/src/tui/theme/mod.rs::Theme::builtin()` — add a `match` arm.
+3. Add the theme name to the list returned by `crates/agent-tui/src/tui/settings/mod.rs::theme_options()`.
 4. Test via `/settings → Appearance → Theme` or config `theme = my-theme`. Requires TUI restart to apply.
 
 ### Adding a New Slash Command
 
-1. Add name to `BUILTIN_COMMANDS` (`src/skills/mod.rs`) — this feeds tab-complete via `CommandRegistry::all_commands()`.
-2. If it should work during streaming, add to `STREAMING_COMMANDS` (`src/tui/commands.rs`).
+1. Add name to `BUILTIN_COMMANDS` (`crates/agent-engine/src/skills/mod.rs`) — this feeds tab-complete via `CommandRegistry::all_commands()`.
+2. If it should work during streaming, add to `STREAMING_COMMANDS` (`crates/agent-tui/src/tui/commands.rs`).
 3. Add a match arm in `handle_command()` (tui/commands.rs).
 4. If it needs async work or opens a modal, extend `CommandAction` enum and handle in `tui/mod.rs` event loop.
 
@@ -264,7 +281,7 @@ Agents from installed plugins can be dispatched via `plugin:agent` namespaced sy
 subagent(agent: "dev-tools:sage", task: "...")
 ```
 
-Resolution order in `resolve_agent_prompt()` (src/tools/agent.rs):
+Resolution order in `resolve_agent_prompt()` (`crates/agent-engine/src/tools/agent.rs`):
 1. Name contains `/` → file path (read directly)
 2. Name contains `:` → `plugin:agent` namespaced lookup → searches `~/.synaps-cli/plugins/<plugin>/skills/*/agents/<agent>.md`
 3. Bare name → `~/.synaps-cli/agents/<name>.md`
@@ -297,10 +314,10 @@ Plugins declare keybinds in `plugin.json`:
 - `run_script` — **NOT IMPLEMENTED.** The match arm in `skills/keybinds.rs` is a no-op TODO. If you implement it: validate the script path stays inside the plugin dir and never pass manifest strings to a shell unescaped.
 
 **Implementation path:**
-1. `ManifestKeybind` (skills/keybinds.rs) — serde struct for plugin.json parsing
-2. `KeybindRegistry` (skills/keybinds.rs) — collects + resolves conflicts
-3. Built during `skills::register()` (skills/mod.rs) alongside command registry
-4. Checked in `handle_key()` (tui/input.rs) before the core match block
+1. `ManifestKeybind` (`crates/agent-engine/src/skills/keybinds.rs`) — serde struct for plugin.json parsing
+2. `KeybindRegistry` (`crates/agent-engine/src/skills/keybinds.rs`) — collects + resolves conflicts
+3. Built during `skills::register()` (`crates/agent-engine/src/skills/mod.rs`) alongside command registry
+4. Checked in `handle_key()` (`crates/agent-tui/src/tui/input.rs`) before the core match block
 5. `parse_key()` / `format_key()` for notation ↔ KeyCombo conversion
 
 **Priority:** Core (Ctrl+C, Esc, etc.) > user config (`keybind.*`) > plugin. Core binds are never overridable. User config always wins over plugins.
@@ -315,7 +332,7 @@ keybind.F6 = disabled        # block a plugin bind
 
 ## Prompt Caching Strategy
 
-This is non-obvious and cost-critical. See `src/runtime/helpers.rs::annotate_cache_breakpoint`.
+This is non-obvious and cost-critical. See `crates/agent-engine/src/runtime/helpers.rs::annotate_cache_breakpoint`.
 
 - **Manual breakpoint placement.** We don't rely solely on Anthropic's auto-cache.
 - Anthropic allows up to 4 cache markers per request. We reserve 2 for tools + system prompt (placed elsewhere in `api.rs`), leaving **2 for conversational markers**.
@@ -348,9 +365,9 @@ No `budget_tokens` field — the API rejects it silently on these models (return
 "thinking": {"type": "enabled", "budget_tokens": N, "display": "summarized"}
 ```
 
-**The "0 is adaptive" sentinel:** `Runtime::thinking_budget: u32` uses `0` to mean "adaptive (model decides)". Any consumer must handle this. If a user sets `thinking = adaptive` but the model is legacy, `thinking_level_for_budget(0)` returns `"adaptive"` but the legacy path clamps it to `DEFAULT_LEGACY_ADAPTIVE_FALLBACK = 16384` (matches "high"). See `core/models.rs:80` and `runtime/api.rs` (the clamp site — commit 5edcb86).
+**The "0 is adaptive" sentinel:** `Runtime::thinking_budget: u32` uses `0` to mean "adaptive (model decides)". Any consumer must handle this. If a user sets `thinking = adaptive` but the model is legacy, `thinking_level_for_budget(0)` returns `"adaptive"` but the legacy path clamps it to `DEFAULT_LEGACY_ADAPTIVE_FALLBACK = 16384` (matches "high"). See `crates/agent-core/src/core/models.rs:80` and `crates/agent-engine/src/runtime/api.rs` (the clamp site — commit 5edcb86).
 
-Mapping (`core/models.rs::thinking_level_for_budget`):
+Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 - `0` → `"adaptive"`
 - `1..=2048` → `"low"`
 - `2049..=4096` → `"medium"`
@@ -363,13 +380,13 @@ Mapping (`core/models.rs::thinking_level_for_budget`):
 
 ```
 ~/.synaps-cli/config (or ~/.synaps-cli/{profile}/config)
-  → core/config.rs::load_config()  — parses key = value, env var overrides
+  → crates/agent-core/src/core/config.rs::load_config()  — parses key = value, env var overrides
   → Runtime::apply_config()         — sets fields on Runtime
   → runtime/api.rs reads from Runtime at request time
-  → tui/helpers.rs::apply_setting() — runtime mutation (via generated apply_setting_dispatch) + write_config_value() for live /settings changes
+  → crates/agent-tui/src/tui/helpers.rs::apply_setting() — runtime mutation (via generated apply_setting_dispatch) + write_config_value() for live /settings changes
 ```
 
-`SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `core/config.rs::resolve_read_path()`.
+`SYNAPS_PROFILE` env var selects a sub-directory under `~/.synaps-cli/` (e.g. `~/.synaps-cli/work/config`). Profile-specific files override root files. See `crates/agent-core/src/core/config.rs::resolve_read_path()`.
 
 ### Config Keys
 
@@ -395,7 +412,7 @@ Mapping (`core/models.rs::thinking_level_for_budget`):
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
 | `telemetry` | string | off | Per-request API telemetry: `off`, `basic` (timing+usage+cost), `full` (adds rate-limit headers + cache diagnostics). JSONL at `~/.cache/synaps/api-log.jsonl` (0600, O_NOFOLLOW) |
 | `cache_diagnostics` | bool | false | Opt into the `cache-diagnosis` beta — server-side cache miss reasons (recorded when telemetry is on) |
-| `shell.*` / `server.*` / `bridge.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` / `parse_bridge_config_key` in `core/config.rs` — see those functions for the full key list |
+| `shell.*` / `server.*` / `bridge.*` | — | — | Namespaced config families parsed by `parse_shell_config_key` / `parse_server_config_key` / `parse_bridge_config_key` in `crates/agent-core/src/core/config.rs` — see those functions for the full key list |
 
 ---
 
@@ -404,10 +421,10 @@ Mapping (`core/models.rs::thinking_level_for_budget`):
 1. **Settings need `defs.rs` + `load_config()` + (optionally) `BUILTIN_COMMANDS`** (see recipe above). The `load_config()` branch is untested — forget it and the setting won't persist.
 2. **`thinking_budget: 0` sentinel.** Always handle the "adaptive" case. Legacy paths must clamp.
 3. **Cache breakpoints are prefix-sensitive.** Any mutation to historical messages breaks the cache for all subsequent turns. Don't "fix up" old messages retroactively (the marker-pruning inside `annotate_cache_breakpoint` is the sanctioned exception).
-4. **`cargo test --lib` skips integration tests.** The `tests/` suite (extensions e2e, provider tests) only runs with plain `cargo test`. "Lib green" can still mean broken.
+4. **`cargo test -p <crate>` skips integration tests.** The `tests/` suite (extensions e2e, provider tests) only runs with `cargo test --workspace`. "Single-crate green" can still mean broken.
 5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes.
-6. **New StreamEvents need TWO consumers.** `tui/stream_handler.rs` AND `engine/stream.rs` — update only the TUI one and headless mode silently drops the event.
-7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced via the restricted registry in `tools/registry.rs` (see the second tool list).
+6. **New StreamEvents need TWO consumers.** `crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs` — update only the TUI one and headless mode silently drops the event.
+7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
 8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
 10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
@@ -442,16 +459,16 @@ Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`.
 
 ## File Layout Conventions
 
-- **One file per tool** in `src/tools/*.rs`. Complex tools get a sub-directory (e.g. `src/tools/shell/`).
+- **One file per tool** in `crates/agent-engine/src/tools/*.rs`. Complex tools get a sub-directory (e.g. `crates/agent-engine/src/tools/shell/`).
 - **TUI separation of concerns:**
-  - `tui/input.rs` — key handling
-  - `tui/draw.rs`/`tui/render.rs` — rendering
-  - `tui/app.rs` — state
-  - `tui/commands.rs` — slash commands
-  - `tui/stream_handler.rs` — StreamEvent → App mutation
+  - `crates/agent-tui/src/tui/input.rs` — key handling
+  - `crates/agent-tui/src/tui/draw.rs`/`crates/agent-tui/src/tui/render.rs` — rendering
+  - `crates/agent-tui/src/tui/app.rs` — state
+  - `crates/agent-tui/src/tui/commands.rs` — slash commands
+  - `crates/agent-tui/src/tui/stream_handler.rs` — StreamEvent → App mutation
 - **Tests** live in `#[cfg(test)] mod tests { ... }` at the bottom of each file.
-- **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `tui/mod.rs::apply_setting()`.
-- **Re-exports** happen at module roots (`tools/mod.rs`, `core/mod.rs`) and at the crate root (`lib.rs`). Prefer using the crate-root re-exports: `synaps_cli::Runtime`, `synaps_cli::config::...`, `synaps_cli::models::...`.
+- **Settings module convention:** `schema.rs` (definitions) → `input.rs` (key handling inside modal) → `draw.rs` (modal rendering) → handled by `crates/agent-tui/src/tui/mod.rs::apply_setting()`.
+- **Re-exports** happen at module roots (`crates/agent-engine/src/tools/mod.rs`, `crates/agent-core/src/core/mod.rs`) and at each crate root (`lib.rs`). Prefer using the crate-root re-exports: `synaps_cli::Runtime`, `synaps_cli::config::...`, `synaps_cli::models::...`.
 
 ### Notable Docs
 
@@ -465,7 +482,7 @@ Release profile: `lto = true, codegen-units = 1, strip = true, panic = "abort"`.
 
 ## The Runtime Struct
 
-Located in `src/runtime/mod.rs`. The single source of truth for a session.
+Located in `crates/agent-engine/src/runtime/mod.rs`. The single source of truth for a session.
 
 Owns: `model`, `thinking_budget`, `system_prompt`, `ToolRegistry` (behind `Arc<RwLock>`), HTTP client, telemetry level, limits (`max_tool_output`, `bash_timeout`, `bash_max_timeout`, `subagent_timeout`, `api_retries`).
 
@@ -484,10 +501,10 @@ Runtime is `Clone` (cheap — uses `Arc` internally) so subagents can fork from 
 
 Things an agent should know about, but not necessarily fix in-passing:
 
-- **`src/tools/agent.rs`** is legacy, superseded by the `subagent` tools. Kept for compatibility with older agent definitions. Remove after deprecation window.
+- **`crates/agent-engine/src/tools/agent.rs`** is legacy, superseded by the `subagent` tools. Kept for compatibility with older agent definitions. Remove after deprecation window.
 - **Theme changes require restart.** `Theme` is captured by long-lived render state; refactor to use `Rc<RefCell<Theme>>` or similar if live-swap becomes important.
-- **Watcher subsystem** (`src/watcher/`, `src/cmd/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
-- **`run_script` keybind action is a stub** (`tui/input.rs` — TODO). Needs path validation before implementation.
+- **Watcher subsystem** (`crates/agent-engine/src/watcher/`, `crates/agent-engine/src/cmd/agent.rs`) is being evaluated for removal from the main repo. Don't invest in deep refactors there without checking with project owner first.
+- **`run_script` keybind action is a stub** (`crates/agent-tui/src/tui/input.rs` — TODO). Needs path validation before implementation.
 - **Sliding-4 cache strategy is over-engineered** — bench data shows `single-last` is equivalent (see Prompt Caching Strategy). Simplification pending.
 - **`gamba.rs`** — easter egg. Yes, really. Leave it alone.
 
@@ -504,7 +521,7 @@ Trigger modes:
 
 Limits (per-agent, in `config.toml`): `max_session_tokens`, `max_session_duration_mins`, `max_session_cost_usd`, `max_daily_cost_usd`, `max_tool_calls`, `cooldown_secs`, `max_retries`.
 
-When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `src/tools/watcher_exit.rs` and `src/watcher/supervisor.rs`.
+When a limit is hit, the agent is prompted to call the `watcher_exit` tool to write a handoff. See `crates/agent-engine/src/tools/watcher_exit.rs` and `crates/agent-engine/src/watcher/supervisor.rs`.
 
 IPC is over a Unix socket (`src/watcher/ipc.rs`). Commands: `deploy`, `status`, `stop`, `logs`.
 
@@ -601,7 +618,7 @@ Load behavioral guidelines. Discovery roots: `.synaps-cli/plugins/`, `.synaps-cl
 | `skill` (string, req) — `name` or `plugin:name` |
 
 ### `shell_start` / `shell_send` / `shell_end`
-Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shell_send` to interact and `shell_end` to clean up. For interactive programs (REPLs, SSH, etc.). See `src/tools/shell/` for the full state machine.
+Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shell_send` to interact and `shell_end` to clean up. For interactive programs (REPLs, SSH, etc.). See `crates/agent-engine/src/tools/shell/` for the full state machine.
 
 ### `watcher_exit`
 **Watcher agents only.** Writes `handoff.json`, triggers shutdown.
@@ -657,7 +674,7 @@ Use `subagent` for simple sequential delegation (blocks until done).
 Use `subagent_start` for parallel execution or when you want to continue working while the subagent runs.
 Use `subagent_resume` on finished/timed-out/failed handles to continue with new instructions — the original handle stays readable.
 
-Implementation: `src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`.
+Implementation: `crates/agent-engine/src/tools/subagent/{oneshot,start,status,steer,collect,resume}.rs`.
 
 ---
 
@@ -671,7 +688,7 @@ Sessions and compaction lineages can be aliased for easy resume.
 - `/chain unname <name>` — remove a chain bookmark.
 - `/chain` (no args) — show lineage + "bookmarked by: @name" if present.
 
-Resolution (`core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
+Resolution (`crates/agent-core/src/core/session.rs::resolve_session()`) tries **chain name → session name → partial ID** in that order. Used by `synaps --continue <NAME_OR_ID>`, `/resume`, and server `--continue`. The resolution path is surfaced to the user via a system message (e.g. `↳ resolved via chain 'foo'`).
 
 ---
 
@@ -691,11 +708,11 @@ Events appear as styled cards and auto-trigger model turns. During streaming, ev
 For agents touching this code — what's protected, what isn't, and what to never weaken.
 
 **Protections that exist (don't break them):**
-- Auth tokens: `~/.synaps-cli/auth.json` — fs4 advisory locks + mode `0600` (`src/core/auth/storage.rs`)
-- Config: `write_config_value` writes via temp file + rename, sets `0600` (`src/core/config.rs`) — it holds provider API keys
-- Telemetry log: `0600` + `O_NOFOLLOW` on the append path (`src/runtime/telemetry.rs`)
-- Event registry/sockets: dirs `0700`, session sockets `0600` after bind, inbox refuses symlinks + caps events at 256KB (`src/events/`)
-- Plugin agent resolution: identifier validation on both sides of `plugin:agent`, no path traversal (`src/tools/agent.rs`)
+- Auth tokens: `~/.synaps-cli/auth.json` — fs4 advisory locks + mode `0600` (`crates/agent-core/src/core/auth/storage.rs`)
+- Config: `write_config_value` writes via temp file + rename, sets `0600` (`crates/agent-core/src/core/config.rs`) — it holds provider API keys
+- Telemetry log: `0600` + `O_NOFOLLOW` on the append path (`crates/agent-engine/src/runtime/telemetry.rs`)
+- Event registry/sockets: dirs `0700`, session sockets `0600` after bind, inbox refuses symlinks + caps events at 256KB (`crates/agent-engine/src/events/`)
+- Plugin agent resolution: identifier validation on both sides of `plugin:agent`, no path traversal (`crates/agent-engine/src/tools/agent.rs`)
 - `ProviderConfig` `Debug` redacts `api_key` — but `Serialize` does NOT. Never serialize provider config into logs or output.
 
 **Known soft spots (be aware, warn users, don't make worse):**
@@ -703,7 +720,7 @@ For agents touching this code — what's protected, what isn't, and what to neve
 - **The `read` tool can read `~/.synaps-cli/config` and the auth store** — a prompt-injected agent can exfiltrate API keys into context, session logs, or subagent logs (`~/.synaps-cli/logs/subagents/`). There is no denylist.
 - **Event bus has no sender authentication.** Filesystem perms (0600/0700) stop other *users*, but any same-UID process can drop JSON into the inbox or hit the session socket and trigger an unattended model turn. Events are untrusted input — prompt injection by design. Treat event content accordingly.
 - **Watcher IPC** (`src/watcher/ipc.rs`): socket chmod'd `0600` after bind (small race window); no command-level auth on deploy/stop beyond filesystem perms.
-- **Marketplace installs are TOFU** (trust-on-first-use, per `github.com/<owner>` host key — `src/skills/marketplace.rs`). No signature verification — a compromised upstream repo ships straight to users on update.
+- **Marketplace installs are TOFU** (trust-on-first-use, per `github.com/<owner>` host key — `crates/agent-engine/src/skills/marketplace.rs`). No signature verification — a compromised upstream repo ships straight to users on update.
 - **`run_script` keybind is an unimplemented stub** — when implementing, validate the path stays inside the plugin dir.
 - **`inject_prompt` keybinds** let plugins submit text as the user. Audit third-party plugin manifests before install.
 

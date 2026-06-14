@@ -162,7 +162,7 @@ pub(super) async fn handle_stream_event(
             }
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
-            app.push_msg(ChatMessage::Error(err));
+            app.push_msg(ChatMessage::Error(sanitize_notice(&err)));
             app.streaming = false;
             app.subagents.clear();
             // Restore a valid trailing state — drop unmatched trailing messages

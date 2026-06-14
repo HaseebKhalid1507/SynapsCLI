@@ -44,6 +44,16 @@ impl SseLineBuffer {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
+        // Hard ceiling: a server that never sends a newline must not grow the
+        // buffer without bound (hostile/buggy endpoint). Discard the in-progress
+        // line and resync rather than OOM. 8 MiB is far above any real SSE frame.
+        const MAX_LINE: usize = 8 * 1024 * 1024;
+        if self.buf.len().saturating_sub(self.pos).saturating_add(chunk.len()) > MAX_LINE {
+            tracing::warn!("SSE line exceeded {} bytes — discarding buffer to resync", MAX_LINE);
+            self.buf.clear();
+            self.pos = 0;
+            return;
+        }
         self.buf.extend_from_slice(chunk);
     }
 
