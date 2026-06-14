@@ -1,5 +1,5 @@
 [package]
-name = "agent-tui"
+name = "synaps-tui"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
@@ -11,8 +11,8 @@ name = "agent_tui"
 path = "src/lib.rs"
 
 [dependencies]
-agent-core   = { path = "../agent-core" }
-agent-engine = { path = "../agent-engine" }
+agent-core   = { path = "../agent-core", version = "0.3.0", package = "synaps-core" }
+agent-engine = { path = "../agent-engine", version = "0.3.0", package = "synaps-engine" }
 
 # Async runtime + utilities
 tokio        = { version = "1.0", features = ["full"] }
