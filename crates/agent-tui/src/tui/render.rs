@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::app::{App, ChatMessage, SPINNER_FRAMES};
+use super::app::{App, ChatMessage, SPINNER_FRAMES, THINKING_PLACEHOLDER};
 use super::theme::THEME;
 use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
 use super::markdown::{render_markdown, wrap_text};
@@ -43,7 +43,7 @@ fn output_panel_bg() -> Color {
 
 /// Tool panels span ~90% of the terminal, leaving ~5% margin on each side.
 fn tool_panel_width(viewport: usize) -> usize {
-    (viewport * 9 / 10).max(20)
+    (viewport * 9 / 10).clamp(1, viewport.saturating_sub(2).max(1))
 }
 
 /// Left margin before a tool panel (~5% of the viewport).
@@ -134,7 +134,7 @@ impl App {
                     let dim = Style::default().fg(THEME.load().thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
-                    let thinking_label = if text == "…" {
+                    let thinking_label = if text == THINKING_PLACEHOLDER {
                         let braille = ['\u{28fe}','\u{28f7}','\u{28ef}','\u{28df}','\u{287f}','\u{28bf}','\u{28fb}','\u{28fd}'];
                         let idx = (self.spinner_frame / 4) % braille.len();
                         let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
@@ -488,7 +488,7 @@ impl App {
                         result_lines.len().min(max_show)
                     };
 
-                    // Detect which tool produced this result
+                    // Detect which tool produced this result (bound once for reuse below)
                     let preceding_tool = self.find_preceding_tool_name(i);
 
                     // Check if this is read tool output (line-numbered) and try syntax highlighting
@@ -540,35 +540,34 @@ impl App {
                         )));
                     }
 
-                    // Footer: success/fail indicator with elapsed time, at the
-                    // very bottom of the box, under the output.
-                    if !is_error && show > 0 {
-                        if is_timeout {
-                            let elapsed_str = match elapsed_ms {
-                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
-                                Some(ms) => format!(" {}ms", ms),
-                                None => String::new(),
-                            };
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
-                                    Style::default().fg(THEME.load().warning_color),
-                                ),
-                                Span::styled(
-                                    elapsed_str,
-                                    Style::default().fg(THEME.load().subagent_time),
-                                ),
-                            ]));
-                        } else if self.is_active_tool_result(i) {
+                    // Footer: timeout indicator is shown unconditionally (even when is_error);
+                    // success/active footers are only shown when not an error.
+                    if is_timeout && show > 0 {
+                        let elapsed_str = match elapsed_ms {
+                            Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                            Some(ms) => format!(" {}ms", ms),
+                            None => String::new(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
+                                Style::default().fg(THEME.load().warning_color),
+                            ),
+                            Span::styled(
+                                elapsed_str,
+                                Style::default().fg(THEME.load().subagent_time),
+                            ),
+                        ]));
+                    } else if !is_error && show > 0 {
+                        if self.is_active_tool_result(i) {
                             // Tool still executing — show animation only for the active result.
-                            let preceding_tool_name = self.find_preceding_tool_name(i);
                             let elapsed_str = if let Some(start) = self.tool_start_time {
                                 let secs = start.elapsed().as_secs_f64();
                                 if secs >= 1.0 { format!(" {:.1}s", secs) }
                                 else { format!(" {}ms", (secs * 1000.0) as u64) }
                             } else { String::new() };
 
-                            if preceding_tool_name.as_deref() == Some("bash") {
+                            if preceding_tool.as_deref() == Some("bash") {
                                 let (trace, color) = bash_trace(self.spinner_frame);
                                 lines.push(Line::from(vec![
                                     Span::styled(format!("{}     ", m), Style::default()),
@@ -608,7 +607,7 @@ impl App {
                     } else if is_timeout {
                         THEME.load().warning_color
                     } else {
-                        self.find_preceding_tool_name(i)
+                        preceding_tool
                             .map(|n| tool_accent(&n))
                             .unwrap_or(THEME.load().tool_generic)
                     };
