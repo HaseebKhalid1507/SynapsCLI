@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-14
+
+### Fixed
+- **`synaps.log` was silently dead** — after the A3 split the tracing `EnvFilter` only enabled `synaps_cli=debug`, but the code now emits from `agent_core` / `agent_engine` / `agent_tui` targets. With `RUST_LOG` unset (the default) every log line was filtered out. Added the three crate targets to the filter.
+- **Version header showed a bogus `<hash>-dirty` on source-tarball installs** — `build.rs` shelled out to `git` and trusted whatever repo it found; AUR/Homebrew extract the source *inside* the package's own git checkout, so it baked an unrelated commit + a spurious `-dirty`. Now it only trusts git when its repo root **is** the synaps workspace root; any packaged build (AUR / Homebrew / crates.io) shows `vX.Y.Z · release` instead. CI-built release binaries still carry the real commit.
+- **Empty `end_turn` could misclassify as a silent-stop error in the default (telemetry-off) config** — `has_stop_reason` was derived from a telemetry-gated field. Now captured unconditionally. (#130 follow-up)
+- **In-stream API error bodies reached the screen unsanitized** — a hostile/MITM endpoint could inject terminal escape sequences via an `error` event message. Error text is now sanitized like notices.
+- **Mid-stream transport drops are now retried** through the unified retry budget instead of hard-failing the turn.
+- **`build.rs` `-dirty` no longer triggers on untracked files** (`--untracked-files=no`); SSE line buffer gained an 8 MiB hard cap against a no-newline OOM; telemetry records now carry the real retry attempt number.
+
+### Changed
+- **crates.io publish job** runs with verification enabled and keys idempotency off the process exit code (not log grep), so a genuine publish failure fails the release loudly instead of silently skipping a crate.
+
+### Docs
+- User + contributor docs (README, AGENTS, in-app `/help`, and the 36-page wiki) cross-checked against the code and refreshed for the 0.2→0.3 / A3 workspace reality.
+
 ## [0.3.1] — 2026-06-14
 
 ### Fixed
