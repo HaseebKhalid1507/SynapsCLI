@@ -711,6 +711,11 @@ impl App {
         lines
     }
 
+    /// Render the entire transcript by concatenating every message's lines.
+    /// Test-only: the live path (`build_render_model`) uses the incremental
+    /// per-message cache and never rebuilds the whole transcript at once.
+    /// Retained as the reference oracle that the cache tests assert against.
+    #[cfg(test)]
     pub(crate) fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for i in 0..self.messages.len() {
