@@ -488,26 +488,58 @@ pub(crate) fn build_render_model(
     let content_width = msg_area.width.saturating_sub(2) as usize;
 
     // ── 3. Line-cache maintenance ──────────────────────────────────────────────
-    let needs_full_rebuild = app
-        .line_cache
-        .as_ref()
-        .map_or(true, |c| c.width != content_width);
-    if needs_full_rebuild {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
-            .map(|i| app.render_message_lines(i, content_width))
-            .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-        app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-        app.dirty_from = None;
-    }
-    // Paranoia fallback: guarantee Some
-    if app.line_cache.is_none() {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
-            .map(|i| app.render_message_lines(i, content_width))
-            .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-        app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-        app.dirty_from = None;
+    {
+        let needs_full_rebuild = app
+            .line_cache
+            .as_ref()
+            .map_or(true, |c| c.width != content_width);
+
+        if needs_full_rebuild {
+            // Width changed or no cache: full rebuild
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+                .map(|i| app.render_message_lines(i, content_width))
+                .collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+            app.dirty_from = None;
+        } else if let Some(k) = app.dirty_from.take() {
+            // Incremental rebuild: only re-render messages[k..]
+            // Render all dirty slots first (immutable borrow of app), then apply.
+            let n = app.messages.len();
+            let cache = app.line_cache.as_ref().expect("cache must be Some here");
+            let needs_resize = cache.per_msg.len() != n;
+
+            // Render fresh slots for [k..n]
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (k..n)
+                .map(|i| app.render_message_lines(i, content_width))
+                .collect();
+
+            // Apply to cache (now mutable borrow)
+            let cache = app.line_cache.as_mut().expect("cache must be Some here");
+            if needs_resize {
+                cache.per_msg.truncate(k);
+                cache.per_msg.extend(fresh);
+            } else {
+                for (offset, rendered) in fresh.into_iter().enumerate() {
+                    cache.per_msg[k + offset] = rendered;
+                }
+            }
+            // Rebuild flat from k
+            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
+            cache.flat.truncate(prefix_line_count);
+            for slot in &cache.per_msg[k..] {
+                cache.flat.extend(slot.iter().cloned());
+            }
+        }
+        // Paranoia fallback: guarantee Some (should never fire)
+        if app.line_cache.is_none() {
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+                .map(|i| app.render_message_lines(i, content_width))
+                .collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+            app.dirty_from = None;
+        }
     }
     let all_lines_vec: &[ratatui::text::Line<'static>] =
         app.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
