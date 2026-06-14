@@ -49,6 +49,7 @@ pub(in crate::tui::theme) fn rose_pine() -> Self {
         event_source: Color::Rgb(120, 180, 255),
         event_text: Color::Rgb(200, 200, 210),
         event_critical: Color::Rgb(255, 80, 80),
+        ..Self::default()
     }
 }
 }

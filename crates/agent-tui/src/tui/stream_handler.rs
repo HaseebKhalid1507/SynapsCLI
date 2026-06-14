@@ -135,6 +135,7 @@ pub(super) async fn handle_stream_event(
         }
         StreamEvent::Session(SessionEvent::Done) => {
             app.streaming = false;
+            app.drop_empty_thinking();
             app.subagents.clear();
             // Clean up finished reactive subagent handles
             if let Some(registry) = runtime.subagent_registry().lock().ok().as_mut() {
@@ -162,6 +163,7 @@ pub(super) async fn handle_stream_event(
             }
         }
         StreamEvent::Session(SessionEvent::Error(err)) => {
+            app.drop_empty_thinking();
             app.push_msg(ChatMessage::Error(sanitize_notice(&err)));
             app.streaming = false;
             app.subagents.clear();

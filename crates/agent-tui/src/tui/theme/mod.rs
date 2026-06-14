@@ -63,6 +63,22 @@ pub(crate) struct Theme {
     pub(crate) event_source: Color,
     pub(crate) event_text: Color,
     pub(crate) event_critical: Color,
+
+    // Tool styling — per-tool gutter/accent colours + panel backgrounds.
+    // `tool_input_bg`/`tool_output_bg` default to `Color::Reset`, which means
+    // "auto-derive a subtle tint from `bg`"; set them in a theme to override.
+    pub(crate) tool_bash: Color,
+    pub(crate) tool_read: Color,
+    pub(crate) tool_write: Color,
+    pub(crate) tool_edit: Color,
+    pub(crate) tool_grep: Color,
+    pub(crate) tool_find: Color,
+    pub(crate) tool_ls: Color,
+    pub(crate) tool_subagent: Color,
+    pub(crate) tool_ext: Color,
+    pub(crate) tool_generic: Color,
+    pub(crate) tool_input_bg: Color,
+    pub(crate) tool_output_bg: Color,
 }
 
 impl Default for Theme {
@@ -113,6 +129,20 @@ impl Default for Theme {
             event_source: Color::Rgb(120, 180, 255),
             event_text: Color::Rgb(200, 200, 210),
             event_critical: Color::Rgb(255, 80, 80),
+
+            // Tool styling (Night City neon set; backgrounds auto-derive)
+            tool_bash: Color::Rgb(108, 240, 122),
+            tool_read: Color::Rgb(34, 211, 238),
+            tool_write: Color::Rgb(255, 46, 136),
+            tool_edit: Color::Rgb(255, 179, 71),
+            tool_grep: Color::Rgb(90, 200, 220),
+            tool_find: Color::Rgb(181, 133, 255),
+            tool_ls: Color::Rgb(130, 160, 200),
+            tool_subagent: Color::Rgb(210, 120, 230),
+            tool_ext: Color::Rgb(252, 214, 70),
+            tool_generic: Color::Rgb(132, 150, 180),
+            tool_input_bg: Color::Reset,
+            tool_output_bg: Color::Reset,
         }
     }
 }
@@ -122,6 +152,7 @@ impl Theme {
     fn builtin(name: &str) -> Option<Self> {
         match name {
             "default" => Some(Self::default()),
+            "night-city" => Some(Self::night_city()),
             "neon-rain" => Some(Self::neon_rain()),
             "amber" => Some(Self::amber()),
             "phosphor" => Some(Self::phosphor()),
@@ -202,6 +233,18 @@ impl Theme {
             "subagent_status" => self.subagent_status = c,
             "subagent_done" => self.subagent_done = c,
             "subagent_time" => self.subagent_time = c,
+            "tool_bash" => self.tool_bash = c,
+            "tool_read" => self.tool_read = c,
+            "tool_write" => self.tool_write = c,
+            "tool_edit" => self.tool_edit = c,
+            "tool_grep" => self.tool_grep = c,
+            "tool_find" => self.tool_find = c,
+            "tool_ls" => self.tool_ls = c,
+            "tool_subagent" => self.tool_subagent = c,
+            "tool_ext" => self.tool_ext = c,
+            "tool_generic" => self.tool_generic = c,
+            "tool_input_bg" => self.tool_input_bg = c,
+            "tool_output_bg" => self.tool_output_bg = c,
             _ => {}, // unknown key, ignore
         }
     }
@@ -261,7 +304,8 @@ pub(crate) fn load_theme_from_config() -> Theme {
         }
     }
 
-    Theme::default()
+    // No theme file and no named theme in config: ship the premium default.
+    Theme::night_city()
 }
 
 pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
@@ -277,4 +321,37 @@ pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
 
 pub(crate) fn set_theme(theme: Theme) {
     THEME.store(Arc::new(theme));
+}
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn tool_styling_is_themeable() {
+        let mut t = Theme::default();
+        // Defaults: Night City neon set; panel backgrounds auto-derive.
+        assert_eq!(t.tool_bash, Color::Rgb(108, 240, 122));
+        assert_eq!(t.tool_read, Color::Rgb(34, 211, 238));
+        assert_eq!(t.tool_input_bg, Color::Reset);
+        assert_eq!(t.tool_output_bg, Color::Reset);
+
+        // A theme file can override each via its key name.
+        t.set("tool_bash", Color::Rgb(1, 2, 3));
+        t.set("tool_read", Color::Rgb(4, 5, 6));
+        t.set("tool_input_bg", Color::Rgb(7, 8, 9));
+        t.set("tool_output_bg", Color::Rgb(10, 11, 12));
+        assert_eq!(t.tool_bash, Color::Rgb(1, 2, 3));
+        assert_eq!(t.tool_read, Color::Rgb(4, 5, 6));
+        assert_eq!(t.tool_input_bg, Color::Rgb(7, 8, 9));
+        assert_eq!(t.tool_output_bg, Color::Rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn builtin_palettes_inherit_tool_defaults() {
+        // A palette that doesn't set tool colours still gets the neon defaults
+        // via `..Self::default()`.
+        let t = Theme::builtin("dracula").expect("dracula exists");
+        assert_eq!(t.tool_bash, Color::Rgb(108, 240, 122));
+        assert_eq!(t.tool_input_bg, Color::Reset);
+    }
 }
