@@ -84,6 +84,11 @@ struct ParseState {
     /// either a retry (transient) or a terminal `Err` so the turn never silently
     /// ends with empty content (the "stopping" bug, task #130).
     stream_error: Option<StreamError>,
+    /// True once a `message_delta` carrying a stop_reason was seen — captured
+    /// UNCONDITIONALLY (independent of the telemetry flag) so
+    /// `classify_stream_outcome` can tell a valid empty `end_turn` from a silent
+    /// stop even in the default (telemetry-off) config.
+    stop_reason_seen: bool,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -146,6 +151,7 @@ impl ParseState {
             msg_start_cache_1h: None,
             usage_emitted: false,
             stream_error: None,
+            stop_reason_seen: false,
         }
     }
 
@@ -332,9 +338,12 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageDelta { delta, usage } => {
-            // ═══ TELEMETRY: capture stop_reason from delta ═══
-            if ctx.telemetry_level.enabled() {
-                if let Some(sr) = delta.and_then(|d| d.stop_reason) {
+            // Capture stop_reason UNCONDITIONALLY — classify_stream_outcome relies
+            // on it to tell a valid empty end_turn from a silent stop, and that
+            // decision must NOT depend on whether telemetry is enabled (default off).
+            if let Some(sr) = delta.and_then(|d| d.stop_reason) {
+                state.stop_reason_seen = true;
+                if ctx.telemetry_level.enabled() {
                     state.telem_stop_reason = Some(sr.into_owned());
                 }
             }
@@ -924,15 +933,20 @@ impl ApiMethods {
             if cancel.is_cancelled() {
                 break;
             }
-            // A transport error mid-stream means connection loss — translate
-            // to an actionable message instead of a raw reqwest debug string.
-            // Bill any start-captured usage first: the API already processed
-            // the input even if the stream died on us.
+            // A transport error mid-stream means connection loss. It's the same
+            // transient class as an HTTP 5xx or an in-stream overloaded_error, so
+            // route it through the unified retry budget instead of hard-failing
+            // the turn. Bill any start-captured usage first: the API already
+            // processed the input even if the stream died on us.
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
                     emit_residual_usage(&mut state, &ctx);
-                    return Err(RuntimeError::ApiStatus(crate::core::error::humanize_network_error(&e)));
+                    state.stream_error = Some(StreamError {
+                        message: crate::core::error::humanize_network_error(&e),
+                        retryable: true,
+                    });
+                    break;
                 }
             };
             line_buffer.extend(&chunk);
@@ -960,7 +974,7 @@ impl ApiMethods {
         // Capture the failure signals BEFORE the telemetry block — it moves
         // `state.telem_stop_reason` into the record when telemetry is enabled.
         let stream_error = state.stream_error.take();
-        let has_stop_reason = state.telem_stop_reason.is_some();
+        let has_stop_reason = state.stop_reason_seen;
         let cancelled = cancel.is_cancelled();
 
 
@@ -985,7 +999,7 @@ impl ApiMethods {
                 request_id: telem_request_id,
                 msg_id: state.telem_msg_id,
                 model: model.to_string(),
-                attempt: 1, // TODO: thread attempt number from retry loop
+                attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
                 ttft_ms: state.telem_ttft,
                 total_ms: request_start.elapsed().as_millis() as u64,
                 stop_reason: state.telem_stop_reason,
@@ -1063,6 +1077,20 @@ mod tests {
         EventCtx {
             tx,
             telemetry_level: TelemetryLevel::Full,
+            request_start: std::time::Instant::now(),
+            cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
+            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_has_1h_marker: true,
+        }
+    }
+
+    /// Telemetry-OFF ctx — the DEFAULT runtime config. Used to prove parse-time
+    /// behavior doesn't silently depend on telemetry being enabled.
+    fn make_ctx_telemetry_off(tx: &mpsc::UnboundedSender<StreamEvent>) -> EventCtx<'_> {
+        EventCtx {
+            tx,
+            telemetry_level: TelemetryLevel::Off,
             request_start: std::time::Instant::now(),
             cache_ttl: crate::core::config::CacheTtl::FiveMinutes,
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1743,6 +1771,27 @@ mod tests {
         assert!(
             state.stream_error.is_some(),
             "error event with no payload must still set a stream error"
+        );
+    }
+
+    #[test]
+    fn stop_reason_seen_captured_even_with_telemetry_off() {
+        // Regression (board review HIGH): classify_stream_outcome's
+        // `has_stop_reason` must NOT depend on the telemetry flag. With telemetry
+        // OFF (the default config), a message_delta carrying a stop_reason must
+        // still set `stop_reason_seen` — otherwise a valid empty `end_turn` would
+        // misclassify as a silent-stop Fail.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx_telemetry_off(&tx);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_seen, "stop_reason must be captured with telemetry OFF");
+        assert!(
+            state.telem_stop_reason.is_none(),
+            "telem_stop_reason stays None when telemetry off — only the unconditional flag is set"
         );
     }
 
