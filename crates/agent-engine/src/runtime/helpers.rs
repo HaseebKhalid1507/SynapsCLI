@@ -24,14 +24,14 @@ pub(super) enum MarkerSite {
 /// Cost trade-off (honest numbers, not marketing):
 /// - 5m:     1.25× write everywhere. Wins for rapid-fire sessions.
 /// - 1h:     2.0× write everywhere. Wins for SPARSE long sessions — note
-///           that under Hybrid, every >5m gap forces a 5m re-write of the
-///           message tail, and that tail write covers the WHOLE conversation
-///           since the system breakpoint, not just the increment. Uniform 1h
-///           avoids that repeated full-tail re-write.
+///   that under Hybrid, every >5m gap forces a 5m re-write of the
+///   message tail, and that tail write covers the WHOLE conversation
+///   since the system breakpoint, not just the increment. Uniform 1h
+///   avoids that repeated full-tail re-write.
 /// - Hybrid: 2.0× write on the stable prefix (tools+system, written rarely),
-///           1.25× on the message tail (written every turn). Wins for
-///           bursty / medium-gap cadence: cheap per-turn writes while the
-///           expensive prefix survives gaps up to 1h.
+///   1.25× on the message tail (written every turn). Wins for
+///   bursty / medium-gap cadence: cheap per-turn writes while the
+///   expensive prefix survives gaps up to 1h.
 pub(super) fn cache_control_value(ttl: CacheTtl, site: MarkerSite) -> Value {
     match (ttl, site) {
         (CacheTtl::FiveMinutes, _) => json!({"type": "ephemeral"}),
