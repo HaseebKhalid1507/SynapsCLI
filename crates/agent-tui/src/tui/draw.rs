@@ -800,7 +800,7 @@ pub(crate) fn render_frame(
             )
         };
         let version_span = Span::styled(
-            concat!("v", env!("CARGO_PKG_VERSION"), " "),
+            concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"), " "),
             Style::default().fg(THEME.load().muted),
         );
         let header = Paragraph::new(Line::from({
