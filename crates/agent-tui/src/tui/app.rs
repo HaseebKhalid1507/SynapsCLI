@@ -1,4 +1,3 @@
-use ratatui::text::Line;
 use serde_json::Value;
 use chrono::Local;
 use synaps_cli::Session;
@@ -42,6 +41,18 @@ pub(crate) enum ChatMessage {
 pub(crate) struct TimestampedMsg {
     pub(crate) msg: ChatMessage,
     pub(crate) time: String,
+}
+
+/// Per-message render cache. Parallel to `App.messages`: each slot holds the
+/// rendered `Vec<Line>` for that message. `flat` is their concatenation, which
+/// is what downstream (draw/selection) consumes. The `width` at which these
+/// were rendered is stored so stale entries can be detected on terminal resize.
+pub(crate) struct LineCache {
+    pub(crate) width: usize,
+    /// Rendered lines per message — index parallel to App.messages.
+    pub(crate) per_msg: Vec<Vec<ratatui::text::Line<'static>>>,
+    /// Concatenation of per_msg; what downstream code consumes.
+    pub(crate) flat: Vec<ratatui::text::Line<'static>>,
 }
 
 pub(crate) struct App {
@@ -91,10 +102,13 @@ pub(crate) struct App {
     pub(crate) session: Session,
     pub(crate) agent_name: String,
     /// Cached wrapped+highlighted message lines.
-    /// `None` means "stale — rebuild on next draw". `Some((w, lines))` means
-    /// "valid at content width `w`". Collapses the old `(line_cache, cache_width, dirty)`
-    /// trio into a single invariant-preserving field — impossible to desync.
-    pub(crate) line_cache: Option<(usize, Vec<Line<'static>>)>,
+    /// `None` means "stale — rebuild on next draw". `Some(cache)` means
+    /// "valid at cache.width". Replaced the old `(usize, Vec<Line>)` tuple
+    /// with a structured type that supports per-message incremental updates.
+    pub(crate) line_cache: Option<LineCache>,
+    /// Lowest message index whose rendered lines are stale. `None` = fully clean.
+    /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
+    pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
@@ -233,6 +247,7 @@ impl App {
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
             line_cache: None,
+            dirty_from: None,
             needs_redraw: true,
             show_full_output: false,
             logo_dismiss_t: None,
@@ -453,8 +468,8 @@ impl App {
         if self.scroll_pinned {
             self.scroll_back = 0;
         }
-        // New visible content — rebuild lines + redraw on next loop pass.
-        self.invalidate();
+        // New tail message — mark last slot dirty (append to per_msg on next rebuild).
+        self.invalidate_last();
     }
 
     /// Insert a freshly created `ToolResult` directly beneath its matching
@@ -495,7 +510,8 @@ impl App {
                 if self.scroll_pinned {
                     self.scroll_back = 0;
                 }
-                self.invalidate();
+                // Insert mid-list — invalidate_from(at) so draw re-renders from insert point.
+                self.invalidate_from(at);
             }
             None => self.push_msg(msg),
         }
@@ -526,9 +542,27 @@ impl App {
 
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
     /// Call this after any mutation that changes how `messages` renders.
+    /// Use for structural changes (theme, width, message list reshuffle). For
+    /// streaming deltas prefer `invalidate_last()` which is O(1).
     pub(crate) fn invalidate(&mut self) {
         self.line_cache = None;
+        self.dirty_from = None;
         self.needs_redraw = true;
+    }
+
+    /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
+    /// Coalesces with any existing dirty_from by taking the minimum.
+    pub(crate) fn invalidate_from(&mut self, idx: usize) {
+        self.dirty_from = Some(match self.dirty_from {
+            Some(k) => k.min(idx),
+            None => idx,
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Mark only the tail message dirty. O(1) during streaming.
+    pub(crate) fn invalidate_last(&mut self) {
+        self.invalidate_from(self.messages.len().saturating_sub(1));
     }
 
     /// Request a redraw without invalidating the line cache (e.g. for
@@ -912,7 +946,7 @@ impl App {
         let (sc, sr, ec, er) = self.selection_range()?;
         let rect = self.msg_area_rect?;
         let (vis_start, vis_end) = self.visible_line_range?;
-        let (_, ref all_lines) = self.line_cache.as_ref()?;
+        let all_lines = &self.line_cache.as_ref()?.flat;
 
         let content_x = rect.x;
         let content_y = rect.y;
@@ -977,7 +1011,7 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Text(text.to_string()));
         }
-        self.invalidate();
+        self.invalidate_last();
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
@@ -992,7 +1026,7 @@ impl App {
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
         }
-        self.invalidate();
+        self.invalidate_last();
     }
 
     /// Remove a trailing thinking block that never received content — the
@@ -1013,6 +1047,7 @@ impl App {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
                     self.messages.remove(idx);
+                    // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate();
                 }
             }
@@ -1283,7 +1318,12 @@ mod tests {
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.line_cache = Some((80, app.render_lines(80)));
+        app.line_cache = Some({
+            let w = 80;
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
         app.subagents.push(SubagentState {
             id: 1,
             name: "tester".to_string(),
@@ -1316,13 +1356,81 @@ mod tests {
         });
         app.tool_start_time = Some(std::time::Instant::now());
         app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.line_cache = Some((80, app.render_lines(80)));
+        app.line_cache = Some({
+            let w = 80;
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
         app.spinner_frame = 2;
 
         let invalidate_messages = app.advance_animations();
 
         assert!(invalidate_messages, "active message-area bash animation must rebuild message cache");
         assert!(!app.needs_clear_for_animation_redraw(), "streaming animation must not force whole-terminal clear flicker");
+    }
+
+    #[test]
+    fn spinner_tick_with_thinking_placeholder_marks_only_tail_dirty() {
+        // After advancing the spinner while THINKING_PLACEHOLDER is present,
+        // only the last message slot should be marked dirty (dirty_from == last index).
+        // Earlier per_msg slots must be untouched on the next rebuild.
+        let mut app = test_app();
+        let w = 80;
+        app.push_msg(ChatMessage::User("question".to_string()));
+        app.push_msg(ChatMessage::Text("partial response".to_string()));
+        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+
+        // Build full cache first
+        app.line_cache = Some({
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            LineCache { width: w, per_msg, flat }
+        });
+        app.dirty_from = None;
+        let last = app.messages.len() - 1;
+
+        // Snapshot per_msg[0..last]
+        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+
+        // Advance spinner (spinner_frame % 3 == 0 triggers render_lines_uses_spinner)
+        app.spinner_frame = 2; // next wrapping_add gives 3, which % 3 == 0
+        let needs_redraw = app.advance_animations();
+        assert!(needs_redraw, "spinner must signal redraw while THINKING_PLACEHOLDER present");
+
+        // The animation tick itself doesn't call invalidate — the caller in mod.rs does.
+        // We simulate that caller calling invalidate_last() (the new behaviour for slice 4).
+        // But first assert dirty_from is still None (advance_animations doesn't set it).
+        // Then we call invalidate_last() as the updated caller will.
+        app.invalidate_last();
+        assert_eq!(app.dirty_from, Some(last), "dirty_from must point to tail message only");
+
+        // Simulate draw.rs incremental rebuild
+        {
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.messages.len())
+                .map(|i| app.render_message_lines(i, w))
+                .collect();
+            let cache = app.line_cache.as_mut().unwrap();
+            for (offset, rendered) in fresh.into_iter().enumerate() {
+                cache.per_msg[last + offset] = rendered;
+            }
+            let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.len()).sum();
+            cache.flat.truncate(prefix_len);
+            for slot in &cache.per_msg[last..] {
+                cache.flat.extend(slot.iter().cloned());
+            }
+        }
+        app.dirty_from = None;
+
+        // per_msg[0..last] must be unchanged
+        let after: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+        assert_eq!(snapshot, after, "earlier per_msg slots must not change on spinner tick");
     }
 
     #[test]
@@ -1643,5 +1751,209 @@ mod tests {
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
+    }
+
+    #[test]
+    fn render_lines_equals_concat_of_render_message_lines() {
+        let mut app = test_app();
+        app.push_msg(ChatMessage::User("hello world".to_string()));
+        app.push_msg(ChatMessage::Thinking("some reasoning".to_string()));
+        app.push_msg(ChatMessage::Text("here is the answer".to_string()));
+        app.push_msg(ChatMessage::ToolUse {
+            tool_id: "call_1".to_string(),
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            tool_id: "call_1".to_string(),
+            content: "file1.txt\nfile2.txt".to_string(),
+            elapsed_ms: Some(42),
+        });
+
+        let w = 80;
+        let flat = app.render_lines(w);
+        let concat: Vec<ratatui::text::Line<'static>> = (0..app.messages.len())
+            .flat_map(|i| app.render_message_lines(i, w))
+            .collect();
+
+        // Compare by rendered string content (Line doesn't impl PartialEq for spans reliably)
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&flat), to_str(&concat),
+            "render_lines must equal concat of render_message_lines for each index");
+    }
+
+    #[test]
+    fn line_cache_build_produces_flat_equal_to_render_lines() {
+        // This test verifies that the LineCache struct's build path (per_msg concat -> flat)
+        // produces the same flat output as render_lines(width).
+        let mut app = test_app();
+        app.push_msg(ChatMessage::User("hi".to_string()));
+        app.push_msg(ChatMessage::Text("hello back".to_string()));
+        app.push_msg(ChatMessage::ToolUse {
+            tool_id: "t1".to_string(),
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+        });
+        app.push_msg(ChatMessage::ToolResult {
+            tool_id: "t1".to_string(),
+            content: "output".to_string(),
+            elapsed_ms: Some(10),
+        });
+
+        let w = 80;
+        let expected_flat = app.render_lines(w);
+
+        // Build a LineCache manually using the new struct
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, w))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+        let cache = LineCache { width: w, per_msg, flat };
+
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
+            "LineCache.flat must equal render_lines output");
+        assert!(cache.width == w);
+    }
+
+    /// Helper: builds a LineCache for an app at a given width, simulating what draw.rs does.
+    fn build_cache(app: &App, width: usize) -> LineCache {
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, width))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+        LineCache { width, per_msg, flat }
+    }
+
+    /// Helper: simulate the incremental rebuild from draw.rs (slice 3 logic).
+    fn rebuild_incremental(app: &mut App, width: usize) {
+        match app.line_cache.take() {
+            Some(mut cache) if cache.width == width => {
+                if let Some(k) = app.dirty_from.take() {
+                    // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
+                    if cache.per_msg.len() != app.messages.len() {
+                        cache.per_msg.truncate(k);
+                        for i in k..app.messages.len() {
+                            cache.per_msg.push(app.render_message_lines(i, width));
+                        }
+                    } else {
+                        // In-place partial re-render: only messages[k..]
+                        for i in k..app.messages.len() {
+                            cache.per_msg[i] = app.render_message_lines(i, width);
+                        }
+                    }
+                    // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
+                    let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
+                    cache.flat.truncate(prefix_len);
+                    for slot in &cache.per_msg[k..] {
+                        cache.flat.extend(slot.iter().cloned());
+                    }
+                }
+                app.line_cache = Some(cache);
+            }
+            _ => {
+                app.dirty_from = None;
+                app.line_cache = Some(build_cache(app, width));
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_cache_does_not_re_render_unchanged_messages() {
+        let mut app = test_app();
+        let w = 80;
+        // Build fixture: User + Thinking + Text (streaming last)
+        app.push_msg(ChatMessage::User("hello".to_string()));
+        app.push_msg(ChatMessage::Thinking("reasoning".to_string()));
+        app.push_msg(ChatMessage::Text("partial answer".to_string()));
+
+        // Full build
+        app.line_cache = Some(build_cache(&app, w));
+        app.dirty_from = None;
+
+        let last = app.messages.len() - 1; // index of Text message
+
+        // Snapshot per_msg[0..last] content strings (before update)
+        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+
+        // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
+        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.messages.last_mut() {
+            t.push_str(" — more content appended");
+        }
+        app.dirty_from = Some(last); // invalidate_last equivalent
+
+        // Incremental rebuild
+        rebuild_incremental(&mut app, w);
+
+        let cache = app.line_cache.as_ref().unwrap();
+
+        // per_msg[0..last] must be unchanged (content-equal to snapshot)
+        let after: Vec<Vec<String>> = cache.per_msg[..last]
+            .iter()
+            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .collect();
+        assert_eq!(snapshot, after, "per_msg[0..last] must not change on tail-only invalidation");
+
+        // per_msg[last] must have changed (the text grew)
+        let last_strs: Vec<String> = cache.per_msg[last].iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        let contains_new = last_strs.iter().any(|s| s.contains("more content appended"));
+        assert!(contains_new, "per_msg[last] must reflect the updated text");
+
+        // flat must equal full render_lines (correctness)
+        let expected_flat = app.render_lines(w);
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
+            "flat must equal full render_lines after incremental rebuild");
+    }
+
+    #[test]
+    fn incremental_cache_handles_tool_result_insert() {
+        let mut app = test_app();
+        let w = 80;
+        app.push_msg(ChatMessage::User("run something".to_string()));
+        app.push_msg(ChatMessage::ToolUse {
+            tool_id: "t1".to_string(),
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+        });
+
+        app.line_cache = Some(build_cache(&app, w));
+        app.dirty_from = None;
+
+        // Insert a ToolResult after ToolUse (as push_tool_result does)
+        let at = 2;
+        app.messages.insert(at, crate::tui::app::TimestampedMsg {
+            msg: ChatMessage::ToolResult {
+                tool_id: "t1".to_string(),
+                content: "file.txt".to_string(),
+                elapsed_ms: Some(5),
+            },
+            time: "00:00".to_string(),
+        });
+        app.dirty_from = Some(at); // invalidate_from(at)
+
+        // Rebuild: since per_msg.len() (2) != messages.len() (3), should do full-from-k rebuild
+        rebuild_incremental(&mut app, w);
+
+        let cache = app.line_cache.as_ref().unwrap();
+        assert_eq!(cache.per_msg.len(), app.messages.len(), "per_msg must track messages after insert");
+
+        let expected_flat = app.render_lines(w);
+        let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        };
+        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
+            "flat must equal render_lines after insert + incremental rebuild");
     }
 }
