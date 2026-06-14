@@ -9,6 +9,10 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
+# Ship gzip tarballs (not the default .tar.xz): the shell installer extracts
+# with `tar`, and xz/xz-utils is absent on minimal systems (slim containers,
+# bare CI) — gzip is universal, so the installer works everywhere. (#134)
+unix-archive = ".tar.gz"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
