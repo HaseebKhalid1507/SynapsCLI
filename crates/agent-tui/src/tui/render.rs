@@ -609,7 +609,7 @@ impl App {
                     } else {
                         preceding_tool
                             .map(|n| tool_accent(&n))
-                            .unwrap_or(THEME.load().tool_generic)
+                            .unwrap_or_else(|| tool_accent("_generic"))
                     };
                     lines.extend(panel_block(card, accent, output_panel_bg(), width, margin));
                 }

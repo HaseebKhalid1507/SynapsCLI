@@ -305,23 +305,32 @@ pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option
     }
 }
 
-/// Per-tool gutter/accent colour, read from the active theme so it can be
-/// overridden per theme. Defaults to the Night City neon set.
+/// Per-tool gutter/accent colour, read from the active theme.
+/// When a theme field is `Color::Reset` (the default sentinel), we derive a
+/// colour from the theme's own semantic palette so every theme looks coherent.
 pub(crate) fn tool_accent(tool_name: &str) -> Color {
     let t = THEME.load();
-    if tool_name.starts_with("ext__") {
-        return t.tool_ext;
+
+    /// Resolve a raw tool_* field: if Reset, fall back to `derived`.
+    #[inline]
+    fn resolve(raw: Color, derived: Color) -> Color {
+        if raw == Color::Reset { derived } else { raw }
     }
+
+    if tool_name.starts_with("ext__") {
+        return resolve(t.tool_ext, t.event_icon);
+    }
+
     match tool_name {
-        "bash" => t.tool_bash,
-        "read" => t.tool_read,
-        "write" => t.tool_write,
-        "edit" => t.tool_edit,
-        "grep" => t.tool_grep,
-        "find" => t.tool_find,
-        "ls" => t.tool_ls,
-        "subagent" => t.tool_subagent,
-        _ => t.tool_generic,
+        "bash"     => resolve(t.tool_bash,     t.tool_result_ok),
+        "read"     => resolve(t.tool_read,     t.claude_label),
+        "write"    => resolve(t.tool_write,    t.warning_color),
+        "edit"     => resolve(t.tool_edit,     t.cost_color),
+        "grep"     => resolve(t.tool_grep,     t.table_header_color),
+        "find"     => resolve(t.tool_find,     t.subagent_name),
+        "ls"       => resolve(t.tool_ls,       t.table_cell_color),
+        "subagent" => resolve(t.tool_subagent, t.subagent_name),
+        _          => resolve(t.tool_generic,  t.tool_label),
     }
 }
 

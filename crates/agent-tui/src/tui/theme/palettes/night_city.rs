@@ -69,6 +69,17 @@ pub(in crate::tui::theme) fn night_city() -> Self {
         event_source: CYAN,
         event_text: Color::Rgb(205, 212, 226),
         event_critical: RED,
+        // Night City neon tool accents — explicit so Default::default() stays clean.
+        tool_bash: LIME,                          // Neuromancer console green
+        tool_read: CYAN,                          // cyber-cyan
+        tool_write: MAGENTA,                      // hot magenta
+        tool_edit: AMBER,                         // Blade Runner amber
+        tool_grep: Color::Rgb(90, 200, 220),      // muted teal
+        tool_find: VIOLET,
+        tool_ls: Color::Rgb(130, 160, 200),       // slate blue
+        tool_subagent: Color::Rgb(210, 120, 230), // soft magenta
+        tool_ext: YELLOW,                         // electric yellow
+        tool_generic: Color::Rgb(132, 150, 180),  // dim steel
         ..Self::default()
     }
 }

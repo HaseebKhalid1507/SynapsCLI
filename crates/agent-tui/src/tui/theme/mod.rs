@@ -130,17 +130,20 @@ impl Default for Theme {
             event_text: Color::Rgb(200, 200, 210),
             event_critical: Color::Rgb(255, 80, 80),
 
-            // Tool styling (Night City neon set; backgrounds auto-derive)
-            tool_bash: Color::Rgb(108, 240, 122),
-            tool_read: Color::Rgb(34, 211, 238),
-            tool_write: Color::Rgb(255, 46, 136),
-            tool_edit: Color::Rgb(255, 179, 71),
-            tool_grep: Color::Rgb(90, 200, 220),
-            tool_find: Color::Rgb(181, 133, 255),
-            tool_ls: Color::Rgb(130, 160, 200),
-            tool_subagent: Color::Rgb(210, 120, 230),
-            tool_ext: Color::Rgb(252, 214, 70),
-            tool_generic: Color::Rgb(132, 150, 180),
+            // Tool styling — accent colours default to Reset (sentinel: derive
+            // from this theme's own palette via tool_accent()).  Only
+            // night-city sets explicit neon values.  Backgrounds always
+            // auto-derive from `bg`.
+            tool_bash: Color::Reset,
+            tool_read: Color::Reset,
+            tool_write: Color::Reset,
+            tool_edit: Color::Reset,
+            tool_grep: Color::Reset,
+            tool_find: Color::Reset,
+            tool_ls: Color::Reset,
+            tool_subagent: Color::Reset,
+            tool_ext: Color::Reset,
+            tool_generic: Color::Reset,
             tool_input_bg: Color::Reset,
             tool_output_bg: Color::Reset,
         }
@@ -304,8 +307,8 @@ pub(crate) fn load_theme_from_config() -> Theme {
         }
     }
 
-    // No theme file and no named theme in config: ship the premium default.
-    Theme::night_city()
+    // No theme configured: use the default palette.
+    Theme::default()
 }
 
 pub(crate) fn load_theme_by_name(name: &str) -> Option<Theme> {
@@ -327,14 +330,19 @@ mod theme_tests {
     use super::*;
 
     #[test]
-    fn tool_styling_is_themeable() {
-        let mut t = Theme::default();
-        // Defaults: Night City neon set; panel backgrounds auto-derive.
-        assert_eq!(t.tool_bash, Color::Rgb(108, 240, 122));
-        assert_eq!(t.tool_read, Color::Rgb(34, 211, 238));
+    fn tool_styling_defaults_to_reset() {
+        // Neon is NOT in Default — tool_* fields are Reset (derive-from-palette sentinel).
+        let t = Theme::default();
+        assert_eq!(t.tool_bash, Color::Reset);
+        assert_eq!(t.tool_read, Color::Reset);
+        assert_eq!(t.tool_generic, Color::Reset);
         assert_eq!(t.tool_input_bg, Color::Reset);
         assert_eq!(t.tool_output_bg, Color::Reset);
+    }
 
+    #[test]
+    fn tool_styling_is_themeable() {
+        let mut t = Theme::default();
         // A theme file can override each via its key name.
         t.set("tool_bash", Color::Rgb(1, 2, 3));
         t.set("tool_read", Color::Rgb(4, 5, 6));
@@ -347,11 +355,20 @@ mod theme_tests {
     }
 
     #[test]
-    fn builtin_palettes_inherit_tool_defaults() {
-        // A palette that doesn't set tool colours still gets the neon defaults
-        // via `..Self::default()`.
-        let t = Theme::builtin("dracula").expect("dracula exists");
+    fn night_city_has_neon_tool_colors() {
+        // night-city is the ONLY theme with explicit neon tool accents.
+        let t = Theme::builtin("night-city").expect("night-city exists");
         assert_eq!(t.tool_bash, Color::Rgb(108, 240, 122));
+        assert_eq!(t.tool_read, Color::Rgb(34, 211, 238));
+        assert_eq!(t.tool_write, Color::Rgb(255, 46, 136));
+        assert_eq!(t.tool_ext, Color::Rgb(252, 214, 70));
+    }
+
+    #[test]
+    fn builtin_palettes_use_reset_tool_colors() {
+        // Other palettes should NOT inherit neon — they get Reset via Default.
+        let t = Theme::builtin("dracula").expect("dracula exists");
+        assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_input_bg, Color::Reset);
     }
 }
