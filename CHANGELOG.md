@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-06-14
+
+### Performance
+- **Incremental message render cache** — the TUI now re-renders only the message(s) that actually changed during streaming, instead of rebuilding the entire transcript on every delta. Per-frame render cost drops from O(transcript size) to O(changed messages), so main-thread CPU during streaming stays flat regardless of how long the session runs. Completes the streaming-render perf work begun in 0.3.3: that release throttled rebuild *frequency* (~60fps → ~10fps); this one cuts the *cost per rebuild*. The full-transcript renderer is retained as a test oracle.
+
 ## [0.3.3] — 2026-06-14
 
 ### Added
