@@ -282,26 +282,55 @@ pub(crate) fn bash_trace(spinner_frame: usize) -> (String, Color) {
 }
 
 /// Format a tool name for display. Returns (icon, display_name, optional_server_tag).
-/// MCP tools like "ext__byteray__read_pseudocode" become ("⚡", "read_pseudocode", Some("byteray"))
+/// MCP tools like "ext__byteray__read_pseudocode" become ("⟫", "read_pseudocode", Some("byteray"))
 pub(crate) fn format_tool_name(tool_name: &str) -> (&'static str, String, Option<String>) {
     if tool_name.starts_with("ext__") {
         let parts: Vec<&str> = tool_name.splitn(3, "__").collect();
         let server = parts.get(1).unwrap_or(&"mcp").to_string();
         let tool = parts.get(2).unwrap_or(&tool_name).to_string();
-        ("\u{00bb}", tool, Some(server)) // »
+        ("\u{27EB}", tool, Some(server)) // ⟫
     } else {
         let icon = match tool_name {
-            "bash" => "$",
-            "read" => ">",
-            "write" => "<",
-            "edit" => "~",
-            "grep" => "/",
-            "find" => "?",
-            "ls" => "=",
-            "subagent" => "*",
-            _ => "-",
+            "bash" => "\u{276F}",     // ❯  the deck / shell
+            "read" => "\u{25A4}",     // ▤  data in
+            "write" => "\u{270E}",    // ✎  mutation
+            "edit" => "\u{2726}",     // ✦  surgical
+            "grep" => "\u{2315}",     // ⌕  scan
+            "find" => "\u{2756}",     // ❖  locate
+            "ls" => "\u{2263}",       // ≣  listing
+            "subagent" => "\u{25C8}", // ◈  spawn
+            _ => "\u{2022}",          // •
         };
         (icon, tool_name.to_string(), None)
+    }
+}
+
+/// Per-tool gutter/accent colour, read from the active theme.
+/// When a theme field is `Color::Reset` (the default sentinel), we derive a
+/// colour from the theme's own semantic palette so every theme looks coherent.
+pub(crate) fn tool_accent(tool_name: &str) -> Color {
+    let t = THEME.load();
+
+    /// Resolve a raw tool_* field: if Reset, fall back to `derived`.
+    #[inline]
+    fn resolve(raw: Color, derived: Color) -> Color {
+        if raw == Color::Reset { derived } else { raw }
+    }
+
+    if tool_name.starts_with("ext__") {
+        return resolve(t.tool_ext, t.event_icon);
+    }
+
+    match tool_name {
+        "bash"     => resolve(t.tool_bash,     t.tool_result_ok),
+        "read"     => resolve(t.tool_read,     t.claude_label),
+        "write"    => resolve(t.tool_write,    t.warning_color),
+        "edit"     => resolve(t.tool_edit,     t.cost_color),
+        "grep"     => resolve(t.tool_grep,     t.table_header_color),
+        "find"     => resolve(t.tool_find,     t.subagent_name),
+        "ls"       => resolve(t.tool_ls,       t.table_cell_color),
+        "subagent" => resolve(t.tool_subagent, t.subagent_name),
+        _          => resolve(t.tool_generic,  t.tool_label),
     }
 }
 

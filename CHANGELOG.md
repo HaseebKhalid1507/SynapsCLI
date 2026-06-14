@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-14
+
+### Added
+- **`night-city` theme** — a premium neon-noir palette (Cyberpunk / Blade Runner / Neuromancer accents on a near-black base). Strictly opt-in via `theme = night-city`.
+- **Tool transcript overhaul** — per-tool colored gutter + glyph identity (bash / read / write / edit / grep / find / ls / subagent / ext), subtle per-tool panel backgrounds (input darker, output lighter), paired input→output ordering for parallel tool calls, and an `ok / timed out` status footer under each result. All themeable via new `tool_*` theme keys.
+
+### Performance
+- **Streaming redraw throttled ~60fps → ~10fps during active turns** (#131). The per-delta full `RenderModel` rebuild — which scales with session size — was the main-thread CPU cost; the spinner only needs ~10fps and deltas arrive faster than the eye reads. The idle/final frame still renders immediately, so end-of-turn state never lags.
+
+### Fixed
+- **Tool colors no longer leak across themes** — `tool_*` accents now derive from each theme's *own* palette (only `night-city` carries the neon set), and the no-config default theme is unchanged. Pick `dracula` and the tool gutters look like dracula, not Night City.
+- **Thinking spinner could spin forever** on an empty thinking step — the placeholder is now dropped when the agent produces text/tools or the turn ends. A real model `…` is preserved via a sentinel so it's never mistaken for the placeholder.
+
 ## [0.3.2] — 2026-06-14
 
 ### Fixed

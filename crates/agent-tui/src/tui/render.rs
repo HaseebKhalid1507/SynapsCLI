@@ -4,11 +4,85 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::app::{App, ChatMessage, SPINNER_FRAMES};
+use super::app::{App, ChatMessage, SPINNER_FRAMES, THINKING_PLACEHOLDER};
 use super::theme::THEME;
 use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
 use super::markdown::{render_markdown, wrap_text};
-use super::draw::{bash_trace, format_tool_name};
+use super::draw::{bash_trace, format_tool_name, tool_accent};
+
+/// Lighten (or darken, with negative `amt`) an RGB colour additively per
+/// channel, clamped. Used to derive subtle panel backgrounds from the theme.
+fn lighten(c: Color, amt: i16) -> Color {
+    if let Color::Rgb(r, g, b) = c {
+        let f = |v: u8| (v as i16 + amt).clamp(0, 255) as u8;
+        Color::Rgb(f(r), f(g), f(b))
+    } else {
+        c
+    }
+}
+
+/// Input-panel background: the theme's `tool_input_bg`, or a subtle tint
+/// auto-derived from `bg` when it's left as `Color::Reset` (the default).
+fn input_panel_bg() -> Color {
+    let t = THEME.load();
+    match t.tool_input_bg {
+        Color::Reset => lighten(t.bg, 8),
+        c => c,
+    }
+}
+
+/// Output-panel background: the theme's `tool_output_bg`, or an auto-derived
+/// (slightly lighter) tint when left as `Color::Reset`.
+fn output_panel_bg() -> Color {
+    let t = THEME.load();
+    match t.tool_output_bg {
+        Color::Reset => lighten(t.bg, 16),
+        c => c,
+    }
+}
+
+/// Tool panels span ~90% of the terminal, leaving ~5% margin on each side.
+fn tool_panel_width(viewport: usize) -> usize {
+    (viewport * 9 / 10).clamp(1, viewport.saturating_sub(2).max(1))
+}
+
+/// Left margin before a tool panel (~5% of the viewport).
+fn tool_panel_margin(viewport: usize) -> usize {
+    viewport / 20
+}
+
+/// Render a tool block as a panel: an inset, subtle-background card (`bg` fills
+/// text and padding) fronted by a coloured gutter bar in `accent`. The left
+/// `margin` stays transparent so the panel reads as inset; content is padded to
+/// `width` for a clean rectangle.
+fn panel_block(inner: Vec<Line<'static>>, accent: Color, bg: Color, width: usize, margin: usize) -> Vec<Line<'static>> {
+    if inner.is_empty() {
+        return inner;
+    }
+    let inner_w = width.max(4);
+    let fill = Style::default().bg(bg);
+    let gutter = Style::default().fg(accent).bg(bg);
+    inner
+        .into_iter()
+        .map(|l| {
+            let mut line = clamp_line(l, inner_w);
+            for span in line.spans.iter_mut() {
+                span.style = span.style.bg(bg);
+            }
+            let pad = inner_w.saturating_sub(line.width());
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 3);
+            if margin > 0 {
+                spans.push(Span::raw(" ".repeat(margin)));
+            }
+            spans.push(Span::styled("\u{258E}", gutter)); // ▎ gutter bar
+            spans.append(&mut line.spans);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), fill));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
 
 impl App {
     pub(crate) fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -60,7 +134,7 @@ impl App {
                     let dim = Style::default().fg(THEME.load().thinking_color);
                     let dim_italic = dim.add_modifier(Modifier::ITALIC);
                     // Header
-                    let thinking_label = if text == "…" {
+                    let thinking_label = if text == THINKING_PLACEHOLDER {
                         let braille = ['\u{28fe}','\u{28f7}','\u{28ef}','\u{28df}','\u{287f}','\u{28bf}','\u{28fb}','\u{28fd}'];
                         let idx = (self.spinner_frame / 4) % braille.len();
                         let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
@@ -189,12 +263,17 @@ impl App {
                 }
 
                 ChatMessage::ToolUseStart { tool_name, partial_input, .. } => {
+                    let margin = tool_panel_margin(width);
+                    let width = tool_panel_width(width);
                     // Breathing room before tool block
                     lines.push(Line::from(""));
+                    let block_start = lines.len();
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
+                    let accent = tool_accent(tool_name);
                     let mut header = vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.load().tool_label)),
-                        Span::styled(display_name, Style::default().fg(THEME.load().tool_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(m.to_string(), Style::default().fg(accent)),
+                        Span::styled(format!("{} ", icon), Style::default().fg(accent)),
+                        Span::styled(display_name, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
                     ];
                     if let Some(tag) = server_tag {
                         header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
@@ -258,16 +337,24 @@ impl App {
                             }
                         }
                     }
+                    lines.push(Line::from("")); // bottom padding of input block
+                    let card = lines.split_off(block_start);
+                    lines.extend(panel_block(card, accent, input_panel_bg(), width, margin));
                 }
 
                 ChatMessage::ToolUse { tool_name, input, .. } => {
+                    let margin = tool_panel_margin(width);
+                    let width = tool_panel_width(width);
                     // Breathing room before tool block
                     lines.push(Line::from(""));
                     // Compact tool header
+                    let block_start = lines.len();
                     let (icon, display_name, server_tag) = format_tool_name(tool_name);
+                    let accent = tool_accent(tool_name);
                     let mut header = vec![
-                        Span::styled(format!("{}   {} ", m, icon), Style::default().fg(THEME.load().tool_label)),
-                        Span::styled(display_name, Style::default().fg(THEME.load().tool_label).add_modifier(Modifier::BOLD)),
+                        Span::styled(m.to_string(), Style::default().fg(accent)),
+                        Span::styled(format!("{} ", icon), Style::default().fg(accent)),
+                        Span::styled(display_name, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
                     ];
                     if let Some(tag) = server_tag {
                         header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
@@ -372,10 +459,16 @@ impl App {
                             }
                         }
                     }
+                    lines.push(Line::from("")); // bottom padding of input block
+                    let card = lines.split_off(block_start);
+                    lines.extend(panel_block(card, accent, input_panel_bg(), width, margin));
                 }
 
                 ChatMessage::ToolResult { ref content, elapsed_ms, .. } => {
+                    let margin = tool_panel_margin(width);
+                    let width = tool_panel_width(width);
                     let result = content;
+                    let block_start = lines.len();
                     let is_error = result.starts_with("Tool execution failed")
                         || result.starts_with("Unknown tool");
                     let is_timeout = result.contains("[TIMED OUT");
@@ -395,66 +488,7 @@ impl App {
                         result_lines.len().min(max_show)
                     };
 
-                    // Success/fail indicator with elapsed time
-                    if !is_error && show > 0 {
-                        if is_timeout {
-                            let elapsed_str = match elapsed_ms {
-                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
-                                Some(ms) => format!(" {}ms", ms),
-                                None => String::new(),
-                            };
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
-                                    Style::default().fg(THEME.load().warning_color),
-                                ),
-                                Span::styled(
-                                    elapsed_str,
-                                    Style::default().fg(THEME.load().subagent_time),
-                                ),
-                            ]));
-                        } else if self.is_active_tool_result(i) {
-                            // Tool still executing — show animation only for the active result.
-                            let preceding_tool_name = self.find_preceding_tool_name(i);
-                            let elapsed_str = if let Some(start) = self.tool_start_time {
-                                let secs = start.elapsed().as_secs_f64();
-                                if secs >= 1.0 { format!(" {:.1}s", secs) }
-                                else { format!(" {}ms", (secs * 1000.0) as u64) }
-                            } else { String::new() };
-
-                            if preceding_tool_name.as_deref() == Some("bash") {
-                                let (trace, color) = bash_trace(self.spinner_frame);
-                                lines.push(Line::from(vec![
-                                    Span::styled(format!("{}     ", m), Style::default()),
-                                    Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(color)),
-                                ]));
-                            } else {
-                                let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
-                                lines.push(Line::from(Span::styled(
-                                    format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
-                                    Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
-                                )));
-                            }
-                        } else {
-                            let elapsed_str = match elapsed_ms {
-                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
-                                Some(ms) => format!(" {}ms", ms),
-                                None => String::new(),
-                            };
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
-                                    Style::default().fg(THEME.load().tool_result_ok),
-                                ),
-                                Span::styled(
-                                    elapsed_str,
-                                    Style::default().fg(THEME.load().subagent_time),
-                                ),
-                            ]));
-                        }
-                    }
-
-                    // Detect which tool produced this result
+                    // Detect which tool produced this result (bound once for reuse below)
                     let preceding_tool = self.find_preceding_tool_name(i);
 
                     // Check if this is read tool output (line-numbered) and try syntax highlighting
@@ -505,6 +539,79 @@ impl App {
                             Style::default().fg(THEME.load().muted),
                         )));
                     }
+
+                    // Footer: timeout indicator is shown unconditionally (even when is_error);
+                    // success/active footers are only shown when not an error.
+                    if is_timeout && show > 0 {
+                        let elapsed_str = match elapsed_ms {
+                            Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                            Some(ms) => format!(" {}ms", ms),
+                            None => String::new(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
+                                Style::default().fg(THEME.load().warning_color),
+                            ),
+                            Span::styled(
+                                elapsed_str,
+                                Style::default().fg(THEME.load().subagent_time),
+                            ),
+                        ]));
+                    } else if !is_error && show > 0 {
+                        if self.is_active_tool_result(i) {
+                            // Tool still executing — show animation only for the active result.
+                            let elapsed_str = if let Some(start) = self.tool_start_time {
+                                let secs = start.elapsed().as_secs_f64();
+                                if secs >= 1.0 { format!(" {:.1}s", secs) }
+                                else { format!(" {}ms", (secs * 1000.0) as u64) }
+                            } else { String::new() };
+
+                            if preceding_tool.as_deref() == Some("bash") {
+                                let (trace, color) = bash_trace(self.spinner_frame);
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!("{}     ", m), Style::default()),
+                                    Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(color)),
+                                ]));
+                            } else {
+                                let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                                lines.push(Line::from(Span::styled(
+                                    format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
+                                    Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
+                                )));
+                            }
+                        } else {
+                            let elapsed_str = match elapsed_ms {
+                                Some(ms) if *ms >= 1000 => format!(" {:.1}s", *ms as f64 / 1000.0),
+                                Some(ms) => format!(" {}ms", ms),
+                                None => String::new(),
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
+                                    Style::default().fg(THEME.load().tool_result_ok),
+                                ),
+                                Span::styled(
+                                    elapsed_str,
+                                    Style::default().fg(THEME.load().subagent_time),
+                                ),
+                            ]));
+                        }
+                    }
+                    // One blank line of bottom padding inside the card (filled
+                    // with the panel bg + gutter by panel_block).
+                    lines.push(Line::from(""));
+                    let card = lines.split_off(block_start);
+                    let accent = if is_error {
+                        THEME.load().error_color
+                    } else if is_timeout {
+                        THEME.load().warning_color
+                    } else {
+                        preceding_tool
+                            .map(|n| tool_accent(&n))
+                            .unwrap_or_else(|| tool_accent("_generic"))
+                    };
+                    lines.extend(panel_block(card, accent, output_panel_bg(), width, margin));
                 }
 
                 ChatMessage::Error(err) => {

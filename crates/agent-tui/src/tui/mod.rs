@@ -24,7 +24,7 @@ mod theme;
 mod toast;
 mod viewport;
 
-use app::{App, ChatMessage};
+use app::{App, ChatMessage, THINKING_PLACEHOLDER};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};
 use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
@@ -188,12 +188,13 @@ pub async fn run(
     let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
-        // redraws to ~60fps — deltas arrive far faster than the eye can read,
-        // and per-delta full-frame rebuilds are what used to burn a core.
-        // 16ms matches the tick branch, which guarantees a throttled frame
-        // flushes promptly. (Was 33ms/30fps; draw-path alloc surgery in
-        // 40c2ce4 made 60fps affordable.)
-        let throttle = std::time::Duration::from_millis(16);
+        // redraws to ~10fps — deltas (and the spinner) arrive far faster than the
+        // eye can read, and rebuilding/republishing the whole RenderModel per
+        // frame is what burns a core (#131: ~60-69% of a core at 60fps; the
+        // spinner only needs ~10fps). The `!app.streaming` short-circuit below
+        // still renders the final/idle frame immediately, so end-of-turn state
+        // never lags. (Was 16ms/60fps; before that 33ms/30fps.)
+        let throttle = std::time::Duration::from_millis(100);
         if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
             // Terminal lives on the render thread — get size via the crossterm
             // TTY syscall directly (doesn't need the Terminal object).
@@ -370,7 +371,7 @@ pub async fn run(
                             app.streaming = true;
                             app.spinner_frame = 0;
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
                         }
@@ -608,6 +609,7 @@ pub async fn run(
                                 } else {
                                     "aborted"
                                 };
+                                app.drop_empty_thinking();
                                 app.push_msg(ChatMessage::Error(abort_msg.to_string()));
                                 app.save_session().await;
                             }
@@ -717,7 +719,7 @@ pub async fn run(
                                         }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
-                                        app.push_msg(ChatMessage::Thinking("…".to_string()));
+                                        app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                                         cancel_token = Some(ct);
                                         steer_tx = Some(s_tx);
                                     }
@@ -1434,7 +1436,7 @@ pub async fn run(
                                 }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
-                                app.push_msg(ChatMessage::Thinking("…".to_string()));
+                                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                                 cancel_token = Some(ct);
                                 steer_tx = Some(s_tx);
                             }
@@ -1890,7 +1892,7 @@ pub async fn run(
                             }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
-                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
                         }
@@ -1903,7 +1905,7 @@ pub async fn run(
                             app.streaming = true;
                             app.spinner_frame = 0;
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking("…".to_string()));
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             cancel_token = Some(ct);
                             steer_tx = Some(s_tx);
                         }
