@@ -544,8 +544,7 @@ pub(crate) fn build_render_model(
     let all_lines_vec: &[ratatui::text::Line<'static>] =
         app.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
     let total = all_lines_vec.len();
-    // Wrap in Arc for zero-copy clone into the model.
-    let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = all_lines_vec.to_vec().into();
+    // `lines` wraps only the visible window — sliced below once (start, end) exist.
 
     // ── 4. Scroll bookkeeping (App mutations lifted from draw()) ──────────────
     if app.scroll_pinned {
@@ -577,6 +576,12 @@ pub(crate) fn build_render_model(
     };
     app.msg_area_rect = Some(msg_inner);
     app.visible_line_range = Some((start, end));
+
+    // Clone only the visible window (~viewport height lines) into the Arc —
+    // O(viewport) not O(n).  `total` above is the full flat count, kept for
+    // scroll bookkeeping; `lines` is only the slice the render thread needs.
+    let visible_slice = all_lines_vec.get(start..end).unwrap_or(&[]);
+    let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = visible_slice.to_vec().into();
 
     // ── 6. Selection range ────────────────────────────────────────────────────
     let selection = app.selection_range();
@@ -714,7 +719,6 @@ pub(crate) fn build_render_model(
         lines,
         lines_width: content_width,
         scroll_back,
-        visible_range: (start, end),
         selection,
         messages_empty: app.messages.is_empty(),
         logo_build_t: app.logo_build_t,
@@ -942,8 +946,8 @@ pub(crate) fn render_frame(
 
         // ── Messages ──────────────────────────────────────────────────────────
         let msg_area = outer[1];
-        let (start, end) = model.visible_range;
-        let visible: Vec<ratatui::text::Line> = model.lines[start..end].to_vec();
+        // model.lines IS the visible window (sliced on the main side) — render the whole arc.
+        let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
         let visible_is_empty = visible.is_empty();
 
         let msg_block = Block::default()
