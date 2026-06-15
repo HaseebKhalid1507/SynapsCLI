@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-06-15
+
+### Added
+- **Configurable streaming frame rate (`max_fps`)** — the TUI's streaming redraw rate is now a config knob. Add `max_fps = 144` (or `240`, or whatever your display runs) to `~/.synaps-cli/config`; default is `60`. Until now streaming redraws were hard-capped at ~10fps — a deliberate throttle from when each redraw rebuilt the whole transcript (O(n)). With 0.3.4's incremental cache (O(changed)) and 0.3.6's O(viewport) publish, a streaming frame is cheap, so the cap is now a real, tunable frame rate. Values are validated (1–1000) with a boot warning on bad input; user input (scroll/typing) always redraws immediately regardless of the cap.
+
 ## [0.3.6] — 2026-06-15
 
 ### Performance
