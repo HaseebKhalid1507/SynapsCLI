@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-06-15
+
+### Performance
+- **Streaming render publish is now O(viewport), not O(transcript)** — each frame, the TUI built its render snapshot by deep-cloning the *entire* line buffer (every message, every span) just so the render thread could slice the ~one screenful it actually draws. On long sessions that per-frame full clone was the last cost standing between streaming and a flat 60fps. The visible window is now sliced on the publishing side, so the snapshot carries only the lines on screen — publish cost no longer grows with session length. Completes the streaming-render perf arc: 0.3.3 throttled rebuild *frequency*, 0.3.4 cut rebuild *cost* (O(changed messages)), and 0.3.6 removes the residual O(n) publish clone. Selection and scrolling are unchanged.
+
+### Fixed
+- **Scrolling and typing stayed smooth during streaming** — the 0.3.3 redraw throttle (~10fps during active turns) also throttled *your* input, so scrolling the transcript or typing while the agent streamed felt sluggish. User input now bypasses the throttle (immediate redraw on scroll/keypress) while streaming text stays throttled — responsive controls without giving back the streaming CPU win.
+
 ## [0.3.5] — 2026-06-14
 
 ### Fixed
