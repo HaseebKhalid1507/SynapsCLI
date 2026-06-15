@@ -188,13 +188,17 @@ pub async fn run(
     let mut last_draw = Instant::now() - std::time::Duration::from_secs(1);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
-        // redraws to ~10fps — deltas (and the spinner) arrive far faster than the
-        // eye can read, and rebuilding/republishing the whole RenderModel per
-        // frame is what burns a core (#131: ~60-69% of a core at 60fps; the
-        // spinner only needs ~10fps). The `!app.streaming` short-circuit below
-        // still renders the final/idle frame immediately, so end-of-turn state
-        // never lags. (Was 16ms/60fps; before that 33ms/30fps.)
-        let throttle = std::time::Duration::from_millis(100);
+        // redraws to the configured frame budget (`max_fps`, default 60fps =
+        // ~16ms) — deltas and the spinner arrive faster than the eye reads, and
+        // building/publishing the RenderModel per frame is main-thread work
+        // (it re-renders the streaming message's markdown each frame). User
+        // input bypasses the cap via `force_redraw` so scroll/typing stays
+        // instant, and the `!app.streaming` short-circuit renders the final/idle
+        // frame immediately so end-of-turn state never lags. Tune via
+        // `max_fps = 60|144|240|…` in ~/.synaps-cli/config. (Was a hardcoded
+        // 100ms/10fps #131 throttle; 0.3.6 made publish O(viewport) so the cap
+        // could be raised to a real frame rate without burning a core.)
+        let throttle = std::time::Duration::from_millis(1000 / config.max_fps.max(1) as u64);
         if should_draw(app.needs_redraw, app.force_redraw, app.streaming, last_draw.elapsed(), throttle) {
             // Terminal lives on the render thread — get size via the crossterm
             // TTY syscall directly (doesn't need the Terminal object).

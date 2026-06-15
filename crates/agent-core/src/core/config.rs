@@ -198,6 +198,10 @@ pub struct SynapsConfig {
     pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
+    /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
+    /// 144, 240). User input always redraws immediately regardless. Default
+    /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
+    pub max_fps: u32,
     pub theme: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -229,6 +233,7 @@ impl Default for SynapsConfig {
             telemetry: "off".to_string(),
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
+            max_fps: 60,
             theme: None,
             agent_name: None,
             identity: None,
@@ -249,7 +254,7 @@ impl Default for SynapsConfig {
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model", "thinking", "compaction_model", "context_window", "max_tool_output",
     "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
-    "telemetry", "cache_diagnostics", "cache_ttl", "theme", "agent_name", "identity",
+    "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "theme", "agent_name", "identity",
     "disabled_plugins", "favorite_models", "disabled_skills",
 ];
 
@@ -502,6 +507,17 @@ pub fn load_config() -> SynapsConfig {
                     )),
                 }
             }
+            "max_fps" => {
+                match val.parse::<u32>() {
+                    Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
+                    Ok(_) => config.warnings.push(format!(
+                        "max_fps = {val} — expected 1–1000; using {}", config.max_fps
+                    )),
+                    Err(_) => config.warnings.push(format!(
+                        "max_fps = {val} — not a number; using {}", config.max_fps
+                    )),
+                }
+            }
             "theme" => config.theme = Some(val.to_string()),
             "agent_name" => config.agent_name = Some(val.to_string()),
             "identity" => config.identity = Some(val.to_string()),
@@ -738,6 +754,51 @@ mod tests {
     fn test_cache_ttl_default_is_five_minutes() {
         assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
         assert_eq!(SynapsConfig::default().cache_ttl, CacheTtl::FiveMinutes);
+    }
+
+    #[test]
+    fn test_max_fps_default_is_60() {
+        assert_eq!(SynapsConfig::default().max_fps, 60);
+    }
+
+    #[test]
+    #[serial]
+    fn test_max_fps_config_parse_and_validation() {
+        let home = std::env::temp_dir().join(format!("synaps-maxfps-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid high-refresh value parses, no warning.
+        std::fs::write(dir.join("config"), "max_fps = 144\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.max_fps, 144);
+            assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        });
+
+        // Out-of-range (0) → default 60 + boot warning (never blocks boot).
+        std::fs::write(dir.join("config"), "max_fps = 0\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.max_fps, 60);
+            assert!(
+                config.warnings.iter().any(|w| w.contains("max_fps")),
+                "warnings: {:?}", config.warnings
+            );
+        });
+
+        // Non-numeric → default 60 + warning.
+        std::fs::write(dir.join("config"), "max_fps = fast\n").unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.max_fps, 60);
+            assert!(
+                config.warnings.iter().any(|w| w.contains("max_fps")),
+                "warnings: {:?}", config.warnings
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
