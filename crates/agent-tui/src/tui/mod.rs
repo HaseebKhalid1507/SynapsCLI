@@ -27,7 +27,7 @@ mod viewport;
 use app::{App, ChatMessage, THINKING_PLACEHOLDER};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};
-use helpers::{apply_setting, fetch_usage, rebuild_display_messages};
+use helpers::{apply_setting, fetch_usage, rebuild_display_messages, should_draw};
 use input::InputAction;
 use lifecycle::setup_terminal;
 use render_thread::spawn_render_thread;
@@ -195,7 +195,7 @@ pub async fn run(
         // still renders the final/idle frame immediately, so end-of-turn state
         // never lags. (Was 16ms/60fps; before that 33ms/30fps.)
         let throttle = std::time::Duration::from_millis(100);
-        if app.needs_redraw && (!app.streaming || last_draw.elapsed() >= throttle) {
+        if should_draw(app.needs_redraw, app.force_redraw, app.streaming, last_draw.elapsed(), throttle) {
             // Terminal lives on the render thread — get size via the crossterm
             // TTY syscall directly (doesn't need the Terminal object).
             // Skip the frame entirely if the reported size is 0×0 (terminal not
@@ -206,6 +206,7 @@ pub async fn run(
                 _ => continue,
             };
             app.needs_redraw = false;
+            app.force_redraw = false;
             last_draw = Instant::now();
             if let Some(model) = build_render_model(
                 &mut app,
@@ -571,8 +572,9 @@ pub async fn run(
                             input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard)
                         };
                         // Input events (keys, mouse, paste, resize) almost always
-                        // change visible state (cursor, input buffer, scroll).
-                        app.request_redraw();
+                        // change visible state (cursor, input buffer, scroll) and
+                        // must feel instant — bypass the streaming redraw throttle.
+                        app.request_immediate_redraw();
                         match action {
                             InputAction::None => {}
                             InputAction::HelpFindOutcome => {}
