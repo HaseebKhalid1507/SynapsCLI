@@ -40,8 +40,6 @@ pub(crate) struct RenderModel {
     pub(crate) lines_width: usize,
     /// Final scroll offset, already clamped on the main side.
     pub(crate) scroll_back: u16,
-    /// `(start, end)` index pair into `lines` for the visible viewport.
-    pub(crate) visible_range: (usize, usize),
     /// Text-selection overlay coordinates (cell-level), pre-computed.
     pub(crate) selection: Option<(u16, u16, u16, u16)>,
     /// `true` when there are no messages — drives logo visibility.

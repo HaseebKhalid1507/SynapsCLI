@@ -2,11 +2,32 @@
 //!
 //! Extracted from `mod.rs` to keep `run()` focused on orchestration.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use super::app::{App, ChatMessage};
 use super::theme;
 use super::settings;
+
+/// Decide whether to repaint on this event-loop iteration.
+///
+/// During streaming, model-text redraws are coalesced to `throttle` — the #131
+/// CPU win (per-delta full-model rebuilds at 60fps used to burn a core, and the
+/// eye can't read faster than ~10fps anyway). But a `force` redraw — set by any
+/// user input (scroll, typing, cursor, paste, resize) — bypasses the throttle so
+/// interaction stays instant. When not streaming, redraws are always immediate.
+/// Nothing repaints unless `needs_redraw` is set.
+#[must_use]
+pub(super) fn should_draw(
+    needs_redraw: bool,
+    force: bool,
+    streaming: bool,
+    since_last: Duration,
+    throttle: Duration,
+) -> bool {
+    needs_redraw && (force || !streaming || since_last >= throttle)
+}
 
 /// Apply a settings-menu change: mutate Runtime where possible, persist to config,
 /// and stash write errors in the modal's row_error slot.
@@ -149,4 +170,39 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     // hundreds of messages on the first frame (the slow-boot cause). Full
     // history stays in api_messages for the model. See App::cap_resumed_display.
     app.cap_resumed_display(120);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_draw;
+    use std::time::Duration;
+
+    const T: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn never_draws_when_flag_unset() {
+        // No redraw requested → never paint, regardless of other state.
+        assert!(!should_draw(false, false, false, Duration::from_secs(1), T));
+        assert!(!should_draw(false, true, true, Duration::from_secs(1), T));
+    }
+
+    #[test]
+    fn idle_redraws_immediately() {
+        // Not streaming → paint as soon as something needs it.
+        assert!(should_draw(true, false, false, Duration::ZERO, T));
+    }
+
+    #[test]
+    fn streaming_text_is_throttled() {
+        // Streaming model text, not user-forced: coalesce to the throttle.
+        assert!(!should_draw(true, false, true, Duration::from_millis(16), T)); // too soon → wait
+        assert!(should_draw(true, false, true, Duration::from_millis(100), T)); // throttle elapsed → paint
+    }
+
+    #[test]
+    fn user_input_bypasses_streaming_throttle() {
+        // THE FIX: scroll/typing during streaming must paint instantly,
+        // even mid-throttle. (Pre-fix this returned false → choppy scroll.)
+        assert!(should_draw(true, true, true, Duration::ZERO, T));
+    }
 }

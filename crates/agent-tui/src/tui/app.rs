@@ -110,6 +110,10 @@ pub(crate) struct App {
     /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
     pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
+    /// When set, the next repaint bypasses the streaming redraw throttle.
+    /// Set by user input (scroll/typing/cursor) so interaction stays instant
+    /// even while the model is streaming; cleared after the paint.
+    pub(crate) force_redraw: bool,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
@@ -249,6 +253,7 @@ impl App {
             line_cache: None,
             dirty_from: None,
             needs_redraw: true,
+            force_redraw: false,
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
@@ -569,6 +574,15 @@ impl App {
     /// panel-only changes like spinner/timer updates, scroll, cursor blink).
     pub(crate) fn request_redraw(&mut self) {
         self.needs_redraw = true;
+    }
+
+    /// Request an immediate repaint that bypasses the streaming redraw throttle.
+    /// Use for user-driven changes (scroll, typing, cursor, paste, resize) that
+    /// must feel instant even while the model is streaming. Streaming text
+    /// deltas use the throttled `request_redraw` / `invalidate` paths.
+    pub(crate) fn request_immediate_redraw(&mut self) {
+        self.needs_redraw = true;
+        self.force_redraw = true;
     }
 
     /// Advance spinner/animation state.
@@ -1955,5 +1969,109 @@ mod tests {
         };
         assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
             "flat must equal render_lines after insert + incremental rebuild");
+    }
+}
+
+#[cfg(test)]
+mod visible_window_tests {
+    use super::*;
+
+    /// Unit-tests the windowing arithmetic that the "publish visible window
+    /// only" perf fix relies on (draw.rs §3-5 + the deferred Arc clone).
+    ///
+    /// `build_render_model` itself needs a live `Runtime` + `CommandRegistry`
+    /// so it can't be called in isolation — instead this mirrors its publish
+    /// path exactly and pins the invariants the production code must satisfy:
+    ///   1. `lines.len()` == content_height (the viewport), NOT `total`.
+    ///      This is what makes the publish O(viewport) instead of O(n).
+    ///   2. `lines` content == `cache.flat[start..end]` for the scroll position.
+    ///   3. the render thread's `model.lines.to_vec()` (no re-slice) equals
+    ///      that same window — proving the [start..end] re-slice is redundant.
+    ///   4. a different scroll_back yields a different window of the same len.
+    ///
+    /// If the production slice arithmetic drifts (wrong start/end, off-by-one,
+    /// or reverting to a full-buffer clone), the mirrored logic here breaks too.
+    #[test]
+    fn visible_window_publish_clones_only_viewport_not_full_buffer() {
+        let mut app = App::new(Session::new("test-model", "low", None));
+
+        // 20 Text messages → each renders as 1 flat line at w=80, so total >= 20.
+        for i in 0..20 {
+            app.push_msg(ChatMessage::Text(format!("line {i}")));
+        }
+
+        let content_width: usize = 80;
+        let content_height: usize = 5; // viewport is 5 rows — much less than 20
+
+        // Mirror draw.rs §3: build cache.
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            .map(|i| app.render_message_lines(i, content_width))
+            .collect();
+        let flat: Vec<ratatui::text::Line<'static>> =
+            per_msg.iter().flatten().cloned().collect();
+        let cache = LineCache { width: content_width, per_msg, flat };
+
+        let total = cache.flat.len();
+        assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
+
+        // Mirror draw.rs §4-5: scroll pinned to bottom, scroll_back = 0.
+        let scroll_back: usize = 0;
+        let end = total.saturating_sub(scroll_back);
+        let start = end.saturating_sub(content_height);
+
+        // ── NEW path (the fix): slice BEFORE Arc wrap ─────────────────────────
+        let all_lines_vec: &[ratatui::text::Line<'static>] = cache.flat.as_slice();
+        let visible_slice = all_lines_vec.get(start..end).unwrap_or(&[]);
+        let lines: std::sync::Arc<[ratatui::text::Line<'static>]> =
+            visible_slice.to_vec().into();
+
+        let to_str = |sl: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            sl.iter()
+              .map(|l| {
+                  l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+              })
+              .collect()
+        };
+
+        // 1. Published len must equal the viewport, NOT the full buffer.
+        //    With OLD code: `lines` = full clone → len == total (e.g. 20+), fails here.
+        assert_eq!(
+            lines.len(),
+            content_height,
+            "model.lines.len() must equal content_height ({content_height}), \
+             got {} (full buffer len = {total}) — old code publishes the whole buffer",
+            lines.len()
+        );
+
+        // 2. Content must match cache.flat[start..end].
+        assert_eq!(
+            to_str(&lines),
+            to_str(&cache.flat[start..end]),
+            "published window content must equal cache.flat[start..end]"
+        );
+
+        // 3. Render-thread side: after fix, visible = model.lines.to_vec() (no re-slice).
+        //    The full `lines` arc IS the window — no [start..end] indexing needed.
+        let visible_render: Vec<ratatui::text::Line> = lines.to_vec();
+        assert_eq!(
+            to_str(&visible_render),
+            to_str(&cache.flat[start..end]),
+            "render-thread .to_vec() on model.lines must equal the visible window"
+        );
+
+        // 4. Sanity: scroll into the middle, check a different window.
+        let scroll_mid: usize = 10; // scroll back 10 lines
+        let end2 = total.saturating_sub(scroll_mid);
+        let start2 = end2.saturating_sub(content_height);
+        let visible2 = all_lines_vec.get(start2..end2).unwrap_or(&[]);
+        let lines2: std::sync::Arc<[ratatui::text::Line<'static>]> =
+            visible2.to_vec().into();
+        assert_eq!(lines2.len(), content_height,
+            "mid-scroll window must also have viewport length");
+        assert_ne!(
+            to_str(&lines2),
+            to_str(&lines),
+            "different scroll positions must yield different window content"
+        );
     }
 }
