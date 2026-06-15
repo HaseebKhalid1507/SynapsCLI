@@ -110,6 +110,10 @@ pub(crate) struct App {
     /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
     pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
+    /// When set, the next repaint bypasses the streaming redraw throttle.
+    /// Set by user input (scroll/typing/cursor) so interaction stays instant
+    /// even while the model is streaming; cleared after the paint.
+    pub(crate) force_redraw: bool,
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
@@ -249,6 +253,7 @@ impl App {
             line_cache: None,
             dirty_from: None,
             needs_redraw: true,
+            force_redraw: false,
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
@@ -569,6 +574,15 @@ impl App {
     /// panel-only changes like spinner/timer updates, scroll, cursor blink).
     pub(crate) fn request_redraw(&mut self) {
         self.needs_redraw = true;
+    }
+
+    /// Request an immediate repaint that bypasses the streaming redraw throttle.
+    /// Use for user-driven changes (scroll, typing, cursor, paste, resize) that
+    /// must feel instant even while the model is streaming. Streaming text
+    /// deltas use the throttled `request_redraw` / `invalidate` paths.
+    pub(crate) fn request_immediate_redraw(&mut self) {
+        self.needs_redraw = true;
+        self.force_redraw = true;
     }
 
     /// Advance spinner/animation state.
