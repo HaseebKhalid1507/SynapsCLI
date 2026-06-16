@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-06-16
+
 ### Added
 - **Static Linux binary (`x86_64-unknown-linux-musl`)** — releases now ship a fully static, musl-linked Linux build alongside the existing glibc one. Because musl is linked statically, the binary carries its own libc and depends on *nothing* on the host — it runs on Alpine, `scratch`/distroless containers, busybox, and older distros where a glibc build dies with `GLIBC_2.xx not found` or simply has no libc to link against. Verified end-to-end: the binary boots and completes a TLS handshake inside a bare Alpine container with no glibc and no system CA certificates.
 
