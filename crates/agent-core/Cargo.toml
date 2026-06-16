@@ -19,7 +19,7 @@ bytes              = "1"
 tracing            = "0.1"
 tracing-appender   = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
 uuid               = { version = "1.0", features = ["v4"] }
 base64             = "0.22"
 rand               = "0.9"
