@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Static Linux binary (`x86_64-unknown-linux-musl`)** — releases now ship a fully static, musl-linked Linux build alongside the existing glibc one. Because musl is linked statically, the binary carries its own libc and depends on *nothing* on the host — it runs on Alpine, `scratch`/distroless containers, busybox, and older distros where a glibc build dies with `GLIBC_2.xx not found` or simply has no libc to link against. Verified end-to-end: the binary boots and completes a TLS handshake inside a bare Alpine container with no glibc and no system CA certificates.
+
+### Changed
+- **TLS trust now uses bundled Mozilla CA roots (webpki-roots)** — HTTPS previously trusted the *system* CA store (`rustls-tls-native-roots`), which reads `/etc/ssl/certs` at runtime. Minimal environments (Alpine, slim/scratch containers, bare CI images) often ship without `ca-certificates`, so every HTTPS call failed there with a certificate/"could not reach" error. The CA roots are now compiled into the binary, so HTTPS works out of the box on any system regardless of what's installed. This is what makes the static musl binary genuinely "runs anywhere." (Trade-off: a custom/corporate CA installed only in the system trust store is no longer picked up automatically.)
+
 ## [0.3.7] — 2026-06-15
 
 ### Added
