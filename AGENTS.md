@@ -407,6 +407,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
+| `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`) |
 | `provider.<name>` | string | — | API key for provider (e.g. `provider.groq = gsk_...`) |
 | `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
