@@ -77,7 +77,11 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
     let access = auth["anthropic"]["access"].as_str()
         .ok_or("No OAuth token")?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
+        .build()
+        .map_err(|e| format!("API client build error: {}", e))?;
     let resp = client.get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", access))
         .header("anthropic-beta", "oauth-2025-04-20")

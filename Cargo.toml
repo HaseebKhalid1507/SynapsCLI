@@ -18,7 +18,7 @@ agent-engine = { path = "crates/agent-engine", version = "0.3.8", package = "syn
 agent-tui = { path = "crates/agent-tui", version = "0.3.8", package = "synaps-tui" }
 arc-swap = "1"
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 bytes = "1"
 memchr = "2"
 serde = { version = "1.0", features = ["derive"] }
