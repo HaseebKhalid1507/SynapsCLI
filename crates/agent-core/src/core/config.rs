@@ -208,6 +208,9 @@ pub struct SynapsConfig {
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
+    /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
+    /// from the registry at boot so they're never offered to the model.
+    pub disabled_tools: Vec<String>,
     pub shell: ShellConfig,
     pub server: ServerConfig,
     pub bridge: BridgeConfig,
@@ -240,6 +243,7 @@ impl Default for SynapsConfig {
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_tools: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
             bridge: BridgeConfig::default(),
@@ -255,7 +259,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model", "thinking", "compaction_model", "context_window", "max_tool_output",
     "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
     "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "theme", "agent_name", "identity",
-    "disabled_plugins", "favorite_models", "disabled_skills",
+    "disabled_plugins", "favorite_models", "disabled_skills", "disabled_tools",
 ];
 
 /// Simple Levenshtein distance for did-you-mean suggestions.
@@ -529,6 +533,9 @@ pub fn load_config() -> SynapsConfig {
             }
             "disabled_skills" => {
                 config.disabled_skills = parse_comma_list(val);
+            }
+            "disabled_tools" => {
+                config.disabled_tools = parse_comma_list(val);
             }
             _ => {
                 // Handle namespaced keys

@@ -60,6 +60,21 @@ impl ToolRegistry {
         Self::from_tools(Vec::new())
     }
 
+    /// Remove built-in tools by runtime name (config `disabled_tools`), then
+    /// rebuild the cached schema and name maps. Unknown names are ignored.
+    pub fn disable(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let remaining: Vec<Arc<dyn Tool>> = self
+            .tools
+            .values()
+            .filter(|t| !names.iter().any(|n| n == t.name()))
+            .cloned()
+            .collect();
+        *self = Self::from_tools(remaining);
+    }
+
     /// Registry without subagent tool — used for subagent runtimes to prevent recursion.
     pub fn without_subagent() -> Self {
         let tools: Vec<Arc<dyn Tool>> = vec![
@@ -433,12 +448,39 @@ mod tests {
     }
 
     #[test]
+    fn test_disable_removes_tools_from_registry_and_schema() {
+        let mut registry = ToolRegistry::new();
+        let before = registry.tools_schema().len();
+
+        registry.disable(&["bash".to_string(), "ls".to_string()]);
+
+        // bash + ls gone from lookup
+        assert!(registry.get("bash").is_none());
+        assert!(registry.get("ls").is_none());
+        // others untouched
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("subagent").is_some());
+        // schema rebuilt with exactly two fewer tools
+        assert_eq!(registry.tools_schema().len(), before - 2);
+    }
+
+    #[test]
+    fn test_disable_empty_and_unknown_are_noops() {
+        let mut registry = ToolRegistry::new();
+        let n = registry.tools_schema().len();
+        registry.disable(&[]); // empty → no change
+        assert_eq!(registry.tools_schema().len(), n);
+        registry.disable(&["not_a_real_tool".to_string()]); // unknown → no change
+        assert_eq!(registry.tools_schema().len(), n);
+        assert!(registry.get("bash").is_some());
+    }
+
+    #[test]
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
 
         // Should have 10 tools without subagent (7 base + 3 shell)
         assert_eq!(registry.tools_schema().len(), 10);
-
         // Should not have subagent tool
         assert!(registry.get("subagent").is_none());
 
