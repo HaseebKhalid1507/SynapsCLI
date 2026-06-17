@@ -345,6 +345,15 @@ impl Runtime {
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+
+        // Remove any built-in tools the user disabled via `disabled_tools`.
+        // try_write is safe here: apply_config runs at boot before the registry
+        // is shared with other tasks.
+        if !config.disabled_tools.is_empty() {
+            if let Ok(mut reg) = self.tools.try_write() {
+                reg.disable(&config.disabled_tools);
+            }
+        }
     }
 
     pub fn thinking_budget(&self) -> u32 {
