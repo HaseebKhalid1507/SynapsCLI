@@ -199,6 +199,8 @@ impl Runtime {
         let (auth_token, auth_type, refresh_token, token_expires) = AuthMethods::get_auth_token()?;
 
         let client = Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()

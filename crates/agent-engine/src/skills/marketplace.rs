@@ -289,6 +289,8 @@ pub async fn fetch_marketplace(input: &str) -> Result<(MarketplaceManifest, Stri
 /// application code should use `fetch_manifest` instead.
 pub async fn fetch_raw(url: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest build: {}", e))?;

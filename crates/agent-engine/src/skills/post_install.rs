@@ -548,6 +548,8 @@ async fn download_prebuilt_to_file(
     }
 
     let client = reqwest::Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
         .connect_timeout(PREBUILT_CONNECT_TIMEOUT)
         .timeout(PREBUILT_REQUEST_TIMEOUT)
         .build()

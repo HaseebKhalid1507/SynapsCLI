@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **TLS now trusts both bundled *and* system CA roots** — 0.3.8 switched to bundled Mozilla roots (webpki) so HTTPS works on minimal systems, but that dropped pickup of custom/corporate CAs installed only in the OS trust store. HTTPS now trusts the *union*: the compiled-in Mozilla bundle **and** the system trust store. Bare containers still work (bundled roots), and enterprise/proxy/custom CAs are honored again (system roots). Both root sources are loaded explicitly on every HTTP client, so the behavior doesn't depend on dependency defaults. Verified: still completes TLS in a bare Alpine container with no system CAs, *and* trusts a custom CA present only in the system store.
+
 ## [0.3.8] — 2026-06-16
 
 ### Added
