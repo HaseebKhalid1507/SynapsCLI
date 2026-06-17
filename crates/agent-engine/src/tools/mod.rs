@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 // ── Module declarations ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "command-exec")]
 mod bash;
 pub(crate) mod context_checkpoint;
 mod edit;
@@ -19,6 +20,7 @@ mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
+#[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
@@ -49,6 +51,7 @@ pub use crate::runtime::subagent::{
     SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
+#[cfg(feature = "command-exec")]
 pub use bash::{bash_intermediary_snapshot, BashIntermediarySnapshot, BashTool};
 pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
@@ -57,6 +60,7 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
+#[cfg(feature = "command-exec")]
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use registry::{

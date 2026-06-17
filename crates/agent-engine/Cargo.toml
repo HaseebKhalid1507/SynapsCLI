@@ -10,6 +10,18 @@ license = "Apache-2.0"
 name = "agent_engine"
 path = "src/lib.rs"
 
+[features]
+# Arbitrary local command execution surface: the `bash` tool and the
+# interactive `shell_*` PTY tools. ON by default so a normal build is unchanged.
+# Build a hardened binary with `--no-default-features` to compile `bash` out of
+# the binary entirely and never register the shell tools (defense-in-depth for
+# gated deployments that only expose read-only MCP tools).
+default = ["command-exec"]
+command-exec = []
+# Test-support surface: offline Runtime construction for headless harnesses.
+# Never enabled in production builds; enabled by synaps-tui's `testing` feature.
+testing = []
+
 [dependencies]
 agent-core = { workspace = true }
 
@@ -82,11 +94,6 @@ tokio-tungstenite  = "0.21"
 # Misc
 arc-swap           = "1"
 
-[features]
-# Test-support surface: offline Runtime construction for headless harnesses.
-# Never enabled in production builds; enabled by synaps-tui's `testing` feature.
-testing = []
-
 [target.'cfg(unix)'.dependencies]
 libc        = "0.2"
 signal-hook = { version = "0.3", features = ["iterator"] }
@@ -98,4 +105,6 @@ tokio       = { version = "1.0", features = ["full", "test-util"] }
 # Self dev-dependency (same pattern as synaps-tui): turns the `testing`
 # feature on for every test target via feature unification, so integration
 # tests in tests/ see the harness seams without extra cargo flags.
-synaps-engine = { path = ".", features = ["testing"] }
+# default-features = false so `--no-default-features` (hardened) test builds
+# are not silently re-unified back to `default` = command-exec by this edge.
+synaps-engine = { path = ".", features = ["testing"], default-features = false }

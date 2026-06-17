@@ -1392,6 +1392,7 @@ mod tests {
     }
 
     /// Test A (RED stub, current signature) — proves the bug.
+    #[cfg(feature = "command-exec")]
     #[tokio::test]
     async fn after_tool_call_transform_receives_full_output_not_pre_truncated() {
         use crate::tools::Tool;
