@@ -102,6 +102,8 @@ async fn exchange_code_for_tokens(
     verifier: &str,
 ) -> std::result::Result<OAuthCredentials, String> {
     let client = Client::builder()
+        .tls_built_in_webpki_certs(true)
+        .tls_built_in_native_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
