@@ -199,6 +199,8 @@ impl Runtime {
         let (auth_token, auth_type, refresh_token, token_expires) = AuthMethods::get_auth_token()?;
 
         let client = Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
@@ -343,6 +345,15 @@ impl Runtime {
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+
+        // Remove any built-in tools the user disabled via `disabled_tools`.
+        // try_write is safe here: apply_config runs at boot before the registry
+        // is shared with other tasks.
+        if !config.disabled_tools.is_empty() {
+            if let Ok(mut reg) = self.tools.try_write() {
+                reg.disable(&config.disabled_tools);
+            }
+        }
     }
 
     pub fn thinking_budget(&self) -> u32 {

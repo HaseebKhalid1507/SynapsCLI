@@ -171,6 +171,10 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 Plus anything from MCP servers. `connect_mcp_server` and they're live.
 
+Need a locked-down agent? Disable any built-in by name in your config:
+`disabled_tools = bash, ls` removes them from the registry at boot, so the model
+never sees them (handy for read-only or no-shell profiles).
+
 ---
 
 ## Configuration
@@ -187,6 +191,7 @@ context_window = 200k
 identity = You are a senior engineer who writes clean, tested code.
 cache_ttl = hybrid          # prompt-cache TTL: 5m (default) | 1h | hybrid
 max_fps = 60                # TUI redraw cap during streaming: 60 (default) | 144 | 240 | …
+disabled_tools = bash, ls   # built-in tools to remove from the registry at boot
 
 provider.groq = gsk_...
 provider.cerebras = csk-...

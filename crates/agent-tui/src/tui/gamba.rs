@@ -35,7 +35,12 @@ impl App {
         crossterm::terminal::enable_raw_mode().ok();
         crossterm::execute!(
             std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen
+            crossterm::terminal::EnterAlternateScreen,
+            // Mirror setup_terminal(): the casino subprocess disables mouse
+            // capture + bracketed paste on its way out, so re-enable both or
+            // the TUI loses scroll-wheel events (and paste) after returning.
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
         ).ok();
     }
 

@@ -2,7 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.9] — 2026-06-23
+
+### Added
+- **Disable built-in tools via config (`disabled_tools`)** — add `disabled_tools = bash, ls` (comma-separated runtime names) to `~/.synaps-cli/config` to remove specific built-in tools from the registry at boot, so they're never offered to the model. Useful for locking down what an agent can do (e.g. a read-only or no-shell profile). Mirrors the existing `disabled_plugins` / `disabled_skills` options; unknown names are ignored.
+
+### Changed
+- **TLS now trusts both bundled *and* system CA roots** — 0.3.8 switched to bundled Mozilla roots (webpki) so HTTPS works on minimal systems, but that dropped pickup of custom/corporate CAs installed only in the OS trust store. HTTPS now trusts the *union*: the compiled-in Mozilla bundle **and** the system trust store. Bare containers still work (bundled roots), and enterprise/proxy/custom CAs are honored again (system roots). Both root sources are loaded explicitly on every HTTP client, so the behavior doesn't depend on dependency defaults. Verified: still completes TLS in a bare Alpine container with no system CAs, *and* trusts a custom CA present only in the system store.
+
+### Fixed
+- **Scroll restored after the casino (`/gamba`)** — returning from the GamblersDen mini-game left the terminal with mouse capture and bracketed paste disabled, so the scroll wheel (and paste) stopped working in the TUI. The terminal handoff now re-enables both on the way back, matching the initial setup.
 
 ## [0.3.8] — 2026-06-16
 
