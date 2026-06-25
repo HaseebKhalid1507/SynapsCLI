@@ -72,7 +72,12 @@ pub struct CallbackResult {
     pub state: String,
 }
 
-/// Check if the current token is expired (or will expire within 5 minutes).
+/// Check if the current token is expired.
+///
+/// Note the effective ~5-minute safety margin lives in the stored value, not
+/// here: `refresh_token`/`exchange_code_for_tokens` bake a 5-minute buffer into
+/// `expires` (`now + expires_in*1000 - 5min`). So a bare `now >= expires` check
+/// already fires ~5 minutes before the credential actually dies at the provider.
 pub fn is_token_expired(creds: &OAuthCredentials) -> bool {
     now_millis() >= creds.expires
 }
