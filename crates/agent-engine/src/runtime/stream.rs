@@ -17,6 +17,11 @@ pub(super) struct StreamSession {
     // Auth & network
     pub(super) auth: Arc<RwLock<AuthState>>,
     pub(super) client: Client,
+    /// Credential source (Local/Remote) — threaded in so the mid-stream refresh
+    /// uses the broker for Remote clients, not the local auth.json. (#157)
+    pub(super) credential_source: crate::auth::CredentialSource,
+    /// Shared broker token cache (Remote source only).
+    pub(super) token_cache: crate::auth::TokenCache,
     pub(super) options: super::api::ApiOptions,
     pub(super) api_retries: u32,
 
@@ -68,7 +73,7 @@ impl StreamMethods {
         initial_messages: Vec<Value>,
     ) -> Result<()> {
         let StreamSession {
-            auth, client, options, api_retries,
+            auth, client, credential_source, token_cache, options, api_retries,
             model, tools, system_prompt, thinking_budget,
             tx, cancel, mut steering_rx,
             watcher_exit_path, max_tool_output,
@@ -85,36 +90,17 @@ impl StreamMethods {
                 return Ok(());
             }
 
-            // Refresh token before each API call in the tool loop — this is
-            // the fix for stale tokens in long-running agentic sessions.
-            {
-                let auth_state = auth.read().await;
-                if auth_state.auth_type == "oauth" {
-                    let expired = match auth_state.token_expires {
-                        Some(exp) => {
-                            let now = crate::epoch_millis();
-                            now >= exp
-                        }
-                        None => false,
-                    };
-                    if expired {
-                        // Drop read lock before acquiring write
-                        drop(auth_state);
-
-                        tracing::info!("Refreshing token mid-stream");
-                        let creds = crate::auth::ensure_fresh_token(&client)
-                            .await
-                            .map_err(|e| RuntimeError::Auth(format!(
-                                "Token refresh failed mid-stream: {}. Run `synaps login` to re-authenticate.", e
-                            )))?;
-
-                        let mut auth_w = auth.write().await;
-                        auth_w.auth_token = creds.access;
-                        auth_w.refresh_token = Some(creds.refresh);
-                        auth_w.token_expires = Some(creds.expires);
-                    }
-                }
-            }
+            // Refresh token before each API call in the tool loop — fixes stale
+            // tokens in long-running agentic sessions. Unified path: branches
+            // Local (auth.json) vs Remote (broker) so Remote clients refresh
+            // mid-stream FROM THE BROKER, never the (absent) local auth.json. (#157)
+            super::auth::AuthMethods::refresh_if_needed(
+                Arc::clone(&auth),
+                &client,
+                &credential_source,
+                &token_cache,
+            )
+            .await?;
 
             let tools_snapshot = tools.read().await.clone();
 
