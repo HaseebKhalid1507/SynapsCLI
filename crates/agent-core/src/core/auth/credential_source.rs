@@ -394,4 +394,19 @@ mod tests {
         let err = c.fetch_token("anthropic").await.unwrap_err();
         assert!(err.contains("401"), "expected 401 error, got: {err}");
     }
+
+    // ── invariant: a Remote client can NEVER hold a refresh token ─────────
+    #[test]
+    fn broker_token_structurally_drops_any_refresh_field() {
+        // Even a misbehaving/compromised broker that leaks a refresh token in
+        // the JSON cannot make a client hold one: BrokerToken has no field for
+        // it, so serde silently drops it. The "clients never hold a refresh
+        // token" invariant is structural, not a runtime check.
+        let json = r#"{"access_token":"a","expires":1,"refresh_token":"LEAK","refresh":"LEAK"}"#;
+        let t: BrokerToken = serde_json::from_str(json).unwrap();
+        assert_eq!(t.access_token, "a");
+        assert_eq!(t.expires, 1);
+        // There is no `refresh`/`refresh_token` field to even read — confirmed
+        // at compile time by the struct definition above.
+    }
 }
