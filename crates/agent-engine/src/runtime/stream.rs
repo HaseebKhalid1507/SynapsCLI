@@ -94,13 +94,17 @@ impl StreamMethods {
             // tokens in long-running agentic sessions. Unified path: branches
             // Local (auth.json) vs Remote (broker) so Remote clients refresh
             // mid-stream FROM THE BROKER, never the (absent) local auth.json. (#157)
-            super::auth::AuthMethods::refresh_if_needed(
-                Arc::clone(&auth),
-                &client,
-                &credential_source,
-                &token_cache,
-            )
-            .await?;
+            // Skip for non-Anthropic models — the OpenAI/codex path self-serves
+            // its provider token (incl. via the broker). (#158 #7)
+            if super::auth::model_is_anthropic(&model) {
+                super::auth::AuthMethods::refresh_if_needed(
+                    Arc::clone(&auth),
+                    &client,
+                    &credential_source,
+                    &token_cache,
+                )
+                .await?;
+            }
 
             let tools_snapshot = tools.read().await.clone();
 
