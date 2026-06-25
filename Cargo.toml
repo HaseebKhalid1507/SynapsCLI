@@ -35,8 +35,8 @@ async-trait = "0.1.89"
 futures = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 sha2 = "0.10"
 rand = "0.9"
 base64 = "0.22"
