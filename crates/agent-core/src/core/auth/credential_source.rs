@@ -227,7 +227,15 @@ pub struct BrokerClient {
 
 impl BrokerClient {
     pub fn new(endpoint: impl Into<String>, machine_token: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), endpoint: endpoint.into(), machine_token: machine_token.into() }
+        // D1: bound the request so a hung/unreachable broker can't stall the
+        // caller's whole turn. (The runtime path uses `with_client` and inherits
+        // the runtime's configured client; this is the standalone fallback.)
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_default();
+        Self { http, endpoint: endpoint.into(), machine_token: machine_token.into() }
     }
 
     /// Like `new` but reuses an existing `reqwest::Client` (shared connection
