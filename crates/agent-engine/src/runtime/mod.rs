@@ -354,24 +354,7 @@ impl Runtime {
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
-        // Credential source: Local (auth.json) by default, or Remote (broker)
-        // when auth.remote_endpoint / SYNAPS_AUTH_ENDPOINT is set. (#157)
-        let new_source = config.auth.credential_source();
-        // A6: switching source (or broker endpoint) must not serve a token minted
-        // by the previous broker/identity — drop any cached token.
-        if new_source != self.credential_source {
-            self.token_cache.invalidate("anthropic");
-        }
-        self.credential_source = new_source;
-        // A2: on Remote, NEVER use a credential seeded from a local auth.json.
-        // Scrub AuthState so the first refresh fetches from the broker and the
-        // client never holds a refresh token (invariant 1). try_write is safe:
-        // apply_config runs at boot before AuthState is shared with stream tasks.
-        if self.credential_source.is_remote() {
-            if let Ok(mut auth) = self.auth.try_write() {
-                AuthMethods::scrub_for_remote(&mut auth);
-            }
-        }
+        self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
         // try_write is safe here: apply_config runs at boot before the registry
@@ -379,6 +362,26 @@ impl Runtime {
         if !config.disabled_tools.is_empty() {
             if let Ok(mut reg) = self.tools.try_write() {
                 reg.disable(&config.disabled_tools);
+            }
+        }
+    }
+
+    /// Apply only the credential-source portion of config. Used by subagent
+    /// spawns that build a fresh `Runtime::new()` (which defaults to Local) and
+    /// must inherit the user's Remote/broker setup. (#158 A3)
+    ///
+    /// A6: invalidates the token cache if the source/endpoint changed.
+    /// A2: scrubs `AuthState` when Remote so no local `auth.json` credential is
+    /// used or held (invariant 1).
+    pub fn apply_auth_config(&mut self, config: &crate::config::SynapsConfig) {
+        let new_source = config.auth.credential_source();
+        if new_source != self.credential_source {
+            self.token_cache.invalidate("anthropic");
+        }
+        self.credential_source = new_source;
+        if self.credential_source.is_remote() {
+            if let Ok(mut auth) = self.auth.try_write() {
+                AuthMethods::scrub_for_remote(&mut auth);
             }
         }
     }
