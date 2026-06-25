@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::{Result, RuntimeError};
 use reqwest::Client;
-use crate::auth::{BrokerClient, CredentialSource, TokenCache, resolve_remote, DEFAULT_MARGIN_MS};
+use crate::auth::{BrokerClient, CredentialSource, TokenCache, resolve_remote, is_expired_with_margin, DEFAULT_MARGIN_MS};
 use super::types::{AuthState, PiAuth};
 
 pub(super) struct AuthMethods;
@@ -33,11 +33,17 @@ impl AuthMethods {
     ) -> Result<()> {
         // ── Remote credential source: resolve via the broker. ──
         if let CredentialSource::Remote { .. } = source {
-            // Fast path: in-memory broker token still fresh?
+            // Fast path: in-memory broker token still outside the refetch margin?
+            // Must use the SAME predicate as the cache (is_expired_with_margin +
+            // DEFAULT_MARGIN_MS) so the fast-path and TokenCache agree on freshness
+            // — otherwise the fast-path serves a token the cache would refetch,
+            // and a >margin tool step can expire it mid-flight (board finding #1).
             {
                 let auth_guard = auth.read().await;
                 if let Some(exp) = auth_guard.token_expires {
-                    if !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp {
+                    if !auth_guard.auth_token.is_empty()
+                        && !is_expired_with_margin(exp, DEFAULT_MARGIN_MS)
+                    {
                         return Ok(());
                     }
                 }
@@ -202,6 +208,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth.read().await.auth_token, "sk-1");
+    }
+
+    #[tokio::test]
+    async fn remote_fast_path_refetches_a_token_inside_the_margin() {
+        // AuthState holds a token that is valid but within the 5-min refetch
+        // margin. The fast path must NOT serve it — it must refetch (board #1).
+        let url = spawn_broker(r#"{"access_token":"sk-FRESH","expires":9999999999999}"#).await;
+        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let cache = TokenCache::new();
+        let near = crate::epoch_millis() + 2 * 60 * 1000; // 2 min — inside the 5-min margin
+        let auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "sk-STALE".into(),
+            auth_type: "oauth".into(),
+            refresh_token: None,
+            token_expires: Some(near),
+        }));
+        AuthMethods::refresh_if_needed(Arc::clone(&auth), &Client::new(), &source, &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.read().await.auth_token,
+            "sk-FRESH",
+            "a token inside the refetch margin must be refetched, not served stale"
+        );
     }
 
     #[tokio::test]
