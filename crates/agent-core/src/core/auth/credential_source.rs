@@ -197,6 +197,16 @@ impl BrokerClient {
         Self { http: reqwest::Client::new(), endpoint: endpoint.into(), machine_token: machine_token.into() }
     }
 
+    /// Like `new` but reuses an existing `reqwest::Client` (shared connection
+    /// pool) instead of building a fresh one per call. (#158 A5)
+    pub fn with_client(
+        endpoint: impl Into<String>,
+        machine_token: impl Into<String>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self { http, endpoint: endpoint.into(), machine_token: machine_token.into() }
+    }
+
     /// Build from a `CredentialSource`. `None` for `Local`.
     pub fn from_source(source: &CredentialSource) -> Option<Self> {
         match source {
@@ -204,6 +214,35 @@ impl BrokerClient {
                 Some(Self::new(endpoint.clone(), machine_token.clone()))
             }
             CredentialSource::Local => None,
+        }
+    }
+}
+
+/// Provider-aware token resolution honoring the credential source — the single
+/// entry point both the Anthropic and the OpenAI/codex paths use. (#158 C4)
+///
+/// - `Local`: refresh the provider's own local credential (`ensure_fresh_*`).
+/// - `Remote`: fetch a short-lived access token from the broker, keyed by
+///   provider. Reuses the caller's `http` client (no per-call pool — A5), and
+///   never holds a refresh token / never writes `auth.json` (invariant 1).
+pub async fn resolve_access_token(
+    provider: &str,
+    source: &CredentialSource,
+    cache: &TokenCache,
+    http: &reqwest::Client,
+) -> Result<String, String> {
+    match source {
+        CredentialSource::Remote { endpoint, machine_token } => {
+            let broker = BrokerClient::with_client(endpoint.clone(), machine_token.clone(), http.clone());
+            Ok(resolve_remote(&broker, cache, provider, DEFAULT_MARGIN_MS).await?.access_token)
+        }
+        CredentialSource::Local => {
+            let creds = if provider == "anthropic" {
+                super::ensure_fresh_token(http).await?
+            } else {
+                super::ensure_fresh_provider_token(http, provider).await?
+            };
+            Ok(creds.access)
         }
     }
 }
@@ -458,6 +497,23 @@ mod tests {
         let c = BrokerClient::new(url, "WRONG-token");
         let err = c.fetch_token("anthropic").await.unwrap_err();
         assert!(err.contains("401"), "expected 401 error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_access_token_remote_fetches_from_broker() {
+        let url = spawn_broker(
+            r#"{"access_token":"sk-broker","expires":9999999999999}"#,
+            "m",
+        )
+        .await;
+        let source = CredentialSource::Remote { endpoint: url, machine_token: "m".into() };
+        let cache = TokenCache::new();
+        let http = reqwest::Client::new();
+        let t = resolve_access_token("anthropic", &source, &cache, &http).await.unwrap();
+        assert_eq!(t, "sk-broker");
+        // second call hits the cache (shared http client reused, no new pool)
+        let t2 = resolve_access_token("anthropic", &source, &cache, &http).await.unwrap();
+        assert_eq!(t2, "sk-broker");
     }
 
     // ── invariant: a Remote client can NEVER hold a refresh token ─────────
