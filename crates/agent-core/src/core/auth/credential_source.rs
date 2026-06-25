@@ -119,6 +119,19 @@ impl TokenCache {
             map.remove(provider);
         }
     }
+
+    /// Cached token if present and not PAST hard expiry (ignores the refetch
+    /// margin). Used as a degraded-mode fallback when the broker is unreachable:
+    /// a token slightly inside its refetch window is still better than failing.
+    pub fn get_unexpired(&self, provider: &str) -> Option<BrokerToken> {
+        let map = self.inner.read().ok()?;
+        let tok = map.get(provider)?;
+        if is_expired_with_margin(tok.expires, 0) {
+            None
+        } else {
+            Some(tok.clone())
+        }
+    }
 }
 
 // ── Fetcher abstraction + resolver ───────────────────────────────────────────
@@ -142,9 +155,21 @@ pub async fn resolve_remote<F: TokenFetcher>(
     if let Some(tok) = cache.get_fresh(provider, margin_ms) {
         return Ok(tok);
     }
-    let tok = fetcher.fetch_token(provider).await?;
-    cache.put(provider, tok.clone());
-    Ok(tok)
+    match fetcher.fetch_token(provider).await {
+        Ok(tok) => {
+            cache.put(provider, tok.clone());
+            Ok(tok)
+        }
+        Err(e) => {
+            // Degraded mode: the broker is unreachable, but if we still hold a
+            // token that hasn't hit hard expiry, serve it rather than failing
+            // the turn. Self-heals on the next call once the broker is back.
+            if let Some(tok) = cache.get_unexpired(provider) {
+                return Ok(tok);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Like [`resolve_remote`] but returns only the access token string.
@@ -350,6 +375,39 @@ mod tests {
         resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
         resolve_remote_token(&f, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
         assert_eq!(f.calls.load(Ordering::SeqCst), 1, "second resolve should hit the cache");
+    }
+
+    // ── broker-down degradation ───────────────────────────────────────────
+    struct FailFetcher;
+    impl TokenFetcher for FailFetcher {
+        async fn fetch_token(&self, _provider: &str) -> Result<BrokerToken, String> {
+            Err("broker unreachable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_serves_stale_cache_when_broker_down() {
+        // Token expires in 2 min; margin is 5 min -> get_fresh misses (would
+        // refetch), the broker is down, but it's not HARD-expired, so we serve it.
+        let cache = TokenCache::new();
+        cache.put("anthropic", tok(now_millis() + 2 * 60 * 1000));
+        let t = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap();
+        assert_eq!(t.access_token, "sk-live");
+    }
+
+    #[tokio::test]
+    async fn resolve_errors_when_broker_down_and_no_cache() {
+        let cache = TokenCache::new();
+        let err = resolve_remote(&FailFetcher, &cache, "anthropic", DEFAULT_MARGIN_MS).await.unwrap_err();
+        assert!(err.contains("unreachable"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_errors_when_broker_down_and_cache_hard_expired() {
+        let cache = TokenCache::new();
+        cache.put("anthropic", tok(now_millis().saturating_sub(1000))); // already expired
+        let err = resolve_remote(&FailFetcher, &cache, "anthropic", 0).await.unwrap_err();
+        assert!(err.contains("unreachable"), "got: {err}");
     }
 
     // ── BrokerClient against a tiny in-test axum server ──────────────────
