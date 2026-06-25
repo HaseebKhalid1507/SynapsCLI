@@ -618,6 +618,8 @@ async fn extension_provider_complete_routes_to_process() {
         None,
         0,
         &tokio_util::sync::CancellationToken::new(),
+        &synaps_cli::auth::CredentialSource::Local,
+        &synaps_cli::auth::TokenCache::new(),
     ).await.expect("extension route").unwrap();
 
     assert_eq!(result["content"][0]["text"], "echo:hello");
@@ -694,6 +696,8 @@ async fn provider_disabled_in_trust_state_blocks_route() {
         None,
         0,
         &tokio_util::sync::CancellationToken::new(),
+        &synaps_cli::auth::CredentialSource::Local,
+        &synaps_cli::auth::TokenCache::new(),
     )
     .await
     .expect("route returned Some");
@@ -758,6 +762,8 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
         None,
         0,
         &tokio_util::sync::CancellationToken::new(),
+        &synaps_cli::auth::CredentialSource::Local,
+        &synaps_cli::auth::TokenCache::new(),
     ).await.expect("extension route").unwrap();
 
     assert_eq!(result["content"][0]["text"], "final:from-provider");
@@ -1140,6 +1146,8 @@ async fn audit_log_records_disabled_route() {
         None,
         0,
         &tokio_util::sync::CancellationToken::new(),
+        &synaps_cli::auth::CredentialSource::Local,
+        &synaps_cli::auth::TokenCache::new(),
     )
     .await
     .expect("route returned Some");
