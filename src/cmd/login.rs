@@ -29,7 +29,7 @@ const LOGIN_BANNER: &[&str] = &[
 ];
 const LOGIN_PICKER_PADDING: &str = "  ";
 
-pub async fn run(profile: Option<String>) {
+pub async fn run(profile: Option<String>, provider_key: Option<String>) {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
@@ -37,11 +37,25 @@ pub async fn run(profile: Option<String>) {
     let _log_guard = synaps_cli::logging::init_logging();
 
     let providers = login_providers();
-    let selected = match select_provider(&providers) {
-        Ok(provider) => provider,
-        Err(e) => {
-            eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
-            std::process::exit(1);
+    let selected = if let Some(ref key) = provider_key {
+        match find_provider(&providers, key) {
+            Some(p) => p,
+            None => {
+                eprintln!("error: unknown provider '{}'", key);
+                eprintln!("valid provider keys:");
+                for p in &providers {
+                    eprintln!("  {}", p.key);
+                }
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match select_provider(&providers) {
+            Ok(provider) => provider,
+            Err(e) => {
+                eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -259,6 +273,11 @@ fn save_api_key(config_key: &str, provider: LoginProvider, api_key: &str) {
             std::process::exit(1);
         }
     }
+}
+
+fn find_provider(providers: &[LoginProvider], key: &str) -> Option<LoginProvider> {
+    let key_lower = key.to_lowercase();
+    providers.iter().find(|p| p.key.to_lowercase() == key_lower).copied()
 }
 
 fn login_providers() -> Vec<LoginProvider> {
@@ -502,5 +521,21 @@ mod tests {
         assert!(providers
             .iter()
             .any(|provider| provider.key == "google" && provider.auth_kind == AuthKind::ApiKey));
+    }
+
+    #[test]
+    fn non_interactive_provider_lookup_finds_openai_codex() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "openai-codex");
+        assert!(found.is_some());
+        let p = found.unwrap();
+        assert_eq!(p.key, "openai-codex");
+        assert_eq!(p.auth_kind, AuthKind::OAuth);
+
+        // case-insensitive
+        assert!(find_provider(&providers, "OpenAI-Codex").is_some());
+
+        // unknown key returns None
+        assert!(find_provider(&providers, "totally-bogus-xyz").is_none());
     }
 }

@@ -94,7 +94,7 @@ fn root_help_uses_common_paths_and_guides() {
 
     assert!(rendered.contains("Common paths"), "root should group fast paths:\n{}", rendered);
     assert!(rendered.contains("Guides"), "root should include guide links:\n{}", rendered);
-    assert!(rendered.contains("/doctor"), "root should include diagnostics path:\n{}", rendered);
+    assert!(rendered.contains("/help doctor"), "root should include diagnostics path:\n{}", rendered);
     assert!(rendered.contains("/help sessions"), "root should link sessions guide:\n{}", rendered);
     assert!(!rendered.contains("Common commands"), "phase 1 root should use common paths wording:\n{}", rendered);
 }
