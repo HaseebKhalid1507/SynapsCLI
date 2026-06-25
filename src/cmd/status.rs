@@ -1,15 +1,20 @@
 //! `synaps status` — show account usage and reset times.
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Refresh-if-needed via the shared auth machinery (honors profiles,
-    // fs4 file locking, and persists the rotated token). Previously this
-    // read auth.json raw from the base dir — expired tokens produced a
-    // useless HTTP 401 even though the user was logged in.
+    // Resolve the access token honoring the credential source: Local refreshes
+    // auth.json (fs4-locked, persisted) exactly as before; Remote fetches from
+    // the broker WITHOUT rotating the refresh token client-side — a stray
+    // `synaps status` on a Remote client must never rotate the broker's token
+    // out from under the fleet. (#158 A4)
     let client = reqwest::Client::new();
-    let creds = synaps_cli::auth::ensure_fresh_token(&client)
+    let config = synaps_cli::config::load_config();
+    let source = config.auth.credential_source();
+    let cache = synaps_cli::auth::TokenCache::new();
+    let access = synaps_cli::auth::resolve_access_token("anthropic", &source, &cache, &client)
         .await
-        .map_err(|e| format!("Not logged in ({}). Run `synaps login` first.", e))?;
-    let access = creds.access;
+        .map_err(|e| format!(
+            "Could not get a token ({}). Run `synaps login`, or check auth.remote_endpoint / broker reachability.", e
+        ))?;
 
     let resp = client.get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {}", access))
