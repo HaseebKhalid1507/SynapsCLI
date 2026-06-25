@@ -54,7 +54,7 @@ use std::time::Instant;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tachyonfx::{Effect, Shader};
+use tachyonfx::Effect;
 
 use super::draw::render_frame;
 use super::lifecycle;

@@ -39,9 +39,9 @@ anyhow       = "1.0"
 reqwest      = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 
 # TUI render crates
-ratatui       = "0.29"
-crossterm     = { version = "0.28", features = ["event-stream"] }
-tachyonfx     = { version = "0.9", features = ["sendable"] }
+ratatui       = "0.30"
+crossterm     = { version = "0.29", features = ["event-stream"] }
+tachyonfx     = { version = "0.25", features = ["sendable"] }
 syntect       = { version = "5", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
 arc-swap      = "1"
 unicode-width = "0.2.0"

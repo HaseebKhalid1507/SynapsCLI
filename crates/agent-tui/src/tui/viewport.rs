@@ -69,7 +69,7 @@ pub(crate) fn edge_scrub_area(size: Rect, protected_bottom_rows: u16) -> Option<
 #[allow(dead_code)]
 pub(crate) fn scrub_terminal_edges<B>(terminal: &mut Terminal<B>, style: Style) -> io::Result<()>
 where
-    B: Backend,
+    B: Backend<Error = io::Error>,
 {
     let size = terminal.size()?;
     let area = Rect::new(0, 0, size.width, size.height);
