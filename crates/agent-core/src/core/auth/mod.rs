@@ -27,7 +27,7 @@ pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token, ens
 pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
 pub use browser::open_browser;
 pub use openai_codex::{extract_account_id as extract_codex_account_id, login as login_openai_codex};
-pub use credential_source::{CredentialSource, BrokerToken, BrokerClient, TokenCache, TokenFetcher, resolve_remote_token, is_expired_with_margin, DEFAULT_MARGIN_MS};
+pub use credential_source::{CredentialSource, BrokerToken, BrokerClient, TokenCache, TokenFetcher, resolve_remote, resolve_remote_token, is_expired_with_margin, DEFAULT_MARGIN_MS};
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 

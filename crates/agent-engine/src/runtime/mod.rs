@@ -192,6 +192,13 @@ pub struct Runtime {
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     reaper_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// How provider credentials are resolved: `Local` (read/refresh auth.json —
+    /// the default) or `Remote` (fetch short-lived access tokens from a broker).
+    /// Set from config in `apply_config`. See task #157.
+    credential_source: crate::auth::CredentialSource,
+    /// In-memory cache of broker-fetched access tokens (Remote source only).
+    /// Cheap to clone (Arc inside). Never persisted to disk.
+    token_cache: crate::auth::TokenCache,
 }
 
 impl Runtime {
@@ -248,6 +255,8 @@ impl Runtime {
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             reaper_handle: Some(reaper_handle),
             reaper_cancel: Some(cancel),
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
         })
     }
 
@@ -345,6 +354,9 @@ impl Runtime {
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        // Credential source: Local (auth.json) by default, or Remote (broker)
+        // when auth.remote_endpoint / SYNAPS_AUTH_ENDPOINT is set. (#157)
+        self.credential_source = config.auth.credential_source();
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
         // try_write is safe here: apply_config runs at boot before the registry
@@ -433,7 +445,13 @@ impl Runtime {
 
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
-        AuthMethods::refresh_if_needed(Arc::clone(&self.auth), &self.client).await
+        AuthMethods::refresh_if_needed(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+        )
+        .await
     }
 
     /// Make a simple non-streaming API call for compaction (no tools).
@@ -831,6 +849,8 @@ impl Clone for Runtime {
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
             reaper_cancel: None,  // Cloned runtimes don't own the reaper
+            credential_source: self.credential_source.clone(),
+            token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
         }
     }
 }
