@@ -769,6 +769,8 @@ impl Runtime {
         // same AuthState so mid-loop token refreshes are visible immediately.
         let auth = Arc::clone(&self.auth);
         let client = self.client.clone();
+        let credential_source = self.credential_source.clone();
+        let token_cache = self.token_cache.clone();
         let model = self.model.clone();
         let tools = self.tools.clone();
         let system_prompt = self.system_prompt.clone();
@@ -793,7 +795,7 @@ impl Runtime {
         };
 
         let session = crate::runtime::stream::StreamSession {
-            auth, client, options, api_retries,
+            auth, client, credential_source, token_cache, options, api_retries,
             model, tools, system_prompt, thinking_budget,
             tx: tx.clone(), cancel, steering_rx,
             watcher_exit_path, max_tool_output,
