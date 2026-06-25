@@ -50,6 +50,7 @@ signal-hook = { version = "0.3", features = ["iterator"] }
 
 # Server deps
 axum = { version = "0.7", features = ["ws"] }
+tower = { version = "0.4", features = ["limit"] }
 unicode-width = "0.2.0"
 
 # Shell / PTY deps

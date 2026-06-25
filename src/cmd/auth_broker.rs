@@ -60,10 +60,26 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub async fn run(bind: String, machine_token: Option<String>, insecure: bool) -> anyhow::Result<()> {
-    let machine_token = machine_token
-        .or_else(|| std::env::var("SYNAPS_BROKER_TOKEN").ok())
-        .filter(|s| !s.trim().is_empty());
+pub async fn run(
+    bind: String,
+    machine_token: Option<String>,
+    machine_token_file: Option<std::path::PathBuf>,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    // B3: token precedence — flag > file (read once, not in argv) > env.
+    let machine_token = match machine_token {
+        Some(t) => Some(t),
+        None => match machine_token_file {
+            Some(ref path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("could not read --machine-token-file {}: {e}", path.display()))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => std::env::var("SYNAPS_BROKER_TOKEN").ok(),
+        },
+    }
+    .filter(|s| !s.trim().is_empty());
 
     let addr: SocketAddr = bind
         .parse()
@@ -74,9 +90,9 @@ pub async fn run(bind: String, machine_token: Option<String>, insecure: bool) ->
     // credential tap, not a convenience.
     if machine_token.is_none() && !addr.ip().is_loopback() && !insecure {
         anyhow::bail!(
-            "refusing to start: no machine token (set --machine-token or SYNAPS_BROKER_TOKEN) while \
-             bound to non-loopback {addr}. That would serve credentials unauthenticated to the network. \
-             Pass --insecure-no-auth to override (NOT recommended), or bind 127.0.0.1."
+            "refusing to start: no machine token (set --machine-token / --machine-token-file / \
+             SYNAPS_BROKER_TOKEN) while bound to non-loopback {addr}. That would serve credentials \
+             unauthenticated to the network. Pass --insecure-no-auth to override, or bind 127.0.0.1."
         );
     }
 
@@ -100,13 +116,11 @@ pub async fn run(bind: String, machine_token: Option<String>, insecure: bool) ->
 
     let state = BrokerState { machine_token: machine_token.clone(), client: client.clone() };
 
-    // Proactive refresh: keep the credential warm so clients always get a fresh
-    // token instantly, and so the single refresher runs even with no traffic.
-    // ensure_fresh_token only hits the network within the expiry margin
-    // (file-locked — still the only refresher).
+    // Proactive refresh, SUPERVISED: keep the credential warm and surface task
+    // death loudly (a silently-dead refresher = unmonitored credential expiry).
     {
         let refresh_client = client;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
@@ -115,11 +129,21 @@ pub async fn run(bind: String, machine_token: Option<String>, insecure: bool) ->
                 }
             }
         });
+        // D1: if the refresh task ever exits/panics, log loudly (it should run forever).
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                eprintln!("[auth-broker] FATAL: proactive refresh task died: {e:?} — tokens will go stale; restart the broker.");
+            }
+        });
     }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/token", get(token))
+        // B7: cap concurrent in-flight requests to bound resource use under a
+        // flooding/crash-looping client (each /token can take a file lock + an
+        // upstream refresh).
+        .layer(tower::limit::ConcurrencyLimitLayer::new(64))
         .with_state(state);
 
     eprintln!(
@@ -130,8 +154,34 @@ pub async fn run(bind: String, machine_token: Option<String>, insecure: bool) ->
         eprintln!("  ⚠ non-loopback bind — run behind WireGuard / a private network (no in-process TLS yet).");
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    // D1: drain in-flight requests on SIGTERM/Ctrl-C instead of dropping them.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve on Ctrl-C or SIGTERM so the broker drains cleanly.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("[auth-broker] shutting down (draining in-flight requests)…");
 }
 
 /// Liveness + credential readiness. Returns non-200 when the credential is

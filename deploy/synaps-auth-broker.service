@@ -1,0 +1,26 @@
+# synaps auth-broker — credential broker (see README "Shared credentials via a broker")
+# Install: cp deploy/synaps-auth-broker.service /etc/systemd/system/
+#          put the machine token in /etc/synaps/broker.token (chmod 600)
+#          systemctl enable --now synaps-auth-broker
+[Unit]
+Description=synaps credential broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=synaps
+# auth.json lives under this user's ~/.synaps-cli/
+ExecStart=/usr/local/bin/synaps auth-broker --bind 0.0.0.0:8181 --machine-token-file /etc/synaps/broker.token
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
