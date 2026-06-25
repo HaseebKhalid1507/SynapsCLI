@@ -101,6 +101,8 @@ pub async fn try_route(
     max_tokens: Option<u32>,
     thinking_budget: u32,
     cancel: &tokio_util::sync::CancellationToken,
+    source: &crate::auth::CredentialSource,
+    cache: &crate::auth::TokenCache,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
@@ -325,7 +327,7 @@ pub async fn try_route(
         Provider::Codex(cfg) => {
             let result = stream::call_codex_stream_inner(
                 &cfg, client, tools_schema, system_prompt, messages, tx,
-                temperature, max_tokens, cancel,
+                temperature, max_tokens, cancel, source, cache,
             ).await;
             Some(result)
         }

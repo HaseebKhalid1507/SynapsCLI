@@ -606,6 +606,12 @@ pub struct ApiOptions {
     /// the downgrade notice on healthy Hybrid turns where the 1h prefix is
     /// already cached (1h == 0, 5m > 0). Shared via Arc like the notice latch.
     pub saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Credential source for provider auth (Local/Remote). Carried here so the
+    /// OpenAI/codex routing path can resolve tokens through the broker on
+    /// Remote, same as the Anthropic path. (#158 C4)
+    pub credential_source: crate::auth::CredentialSource,
+    /// Shared broker token cache (Remote only).
+    pub token_cache: crate::auth::TokenCache,
 }
 
 pub(super) struct ApiMethods;
@@ -651,6 +657,7 @@ impl ApiMethods {
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
             None, None, thinking_budget, cancel,
+            &options.credential_source, &options.token_cache,
         ).await {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }

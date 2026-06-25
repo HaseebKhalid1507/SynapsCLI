@@ -516,6 +516,8 @@ impl Runtime {
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
                     saw_1h_honored: self.saw_1h_honored.clone(),
+                    credential_source: self.credential_source.clone(),
+                    token_cache: self.token_cache.clone(),
                 },
             ).await?;
             
@@ -810,6 +812,8 @@ impl Runtime {
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
             saw_1h_honored: self.saw_1h_honored.clone(),
+            credential_source: self.credential_source.clone(),
+            token_cache: self.token_cache.clone(),
         };
 
         let session = crate::runtime::stream::StreamSession {
