@@ -185,8 +185,15 @@ async fn token(
 
     match creds {
         Ok(c) => {
+            // C3: send a relative TTL so clients compute expiry on their own
+            // clock (kills broker↔client skew on suspend/resume VMs).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let ttl_ms = c.expires.saturating_sub(now);
             eprintln!("[auth-broker] issued {provider} token to {} (expires {})", peer.ip(), c.expires);
-            (StatusCode::OK, Json(json!({ "access_token": c.access, "expires": c.expires })))
+            (StatusCode::OK, Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })))
                 .into_response()
         }
         Err(e) => {

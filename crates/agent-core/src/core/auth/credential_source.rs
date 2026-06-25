@@ -73,8 +73,14 @@ impl std::fmt::Debug for CredentialSource {
 pub struct BrokerToken {
     pub access_token: String,
     /// Absolute expiry, unix-epoch **milliseconds** (matches
-    /// `OAuthCredentials.expires`).
+    /// `OAuthCredentials.expires`). When `ttl_ms` is present the client
+    /// overwrites this with its own clock + ttl to defeat clock skew.
     pub expires: u64,
+    /// Optional relative TTL in ms. When the broker sends it, the client
+    /// recomputes `expires = client_now + ttl_ms`, eliminating broker↔client
+    /// clock skew on suspend/resume VMs (board C3). Absent → use `expires`.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
 }
 
 /// Current unix time in milliseconds.
@@ -292,9 +298,23 @@ impl TokenFetcher for BrokerClient {
         if !status.is_success() {
             return Err(format!("broker returned HTTP {status}"));
         }
-        resp.json::<BrokerToken>()
+        let mut tok = resp
+            .json::<BrokerToken>()
             .await
-            .map_err(|e| format!("invalid broker token response: {e}"))
+            .map_err(|e| format!("invalid broker token response: {e}"))?;
+        // C3: prefer the broker's relative TTL over its absolute clock.
+        if let Some(ttl) = tok.ttl_ms {
+            tok.expires = now_millis().saturating_add(ttl);
+        }
+        // C2: reject a malformed/dead token rather than caching it (which would
+        // cause a permanent refetch storm or a dud bearer).
+        if tok.access_token.is_empty() {
+            return Err("broker returned an empty access_token".to_string());
+        }
+        if tok.expires <= now_millis() {
+            return Err("broker returned an already-expired token".to_string());
+        }
+        Ok(tok)
     }
 }
 
@@ -378,7 +398,7 @@ mod tests {
 
     // ── cache ────────────────────────────────────────────────────────────
     fn tok(expires: u64) -> BrokerToken {
-        BrokerToken { access_token: "sk-live".into(), expires }
+        BrokerToken { access_token: "sk-live".into(), expires, ttl_ms: None }
     }
 
     #[test]
@@ -524,6 +544,30 @@ mod tests {
         let c = BrokerClient::new(url, "WRONG-token");
         let err = c.fetch_token("anthropic").await.unwrap_err();
         assert!(err.contains("401"), "expected 401 error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_token_recomputes_expiry_from_ttl_ms() {
+        // Broker sends a STALE absolute `expires` but a fresh `ttl_ms`; the
+        // client must recompute from its own clock (clock-skew defense, C3).
+        let url = spawn_broker(r#"{"access_token":"sk","expires":1,"ttl_ms":3600000}"#, "m").await;
+        let c = BrokerClient::new(url, "m");
+        let t = c.fetch_token("anthropic").await.unwrap();
+        assert!(t.expires > now_millis(), "expires must come from ttl_ms, got {}", t.expires);
+    }
+
+    #[tokio::test]
+    async fn fetch_token_rejects_empty_access_token() {
+        let url = spawn_broker(r#"{"access_token":"","expires":9999999999999}"#, "m").await;
+        let c = BrokerClient::new(url, "m");
+        assert!(c.fetch_token("anthropic").await.unwrap_err().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn fetch_token_rejects_already_expired() {
+        let url = spawn_broker(r#"{"access_token":"sk","expires":1}"#, "m").await;
+        let c = BrokerClient::new(url, "m");
+        assert!(c.fetch_token("anthropic").await.unwrap_err().contains("expired"));
     }
 
     #[tokio::test]
