@@ -218,6 +218,33 @@ if the bridge UDS is missing. See
 [`docs/smoke/watcher-bridge.md`](docs/smoke/watcher-bridge.md) for the
 verification playbook.
 
+### Shared credentials via a broker (`auth.*`)
+
+By default each machine reads and refreshes its own `~/.synaps-cli/auth.json`
+(`auth.remote_endpoint` unset). To share ONE OAuth credential across many
+machines without copying it to each disk, run a broker on one trusted host and
+point the others at it:
+
+```ini
+# on a CLIENT machine — fetch short-lived access tokens from the broker
+auth.remote_endpoint = http://broker-host:8181
+auth.machine_token   = <shared-secret>
+# env overrides (win over config): SYNAPS_AUTH_ENDPOINT / SYNAPS_MACHINE_TOKEN
+```
+
+```bash
+# on the BROKER host — holds the credential, refreshes centrally, serves tokens
+synaps auth-broker --bind 0.0.0.0:8181 --machine-token <shared-secret>
+#   GET /healthz            -> { status, fresh_until }
+#   GET /token?provider=X   -> { access_token, expires }   (Authorization: Bearer)
+```
+
+A Remote client **never stores the credential**: it holds only short-lived
+access tokens in memory, never a refresh token, and never writes `auth.json`.
+The broker is the single refresher (Anthropic rotates the refresh token, so
+exactly one party may refresh). Run the broker behind WireGuard / a private
+network — the machine token gates who may fetch.
+
 ---
 
 ## Extensions & Plugins
