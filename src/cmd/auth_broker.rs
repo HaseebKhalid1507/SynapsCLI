@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -53,7 +53,24 @@ pub async fn run(bind: String, machine_token: Option<String>) -> anyhow::Result<
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let state = BrokerState { machine_token: machine_token.clone(), client };
+    let state = BrokerState { machine_token: machine_token.clone(), client: client.clone() };
+
+    // Proactive refresh: keep the credential warm so clients always get a
+    // fresh token instantly, and so the single refresher runs even when no
+    // client is calling. ensure_fresh_token only hits the network when the
+    // token is within its expiry margin (file-locked — still the only refresher).
+    {
+        let refresh_client = client;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                if let Err(e) = auth::ensure_fresh_token(&refresh_client).await {
+                    eprintln!("[auth-broker] proactive refresh failed: {e}");
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -68,8 +85,11 @@ pub async fn run(bind: String, machine_token: Option<String>) -> anyhow::Result<
         "synaps auth-broker listening on http://{addr}  (machine auth: {})",
         if machine_token.is_some() { "ON" } else { "OFF — trusted-network only!" }
     );
+    if !addr.ip().is_loopback() {
+        eprintln!("  ⚠ bound to a non-loopback address — run this behind WireGuard / a private network (no TLS termination here).");
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -86,6 +106,7 @@ async fn healthz() -> impl IntoResponse {
 /// The broker refreshes centrally if needed (file-locked — the single refresher).
 async fn token(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> impl IntoResponse {
@@ -96,6 +117,7 @@ async fn token(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if got != format!("Bearer {expected}") {
+            eprintln!("[auth-broker] DENIED token request from {} (bad machine auth)", peer.ip());
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "bad machine auth" })))
                 .into_response();
         }
@@ -110,12 +132,12 @@ async fn token(
 
     match creds {
         Ok(c) => {
-            eprintln!("[auth-broker] issued {} token (expires {})", provider, c.expires);
+            eprintln!("[auth-broker] issued {} token to {} (expires {})", provider, peer.ip(), c.expires);
             (StatusCode::OK, Json(json!({ "access_token": c.access, "expires": c.expires })))
                 .into_response()
         }
         Err(e) => {
-            eprintln!("[auth-broker] refresh failed for {}: {}", provider, e);
+            eprintln!("[auth-broker] refresh failed for {} ({}): {}", provider, peer.ip(), e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response()
         }
     }
