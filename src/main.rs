@@ -123,9 +123,13 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8181")]
         bind: String,
         /// Token clients must present (`Authorization: Bearer <token>`). Falls
-        /// back to `SYNAPS_BROKER_TOKEN`; if unset, auth is OFF (trusted net only).
+        /// back to `SYNAPS_BROKER_TOKEN`; if unset, auth is OFF (loopback only).
         #[arg(long)]
         machine_token: Option<String>,
+        /// Allow starting with auth OFF on a non-loopback bind (serves
+        /// credentials unauthenticated to the network — NOT recommended).
+        #[arg(long)]
+        insecure_no_auth: bool,
     },
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
     Rpc {
@@ -211,8 +215,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::AuthBroker { bind, machine_token }) => {
-            cmd::auth_broker::run(bind, machine_token).await?;
+        Some(Command::AuthBroker { bind, machine_token, insecure_no_auth }) => {
+            cmd::auth_broker::run(bind, machine_token, insecure_no_auth).await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
