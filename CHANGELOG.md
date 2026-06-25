@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Shared credentials via a broker (`auth.remote_endpoint` + `synaps auth-broker`).**
+  Many machines can share ONE OAuth credential without copying it to each disk.
+  On a client, set `auth.remote_endpoint` (+ `auth.machine_token`, or env
+  `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`) and it fetches short-lived
+  access tokens from a broker instead of reading/refreshing the local `auth.json`.
+  Run the broker with `synaps auth-broker --bind <addr> --machine-token <secret>`
+  on a trusted host (behind WireGuard). Clients hold only access tokens in memory
+  — never a refresh token, never written to disk; the broker is the single
+  refresher (Anthropic rotates the refresh token, so exactly one party may
+  refresh). Degrades gracefully on a broker blip (serves a still-valid cached
+  token). Closes the agentic-VM bootstrap: guests authenticate with zero
+  credentials on their own disk.
+
 ## [0.3.10] — 2026-06-24
 
 ### Added
