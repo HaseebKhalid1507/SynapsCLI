@@ -130,24 +130,31 @@ pub trait TokenFetcher {
     async fn fetch_token(&self, provider: &str) -> Result<BrokerToken, String>;
 }
 
-/// Resolve a provider access token via cache-or-fetch. Returns the cached token
-/// if fresh; otherwise fetches from `fetcher`, caches it, and returns it.
-///
-/// This is the entire Remote credential path. It NEVER reads or holds a refresh
-/// token, NEVER writes `auth.json`, NEVER refreshes client-side — `fetcher` only
-/// ever yields a short-lived `BrokerToken` (which structurally has no refresh).
+/// Resolve a provider token via cache-or-fetch, returning the full
+/// `BrokerToken` (access + expiry). The runtime needs the expiry to drive its
+/// in-memory refresh trigger. NEVER touches a refresh token or `auth.json`.
+pub async fn resolve_remote<F: TokenFetcher>(
+    fetcher: &F,
+    cache: &TokenCache,
+    provider: &str,
+    margin_ms: u64,
+) -> Result<BrokerToken, String> {
+    if let Some(tok) = cache.get_fresh(provider, margin_ms) {
+        return Ok(tok);
+    }
+    let tok = fetcher.fetch_token(provider).await?;
+    cache.put(provider, tok.clone());
+    Ok(tok)
+}
+
+/// Like [`resolve_remote`] but returns only the access token string.
 pub async fn resolve_remote_token<F: TokenFetcher>(
     fetcher: &F,
     cache: &TokenCache,
     provider: &str,
     margin_ms: u64,
 ) -> Result<String, String> {
-    if let Some(tok) = cache.get_fresh(provider, margin_ms) {
-        return Ok(tok.access_token);
-    }
-    let tok = fetcher.fetch_token(provider).await?;
-    cache.put(provider, tok.clone());
-    Ok(tok.access_token)
+    Ok(resolve_remote(fetcher, cache, provider, margin_ms).await?.access_token)
 }
 
 // ── Broker HTTP client ───────────────────────────────────────────────────────
