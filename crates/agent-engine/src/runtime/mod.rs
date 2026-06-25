@@ -463,6 +463,11 @@ impl Runtime {
 
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
+        // Non-Anthropic models resolve their own provider auth in the OpenAI
+        // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
+        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+            return Ok(());
+        }
         AuthMethods::refresh_if_needed(
             Arc::clone(&self.auth),
             &self.client,

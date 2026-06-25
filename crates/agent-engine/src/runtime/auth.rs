@@ -7,6 +7,19 @@ use super::types::{AuthState, PiAuth};
 
 pub(super) struct AuthMethods;
 
+/// True if `model` routes to the Anthropic path (not OpenAI/codex/local). Used
+/// to skip the Anthropic pre-stream refresh for non-Anthropic models — they
+/// resolve their own provider auth (incl. via the broker), so fetching an
+/// Anthropic token first is wasteful and would FAIL on a codex-only Remote
+/// broker. (#158 C4/#7)
+pub(super) fn model_is_anthropic(model: &str) -> bool {
+    let keys = crate::core::config::get_provider_keys();
+    matches!(
+        crate::runtime::openai::resolve_route(model, &keys),
+        crate::runtime::openai::Provider::Anthropic
+    )
+}
+
 impl AuthMethods {
     /// Reset `AuthState` so a Remote client never *uses* or *holds* a credential
     /// seeded from a local `auth.json`. Called from `apply_config` when the
