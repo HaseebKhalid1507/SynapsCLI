@@ -356,7 +356,22 @@ impl Runtime {
         self.cache_ttl = config.cache_ttl;
         // Credential source: Local (auth.json) by default, or Remote (broker)
         // when auth.remote_endpoint / SYNAPS_AUTH_ENDPOINT is set. (#157)
-        self.credential_source = config.auth.credential_source();
+        let new_source = config.auth.credential_source();
+        // A6: switching source (or broker endpoint) must not serve a token minted
+        // by the previous broker/identity — drop any cached token.
+        if new_source != self.credential_source {
+            self.token_cache.invalidate("anthropic");
+        }
+        self.credential_source = new_source;
+        // A2: on Remote, NEVER use a credential seeded from a local auth.json.
+        // Scrub AuthState so the first refresh fetches from the broker and the
+        // client never holds a refresh token (invariant 1). try_write is safe:
+        // apply_config runs at boot before AuthState is shared with stream tasks.
+        if self.credential_source.is_remote() {
+            if let Ok(mut auth) = self.auth.try_write() {
+                AuthMethods::scrub_for_remote(&mut auth);
+            }
+        }
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
         // try_write is safe here: apply_config runs at boot before the registry
