@@ -8,6 +8,18 @@ use super::types::{AuthState, PiAuth};
 pub(super) struct AuthMethods;
 
 impl AuthMethods {
+    /// Reset `AuthState` so a Remote client never *uses* or *holds* a credential
+    /// seeded from a local `auth.json`. Called from `apply_config` when the
+    /// source is Remote: clears the access token, drops any refresh token
+    /// (invariant 1), and forces the next `refresh_if_needed` to fetch from the
+    /// broker. `auth_type` stays "oauth" so the Local early-return is not taken.
+    pub(super) fn scrub_for_remote(s: &mut AuthState) {
+        s.auth_token.clear();
+        s.auth_type = "oauth".to_string();
+        s.refresh_token = None;
+        s.token_expires = None;
+    }
+
     /// Check if the OAuth token is expired and refresh it if needed.
     ///
     /// Two credential sources:
@@ -252,5 +264,20 @@ mod tests {
         let g = auth.read().await;
         assert_eq!(g.auth_token, "key");
         assert_eq!(g.auth_type, "api_key");
+    }
+
+    #[test]
+    fn scrub_for_remote_clears_local_credential_and_refresh_token() {
+        let mut s = AuthState {
+            auth_token: "local-token".into(),
+            auth_type: "oauth".into(),
+            refresh_token: Some("LEAKED-REFRESH".into()),
+            token_expires: Some(123),
+        };
+        AuthMethods::scrub_for_remote(&mut s);
+        assert!(s.auth_token.is_empty(), "access token must be cleared");
+        assert_eq!(s.refresh_token, None, "refresh token must be dropped (invariant 1)");
+        assert_eq!(s.token_expires, None, "expiry must be cleared to force a broker fetch");
+        assert_eq!(s.auth_type, "oauth", "auth_type stays oauth so Local early-return is skipped");
     }
 }
