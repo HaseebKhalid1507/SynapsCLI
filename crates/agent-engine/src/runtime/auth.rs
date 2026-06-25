@@ -44,7 +44,7 @@ impl AuthMethods {
         cache: &TokenCache,
     ) -> Result<()> {
         // ── Remote credential source: resolve via the broker. ──
-        if let CredentialSource::Remote { .. } = source {
+        if let CredentialSource::Remote { endpoint, machine_token } = source {
             // Fast path: in-memory broker token still outside the refetch margin?
             // Must use the SAME predicate as the cache (is_expired_with_margin +
             // DEFAULT_MARGIN_MS) so the fast-path and TokenCache agree on freshness
@@ -60,8 +60,9 @@ impl AuthMethods {
                     }
                 }
             }
-            let broker = BrokerClient::from_source(source)
-                .expect("CredentialSource::Remote always yields a BrokerClient");
+            // Reuse the runtime's shared reqwest::Client (shared connection
+            // pool) instead of building a fresh one per refresh. (#158 A5)
+            let broker = BrokerClient::with_client(endpoint.clone(), machine_token.clone(), client.clone());
             let tok = resolve_remote(&broker, cache, "anthropic", DEFAULT_MARGIN_MS)
                 .await
                 .map_err(|e| RuntimeError::Auth(format!(
