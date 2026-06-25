@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.10] — 2026-06-24
+
+### Added
+- **Non-interactive provider login (`auth login --provider`)** — adds a `synaps auth login` subcommand with a `--provider <id>` flag for scripted/headless OAuth and API-key login. It dispatches to the existing provider handlers (e.g. `openai-codex` via `login_openai_codex`), so a login can be driven end-to-end without a TTY prompt. `synaps login` still runs interactively when no provider is given. This unblocks headless bootstrap flows (e.g. an agentic-VM guest that has to authenticate without a human at the keyboard). Covered by 8 unit tests in `cmd::login` (provider lookup, claude-first ordering, openai-codex resolution, relaunch arg/profile handling).
+
 ## [0.3.9] — 2026-06-23
 
 ### Added

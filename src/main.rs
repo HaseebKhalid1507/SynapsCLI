@@ -104,7 +104,16 @@ enum Command {
         args: Vec<String>,
     },
     /// OAuth login
-    Login,
+    Login {
+        /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Authentication management
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Show account usage and reset times
     Status,
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
@@ -149,6 +158,16 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum AuthAction {
+    /// OAuth / API-key login (non-interactive with --provider, interactive without)
+    Login {
+        /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
+        #[arg(long)]
+        provider: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -172,9 +191,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
-        Some(Command::Login) => {
-            cmd::login::run(cli.profile).await;
+        Some(Command::Login { provider }) => {
+            cmd::login::run(cli.profile, provider).await;
         }
+        Some(Command::Auth { action }) => match action {
+            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider).await,
+        },
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
