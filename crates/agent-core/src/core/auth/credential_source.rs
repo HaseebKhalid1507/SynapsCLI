@@ -16,9 +16,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where a client gets its provider credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum CredentialSource {
     /// Read + refresh the local `auth.json` (default — unchanged behavior).
+    #[default]
     Local,
     /// Fetch short-lived access tokens from a broker over the network.
     Remote {
@@ -46,6 +47,20 @@ impl CredentialSource {
 
     pub fn is_remote(&self) -> bool {
         matches!(self, CredentialSource::Remote { .. })
+    }
+}
+
+/// Redacting Debug — never print the machine token (board M3/B3).
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialSource::Local => write!(f, "Local"),
+            CredentialSource::Remote { endpoint, .. } => f
+                .debug_struct("Remote")
+                .field("endpoint", endpoint)
+                .field("machine_token", &"***")
+                .finish(),
+        }
     }
 }
 
@@ -89,6 +104,18 @@ pub const DEFAULT_MARGIN_MS: u64 = 5 * 60 * 1000;
 #[derive(Clone, Default)]
 pub struct TokenCache {
     inner: Arc<RwLock<HashMap<String, BrokerToken>>>,
+}
+
+/// Redacting Debug — print only the cached provider names, never the tokens.
+impl std::fmt::Debug for TokenCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let providers: Vec<String> = self
+            .inner
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        f.debug_struct("TokenCache").field("providers", &providers).finish()
+    }
 }
 
 impl TokenCache {

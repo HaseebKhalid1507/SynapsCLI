@@ -50,6 +50,7 @@ impl ApiMethods {
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
             None, None, thinking_budget, &tokio_util::sync::CancellationToken::new(),
+            &options.credential_source, &options.token_cache,
         ).await {
             drop(tx);
             while rx.recv().await.is_some() {}
@@ -267,6 +268,10 @@ impl ApiMethods {
             None,
             thinking_budget,
             &tokio_util::sync::CancellationToken::new(),
+            // call_api_simple is an internal helper without ApiOptions; codex here
+            // uses the Local credential. (Broker-routed codex goes via the stream path.)
+            &crate::auth::CredentialSource::Local,
+            &crate::auth::TokenCache::new(),
         )
         .await
         {
