@@ -48,7 +48,11 @@ Unsupported result actions are ignored fail-open and logged as warnings.
 - `modify` replaces the tool input before execution. It is accepted only on
   `before_tool_call`; the first modifier stops the handler chain.
 - `replace` substitutes the tool **output** after execution, before it enters
-  conversation history. It is accepted only on `after_tool_call`. Return
+  conversation history. It is accepted only on `after_tool_call`, and requires
+  the **`tools.transform_output`** permission **in addition to** `tools.intercept`
+  (subscribing/observing needs `tools.intercept`; rewriting the output needs the
+  second key — a Replace from an extension lacking `tools.transform_output` is
+  ignored and the original output is preserved). Return
   `{"action": "replace", "output": "<string>"}`. The first handler to return
   `replace` wins and stops the chain (later handlers are skipped). Use it for
   compression, redaction, or summarization. Notes:

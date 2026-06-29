@@ -19,8 +19,9 @@ const ALL_HOOK_KINDS: [HookKind; 7] = [
     HookKind::OnSessionEnd,
 ];
 
-const ALL_PERMISSIONS: [Permission; 5] = [
+const ALL_PERMISSIONS: [Permission; 6] = [
     Permission::ToolsIntercept,
+    Permission::ToolsTransformOutput,
     Permission::LlmContent,
     Permission::SessionLifecycle,
     Permission::ToolsRegister,

@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 
 use self::events::{HookEvent, HookKind, HookResult};
 use crate::extensions::manifest::HookMatcher;
-use crate::extensions::permissions::PermissionSet;
+use crate::extensions::permissions::{Permission, PermissionSet};
 
 /// Default timeout for a single hook handler call.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -236,6 +236,19 @@ impl HookBus {
                     return HookResult::Modify { input };
                 }
                 Ok(HookResult::Replace { output }) => {
+                    // Two-key gate: subscribing to after_tool_call needs
+                    // `tools.intercept` (observe); rewriting the output
+                    // additionally needs `tools.transform_output`. Without it,
+                    // ignore this handler's Replace (fail-safe: original output
+                    // preserved) and continue the chain.
+                    if !reg.permissions.has(Permission::ToolsTransformOutput) {
+                        tracing::warn!(
+                            hook = %event.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            "Extension returned Replace without tools.transform_output permission — ignoring transform"
+                        );
+                        continue;
+                    }
                     let observed_len = event.tool_output.as_ref().map_or(0, String::len);
                     tracing::info!(
                         hook = %event.kind.as_str(),
@@ -511,7 +524,7 @@ mod tests {
             handler,
             None,
             None,
-            perms_with(&[Permission::ToolsIntercept]),
+            perms_with(&[Permission::ToolsIntercept, Permission::ToolsTransformOutput]),
         )
         .await
         .unwrap();
@@ -552,7 +565,7 @@ mod tests {
         let bus = HookBus::new();
         let first = TestHandler::new("first", HookResult::Replace { output: "FIRST".into() });
         let second = TestHandler::new("second", HookResult::Replace { output: "SECOND".into() });
-        let perms = perms_with(&[Permission::ToolsIntercept]);
+        let perms = perms_with(&[Permission::ToolsIntercept, Permission::ToolsTransformOutput]);
 
         bus.subscribe(HookKind::AfterToolCall, first.clone(), None, None, perms.clone())
             .await
@@ -567,6 +580,43 @@ mod tests {
         assert_eq!(result, HookResult::Replace { output: "FIRST".into() });
         assert_eq!(first.calls(), 1);
         assert_eq!(second.calls(), 0); // never reached — first transform wins
+    }
+
+    /// Two-key gate: an extension may subscribe to after_tool_call with only
+    /// `tools.intercept` (observe), but its Replace is IGNORED without the
+    /// additional `tools.transform_output` — the original output is preserved.
+    #[tokio::test]
+    async fn replace_without_transform_permission_is_ignored() {
+        let bus = std::sync::Arc::new(HookBus::new());
+        let handler = TestHandler::new(
+            "observer-only",
+            HookResult::Replace { output: "SNEAKY".into() },
+        );
+        // Only the observe key — NOT tools.transform_output.
+        bus.subscribe(
+            HookKind::AfterToolCall,
+            handler.clone(),
+            None,
+            None,
+            perms_with(&[Permission::ToolsIntercept]),
+        )
+        .await
+        .unwrap();
+
+        let recorded = crate::runtime::emit_after_tool_call(
+            &bus,
+            "bash",
+            None,
+            serde_json::json!({}),
+            "ORIGINAL".to_string(),
+        )
+        .await;
+
+        assert_eq!(handler.calls(), 1, "handler still runs (it's subscribed)");
+        assert_eq!(
+            recorded, "ORIGINAL",
+            "Replace without tools.transform_output must be ignored — original preserved"
+        );
     }
 
     #[test]

@@ -241,7 +241,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         setup: None,
         prebuilt: ::std::collections::HashMap::new(),
         args: vec![fixture],
-        permissions: vec!["tools.intercept".to_string()],
+        permissions: vec!["tools.intercept".to_string(), "tools.transform_output".to_string()],
         hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
             hook: "after_tool_call".to_string(),
             tool: Some("bash".to_string()),

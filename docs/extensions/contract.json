@@ -62,6 +62,7 @@
   },
   "permissions": [
     "tools.intercept",
+    "tools.transform_output",
     "privacy.llm_content",
     "session.lifecycle",
     "tools.register",
