@@ -19,7 +19,8 @@
       "permission": "tools.intercept",
       "tool_filter": true,
       "actions": [
-        "continue"
+        "continue",
+        "replace"
       ]
     },
     "before_message": {

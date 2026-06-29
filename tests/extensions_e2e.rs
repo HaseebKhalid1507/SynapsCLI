@@ -212,7 +212,8 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         input,
         output,
     ).await;
-    assert!(matches!(after, HookResult::Continue));
+    // No after_tool_call transform handler registered → output unchanged.
+    assert_eq!(after, "modified");
 
     manager.shutdown_all().await;
 }

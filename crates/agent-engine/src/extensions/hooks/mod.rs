@@ -471,6 +471,54 @@ mod tests {
         set
     }
 
+    /// emit_after_tool_call returns the substituted output when an
+    /// after_tool_call handler returns Replace — this is the seam that lets an
+    /// extension compress/redact tool output before it enters history.
+    #[tokio::test]
+    async fn after_tool_call_replace_substitutes_recorded_output() {
+        let bus = std::sync::Arc::new(HookBus::new());
+        let handler = TestHandler::new(
+            "compressor",
+            HookResult::Replace { output: "COMPRESSED".into() },
+        );
+        bus.subscribe(
+            HookKind::AfterToolCall,
+            handler,
+            None,
+            None,
+            perms_with(&[Permission::ToolsIntercept]),
+        )
+        .await
+        .unwrap();
+
+        let recorded = crate::runtime::emit_after_tool_call(
+            &bus,
+            "bash",
+            None,
+            serde_json::json!({"command": "cat huge.log"}),
+            "RAW 10k lines".to_string(),
+        )
+        .await;
+
+        assert_eq!(recorded, "COMPRESSED", "Replace output must reach history");
+    }
+
+    /// With no transform handler, the original output is preserved unchanged.
+    #[tokio::test]
+    async fn after_tool_call_without_replace_keeps_original_output() {
+        let bus = std::sync::Arc::new(HookBus::new());
+        let recorded = crate::runtime::emit_after_tool_call(
+            &bus,
+            "bash",
+            None,
+            serde_json::json!({}),
+            "RAW".to_string(),
+        )
+        .await;
+
+        assert_eq!(recorded, "RAW", "no Replace → original output preserved");
+    }
+
     #[test]
     fn trace_env_value_parser_accepts_common_truthy_values() {
         for value in ["1", "true", "TRUE", "yes", "on"] {
