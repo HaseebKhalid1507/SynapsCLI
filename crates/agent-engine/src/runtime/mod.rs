@@ -1,36 +1,36 @@
+use crate::{Result, RuntimeError, ToolRegistry};
+use futures::stream::Stream;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use crate::{Result, RuntimeError, ToolRegistry};
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use futures::stream::Stream;
-use std::pin::Pin;
 
-mod types;
-mod auth;
 mod api;
 mod api_sync;
+mod auth;
+pub mod compaction;
+pub(crate) mod helpers;
+pub mod openai;
 mod request;
-mod stream;
-mod helpers;
 mod sse;
 mod sse_types;
+mod stream;
 pub mod subagent;
-pub mod openai;
 pub mod telemetry;
-pub mod compaction;
+mod types;
 
-pub use types::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
-use types::AuthState;
-use auth::AuthMethods;
 use api::ApiMethods;
-use stream::StreamMethods;
+use auth::AuthMethods;
 use helpers::HelperMethods;
+use stream::StreamMethods;
+use types::AuthState;
+pub use types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 
 /// Result of resolving before_tool_call extension policy.
 pub enum BeforeToolCallDecision {
@@ -52,7 +52,6 @@ pub async fn emit_before_tool_call(
     }
     hook_bus.emit(&event).await
 }
-
 
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
@@ -87,7 +86,9 @@ pub async fn resolve_before_tool_call_result(
                 .await;
 
             match response.as_deref().map(str::trim) {
-                Some(answer) if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") => {
+                Some(answer)
+                    if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
+                {
                     crate::extensions::hooks::events::HookResult::Continue
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
@@ -113,7 +114,9 @@ pub async fn resolve_before_tool_call_decision(
         crate::extensions::hooks::events::HookResult::Modify { input } => {
             BeforeToolCallDecision::Continue { input }
         }
-        _ => BeforeToolCallDecision::Continue { input: original_input },
+        _ => BeforeToolCallDecision::Continue {
+            input: original_input,
+        },
     }
 }
 
@@ -135,29 +138,29 @@ const MAX_REPLACE_OUTPUT: usize = 1024 * 1024; // 1 MiB
 /// drop or corrupt a tool's output.
 ///
 /// Note: the event delivered to the extension carries `tool_output` as a
-/// size-limited preview for large outputs — a ~32 KB prefix plus a
+/// size-limited preview for large outputs — a ~256 KB prefix plus a
 /// `…[truncated, N total bytes]` marker (see [`HookEvent::after_tool_call`]),
-/// so the delivered string can slightly exceed 32 KB. A transform therefore
-/// decides based on a preview, not the full bytes.
+/// matching `max_tool_buffer`. The final returned string is then truncated to
+/// `max_tool_output` (the context budget) — compress-then-truncate ordering,
+/// so a transform extension sees the full buffered output and decides what to
+/// keep before the hard cap is applied.
 pub async fn emit_after_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
     output: String,
+    max_tool_output: usize,
 ) -> String {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
-    let mut event = crate::extensions::hooks::events::HookEvent::after_tool_call(
-        tool_name,
-        input,
-        output,
-    );
+    let mut event =
+        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
-    match hook_bus.emit(&event).await {
+    let post_hook = match hook_bus.emit(&event).await {
         HookResult::Replace { mut output } => {
             if output.len() > MAX_REPLACE_OUTPUT {
                 tracing::warn!(
@@ -184,7 +187,11 @@ pub async fn emit_after_tool_call(
             );
             original
         }
-    }
+    };
+    // Compress-then-truncate: apply the context-budget cap AFTER the hook.
+    // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
+    // no-extension path is behavior-identical to the legacy ordering.
+    crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
 }
 
 /// The core runtime — manages API communication, tool execution, authentication,
@@ -287,7 +294,9 @@ impl Runtime {
             thinking_budget: 4096,
             context_window_override: None,
             compaction_model: None,
-            subagent_registry: Arc::new(Mutex::new(crate::runtime::subagent::SubagentRegistry::new())),
+            subagent_registry: Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
@@ -324,8 +333,15 @@ impl Runtime {
             model[pos..].to_string()
         } else if let Some(pos) = model.find('/') {
             let before = &model[..pos];
-            let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
+            let key_start = before
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .map(|i| {
+                    i + before[i..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1)
+                })
                 .unwrap_or(0);
             model[key_start..].to_string()
         } else {
@@ -378,7 +394,9 @@ impl Runtime {
     /// Effective context window for the current model — user override if set,
     /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn compaction_model(&self) -> &str {
-        self.compaction_model.as_deref().unwrap_or("claude-sonnet-4-6")
+        self.compaction_model
+            .as_deref()
+            .unwrap_or("claude-sonnet-4-6")
     }
 
     pub fn context_window(&self) -> u64 {
@@ -401,7 +419,8 @@ impl Runtime {
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
-        self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.telemetry_level =
+            crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
         self.apply_auth_config(config);
@@ -545,7 +564,8 @@ impl Runtime {
             self.thinking_budget,
             &messages,
             self.api_retries,
-        ).await
+        )
+        .await
     }
 
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
@@ -555,7 +575,7 @@ impl Runtime {
         self.refresh_if_needed().await?;
 
         let mut messages = vec![json!({"role": "user", "content": prompt})];
-        
+
         loop {
             let response = ApiMethods::call_api(
                 &self.auth,
@@ -574,13 +594,14 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                 },
-            ).await?;
-            
+            )
+            .await?;
+
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
                 let mut response_text = String::new();
                 let mut tool_uses = Vec::new();
-                
+
                 // Process response content
                 for item in content {
                     match item["type"].as_str() {
@@ -595,33 +616,41 @@ impl Runtime {
                         _ => {}
                     }
                 }
-                
+
                 // If no tool uses, return the text response
                 if tool_uses.is_empty() {
                     return Ok(response_text);
                 }
-                
+
                 // Add assistant's response to conversation (only content, role)
                 messages.push(json!({
                     "role": "assistant",
                     "content": content
                 }));
-                
+
                 // Execute tools — parallel when multiple are requested
                 let mut tool_results = Vec::new();
-                
+
                 if tool_uses.len() == 1 {
                     // Single tool — run inline, no spawn overhead
                     let tool_use = &tool_uses[0];
-                    if let (Some(tool_name), Some(tool_id)) = (
-                        tool_use["name"].as_str(),
-                        tool_use["id"].as_str()
-                    ) {
+                    if let (Some(tool_name), Some(tool_id)) =
+                        (tool_use["name"].as_str(), tool_use["id"].as_str())
+                    {
                         let input = &tool_use["input"];
                         let result = match self.tools.read().await.get(tool_name).cloned() {
                             Some(tool) => {
-                                let input = self.tools.read().await.translate_input_for_api_tool(tool_name, input.clone());
-                                let runtime_name = self.tools.read().await.runtime_name_for_api(tool_name).to_string();
+                                let input = self
+                                    .tools
+                                    .read()
+                                    .await
+                                    .translate_input_for_api_tool(tool_name, input.clone());
+                                let runtime_name = self
+                                    .tools
+                                    .read()
+                                    .await
+                                    .runtime_name_for_api(tool_name)
+                                    .to_string();
                                 let ctx = crate::ToolContext {
                                     channels: crate::tools::ToolChannels {
                                         tx_delta: None,
@@ -637,6 +666,7 @@ impl Runtime {
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
+                                        max_tool_buffer: 256 * 1024,
                                         bash_timeout: self.bash_timeout,
                                         bash_max_timeout: self.bash_max_timeout,
                                         subagent_timeout: self.subagent_timeout,
@@ -649,14 +679,19 @@ impl Runtime {
                                         tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
-                                    ).await,
+                                    )
+                                    .await,
                                     None,
                                     false,
-                                ).await;
+                                )
+                                .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
-                                    let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
+                                    let BeforeToolCallDecision::Continue { input } = decision
+                                    else {
+                                        unreachable!()
+                                    };
                                     let input_for_hook = input.clone();
                                     let output = match tool.execute(input, ctx).await {
                                         Ok(output) => output,
@@ -668,7 +703,9 @@ impl Runtime {
                                         Some(&runtime_name),
                                         input_for_hook,
                                         output,
-                                    ).await;
+                                        self.max_tool_output,
+                                    )
+                                    .await;
                                     output
                                 }
                             }
@@ -683,7 +720,7 @@ impl Runtime {
                 } else {
                     // Multiple tools — run in parallel with JoinSet
                     let mut join_set = tokio::task::JoinSet::new();
-                    
+
                     // Capture config values before spawning (can't borrow &self in 'static spawn)
                     let cfg_max_tool_output = self.max_tool_output;
                     let cfg_bash_timeout = self.bash_timeout;
@@ -693,7 +730,7 @@ impl Runtime {
                     let cfg_subagent_registry = self.subagent_registry.clone();
                     let cfg_event_queue = self.event_queue.clone();
                     let cfg_hook_bus = self.hook_bus.clone();
-                    
+
                     for tool_use in &tool_uses {
                         if let (Some(tool_name), Some(tool_id)) = (
                             tool_use["name"].as_str().map(|s| s.to_string()),
@@ -701,8 +738,10 @@ impl Runtime {
                         ) {
                             let input = tool_use["input"].clone();
                             let tools_snapshot = self.tools.read().await;
-                            let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
-                            let runtime_name = tools_snapshot.runtime_name_for_api(&tool_name).to_string();
+                            let input =
+                                tools_snapshot.translate_input_for_api_tool(&tool_name, input);
+                            let runtime_name =
+                                tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                             let tool = tools_snapshot.get(&tool_name).cloned();
                             drop(tools_snapshot);
                             let exit_path = self.watcher_exit_path.clone();
@@ -712,58 +751,72 @@ impl Runtime {
                             let hook_bus_inner = cfg_hook_bus.clone();
                             let tool_name_for_hook = tool_name.clone();
                             let runtime_name_for_hook = runtime_name.clone();
-                            
+
                             join_set.spawn(async move {
                                 let result = match tool {
                                     Some(t) => {
-                                        let decision = crate::runtime::resolve_before_tool_call_decision(
-                                            input.clone(),
-                                            crate::runtime::emit_before_tool_call(
+                                        let decision =
+                                            crate::runtime::resolve_before_tool_call_decision(
+                                                input.clone(),
+                                                crate::runtime::emit_before_tool_call(
+                                                    &hook_bus_inner,
+                                                    &tool_name_for_hook,
+                                                    Some(&runtime_name_for_hook),
+                                                    input.clone(),
+                                                )
+                                                .await,
+                                                None,
+                                                false,
+                                            )
+                                            .await;
+                                        if let crate::runtime::BeforeToolCallDecision::Block {
+                                            reason,
+                                        } = decision
+                                        {
+                                            format!("Tool call blocked by extension: {}", reason)
+                                        } else {
+                                            let crate::runtime::BeforeToolCallDecision::Continue {
+                                                input,
+                                            } = decision
+                                            else {
+                                                unreachable!()
+                                            };
+                                            let ctx = crate::ToolContext {
+                                                channels: crate::tools::ToolChannels {
+                                                    tx_delta: None,
+                                                    tx_events: None,
+                                                },
+                                                capabilities: crate::tools::ToolCapabilities {
+                                                    watcher_exit_path: exit_path,
+                                                    tool_register_tx: None,
+                                                    session_manager: Some(session_mgr_inner),
+                                                    subagent_registry: Some(registry_inner),
+                                                    event_queue: Some(event_queue_inner),
+                                                    secret_prompt: None,
+                                                },
+                                                limits: crate::tools::ToolLimits {
+                                                    max_tool_output: cfg_max_tool_output,
+                                                    max_tool_buffer: 256 * 1024,
+                                                    bash_timeout: cfg_bash_timeout,
+                                                    bash_max_timeout: cfg_bash_max_timeout,
+                                                    subagent_timeout: cfg_subagent_timeout,
+                                                },
+                                            };
+                                            let input_for_hook = input.clone();
+                                            let output = match t.execute(input, ctx).await {
+                                                Ok(output) => output,
+                                                Err(e) => format!("Tool execution failed: {}", e),
+                                            };
+                                            let output = crate::runtime::emit_after_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
-                                                input.clone(),
-                                            ).await,
-                                            None,
-                                            false,
-                                        ).await;
-                                        if let crate::runtime::BeforeToolCallDecision::Block { reason } = decision {
-                                            format!("Tool call blocked by extension: {}", reason)
-                                        } else {
-                                        let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
-                                        let ctx = crate::ToolContext {
-                                            channels: crate::tools::ToolChannels {
-                                                tx_delta: None,
-                                                tx_events: None,
-                                            },
-                                            capabilities: crate::tools::ToolCapabilities {
-                                                watcher_exit_path: exit_path,
-                                                tool_register_tx: None,
-                                                session_manager: Some(session_mgr_inner),
-                                                subagent_registry: Some(registry_inner),
-                                                event_queue: Some(event_queue_inner),
-                                                secret_prompt: None,
-                                            },
-                                            limits: crate::tools::ToolLimits {
-                                                max_tool_output: cfg_max_tool_output,
-                                                bash_timeout: cfg_bash_timeout,
-                                                bash_max_timeout: cfg_bash_max_timeout,
-                                                subagent_timeout: cfg_subagent_timeout,
-                                            },
-                                        };
-                                        let input_for_hook = input.clone();
-                                        let output = match t.execute(input, ctx).await {
-                                            Ok(output) => output,
-                                            Err(e) => format!("Tool execution failed: {}", e),
-                                        };
-                                        let output = crate::runtime::emit_after_tool_call(
-                                            &hook_bus_inner,
-                                            &tool_name_for_hook,
-                                            Some(&runtime_name_for_hook),
-                                            input_for_hook,
-                                            output,
-                                        ).await;
-                                        output
+                                                input_for_hook,
+                                                output,
+                                                cfg_max_tool_output,
+                                            )
+                                            .await;
+                                            output
                                         }
                                     }
                                     None => format!("Unknown tool: {}", tool_name),
@@ -772,7 +825,7 @@ impl Runtime {
                             });
                         }
                     }
-                    
+
                     // Collect results, preserving order by tool_id
                     let mut results_map = std::collections::HashMap::new();
                     while let Some(res) = join_set.join_next().await {
@@ -786,12 +839,13 @@ impl Runtime {
                             }
                         }
                     }
-                    
+
                     // Build tool_results in original order — every tool_use MUST have a result
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map.remove(tool_id)
-                                .unwrap_or_else(|| "Tool execution failed: task panicked".to_string());
+                            let result = results_map.remove(tool_id).unwrap_or_else(|| {
+                                "Tool execution failed: task panicked".to_string()
+                            });
                             tool_results.push(json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -800,13 +854,13 @@ impl Runtime {
                         }
                     }
                 }
-                
+
                 // Add tool results to conversation
                 messages.push(json!({
                     "role": "user",
                     "content": tool_results
                 }));
-                
+
                 // Continue the loop to get Claude's response with tool results
             } else {
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
@@ -816,8 +870,19 @@ impl Runtime {
 
     /// Run a prompt as a cancellable stream of [`StreamEvent`]s. Convenience wrapper
     /// around [`run_stream_with_messages`] for single-turn usage.
-    pub async fn run_stream(&self, prompt: String, cancel: CancellationToken) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
-        self.run_stream_with_messages(vec![json!({"role": "user", "content": prompt})], cancel, None, None, false).await
+    pub async fn run_stream(
+        &self,
+        prompt: String,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_with_messages(
+            vec![json!({"role": "user", "content": prompt})],
+            cancel,
+            None,
+            None,
+            false,
+        )
+        .await
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -872,12 +937,28 @@ impl Runtime {
         };
 
         let session = crate::runtime::stream::StreamSession {
-            auth, client, credential_source, token_cache, options, api_retries,
-            model, tools, system_prompt, thinking_budget,
-            tx: tx.clone(), cancel, steering_rx,
-            watcher_exit_path, max_tool_output,
-            bash_timeout, bash_max_timeout, subagent_timeout,
-            session_manager, subagent_registry, event_queue, secret_prompt,
+            auth,
+            client,
+            credential_source,
+            token_cache,
+            options,
+            api_retries,
+            model,
+            tools,
+            system_prompt,
+            thinking_budget,
+            tx: tx.clone(),
+            cancel,
+            steering_rx,
+            watcher_exit_path,
+            max_tool_output,
+            bash_timeout,
+            bash_max_timeout,
+            subagent_timeout,
+            session_manager,
+            subagent_registry,
+            event_queue,
+            secret_prompt,
             hook_bus: self.hook_bus.clone(),
             auto_approve_confirms,
             telemetry_level: self.telemetry_level,
@@ -926,8 +1007,8 @@ impl Clone for Runtime {
             last_msg_id: Arc::new(Mutex::new(None)),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
-            reaper_handle: None,  // Cloned runtimes don't own the reaper
-            reaper_cancel: None,  // Cloned runtimes don't own the reaper
+            reaper_handle: None, // Cloned runtimes don't own the reaper
+            reaper_cancel: None, // Cloned runtimes don't own the reaper
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
         }
@@ -965,7 +1046,8 @@ mod tests {
             },
             None,
             false,
-        ).await;
+        )
+        .await;
 
         match result {
             BeforeToolCallDecision::Continue { input } => {
@@ -1033,52 +1115,75 @@ mod tests {
     #[test]
     fn test_max_tokens_for_model() {
         // Opus models should return 128000
-        assert_eq!(HelperMethods::max_tokens_for_model("claude-opus-4-6"), 128000);
-        assert_eq!(HelperMethods::max_tokens_for_model("opus-something"), 128000);
-        
+        assert_eq!(
+            HelperMethods::max_tokens_for_model("claude-opus-4-6"),
+            128000
+        );
+        assert_eq!(
+            HelperMethods::max_tokens_for_model("opus-something"),
+            128000
+        );
+
         // Non-opus models should return 64000
-        assert_eq!(HelperMethods::max_tokens_for_model("claude-sonnet-4-20250514"), 64000);
+        assert_eq!(
+            HelperMethods::max_tokens_for_model("claude-sonnet-4-20250514"),
+            64000
+        );
         assert_eq!(HelperMethods::max_tokens_for_model("haiku"), 64000);
         assert_eq!(HelperMethods::max_tokens_for_model("claude-3-haiku"), 64000);
-        assert_eq!(HelperMethods::max_tokens_for_model("some-other-model"), 64000);
-        
+        assert_eq!(
+            HelperMethods::max_tokens_for_model("some-other-model"),
+            64000
+        );
+
         // Edge cases
         assert_eq!(HelperMethods::max_tokens_for_model(""), 64000);
         assert_eq!(HelperMethods::max_tokens_for_model("OPUS"), 64000); // Case sensitive - uppercase doesn't match
-        assert_eq!(HelperMethods::max_tokens_for_model("model-opus-end"), 128000); // Contains "opus" anywhere
+        assert_eq!(
+            HelperMethods::max_tokens_for_model("model-opus-end"),
+            128000
+        ); // Contains "opus" anywhere
     }
 
     #[test]
     fn test_truncate_tool_result() {
         let default_max = 30000;
-        
+
         // Short string should remain unchanged
         let short = "This is a short string.";
-        assert_eq!(HelperMethods::truncate_tool_result(short, default_max), short);
-        
+        assert_eq!(
+            HelperMethods::truncate_tool_result(short, default_max),
+            short
+        );
+
         // Exactly max should remain unchanged
         let exact = "x".repeat(30000);
-        assert_eq!(HelperMethods::truncate_tool_result(&exact, default_max), exact);
-        
+        assert_eq!(
+            HelperMethods::truncate_tool_result(&exact, default_max),
+            exact
+        );
+
         // String longer than max should be truncated with notice
         let too_long = "x".repeat(30001);
         let truncated = HelperMethods::truncate_tool_result(&too_long, default_max);
-        
+
         // Should start with the truncated content
         assert!(truncated.starts_with(&"x".repeat(30000)));
-        
+
         // Should contain truncation notice with total char count
         assert!(truncated.contains("[truncated — 30001 total chars, showing first 30000]"));
-        
+
         // Should be longer than max (due to notice)
         assert!(truncated.len() > 30000);
-        
+
         // Test with a much longer string
         let very_long = "a".repeat(50000);
         let truncated_very_long = HelperMethods::truncate_tool_result(&very_long, default_max);
-        assert!(truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]"));
+        assert!(
+            truncated_very_long.contains("[truncated — 50000 total chars, showing first 30000]")
+        );
         assert!(truncated_very_long.starts_with(&"a".repeat(30000)));
-        
+
         // Test with custom limit
         let custom_truncated = HelperMethods::truncate_tool_result(&very_long, 100);
         assert!(custom_truncated.starts_with(&"a".repeat(100)));

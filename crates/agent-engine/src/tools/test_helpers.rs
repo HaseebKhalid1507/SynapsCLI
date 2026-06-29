@@ -19,6 +19,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
         },
         limits: ToolLimits {
             max_tool_output: 30000,
+            max_tool_buffer: 256 * 1024,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,

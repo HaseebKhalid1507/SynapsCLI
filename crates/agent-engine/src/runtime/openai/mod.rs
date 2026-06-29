@@ -6,14 +6,14 @@
 
 use std::collections::BTreeMap;
 
+pub mod catalog;
+pub mod ping;
+pub mod reasoning;
+pub mod registry;
+pub mod stream;
+pub mod translate;
 pub mod types;
 pub mod wire;
-pub mod registry;
-pub mod catalog;
-pub mod reasoning;
-pub mod translate;
-pub mod stream;
-pub mod ping;
 
 use std::sync::Arc;
 
@@ -22,19 +22,24 @@ use crate::extensions::providers::ProviderRegistry;
 use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
 pub use types::{
-    ChatMessage, ChatOptions, ChatRequest, FunctionCall, FunctionDefinition,
-    OaiEvent, ProviderConfig, StreamOptions, ToolCall, ToolChoice, ToolDefinition,
+    ChatMessage, ChatOptions, ChatRequest, FunctionCall, FunctionDefinition, OaiEvent,
+    ProviderConfig, StreamOptions, ToolCall, ToolChoice, ToolDefinition,
 };
 pub use wire::StreamDecoder;
 
-static EXTENSION_MANAGER: std::sync::RwLock<Option<Arc<tokio::sync::RwLock<ExtensionManager>>>> = std::sync::RwLock::new(None);
+static EXTENSION_MANAGER: std::sync::RwLock<Option<Arc<tokio::sync::RwLock<ExtensionManager>>>> =
+    std::sync::RwLock::new(None);
 
 pub fn set_extension_manager_for_routing(manager: Arc<tokio::sync::RwLock<ExtensionManager>>) {
-    *EXTENSION_MANAGER.write().expect("extension manager routing lock poisoned") = Some(manager);
+    *EXTENSION_MANAGER
+        .write()
+        .expect("extension manager routing lock poisoned") = Some(manager);
 }
 
 pub fn clear_extension_manager_for_routing() {
-    *EXTENSION_MANAGER.write().expect("extension manager routing lock poisoned") = None;
+    *EXTENSION_MANAGER
+        .write()
+        .expect("extension manager routing lock poisoned") = None;
 }
 
 pub fn extension_manager_for_routing() -> Option<Arc<tokio::sync::RwLock<ExtensionManager>>> {
@@ -120,11 +125,21 @@ pub async fn try_route(
                             .and_then(|m| m.capabilities.get("tool_use"))
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        (handler.clone(), manager.hook_bus().clone(), manager.tools_shared(), streaming, model_tool_use)
+                        (
+                            handler.clone(),
+                            manager.hook_bus().clone(),
+                            manager.tools_shared(),
+                            streaming,
+                            model_tool_use,
+                        )
                     })
                 })
             }) else {
-                return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
+                return Some(Err(format!(
+                    "Extension provider model '{}' is not available",
+                    model
+                )
+                .into()));
             };
             // Per-provider trust gate: a disabled provider must not be invoked.
             // The check runs before any IPC and we DO NOT silently fall back to
@@ -133,9 +148,10 @@ pub async fn try_route(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("trust.json corrupt or unreadable, failing closed: {e}");
-                    return Some(Err(
-                        format!("Cannot route to provider: trust state unreadable: {e}").into()
-                    ));
+                    return Some(Err(format!(
+                        "Cannot route to provider: trust state unreadable: {e}"
+                    )
+                    .into()));
                 }
             };
             if !crate::extensions::trust::is_provider_enabled(&trust, &provider_runtime_id) {
@@ -154,27 +170,29 @@ pub async fn try_route(
                 return Some(Err(format!(
                     "Provider '{}' is disabled by user trust settings",
                     provider_runtime_id
-                ).into()));
+                )
+                .into()));
             }
             // Audit metadata captured up-front so each terminal branch can record an entry.
             let audit_plugin = plugin_id.to_string();
             let audit_provider = provider_id.to_string();
             let audit_model = model_id.to_string();
             let tools_exposed = !tools_schema.is_empty();
-            let emit_audit = |streamed: bool, outcome: &str, error_class: Option<&str>, tools_requested: u32| {
-                let _ = crate::extensions::audit::append_audit_entry(
-                    &crate::extensions::audit::new_audit_entry(
-                        audit_plugin.clone(),
-                        audit_provider.clone(),
-                        audit_model.clone(),
-                        tools_exposed,
-                        tools_requested,
-                        streamed,
-                        outcome,
-                        error_class.map(|s| s.to_string()),
-                    ),
-                );
-            };
+            let emit_audit =
+                |streamed: bool, outcome: &str, error_class: Option<&str>, tools_requested: u32| {
+                    let _ = crate::extensions::audit::append_audit_entry(
+                        &crate::extensions::audit::new_audit_entry(
+                            audit_plugin.clone(),
+                            audit_provider.clone(),
+                            audit_model.clone(),
+                            tools_exposed,
+                            tools_requested,
+                            streamed,
+                            outcome,
+                            error_class.map(|s| s.to_string()),
+                        ),
+                    );
+                };
             if cancel.is_cancelled() {
                 emit_audit(false, "error", Some("canceled"), 0);
                 return Some(Err("operation canceled".into()));
@@ -193,7 +211,9 @@ pub async fn try_route(
             let has_active_tools = model_tool_use && !tools_schema.is_empty();
             // Streaming path: forward TextDelta events as LlmEvent::Text deltas in real time.
             if streaming && !has_active_tools {
-                let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<crate::extensions::runtime::process::ProviderStreamEvent>();
+                let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<
+                    crate::extensions::runtime::process::ProviderStreamEvent,
+                >();
                 let tx_clone = tx.clone();
                 let forwarder = tokio::spawn(async move {
                     use crate::extensions::runtime::process::ProviderStreamEvent;
@@ -201,7 +221,7 @@ pub async fn try_route(
                         match event {
                             ProviderStreamEvent::TextDelta { text } => {
                                 let _ = tx_clone.send(crate::runtime::types::StreamEvent::Llm(
-                                    crate::runtime::types::LlmEvent::Text(text)
+                                    crate::runtime::types::LlmEvent::Text(text),
                                 ));
                             }
                             ProviderStreamEvent::ToolUse { .. } => {
@@ -267,6 +287,7 @@ pub async fn try_route(
                         },
                         limits: ToolLimits {
                             max_tool_output: 30000,
+                            max_tool_buffer: 256 * 1024,
                             bash_timeout: 30,
                             bash_max_timeout: 300,
                             subagent_timeout: 300,
@@ -274,7 +295,8 @@ pub async fn try_route(
                     },
                     30000,
                     8,
-                ).await
+                )
+                .await
             } else {
                 handler.provider_complete(params).await
             };
@@ -296,7 +318,7 @@ pub async fn try_route(
                         .join("");
                     if !text.is_empty() {
                         let _ = tx.send(crate::runtime::types::StreamEvent::Llm(
-                            crate::runtime::types::LlmEvent::Text(text)
+                            crate::runtime::types::LlmEvent::Text(text),
                         ));
                     }
                     emit_audit(false, "ok", None, 0);
@@ -312,7 +334,11 @@ pub async fn try_route(
                 }
             }
         }
-        return Some(Err(format!("Extension provider model '{}' is not available", model).into()));
+        return Some(Err(format!(
+            "Extension provider model '{}' is not available",
+            model
+        )
+        .into()));
     }
 
     let provider_keys = crate::core::config::get_provider_keys();
@@ -361,14 +387,24 @@ mod tests {
     #[test]
     fn set_extension_manager_for_routing_overwrites_previous_manager() {
         clear_extension_manager_for_routing();
-        let first = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(crate::extensions::hooks::HookBus::new()))));
-        let second = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(crate::extensions::hooks::HookBus::new()))));
+        let first = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ))));
+        let second = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(Arc::new(
+            crate::extensions::hooks::HookBus::new(),
+        ))));
 
         set_extension_manager_for_routing(first.clone());
-        assert!(Arc::ptr_eq(&extension_manager_for_routing().unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            &extension_manager_for_routing().unwrap(),
+            &first
+        ));
 
         set_extension_manager_for_routing(second.clone());
-        assert!(Arc::ptr_eq(&extension_manager_for_routing().unwrap(), &second));
+        assert!(Arc::ptr_eq(
+            &extension_manager_for_routing().unwrap(),
+            &second
+        ));
 
         clear_extension_manager_for_routing();
         assert!(extension_manager_for_routing().is_none());
