@@ -192,6 +192,13 @@ pub struct Runtime {
     reaper_handle: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     reaper_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// How provider credentials are resolved: `Local` (read/refresh auth.json —
+    /// the default) or `Remote` (fetch short-lived access tokens from a broker).
+    /// Set from config in `apply_config`. See task #157.
+    credential_source: crate::auth::CredentialSource,
+    /// In-memory cache of broker-fetched access tokens (Remote source only).
+    /// Cheap to clone (Arc inside). Never persisted to disk.
+    token_cache: crate::auth::TokenCache,
 }
 
 impl Runtime {
@@ -248,6 +255,8 @@ impl Runtime {
             hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
             reaper_handle: Some(reaper_handle),
             reaper_cancel: Some(cancel),
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
         })
     }
 
@@ -345,6 +354,7 @@ impl Runtime {
         self.telemetry_level = crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.apply_auth_config(config);
 
         // Remove any built-in tools the user disabled via `disabled_tools`.
         // try_write is safe here: apply_config runs at boot before the registry
@@ -352,6 +362,26 @@ impl Runtime {
         if !config.disabled_tools.is_empty() {
             if let Ok(mut reg) = self.tools.try_write() {
                 reg.disable(&config.disabled_tools);
+            }
+        }
+    }
+
+    /// Apply only the credential-source portion of config. Used by subagent
+    /// spawns that build a fresh `Runtime::new()` (which defaults to Local) and
+    /// must inherit the user's Remote/broker setup. (#158 A3)
+    ///
+    /// A6: invalidates the token cache if the source/endpoint changed.
+    /// A2: scrubs `AuthState` when Remote so no local `auth.json` credential is
+    /// used or held (invariant 1).
+    pub fn apply_auth_config(&mut self, config: &crate::config::SynapsConfig) {
+        let new_source = config.auth.credential_source();
+        if new_source != self.credential_source {
+            self.token_cache.invalidate("anthropic");
+        }
+        self.credential_source = new_source;
+        if self.credential_source.is_remote() {
+            if let Ok(mut auth) = self.auth.try_write() {
+                AuthMethods::scrub_for_remote(&mut auth);
             }
         }
     }
@@ -433,7 +463,18 @@ impl Runtime {
 
     /// Check if the OAuth token is expired and refresh it if needed.
     pub async fn refresh_if_needed(&self) -> Result<()> {
-        AuthMethods::refresh_if_needed(Arc::clone(&self.auth), &self.client).await
+        // Non-Anthropic models resolve their own provider auth in the OpenAI
+        // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
+        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+            return Ok(());
+        }
+        AuthMethods::refresh_if_needed(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+        )
+        .await
     }
 
     /// Make a simple non-streaming API call for compaction (no tools).
@@ -480,6 +521,8 @@ impl Runtime {
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
                     saw_1h_honored: self.saw_1h_honored.clone(),
+                    credential_source: self.credential_source.clone(),
+                    token_cache: self.token_cache.clone(),
                 },
             ).await?;
             
@@ -751,6 +794,8 @@ impl Runtime {
         // same AuthState so mid-loop token refreshes are visible immediately.
         let auth = Arc::clone(&self.auth);
         let client = self.client.clone();
+        let credential_source = self.credential_source.clone();
+        let token_cache = self.token_cache.clone();
         let model = self.model.clone();
         let tools = self.tools.clone();
         let system_prompt = self.system_prompt.clone();
@@ -772,10 +817,12 @@ impl Runtime {
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
             saw_1h_honored: self.saw_1h_honored.clone(),
+            credential_source: self.credential_source.clone(),
+            token_cache: self.token_cache.clone(),
         };
 
         let session = crate::runtime::stream::StreamSession {
-            auth, client, options, api_retries,
+            auth, client, credential_source, token_cache, options, api_retries,
             model, tools, system_prompt, thinking_budget,
             tx: tx.clone(), cancel, steering_rx,
             watcher_exit_path, max_tool_output,
@@ -831,6 +878,8 @@ impl Clone for Runtime {
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None,  // Cloned runtimes don't own the reaper
             reaper_cancel: None,  // Cloned runtimes don't own the reaper
+            credential_source: self.credential_source.clone(),
+            token_cache: self.token_cache.clone(), // shares the same cache (Arc inside)
         }
     }
 }

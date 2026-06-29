@@ -158,6 +158,8 @@ impl Tool for SubagentStartTool {
                         Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
                     };
 
+                    // Inherit the user's credential source (Remote/broker). (#158 A3)
+                    runtime.apply_auth_config(&crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
                     let tools = if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {

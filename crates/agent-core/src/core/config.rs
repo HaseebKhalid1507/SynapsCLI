@@ -152,6 +152,37 @@ impl BridgeConfig {
     }
 }
 
+/// Auth configuration parsed from `auth.*` keys. Controls whether this client
+/// resolves provider tokens from the local `auth.json` (default) or from a
+/// remote credential broker. See task #157 / `auth::credential_source`.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    /// Broker base URL. When set (here, or via `SYNAPS_AUTH_ENDPOINT`), the
+    /// client fetches short-lived access tokens from the broker instead of
+    /// reading/refreshing the local `auth.json`.
+    pub remote_endpoint: Option<String>,
+    /// Per-machine bearer presented to the broker (or `SYNAPS_MACHINE_TOKEN`).
+    /// This is the machine's own identity, never the provider credential.
+    pub machine_token: Option<String>,
+}
+
+impl AuthConfig {
+    /// Resolve the credential source. Environment variables take precedence over
+    /// config-file values: `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`.
+    /// Returns `Remote` iff an endpoint is set (env or config), else `Local`.
+    pub fn credential_source(&self) -> crate::core::auth::CredentialSource {
+        let endpoint = std::env::var("SYNAPS_AUTH_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.remote_endpoint.clone());
+        let machine_token = std::env::var("SYNAPS_MACHINE_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.machine_token.clone());
+        crate::core::auth::CredentialSource::from_parts(endpoint, machine_token)
+    }
+}
+
 /// Prompt-cache TTL strategy for Anthropic requests.
 ///
 /// Controls the `cache_control` value emitted at every cache marker site:
@@ -214,6 +245,7 @@ pub struct SynapsConfig {
     pub shell: ShellConfig,
     pub server: ServerConfig,
     pub bridge: BridgeConfig,
+    pub auth: AuthConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
     /// Non-fatal problems found while parsing the config file (unknown keys,
@@ -247,6 +279,7 @@ impl Default for SynapsConfig {
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
             bridge: BridgeConfig::default(),
+            auth: AuthConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             warnings: Vec::new(),
@@ -435,6 +468,21 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
     }
 }
 
+/// Parse auth.* configuration keys and update the AuthConfig.
+fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
+    let v = val.trim();
+    match key {
+        "auth.remote_endpoint" => {
+            auth_config.remote_endpoint = if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+        "auth.machine_token" => {
+            auth_config.machine_token = if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+        _ => {
+            // Unknown auth.* keys preserved (not rejected)
+        }
+    }
+}
 /// Parse the config file at ~/.synaps-cli/config (or profile variant).
 /// Returns default config if file doesn't exist or can't be read.
 pub fn load_config() -> SynapsConfig {
@@ -545,6 +593,8 @@ pub fn load_config() -> SynapsConfig {
                     parse_server_config_key(&mut config.server, key, val);
                 } else if key.starts_with("bridge.") {
                     parse_bridge_config_key(&mut config.bridge, key, val);
+                } else if key.starts_with("auth.") {
+                    parse_auth_config_key(&mut config.auth, key, val);
                 } else if let Some(provider_key) = key.strip_prefix("provider.") {
                     config.provider_keys.insert(provider_key.to_string(), val.to_string());
                 } else if let Some(keybind_key) = key.strip_prefix("keybind.") {
@@ -1223,5 +1273,69 @@ api_retries = 5
         assert_eq!(config.bash_max_timeout, 600);
         assert_eq!(config.subagent_timeout, 120);
         assert_eq!(config.api_retries, 5);
+    }
+
+    // ── auth.* config + credential source (#157) ──
+
+    #[test]
+    #[serial]
+    fn test_auth_config_parses_endpoint_and_token() {
+        let home = std::env::temp_dir().join(format!("synaps-auth-test-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            "auth.remote_endpoint = https://jade.jade:8181\nauth.machine_token = machine-abc\n",
+        )
+        .unwrap();
+        with_home(&home, || {
+            let config = load_config();
+            assert_eq!(config.auth.remote_endpoint.as_deref(), Some("https://jade.jade:8181"));
+            assert_eq!(config.auth.machine_token.as_deref(), Some("machine-abc"));
+            // auth.* are namespaced -> must NOT warn as unknown keys
+            assert!(!config.warnings.iter().any(|w| w.contains("auth.")), "{:?}", config.warnings);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn test_credential_source_local_by_default() {
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        assert!(!AuthConfig::default().credential_source().is_remote());
+    }
+
+    #[test]
+    #[serial]
+    fn test_credential_source_remote_from_config() {
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        let auth = AuthConfig {
+            remote_endpoint: Some("https://b".into()),
+            machine_token: Some("m".into()),
+        };
+        assert_eq!(
+            auth.credential_source(),
+            crate::core::auth::CredentialSource::Remote { endpoint: "https://b".into(), machine_token: "m".into() }
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_credential_source_env_overrides_config() {
+        let auth = AuthConfig {
+            remote_endpoint: Some("https://config-host".into()),
+            machine_token: Some("config-tok".into()),
+        };
+        std::env::set_var("SYNAPS_AUTH_ENDPOINT", "https://env-host");
+        std::env::set_var("SYNAPS_MACHINE_TOKEN", "env-tok");
+        let src = auth.credential_source();
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        assert_eq!(
+            src,
+            crate::core::auth::CredentialSource::Remote { endpoint: "https://env-host".into(), machine_token: "env-tok".into() }
+        );
     }
 }

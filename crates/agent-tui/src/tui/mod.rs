@@ -24,6 +24,14 @@ mod theme;
 mod toast;
 mod viewport;
 
+/// Single process-global lock for ALL tests that mutate config-env vars
+/// (`SYNAPS_BASE_DIR`, `HOME`).  Both `migration_tests` (this file) and the
+/// `BASE_DIR_TEST_LOCK` tests in `plugins/actions.rs` must hold this lock for
+/// the duration of any test that sets or reads those vars, so the two groups
+/// can never interleave even when `cargo test` runs them on parallel threads.
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use app::{App, ChatMessage, THINKING_PLACEHOLDER};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};
@@ -2332,24 +2340,44 @@ fn pick_display_name_for_plugin(
 #[cfg(test)]
 mod migration_tests {
     use super::*;
-    use serial_test::serial;
     use synaps_cli::skills::registry::LifecycleClaim;
 
-    fn make_test_home(subdir: &str) -> std::path::PathBuf {
-        let dir = std::path::PathBuf::from(format!("/tmp/synaps-mig-test-{}", subdir));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".synaps-cli")).unwrap();
-        dir
+    // RAII guard: sets SYNAPS_BASE_DIR for the duration of the test, then
+    // restores the previous value (or removes the var) on drop.  This is the
+    // canonical override – base_dir() checks SYNAPS_BASE_DIR *before* HOME, so
+    // setting it here completely shadows the real ~/.synaps-cli regardless of
+    // what HOME is, and is immune to the HOME-vs-SYNAPS_BASE_DIR race that was
+    // the root cause of T137 flakiness.
+    struct BaseDir {
+        _dir: tempfile::TempDir,
+        old: Option<String>,
     }
 
-    fn with_home<F: FnOnce()>(home: &std::path::Path, f: F) {
-        let original = std::env::var("HOME").ok();
-        std::env::set_var("HOME", home);
-        f();
-        if let Some(h) = original {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
+    impl BaseDir {
+        /// Create a fresh TempDir, point SYNAPS_BASE_DIR at it, write the
+        /// given initial config content into `<tmpdir>/config`, and return the
+        /// guard.  The directory is removed automatically when the guard drops.
+        fn new(initial_config: &str) -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let old = std::env::var("SYNAPS_BASE_DIR").ok();
+            synaps_cli::config::set_base_dir_for_tests(dir.path().to_path_buf());
+            std::fs::write(dir.path().join("config"), initial_config)
+                .expect("write test config");
+            Self { _dir: dir, old }
+        }
+
+        /// Path to the config file that base_dir() resolves to.
+        fn config_path(&self) -> std::path::PathBuf {
+            self._dir.path().join("config")
+        }
+    }
+
+    impl Drop for BaseDir {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+                None    => std::env::remove_var("SYNAPS_BASE_DIR"),
+            }
         }
     }
 
@@ -2364,113 +2392,102 @@ mod migration_tests {
     }
 
     #[test]
-    #[serial]
     fn migrate_copies_legacy_into_namespaced_key() {
-        let home = make_test_home("copy-into-namespaced");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "sidecar_toggle_key = F2\n").unwrap();
-        with_home(&home, || {
-            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "sample-sidecar",
-                "capture",
-                Some("capture"),
-            )]);
-            let v = synaps_cli::config::read_config_value(
-                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
-            );
-            assert_eq!(v.as_deref(), Some("F2"));
-        });
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _base = BaseDir::new("sidecar_toggle_key = F2\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        let v = synaps_cli::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+        );
+        assert_eq!(v.as_deref(), Some("F2"));
     }
 
     #[test]
-    #[serial]
     fn migrate_skips_when_new_key_already_set() {
-        let home = make_test_home("skip-existing");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(
-            &cfg,
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _base = BaseDir::new(
             "sidecar_toggle_key = F2\nplugins.sample-sidecar.capture._lifecycle_toggle_key = F12\n",
-        )
-        .unwrap();
-        with_home(&home, || {
-            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "sample-sidecar",
-                "capture",
-                Some("capture"),
-            )]);
-            let v = synaps_cli::config::read_config_value(
-                "plugins.sample-sidecar.capture._lifecycle_toggle_key",
-            );
-            assert_eq!(
-                v.as_deref(),
-                Some("F12"),
-                "must not overwrite a user-set value"
-            );
-        });
+        );
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        let v = synaps_cli::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+        );
+        assert_eq!(v.as_deref(), Some("F12"), "must not overwrite a user-set value");
     }
 
     #[test]
-    #[serial]
     fn migrate_is_noop_when_legacy_unset() {
-        let home = make_test_home("noop-no-legacy");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "model = claude-sonnet-4-6\n").unwrap();
-        with_home(&home, || {
-            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
-                "sample-sidecar",
-                "capture",
-                Some("capture"),
-            )]);
-            assert!(synaps_cli::config::read_config_value(
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _base = BaseDir::new("model = claude-sonnet-4-6\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        assert!(synaps_cli::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn migrate_skips_claim_without_settings_category() {
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = BaseDir::new("sidecar_toggle_key = F8\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim("p", "ocr", None)]);
+        // No namespaced key written for a claim with no category.
+        let contents = std::fs::read_to_string(base.config_path()).unwrap();
+        assert!(
+            !contents.contains("_lifecycle_toggle_key"),
+            "no namespaced key should be written when settings_category is None: {contents}"
+        );
+    }
+
+    #[test]
+    fn migrate_handles_multiple_claims_in_one_pass() {
+        let _lock = crate::tui::CONFIG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _base = BaseDir::new("sidecar_toggle_key = C-V\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[
+            claim("sample-sidecar", "capture", Some("capture")),
+            claim("ocr-plugin", "ocr", Some("ocr")),
+        ]);
+        assert_eq!(
+            synaps_cli::config::read_config_value(
                 "plugins.sample-sidecar.capture._lifecycle_toggle_key"
             )
-            .is_none());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn migrate_skips_claim_without_settings_category() {
-        let home = make_test_home("skip-no-category");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "sidecar_toggle_key = F8\n").unwrap();
-        with_home(&home, || {
-            migrate_sidecar_toggle_key_to_claimed_plugins(&[claim("p", "ocr", None)]);
-            // No namespaced key written for a claim with no category.
-            let contents = std::fs::read_to_string(&cfg).unwrap();
-            assert!(
-                !contents.contains("_lifecycle_toggle_key"),
-                "no namespaced key should be written when settings_category is None: {contents}"
-            );
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn migrate_handles_multiple_claims_in_one_pass() {
-        let home = make_test_home("multi-claim");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "sidecar_toggle_key = C-V\n").unwrap();
-        with_home(&home, || {
-            migrate_sidecar_toggle_key_to_claimed_plugins(&[
-                claim("sample-sidecar", "capture", Some("capture")),
-                claim("ocr-plugin", "ocr", Some("ocr")),
-            ]);
-            assert_eq!(
-                synaps_cli::config::read_config_value(
-                    "plugins.sample-sidecar.capture._lifecycle_toggle_key"
-                )
-                .as_deref(),
-                Some("C-V")
-            );
-            assert_eq!(
-                synaps_cli::config::read_config_value(
-                    "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
-                )
-                .as_deref(),
-                Some("C-V")
-            );
-        });
+            .as_deref(),
+            Some("C-V")
+        );
+        assert_eq!(
+            synaps_cli::config::read_config_value(
+                "plugins.ocr-plugin.ocr._lifecycle_toggle_key"
+            )
+            .as_deref(),
+            Some("C-V")
+        );
     }
 }
 

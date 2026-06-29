@@ -7,7 +7,7 @@ use ratatui::{
     Terminal,
 };
 use std::io;
-use tachyonfx::{fx, Effect, Interpolation, Shader};
+use tachyonfx::{fx, Effect, Interpolation};
 
 /// Build a single sidecar pill segment for one `SidecarUiState`.
 #[allow(dead_code)] // used in tests
@@ -335,7 +335,7 @@ pub(crate) fn tool_accent(tool_name: &str) -> Color {
 }
 
 pub(crate) fn boot_effect() -> Effect {
-    use tachyonfx::fx::Direction as FxDir;
+    use tachyonfx::Motion as FxDir;
     let Color::Rgb(r, g, b) = THEME.load().bg else {
         return fx::sleep(0);
     };
@@ -365,7 +365,7 @@ pub(crate) fn boot_effect() -> Effect {
 }
 
 pub(crate) fn quit_effect() -> Effect {
-    use tachyonfx::fx::Direction as FxDir;
+    use tachyonfx::Motion as FxDir;
     let Color::Rgb(r, g, b) = THEME.load().muted else {
         return fx::sleep(0);
     };
