@@ -344,6 +344,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The extension wire format `{"action":"replace","output":"..."}`
+    /// deserializes to HookResult::Replace via the serde action tag — and
+    /// round-trips back. This locks the contract a transform extension speaks.
+    #[test]
+    fn replace_action_roundtrips_extension_wire_format() {
+        // Inbound: what a process extension sends on hook.handle.
+        let wire = json!({"action": "replace", "output": "compressed"});
+        let parsed: HookResult = serde_json::from_value(wire).expect("must deserialize");
+        match parsed {
+            HookResult::Replace { output } => assert_eq!(output, "compressed"),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+
+        // Outbound: the action tag is exactly "replace".
+        let out = serde_json::to_value(HookResult::Replace { output: "x".into() }).unwrap();
+        assert_eq!(out["action"], "replace");
+        assert_eq!(out["output"], "x");
+    }
+
     // ── HookKind ──────────────────────────────────────────────────────────────
 
     /// after_tool_call may return Replace; other hooks may not, and
