@@ -3,11 +3,11 @@
 //! Spawns the extension as a child process. Communication uses
 //! Content-Length framing (LSP-style) over stdin/stdout.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,6 @@ struct JsonRpcRequest {
     params: Value,
     id: u64,
 }
-
 
 #[derive(Serialize)]
 struct InitializeParams {
@@ -181,9 +180,7 @@ pub fn parse_provider_stream_event(params: &Value) -> Result<ProviderStreamEvent
                 None => Value::Object(Default::default()),
                 Some(v) if v.is_object() => v.clone(),
                 Some(_) => {
-                    return Err(
-                        "provider stream tool_use input must be a JSON object".to_string()
-                    );
+                    return Err("provider stream tool_use input must be a JSON object".to_string());
                 }
             };
             Ok(ProviderStreamEvent::ToolUse {
@@ -245,13 +242,17 @@ pub async fn execute_provider_tool_use(
             &tool_name,
             Some(&runtime_name),
             input.clone(),
-        ).await,
+        )
+        .await,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
-    ).await;
+    )
+    .await;
 
     let crate::runtime::BeforeToolCallDecision::Continue { input } = decision else {
-        let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else { unreachable!() };
+        let crate::runtime::BeforeToolCallDecision::Block { reason } = decision else {
+            unreachable!()
+        };
         return serde_json::json!({
             "type": "tool_result",
             "tool_use_id": tool_id,
@@ -271,7 +272,9 @@ pub async fn execute_provider_tool_use(
         Some(&runtime_name),
         input_for_hook,
         result,
-    ).await;
+        max_tool_output,
+    )
+    .await;
 
     let mut response = serde_json::json!({
         "type": "tool_result",
@@ -319,13 +322,16 @@ where
 
         let mut tool_results = Vec::with_capacity(tool_uses.len());
         for tool_use in tool_uses {
-            tool_results.push(execute_provider_tool_use(
-                registry,
-                hook_bus,
-                tool_use,
-                context_factory(),
-                max_tool_output,
-            ).await);
+            tool_results.push(
+                execute_provider_tool_use(
+                    registry,
+                    hook_bus,
+                    tool_use,
+                    context_factory(),
+                    max_tool_output,
+                )
+                .await,
+            );
         }
         params.messages.push(serde_json::json!({
             "role": "user",
@@ -539,7 +545,8 @@ impl Inbox {
     /// Drains all pending request senders, sending `Err(reason)` to each.
     /// Also marks the inbox as closed so no new requests can be registered.
     async fn fail_all_pending(&self, reason: &str) {
-        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let drained: Vec<_> = {
             let mut pending = self.pending.lock().await;
             pending.drain().collect()
@@ -799,8 +806,8 @@ impl ProcessExtension {
         tokio::io::AsyncReadExt::read_exact(reader, &mut buf)
             .await
             .map_err(|e| format!("Read body error: {}", e))?;
-        let value: Value = serde_json::from_slice(&buf)
-            .map_err(|e| format!("Parse frame error: {}", e))?;
+        let value: Value =
+            serde_json::from_slice(&buf).map_err(|e| format!("Parse frame error: {}", e))?;
         Ok(Some(value))
     }
 
@@ -812,7 +819,10 @@ impl ProcessExtension {
     async fn dispatch_frame(value: Value, inbox: &Arc<Inbox>, extension_id: &str) {
         let id_field = value.get("id");
         let id_is_present = !matches!(id_field, None | Some(Value::Null));
-        let method_field = value.get("method").and_then(Value::as_str).map(str::to_string);
+        let method_field = value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         if id_is_present && method_field.is_some() {
             // Inbound request from the extension. Spawn a task to handle it
@@ -909,10 +919,7 @@ impl ProcessExtension {
                             .to_string();
                         Err(format!("Extension error: {}", message))
                     } else {
-                        Ok(value
-                            .get("result")
-                            .cloned()
-                            .unwrap_or(Value::Null))
+                        Ok(value.get("result").cloned().unwrap_or(Value::Null))
                     };
                     let _ = tx.send(payload);
                 }
@@ -1003,12 +1010,7 @@ impl ProcessExtension {
                         }
                         out
                     }
-                    _ => {
-                        return Err((
-                            -32602,
-                            "tags must be an array of strings".to_string(),
-                        ))
-                    }
+                    _ => return Err((-32602, "tags must be an array of strings".to_string())),
                 };
                 let meta = match params.get("meta") {
                     None | Some(Value::Null) => None,
@@ -1045,7 +1047,8 @@ impl ProcessExtension {
             "config.get" => {
                 let key = Self::param_str(&params, "key")?;
                 Self::validate_config_key(&key)?;
-                let value = crate::extensions::config_store::read_plugin_config(&inbox.extension_id, &key);
+                let value =
+                    crate::extensions::config_store::read_plugin_config(&inbox.extension_id, &key);
                 Ok(serde_json::json!({"value": value}))
             }
             "config.set" => {
@@ -1053,12 +1056,17 @@ impl ProcessExtension {
                 let key = Self::param_str(&params, "key")?;
                 Self::validate_config_key(&key)?;
                 let value = Self::param_str(&params, "value")?;
-                crate::extensions::config_store::write_plugin_config(&inbox.extension_id, &key, &value)
-                    .map_err(|e| (-32000, e.to_string()))?;
+                crate::extensions::config_store::write_plugin_config(
+                    &inbox.extension_id,
+                    &key,
+                    &value,
+                )
+                .map_err(|e| (-32000, e.to_string()))?;
                 Ok(serde_json::json!({"ok": true}))
             }
             "config.subscribe" => {
-                Self::require_permission(inbox, Permission::ConfigSubscribe, "config.subscribe").await?;
+                Self::require_permission(inbox, Permission::ConfigSubscribe, "config.subscribe")
+                    .await?;
                 // The long-lived watcher-to-notification bridge is wired at the manager/UI layer.
                 // This phase exposes the authorized protocol ACK so plugins can opt in without
                 // blocking initialize; direct store watchers are unit-tested in config_store.
@@ -1076,10 +1084,7 @@ impl ProcessExtension {
         let guard = inbox.permissions.read().await;
         match guard.as_ref() {
             Some(set) if set.has(perm) => Ok(()),
-            _ => Err((
-                -32602,
-                format!("permission denied: {wire} required"),
-            )),
+            _ => Err((-32602, format!("permission denied: {wire} required"))),
         }
     }
 
@@ -1122,7 +1127,11 @@ impl ProcessExtension {
         Ok(())
     }
 
-    pub async fn initialize(&self, plugin_root: Option<PathBuf>, config: Value) -> Result<InitializeCapabilitiesResult, String> {
+    pub async fn initialize(
+        &self,
+        plugin_root: Option<PathBuf>,
+        config: Value,
+    ) -> Result<InitializeCapabilitiesResult, String> {
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
@@ -1132,11 +1141,19 @@ impl ProcessExtension {
                 .map(|path| path.to_string_lossy().to_string()),
             config,
         };
-        let value = self.call_no_restart("initialize", serde_json::to_value(params).map_err(|e| e.to_string())?).await?;
+        let value = self
+            .call_no_restart(
+                "initialize",
+                serde_json::to_value(params).map_err(|e| e.to_string())?,
+            )
+            .await?;
         Self::parse_initialize_result(&self.id, value)
     }
 
-    fn parse_initialize_result(id: &str, value: Value) -> Result<InitializeCapabilitiesResult, String> {
+    fn parse_initialize_result(
+        id: &str,
+        value: Value,
+    ) -> Result<InitializeCapabilitiesResult, String> {
         let result: InitializeResult = serde_json::from_value(value)
             .map_err(|e| format!("Invalid initialize response from extension '{}': {}", id, e))?;
         if result.protocol_version != CURRENT_EXTENSION_PROTOCOL_VERSION {
@@ -1154,7 +1171,10 @@ impl ProcessExtension {
         })
     }
 
-    fn validate_registered_tool_specs(id: &str, tools: &[RegisteredExtensionToolSpec]) -> Result<(), String> {
+    fn validate_registered_tool_specs(
+        id: &str,
+        tools: &[RegisteredExtensionToolSpec],
+    ) -> Result<(), String> {
         use crate::extensions::validation::{validate_id_segment, IdValidationError};
         let mut names = HashSet::new();
         for tool in tools {
@@ -1184,7 +1204,10 @@ impl ProcessExtension {
                 });
             }
             if !names.insert(name.to_string()) {
-                return Err(format!("Extension '{}' registered duplicate tool name '{}'", id, name));
+                return Err(format!(
+                    "Extension '{}' registered duplicate tool name '{}'",
+                    id, name
+                ));
             }
             if tool.description.trim().is_empty() {
                 return Err(format!(
@@ -1202,7 +1225,10 @@ impl ProcessExtension {
         Ok(())
     }
 
-    fn validate_registered_provider_specs(id: &str, providers: &[RegisteredProviderSpec]) -> Result<(), String> {
+    fn validate_registered_provider_specs(
+        id: &str,
+        providers: &[RegisteredProviderSpec],
+    ) -> Result<(), String> {
         use crate::extensions::validation::{validate_id_segment, IdValidationError};
         for provider in providers {
             let provider_id = provider.id.trim();
@@ -1295,12 +1321,16 @@ impl ProcessExtension {
     fn is_safe_provider_id(id: &str) -> bool {
         !id.is_empty()
             && !id.contains(':')
-            && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     }
 
     #[doc(hidden)]
     pub async fn initialize_for_test(&self, plugin_root: Option<PathBuf>) -> Result<(), String> {
-        self.initialize(plugin_root, Value::Object(Default::default())).await.map(|_| ())
+        self.initialize(plugin_root, Value::Object(Default::default()))
+            .await
+            .map(|_| ())
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
@@ -1342,15 +1372,20 @@ impl ProcessExtension {
             tokio::time::sleep(delay).await;
         }
 
-        *state = Some(Self::spawn_state(
-            &self.id,
-            &self.command,
-            &self.args,
-            self.cwd.as_ref(),
-            self.inbox.clone(),
-        ).await?);
+        *state = Some(
+            Self::spawn_state(
+                &self.id,
+                &self.command,
+                &self.args,
+                self.cwd.as_ref(),
+                self.inbox.clone(),
+            )
+            .await?,
+        );
         // Reset closed flag now that we have a fresh transport
-        self.inbox.closed.store(false, std::sync::atomic::Ordering::Release);
+        self.inbox
+            .closed
+            .store(false, std::sync::atomic::Ordering::Release);
         self.initialize_locked(state).await?;
         // NOTE: the consecutive-failure counter is NOT reset here. A
         // successful handshake isn't proof of recovery — a crash-looping
@@ -1361,13 +1396,13 @@ impl ProcessExtension {
         Ok(())
     }
 
-
     async fn initialize_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         let params = InitializeParams {
             synaps_version: env!("CARGO_PKG_VERSION"),
             extension_protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
             plugin_id: self.id.clone(),
-            plugin_root: self.cwd
+            plugin_root: self
+                .cwd
                 .clone()
                 .map(|path| path.to_string_lossy().to_string()),
             config: Value::Object(Default::default()),
@@ -1383,8 +1418,7 @@ impl ProcessExtension {
             ),
         )
         .await
-        .map_err(|_| format!("Extension '{}' initialize timed out after 10s", self.id))?
-        ?;
+        .map_err(|_| format!("Extension '{}' initialize timed out after 10s", self.id))??;
         Self::parse_initialize_result(&self.id, value).map(|_| ())
     }
 
@@ -1456,20 +1490,24 @@ impl ProcessExtension {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut state_guard = self.state.lock().await;
         if state_guard.is_none() {
-            *state_guard = Some(Self::spawn_state(
-                &self.id,
-                &self.command,
-                &self.args,
-                self.cwd.as_ref(),
-                self.inbox.clone(),
-            ).await?);
+            *state_guard = Some(
+                Self::spawn_state(
+                    &self.id,
+                    &self.command,
+                    &self.args,
+                    self.cwd.as_ref(),
+                    self.inbox.clone(),
+                )
+                .await?,
+            );
         }
         self.call_once_locked(
             state_guard.as_mut().expect("state should exist"),
             method,
             params,
             id,
-        ).await
+        )
+        .await
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -1502,7 +1540,9 @@ impl ProcessExtension {
 
         let result = self
             .call_once_locked(
-                state_guard.as_mut().expect("state should exist after restart"),
+                state_guard
+                    .as_mut()
+                    .expect("state should exist after restart"),
                 method,
                 params.clone(),
                 id,
@@ -1521,7 +1561,9 @@ impl ProcessExtension {
                 self.restart_locked(&mut state_guard).await?;
                 let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 self.call_once_locked(
-                    state_guard.as_mut().expect("state should exist after restart"),
+                    state_guard
+                        .as_mut()
+                        .expect("state should exist after restart"),
                     method,
                     params,
                     retry_id,
@@ -1532,7 +1574,10 @@ impl ProcessExtension {
                     self.restart_count.store(0, Ordering::Relaxed);
                 })
                 .map_err(|retry_error| {
-                    format!("{}; retry after restart failed: {}", first_error, retry_error)
+                    format!(
+                        "{}; retry after restart failed: {}",
+                        first_error, retry_error
+                    )
                 })
             }
         }
@@ -1600,14 +1645,17 @@ impl ProcessExtension {
         frame: NotificationFrame,
     ) -> bool {
         use crate::extensions::commands::parse_command_output;
-        use crate::extensions::tasks::{is_task_method, parse_task_event};
         use crate::extensions::runtime::InvokeCommandEvent;
+        use crate::extensions::tasks::{is_task_method, parse_task_event};
 
         let mut saw_done = false;
         if frame.method == "command.output" {
             match parse_command_output(&frame.params) {
                 Ok(parsed) if parsed.request_id == request_id => {
-                    if matches!(parsed.event, crate::extensions::commands::CommandOutputEvent::Done) {
+                    if matches!(
+                        parsed.event,
+                        crate::extensions::commands::CommandOutputEvent::Done
+                    ) {
                         saw_done = true;
                     }
                     if *sink_open && sink.send(InvokeCommandEvent::Output(parsed.event)).is_err() {
@@ -1702,23 +1750,40 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call("tool.call", serde_json::json!({
-            "name": name,
-            "input": input,
-        })).await
+        self.call(
+            "tool.call",
+            serde_json::json!({
+                "name": name,
+                "input": input,
+            }),
+        )
+        .await
     }
 
-    async fn provider_complete(&self, params: ProviderCompleteParams) -> Result<ProviderCompleteResult, String> {
+    async fn provider_complete(
+        &self,
+        params: ProviderCompleteParams,
+    ) -> Result<ProviderCompleteResult, String> {
         let value = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            self.call("provider.complete", serde_json::to_value(params).map_err(|e| e.to_string())?),
+            self.call(
+                "provider.complete",
+                serde_json::to_value(params).map_err(|e| e.to_string())?,
+            ),
         )
         .await
         .map_err(|_| format!("Extension '{}' provider.complete timed out", self.id))??;
-        let result: ProviderCompleteResult = serde_json::from_value(value)
-            .map_err(|e| format!("Invalid provider.complete response from extension '{}': {}", self.id, e))?;
+        let result: ProviderCompleteResult = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "Invalid provider.complete response from extension '{}': {}",
+                self.id, e
+            )
+        })?;
         if result.content.is_empty() {
-            return Err(format!("Extension '{}' provider.complete returned empty content", self.id));
+            return Err(format!(
+                "Extension '{}' provider.complete returned empty content",
+                self.id
+            ));
         }
         Ok(result)
     }
@@ -1731,8 +1796,7 @@ impl ExtensionHandler for ProcessExtension {
         // Subscribe BEFORE issuing the request so we don't miss early
         // notifications that may arrive before `call(...)` even starts polling.
         let (sub_id, mut rx) = self.subscribe_notifications().await;
-        let params_value =
-            serde_json::to_value(params).map_err(|e| e.to_string())?;
+        let params_value = serde_json::to_value(params).map_err(|e| e.to_string())?;
 
         let extension_id = self.id.clone();
         let stream_future = async {
@@ -1754,30 +1818,26 @@ impl ExtensionHandler for ProcessExtension {
             // subscribers (if any) are untouched.
             self.unsubscribe_notifications(sub_id).await;
             while let Some(frame) = rx.recv().await {
-                Self::forward_provider_stream_frame(
-                    &extension_id, &sink, &mut sink_open, frame,
-                );
+                Self::forward_provider_stream_frame(&extension_id, &sink, &mut sink_open, frame);
             }
             response
         };
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            stream_future,
-        )
-        .await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), stream_future).await;
 
         // Belt-and-braces: ensure our subscription is cleared on timeout too.
         // Idempotent if the inner future already unsubscribed.
         self.unsubscribe_notifications(sub_id).await;
 
-        let value = outcome
-            .map_err(|_| format!("Extension '{}' provider.stream timed out", self.id))??;
+        let value =
+            outcome.map_err(|_| format!("Extension '{}' provider.stream timed out", self.id))??;
 
-        let result: ProviderCompleteResult = serde_json::from_value(value)
-            .map_err(|e| {
-                format!("Invalid provider.stream response from extension '{}': {}", self.id, e)
-            })?;
+        let result: ProviderCompleteResult = serde_json::from_value(value).map_err(|e| {
+            format!(
+                "Invalid provider.stream response from extension '{}': {}",
+                self.id, e
+            )
+        })?;
         // NOTE: empty `content` is permitted for streaming — output may have
         // been delivered entirely via TextDelta notifications.
         Ok(result)
@@ -1819,29 +1879,34 @@ impl ExtensionHandler for ProcessExtension {
             self.unsubscribe_notifications(sub_id).await;
             while let Ok(frame) = rx.try_recv() {
                 let _ = Self::forward_invoke_command_frame(
-                    &extension_id, &request_id_owned, &sink, &mut sink_open, frame,
+                    &extension_id,
+                    &request_id_owned,
+                    &sink,
+                    &mut sink_open,
+                    frame,
                 );
             }
             response
         };
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            invoke_future,
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(120), invoke_future).await;
 
         // Belt-and-braces: ensure our subscription is cleared on timeout too.
         // Idempotent if the inner future already unsubscribed.
         self.unsubscribe_notifications(sub_id).await;
 
-        outcome
-            .map_err(|_| format!("Extension '{}' command.invoke timed out", self.id))?
+        outcome.map_err(|_| format!("Extension '{}' command.invoke timed out", self.id))?
     }
 
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.call("hook.handle", params)).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.call("hook.handle", params),
+        )
+        .await
+        {
             Ok(Ok(value)) => match serde_json::from_value(value.clone()) {
                 Ok(result) => result,
                 Err(error) => {
@@ -1892,13 +1957,15 @@ impl ExtensionHandler for ProcessExtension {
         )
         .await
         .map_err(|_| format!("Extension '{}' info.get timed out", self.id))??;
-        serde_json::from_value(value)
-            .map_err(|e| format!("Invalid info.get response from extension '{}': {}", self.id, e))
+        serde_json::from_value(value).map_err(|e| {
+            format!(
+                "Invalid info.get response from extension '{}': {}",
+                self.id, e
+            )
+        })
     }
 
-    async fn sidecar_spawn_args(
-        &self,
-    ) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
+    async fn sidecar_spawn_args(&self) -> Result<crate::sidecar::spawn::SidecarSpawnArgs, String> {
         let value = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.call("sidecar.spawn_args", Value::Null),
@@ -1920,16 +1987,27 @@ impl ExtensionHandler for ProcessExtension {
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            self.call("settings.editor.open", serde_json::to_value(params).map_err(|e| e.to_string())?),
+            self.call(
+                "settings.editor.open",
+                serde_json::to_value(params).map_err(|e| e.to_string())?,
+            ),
         )
         .await
         .map_err(|_| format!("Extension '{}' settings.editor.open timed out", self.id))?
     }
 
-    async fn settings_editor_key(&self, category: &str, field: &str, key: &str) -> Result<Value, String> {
-        let mut params = serde_json::to_value(crate::extensions::settings_editor::SettingsEditorKeyParams {
-            key: key.to_string(),
-        }).map_err(|e| e.to_string())?;
+    async fn settings_editor_key(
+        &self,
+        category: &str,
+        field: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        let mut params = serde_json::to_value(
+            crate::extensions::settings_editor::SettingsEditorKeyParams {
+                key: key.to_string(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
         if let Some(obj) = params.as_object_mut() {
             obj.insert("category".to_string(), Value::String(category.to_string()));
             obj.insert("field".to_string(), Value::String(field.to_string()));
@@ -1942,7 +2020,12 @@ impl ExtensionHandler for ProcessExtension {
         .map_err(|_| format!("Extension '{}' settings.editor.key timed out", self.id))?
     }
 
-    async fn settings_editor_commit(&self, category: &str, field: &str, value: Value) -> Result<Value, String> {
+    async fn settings_editor_commit(
+        &self,
+        category: &str,
+        field: &str,
+        value: Value,
+    ) -> Result<Value, String> {
         let params = serde_json::json!({
             "category": category,
             "field": field,
@@ -1977,7 +2060,12 @@ impl ExtensionHandler for ProcessExtension {
             .await;
     }
 
-    async fn subscribe_notifications(&self) -> (usize, tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>) {
+    async fn subscribe_notifications(
+        &self,
+    ) -> (
+        usize,
+        tokio::sync::mpsc::UnboundedReceiver<NotificationFrame>,
+    ) {
         ProcessExtension::subscribe_notifications(self).await
     }
 
@@ -2094,7 +2182,9 @@ mod stream_event_tests {
         let v = json!({"type": "error", "message": "boom"});
         assert_eq!(
             parse_provider_stream_event(&v).unwrap(),
-            ProviderStreamEvent::Error { message: "boom".into() }
+            ProviderStreamEvent::Error {
+                message: "boom".into()
+            }
         );
     }
 
@@ -2306,7 +2396,6 @@ mod capture_validator_tests {
             validate_capability(&d, &perms).expect("should validate");
         }
     }
-
 }
 
 #[cfg(test)]
@@ -2342,10 +2431,7 @@ mod invoke_command_dispatch_tests {
                 "task.start",
                 json!({"id":"dl","label":"Downloading","kind":"download"}),
             ),
-            frame(
-                "task.update",
-                json!({"id":"dl","current":50,"total":100}),
-            ),
+            frame("task.update", json!({"id":"dl","current":50,"total":100})),
             frame(
                 "command.output",
                 json!({"request_id":"r1","event":{"kind":"system","content":"working"}}),
@@ -2359,9 +2445,8 @@ mod invoke_command_dispatch_tests {
 
         let mut saw_done = false;
         for f in frames {
-            saw_done |= ProcessExtension::forward_invoke_command_frame(
-                "ext-test", "r1", &tx, &mut open, f,
-            );
+            saw_done |=
+                ProcessExtension::forward_invoke_command_frame("ext-test", "r1", &tx, &mut open, f);
         }
         drop(tx);
         assert!(saw_done, "should have observed the command Done marker");
@@ -2373,11 +2458,16 @@ mod invoke_command_dispatch_tests {
         assert_eq!(events.len(), 6);
         assert_eq!(
             events[0],
-            InvokeCommandEvent::Output(CommandOutputEvent::Text { content: "A".into() })
+            InvokeCommandEvent::Output(CommandOutputEvent::Text {
+                content: "A".into()
+            })
         );
         assert!(matches!(
             events[1],
-            InvokeCommandEvent::Task(TaskEvent::Start { kind: TaskKind::Download, .. })
+            InvokeCommandEvent::Task(TaskEvent::Start {
+                kind: TaskKind::Download,
+                ..
+            })
         ));
         assert!(matches!(
             events[2],
@@ -2391,7 +2481,10 @@ mod invoke_command_dispatch_tests {
             events[4],
             InvokeCommandEvent::Task(TaskEvent::Done { error: None, .. })
         ));
-        assert_eq!(events[5], InvokeCommandEvent::Output(CommandOutputEvent::Done));
+        assert_eq!(
+            events[5],
+            InvokeCommandEvent::Output(CommandOutputEvent::Done)
+        );
     }
 
     #[test]

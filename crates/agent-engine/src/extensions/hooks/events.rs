@@ -78,7 +78,10 @@ impl HookKind {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
             Self::AfterToolCall => &["continue", "replace"],
             Self::BeforeMessage => &["continue", "inject"],
-            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
+            Self::OnMessageComplete
+            | Self::OnCompaction
+            | Self::OnSessionStart
+            | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -108,7 +111,9 @@ impl HookKind {
     pub fn required_permission(&self) -> Permission {
         match self {
             Self::BeforeToolCall | Self::AfterToolCall => Permission::ToolsIntercept,
-            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => Permission::LlmContent,
+            Self::BeforeMessage | Self::OnMessageComplete | Self::OnCompaction => {
+                Permission::LlmContent
+            }
             Self::OnSessionStart | Self::OnSessionEnd => Permission::SessionLifecycle,
         }
     }
@@ -177,10 +182,14 @@ impl HookEvent {
     }
 
     /// Construct an `after_tool_call` event carrying both input and output.
-    /// Output is truncated to MAX_HOOK_OUTPUT_SIZE to prevent sending
-    /// megabytes of bash output over the JSON-RPC pipe.
+    /// Output is truncated to MAX_HOOK_OUTPUT to bound the JSON-RPC payload
+    /// to extensions. This cap matches the runtime's `max_tool_buffer`
+    /// (the OOM safety net) so transform extensions see the FULL buffered
+    /// tool output and can decide what to keep — the final context-budget
+    /// truncation to `max_tool_output` happens AFTER the hook in
+    /// `emit_after_tool_call` (compress-then-truncate).
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
-        const MAX_HOOK_OUTPUT: usize = 32 * 1024; // 32 KB
+        const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB — matches max_tool_buffer
         let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
             let boundary = output
                 .char_indices()
@@ -251,9 +260,18 @@ impl HookEvent {
             data = Value::Object(Default::default());
         }
         if let Some(object) = data.as_object_mut() {
-            object.insert("old_session_id".to_string(), Value::String(old_session_id.to_string()));
-            object.insert("new_session_id".to_string(), Value::String(new_session_id.to_string()));
-            object.insert("message_count".to_string(), Value::Number(message_count.into()));
+            object.insert(
+                "old_session_id".to_string(),
+                Value::String(old_session_id.to_string()),
+            );
+            object.insert(
+                "new_session_id".to_string(),
+                Value::String(new_session_id.to_string()),
+            );
+            object.insert(
+                "message_count".to_string(),
+                Value::Number(message_count.into()),
+            );
         }
         Self {
             kind: HookKind::OnCompaction,
@@ -374,7 +392,9 @@ mod tests {
     /// after_tool_call advertises "replace" in its action contract.
     #[test]
     fn after_tool_call_allows_replace_output() {
-        let replace = HookResult::Replace { output: "compressed".into() };
+        let replace = HookResult::Replace {
+            output: "compressed".into(),
+        };
 
         // The transform seam: after_tool_call accepts Replace.
         assert!(
@@ -394,7 +414,9 @@ mod tests {
 
         // The extension-facing action contract advertises "replace".
         assert!(
-            HookKind::AfterToolCall.allowed_action_names().contains(&"replace"),
+            HookKind::AfterToolCall
+                .allowed_action_names()
+                .contains(&"replace"),
             "after_tool_call must advertise the 'replace' action"
         );
     }
@@ -491,8 +513,7 @@ mod tests {
     #[test]
     fn hook_event_after_tool_call() {
         let input = json!({"query": "select 1"});
-        let ev =
-            HookEvent::after_tool_call("sql_query", input.clone(), "1 row".to_string());
+        let ev = HookEvent::after_tool_call("sql_query", input.clone(), "1 row".to_string());
 
         assert_eq!(ev.kind, HookKind::AfterToolCall);
         assert_eq!(ev.tool_name.as_deref(), Some("sql_query"));
@@ -609,7 +630,10 @@ mod tests {
             message: "Run this command?".to_string(),
         };
         let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(json, r#"{"action":"confirm","message":"Run this command?"}"#);
+        assert_eq!(
+            json,
+            r#"{"action":"confirm","message":"Run this command?"}"#
+        );
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
@@ -618,12 +642,19 @@ mod tests {
     /// Modify carries replacement input through serialization.
     #[test]
     fn hook_result_modify_serde() {
-        let r = HookResult::Modify { input: json!({"command": "echo safe"}) };
+        let r = HookResult::Modify {
+            input: json!({"command": "echo safe"}),
+        };
         let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(json, r#"{"action":"modify","input":{"command":"echo safe"}}"#);
+        assert_eq!(
+            json,
+            r#"{"action":"modify","input":{"command":"echo safe"}}"#
+        );
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, HookResult::Modify { input } if input == json!({"command": "echo safe"})));
+        assert!(
+            matches!(back, HookResult::Modify { input } if input == json!({"command": "echo safe"}))
+        );
     }
 
     /// Continue serialises as {"action":"continue"}.

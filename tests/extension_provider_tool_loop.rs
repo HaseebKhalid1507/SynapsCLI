@@ -76,6 +76,7 @@ fn test_context() -> ToolContext {
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,
+            max_tool_buffer: 256 * 1024,
             bash_timeout: 1,
             bash_max_timeout: 1,
             subagent_timeout: 1,
