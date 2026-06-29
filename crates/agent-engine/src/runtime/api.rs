@@ -606,6 +606,12 @@ pub struct ApiOptions {
     /// the downgrade notice on healthy Hybrid turns where the 1h prefix is
     /// already cached (1h == 0, 5m > 0). Shared via Arc like the notice latch.
     pub saw_1h_honored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Credential source for provider auth (Local/Remote). Carried here so the
+    /// OpenAI/codex routing path can resolve tokens through the broker on
+    /// Remote, same as the Anthropic path. (#158 C4)
+    pub credential_source: crate::auth::CredentialSource,
+    /// Shared broker token cache (Remote only).
+    pub token_cache: crate::auth::TokenCache,
 }
 
 pub(super) struct ApiMethods;
@@ -651,12 +657,15 @@ impl ApiMethods {
         if let Some(result) = crate::runtime::openai::try_route(
             model, client, &tools_schema, system_prompt, messages, &tx,
             None, None, thinking_budget, cancel,
+            &options.credential_source, &options.token_cache,
         ).await {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
 
         // Read auth state for this API call
-        let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
+        let (mut auth_header_name, mut auth_header_value, auth_type) = Self::build_auth_header(auth).await;
+        // C1: allow a single on-401 token refetch+retry for Remote clients.
+        let mut auth_retried = false;
 
         // Fail early with a clear message if no Anthropic credentials
         if auth_type == "none" {
@@ -798,6 +807,35 @@ impl ApiMethods {
                         if status.is_success() {
                             response = Some(resp);
                             break;
+                        }
+
+                        // C1: a 401 with a Remote source means the broker token
+                        // was rejected (revoked, or rotated at the broker before
+                        // our cache thought it expired). Invalidate, refetch from
+                        // the broker, and retry ONCE with the fresh token.
+                        if status.as_u16() == 401
+                            && options.credential_source.is_remote()
+                            && !auth_retried
+                        {
+                            auth_retried = true;
+                            let _ = resp.text().await; // drain body
+                            options.token_cache.invalidate("anthropic");
+                            {
+                                let mut g = auth.write().await;
+                                g.auth_token.clear();
+                                g.token_expires = None;
+                            }
+                            super::auth::AuthMethods::refresh_if_needed(
+                                std::sync::Arc::clone(auth),
+                                client,
+                                &options.credential_source,
+                                &options.token_cache,
+                            )
+                            .await?;
+                            let (n, v, _t) = Self::build_auth_header(auth).await;
+                            auth_header_name = n;
+                            auth_header_value = v;
+                            continue;
                         }
 
                         let is_429    = status.as_u16() == 429;

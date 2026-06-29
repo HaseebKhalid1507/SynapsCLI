@@ -218,6 +218,70 @@ if the bridge UDS is missing. See
 [`docs/smoke/watcher-bridge.md`](docs/smoke/watcher-bridge.md) for the
 verification playbook.
 
+### Shared credentials via a broker (`auth.*`)
+
+By default each machine reads and refreshes its own `~/.synaps-cli/auth.json`
+(`auth.remote_endpoint` unset). To share ONE OAuth credential across many
+machines without copying it to each disk, run a broker on one trusted host and
+point the others at it. Anthropic **and** OpenAI/codex tokens both route through
+the broker.
+
+```ini
+# on a CLIENT machine — fetch short-lived access tokens from the broker
+auth.remote_endpoint = https://broker-host:8181
+auth.machine_token   = <shared-secret>
+# env overrides (win over config): SYNAPS_AUTH_ENDPOINT / SYNAPS_MACHINE_TOKEN
+```
+
+```bash
+# on the BROKER host — holds the credential, refreshes centrally, serves tokens
+synaps auth-broker --bind 0.0.0.0:8181 --machine-token-file /etc/synaps/broker.token
+#   GET /healthz            -> { status }                  (non-200 if cred missing)
+#   GET /token?provider=X   -> { access_token, expires, ttl_ms }  (Bearer machine token)
+```
+
+A Remote client **never stores the credential**: it holds only short-lived
+access tokens in memory, never a refresh token, and never writes `auth.json`.
+The broker is the single refresher (Anthropic rotates the refresh token on every
+refresh, so exactly one party may refresh).
+
+**Token config (note the three env vars):**
+
+| Role | config key | env var |
+|---|---|---|
+| client → broker URL | `auth.remote_endpoint` | `SYNAPS_AUTH_ENDPOINT` |
+| client → its identity to the broker | `auth.machine_token` | `SYNAPS_MACHINE_TOKEN` |
+| broker → secret it requires of clients | `--machine-token` / `--machine-token-file` | `SYNAPS_BROKER_TOKEN` |
+
+Prefer `--machine-token-file` over `--machine-token` so the secret isn't exposed
+in `argv`/`ps`.
+
+**Security model — read before exposing it:**
+- The broker constant-time-compares the machine token, allowlists providers,
+  rate-limits in-flight requests, and refuses to start unauthenticated on a
+  non-loopback bind (override with `--insecure-no-auth`, don't).
+- **TLS is terminated externally** — the broker speaks plain HTTP to stay a lean
+  single static binary. Run it **behind WireGuard** (private overlay) **or front
+  it with a TLS-terminating reverse proxy / load balancer / service mesh.** A
+  bare non-loopback HTTP bind ships your machine token and access tokens in
+  cleartext — a DNS-spoof/MITM then harvests them. Example with Caddy:
+  ```
+  # Caddyfile — terminates TLS, proxies to the loopback broker
+  broker.internal {
+      reverse_proxy 127.0.0.1:8181
+  }
+  ```
+  Then run `synaps auth-broker --bind 127.0.0.1:8181 ...` and point clients at
+  `https://broker.internal`. (systemd unit: `deploy/synaps-auth-broker.service`.)
+
+> **⚠ Terms of Service.** This is for sharing ONE account's credential across
+> **your own** machines (a personal homelab / your own fleet). Sharing a Claude
+> Pro/Max or ChatGPT **subscription seat** across multiple distinct users — or
+> fanning one seat out across a large machine fleet — likely violates Anthropic's
+> / OpenAI's Terms and risks **account suspension**. At real scale use **org/
+> enterprise API keys**, not subscription-seat OAuth. Check the current ToS
+> before deploying beyond your own boxes.
+
 ---
 
 ## Extensions & Plugins

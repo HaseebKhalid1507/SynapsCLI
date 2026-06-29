@@ -17,6 +17,7 @@ mod token;
 mod storage;
 mod browser;
 mod openai_codex;
+mod credential_source;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
 
@@ -26,6 +27,7 @@ pub use token::{exchange_code_for_tokens, refresh_token, ensure_fresh_token, ens
 pub use storage::{auth_file_path, load_auth, load_provider_auth, save_auth, save_provider_auth};
 pub use browser::open_browser;
 pub use openai_codex::{extract_account_id as extract_codex_account_id, login as login_openai_codex};
+pub use credential_source::{CredentialSource, BrokerToken, BrokerClient, TokenCache, TokenFetcher, resolve_remote, resolve_remote_token, resolve_access_token, is_expired_with_margin, DEFAULT_MARGIN_MS};
 
 // ── Constants (match Claude Code / Pi) ──────────────────────────────────────
 
@@ -70,7 +72,12 @@ pub struct CallbackResult {
     pub state: String,
 }
 
-/// Check if the current token is expired (or will expire within 5 minutes).
+/// Check if the current token is expired.
+///
+/// Note the effective ~5-minute safety margin lives in the stored value, not
+/// here: `refresh_token`/`exchange_code_for_tokens` bake a 5-minute buffer into
+/// `expires` (`now + expires_in*1000 - 5min`). So a bare `now >= expires` check
+/// already fires ~5 minutes before the credential actually dies at the provider.
 pub fn is_token_expired(creds: &OAuthCredentials) -> bool {
     now_millis() >= creds.expires
 }

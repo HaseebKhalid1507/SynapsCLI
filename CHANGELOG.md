@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Shared credentials via a broker (`auth.remote_endpoint` + `synaps auth-broker`).**
+  Many machines share ONE OAuth credential without copying it to each disk — both
+  **Anthropic and OpenAI/codex** tokens route through the broker. On a client, set
+  `auth.remote_endpoint` (+ `auth.machine_token`, or env `SYNAPS_AUTH_ENDPOINT` /
+  `SYNAPS_MACHINE_TOKEN`) and it fetches short-lived access tokens from a broker
+  instead of reading/refreshing the local `auth.json`. Clients hold only access
+  tokens in memory — never a refresh token, never written to disk; the broker is
+  the single refresher. Run the broker with `synaps auth-broker` on a trusted
+  host (`--machine-token-file`, behind WireGuard or a TLS-terminating proxy).
+  Closes the agentic-VM bootstrap: guests authenticate with zero credentials on
+  their own disk.
+  - **Security:** constant-time machine-token compare, provider allowlist,
+    in-flight rate cap, refuses unauthenticated non-loopback start, graceful
+    shutdown, redacting `Debug` on secrets, on-401 refetch+retry, clock-skew
+    defense (`ttl_ms`), token validation, and a `systemd` unit at
+    `deploy/synaps-auth-broker.service`.
+  - **ToS:** intended for sharing one account across YOUR OWN machines. Sharing a
+    subscription seat across users / a large fleet risks account suspension — use
+    org/enterprise API keys at scale. See the README.
+
 ## [0.3.10] — 2026-06-24
 
 ### Added

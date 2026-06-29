@@ -51,6 +51,8 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         None,
         0,
         &tokio_util::sync::CancellationToken::new(),
+        &synaps_cli::auth::CredentialSource::Local,
+        &synaps_cli::auth::TokenCache::new(),
     )
     .await
     .expect("extension route")
