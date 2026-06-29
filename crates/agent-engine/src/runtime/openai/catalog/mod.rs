@@ -294,7 +294,13 @@ async fn read_catalog_response(resp: reqwest::Response) -> Result<String, String
 async fn fetch_anthropic_catalog_models(
     client: &reqwest::Client,
 ) -> Result<Vec<CatalogModel>, String> {
-    let creds = crate::auth::ensure_fresh_token(client)
+    // Honor the credential source so a Remote client lists models via a
+    // broker-issued token instead of refreshing (and rotating) auth.json
+    // client-side — which would lock the broker out. (#158 A4)
+    let config = crate::config::load_config();
+    let source = config.auth.credential_source();
+    let cache = crate::auth::TokenCache::new();
+    let access = crate::auth::resolve_access_token("anthropic", &source, &cache, client)
         .await
         .map_err(|e| format!("Anthropic is not configured: {e}"))?;
     let mut pages = Vec::new();
@@ -303,8 +309,8 @@ async fn fetch_anthropic_catalog_models(
     for _ in 0..ANTHROPIC_MODELS_MAX_PAGES {
         let url = anthropic_models_url(after_id.as_deref());
         let resp = catalog_get(client, &url)
-            .bearer_auth(&creds.access)
-            .header("x-api-key", &creds.access)
+            .bearer_auth(&access)
+            .header("x-api-key", &access)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await

@@ -1,4 +1,5 @@
 pub(crate) mod agent;
+pub(crate) mod auth_broker;
 pub(crate) mod chat;
 pub(crate) mod login;
 pub(crate) mod rpc;

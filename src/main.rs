@@ -116,6 +116,24 @@ enum Command {
     },
     /// Show account usage and reset times
     Status,
+    /// Credential broker — serve short-lived access tokens to client machines
+    /// over HTTP so they can share one OAuth credential without storing it.
+    AuthBroker {
+        /// Address to bind, e.g. `0.0.0.0:8181` or `127.0.0.1:8181`.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        bind: String,
+        /// Token clients must present (`Authorization: Bearer <token>`). Falls
+        /// back to `--machine-token-file`, then `SYNAPS_BROKER_TOKEN`.
+        #[arg(long)]
+        machine_token: Option<String>,
+        /// Read the machine token from a file (avoids exposing it in argv/`ps`).
+        #[arg(long)]
+        machine_token_file: Option<std::path::PathBuf>,
+        /// Allow starting with auth OFF on a non-loopback bind (serves
+        /// credentials unauthenticated to the network — NOT recommended).
+        #[arg(long)]
+        insecure_no_auth: bool,
+    },
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
     Rpc {
         /// Resume an existing session by ID, name, or prefix.
@@ -199,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
         },
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth }) => {
+            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth).await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
