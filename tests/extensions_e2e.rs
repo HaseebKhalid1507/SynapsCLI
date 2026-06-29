@@ -195,6 +195,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
+                    max_tool_buffer: 256 * 1024,
                     bash_timeout: 30,
                     bash_max_timeout: 300,
                     subagent_timeout: 300,
@@ -211,6 +212,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         None,
         input,
         output,
+        256 * 1024,
     ).await;
     // No after_tool_call transform handler registered → output unchanged.
     assert_eq!(after, "modified");
@@ -260,6 +262,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
         None,
         json!({"command": "echo big"}),
         raw,
+        256 * 1024,
     )
     .await;
 
@@ -337,6 +340,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
+                    max_tool_buffer: 256 * 1024,
                     bash_timeout: 30,
                     bash_max_timeout: 300,
                     subagent_timeout: 300,
