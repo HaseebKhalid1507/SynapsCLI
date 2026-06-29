@@ -22,6 +22,9 @@ pub mod keybinds;
 pub mod commands;
 pub mod trust;
 pub mod post_install;
+pub mod writer;
+pub mod sidecar;
+pub mod manage_tool;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -126,6 +129,8 @@ pub async fn register(
     let registry = Arc::new(CommandRegistry::new_with_plugins(BUILTIN_COMMANDS, skills, plugins));
     let tool = LoadSkillTool::new(registry.clone());
     tools.write().await.register(Arc::new(tool));
+    let manage = manage_tool::SkillManageTool::new(registry.clone(), Arc::new(config.clone()));
+    tools.write().await.register(Arc::new(manage));
     (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
 }
 

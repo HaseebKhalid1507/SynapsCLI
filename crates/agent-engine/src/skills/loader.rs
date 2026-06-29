@@ -5,7 +5,7 @@ use crate::skills::LoadedSkill;
 
 /// Parse YAML frontmatter from a markdown file.
 /// Returns (frontmatter_fields, body).
-pub(super) fn parse_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
+pub(crate) fn parse_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
     if !text.starts_with("---") {
         return (vec![], text.to_string());
     }
