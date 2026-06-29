@@ -1,7 +1,7 @@
+use super::{strip_ansi, Tool, ToolContext};
+use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
-use crate::{Result, RuntimeError};
-use super::{Tool, ToolContext, strip_ansi};
 
 pub struct BashTool;
 
@@ -20,10 +20,7 @@ fn sanitize_output(input: &[u8]) -> String {
     stripped
         .chars()
         .filter(|ch| {
-            *ch == '\n'
-                || *ch == '\r'
-                || *ch == '\t'
-                || (!ch.is_control() && *ch != '\u{7f}')
+            *ch == '\n' || *ch == '\r' || *ch == '\t' || (!ch.is_control() && *ch != '\u{7f}')
         })
         .collect()
 }
@@ -77,7 +74,9 @@ pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
 
 #[async_trait::async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &str { "bash" }
+    fn name(&self) -> &str {
+        "bash"
+    }
 
     fn description(&self) -> &str {
         "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model."
@@ -101,11 +100,14 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let command = params["command"].as_str()
+        let command = params["command"]
+            .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let timeout_secs = params["timeout"].as_u64().unwrap_or(ctx.limits.bash_timeout);
-        let max_output = ctx.limits.max_tool_output;
+        let timeout_secs = params["timeout"]
+            .as_u64()
+            .unwrap_or(ctx.limits.bash_timeout);
+        let max_output = ctx.limits.max_tool_buffer;
 
         let script = bash_script_with_secure_sudo(command);
         let mut cmd = tokio::process::Command::new("bash");
@@ -130,14 +132,19 @@ impl Tool for BashTool {
             });
         }
 
-        let mut child = cmd.spawn()
-            .map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        let mut child = cmd.spawn().map_err(|e| RuntimeError::Tool(e.to_string()))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stdout".to_string()))?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stderr".to_string()))?;
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stdin".to_string()))?;
 
         let (tx_inter, mut rx_inter) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
@@ -197,20 +204,28 @@ impl Tool for BashTool {
                     stderr_tail.push_str(&msg);
                     if stderr_tail.len() > 512 {
                         let keep_from = stderr_tail.len() - 512;
-                        if let Some((idx, _)) = stderr_tail.char_indices().find(|(i, _)| *i >= keep_from) {
+                        if let Some((idx, _)) =
+                            stderr_tail.char_indices().find(|(i, _)| *i >= keep_from)
+                        {
                             stderr_tail.drain(..idx);
                         }
                     }
                     if let Some(kind) = detect_password_prompt(&stderr_tail) {
                         let prompt_text = stderr_tail.trim().to_string();
                         let secret = match &ctx.capabilities.secret_prompt {
-                            Some(prompt) => prompt.prompt(
-                                match kind {
-                                    PromptKind::Sudo => "sudo password required".to_string(),
-                                    PromptKind::Password => "password required".to_string(),
-                                },
-                                prompt_text.clone(),
-                            ).await,
+                            Some(prompt) => {
+                                prompt
+                                    .prompt(
+                                        match kind {
+                                            PromptKind::Sudo => {
+                                                "sudo password required".to_string()
+                                            }
+                                            PromptKind::Password => "password required".to_string(),
+                                        },
+                                        prompt_text.clone(),
+                                    )
+                                    .await
+                            }
                             None => None,
                         };
                         match secret {
@@ -229,7 +244,9 @@ impl Tool for BashTool {
                             }
                             None => {
                                 let _ = child.kill().await;
-                                return Err(RuntimeError::Tool("Command canceled while waiting for password".to_string()));
+                                return Err(RuntimeError::Tool(
+                                    "Command canceled while waiting for password".to_string(),
+                                ));
                             }
                         }
                         let prompt_len = prompt_text.len();
@@ -282,13 +299,17 @@ impl Tool for BashTool {
                     let _ = child.kill().await;
                 }
             }
-            let status = child.wait().await.map_err(|e| RuntimeError::Tool(e.to_string()))?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| RuntimeError::Tool(e.to_string()))?;
             // Zeroize redactions (passwords) from memory now that command is done
             for secret in &mut redactions {
                 secret.zeroize();
             }
             Ok::<_, RuntimeError>((status, full_output, truncated))
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok((status, output, was_truncated))) => {
@@ -297,12 +318,19 @@ impl Tool for BashTool {
                 } else {
                     Err(RuntimeError::Tool(format!(
                         "Command failed (exit {}):\n{}",
-                        status.code().unwrap_or(-1), output
+                        status.code().unwrap_or(-1),
+                        output
                     )))
                 }
             }
-            Ok(Err(e)) => Err(RuntimeError::Tool(format!("Failed to execute command: {}", e))),
-            Err(_) => Err(RuntimeError::Tool(format!("Command timed out after {}s", timeout_secs))),
+            Ok(Err(e)) => Err(RuntimeError::Tool(format!(
+                "Failed to execute command: {}",
+                e
+            ))),
+            Err(_) => Err(RuntimeError::Tool(format!(
+                "Command timed out after {}s",
+                timeout_secs
+            ))),
         }
     }
 }
@@ -313,7 +341,10 @@ mod tests {
 
     #[test]
     fn detects_sudo_password_prompt_without_newline() {
-        assert_eq!(detect_password_prompt("[sudo] password for me: "), Some(PromptKind::Sudo));
+        assert_eq!(
+            detect_password_prompt("[sudo] password for me: "),
+            Some(PromptKind::Sudo)
+        );
     }
 
     #[test]
@@ -387,7 +418,10 @@ mod tests {
         });
 
         let result = tool.execute(params, ctx).await;
-        assert!(result.is_ok(), "requested timeout should not be clamped by bash_max_timeout: {result:?}");
+        assert!(
+            result.is_ok(),
+            "requested timeout should not be clamped by bash_max_timeout: {result:?}"
+        );
         assert!(result.unwrap().contains("done"));
     }
 
@@ -399,8 +433,15 @@ mod tests {
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let responder = tokio::spawn(async move {
-            let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
-            assert!(req.prompt.to_ascii_lowercase().contains("password"), "prompt was {:?}", req.prompt);
+            let req = prompt_rx
+                .recv()
+                .await
+                .expect("bash should request a secret prompt");
+            assert!(
+                req.prompt.to_ascii_lowercase().contains("password"),
+                "prompt was {:?}",
+                req.prompt
+            );
             req.response_tx.send(Some("swordfish".to_string())).unwrap();
         });
 
@@ -442,9 +483,18 @@ mod tests {
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let responder = tokio::spawn(async move {
-            let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
-            assert!(req.prompt.contains("[sudo] password required"), "prompt was {:?}", req.prompt);
-            req.response_tx.send(Some("wrong-password-for-test".to_string())).unwrap();
+            let req = prompt_rx
+                .recv()
+                .await
+                .expect("bash should request a secret prompt");
+            assert!(
+                req.prompt.contains("[sudo] password required"),
+                "prompt was {:?}",
+                req.prompt
+            );
+            req.response_tx
+                .send(Some("wrong-password-for-test".to_string()))
+                .unwrap();
         });
 
         let mut ctx = create_tool_context();
@@ -462,7 +512,10 @@ mod tests {
             streamed.push_str(&delta);
         }
 
-        assert!(!streamed.contains("[sudo] password required"), "sudo password prompt leaked into deltas: {streamed:?}");
+        assert!(
+            !streamed.contains("[sudo] password required"),
+            "sudo password prompt leaked into deltas: {streamed:?}"
+        );
     }
 
     #[tokio::test]
@@ -471,7 +524,7 @@ mod tests {
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = create_tool_context();
         ctx.channels.tx_delta = Some(delta_tx);
-        ctx.limits.max_tool_output = 256;
+        ctx.limits.max_tool_buffer = 256;
 
         let params = json!({
             "command": "python3 -c \"import sys; sys.stdout.buffer.write(b'clean\\x1b[2J\\x00' + b'A' * 2000); sys.stdout.flush()\"",
@@ -489,7 +542,11 @@ mod tests {
         assert!(!result.contains('\0'));
         assert!(!streamed.contains('\u{1b}'));
         assert!(!streamed.contains('\0'));
-        assert!(streamed.len() <= 2048, "streamed deltas must be bounded, got {} bytes", streamed.len());
+        assert!(
+            streamed.len() <= 2048,
+            "streamed deltas must be bounded, got {} bytes",
+            streamed.len()
+        );
     }
 
     #[tokio::test]
@@ -499,7 +556,10 @@ mod tests {
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
 
         let responder = tokio::spawn(async move {
-            let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+            let req = prompt_rx
+                .recv()
+                .await
+                .expect("bash should request a secret prompt");
             req.response_tx.send(Some("swordfish".to_string())).unwrap();
         });
 
@@ -525,7 +585,10 @@ mod tests {
 
         let responder = tokio::spawn(async move {
             for value in ["first", "second"] {
-                let req = prompt_rx.recv().await.expect("bash should request each secret prompt");
+                let req = prompt_rx
+                    .recv()
+                    .await
+                    .expect("bash should request each secret prompt");
                 assert!(req.prompt.to_ascii_lowercase().contains("password"));
                 req.response_tx.send(Some(value.to_string())).unwrap();
             }
@@ -553,7 +616,10 @@ mod tests {
         let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
 
         let responder = tokio::spawn(async move {
-            let req = prompt_rx.recv().await.expect("bash should request a secret prompt");
+            let req = prompt_rx
+                .recv()
+                .await
+                .expect("bash should request a secret prompt");
             req.response_tx.send(None).unwrap();
         });
 

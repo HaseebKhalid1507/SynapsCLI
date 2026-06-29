@@ -1,8 +1,8 @@
-use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use super::types::{StreamEvent, AgentEvent};
+use super::types::{AgentEvent, StreamEvent};
 use crate::core::config::CacheTtl;
 use crate::truncate_str;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 /// Where a cache_control marker sits in the request body.
 /// The API's logical emission order is tools → system → messages, so
@@ -41,7 +41,7 @@ pub(super) fn cache_control_value(ttl: CacheTtl, site: MarkerSite) -> Value {
     }
 }
 
-pub(super) struct HelperMethods;
+pub(crate) struct HelperMethods;
 
 impl HelperMethods {
     /// Drain all pending steering messages from the channel and inject them
@@ -59,7 +59,9 @@ impl HelperMethods {
         let mut injected = false;
         while let Ok(msg) = rx.try_recv() {
             tracing::info!("Steering message injected: {}", truncate_str(&msg, 80));
-            let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered { message: msg.clone() }));
+            let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered {
+                message: msg.clone(),
+            }));
             messages.push(json!({"role": "user", "content": msg}));
             injected = true;
         }
@@ -120,22 +122,20 @@ impl HelperMethods {
         for mut msg in original {
             if msg["role"].as_str() == Some("assistant") {
                 if let Some(content) = msg["content"].as_array_mut() {
-                    content.retain(|block| {
-                        match block["type"].as_str() {
-                            Some("thinking") => block["thinking"]
-                                .as_str()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false),
-                            Some("redacted_thinking") => block["data"]
-                                .as_str()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false),
-                            Some("text") => block["text"]
-                                .as_str()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false),
-                            _ => true,
-                        }
+                    content.retain(|block| match block["type"].as_str() {
+                        Some("thinking") => block["thinking"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false),
+                        Some("redacted_thinking") => block["data"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false),
+                        Some("text") => block["text"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false),
+                        _ => true,
                     });
                     if content.is_empty() {
                         // No salvageable content. The API rejects empty content
@@ -185,7 +185,9 @@ impl HelperMethods {
     /// The marker is the message-tail site: bare 5m under both `FiveMinutes`
     /// and `Hybrid`, `"ttl":"1h"` only under uniform `OneHour`.
     pub(super) fn annotate_cache_breakpoint(messages: &mut [Value], ttl: CacheTtl) {
-        let Some(last) = messages.last_mut() else { return };
+        let Some(last) = messages.last_mut() else {
+            return;
+        };
 
         // Coerce raw string content into a block array so we can attach cache_control.
         if let Some(text) = last["content"].as_str().map(str::to_owned) {
@@ -247,13 +249,17 @@ impl HelperMethods {
     /// Truncate tool results to avoid ballooning message history.
     /// The full result is still sent to the UI — this only caps what goes into
     /// the API messages that are re-sent on every subsequent call.
-    pub(super) fn truncate_tool_result(result: &str, max_chars: usize) -> String {
+    pub(crate) fn truncate_tool_result(result: &str, max_chars: usize) -> String {
         if result.len() <= max_chars {
             return result.to_string();
         }
         let truncated: String = result.chars().take(max_chars).collect();
-        format!("{}\n\n[truncated — {} total chars, showing first {}]",
-            truncated, result.len(), max_chars)
+        format!(
+            "{}\n\n[truncated — {} total chars, showing first {}]",
+            truncated,
+            result.len(),
+            max_chars
+        )
     }
 
     /// Returns the max output tokens for a given model.
@@ -300,7 +306,11 @@ impl HelperMethods {
         }
 
         let total = input_t + cache_read + cache_create;
-        let pct = if total > 0 { (cache_read as f64 / total as f64 * 100.0) as u32 } else { 0 };
+        let pct = if total > 0 {
+            (cache_read as f64 / total as f64 * 100.0) as u32
+        } else {
+            0
+        };
 
         use std::os::unix::fs::OpenOptionsExt;
         // O_NOFOLLOW: refuse to open if the target is a symlink. Defensive
@@ -333,20 +343,18 @@ impl HelperMethods {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::core::config::CacheTtl;
+    use serde_json::json;
 
     #[test]
     fn sanitize_drops_empty_thinking_blocks() {
-        let mut msgs = vec![
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "", "signature": "sig1"},
-                    {"type": "text", "text": "hello"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig1"},
+                {"type": "text", "text": "hello"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -355,30 +363,26 @@ mod tests {
 
     #[test]
     fn sanitize_keeps_non_empty_thinking_blocks() {
-        let mut msgs = vec![
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "reasoning here", "signature": "sig1"},
-                    {"type": "text", "text": "hello"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "reasoning here", "signature": "sig1"},
+                {"type": "text", "text": "hello"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn sanitize_drops_thinking_with_missing_field() {
-        let mut msgs = vec![
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "signature": "sig1"},
-                    {"type": "text", "text": "hello"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "signature": "sig1"},
+                {"type": "text", "text": "hello"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -411,15 +415,13 @@ mod tests {
 
     #[test]
     fn sanitize_drops_empty_text_blocks() {
-        let mut msgs = vec![
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": ""},
-                    {"type": "text", "text": "real content"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "real content"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -454,14 +456,12 @@ mod tests {
 
     #[test]
     fn sanitize_skips_user_messages() {
-        let mut msgs = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "thinking", "thinking": "", "signature": "sig1"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig1"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         // We only police assistant messages — user messages would be malformed for
         // a different reason and aren't ours to rewrite.
@@ -470,15 +470,13 @@ mod tests {
 
     #[test]
     fn sanitize_drops_redacted_thinking_with_empty_data() {
-        let mut msgs = vec![
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "redacted_thinking", "data": ""},
-                    {"type": "text", "text": "hi"},
-                ]
-            }),
-        ];
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": ""},
+                {"type": "text", "text": "hi"},
+            ]
+        })];
         HelperMethods::sanitize_thinking_blocks(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
@@ -505,7 +503,9 @@ mod tests {
     fn cache_single_user_string_content_coerced_and_marked() {
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
         HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
-        let content = msgs[0]["content"].as_array().expect("coerced to block array");
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("coerced to block array");
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "hello");
@@ -523,7 +523,10 @@ mod tests {
         ];
         HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
         for msg in &msgs[..4] {
-            assert!(!has_marker(msg), "earlier message must not have cache_control");
+            assert!(
+                !has_marker(msg),
+                "earlier message must not have cache_control"
+            );
         }
         assert!(has_marker(&msgs[4]));
         // Earlier string contents must remain untouched strings.
@@ -598,11 +601,19 @@ mod tests {
     #[test]
     fn ccv_hybrid_splits_by_site() {
         assert_eq!(
-            serde_json::to_string(&cache_control_value(CacheTtl::Hybrid, MarkerSite::StablePrefix)).unwrap(),
+            serde_json::to_string(&cache_control_value(
+                CacheTtl::Hybrid,
+                MarkerSite::StablePrefix
+            ))
+            .unwrap(),
             r#"{"ttl":"1h","type":"ephemeral"}"#,
         );
         assert_eq!(
-            serde_json::to_string(&cache_control_value(CacheTtl::Hybrid, MarkerSite::MessageTail)).unwrap(),
+            serde_json::to_string(&cache_control_value(
+                CacheTtl::Hybrid,
+                MarkerSite::MessageTail
+            ))
+            .unwrap(),
             r#"{"type":"ephemeral"}"#,
         );
     }
@@ -615,7 +626,10 @@ mod tests {
         HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
         let cc = &msgs[0]["content"][0]["cache_control"];
         assert_eq!(cc["type"], "ephemeral");
-        assert!(cc.get("ttl").is_none(), "5m must not emit a ttl key (assert absence)");
+        assert!(
+            cc.get("ttl").is_none(),
+            "5m must not emit a ttl key (assert absence)"
+        );
         assert_eq!(cc.as_object().unwrap().len(), 1, "exactly one key: type");
     }
 
@@ -650,10 +664,19 @@ mod tests {
                 ]}),
             ];
             HelperMethods::annotate_cache_breakpoint(&mut msgs, ttl);
-            assert!(!has_marker(&msgs[0]), "earlier message unmarked under {ttl:?}");
-            assert!(msgs[0]["content"].is_string(), "earlier string content untouched");
+            assert!(
+                !has_marker(&msgs[0]),
+                "earlier message unmarked under {ttl:?}"
+            );
+            assert!(
+                msgs[0]["content"].is_string(),
+                "earlier string content untouched"
+            );
             let content = msgs[1]["content"].as_array().unwrap();
-            assert!(content[0].get("cache_control").is_none(), "only final block marked");
+            assert!(
+                content[0].get("cache_control").is_none(),
+                "only final block marked"
+            );
             assert!(content[1].get("cache_control").is_some());
         }
     }
@@ -683,7 +706,10 @@ mod tests {
         for ttl in [CacheTtl::OneHour, CacheTtl::Hybrid] {
             let mut body = tools_body();
             HelperMethods::mark_last_tool(&mut body, ttl);
-            assert_eq!(body["tools"][1]["cache_control"]["ttl"], "1h", "under {ttl:?}");
+            assert_eq!(
+                body["tools"][1]["cache_control"]["ttl"], "1h",
+                "under {ttl:?}"
+            );
         }
     }
 
@@ -719,7 +745,8 @@ mod tests {
 
     #[test]
     fn system_blocks_oauth_5m_marker_exact_bytes() {
-        let system = HelperMethods::build_system_blocks("oauth", &None, CacheTtl::FiveMinutes).unwrap();
+        let system =
+            HelperMethods::build_system_blocks("oauth", &None, CacheTtl::FiveMinutes).unwrap();
         let last = system.as_array().unwrap().last().unwrap().clone();
         assert_eq!(
             serde_json::to_string(&last["cache_control"]).unwrap(),
@@ -790,7 +817,11 @@ mod tests {
             }
         }
 
-        assert_eq!(markers, vec!["1h", "1h", "5m"], "tool 1h, system 1h, tail 5m");
+        assert_eq!(
+            markers,
+            vec!["1h", "1h", "5m"],
+            "tool 1h, system 1h, tail 5m"
+        );
         // Ordering rule: once a 5m marker appears, no 1h marker may follow.
         let first_5m = markers.iter().position(|m| *m == "5m").unwrap();
         assert!(
@@ -814,7 +845,10 @@ mod tests {
             let system = HelperMethods::build_system_blocks(auth, &prompt, ttl).unwrap();
             for block in system.as_array().unwrap() {
                 if let Some(cc) = block.get("cache_control") {
-                    assert_eq!(serde_json::to_string(cc).unwrap(), r#"{"type":"ephemeral"}"#);
+                    assert_eq!(
+                        serde_json::to_string(cc).unwrap(),
+                        r#"{"type":"ephemeral"}"#
+                    );
                 }
             }
         }
