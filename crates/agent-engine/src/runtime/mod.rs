@@ -117,15 +117,38 @@ pub async fn resolve_before_tool_call_decision(
     }
 }
 
-/// Emit an `after_tool_call` event and include the runtime tool name when it
-/// differs from the API-safe name.
+/// Maximum size (bytes) of a `Replace` output an extension may substitute.
+/// A transform returning more than this is clamped (with a warning) to bound
+/// memory between deserialization and the downstream tool-output truncation.
+/// Generous on purpose — legitimate compression/redaction shrinks output.
+const MAX_REPLACE_OUTPUT: usize = 1024 * 1024; // 1 MiB
+
+/// Emit an `after_tool_call` event and return the tool output to record in
+/// history — either the original `output`, or a `Replace { output }`
+/// substituted by an extension transform hook (compression, redaction,
+/// summarization). The runtime tool name is included when it differs from the
+/// API-safe name.
+///
+/// Fail-safe: any non-`Replace` result — `Continue`, a result rejected by the
+/// permission matrix, a crashed/timed-out handler, or any future variant —
+/// returns the original `output` unchanged. A misbehaving extension can never
+/// drop or corrupt a tool's output.
+///
+/// Note: the event delivered to the extension carries `tool_output` as a
+/// size-limited preview for large outputs — a ~32 KB prefix plus a
+/// `…[truncated, N total bytes]` marker (see [`HookEvent::after_tool_call`]),
+/// so the delivered string can slightly exceed 32 KB. A transform therefore
+/// decides based on a preview, not the full bytes.
 pub async fn emit_after_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
     output: String,
-) -> crate::extensions::hooks::events::HookResult {
+) -> String {
+    use crate::extensions::hooks::events::HookResult;
+    // Keep the original to return verbatim if no transform fires.
+    let original = output.clone();
     let mut event = crate::extensions::hooks::events::HookEvent::after_tool_call(
         tool_name,
         input,
@@ -134,7 +157,34 @@ pub async fn emit_after_tool_call(
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
-    hook_bus.emit(&event).await
+    match hook_bus.emit(&event).await {
+        HookResult::Replace { mut output } => {
+            if output.len() > MAX_REPLACE_OUTPUT {
+                tracing::warn!(
+                    tool = %tool_name,
+                    len = output.len(),
+                    cap = MAX_REPLACE_OUTPUT,
+                    "Extension Replace output exceeds cap — clamping",
+                );
+                // Floor to a UTF-8 char boundary before truncating.
+                let mut boundary = MAX_REPLACE_OUTPUT;
+                while boundary > 0 && !output.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                output.truncate(boundary);
+            }
+            output
+        }
+        HookResult::Continue => original,
+        other => {
+            tracing::warn!(
+                tool = %tool_name,
+                ?other,
+                "Unexpected after_tool_call result — using original output",
+            );
+            original
+        }
+    }
 }
 
 /// The core runtime — manages API communication, tool execution, authentication,
@@ -612,12 +662,12 @@ impl Runtime {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
                                     };
-                                    let _ = emit_after_tool_call(
+                                    let output = emit_after_tool_call(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
-                                        output.clone(),
+                                        output,
                                     ).await;
                                     output
                                 }
@@ -706,12 +756,12 @@ impl Runtime {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        let _ = crate::runtime::emit_after_tool_call(
+                                        let output = crate::runtime::emit_after_tool_call(
                                             &hook_bus_inner,
                                             &tool_name_for_hook,
                                             Some(&runtime_name_for_hook),
                                             input_for_hook,
-                                            output.clone(),
+                                            output,
                                         ).await;
                                         output
                                         }

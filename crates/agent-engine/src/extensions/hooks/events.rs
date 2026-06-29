@@ -76,7 +76,7 @@ impl HookKind {
     pub fn allowed_action_names(&self) -> &'static [&'static str] {
         match self {
             Self::BeforeToolCall => &["continue", "block", "confirm", "modify"],
-            Self::AfterToolCall => &["continue"],
+            Self::AfterToolCall => &["continue", "replace"],
             Self::BeforeMessage => &["continue", "inject"],
             Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionStart | Self::OnSessionEnd => &["continue"],
         }
@@ -95,6 +95,7 @@ impl HookKind {
                 | (Self::BeforeToolCall, HookResult::Block { .. })
                 | (Self::BeforeToolCall, HookResult::Confirm { .. })
                 | (Self::BeforeToolCall, HookResult::Modify { .. })
+                | (Self::AfterToolCall, HookResult::Replace { .. })
                 | (Self::BeforeMessage, HookResult::Inject { .. })
         )
     }
@@ -306,7 +307,7 @@ impl HookEvent {
 /// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HookResult {
     /// Allow execution to proceed unchanged.
@@ -320,8 +321,17 @@ pub enum HookResult {
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
     Confirm { message: String },
-    /// Replace the tool input before execution. Only valid on before_tool_call hooks.
+    /// Replace the tool **input** before execution (structured JSON args).
+    /// Only valid on before_tool_call hooks. The output-side counterpart is
+    /// [`HookResult::Replace`]. The first modifier stops the handler chain.
     Modify { input: Value },
+    /// Replace the tool **output** after execution (flat string), before it
+    /// enters history. Only valid on after_tool_call hooks. The input-side
+    /// counterpart is [`HookResult::Modify`] — distinct name because the payload
+    /// is an unstructured `String`, not structured `Value`. Enables native
+    /// output transforms (compression, redaction, summarization) by extensions.
+    /// The first transform stops the handler chain.
+    Replace { output: String },
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -339,7 +349,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The extension wire format `{"action":"replace","output":"..."}`
+    /// deserializes to HookResult::Replace via the serde action tag — and
+    /// round-trips back. This locks the contract a transform extension speaks.
+    #[test]
+    fn replace_action_roundtrips_extension_wire_format() {
+        // Inbound: what a process extension sends on hook.handle.
+        let wire = json!({"action": "replace", "output": "compressed"});
+        let parsed: HookResult = serde_json::from_value(wire).expect("must deserialize");
+        match parsed {
+            HookResult::Replace { output } => assert_eq!(output, "compressed"),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+
+        // Outbound: the action tag is exactly "replace".
+        let out = serde_json::to_value(HookResult::Replace { output: "x".into() }).unwrap();
+        assert_eq!(out["action"], "replace");
+        assert_eq!(out["output"], "x");
+    }
+
     // ── HookKind ──────────────────────────────────────────────────────────────
+
+    /// after_tool_call may return Replace; other hooks may not, and
+    /// after_tool_call advertises "replace" in its action contract.
+    #[test]
+    fn after_tool_call_allows_replace_output() {
+        let replace = HookResult::Replace { output: "compressed".into() };
+
+        // The transform seam: after_tool_call accepts Replace.
+        assert!(
+            HookKind::AfterToolCall.allows_result(&replace),
+            "after_tool_call must permit Replace to enable output transforms"
+        );
+
+        // Replace is scoped strictly to after_tool_call.
+        assert!(
+            !HookKind::BeforeToolCall.allows_result(&replace),
+            "before_tool_call must not permit Replace (input-only)"
+        );
+        assert!(
+            !HookKind::BeforeMessage.allows_result(&replace),
+            "before_message must not permit Replace"
+        );
+
+        // The extension-facing action contract advertises "replace".
+        assert!(
+            HookKind::AfterToolCall.allowed_action_names().contains(&"replace"),
+            "after_tool_call must advertise the 'replace' action"
+        );
+    }
 
     /// Every variant's as_str round-trips through from_str.
     #[test]

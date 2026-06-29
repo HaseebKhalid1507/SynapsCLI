@@ -265,12 +265,12 @@ pub async fn execute_provider_tool_use(
         Ok(output) => (output, false),
         Err(error) => (format!("Tool execution failed: {}", error), true),
     };
-    let _ = crate::runtime::emit_after_tool_call(
+    let result = crate::runtime::emit_after_tool_call(
         hook_bus,
         &tool_name,
         Some(&runtime_name),
         input_for_hook,
-        result.clone(),
+        result,
     ).await;
 
     let mut response = serde_json::json!({
@@ -1851,12 +1851,18 @@ impl ExtensionHandler for ProcessExtension {
                         response = %value,
                         "Extension hook handler returned invalid result",
                     );
-                    if value.get("action").and_then(Value::as_str) == Some("modify") {
-                        HookResult::Block {
+                    match value.get("action").and_then(Value::as_str) {
+                        // A malformed `modify` is dangerous — it would let an
+                        // unknown/partial input through. Fail safe by blocking.
+                        Some("modify") => HookResult::Block {
                             reason: "Extension returned malformed modify result".to_string(),
-                        }
-                    } else {
-                        HookResult::Continue
+                        },
+                        // A malformed `replace` is safe to ignore: the original
+                        // tool output is preserved by emit_after_tool_call.
+                        // Explicit arm so this intent can't be silently changed
+                        // by a future edit to the catch-all below.
+                        Some("replace") => HookResult::Continue,
+                        _ => HookResult::Continue,
                     }
                 }
             },

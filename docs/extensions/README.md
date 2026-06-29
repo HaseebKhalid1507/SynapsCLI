@@ -16,6 +16,7 @@ Extensions can:
 - **Block** — prevent a `before_tool_call` event from proceeding
 - **Confirm** — ask for explicit user approval before a tool call proceeds
 - **Modify** — replace `before_tool_call` input before execution
+- **Replace** — rewrite `after_tool_call` output before it enters history (compression, redaction, summarization; requires `tools.transform_output`)
 - **Inject** — prepend context into the system prompt before a request reaches the LLM
 
 Future protocol phases reserve names for tool/provider registration, but phase 1 does not grant those capabilities yet.
@@ -103,8 +104,9 @@ The `extension` field is what distinguishes a plugin that provides an extension 
 - `before_tool_call` supports `block`; if any extension blocks, the tool is not executed and later handlers are skipped.
 - `before_tool_call` also supports `confirm`, which requests explicit user approval before proceeding. Interactive TUI streams prompt the user; headless/non-interactive call sites fail closed by blocking the tool call.
 - `before_tool_call` supports `modify`, which replaces the tool input before execution. Trace logs record that modification occurred without logging the modified input.
+- `after_tool_call` supports `replace`, which rewrites the tool **output** before it enters history (compression, redaction, summarization). It requires `tools.transform_output` *in addition to* `tools.intercept`; the first `replace` wins and stops the chain. A `replace` from an extension lacking the permission, or a malformed/crashed handler, is ignored and the original output is preserved.
 - `before_message` supports `inject`; injected content from matching extensions is accumulated.
-- Other hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
+- The remaining hooks are observation-oriented today. Returning an unsupported action is ignored by the current call site.
 
 ---
 
@@ -156,7 +158,8 @@ Extensions must declare the permissions they require. SynapsCLI rejects unknown 
 
 | Permission           | What it grants                                                                 |
 |----------------------|--------------------------------------------------------------------------------|
-| `tools.intercept`    | Ability to receive `before_tool_call` / `after_tool_call` events               |
+| `tools.intercept`    | Subscribe to `before_tool_call` / `after_tool_call` (observe, block, confirm, modify input) |
+| `tools.transform_output` | Rewrite tool output via `after_tool_call` → `replace` (required in addition to `tools.intercept`) |
 | `privacy.llm_content`| Access to message content for `before_message`                                 |
 | `session.lifecycle`  | Receipt of `on_session_start` and `on_session_end` events                      |
 | `tools.register`    | Register extension-provided tools during initialization                         |

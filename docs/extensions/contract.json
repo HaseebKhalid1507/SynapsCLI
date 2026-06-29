@@ -19,7 +19,8 @@
       "permission": "tools.intercept",
       "tool_filter": true,
       "actions": [
-        "continue"
+        "continue",
+        "replace"
       ]
     },
     "before_message": {
@@ -61,6 +62,7 @@
   },
   "permissions": [
     "tools.intercept",
+    "tools.transform_output",
     "privacy.llm_content",
     "session.lifecycle",
     "tools.register",
