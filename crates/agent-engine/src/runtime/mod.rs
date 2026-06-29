@@ -119,22 +119,30 @@ pub async fn resolve_before_tool_call_decision(
 
 /// Emit an `after_tool_call` event and include the runtime tool name when it
 /// differs from the API-safe name.
+/// Emit an `after_tool_call` event and return the tool output to record in
+/// history — either the original `output`, or a `Replace { output }`
+/// substituted by an extension transform hook (compression, redaction,
+/// summarization). The runtime tool name is included when it differs from the
+/// API-safe name.
 pub async fn emit_after_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
     runtime_tool_name: Option<&str>,
     input: Value,
     output: String,
-) -> crate::extensions::hooks::events::HookResult {
+) -> String {
     let mut event = crate::extensions::hooks::events::HookEvent::after_tool_call(
         tool_name,
         input,
-        output,
+        output.clone(),
     );
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
-    hook_bus.emit(&event).await
+    match hook_bus.emit(&event).await {
+        crate::extensions::hooks::events::HookResult::Replace { output } => output,
+        _ => output,
+    }
 }
 
 /// The core runtime — manages API communication, tool execution, authentication,
@@ -612,12 +620,12 @@ impl Runtime {
                                         Ok(output) => output,
                                         Err(e) => format!("Tool execution failed: {}", e),
                                     };
-                                    let _ = emit_after_tool_call(
+                                    let output = emit_after_tool_call(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
-                                        output.clone(),
+                                        output,
                                     ).await;
                                     output
                                 }
@@ -706,12 +714,12 @@ impl Runtime {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        let _ = crate::runtime::emit_after_tool_call(
+                                        let output = crate::runtime::emit_after_tool_call(
                                             &hook_bus_inner,
                                             &tool_name_for_hook,
                                             Some(&runtime_name_for_hook),
                                             input_for_hook,
-                                            output.clone(),
+                                            output,
                                         ).await;
                                         output
                                         }

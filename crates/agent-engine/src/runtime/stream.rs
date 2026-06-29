@@ -307,12 +307,12 @@ impl StreamMethods {
                                             Ok(output) => output,
                                             Err(e) => format!("Tool execution failed: {}", e),
                                         };
-                                        let _ = emit_after_tool_call(
+                                        let output = emit_after_tool_call(
                                             &hook_bus,
                                             &tool_name,
                                             Some(&runtime_name),
                                             input_for_hook,
-                                            output.clone(),
+                                            output,
                                         ).await;
                                         output
                                     }
@@ -422,12 +422,12 @@ impl StreamMethods {
                                                 Ok(output) => output,
                                                 Err(e) => format!("Tool execution failed: {}", e),
                                             };
-                                            let _ = emit_after_tool_call(
+                                            let output = emit_after_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
                                                 input_for_hook,
-                                                output.clone(),
+                                                output,
                                             ).await;
                                             (false, output)
                                         }

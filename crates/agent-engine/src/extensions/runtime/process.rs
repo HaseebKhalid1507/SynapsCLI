@@ -265,12 +265,12 @@ pub async fn execute_provider_tool_use(
         Ok(output) => (output, false),
         Err(error) => (format!("Tool execution failed: {}", error), true),
     };
-    let _ = crate::runtime::emit_after_tool_call(
+    let result = crate::runtime::emit_after_tool_call(
         hook_bus,
         &tool_name,
         Some(&runtime_name),
         input_for_hook,
-        result.clone(),
+        result,
     ).await;
 
     let mut response = serde_json::json!({
