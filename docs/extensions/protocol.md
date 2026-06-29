@@ -314,7 +314,7 @@ The `params` field of a `hook.handle` request is a `HookEvent` object.
 | `tool_name`         | string \| null  | `before_tool_call`, `after_tool_call`         | API-safe name of the tool being called                           |
 | `tool_runtime_name` | string \| null  | `before_tool_call`, `after_tool_call`         | Original runtime tool name (before API sanitization)             |
 | `tool_input`        | object \| null  | `before_tool_call`, `after_tool_call`         | The raw input arguments passed to the tool                       |
-| `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (truncated at 32 KB)             |
+| `tool_output`       | string \| null  | `after_tool_call`                             | The result returned by the tool (size-limited preview: ~32 KB prefix + marker) |
 | `message`           | string \| null  | `before_message`, `on_message_complete`, `on_compaction` | User/assistant/summary message content for message hooks         |
 | `session_id`        | string \| null  | `on_compaction`, `on_session_start`, `on_session_end` | Stable identifier for the current or newly-created session       |
 | `transcript`        | array \| null   | `on_session_end`                              | Conversation transcript delivered at session end                 |
@@ -434,6 +434,34 @@ Replace the tool input before execution. Only valid on `before_tool_call`; on ot
 | Field   | Type   | Required | Description                       |
 |---------|--------|----------|-----------------------------------|
 | `input` | object | yes      | Replacement tool input JSON value |
+
+### `replace`
+
+Rewrite the tool **output** after execution, before it enters conversation
+history (compression, redaction, summarization). Only valid on `after_tool_call`;
+on other hooks it is treated as `continue` and logged as an unsupported action.
+The first `replace` stops the handler chain. Trace logs record `action=replace`
+and the observed/replacement lengths, but never the content.
+
+Requires the **`tools.transform_output`** permission *in addition to*
+`tools.intercept`. A `replace` from an extension lacking it is ignored and the
+original output is preserved (fail-safe). Each replacement is recorded to
+`extensions/intercept.jsonl` (metadata only: plugin id, tool, sizes — never
+content). Replacement output is clamped at 1 MiB.
+
+> The `tool_output` an extension sees is a size-limited preview (~32 KB prefix +
+> truncation marker), so a transform decides on a preview of large outputs.
+
+```json
+{
+  "action": "replace",
+  "output": "compressed/redacted/summarized tool output"
+}
+```
+
+| Field    | Type   | Required | Description                          |
+|----------|--------|----------|--------------------------------------|
+| `output` | string | yes      | Replacement tool output (≤ 1 MiB)    |
 
 ### `inject`
 

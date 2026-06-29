@@ -11,7 +11,8 @@ These are the only permissions currently accepted in `extension.permissions`:
 
 | Permission | Allows |
 |---|---|
-| `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` |
+| `tools.intercept` | Subscribe to `before_tool_call` and `after_tool_call` (observe, block, confirm, modify input) |
+| `tools.transform_output` | Rewrite tool **output** via `after_tool_call` → `replace`. Required *in addition to* `tools.intercept`; without it a `replace` is ignored |
 | `privacy.llm_content` | Subscribe to `before_message`, `on_message_complete`, and `on_compaction`; receive message/summary content |
 | `session.lifecycle` | Subscribe to `on_session_start` and `on_session_end` |
 | `tools.register` | Register extension-provided tools during initialization |
