@@ -134,9 +134,11 @@ const MAX_REPLACE_OUTPUT: usize = 1024 * 1024; // 1 MiB
 /// returns the original `output` unchanged. A misbehaving extension can never
 /// drop or corrupt a tool's output.
 ///
-/// Note: the event delivered to the extension carries `tool_output` truncated
-/// to 32 KB (see [`HookEvent::after_tool_call`]); a transform therefore decides
-/// based on a preview of large outputs, not the full bytes.
+/// Note: the event delivered to the extension carries `tool_output` as a
+/// size-limited preview for large outputs — a ~32 KB prefix plus a
+/// `…[truncated, N total bytes]` marker (see [`HookEvent::after_tool_call`]),
+/// so the delivered string can slightly exceed 32 KB. A transform therefore
+/// decides based on a preview, not the full bytes.
 pub async fn emit_after_tool_call(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,

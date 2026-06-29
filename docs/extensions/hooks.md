@@ -56,8 +56,10 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   `{"action": "replace", "output": "<string>"}`. The first handler to return
   `replace` wins and stops the chain (later handlers are skipped). Use it for
   compression, redaction, or summarization. Notes:
-  - The `tool_output` delivered in the event is **truncated to 32 KB**, so a
-    transform decides based on a preview of large outputs.
+  - The `tool_output` delivered in the event is a **size-limited preview** for
+    large outputs — a ~32 KB prefix plus a `…[truncated, N total bytes]` marker,
+    so it can slightly exceed 32 KB. A transform decides on this preview, not
+    the full bytes.
   - A malformed `replace` (missing/invalid `output`) or a crashed/timed-out
     handler is fail-safe: the **original output is preserved unchanged**.
   - `replace` does **not** clear the `is_error` flag — replacing the content of
