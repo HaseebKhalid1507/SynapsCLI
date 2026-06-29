@@ -1271,7 +1271,11 @@ mod tests {
         PluginIndexCapabilities, PluginIndexChecksum, PluginIndexCompatibility, PluginIndexEntry,
     };
 
-    static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // All config-env tests in agent-tui must share ONE lock so that the
+    // migration_tests (tui/mod.rs) and these async tests can never interleave.
+    // Re-export the crate-wide lock under the name already used below so no
+    // call sites need to change.
+    use crate::tui::CONFIG_ENV_TEST_LOCK as BASE_DIR_TEST_LOCK;
 
     struct EnvGuard {
         old_base_dir: Option<String>,
