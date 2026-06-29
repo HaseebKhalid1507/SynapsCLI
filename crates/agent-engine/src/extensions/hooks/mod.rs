@@ -236,10 +236,23 @@ impl HookBus {
                     return HookResult::Modify { input };
                 }
                 Ok(HookResult::Replace { output }) => {
+                    let observed_len = event.tool_output.as_ref().map_or(0, String::len);
                     tracing::info!(
                         hook = %event.kind.as_str(),
                         extension = %reg.handler.id(),
+                        observed_len,
+                        replacement_len = output.len(),
                         "Hook replaced tool output by extension"
+                    );
+                    // Persistent audit trail — who rewrote which tool's output
+                    // and when, plus sizes (never content). Best-effort: a
+                    // failed audit write must not break the tool flow.
+                    let _ = crate::extensions::audit::record_tool_output_replace(
+                        reg.handler.id(),
+                        event.kind.as_str(),
+                        event.tool_name.clone(),
+                        observed_len,
+                        output.len(),
                     );
                     // First transform wins (mirrors Modify). Chaining is a future enhancement.
                     return HookResult::Replace { output };
