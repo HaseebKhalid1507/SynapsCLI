@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-29
+
 ### Added
 - **Shared credentials via a broker (`auth.remote_endpoint` + `synaps auth-broker`).**
   Many machines share ONE OAuth credential without copying it to each disk — both
@@ -24,6 +26,13 @@ All notable changes to this project will be documented in this file.
   - **ToS:** intended for sharing one account across YOUR OWN machines. Sharing a
     subscription seat across users / a large fleet risks account suspension — use
     org/enterprise API keys at scale. See the README.
+
+### Fixed
+- **Flaky test isolation in `synaps-tui` (#137).** Config-env tests (config
+  migration + plugin actions) raced on `SYNAPS_BASE_DIR`/`HOME` through two
+  independent locks, causing intermittent failures in parallel `cargo test` runs
+  only. Unified all config-env tests under one shared test lock; verified green
+  across repeated parallel runs.
 
 ## [0.3.10] — 2026-06-24
 
