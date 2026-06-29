@@ -37,6 +37,7 @@ fn hook_result_action(result: &HookResult) -> &'static str {
         HookResult::Inject { .. } => "inject",
         HookResult::Confirm { .. } => "confirm",
         HookResult::Modify { .. } => "modify",
+        HookResult::Replace { .. } => "replace",
     }
 }
 
@@ -234,6 +235,15 @@ impl HookBus {
                     );
                     return HookResult::Modify { input };
                 }
+                Ok(HookResult::Replace { output }) => {
+                    tracing::info!(
+                        hook = %event.kind.as_str(),
+                        extension = %reg.handler.id(),
+                        "Hook replaced tool output by extension"
+                    );
+                    // First transform wins (mirrors Modify). Chaining is a future enhancement.
+                    return HookResult::Replace { output };
+                }
                 Ok(HookResult::Confirm { message }) => {
                     tracing::info!(
                         hook = %event.kind.as_str(),
@@ -337,6 +347,9 @@ impl HookBus {
                 }
                 Ok(HookResult::Modify { input }) => {
                     return HookResult::Modify { input };
+                }
+                Ok(HookResult::Replace { output }) => {
+                    return HookResult::Replace { output };
                 }
                 Ok(HookResult::Confirm { message }) => {
                     return HookResult::Confirm { message };
