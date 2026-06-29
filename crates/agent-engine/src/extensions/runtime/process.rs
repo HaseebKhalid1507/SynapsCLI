@@ -1851,12 +1851,18 @@ impl ExtensionHandler for ProcessExtension {
                         response = %value,
                         "Extension hook handler returned invalid result",
                     );
-                    if value.get("action").and_then(Value::as_str) == Some("modify") {
-                        HookResult::Block {
+                    match value.get("action").and_then(Value::as_str) {
+                        // A malformed `modify` is dangerous — it would let an
+                        // unknown/partial input through. Fail safe by blocking.
+                        Some("modify") => HookResult::Block {
                             reason: "Extension returned malformed modify result".to_string(),
-                        }
-                    } else {
-                        HookResult::Continue
+                        },
+                        // A malformed `replace` is safe to ignore: the original
+                        // tool output is preserved by emit_after_tool_call.
+                        // Explicit arm so this intent can't be silently changed
+                        // by a future edit to the catch-all below.
+                        Some("replace") => HookResult::Continue,
+                        _ => HookResult::Continue,
                     }
                 }
             },

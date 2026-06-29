@@ -288,14 +288,26 @@ impl HookBus {
     ///     fire-and-forget notification calls (deck, d20, jawz-widget,
     ///     synaps-tasks all write to their own stores independently).
     ///
-    /// **Do NOT use for** `before_tool_call` / `before_message` hooks where
-    /// `Block` / `Modify` / `Inject` semantics require a defined winner when
-    /// two handlers disagree.
+    /// **Do NOT use for** `before_tool_call` / `after_tool_call` / `before_message`
+    /// hooks where `Block` / `Modify` / `Replace` / `Inject` semantics require a
+    /// defined winner when two handlers disagree — `join_all` completion order is
+    /// nondeterministic, so the "winner" would be unstable. Those hooks must use
+    /// the sequential [`emit`](Self::emit), which enforces first-wins ordering.
     ///
     /// With N extensions and a 5 s per-handler timeout, serial emit takes up
     /// to N×5 s; concurrent emit collapses that to a single 5 s window
     /// regardless of N — critical for teardown budgets.
     pub async fn emit_concurrent(&self, event: &HookEvent) -> HookResult {
+        debug_assert!(
+            !matches!(
+                event.kind,
+                HookKind::BeforeToolCall | HookKind::AfterToolCall | HookKind::BeforeMessage
+            ),
+            "emit_concurrent must not be used for transform-capable hooks \
+             ({:?}); their Block/Modify/Replace/Inject results need the \
+             deterministic first-wins ordering of the sequential emit()",
+            event.kind,
+        );
         // Snapshot handler list (same as emit()).
         let registrations = {
             let handlers = self.handlers.read().await;
@@ -517,6 +529,31 @@ mod tests {
         .await;
 
         assert_eq!(recorded, "RAW", "no Replace → original output preserved");
+    }
+
+    /// First Replace wins: once an earlier after_tool_call handler returns
+    /// Replace, later handlers are never reached (mirrors block/modify
+    /// chain-stop). Proves the "first transform wins" comment in emit().
+    #[tokio::test]
+    async fn replace_stops_chain_for_after_tool_call() {
+        let bus = HookBus::new();
+        let first = TestHandler::new("first", HookResult::Replace { output: "FIRST".into() });
+        let second = TestHandler::new("second", HookResult::Replace { output: "SECOND".into() });
+        let perms = perms_with(&[Permission::ToolsIntercept]);
+
+        bus.subscribe(HookKind::AfterToolCall, first.clone(), None, None, perms.clone())
+            .await
+            .unwrap();
+        bus.subscribe(HookKind::AfterToolCall, second.clone(), None, None, perms)
+            .await
+            .unwrap();
+
+        let event = HookEvent::after_tool_call("bash", serde_json::json!({}), "RAW".to_string());
+        let result = bus.emit(&event).await;
+
+        assert_eq!(result, HookResult::Replace { output: "FIRST".into() });
+        assert_eq!(first.calls(), 1);
+        assert_eq!(second.calls(), 0); // never reached — first transform wins
     }
 
     #[test]

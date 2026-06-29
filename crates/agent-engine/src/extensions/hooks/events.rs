@@ -307,7 +307,7 @@ impl HookEvent {
 /// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HookResult {
     /// Allow execution to proceed unchanged.
@@ -321,11 +321,16 @@ pub enum HookResult {
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
     Confirm { message: String },
-    /// Replace the tool input before execution. Only valid on before_tool_call hooks.
+    /// Replace the tool **input** before execution (structured JSON args).
+    /// Only valid on before_tool_call hooks. The output-side counterpart is
+    /// [`HookResult::Replace`]. The first modifier stops the handler chain.
     Modify { input: Value },
-    /// Replace the tool output after execution, before it enters history.
-    /// Only valid on after_tool_call hooks. Enables native output transforms
-    /// (compression, redaction, summarization) by extensions.
+    /// Replace the tool **output** after execution (flat string), before it
+    /// enters history. Only valid on after_tool_call hooks. The input-side
+    /// counterpart is [`HookResult::Modify`] — distinct name because the payload
+    /// is an unstructured `String`, not structured `Value`. Enables native
+    /// output transforms (compression, redaction, summarization) by extensions.
+    /// The first transform stops the handler chain.
     Replace { output: String },
 }
 

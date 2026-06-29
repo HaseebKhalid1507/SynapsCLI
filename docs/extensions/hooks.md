@@ -26,7 +26,7 @@ name.
 | Hook | Required permission | Tool filter? | Allowed result actions | Purpose |
 |---|---|---:|---|---|
 | `before_tool_call` | `tools.intercept` | yes | `continue`, `block`, `confirm`, `modify` | Inspect/block/confirm/modify a tool call before execution |
-| `after_tool_call` | `tools.intercept` | yes | `continue` | Observe tool input/output after execution |
+| `after_tool_call` | `tools.intercept` | yes | `continue`, `replace` | Observe or rewrite tool output after execution |
 | `before_message` | `privacy.llm_content` | no | `continue`, `inject` | Inspect the user message and optionally inject context |
 | `on_message_complete` | `privacy.llm_content` | no | `continue` | Observe completed assistant responses |
 | `on_compaction` | `privacy.llm_content` | no | `continue` | Observe completed conversation compaction summaries |
@@ -47,6 +47,18 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   model context. It is accepted only on `before_message`.
 - `modify` replaces the tool input before execution. It is accepted only on
   `before_tool_call`; the first modifier stops the handler chain.
+- `replace` substitutes the tool **output** after execution, before it enters
+  conversation history. It is accepted only on `after_tool_call`. Return
+  `{"action": "replace", "output": "<string>"}`. The first handler to return
+  `replace` wins and stops the chain (later handlers are skipped). Use it for
+  compression, redaction, or summarization. Notes:
+  - The `tool_output` delivered in the event is **truncated to 32 KB**, so a
+    transform decides based on a preview of large outputs.
+  - A malformed `replace` (missing/invalid `output`) or a crashed/timed-out
+    handler is fail-safe: the **original output is preserved unchanged**.
+  - `replace` does **not** clear the `is_error` flag — replacing the content of
+    a failed tool call leaves it marked as an error.
+  - Replacement output larger than 1 MiB is clamped.
 
 `on_message_complete` fires after an assistant response is added to session
 history. It requires `privacy.llm_content` and is observe-only. The `message`
