@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 pub enum Permission {
     /// Can subscribe to before_tool_call / after_tool_call hooks.
     ToolsIntercept,
+    /// Can rewrite tool OUTPUT via `after_tool_call` → `HookResult::Replace`.
+    /// Distinct from (and additional to) `tools.intercept`: observing a tool's
+    /// output is a weaker capability than silently rewriting what the model
+    /// believes the tool returned, so it requires explicit, separate consent.
+    ToolsTransformOutput,
     /// Can override built-in tools.
     ToolsOverride,
     /// Can read LLM input/output (before_message hook).
@@ -43,6 +48,7 @@ impl Permission {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ToolsIntercept => "tools.intercept",
+            Self::ToolsTransformOutput => "tools.transform_output",
             Self::ToolsOverride => "tools.override",
             Self::LlmContent => "privacy.llm_content",
             Self::SessionLifecycle => "session.lifecycle",
@@ -61,6 +67,7 @@ impl Permission {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "tools.intercept" => Some(Self::ToolsIntercept),
+            "tools.transform_output" => Some(Self::ToolsTransformOutput),
             "tools.override" => Some(Self::ToolsOverride),
             "privacy.llm_content" => Some(Self::LlmContent),
             "session.lifecycle" => Some(Self::SessionLifecycle),

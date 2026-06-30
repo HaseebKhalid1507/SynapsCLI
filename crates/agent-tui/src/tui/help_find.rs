@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, BorderType, Clear, Paragraph},
@@ -76,22 +76,20 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let [search_bar, results, status_bar] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
     let search = Paragraph::new(Line::from(vec![
         Span::styled("Search: ", Style::default().fg(THEME.load().muted)),
         Span::styled(state.filter().to_string(), Style::default().fg(THEME.load().input_fg)),
     ]));
-    frame.render_widget(search, chunks[0]);
+    frame.render_widget(search, search_bar);
 
-    let visible_height = chunks[1].height as usize;
+    let visible_height = results.height as usize;
     state.set_visible_height(visible_height);
     let rows = state.filtered_rows();
     let result_count = state.filtered_entries().len();
@@ -102,7 +100,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
             .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
             .collect()
     } else {
-        let rendered_rows = render_help_find_rows(&rows, state, chunks[1].width as usize);
+        let rendered_rows = render_help_find_rows(&rows, state, results.width as usize);
         let row_heights = rendered_rows.iter().map(Vec::len).collect::<Vec<_>>();
         let start = synaps_cli::help::visible_help_find_window(
             &row_heights,
@@ -126,12 +124,12 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
             .flatten()
             .collect()
     };
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(Paragraph::new(lines), results);
 
     let footer = format!("{} result{}  ↑↓ move  Enter details  type filter  Esc close", result_count, if result_count == 1 { "" } else { "s" });
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(THEME.load().muted)))),
-        chunks[2],
+        status_bar,
     );
 }
 

@@ -99,13 +99,34 @@ fn process_input_escapes(input: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             match chars.peek() {
-                Some('n') => { chars.next(); result.push('\n'); }
-                Some('r') => { chars.next(); result.push('\r'); }
-                Some('t') => { chars.next(); result.push('\t'); }
-                Some('\\') => { chars.next(); result.push('\\'); }
-                Some('a') => { chars.next(); result.push('\x07'); }  // bell
-                Some('b') => { chars.next(); result.push('\x08'); }  // backspace
-                Some('0') => { chars.next(); result.push('\0'); }    // null
+                Some('n') => {
+                    chars.next();
+                    result.push('\n');
+                }
+                Some('r') => {
+                    chars.next();
+                    result.push('\r');
+                }
+                Some('t') => {
+                    chars.next();
+                    result.push('\t');
+                }
+                Some('\\') => {
+                    chars.next();
+                    result.push('\\');
+                }
+                Some('a') => {
+                    chars.next();
+                    result.push('\x07');
+                } // bell
+                Some('b') => {
+                    chars.next();
+                    result.push('\x08');
+                } // backspace
+                Some('0') => {
+                    chars.next();
+                    result.push('\0');
+                } // null
                 Some('e') => {
                     chars.next();
                     tracing::warn!("blocked \\e escape sequence (raw ESC) in shell input");
@@ -126,7 +147,9 @@ fn process_input_escapes(input: &str) -> String {
                     if let Ok(byte) = u8::from_str_radix(&hex, 16) {
                         if byte == 0x1b {
                             // Block ESC (ANSI escape initiator)
-                            tracing::warn!("blocked \\x1b escape sequence (raw ESC) in shell input");
+                            tracing::warn!(
+                                "blocked \\x1b escape sequence (raw ESC) in shell input"
+                            );
                         } else if byte >= 0x80 {
                             // Block high bytes
                             tracing::warn!("blocked \\x{hex:} high byte (>= 0x80) in shell input");
@@ -202,7 +225,7 @@ async fn wait_for_output(
             let text = String::from_utf8_lossy(&bytes);
             output.push_str(&text);
             last_output_time = Instant::now();
-            
+
             // Stream to TUI if requested (normalized)
             if let Some(tx) = tx_delta {
                 let _ = tx.send(normalize_output(&text));
@@ -227,14 +250,17 @@ async fn wait_for_output(
             if !remaining.is_empty() {
                 let remaining_text = String::from_utf8_lossy(&remaining);
                 output.push_str(&remaining_text);
-                
+
                 // Stream remaining output to TUI
                 if let Some(tx) = tx_delta {
                     let _ = tx.send(normalize_output(&remaining_text));
                 }
             }
             // PtyHandle doesn't expose exit codes currently — use None
-            return (normalize_output(&output), status_string(&SessionStatus::Exited(None)));
+            return (
+                normalize_output(&output),
+                status_string(&SessionStatus::Exited(None)),
+            );
         }
 
         // Evaluate readiness.
@@ -268,15 +294,17 @@ impl SessionManager {
     ///
     /// Returns `(session_id, initial_output, status)` on success.
     pub async fn create_session(
-        &self, 
+        &self,
         opts: SessionOpts,
         tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        max_output: usize,
     ) -> Result<(String, String, String)> {
         // --- Check session limit ---
         {
-            let sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             if sessions.len() >= self.config.max_sessions {
                 return Err(RuntimeError::Tool(format!(
                     "maximum session limit reached ({})",
@@ -290,9 +318,9 @@ impl SessionManager {
         let id = format!("shell_{:02}", seq);
 
         // --- Resolve parameters with config defaults ---
-        let command = opts.command.unwrap_or_else(|| {
-            std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
-        });
+        let command = opts
+            .command
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "bash".into()));
         let rows = opts.rows.unwrap_or(self.config.default_rows);
         let cols = opts.cols.unwrap_or(self.config.default_cols);
 
@@ -326,8 +354,14 @@ impl SessionManager {
         // Without this, the silence timeout can fire before the process has
         // had time to print anything (e.g. Python startup, shell rc files).
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let (initial_output, status_str) =
-            wait_for_output(&mut pty, &detector, opts.readiness_timeout_ms, tx_delta, 30000).await;
+        let (initial_output, status_str) = wait_for_output(
+            &mut pty,
+            &detector,
+            opts.readiness_timeout_ms,
+            tx_delta,
+            max_output,
+        )
+        .await;
 
         let now = Instant::now();
         let status = if status_str.starts_with("exited") {
@@ -347,9 +381,10 @@ impl SessionManager {
 
         // --- Insert into map ---
         {
-            let mut sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             sessions.insert(id.clone(), session);
         }
 
@@ -363,12 +398,14 @@ impl SessionManager {
         input: &str,
         timeout_ms: Option<u64>,
         tx_delta: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        max_output: usize,
     ) -> Result<SendResult> {
         // --- Remove session from map (release lock before I/O) ---
         let mut session = {
-            let mut sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             sessions.remove(id).ok_or_else(|| {
                 RuntimeError::Tool(format!(
                     "session {id} not found — it may have been closed, reaped, or is currently in use by another call"
@@ -380,9 +417,10 @@ impl SessionManager {
         if session.status != SessionStatus::Active {
             // Reinsert so it can still be closed/inspected.
             let s_str = status_string(&session.status);
-            let mut sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             sessions.insert(id.to_string(), session);
             return Err(RuntimeError::Tool(format!(
                 "session {id} is not active (status: {s_str})"
@@ -394,8 +432,14 @@ impl SessionManager {
         session.pty.write(processed.as_bytes())?;
 
         // --- Wait for output ---
-        let (output, status_str) =
-            wait_for_output(&mut session.pty, &session.detector, timeout_ms, tx_delta, 30000).await;
+        let (output, status_str) = wait_for_output(
+            &mut session.pty,
+            &session.detector,
+            timeout_ms,
+            tx_delta,
+            max_output,
+        )
+        .await;
 
         // --- Update metadata ---
         session.last_active = Instant::now();
@@ -410,9 +454,10 @@ impl SessionManager {
 
         // --- Reinsert into map ---
         {
-            let mut sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             sessions.insert(id.to_string(), session);
         }
 
@@ -424,9 +469,10 @@ impl SessionManager {
     /// Idempotent — closing a non-existent session returns `Ok("")`.
     pub async fn close_session(&self, id: &str) -> Result<String> {
         let mut session = {
-            let mut sessions = self.sessions.lock().map_err(|e| {
-                RuntimeError::Tool(format!("session lock poisoned: {e}"))
-            })?;
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| RuntimeError::Tool(format!("session lock poisoned: {e}")))?;
             match sessions.remove(id) {
                 Some(s) => s,
                 None => return Ok(String::new()),
@@ -508,17 +554,15 @@ impl SessionManager {
     /// Snapshot of all sessions.
     pub fn list_sessions(&self) -> Vec<ShellSessionInfo> {
         match self.sessions.lock() {
-            Ok(sessions) => {
-                sessions
-                    .iter()
-                    .map(|(id, s)| ShellSessionInfo {
-                        id: id.clone(),
-                        status: s.status.clone(),
-                        created_at: s.created_at,
-                        last_active: s.last_active,
-                    })
-                    .collect()
-            }
+            Ok(sessions) => sessions
+                .iter()
+                .map(|(id, s)| ShellSessionInfo {
+                    id: id.clone(),
+                    status: s.status.clone(),
+                    created_at: s.created_at,
+                    last_active: s.last_active,
+                })
+                .collect(),
             Err(e) => {
                 tracing::error!("session lock poisoned: {e}");
                 Vec::new()
@@ -595,7 +639,7 @@ mod tests {
     async fn test_create_session_echo_hello() {
         let mgr = default_manager();
         let (id, output, _status) = mgr
-            .create_session(opts_for("echo hello"), None)
+            .create_session(opts_for("echo hello"), None, 256 * 1024)
             .await
             .expect("failed to create session");
 
@@ -611,12 +655,12 @@ mod tests {
     async fn test_send_input_echo() {
         let mgr = default_manager();
         let (id, _initial, _status) = mgr
-            .create_session(opts_for("bash"), None)
+            .create_session(opts_for("bash"), None, 256 * 1024)
             .await
             .expect("failed to create session");
 
         let result = mgr
-            .send_input(&id, "echo test\n", None, None)
+            .send_input(&id, "echo test\n", None, None, 256 * 1024)
             .await
             .expect("failed to send input");
 
@@ -635,7 +679,7 @@ mod tests {
     async fn test_close_session_idempotent() {
         let mgr = default_manager();
         let (id, _, _status) = mgr
-            .create_session(opts_for("bash"), None)
+            .create_session(opts_for("bash"), None, 256 * 1024)
             .await
             .expect("failed to create session");
 
@@ -643,26 +687,32 @@ mod tests {
         assert!(result1.is_ok(), "first close should succeed");
 
         let result2 = mgr.close_session(&id).await;
-        assert!(result2.is_ok(), "second close should also succeed (idempotent)");
+        assert!(
+            result2.is_ok(),
+            "second close should also succeed (idempotent)"
+        );
         assert_eq!(result2.unwrap(), "", "second close returns empty string");
     }
 
     // 4. Max sessions limit → error on exceeding
     #[tokio::test]
     async fn test_max_sessions_limit() {
-        let config = ShellConfig { max_sessions: 2, ..Default::default() };
+        let config = ShellConfig {
+            max_sessions: 2,
+            ..Default::default()
+        };
         let mgr = SessionManager::new(config);
 
         let (id1, _, _s) = mgr
-            .create_session(opts_for("bash"), None)
+            .create_session(opts_for("bash"), None, 256 * 1024)
             .await
             .expect("session 1");
         let (id2, _, _s) = mgr
-            .create_session(opts_for("bash"), None)
+            .create_session(opts_for("bash"), None, 256 * 1024)
             .await
             .expect("session 2");
 
-        let result = mgr.create_session(opts_for("bash"), None).await;
+        let result = mgr.create_session(opts_for("bash"), None, 256 * 1024).await;
         assert!(result.is_err(), "third session should fail");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -679,7 +729,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_not_found() {
         let mgr = default_manager();
-        let result = mgr.send_input("shell_99", "hello\n", None, None).await;
+        let result = mgr
+            .send_input("shell_99", "hello\n", None, None, 256 * 1024)
+            .await;
         assert!(result.is_err(), "send to non-existent session should fail");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(

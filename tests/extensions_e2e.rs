@@ -195,6 +195,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
+                    max_tool_buffer: 256 * 1024,
                     bash_timeout: 30,
                     bash_max_timeout: 300,
                     subagent_timeout: 300,
@@ -211,8 +212,64 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         None,
         input,
         output,
+        256 * 1024,
     ).await;
-    assert!(matches!(after, HookResult::Continue));
+    // No after_tool_call transform handler registered → output unchanged.
+    assert_eq!(after, "modified");
+
+    manager.shutdown_all().await;
+}
+
+/// End-to-end proof of HookResult::Replace: a real process extension subscribed
+/// to after_tool_call returns {"action":"replace","output":...}, and the engine
+/// substitutes that transformed string in place of the raw tool output before it
+/// enters history. This exercises the full path — subprocess spawn, JSON-RPC
+/// initialize handshake, hook.handle dispatch, serde deserialization of the new
+/// `replace` action, and resolution inside emit_after_tool_call.
+#[tokio::test]
+async fn after_tool_call_replace_substitutes_output_via_real_extension() {
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/replace_extension.py")
+        .to_string_lossy()
+        .to_string();
+
+    let hook_bus = Arc::new(HookBus::new());
+    let mut manager = ExtensionManager::new(hook_bus.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
+        args: vec![fixture],
+        permissions: vec!["tools.intercept".to_string(), "tools.transform_output".to_string()],
+        hooks: vec![synaps_cli::extensions::manifest::HookSubscription {
+            hook: "after_tool_call".to_string(),
+            tool: Some("bash".to_string()),
+            matcher: None,
+        }],
+        config: vec![],
+    };
+    manager.load("replace-test", &manifest).await.unwrap();
+
+    // 32-byte raw output the tool "produced"; the fixture clamps it deterministically
+    // to "[clamped:<len>] <first 8 chars>".
+    let raw = "DEADBEEFDEADBEEFDEADBEEFDEADBEEF".to_string();
+    let result = synaps_cli::runtime::emit_after_tool_call(
+        &hook_bus,
+        "bash",
+        None,
+        json!({"command": "echo big"}),
+        raw,
+        256 * 1024,
+    )
+    .await;
+
+    assert_eq!(
+        result, "[clamped:32] DEADBEEF",
+        "the extension's Replace output must be substituted for the raw tool output"
+    );
 
     manager.shutdown_all().await;
 }
@@ -283,6 +340,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
+                    max_tool_buffer: 256 * 1024,
                     bash_timeout: 30,
                     bash_max_timeout: 300,
                     subagent_timeout: 300,

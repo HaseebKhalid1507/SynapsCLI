@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
@@ -28,21 +28,17 @@ pub(crate) fn render(
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Min(1)])
-        .split(outer[0]);
+    let [content, footer_bar] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+        .areas(inner);
+    let [sidebar, main] = Layout::horizontal([Constraint::Length(20), Constraint::Min(1)])
+        .areas(content);
 
-    render_categories(frame, panes[0], state, snap);
-    render_settings(frame, panes[1], state, snap);
-    render_footer(frame, outer[1], state, snap);
+    render_categories(frame, sidebar, state, snap);
+    render_settings(frame, main, state, snap);
+    render_footer(frame, footer_bar, state, snap);
 
     if let Some(ActiveEditor::PluginCustom { render, .. }) = &state.edit_mode {
-        render_plugin_custom_editor(frame, panes[1], render);
+        render_plugin_custom_editor(frame, main, render);
     }
 }
 
@@ -465,11 +461,9 @@ fn render_plugin_custom_editor(
     frame.render_widget(block, rect);
 
     let (list_area, footer_area) = if footer_lines > 0 {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(footer_lines)])
-            .split(inner);
-        (split[0], Some(split[1]))
+        let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(footer_lines)])
+            .areas(inner);
+        (body, Some(foot))
     } else {
         (inner, None)
     };

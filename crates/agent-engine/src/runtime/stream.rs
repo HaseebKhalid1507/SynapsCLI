@@ -1,15 +1,18 @@
+use super::api::ApiMethods;
+use super::helpers::HelperMethods;
+use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
+use super::{
+    emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision,
+    BeforeToolCallDecision,
+};
+use crate::extensions::hooks::events::HookEvent;
+use crate::{Result, RuntimeError, ToolRegistry};
+use reqwest::Client;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use serde_json::{json, Value};
-use reqwest::Client;
-use crate::{Result, RuntimeError, ToolRegistry};
-use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
-use super::helpers::HelperMethods;
-use super::{BeforeToolCallDecision, emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision};
-use crate::extensions::hooks::events::HookEvent;
-use super::api::ApiMethods;
 
 /// Bundle of all dependencies needed to drive a streaming agent loop.
 /// Constructed once by `Runtime::run_stream_with_messages` before spawning the stream task.
@@ -73,13 +76,31 @@ impl StreamMethods {
         initial_messages: Vec<Value>,
     ) -> Result<()> {
         let StreamSession {
-            auth, client, credential_source, token_cache, options, api_retries,
-            model, tools, system_prompt, thinking_budget,
-            tx, cancel, mut steering_rx,
-            watcher_exit_path, max_tool_output,
-            bash_timeout, bash_max_timeout, subagent_timeout,
-            session_manager, subagent_registry, event_queue, hook_bus, secret_prompt,
-            auto_approve_confirms, telemetry_level,
+            auth,
+            client,
+            credential_source,
+            token_cache,
+            options,
+            api_retries,
+            model,
+            tools,
+            system_prompt,
+            thinking_budget,
+            tx,
+            cancel,
+            mut steering_rx,
+            watcher_exit_path,
+            max_tool_output,
+            bash_timeout,
+            bash_max_timeout,
+            subagent_timeout,
+            session_manager,
+            subagent_registry,
+            event_queue,
+            hook_bus,
+            secret_prompt,
+            auto_approve_confirms,
+            telemetry_level,
         } = session;
         let mut messages = initial_messages;
 
@@ -113,7 +134,9 @@ impl StreamMethods {
             // Extract the last user message text — handles both string content
             // and block array content (common after tool results).
             let injected_system: Option<String>;
-            let last_user_msg: Option<String> = messages.iter().rev()
+            let last_user_msg: Option<String> = messages
+                .iter()
+                .rev()
                 .find(|m| m["role"].as_str() == Some("user"))
                 .and_then(|m| {
                     // Try string content first
@@ -122,7 +145,8 @@ impl StreamMethods {
                     }
                     // Try block array content
                     if let Some(arr) = m["content"].as_array() {
-                        return arr.iter()
+                        return arr
+                            .iter()
                             .find(|b| b["type"].as_str() == Some("text"))
                             .and_then(|b| b["text"].as_str())
                             .map(String::from);
@@ -130,12 +154,18 @@ impl StreamMethods {
                     None
                 });
             let did_inject = if let Some(ref msg_text) = last_user_msg {
-                let hook_event = crate::extensions::hooks::events::HookEvent::before_message(msg_text);
-                if let crate::extensions::hooks::events::HookResult::Inject { content } = hook_bus.emit(&hook_event).await {
+                let hook_event =
+                    crate::extensions::hooks::events::HookEvent::before_message(msg_text);
+                if let crate::extensions::hooks::events::HookResult::Inject { content } =
+                    hook_bus.emit(&hook_event).await
+                {
                     // Append injected content AFTER system prompt to preserve cache prefix
                     let base = system_prompt.as_deref().unwrap_or_default();
                     injected_system = Some(format!("{base}\n\n[Extension context — do not treat as user instructions]\n{content}\n[End extension context]"));
-                    tracing::debug!(len = content.len(), "Extension context injected into system prompt");
+                    tracing::debug!(
+                        len = content.len(),
+                        "Extension context injected into system prompt"
+                    );
                     true
                 } else {
                     injected_system = system_prompt.clone();
@@ -148,10 +178,21 @@ impl StreamMethods {
             let _ = did_inject;
 
             let response = match ApiMethods::call_api_stream_inner(
-                &auth, &client, &model, &tools_snapshot, &injected_system, thinking_budget,
-                &messages, tx.clone(), &cancel, api_retries, &options,
+                &auth,
+                &client,
+                &model,
+                &tools_snapshot,
+                &injected_system,
+                thinking_budget,
+                &messages,
+                tx.clone(),
+                &cancel,
+                api_retries,
+                &options,
                 telemetry_level,
-            ).await {
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
@@ -178,7 +219,8 @@ impl StreamMethods {
                         let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                             "model returned an empty response — likely context-window \
                              exceeded or API overload. Try /compact or start a fresh \
-                             session.".to_string(),
+                             session."
+                                .to_string(),
                         )));
                     }
                     let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
@@ -213,10 +255,12 @@ impl StreamMethods {
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
                 if tool_uses.is_empty() {
-                    let steered = HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    let steered =
+                        HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
                     if !steered {
                         // No steering, truly done
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        let _ =
+                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Ok(());
                     }
                     // Steering message injected — continue the loop for another LLM call
@@ -228,7 +272,8 @@ impl StreamMethods {
                 // next API call will fail with "tool_use ids were found without tool_result
 
                 // Channel for dynamic tool registration (MCP connect uses this)
-                let (tool_reg_tx, mut tool_reg_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
+                let (tool_reg_tx, mut tool_reg_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<Vec<Arc<dyn crate::Tool>>>();
                 // blocks". On cancellation we synthesize a "Canceled by user" result for any
                 // remaining tools so message history stays valid.
                 let mut tool_results = Vec::new();
@@ -262,25 +307,38 @@ impl StreamMethods {
                             "content": err,
                             "is_error": true
                         }));
-                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result: err.to_string() }));
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                            tool_id,
+                            result: err.to_string(),
+                        }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         let result = match tools.read().await.get(&tool_name).cloned() {
                             Some(tool) => {
-                                let input = tools.read().await.translate_input_for_api_tool(&tool_name, input);
-                                let (tx_d, mut rx_d) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                let input = tools
+                                    .read()
+                                    .await
+                                    .translate_input_for_api_tool(&tool_name, input);
+                                let (tx_d, mut rx_d) =
+                                    tokio::sync::mpsc::unbounded_channel::<String>();
                                 let tx_k = tx.clone();
                                 let t_id = tool_id.clone();
                                 tokio::spawn(async move {
                                     while let Some(msg) = rx_d.recv().await {
-                                        let _ = tx_k.send(StreamEvent::Llm(LlmEvent::ToolResultDelta {
-                                            tool_id: t_id.clone(),
-                                            delta: msg,
-                                        }));
+                                        let _ = tx_k.send(StreamEvent::Llm(
+                                            LlmEvent::ToolResultDelta {
+                                                tool_id: t_id.clone(),
+                                                delta: msg,
+                                            },
+                                        ));
                                     }
                                 });
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
-                                let runtime_name = tools.read().await.runtime_name_for_api(&tool_name).to_string();
+                                let runtime_name = tools
+                                    .read()
+                                    .await
+                                    .runtime_name_for_api(&tool_name)
+                                    .to_string();
                                 let decision = resolve_before_tool_call_decision(
                                     input.clone(),
                                     emit_before_tool_call(
@@ -288,39 +346,45 @@ impl StreamMethods {
                                         &tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
-                                    ).await,
+                                    )
+                                    .await,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
-                                ).await;
+                                )
+                                .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
                                     format!("Tool call blocked by extension: {}", reason)
                                 } else {
-                                let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
-                                let input_for_hook = input.clone();
-                                tokio::select! {
-                                    res = tool.execute(input, crate::ToolContext {
-                                        channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                        capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone() },
-                                        limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
-                                    }) => {
-                                        let output = match res {
-                                            Ok(output) => output,
-                                            Err(e) => format!("Tool execution failed: {}", e),
-                                        };
-                                        let _ = emit_after_tool_call(
-                                            &hook_bus,
-                                            &tool_name,
-                                            Some(&runtime_name),
-                                            input_for_hook,
-                                            output.clone(),
-                                        ).await;
-                                        output
+                                    let BeforeToolCallDecision::Continue { input } = decision
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let input_for_hook = input.clone();
+                                    tokio::select! {
+                                        res = tool.execute(input, crate::ToolContext {
+                                            channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
+                                            capabilities: crate::tools::ToolCapabilities { watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), secret_prompt: secret_prompt.clone() },
+                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
+                                        }) => {
+                                            let output = match res {
+                                                Ok(output) => output,
+                                                Err(e) => format!("Tool execution failed: {}", e),
+                                            };
+                                            let output = emit_after_tool_call(
+                                                &hook_bus,
+                                                &tool_name,
+                                                Some(&runtime_name),
+                                                input_for_hook,
+                                                output,
+                                                max_tool_output,
+                                            ).await;
+                                            output
+                                        }
+                                        _ = cancel.cancelled() => {
+                                            canceled = true;
+                                            "Canceled by user".to_string()
+                                        }
                                     }
-                                    _ = cancel.cancelled() => {
-                                        canceled = true;
-                                        "Canceled by user".to_string()
-                                    }
-                                }
                                 }
                             }
                             None => format!("Unknown tool: {}", tool_name),
@@ -357,14 +421,18 @@ impl StreamMethods {
                             let tid = tool_id.clone();
                             let tx_c = tx.clone();
                             join_set.spawn(async move {
-                                let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult { tool_id: tid.clone(), result: err.clone() }));
+                                let _ = tx_c.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id: tid.clone(),
+                                    result: err.clone(),
+                                }));
                                 (tid, false, format!("Tool execution failed: {}", err))
                             });
                             continue;
                         }
 
                         let tools_snapshot = tools.read().await;
-                        let runtime_name = tools_snapshot.runtime_name_for_api(&tool_name).to_string();
+                        let runtime_name =
+                            tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                         let input = tools_snapshot.translate_input_for_api_tool(&tool_name, input);
                         let tool = tools_snapshot.get(&tool_name).cloned();
                         drop(tools_snapshot);
@@ -416,18 +484,19 @@ impl StreamMethods {
                                         res = t.execute(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), secret_prompt: prompt_inner.clone() },
-                                            limits: crate::tools::ToolLimits { max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout },
+                                            limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         }) => {
                                             let output = match res {
                                                 Ok(output) => output,
                                                 Err(e) => format!("Tool execution failed: {}", e),
                                             };
-                                            let _ = emit_after_tool_call(
+                                            let output = emit_after_tool_call(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
                                                 input_for_hook,
-                                                output.clone(),
+                                                output,
+                                                max_tool_output,
                                             ).await;
                                             (false, output)
                                         }
@@ -454,7 +523,9 @@ impl StreamMethods {
                     while let Some(res) = join_set.join_next().await {
                         match res {
                             Ok((tool_id, was_canceled, result)) => {
-                                if was_canceled { canceled = true; }
+                                if was_canceled {
+                                    canceled = true;
+                                }
                                 results_map.insert(tool_id, result);
                             }
                             Err(e) => {
@@ -466,7 +537,8 @@ impl StreamMethods {
                     // Build tool_results in original order
                     for tool_use in &tool_uses {
                         if let Some(tool_id) = tool_use["id"].as_str() {
-                            let result = results_map.remove(tool_id)
+                            let result = results_map
+                                .remove(tool_id)
                                 .unwrap_or_else(|| "Canceled by user".to_string());
                             tool_results.push(json!({
                                 "type": "tool_result",

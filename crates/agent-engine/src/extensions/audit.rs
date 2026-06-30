@@ -108,6 +108,95 @@ pub(crate) fn append_audit_entry_to(
     Ok(())
 }
 
+// ── Tool-output intercept audit (HookResult::Replace) ───────────────────────
+
+/// Audit record for an extension rewriting a tool's output via
+/// `HookResult::Replace`. Captures WHO rewrote WHICH tool's output and WHEN,
+/// plus sizes — never the content (privacy), matching the provider-audit policy.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InterceptAuditEntry {
+    /// RFC3339 UTC timestamp.
+    pub timestamp: String,
+    pub plugin_id: String,
+    /// Hook that fired (e.g. "after_tool_call").
+    pub hook: String,
+    /// Tool whose output was rewritten, when tool-specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Action taken (currently always "replace").
+    pub action: String,
+    /// Length (bytes) of the output the extension observed. For large outputs
+    /// this is the 32 KB event preview, not the full original.
+    pub observed_len: usize,
+    /// Length (bytes) of the replacement the extension returned.
+    pub replacement_len: usize,
+}
+
+/// Path to the intercept audit file (`$SYNAPS_BASE_DIR/extensions/intercept.jsonl`).
+pub fn intercept_file_path() -> PathBuf {
+    intercept_file_path_for(&crate::config::base_dir())
+}
+
+pub(crate) fn intercept_file_path_for(base: &Path) -> PathBuf {
+    base.join("extensions").join("intercept.jsonl")
+}
+
+/// Record that an extension replaced a tool's output. Best-effort and
+/// metadata-only — auditing must never break or alter the tool flow, so
+/// callers typically ignore the result.
+pub fn record_tool_output_replace(
+    plugin_id: impl Into<String>,
+    hook: impl Into<String>,
+    tool_name: Option<String>,
+    observed_len: usize,
+    replacement_len: usize,
+) -> Result<(), String> {
+    record_tool_output_replace_to(
+        &crate::config::base_dir(),
+        plugin_id,
+        hook,
+        tool_name,
+        observed_len,
+        replacement_len,
+    )
+}
+
+pub(crate) fn record_tool_output_replace_to(
+    base: &Path,
+    plugin_id: impl Into<String>,
+    hook: impl Into<String>,
+    tool_name: Option<String>,
+    observed_len: usize,
+    replacement_len: usize,
+) -> Result<(), String> {
+    let entry = InterceptAuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        plugin_id: plugin_id.into(),
+        hook: hook.into(),
+        tool_name,
+        action: "replace".to_string(),
+        observed_len,
+        replacement_len,
+    };
+    let path = intercept_file_path_for(base);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("intercept.jsonl path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
+    let mut line = serde_json::to_string(&entry)
+        .map_err(|e| format!("failed to serialize intercept entry: {}", e))?;
+    line.push('\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("failed to append to {}: {}", path.display(), e))?;
+    Ok(())
+}
+
 /// Read all entries (one per line). Missing file → empty Vec. Malformed
 /// lines are skipped with a `tracing::warn!`.
 pub fn read_audit_entries() -> Result<Vec<ProviderAuditEntry>, String> {
@@ -254,6 +343,39 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let entries = read_audit_entries_from(dir.path()).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn intercept_path_is_under_extensions_dir() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            intercept_file_path_for(dir.path()),
+            dir.path().join("extensions").join("intercept.jsonl")
+        );
+    }
+
+    #[test]
+    fn record_tool_output_replace_writes_metadata_only() {
+        let dir = TempDir::new().unwrap();
+        record_tool_output_replace_to(
+            dir.path(),
+            "headroom-bridge",
+            "after_tool_call",
+            Some("bash".to_string()),
+            45_000,
+            6_080,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(intercept_file_path_for(dir.path())).unwrap();
+        let entry: InterceptAuditEntry = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(entry.plugin_id, "headroom-bridge");
+        assert_eq!(entry.hook, "after_tool_call");
+        assert_eq!(entry.tool_name.as_deref(), Some("bash"));
+        assert_eq!(entry.action, "replace");
+        assert_eq!(entry.observed_len, 45_000);
+        assert_eq!(entry.replacement_len, 6_080);
+        // Privacy: the record carries sizes, never tool content.
+        assert!(!raw.contains("tool_output"), "audit line must not carry content");
     }
 
     #[test]

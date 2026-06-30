@@ -36,7 +36,12 @@ fn interpolate_slash_args(value: Value, slash_args: &str) -> Value {
     match value {
         Value::String(s) if s == "${args}" => Value::String(slash_args.to_string()),
         Value::String(s) => Value::String(s.replace("${args}", slash_args)),
-        Value::Array(items) => Value::Array(items.into_iter().map(|v| interpolate_slash_args(v, slash_args)).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| interpolate_slash_args(v, slash_args))
+                .collect(),
+        ),
         Value::Object(obj) => Value::Object(
             obj.into_iter()
                 .map(|(k, v)| (k, interpolate_slash_args(v, slash_args)))
@@ -51,7 +56,10 @@ pub async fn execute_plugin_command(
     slash_args: &str,
 ) -> crate::Result<PluginCommandOutput> {
     match &command.backend {
-        RegisteredPluginCommandBackend::Shell { command: executable, args } => {
+        RegisteredPluginCommandBackend::Shell {
+            command: executable,
+            args,
+        } => {
             validate_command_path(executable)?;
 
             let mut cmd = tokio::process::Command::new(executable);
@@ -83,12 +91,16 @@ pub async fn execute_plugin_command(
             }
             Ok(PluginCommandOutput {
                 status: Some(0),
-                stdout: format!("Skill prompt for /{}:{} (skill: {})\n{}", command.plugin, command.name, skill, text),
+                stdout: format!(
+                    "Skill prompt for /{}:{} (skill: {})\n{}",
+                    command.plugin, command.name, skill, text
+                ),
                 stderr: String::new(),
             })
         }
         RegisteredPluginCommandBackend::ExtensionTool { .. } => Err(crate::RuntimeError::Tool(
-            "extension-backed plugin command requires execute_plugin_command_with_tools".to_string(),
+            "extension-backed plugin command requires execute_plugin_command_with_tools"
+                .to_string(),
         )),
         RegisteredPluginCommandBackend::Interactive { .. } => Err(crate::RuntimeError::Tool(
             "interactive plugin command requires ExtensionManager::invoke_command".to_string(),
@@ -105,12 +117,22 @@ pub async fn execute_plugin_command_with_tools(
         let runtime_tool_name = format!("{}:{}", command.plugin, tool);
         let params = interpolate_slash_args(input.clone(), slash_args);
         let registry = tools.read().await;
-        let tool = registry.get(&runtime_tool_name).ok_or_else(|| {
-            crate::RuntimeError::Tool(format!("extension tool '{}' is not registered", runtime_tool_name))
-        })?.clone();
+        let tool = registry
+            .get(&runtime_tool_name)
+            .ok_or_else(|| {
+                crate::RuntimeError::Tool(format!(
+                    "extension tool '{}' is not registered",
+                    runtime_tool_name
+                ))
+            })?
+            .clone();
         drop(registry);
         let stdout = tool.execute(params, empty_tool_context()).await?;
-        Ok(PluginCommandOutput { status: Some(0), stdout, stderr: String::new() })
+        Ok(PluginCommandOutput {
+            status: Some(0),
+            stdout,
+            stderr: String::new(),
+        })
     } else {
         execute_plugin_command(command, slash_args).await
     }
@@ -118,7 +140,10 @@ pub async fn execute_plugin_command_with_tools(
 
 fn empty_tool_context() -> ToolContext {
     ToolContext {
-        channels: ToolChannels { tx_delta: None, tx_events: None },
+        channels: ToolChannels {
+            tx_delta: None,
+            tx_events: None,
+        },
         capabilities: ToolCapabilities {
             watcher_exit_path: None,
             tool_register_tx: None,
@@ -129,6 +154,7 @@ fn empty_tool_context() -> ToolContext {
         },
         limits: ToolLimits {
             max_tool_output: 30_000,
+            max_tool_buffer: 256 * 1024,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -143,9 +169,9 @@ fn slash_words(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Tool;
     use async_trait::async_trait;
     use std::path::PathBuf;
-    use crate::Tool;
 
     fn cmd(command: &str, args: Vec<&str>, root: PathBuf) -> RegisteredPluginCommand {
         RegisteredPluginCommand {
@@ -213,9 +239,15 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "p:echo" }
-        fn description(&self) -> &str { "echo" }
-        fn parameters(&self) -> Value { serde_json::json!({"type":"object"}) }
+        fn name(&self) -> &str {
+            "p:echo"
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
         async fn execute(&self, params: Value, _ctx: ToolContext) -> crate::Result<String> {
             Ok(format!("echo {}", params["text"].as_str().unwrap()))
         }
@@ -236,7 +268,9 @@ mod tests {
         let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::without_subagent()));
         registry.write().await.register(Arc::new(EchoTool));
 
-        let output = execute_plugin_command_with_tools(&command, "hello", registry).await.unwrap();
+        let output = execute_plugin_command_with_tools(&command, "hello", registry)
+            .await
+            .unwrap();
 
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "echo hello");

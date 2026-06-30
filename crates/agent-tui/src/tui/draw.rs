@@ -1,6 +1,6 @@
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
@@ -8,6 +8,41 @@ use ratatui::{
 };
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
+
+/// The six named panes that make up the outer app layout.
+///
+/// Single source of truth for the header/body/subagent/download/input/footer
+/// split — use [`AppAreas::from_heights`] instead of inlining the constraints.
+pub(crate) struct AppAreas {
+    pub header: ratatui::layout::Rect,
+    pub body: ratatui::layout::Rect,
+    pub subagent: ratatui::layout::Rect,
+    pub download: ratatui::layout::Rect,
+    pub input: ratatui::layout::Rect,
+    pub footer: ratatui::layout::Rect,
+}
+
+impl AppAreas {
+    /// Split `area` into the 6 app panes given the runtime-computed heights.
+    /// Single source of truth for the outer layout (header/body/subagent/download/input/footer).
+    pub(crate) fn from_heights(
+        area: ratatui::layout::Rect,
+        subagent_height: u16,
+        download_height: u16,
+        input_height: u16,
+    ) -> Self {
+        let [header, body, subagent, download, input, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(subagent_height),
+            Constraint::Length(download_height),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        Self { header, body, subagent, download, input, footer }
+    }
+}
 
 /// Build a single sidecar pill segment for one `SidecarUiState`.
 #[allow(dead_code)] // used in tests
@@ -468,22 +503,11 @@ pub(crate) fn build_render_model(
         .saturating_add(input_height)
         .saturating_add(1); // footer
 
-    // Replicate the outer layout to find msg_area deterministically.
-    // header(1) + messages(min 1) + subagents + download + input + footer(1).
-    let msg_area_height = term_size
-        .height
-        .saturating_sub(1) // header
-        .saturating_sub(subagent_height)
-        .saturating_sub(download_height)
-        .saturating_sub(input_height)
-        .saturating_sub(1) // footer
-        .max(1);
-    let msg_area = ratatui::layout::Rect {
-        x: 0,
-        y: 1,
-        width: term_size.width,
-        height: msg_area_height,
-    };
+    // Use AppAreas to derive msg_area — single source of truth for the outer layout.
+    // body sits at y=1 (after the 1-line header) with Min(1) height matching the
+    // old saturating_sub chain + .max(1), so the resulting Rect is identical.
+    let area = ratatui::layout::Rect { x: 0, y: 0, width: term_size.width, height: term_size.height };
+    let msg_area = AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
     let content_height = msg_area.height.saturating_sub(2) as usize;
     let content_width = msg_area.width.saturating_sub(2) as usize;
 
@@ -813,17 +837,14 @@ pub(crate) fn render_frame(
         let input_height = input_lines.min(max_input_lines) + 2;
         let download_height: u16 = if !model.active_tasks.is_empty() { 1 } else { 0 };
 
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(subagent_height),
-                Constraint::Length(download_height),
-                Constraint::Length(input_height),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
+        let AppAreas {
+            header: header_area,
+            body,
+            subagent: subagent_area,
+            download: download_area,
+            input: input_area,
+            footer: footer_area,
+        } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
 
         // ── Header ────────────────────────────────────────────────────────────
         let spinner_idx = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
@@ -933,7 +954,7 @@ pub(crate) fn render_frame(
                 ));
             }
             let used: usize = spans.iter().map(|s| s.content.len()).sum();
-            let total_w = outer[0].width as usize;
+            let total_w = header_area.width as usize;
             if total_w > used + version_span.content.len() {
                 let pad = total_w - used - version_span.content.len();
                 spans.push(Span::raw(" ".repeat(pad)));
@@ -942,10 +963,10 @@ pub(crate) fn render_frame(
             spans
         }))
         .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(header, outer[0]);
+        frame.render_widget(header, header_area);
 
         // ── Messages ──────────────────────────────────────────────────────────
-        let msg_area = outer[1];
+        let msg_area = body;
         // model.lines IS the visible window (sliced on the main side) — render the whole arc.
         let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
         let visible_is_empty = visible.is_empty();
@@ -1287,7 +1308,7 @@ pub(crate) fn render_frame(
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(THEME.load().subagent_border))
                 .style(Style::default().bg(THEME.load().bg));
-            frame.render_widget(Paragraph::new(agent_lines).block(agent_block), outer[2]);
+            frame.render_widget(Paragraph::new(agent_lines).block(agent_block), subagent_area);
         }
 
         // ── Input ─────────────────────────────────────────────────────────────
@@ -1387,13 +1408,13 @@ pub(crate) fn render_frame(
         let input_widget = Paragraph::new(input_lines_vec)
             .scroll((input_scroll, 0))
             .block(input_block);
-        frame.render_widget(input_widget, outer[4]);
+        frame.render_widget(input_widget, input_area);
 
         // Software cursor
-        let cursor_x = outer[4].x + 1 + cursor_col;
-        let cursor_y = outer[4].y + 1 + cursor_row - input_scroll;
-        if cursor_x < outer[4].x.saturating_add(outer[4].width)
-            && cursor_y < outer[4].y.saturating_add(outer[4].height)
+        let cursor_x = input_area.x + 1 + cursor_col;
+        let cursor_y = input_area.y + 1 + cursor_row - input_scroll;
+        if cursor_x < input_area.x.saturating_add(input_area.width)
+            && cursor_y < input_area.y.saturating_add(input_area.height)
         {
             if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
                 let symbol = cell.symbol().to_string();
@@ -1410,18 +1431,16 @@ pub(crate) fn render_frame(
 
         // ── Active task bar ───────────────────────────────────────────────────
         if !model.active_tasks.is_empty() {
-            let bar = render_active_tasks_line(&model.active_tasks, outer[3].width);
-            frame.render_widget(bar, outer[3]);
+            let bar = render_active_tasks_line(&model.active_tasks, download_area.width);
+            frame.render_widget(bar, download_area);
         }
 
         // ── Footer ────────────────────────────────────────────────────────────
-        let footer_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(model.runtime_model.len() as u16 + 75),
-            ])
-            .split(outer[5]);
+        let [keybinds_area, info_area] = Layout::horizontal([
+            Constraint::Min(1),
+            Constraint::Length(model.runtime_model.len() as u16 + 75),
+        ])
+        .areas(footer_area);
 
         let key_style = Style::default().fg(THEME.load().muted);
         let label_style = Style::default().fg(THEME.load().help_fg);
@@ -1450,7 +1469,7 @@ pub(crate) fn render_frame(
             Span::styled("send", label_style),
         ]))
         .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(keybinds, footer_chunks[0]);
+        frame.render_widget(keybinds, keybinds_area);
 
         let cost_str = if model.session_cost > 0.0 {
             format!("${:.4} ", model.session_cost)
@@ -1530,7 +1549,7 @@ pub(crate) fn render_frame(
         ]))
         .alignment(Alignment::Right)
         .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(info, footer_chunks[1]);
+        frame.render_widget(info, info_area);
 
         // ── Effects ───────────────────────────────────────────────────────────
         if let Some(ref mut fx) = boot_fx {

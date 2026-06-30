@@ -137,7 +137,7 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 
 **📡 Event bus.** Push events into a running session from any script, cron, or service. The agent reacts in real time.
 
-**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_message_complete`, `on_compaction`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls.
+**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_message_complete`, `on_compaction`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls, and transform tool output (compression, redaction, summarization).
 
 **🧠 Context that lasts.** 90%+ prompt cache hit rate. `/compact` replaces history with a structured checkpoint. Chain sessions across days.
 
