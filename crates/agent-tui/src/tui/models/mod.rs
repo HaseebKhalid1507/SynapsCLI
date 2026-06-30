@@ -52,7 +52,7 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
@@ -608,37 +608,35 @@ impl Widget for ModelsModalWidget<'_> {
             ModelsView::Favorites => "✦ All  [★ Favorites]",
         };
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(inner);
+        let [title, search_bar, view_bar, list_area, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
 
         Paragraph::new(Line::from(vec![
             Span::styled("◇ Switch model", Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" · {model_count} available · {favorite_count} ★ favorites"), Style::default().fg(theme.muted)),
         ]))
-        .render(chunks[0], buf);
+        .render(title, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("Search: ", Style::default().fg(theme.muted)),
             Span::styled(if self.state.search.is_empty() { "▎".to_string() } else { format!("{}▎", self.state.search) }, Style::default().fg(theme.header_fg)),
         ]))
-        .render(chunks[1], buf);
+        .render(search_bar, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("View:   ", Style::default().fg(theme.muted)),
             Span::styled(view, Style::default().fg(theme.help_fg)),
             Span::styled(format!("   current: {}", self.current_model), Style::default().fg(theme.muted)),
         ]))
-        .render(chunks[2], buf);
+        .render(view_bar, buf);
 
-        let list_height = chunks[3].height as usize;
+        let list_height = list_area.height as usize;
         let offset = self.state.cursor.saturating_sub(list_height.saturating_sub(1));
         let lines: Vec<Line> = rows
             .iter()
@@ -697,12 +695,12 @@ impl Widget for ModelsModalWidget<'_> {
         } else {
             lines
         };
-        Paragraph::new(list).render(chunks[3], buf);
+        Paragraph::new(list).render(list_area, buf);
 
         Paragraph::new("↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close")
             .style(Style::default().fg(theme.muted))
             .alignment(Alignment::Center)
-            .render(chunks[4], buf);
+            .render(footer, buf);
 
         if let Some(expanded) = self.state.expanded.as_ref() {
             render_expanded_lightbox(area, buf, self.state, expanded);
@@ -737,22 +735,20 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
     let inner = block.inner(popup);
     block.render(popup, buf);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let [search_bar, list, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
     Paragraph::new(Line::from(vec![
         Span::styled("Search: ", Style::default().fg(theme.muted)),
         Span::styled(if expanded.search.is_empty() { "▎".to_string() } else { format!("{}▎", expanded.search) }, Style::default().fg(theme.header_fg)),
     ]))
-    .render(chunks[0], buf);
+    .render(search_bar, buf);
 
-    let list_height = chunks[1].height as usize;
+    let list_height = list.height as usize;
     let visible = expanded_visible_models(state);
     let offset = expanded.cursor.saturating_sub(list_height.saturating_sub(1));
     let lines = match &expanded.load_state {
@@ -784,12 +780,12 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
             })
             .collect(),
     };
-    Paragraph::new(lines).render(chunks[1], buf);
+    Paragraph::new(lines).render(list, buf);
 
     Paragraph::new("type to fuzzy-search • ↑/↓ select • Enter use • f favorite • Esc back")
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center)
-        .render(chunks[2], buf);
+        .render(footer, buf);
 }
 
 #[cfg(test)]

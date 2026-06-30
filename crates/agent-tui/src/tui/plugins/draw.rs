@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
@@ -65,18 +65,14 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Min(1)])
-        .split(outer[0]);
+    let [content, footer_bar] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+        .areas(inner);
+    let [sidebar, main] = Layout::horizontal([Constraint::Length(20), Constraint::Min(1)])
+        .areas(content);
 
-    render_left(frame, panes[0], state);
-    render_right(frame, panes[1], state);
-    render_footer(frame, outer[1], state);
+    render_left(frame, sidebar, state);
+    render_right(frame, main, state);
+    render_footer(frame, footer_bar, state);
 }
 
 fn render_left(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
@@ -524,16 +520,14 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
     let height = (needed as u16).max(OVERLAY_HEIGHT).min(area.height.max(1));
     let inner = centered_overlay_with_height(frame, area, " Installing ", height);
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // gauge
-            Constraint::Length(1), // status line
-            Constraint::Min(0),    // error / spacer
-        ])
-        .split(inner);
+    let [title_row, _blank, gauge_row, status_row, error_row] = Layout::vertical([
+        Constraint::Length(1), // title
+        Constraint::Length(1), // blank
+        Constraint::Length(1), // gauge
+        Constraint::Length(1), // status line
+        Constraint::Min(0),    // error / spacer
+    ])
+    .areas(inner);
 
     let spinner_ch = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
     let title_line = Line::from(vec![
@@ -552,7 +546,7 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
             Style::default().fg(THEME.load().help_fg),
         ),
     ]);
-    frame.render_widget(Paragraph::new(title_line), layout[0]);
+    frame.render_widget(Paragraph::new(title_line), title_row);
 
     // Gauge — show indeterminate spinner-style fill while connecting,
     // real percentage once we have one.
@@ -578,7 +572,7 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
         )
         .ratio(pct_ratio)
         .label(gauge_label);
-    frame.render_widget(gauge, layout[2]);
+    frame.render_widget(gauge, gauge_row);
 
     // Status line: phase label + throughput
     let mut status_spans = vec![Span::styled(
@@ -591,7 +585,7 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
             Style::default().fg(THEME.load().help_fg),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(status_spans)), layout[3]);
+    frame.render_widget(Paragraph::new(Line::from(status_spans)), status_row);
 
     if has_error {
         if let Some(msg) = last_raw {
@@ -601,7 +595,7 @@ fn render_installing(frame: &mut Frame, area: Rect, progress: &InstallProgressHa
                     Style::default().fg(THEME.load().error_color),
                 )))
                 .wrap(Wrap { trim: false }),
-                layout[4],
+                error_row,
             );
         }
     }
