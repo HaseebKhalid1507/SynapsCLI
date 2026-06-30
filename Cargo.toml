@@ -1,6 +1,6 @@
 [package]
 name = "synaps"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
 license = "Apache-2.0"
@@ -13,9 +13,9 @@ exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
 rust-version = "1.80"
 
 [dependencies]
-agent-core = { path = "crates/agent-core", version = "0.4.0", package = "synaps-core" }
-agent-engine = { path = "crates/agent-engine", version = "0.4.0", package = "synaps-engine" }
-agent-tui = { path = "crates/agent-tui", version = "0.4.0", package = "synaps-tui" }
+agent-core = { path = "crates/agent-core", version = "0.5.0", package = "synaps-core" }
+agent-engine = { path = "crates/agent-engine", version = "0.5.0", package = "synaps-engine" }
+agent-tui = { path = "crates/agent-tui", version = "0.5.0", package = "synaps-tui" }
 arc-swap = "1"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }

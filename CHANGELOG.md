@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-30
+
+### Added
+- **Extensions can rewrite tool output before it enters history (`HookResult::Replace`).**
+  An `after_tool_call` hook may now return a `Replace` action that substitutes the
+  tool's output before it's appended to the conversation — enabling context
+  virtualization, redaction, summarization, or any transform of what the model
+  sees, implemented as an extension rather than baked into the core. Honored at
+  **all 5** `after_tool_call` sites for consistent behavior across every tool path.
+  - **Security — two-key gate.** Rewriting tool output is privileged: an extension
+    must both declare the capability *and* be granted it; a single switch isn't
+    enough to silently alter what the model reads. (From security review.)
+  - **Audit trail.** Every `Replace` is recorded to a persistent audit log so
+    output rewrites are accountable and inspectable after the fact.
+  - **Docs.** The `replace` action and `tools.transform_output` are documented
+    across the extension docs (hooks, permissions, protocol, contract), with a
+    worked `replace_extension.py` fixture proving the path end-to-end.
+
+### Changed
+- **Oversized tool output now compresses before it truncates.** When a tool's
+  output exceeds the buffer, the runtime first attempts to compress/condense it
+  rather than hard-cutting the tail, so more of the useful signal survives instead
+  of being lost to a blunt truncation. The preview remains a ~32KB prefix plus a
+  marker (clarified in docs — it is a preview, not a hard cap).
+- **Unambiguous plugin commands resolve by bare name.** A plugin command with no
+  naming collision can be invoked directly (e.g. `/crush`) instead of requiring
+  the fully-qualified `/plugin:command` form. Ambiguous names still require
+  qualification.
+
+### Internal
+- **TUI layout layer hardened.** Migrated all 12 `Layout::split()` sites to the
+  typed `.areas()` API (named bindings, compile-checked pane counts — a class of
+  runtime index panics becomes compile errors) and extracted the main 6-pane
+  layout into a single `AppAreas` function, removing duplicated height math that
+  had to be kept in sync by hand. No behavior change — equivalence verified live.
+
 ## [0.4.0] — 2026-06-29
 
 ### Added
