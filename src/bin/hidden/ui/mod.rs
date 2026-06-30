@@ -19,34 +19,32 @@ use crate::app::App;
 
 pub fn draw(f: &mut Frame, app: &App) {
     use crate::app::Screen;
-    use ratatui::layout::{Layout, Constraint, Direction};
+    use ratatui::layout::{Layout, Constraint};
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),     // main area
-            Constraint::Length(3),  // HUD
-        ])
-        .split(f.area());
+    let [main_area, hud_area] = Layout::vertical([
+        Constraint::Min(1),     // main area
+        Constraint::Length(3),  // HUD
+    ])
+    .areas(f.area());
 
     // Main content
     match &app.screen {
-        Screen::Boot => boot::draw_boot(f, app, chunks[0]),
-        Screen::Hub => hub::draw_hub(f, app, chunks[0]),
-        Screen::Blackjack => blackjack_ui::draw_blackjack(f, app, &app.blackjack, chunks[0]),
-        Screen::Slots => slots_ui::draw_slots(f, app, &app.slots, chunks[0]),
-        Screen::Roulette => roulette_ui::draw_roulette(f, app, &app.roulette, chunks[0]),
-        Screen::War => war_ui::draw_war(f, app, &app.war, chunks[0]),
-        Screen::Baccarat => baccarat_ui::draw_baccarat(f, app, &app.baccarat, chunks[0]),
-        Screen::VideoPoker => video_poker_ui::draw_video_poker(f, app, &app.video_poker, chunks[0]),
-        Screen::Keno => keno_ui::draw_keno(f, app, &app.keno, chunks[0]),
-        Screen::SicBo => sicbo_ui::draw_sicbo(f, app, &app.sicbo, chunks[0]),
-        Screen::Craps => craps_ui::draw_craps(f, app, &app.craps, chunks[0]),
-        Screen::GameOver => draw_game_over(f, app, chunks[0]),
+        Screen::Boot => boot::draw_boot(f, app, main_area),
+        Screen::Hub => hub::draw_hub(f, app, main_area),
+        Screen::Blackjack => blackjack_ui::draw_blackjack(f, app, &app.blackjack, main_area),
+        Screen::Slots => slots_ui::draw_slots(f, app, &app.slots, main_area),
+        Screen::Roulette => roulette_ui::draw_roulette(f, app, &app.roulette, main_area),
+        Screen::War => war_ui::draw_war(f, app, &app.war, main_area),
+        Screen::Baccarat => baccarat_ui::draw_baccarat(f, app, &app.baccarat, main_area),
+        Screen::VideoPoker => video_poker_ui::draw_video_poker(f, app, &app.video_poker, main_area),
+        Screen::Keno => keno_ui::draw_keno(f, app, &app.keno, main_area),
+        Screen::SicBo => sicbo_ui::draw_sicbo(f, app, &app.sicbo, main_area),
+        Screen::Craps => craps_ui::draw_craps(f, app, &app.craps, main_area),
+        Screen::GameOver => draw_game_over(f, app, main_area),
     }
 
     // HUD (always visible)
-    hud::draw_hud(f, app, chunks[1]);
+    hud::draw_hud(f, app, hud_area);
 
     // ── CRT OVERLAY (always on) ─────────────────────────────────────
     draw_crt_overlay(f, app);
