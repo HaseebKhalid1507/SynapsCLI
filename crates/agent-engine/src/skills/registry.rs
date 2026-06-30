@@ -385,7 +385,18 @@ impl CommandRegistry {
                     .map(|s| format!("{}:{}", s.plugin.as_deref().unwrap_or("?"), s.name))
                     .collect(),
             ),
-            None => Resolution::Unknown,
+            None => {
+                // Fall back to an unambiguous plugin command claiming
+                // this bare name. `find_plugin_command_unqualified`
+                // returns Some only when exactly one plugin claims it;
+                // ambiguous (>=2) and missing both fall through to
+                // Unknown so the user must qualify.
+                drop(r);
+                if let Some(c) = self.find_plugin_command_unqualified(cmd) {
+                    return Resolution::PluginCommand(c);
+                }
+                Resolution::Unknown
+            }
         }
     }
 
@@ -410,7 +421,22 @@ impl CommandRegistry {
         let r = self.inner.read().unwrap();
         let mut v: Vec<String> = self.builtins.iter().map(|s| s.to_string()).collect();
         v.extend(r.skills.keys().cloned());
-        v.extend(r.plugin_commands.keys().cloned());
+        // Plugin commands: group by unqualified name. If exactly one
+        // plugin claims a name, surface it bare so users can type
+        // `/crush` instead of `/crush:crush`. If two or more plugins
+        // share the name, surface every qualified key so the user can
+        // disambiguate. Mirrors `resolve()`'s bare-resolution logic.
+        let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (qkey, c) in r.plugin_commands.iter() {
+            by_name.entry(c.name.as_str()).or_default().push(qkey.as_str());
+        }
+        for (name, qkeys) in by_name {
+            if qkeys.len() == 1 {
+                v.push(name.to_string());
+            } else {
+                v.extend(qkeys.iter().map(|s| s.to_string()));
+            }
+        }
         // Phase 8 slice 8A: plugin-claimed lifecycle commands surface
         // as top-level commands too.
         v.extend(r.lifecycle_claims.keys().cloned());
@@ -756,11 +782,72 @@ mod tests {
     }
 
     #[test]
-    fn all_commands_includes_qualified_plugin_commands() {
+    fn all_commands_includes_unambiguous_plugin_commands_bare() {
+        // Updated from `all_commands_includes_qualified_plugin_commands`:
+        // a sole plugin command is now surfaced bare ("hello"), not
+        // qualified ("p:hello"). Ambiguous names stay qualified — see
+        // `all_commands_ambiguous_plugin_commands_stay_qualified`.
         let r = CommandRegistry::new_with_plugins(&["help"], vec![], vec![mk_cmd("p", "hello", PathBuf::from("/tmp/p"))]);
         let cmds = r.all_commands();
         assert!(cmds.contains(&"help".to_string()));
-        assert!(cmds.contains(&"p:hello".to_string()));
+        assert!(cmds.contains(&"hello".to_string()));
+        assert!(!cmds.contains(&"p:hello".to_string()));
+    }
+
+    #[test]
+    fn resolve_bare_unique_plugin_command() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![mk_cmd("crush", "crush", PathBuf::from("/tmp/crush"))],
+        );
+        match r.resolve("crush") {
+            Resolution::PluginCommand(cmd) => {
+                assert_eq!(cmd.plugin, "crush");
+                assert_eq!(cmd.name, "crush");
+            }
+            _ => panic!("expected PluginCommand"),
+        }
+        // Qualified form still works (no regression).
+        match r.resolve("crush:crush") {
+            Resolution::PluginCommand(cmd) => assert_eq!(cmd.plugin, "crush"),
+            _ => panic!("expected PluginCommand"),
+        }
+    }
+
+    #[test]
+    fn resolve_bare_ambiguous_plugin_command_unknown() {
+        // Two plugins both expose "foo". Bare resolution must NOT pick
+        // one — `find_plugin_command_unqualified` returns None for >1
+        // match, so we fall through to Unknown. Qualified forms still
+        // resolve.
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_cmd("a", "foo", PathBuf::from("/tmp/a")),
+                mk_cmd("b", "foo", PathBuf::from("/tmp/b")),
+            ],
+        );
+        assert!(matches!(r.resolve("foo"), Resolution::Unknown));
+        assert!(matches!(r.resolve("a:foo"), Resolution::PluginCommand(_)));
+        assert!(matches!(r.resolve("b:foo"), Resolution::PluginCommand(_)));
+    }
+
+    #[test]
+    fn all_commands_ambiguous_plugin_commands_stay_qualified() {
+        let r = CommandRegistry::new_with_plugins(
+            &[],
+            vec![],
+            vec![
+                mk_cmd("a", "foo", PathBuf::from("/tmp/a")),
+                mk_cmd("b", "foo", PathBuf::from("/tmp/b")),
+            ],
+        );
+        let cmds = r.all_commands();
+        assert!(cmds.contains(&"a:foo".to_string()));
+        assert!(cmds.contains(&"b:foo".to_string()));
+        assert!(!cmds.contains(&"foo".to_string()));
     }
 
     #[test]
