@@ -222,6 +222,7 @@ pub struct Runtime {
     bash_max_timeout: u64,
     subagent_timeout: u64,
     api_retries: u32,
+    refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
@@ -304,6 +305,7 @@ impl Runtime {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
@@ -419,6 +421,7 @@ impl Runtime {
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
+        self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.cache_diagnostics = config.cache_diagnostics;
@@ -921,6 +924,7 @@ impl Runtime {
         let bash_max_timeout = self.bash_max_timeout;
         let subagent_timeout = self.subagent_timeout;
         let api_retries = self.api_retries;
+        let refusal_retries = self.refusal_retries;
         let session_manager = self.session_manager.clone();
         // Opt into the 1M-context beta header only when the user explicitly
         // requested 1M (via context_window setting). Default 200k matches
@@ -943,6 +947,7 @@ impl Runtime {
             token_cache,
             options,
             api_retries,
+            refusal_retries,
             model,
             tools,
             system_prompt,
@@ -994,6 +999,7 @@ impl Clone for Runtime {
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
+            refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,

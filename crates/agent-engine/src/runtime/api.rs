@@ -89,6 +89,10 @@ struct ParseState {
     /// `classify_stream_outcome` can tell a valid empty `end_turn` from a silent
     /// stop even in the default (telemetry-off) config.
     stop_reason_seen: bool,
+    /// True when the captured stop_reason is exactly "refusal" — the model
+    /// declined the request. Used by `classify_stream_outcome` to gate the
+    /// refusal-retry path independently of the telemetry flag.
+    stop_reason_is_refusal: bool,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -124,6 +128,9 @@ enum StreamOutcome {
     Retry(String),
     /// A terminal failure — surface as a visible `Err`, never a silent stop.
     Fail(String),
+    /// The model set stop_reason=refusal — discard all partial content and
+    /// retry the identical request (up to the refusal_retries budget).
+    Refusal,
 }
 
 impl ParseState {
@@ -152,6 +159,7 @@ impl ParseState {
             usage_emitted: false,
             stream_error: None,
             stop_reason_seen: false,
+            stop_reason_is_refusal: false,
         }
     }
 
@@ -343,6 +351,9 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             // decision must NOT depend on whether telemetry is enabled (default off).
             if let Some(sr) = delta.and_then(|d| d.stop_reason) {
                 state.stop_reason_seen = true;
+                if sr.as_ref() == "refusal" {
+                    state.stop_reason_is_refusal = true;
+                }
                 if ctx.telemetry_level.enabled() {
                     state.telem_stop_reason = Some(sr.into_owned());
                 }
@@ -554,6 +565,9 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
 ///   * An in-stream `error` event → `Retry` (transient class) or `Fail`
 ///     (terminal class, e.g. `request_too_large` context overflow). A user
 ///     cancellation downgrades any error to a clean (empty) `Done`.
+///   * stop_reason=refusal → `Refusal`: ALL accumulated content discarded,
+///     caller retries up to `refusal_retries` budget with a short delay.
+///     Refusal on a cancelled stream downgrades to `Done` (don't fight cancel).
 ///   * A degenerate empty stream (no content AND no stop_reason) that was NOT
 ///     cancelled → `Fail`. An empty streamed response with no stop reason is
 ///     never valid; swallowing it as an empty assistant turn is exactly what
@@ -564,6 +578,7 @@ fn classify_stream_outcome(
     stream_error: Option<StreamError>,
     content: Vec<Value>,
     has_stop_reason: bool,
+    stop_reason_is_refusal: bool,
     cancelled: bool,
 ) -> StreamOutcome {
     if let Some(e) = stream_error {
@@ -577,6 +592,11 @@ fn classify_stream_outcome(
         } else {
             StreamOutcome::Fail(e.message)
         };
+    }
+    // Refusal: model ended the stream cleanly but declined the request.
+    // DISCARD all partial content — nothing partial may enter history.
+    if stop_reason_is_refusal && !cancelled {
+        return StreamOutcome::Refusal;
     }
     if !cancelled && content.is_empty() && !has_stop_reason {
         return StreamOutcome::Fail(
@@ -628,10 +648,11 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
+        refusal_retries: u32,
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options, telemetry_level).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, refusal_retries, options, telemetry_level).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -649,6 +670,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
+        refusal_retries: u32,
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
@@ -769,6 +791,7 @@ impl ApiMethods {
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
         let mut non_429_attempts: u32 = 0; // shared server-error budget
+        let mut refusal_attempts: u32 = 0; // refusal-retry budget (separate from error budget)
         let mut attempt: u32 = 0;          // total attempts (for backoff calc)
 
         loop {
@@ -1013,6 +1036,7 @@ impl ApiMethods {
         // `state.telem_stop_reason` into the record when telemetry is enabled.
         let stream_error = state.stream_error.take();
         let has_stop_reason = state.stop_reason_seen;
+        let stop_reason_is_refusal = state.stop_reason_is_refusal;
         let cancelled = cancel.is_cancelled();
 
 
@@ -1038,6 +1062,7 @@ impl ApiMethods {
                 msg_id: state.telem_msg_id,
                 model: model.to_string(),
                 attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
+                refusal_retries_used: if refusal_attempts > 0 { Some(refusal_attempts) } else { None },
                 ttft_ms: state.telem_ttft,
                 total_ms: request_start.elapsed().as_millis() as u64,
                 stop_reason: state.telem_stop_reason,
@@ -1058,6 +1083,7 @@ impl ApiMethods {
             stream_error,
             std::mem::take(&mut state.accumulated_content),
             has_stop_reason,
+            stop_reason_is_refusal,
             cancelled,
         ) {
             StreamOutcome::Done(v) => return Ok(v),
@@ -1089,6 +1115,41 @@ impl ApiMethods {
                     return Err(RuntimeError::Canceled);
                 }
                 // fall through to the outer `loop` head: rebuild request + re-stream.
+            }
+            StreamOutcome::Refusal => {
+                // Model declined the request (stop_reason=refusal). Partial
+                // content was already discarded by std::mem::take in classify.
+                // Check budget before sleeping so an immediate exhaustion is
+                // surfaced without a pointless delay.
+                if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                    let msg = format!(
+                        "⚠ model refused the request ({} attempt{})",
+                        refusal_attempts + 1,
+                        if refusal_attempts == 0 { "" } else { "s" }
+                    );
+                    // Surface visible inline notice to TUI (same channel as
+                    // rate-limit notices — renders as a turn-end inline message).
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(msg.clone())));
+                    // Hard-terminate so the turn never silently ends.
+                    return Err(RuntimeError::ApiStatus(msg));
+                }
+                refusal_attempts += 1;
+                attempt += 1;
+                // Fixed 1s delay — refusals are not transient load, exponential
+                // backoff doesn't help. Separate budget from the error budget.
+                let delay = Duration::from_secs(1);
+                tracing::warn!(
+                    "stop_reason=refusal — retrying {}/{} after {:?}",
+                    refusal_attempts, refusal_retries, delay
+                );
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                    format!("⏳ model refusal — retrying ({}/{})…", refusal_attempts, refusal_retries),
+                )));
+                tokio::time::sleep(delay).await;
+                if cancel.is_cancelled() {
+                    return Err(RuntimeError::Canceled);
+                }
+                // fall through to outer `loop` head — fresh request, fresh ParseState
             }
         }
         } // end UNIFIED RETRY LOOP (task #130)
@@ -1858,6 +1919,7 @@ mod tests {
             vec![],
             false,
             false,
+            false,
         );
         assert!(matches!(r, StreamOutcome::Retry(_)), "transient error must retry, got {r:?}");
     }
@@ -1867,6 +1929,7 @@ mod tests {
         let r = classify_stream_outcome(
             Some(StreamError { message: "request_too_large".to_string(), retryable: false }),
             vec![],
+            false,
             false,
             false,
         );
@@ -1879,7 +1942,7 @@ mod tests {
     #[test]
     fn outcome_fails_on_degenerate_empty_stream() {
         // Empty content + no stop_reason + not cancelled = the silent stop.
-        let r = classify_stream_outcome(None, vec![], false, false);
+        let r = classify_stream_outcome(None, vec![], false, false, false);
         match r {
             StreamOutcome::Fail(m) => assert!(
                 m.contains("context window") || m.contains("overloaded"),
@@ -1893,13 +1956,14 @@ mod tests {
     fn outcome_done_when_empty_but_cancelled() {
         // User cancellation legitimately yields empty content — not an error,
         // and never a retry (don't fight the user's cancel).
-        let r = classify_stream_outcome(None, vec![], false, true);
+        let r = classify_stream_outcome(None, vec![], false, false, true);
         assert!(matches!(r, StreamOutcome::Done(_)), "cancellation is a clean Done");
 
         // A cancel during a retryable error must ALSO downgrade to Done.
         let r2 = classify_stream_outcome(
             Some(StreamError { message: "overloaded".to_string(), retryable: true }),
             vec![],
+            false,
             false,
             true,
         );
@@ -1910,14 +1974,14 @@ mod tests {
     fn outcome_done_when_empty_but_has_stop_reason() {
         // A real end_turn with no content (rare but valid — e.g. a pause turn)
         // carries a stop_reason and must pass through.
-        let r = classify_stream_outcome(None, vec![], true, false);
+        let r = classify_stream_outcome(None, vec![], true, false, false);
         assert!(matches!(r, StreamOutcome::Done(_)), "empty-but-stop_reason is valid");
     }
 
     #[test]
     fn outcome_done_passes_content_through() {
         let content = vec![json!({"type":"text","text":"hi"})];
-        let r = classify_stream_outcome(None, content.clone(), true, false);
+        let r = classify_stream_outcome(None, content.clone(), true, false, false);
         match r {
             StreamOutcome::Done(v) => assert_eq!(v["content"], json!(content)),
             other => panic!("non-empty content is always Done, got {other:?}"),
@@ -1933,6 +1997,7 @@ mod tests {
             Some(StreamError { message: "boom".to_string(), retryable: false }),
             content,
             true,
+            false,
             false,
         );
         assert!(matches!(r, StreamOutcome::Fail(_)), "error event wins over partial content");
@@ -2192,4 +2257,124 @@ mod tests {
         assert_eq!(count_downgrade_notices(&mut rx), 0, "no 1h marker in request → silent");
         assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
     }
+
+    // ── refusal-retry: the 8 spec tests (§8) ──
+
+    #[test]
+    fn refusal_stop_reason_detected_in_parse_state() {
+        // Test 1: feed a message_delta with stop_reason="refusal"
+        // → both stop_reason_seen and stop_reason_is_refusal must be true.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_seen, "stop_reason_seen must be true on refusal");
+        assert!(state.stop_reason_is_refusal, "stop_reason_is_refusal must be true when stop_reason=refusal");
+    }
+
+    #[test]
+    fn non_refusal_stop_reason_does_not_set_refusal_flag() {
+        // Test 2: feed a message_delta with stop_reason="end_turn"
+        // → stop_reason_seen true, stop_reason_is_refusal false.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_seen, "stop_reason_seen must be true");
+        assert!(!state.stop_reason_is_refusal, "stop_reason_is_refusal must be false for end_turn");
+    }
+
+    #[test]
+    fn outcome_refusal_when_stop_reason_is_refusal() {
+        // Test 3: classify returns Refusal when stop_reason_is_refusal=true and not cancelled.
+        let content = vec![json!({"type": "text", "text": "some content"})];
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "classify must return Refusal when stop_reason_is_refusal=true, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_refusal_discards_partial_content() {
+        // Test 4: even with non-empty accumulated content, classify returns
+        // Refusal (not Done) — content is consumed by take() and dropped.
+        let content = vec![json!({"type": "text", "text": "partial answer"})];
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "partial content must not produce Done when refusal flag set, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_refusal_cancelled_downgrades_to_done() {
+        // Test 5: a cancelled stream with refusal flag must downgrade to Done,
+        // not Refusal — don't burn retry budget after user cancels.
+        let r = classify_stream_outcome(None, vec![], true, true, true);
+        assert!(
+            matches!(r, StreamOutcome::Done(_)),
+            "cancelled refusal must downgrade to Done, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn config_refusal_retries_default_is_2() {
+        // Test 6: SynapsConfig default must set refusal_retries = 2.
+        use crate::core::config::SynapsConfig;
+        let config = SynapsConfig::default();
+        assert_eq!(config.refusal_retries, 2, "default refusal_retries must be 2");
+    }
+
+    #[test]
+    fn config_refusal_retries_parsed_from_file() {
+        // Test 7: load_config() parses "refusal_retries = 5" from the config file.
+        // Uses SYNAPS_BASE_DIR to point load_config at a temp dir (no HOME mutation).
+        use agent_core::config::load_config;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Config file is <base_dir>/config (no extension).
+        std::fs::write(dir.path().join("config"), b"refusal_retries = 5\n").expect("write");
+        let prev = std::env::var("SYNAPS_BASE_DIR").ok();
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().to_str().unwrap());
+        let config = load_config();
+        match prev {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert_eq!(config.refusal_retries, 5, "refusal_retries must parse from config file");
+    }
+
+    #[test]
+    fn refusal_in_stream_sets_flag_end_to_end() {
+        // Test 8: full SSE fixture through process_data_line.
+        // After finalize(): stop_reason_is_refusal == true.
+        // classify_stream_outcome returns Refusal.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I cannot"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_is_refusal, "end-to-end: refusal flag must survive full event sequence");
+        let content = std::mem::take(&mut state.accumulated_content);
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "end-to-end: classify must return Refusal after realistic fixture, got {r:?}"
+        );
+    }
+
 }
