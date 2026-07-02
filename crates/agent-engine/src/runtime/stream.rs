@@ -27,6 +27,7 @@ pub(super) struct StreamSession {
     pub(super) token_cache: crate::auth::TokenCache,
     pub(super) options: super::api::ApiOptions,
     pub(super) api_retries: u32,
+    pub(super) refusal_retries: u32,
 
     // Model config
     pub(super) model: String,
@@ -82,6 +83,7 @@ impl StreamMethods {
             token_cache,
             options,
             api_retries,
+            refusal_retries,
             model,
             tools,
             system_prompt,
@@ -188,6 +190,7 @@ impl StreamMethods {
                 tx.clone(),
                 &cancel,
                 api_retries,
+                refusal_retries,
                 &options,
                 telemetry_level,
             )
