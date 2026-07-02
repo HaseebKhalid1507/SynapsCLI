@@ -57,9 +57,9 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   `replace` wins and stops the chain (later handlers are skipped). Use it for
   compression, redaction, or summarization. Notes:
   - The `tool_output` delivered in the event is a **size-limited preview** for
-    large outputs — a ~32 KB prefix plus a `…[truncated, N total bytes]` marker,
-    so it can slightly exceed 32 KB. A transform decides on this preview, not
-    the full bytes.
+    large outputs — up to 256 KB (`MAX_HOOK_OUTPUT = 256 * 1024`, matching
+    `max_tool_buffer`) plus a `…[truncated, N total bytes]` marker when the
+    output exceeds that cap. A transform decides on this preview, not the full bytes.
   - A malformed `replace` (missing/invalid `output`) or a crashed/timed-out
     handler is fail-safe: the **original output is preserved unchanged**.
   - `replace` does **not** clear the `is_error` flag — replacing the content of
