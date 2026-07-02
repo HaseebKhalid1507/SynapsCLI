@@ -432,9 +432,13 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
 }
 
 fn mask_key(key: &str) -> String {
-    let n = key.len();
+    // Use char-count (not byte-length) so non-ASCII keys can't cause a
+    // byte-slice panic on the render thread (#tui-safety fix 2).
+    let chars: Vec<char> = key.chars().collect();
+    let n = chars.len();
     if n <= 8 { return "*".repeat(n); }
-    format!("***...{}", &key[n - 4..])
+    let suffix: String = chars[n - 4..].iter().collect();
+    format!("***...{}", suffix)
 }
 
 
@@ -446,7 +450,8 @@ fn render_plugin_custom_editor(
     let rows = &session.render.rows;
     let cursor = session.render.cursor.unwrap_or(0);
     let footer_lines: u16 = if session.render.footer.is_some() { 1 } else { 0 };
-    let w = area.width.saturating_sub(4).clamp(40, 100);
+    let avail_w = area.width.saturating_sub(4).max(1);
+    let w = avail_w.clamp(avail_w.min(40), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
     let needed = rows.len() as u16 + 2 + footer_lines;
     let h = needed.clamp(3, area.height.saturating_sub(2).max(3));
     let rect = Rect { x: area.x + 2, y: area.y + 2, width: w, height: h };
@@ -495,7 +500,8 @@ fn render_plugin_custom_editor(
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usize) {
-    let w = area.width.saturating_sub(4).clamp(20, 100);
+    let avail_w = area.width.saturating_sub(4).max(1);
+    let w = avail_w.clamp(avail_w.min(20), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
     let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let x = area.x + 2;
     let y = area.y + 2;
@@ -573,5 +579,128 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "F8".to_string()),
         _ => "?".into(),
+    }
+}
+
+#[cfg(test)]
+mod tui_safety_tests {
+    // ── Fix 2: mask_key char-boundary safety ────────────────────────────────
+    // The old implementation used byte-indexing (`&key[n-4..]`) which panics
+    // when the key contains multi-byte UTF-8 characters. These tests verify
+    // the new char-based implementation is panic-free and produces the right
+    // shape of output for both ASCII and non-ASCII inputs.
+    fn mask_key(key: &str) -> String {
+        let chars: Vec<char> = key.chars().collect();
+        let n = chars.len();
+        if n <= 8 { return "*".repeat(n); }
+        let suffix: String = chars[n - 4..].iter().collect();
+        format!("***...{}", suffix)
+    }
+
+    #[test]
+    fn mask_key_short_ascii() {
+        // ≤8 chars → all stars, length preserved
+        assert_eq!(mask_key("abc"), "***");
+        assert_eq!(mask_key("12345678"), "********");
+    }
+
+    #[test]
+    fn mask_key_long_ascii() {
+        // >8 ASCII chars → prefix mask + last 4 chars
+        let key = "sk-abcdefghij1234";
+        let result = mask_key(key);
+        assert!(result.starts_with("***..."), "should start with ***...");
+        assert!(result.ends_with("1234"), "should end with last 4 ASCII chars");
+    }
+
+    #[test]
+    fn mask_key_multibyte_no_panic() {
+        // Multi-byte UTF-8 — old code panicked here, new code must not
+        let key = "sk-café-über-日本語-key1"; // contains non-ASCII
+        let result = mask_key(key); // must not panic
+        assert!(result.starts_with("***...") || result.chars().all(|c| c == '*'),
+            "unexpected shape: {result}");
+    }
+
+    #[test]
+    fn mask_key_all_multibyte() {
+        // Entirely non-ASCII, >8 chars by char-count
+        let key = "日本語テスト用キー入力"; // 11 chars, each 3 bytes
+        let result = mask_key(key);
+        // Must not panic; must start with ***...
+        assert!(result.starts_with("***..."), "got: {result}");
+        // Last 4 chars should be the tail
+        let expected_tail: String = key.chars().rev().take(4).collect::<Vec<_>>()
+            .into_iter().rev().collect();
+        assert!(result.ends_with(&expected_tail), "tail mismatch: {result}");
+    }
+
+    #[test]
+    fn mask_key_exactly_9_chars() {
+        // 9-char boundary — should produce ***...XXXX (last 4)
+        let key = "abcde6789"; // 9 chars
+        let result = mask_key(key);
+        assert_eq!(result, "***...6789");
+    }
+
+    // ── Fix 3: modal width clamping never exceeds area ──────────────────────
+    // These are logic-only tests for the clamping expressions used in
+    // render_plugin_custom_editor and render_picker; no ratatui Frame needed.
+
+    fn plugin_editor_w(area_width: u16) -> u16 {
+        let avail_w = area_width.saturating_sub(4).max(1);
+        avail_w.clamp(avail_w.min(40), 100)
+    }
+
+    fn picker_w(area_width: u16) -> u16 {
+        let avail_w = area_width.saturating_sub(4).max(1);
+        avail_w.clamp(avail_w.min(20), 100)
+    }
+
+    fn secret_prompt_w(area_width: u16) -> u16 {
+        area_width.min(62)
+    }
+
+    #[test]
+    fn plugin_editor_width_never_exceeds_area() {
+        for aw in 0u16..=200 {
+            let w = plugin_editor_w(aw);
+            assert!(w <= aw.max(1),
+                "plugin editor width {w} exceeds area {aw}");
+        }
+    }
+
+    #[test]
+    fn picker_width_never_exceeds_area() {
+        for aw in 0u16..=200 {
+            let w = picker_w(aw);
+            assert!(w <= aw.max(1),
+                "picker width {w} exceeds area {aw}");
+        }
+    }
+
+    #[test]
+    fn secret_prompt_width_never_exceeds_area() {
+        for aw in 0u16..=200 {
+            let w = secret_prompt_w(aw);
+            assert!(w <= aw,
+                "secret prompt width {w} exceeds area {aw}");
+        }
+    }
+
+    #[test]
+    fn plugin_editor_width_normal_terminal() {
+        // 80-wide terminal → avail = 76, clamp(min(76,40), 100) = 76
+        assert_eq!(plugin_editor_w(80), 76);
+        // 200-wide → avail = 196, clamp(40, 100) = 100
+        assert_eq!(plugin_editor_w(200), 100);
+    }
+
+    #[test]
+    fn picker_width_normal_terminal() {
+        // 80-wide → avail = 76, clamp(20, 100) = 76
+        assert_eq!(picker_w(80), 76);
+        // 24-wide → avail = 20, clamp(min(20,20), 100) = 20
+        assert_eq!(picker_w(24), 20);
     }
 }

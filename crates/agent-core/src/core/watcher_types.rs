@@ -65,7 +65,7 @@ pub struct AgentInfo {
 }
 
 /// Trigger-specific configuration (for watch, cron, webhook modes)
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TriggerConfig {
     /// Directories to watch (watch mode)
     #[serde(default)]
@@ -76,6 +76,16 @@ pub struct TriggerConfig {
     /// Seconds to wait for writes to settle before triggering
     #[serde(default = "default_debounce")]
     pub debounce_secs: u64,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            patterns: Vec::new(),
+            debounce_secs: default_debounce(),
+        }
+    }
 }
 
 fn default_debounce() -> u64 { 3 }
@@ -376,5 +386,23 @@ paths = ["/tmp/inbox"]
         assert_eq!(limits.max_session_duration_mins, 60);
         assert_eq!(limits.cooldown_secs, 10);
         assert_eq!(limits.max_retries, 3);
+    }
+
+    /// BUG-2 regression: `#[derive(Default)]` on TriggerConfig gives
+    /// `debounce_secs = 0` (u64::default) instead of the correct 3 sec value
+    /// set by `default_debounce()`.  When a TOML has no `[trigger]` table,
+    /// serde uses `TriggerConfig::default()` and the agent fires on every
+    /// partial write (0 debounce = immediate trigger).
+    /// The fix: hand-write `impl Default for TriggerConfig` like sibling structs.
+    #[test]
+    fn test_trigger_config_default_debounce_is_3() {
+        let trigger = TriggerConfig::default();
+        assert_eq!(
+            trigger.debounce_secs,
+            default_debounce(),
+            "TriggerConfig::default() must use default_debounce() ({}), got {}",
+            default_debounce(),
+            trigger.debounce_secs,
+        );
     }
 }

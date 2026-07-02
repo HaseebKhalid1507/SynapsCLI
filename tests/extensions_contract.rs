@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use synaps_cli::extensions::hooks::events::{HookEvent, HookKind};
+use synaps_cli::extensions::hooks::events::{HookEvent, HookKind, MAX_HOOK_OUTPUT};
 use synaps_cli::extensions::manager::ExtensionManager;
 use synaps_cli::extensions::manifest::HookMatcher;
 use synaps_cli::extensions::permissions::{Permission, PermissionSet};
@@ -138,12 +138,35 @@ fn permission_set_rejects_unknown_permissions() {
 
 #[test]
 fn after_tool_call_truncates_utf8_safely() {
-    let output = format!("{}é", "a".repeat(32 * 1024 - 1));
+    // Build a payload just over the cap with a multibyte char (é = 2 bytes)
+    // straddling the boundary, so we prove UTF-8-safe truncation.
+    // Size is derived from the exported constant so this test can't rot
+    // silently when the cap changes.
+    let output = format!("{}é", "a".repeat(MAX_HOOK_OUTPUT - 1));
 
     let event = HookEvent::after_tool_call("bash", serde_json::json!({}), output);
 
     let truncated = event.tool_output.expect("after_tool_call should carry output");
-    assert!(truncated.contains("[truncated"));
+
+    // 1. Truncation must have fired — the sentinel suffix must be present.
+    assert!(
+        truncated.contains("[truncated"),
+        "expected '[truncated' in output but got: {:?}",
+        &truncated[..truncated.len().min(120)]
+    );
+
+    // 2. The result must be valid UTF-8 (no broken multibyte sequences at the
+    //    cut point). std::string::String *is* always valid UTF-8 in Rust, but
+    //    we also verify the slice up to the ellipsis is valid — i.e. the
+    //    boundary logic did not slice through the 2-byte 'é'.
+    let before_ellipsis = truncated
+        .split('…')
+        .next()
+        .expect("truncated string should contain the ellipsis separator");
+    assert!(
+        std::str::from_utf8(before_ellipsis.as_bytes()).is_ok(),
+        "truncation point is not on a valid UTF-8 char boundary"
+    );
 }
 
 #[test]

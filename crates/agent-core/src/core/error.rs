@@ -44,7 +44,7 @@ pub fn humanize_api_error_with_reset(status: u16, body: &str, reset_hint: Option
         });
     let detail = api_msg.unwrap_or_else(|| {
         let trimmed = body.trim();
-        if trimmed.len() > 200 { format!("{}…", &trimmed[..200]) } else { trimmed.to_string() }
+        if trimmed.len() > 200 { format!("{}…", crate::truncate_str(trimmed, 200)) } else { trimmed.to_string() }
     });
 
     match status {
@@ -128,6 +128,27 @@ mod tests {
         let long_body = "x".repeat(500);
         let msg = humanize_api_error(418, &long_body);
         assert!(msg.len() < 300, "not truncated: {} chars", msg.len());
+    }
+
+    /// BUG-1 regression: byte-slicing at offset 200 panics when a multibyte
+    /// char (e.g. the 4-byte emoji 🔥) straddles that boundary.
+    /// Craft a body where the emoji starts at byte 198 (i.e. bytes 198-201),
+    /// so `&trimmed[..200]` would land in the middle of a char → panic.
+    /// The fixed code must NOT panic and must truncate cleanly at a char boundary.
+    #[test]
+    fn test_humanize_multibyte_boundary_no_panic() {
+        // 198 ASCII bytes + 🔥 (4 bytes, positions 198-201) + filler to exceed 200 total
+        let body = format!("{}{}{}", "a".repeat(198), "🔥", "b".repeat(100));
+        assert!(body.len() > 200, "precondition: body must exceed 200 bytes");
+        // This must NOT panic — the bug causes a panic on unpatched code
+        let msg = humanize_api_error(418, &body);
+        // The result must be valid UTF-8 (it's a &str / String, always is if no panic)
+        // and must contain the truncated prefix (not the raw emoji bytes mid-char)
+        assert!(msg.contains("418"), "status should appear: {msg}");
+        // The body portion forwarded must be ≤ 200 bytes (emoji trimmed at boundary)
+        // After truncation at 198 bytes (the last safe boundary before 200), we get
+        // 198 'a's — confirm no garbled bytes leaked through
+        assert!(!msg.contains('\u{FFFD}'), "replacement char leaked: {msg}");
     }
 
     #[test]

@@ -164,6 +164,18 @@ fn save_provider_auth_at(
     Ok(())
 }
 
+/// Test-only re-export of `save_provider_auth_at` so that `token::tests`
+/// can exercise the same function `ensure_fresh_token` now delegates to,
+/// without making the path-explicit variant part of the public API.
+#[cfg(test)]
+pub(super) fn save_provider_auth_at_test_hook(
+    path: &std::path::Path,
+    provider: &str,
+    creds: &OAuthCredentials,
+) -> std::result::Result<(), String> {
+    save_provider_auth_at(path, provider, creds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
