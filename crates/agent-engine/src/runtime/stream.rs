@@ -371,7 +371,7 @@ impl StreamMethods {
                                         }) => {
                                             let output = match res {
                                                 Ok(output) => output,
-                                                Err(e) => format!("Tool execution failed: {}", e),
+                                                Err(e) => e.to_string(),
                                             };
                                             let output = emit_after_tool_call(
                                                 &hook_bus,
@@ -428,7 +428,7 @@ impl StreamMethods {
                                     tool_id: tid.clone(),
                                     result: err.clone(),
                                 }));
-                                (tid, false, format!("Tool execution failed: {}", err))
+                                (tid, false, err)
                             });
                             continue;
                         }
@@ -491,7 +491,7 @@ impl StreamMethods {
                                         }) => {
                                             let output = match res {
                                                 Ok(output) => output,
-                                                Err(e) => format!("Tool execution failed: {}", e),
+                                                Err(e) => e.to_string(),
                                             };
                                             let output = emit_after_tool_call(
                                                 &hook_bus_inner,

@@ -698,7 +698,7 @@ impl Runtime {
                                     let input_for_hook = input.clone();
                                     let output = match tool.execute(input, ctx).await {
                                         Ok(output) => output,
-                                        Err(e) => format!("Tool execution failed: {}", e),
+                                        Err(e) => e.to_string(),
                                     };
                                     let output = emit_after_tool_call(
                                         &self.hook_bus,
@@ -808,7 +808,7 @@ impl Runtime {
                                             let input_for_hook = input.clone();
                                             let output = match t.execute(input, ctx).await {
                                                 Ok(output) => output,
-                                                Err(e) => format!("Tool execution failed: {}", e),
+                                                Err(e) => e.to_string(),
                                             };
                                             let output = crate::runtime::emit_after_tool_call(
                                                 &hook_bus_inner,
