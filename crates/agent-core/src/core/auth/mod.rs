@@ -88,11 +88,19 @@ pub(crate) fn now_millis() -> u64 {
     crate::epoch_millis()
 }
 
-/// Try to parse manual input as a redirect URL or raw code.
+/// Try to parse manual input as a redirect URL or code#state shorthand.
+///
+/// Returns `(Some(code), Some(state))` only when both components are present
+/// and unambiguous. The `None` state path has been intentionally removed:
+/// previously the caller defaulted a missing state to the expected value
+/// (`parsed_state.unwrap_or(manual_state)`), which made the downstream
+/// `result.state != state` check compare a value against itself — CSRF
+/// protection silently nullified. By never returning `Some(code)` without
+/// `Some(state)`, the CSRF guard is guaranteed to do real work.
 fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
     let trimmed = input.trim();
 
-    // Try as full URL
+    // Try as full URL (e.g. the redirect from the browser)
     if let Ok(url) = url::Url::parse(trimmed) {
         let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string());
         let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
@@ -109,12 +117,24 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
         }
     }
 
-    // Treat as raw code
-    if !trimmed.is_empty() {
-        return (Some(trimmed.to_string()), None);
-    }
-
+    // Bare code with no state: REJECTED. Accepting it and defaulting the state
+    // to `manual_state` would cause the CSRF check to compare a value to itself.
+    // The caller (`manual_paste_to_callback`) will return `None` for this input.
     (None, None)
+}
+
+/// Validate user-pasted OAuth authorization input for the Anthropic manual
+/// fallback flow.
+///
+/// Returns `Some(CallbackResult)` only if the input contains BOTH a `code`
+/// and a `state`. Previously the caller defaulted a missing `state` to the
+/// original CSRF token (`parsed_state.unwrap_or(manual_state)`), which
+/// silently bypassed the CSRF check — the state comparison became
+/// `manual_state == state` (always true). By requiring an explicit state
+/// here, a bare code paste or a URL without `state` is rejected outright.
+fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
+    let (code, state) = parse_manual_input(input);
+    Some(CallbackResult { code: code?, state: state? })
 }
 
 // ── High-level login flow ───────────────────────────────────────────────────
@@ -145,9 +165,8 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 
     // Also provide manual paste option
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
-    let manual_state = state.clone();
     let stdin_task = tokio::spawn(async move {
-        eprintln!("\x1b[2mOr paste the authorization code here:\x1b[0m");
+        eprintln!("\x1b[2mOr paste the redirect URL here (must include `state`):\x1b[0m");
 
         let mut line = String::new();
         let result = tokio::task::spawn_blocking(move || {
@@ -157,14 +176,19 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
         .await;
 
         if let Ok(input) = result {
-            if !input.is_empty() {
-                let (code, parsed_state) = parse_manual_input(&input);
-                if let Some(code) = code {
-                    let _ = manual_tx.send(CallbackResult {
-                        code,
-                        state: parsed_state.unwrap_or(manual_state),
-                    });
+            match manual_paste_to_callback(&input) {
+                Some(callback) => {
+                    let _ = manual_tx.send(callback);
                 }
+                None if !input.is_empty() => {
+                    eprintln!(
+                        "\x1b[31m✗ Pasted input did not contain both `code` and `state`.\x1b[0m"
+                    );
+                    eprintln!(
+                        "\x1b[2m  Paste the full redirect URL (e.g. http://localhost:53692/callback?code=…&state=…).\x1b[0m"
+                    );
+                }
+                None => {}
             }
         }
     });
@@ -206,6 +230,11 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 
     Ok(creds)
 }
+
+// ── Anthropic-specific CSRF regression tests ─────────────────────────────────
+//
+// See also: openai_codex::tests for the parallel codex test suite.
+// These mirror the codex tests — same invariants, same naming pattern.
 
 #[cfg(test)]
 mod tests {
@@ -361,5 +390,65 @@ mod tests {
         assert_eq!(original_creds.refresh, deserialized_creds.refresh);
         assert_eq!(original_creds.access, deserialized_creds.access);
         assert_eq!(original_creds.expires, deserialized_creds.expires);
+    }
+
+    // ── manual_paste_to_callback: CSRF guard on the Anthropic manual paste path ──
+    //
+    // Mirrors the regression suite in openai_codex::tests (manual_paste_to_callback).
+    // Pre-fix: parse_manual_input returned (Some(code), None) for bare codes,
+    // and the caller did `parsed_state.unwrap_or(manual_state)`, making the
+    // CSRF check `manual_state == state` — always true — bypass.
+    // Fix: removed bare-code fallback from parse_manual_input + extracted
+    // manual_paste_to_callback that requires both code AND state.
+
+    #[test]
+    fn anthropic_manual_paste_accepts_full_redirect_url() {
+        let result = manual_paste_to_callback(
+            "http://localhost:53692/callback?code=abc&state=xyz",
+        )
+        .expect("URL with code+state must be accepted");
+        assert_eq!(result.code, "abc");
+        assert_eq!(result.state, "xyz");
+    }
+
+    #[test]
+    fn anthropic_manual_paste_rejects_bare_code() {
+        // CSRF regression: a bare code with no state was previously defaulted
+        // to `manual_state`, making the CSRF check trivially true.
+        assert!(
+            manual_paste_to_callback("abc123_bare_code").is_none(),
+            "bare code with no state must be rejected — was the root of the CSRF bypass"
+        );
+    }
+
+    #[test]
+    fn anthropic_manual_paste_rejects_url_without_state() {
+        assert!(
+            manual_paste_to_callback("http://localhost:53692/callback?code=abc").is_none(),
+            "URL missing `state` must be rejected — would bypass CSRF check"
+        );
+    }
+
+    #[test]
+    fn anthropic_manual_paste_accepts_code_hash_state() {
+        // "code#state" is the Claude Code shorthand; both components explicit.
+        let result = manual_paste_to_callback("mycode#mystate")
+            .expect("code#state shorthand must be accepted");
+        assert_eq!(result.code, "mycode");
+        assert_eq!(result.state, "mystate");
+    }
+
+    #[test]
+    fn anthropic_manual_paste_rejects_empty_input() {
+        assert!(manual_paste_to_callback("").is_none());
+        assert!(manual_paste_to_callback("   ").is_none());
+    }
+
+    #[test]
+    fn anthropic_manual_paste_rejects_url_with_only_state() {
+        assert!(
+            manual_paste_to_callback("http://localhost:53692/callback?state=xyz").is_none(),
+            "URL missing `code` must be rejected"
+        );
     }
 }
