@@ -215,7 +215,15 @@ pub async fn run(
             // would produce layout artifacts.
             let term_size = match crossterm::terminal::size() {
                 Ok((w, h)) if w > 0 && h > 0 => ratatui::layout::Size { width: w, height: h },
-                _ => continue,
+                _ => {
+                    // Terminal not yet ready or transient resize — clear redraw
+                    // flags and back off so we don't busy-spin when the size is
+                    // 0×0 or the syscall fails (#tui-safety fix 1).
+                    app.needs_redraw = false;
+                    app.force_redraw = false;
+                    last_draw = Instant::now();
+                    continue;
+                }
             };
             app.needs_redraw = false;
             app.force_redraw = false;

@@ -1567,7 +1567,7 @@ pub(crate) fn render_frame(
         // ── Secret prompt modal ───────────────────────────────────────────────
         if let Some(ref prompt) = model.secret_prompt {
             let area = frame.area();
-            let width = area.width.clamp(30, 62);
+            let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
             let height = 7u16;
             let x = area.x + area.width.saturating_sub(width) / 2;
             let y = area.y + area.height.saturating_sub(height) / 2;
