@@ -225,6 +225,7 @@ pub struct SynapsConfig {
     pub bash_max_timeout: u64,         // default 300
     pub subagent_timeout: u64,         // default 300
     pub api_retries: u32,              // default 3
+    pub refusal_retries: u32,          // default 2 — retries on stop_reason=refusal
     pub telemetry: String,             // off | basic | full (default off)
     pub cache_diagnostics: bool,       // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
@@ -265,6 +266,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             api_retries: 3,
+            refusal_retries: 2,
             telemetry: "off".to_string(),
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
@@ -290,7 +292,7 @@ impl Default for SynapsConfig {
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model", "thinking", "compaction_model", "context_window", "max_tool_output",
-    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries",
+    "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries", "refusal_retries",
     "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "theme", "agent_name", "identity",
     "disabled_plugins", "favorite_models", "disabled_skills", "disabled_tools",
 ];
@@ -545,6 +547,11 @@ pub fn load_config() -> SynapsConfig {
             "api_retries" => {
                 if let Ok(retries) = val.parse::<u32>() {
                     config.api_retries = retries;
+                }
+            }
+            "refusal_retries" => {
+                if let Ok(retries) = val.parse::<u32>() {
+                    config.refusal_retries = retries;
                 }
             }
             "telemetry" => config.telemetry = val.to_string(),

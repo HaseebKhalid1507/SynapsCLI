@@ -54,17 +54,19 @@ pub async fn run(
         }
     }
 
-    // Extension discovery
+    // Extension discovery — await completion before entering the read loop.
+    //
+    // In pipe/headless mode (echo "..." | synaps chat ...) stdin is immediately
+    // ready, so the old fire-and-forget approach caused a race: the first API
+    // call fired before extension processes finished spawning, and the model
+    // never saw extension-registered tools (e.g. get_weather). Awaiting here
+    // ensures all extensions are loaded and their tools are registered in the
+    // ToolRegistry before we read stdin and send the first message to the API.
+    //
+    // The TUI is unaffected — it has its own extension loader path that runs
+    // concurrently with the event loop (human typing provides natural latency).
     if !boot.no_extensions {
-        let (loader_tx, mut loader_rx) = tokio::sync::mpsc::unbounded_channel();
-        synaps_cli::extensions::loader::spawn_discover_and_load(
-            std::sync::Arc::clone(&boot.ext_manager),
-            loader_tx,
-        );
-        // Drain loader events in the background — prevents SendError crash
-        tokio::spawn(async move {
-            while loader_rx.recv().await.is_some() {}
-        });
+        boot.ext_manager.write().await.discover_and_load().await;
     }
 
     eprintln!("synaps {} | {} | session {}", 

@@ -13,6 +13,13 @@ use serde_json::Value;
 
 use crate::extensions::permissions::Permission;
 
+/// Maximum hook output size (bytes) before truncation on the JSON-RPC path.
+/// Matches `max_tool_buffer` (256 KB) — keeps the payload bounded while still
+/// giving transform extensions the full buffered output to work with.
+/// Exported so tests can build payloads that derive from the real cap and
+/// won't rot when the constant changes.
+pub const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB
+
 // ── HookKind ──────────────────────────────────────────────────────────────────
 
 /// All hook event kinds in the phase-1 catalog.
@@ -189,7 +196,6 @@ impl HookEvent {
     /// truncation to `max_tool_output` happens AFTER the hook in
     /// `emit_after_tool_call` (compress-then-truncate).
     pub fn after_tool_call(tool_name: &str, input: Value, output: String) -> Self {
-        const MAX_HOOK_OUTPUT: usize = 256 * 1024; // 256 KB — matches max_tool_buffer
         let truncated_output = if output.len() > MAX_HOOK_OUTPUT {
             let boundary = output
                 .char_indices()

@@ -89,6 +89,10 @@ struct ParseState {
     /// `classify_stream_outcome` can tell a valid empty `end_turn` from a silent
     /// stop even in the default (telemetry-off) config.
     stop_reason_seen: bool,
+    /// True when the captured stop_reason is exactly "refusal" — the model
+    /// declined the request. Used by `classify_stream_outcome` to gate the
+    /// refusal-retry path independently of the telemetry flag.
+    stop_reason_is_refusal: bool,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -124,6 +128,9 @@ enum StreamOutcome {
     Retry(String),
     /// A terminal failure — surface as a visible `Err`, never a silent stop.
     Fail(String),
+    /// The model set stop_reason=refusal — discard all partial content and
+    /// retry the identical request (up to the refusal_retries budget).
+    Refusal,
 }
 
 impl ParseState {
@@ -152,6 +159,7 @@ impl ParseState {
             usage_emitted: false,
             stream_error: None,
             stop_reason_seen: false,
+            stop_reason_is_refusal: false,
         }
     }
 
@@ -343,6 +351,9 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             // decision must NOT depend on whether telemetry is enabled (default off).
             if let Some(sr) = delta.and_then(|d| d.stop_reason) {
                 state.stop_reason_seen = true;
+                if sr.as_ref() == "refusal" {
+                    state.stop_reason_is_refusal = true;
+                }
                 if ctx.telemetry_level.enabled() {
                     state.telem_stop_reason = Some(sr.into_owned());
                 }
@@ -554,6 +565,9 @@ fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
 ///   * An in-stream `error` event → `Retry` (transient class) or `Fail`
 ///     (terminal class, e.g. `request_too_large` context overflow). A user
 ///     cancellation downgrades any error to a clean (empty) `Done`.
+///   * stop_reason=refusal → `Refusal`: ALL accumulated content discarded,
+///     caller retries up to `refusal_retries` budget with a short delay.
+///     Refusal on a cancelled stream downgrades to `Done` (don't fight cancel).
 ///   * A degenerate empty stream (no content AND no stop_reason) that was NOT
 ///     cancelled → `Fail`. An empty streamed response with no stop reason is
 ///     never valid; swallowing it as an empty assistant turn is exactly what
@@ -564,6 +578,7 @@ fn classify_stream_outcome(
     stream_error: Option<StreamError>,
     content: Vec<Value>,
     has_stop_reason: bool,
+    stop_reason_is_refusal: bool,
     cancelled: bool,
 ) -> StreamOutcome {
     if let Some(e) = stream_error {
@@ -577,6 +592,11 @@ fn classify_stream_outcome(
         } else {
             StreamOutcome::Fail(e.message)
         };
+    }
+    // Refusal: model ended the stream cleanly but declined the request.
+    // DISCARD all partial content — nothing partial may enter history.
+    if stop_reason_is_refusal && !cancelled {
+        return StreamOutcome::Refusal;
     }
     if !cancelled && content.is_empty() && !has_stop_reason {
         return StreamOutcome::Fail(
@@ -612,6 +632,12 @@ pub struct ApiOptions {
     pub credential_source: crate::auth::CredentialSource,
     /// Shared broker token cache (Remote only).
     pub token_cache: crate::auth::TokenCache,
+    /// Override the Anthropic API base URL. In production always `None`, which
+    /// causes the code to read `SYNAPS_ANTHROPIC_BASE_URL` from the environment
+    /// and then fall back to `"https://api.anthropic.com"`.
+    /// Set by tests to point at a local mock server without touching env vars.
+    #[doc(hidden)]
+    pub anthropic_base_url: Option<String>,
 }
 
 pub(super) struct ApiMethods;
@@ -628,10 +654,11 @@ impl ApiMethods {
         messages: &[Value],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
+        refusal_retries: u32,
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, options, telemetry_level).await
+        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, refusal_retries, options, telemetry_level).await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -649,6 +676,7 @@ impl ApiMethods {
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
+        refusal_retries: u32,
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
@@ -769,6 +797,7 @@ impl ApiMethods {
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
         let mut non_429_attempts: u32 = 0; // shared server-error budget
+        let mut refusal_attempts: u32 = 0; // refusal-retry budget (separate from error budget)
         let mut attempt: u32 = 0;          // total attempts (for backoff calc)
 
         loop {
@@ -786,8 +815,12 @@ impl ApiMethods {
                 }
 
                 // Rebuild request (consumed on send)
+                let anthropic_base = options.anthropic_base_url.clone()
+                    .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.anthropic.com".into());
+                let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
                 let mut req = client
-                    .post("https://api.anthropic.com/v1/messages")
+                    .post(&anthropic_url)
                     .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
@@ -1013,6 +1046,7 @@ impl ApiMethods {
         // `state.telem_stop_reason` into the record when telemetry is enabled.
         let stream_error = state.stream_error.take();
         let has_stop_reason = state.stop_reason_seen;
+        let stop_reason_is_refusal = state.stop_reason_is_refusal;
         let cancelled = cancel.is_cancelled();
 
 
@@ -1038,6 +1072,7 @@ impl ApiMethods {
                 msg_id: state.telem_msg_id,
                 model: model.to_string(),
                 attempt: attempt + 1, // 1-based: 0 = first try, N = (N+1)th send
+                refusal_retries_used: if refusal_attempts > 0 { Some(refusal_attempts) } else { None },
                 ttft_ms: state.telem_ttft,
                 total_ms: request_start.elapsed().as_millis() as u64,
                 stop_reason: state.telem_stop_reason,
@@ -1058,6 +1093,7 @@ impl ApiMethods {
             stream_error,
             std::mem::take(&mut state.accumulated_content),
             has_stop_reason,
+            stop_reason_is_refusal,
             cancelled,
         ) {
             StreamOutcome::Done(v) => return Ok(v),
@@ -1089,6 +1125,41 @@ impl ApiMethods {
                     return Err(RuntimeError::Canceled);
                 }
                 // fall through to the outer `loop` head: rebuild request + re-stream.
+            }
+            StreamOutcome::Refusal => {
+                // Model declined the request (stop_reason=refusal). Partial
+                // content was already discarded by std::mem::take in classify.
+                // Check budget before sleeping so an immediate exhaustion is
+                // surfaced without a pointless delay.
+                if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                    let msg = format!(
+                        "⚠ model refused the request ({} attempt{})",
+                        refusal_attempts + 1,
+                        if refusal_attempts == 0 { "" } else { "s" }
+                    );
+                    // Surface visible inline notice to TUI (same channel as
+                    // rate-limit notices — renders as a turn-end inline message).
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(msg.clone())));
+                    // Hard-terminate so the turn never silently ends.
+                    return Err(RuntimeError::ApiStatus(msg));
+                }
+                refusal_attempts += 1;
+                attempt += 1;
+                // Fixed 1s delay — refusals are not transient load, exponential
+                // backoff doesn't help. Separate budget from the error budget.
+                let delay = Duration::from_secs(1);
+                tracing::warn!(
+                    "stop_reason=refusal — retrying {}/{} after {:?}",
+                    refusal_attempts, refusal_retries, delay
+                );
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                    format!("⏳ model refusal — retrying ({}/{})…", refusal_attempts, refusal_retries),
+                )));
+                tokio::time::sleep(delay).await;
+                if cancel.is_cancelled() {
+                    return Err(RuntimeError::Canceled);
+                }
+                // fall through to outer `loop` head — fresh request, fresh ParseState
             }
         }
         } // end UNIFIED RETRY LOOP (task #130)
@@ -1858,6 +1929,7 @@ mod tests {
             vec![],
             false,
             false,
+            false,
         );
         assert!(matches!(r, StreamOutcome::Retry(_)), "transient error must retry, got {r:?}");
     }
@@ -1867,6 +1939,7 @@ mod tests {
         let r = classify_stream_outcome(
             Some(StreamError { message: "request_too_large".to_string(), retryable: false }),
             vec![],
+            false,
             false,
             false,
         );
@@ -1879,7 +1952,7 @@ mod tests {
     #[test]
     fn outcome_fails_on_degenerate_empty_stream() {
         // Empty content + no stop_reason + not cancelled = the silent stop.
-        let r = classify_stream_outcome(None, vec![], false, false);
+        let r = classify_stream_outcome(None, vec![], false, false, false);
         match r {
             StreamOutcome::Fail(m) => assert!(
                 m.contains("context window") || m.contains("overloaded"),
@@ -1893,13 +1966,14 @@ mod tests {
     fn outcome_done_when_empty_but_cancelled() {
         // User cancellation legitimately yields empty content — not an error,
         // and never a retry (don't fight the user's cancel).
-        let r = classify_stream_outcome(None, vec![], false, true);
+        let r = classify_stream_outcome(None, vec![], false, false, true);
         assert!(matches!(r, StreamOutcome::Done(_)), "cancellation is a clean Done");
 
         // A cancel during a retryable error must ALSO downgrade to Done.
         let r2 = classify_stream_outcome(
             Some(StreamError { message: "overloaded".to_string(), retryable: true }),
             vec![],
+            false,
             false,
             true,
         );
@@ -1910,14 +1984,14 @@ mod tests {
     fn outcome_done_when_empty_but_has_stop_reason() {
         // A real end_turn with no content (rare but valid — e.g. a pause turn)
         // carries a stop_reason and must pass through.
-        let r = classify_stream_outcome(None, vec![], true, false);
+        let r = classify_stream_outcome(None, vec![], true, false, false);
         assert!(matches!(r, StreamOutcome::Done(_)), "empty-but-stop_reason is valid");
     }
 
     #[test]
     fn outcome_done_passes_content_through() {
         let content = vec![json!({"type":"text","text":"hi"})];
-        let r = classify_stream_outcome(None, content.clone(), true, false);
+        let r = classify_stream_outcome(None, content.clone(), true, false, false);
         match r {
             StreamOutcome::Done(v) => assert_eq!(v["content"], json!(content)),
             other => panic!("non-empty content is always Done, got {other:?}"),
@@ -1933,6 +2007,7 @@ mod tests {
             Some(StreamError { message: "boom".to_string(), retryable: false }),
             content,
             true,
+            false,
             false,
         );
         assert!(matches!(r, StreamOutcome::Fail(_)), "error event wins over partial content");
@@ -2191,5 +2266,346 @@ mod tests {
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0, "no 1h marker in request → silent");
         assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // ── refusal-retry: the 8 spec tests (§8) ──
+
+    #[test]
+    fn refusal_stop_reason_detected_in_parse_state() {
+        // Test 1: feed a message_delta with stop_reason="refusal"
+        // → both stop_reason_seen and stop_reason_is_refusal must be true.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_seen, "stop_reason_seen must be true on refusal");
+        assert!(state.stop_reason_is_refusal, "stop_reason_is_refusal must be true when stop_reason=refusal");
+    }
+
+    #[test]
+    fn non_refusal_stop_reason_does_not_set_refusal_flag() {
+        // Test 2: feed a message_delta with stop_reason="end_turn"
+        // → stop_reason_seen true, stop_reason_is_refusal false.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_seen, "stop_reason_seen must be true");
+        assert!(!state.stop_reason_is_refusal, "stop_reason_is_refusal must be false for end_turn");
+    }
+
+    #[test]
+    fn outcome_refusal_when_stop_reason_is_refusal() {
+        // Test 3: classify returns Refusal when stop_reason_is_refusal=true and not cancelled.
+        let content = vec![json!({"type": "text", "text": "some content"})];
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "classify must return Refusal when stop_reason_is_refusal=true, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_refusal_discards_partial_content() {
+        // Test 4: even with non-empty accumulated content, classify returns
+        // Refusal (not Done) — content is consumed by take() and dropped.
+        let content = vec![json!({"type": "text", "text": "partial answer"})];
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "partial content must not produce Done when refusal flag set, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_refusal_cancelled_downgrades_to_done() {
+        // Test 5: a cancelled stream with refusal flag must downgrade to Done,
+        // not Refusal — don't burn retry budget after user cancels.
+        let r = classify_stream_outcome(None, vec![], true, true, true);
+        assert!(
+            matches!(r, StreamOutcome::Done(_)),
+            "cancelled refusal must downgrade to Done, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn config_refusal_retries_default_is_2() {
+        // Test 6: SynapsConfig default must set refusal_retries = 2.
+        use crate::core::config::SynapsConfig;
+        let config = SynapsConfig::default();
+        assert_eq!(config.refusal_retries, 2, "default refusal_retries must be 2");
+    }
+
+    #[test]
+    fn config_refusal_retries_parsed_from_file() {
+        // Test 7: load_config() parses "refusal_retries = 5" from the config file.
+        // Uses SYNAPS_BASE_DIR to point load_config at a temp dir (no HOME mutation).
+        use agent_core::config::load_config;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Config file is <base_dir>/config (no extension).
+        std::fs::write(dir.path().join("config"), b"refusal_retries = 5\n").expect("write");
+        let prev = std::env::var("SYNAPS_BASE_DIR").ok();
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path().to_str().unwrap());
+        let config = load_config();
+        match prev {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert_eq!(config.refusal_retries, 5, "refusal_retries must parse from config file");
+    }
+
+    #[test]
+    fn refusal_in_stream_sets_flag_end_to_end() {
+        // Test 8: full SSE fixture through process_data_line.
+        // After finalize(): stop_reason_is_refusal == true.
+        // classify_stream_outcome returns Refusal.
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I cannot"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert!(state.stop_reason_is_refusal, "end-to-end: refusal flag must survive full event sequence");
+        let content = std::mem::take(&mut state.accumulated_content);
+        let r = classify_stream_outcome(None, content, true, true, false);
+        assert!(
+            matches!(r, StreamOutcome::Refusal),
+            "end-to-end: classify must return Refusal after realistic fixture, got {r:?}"
+        );
+    }
+
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// on-401 refetch integration tests  (task #157, subtask 9)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Strategy: spin up two tiny axum servers — one that pretends to be Anthropic,
+// one that pretends to be the credential broker.  Point ApiOptions at them via
+// `anthropic_base_url` (test-only seam) + a Remote CredentialSource.
+//
+// This module tests the C1 guard in call_api_stream_inner directly.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod on401_tests {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use tokio::sync::{mpsc, RwLock};
+    use reqwest::Client;
+    use serde_json::json;
+    use axum::{
+        Router,
+        routing::post as axum_post,
+        routing::get as axum_get,
+        http::{StatusCode, HeaderMap},
+        response::IntoResponse,
+    };
+
+    use super::{ApiMethods, ApiOptions};
+    use crate::{ToolRegistry, StreamEvent};
+    use crate::runtime::types::AuthState;
+    use crate::auth::{CredentialSource, TokenCache};
+    use crate::runtime::telemetry::TelemetryLevel;
+
+    // ── minimal SSE body Anthropic would return for a "hello" text turn ──────
+    const SSE_SUCCESS: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// Spawn a mock Anthropic endpoint. Returns (base_url, call_counter).
+    /// Behaviour: first `fail_count` POSTs → 401; subsequent → SSE success.
+    async fn spawn_mock_anthropic(fail_count: usize) -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let app = Router::new()
+            .route("/v1/messages", axum_post(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_count {
+                        (StatusCode::UNAUTHORIZED,
+                         [("content-type", "application/json")],
+                         "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}".to_string()
+                        ).into_response()
+                    } else {
+                        (StatusCode::OK,
+                         [("content-type", "text/event-stream")],
+                         SSE_SUCCESS.to_string()
+                        ).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter)
+    }
+
+    /// Spawn a mock broker that always vends a fresh token.
+    async fn spawn_mock_broker(token: &'static str) -> String {
+        let app = Router::new()
+            .route("/token", axum_get(move |_headers: HeaderMap| async move {
+                // Accept any machine-token for test simplicity
+                (StatusCode::OK,
+                 format!("{{\"access_token\":\"{token}\",\"expires\":9999999999999}}"))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Build an AuthState with the given token pre-loaded (simulates a Remote
+    /// client that already ran refresh_if_needed and cached a token).
+    fn auth_with_token(token: &str) -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: token.to_string(),
+            auth_type: "api_key".to_string(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+        }))
+    }
+
+    fn make_options(base_url: String, source: CredentialSource, cache: TokenCache) -> ApiOptions {
+        ApiOptions {
+            anthropic_base_url: Some(base_url),
+            credential_source: source,
+            token_cache: cache,
+            ..Default::default()
+        }
+    }
+
+    async fn drive_call(
+        auth: Arc<RwLock<AuthState>>,
+        options: ApiOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        let client = Client::new();
+        let tools = ToolRegistry::new();
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "claude-haiku-4-5",   // fast/cheap model name; routing check just does prefix match
+            &tools,
+            &None,                 // system prompt
+            0,                     // thinking_budget
+            &messages,
+            tx,
+            0,                     // max_retries (surface errors fast)
+            0,                     // refusal_retries
+            &options,
+            TelemetryLevel::Off,
+        ).await
+    }
+
+    // ─── T1: Happy path — first call 401, second call succeeds ───────────────
+    // RED: before C1 guard is restored this MUST fail (no retry → error).
+    // GREEN: with C1 guard it retries once with the new token and succeeds.
+    #[tokio::test]
+    async fn on401_remote_retries_once_and_succeeds() {
+        let broker_url = spawn_mock_broker("sk-fresh-token").await;
+        let (anthropic_url, counter) = spawn_mock_anthropic(1).await; // 1 × 401, then SSE
+
+        let source = CredentialSource::Remote {
+            endpoint: broker_url.clone(),
+            machine_token: "machine-tok".into(),
+        };
+        // Pre-seed cache with the STALE token (the one that gets the 401)
+        let cache = TokenCache::new();
+        cache.put("anthropic", crate::auth::BrokerToken {
+            access_token: "sk-stale".into(),
+            expires: 9_999_999_999_999,
+            ttl_ms: None,
+        });
+
+        let auth = auth_with_token("sk-stale");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        // Call must succeed
+        assert!(result.is_ok(), "expected success after retry, got: {:?}", result.err());
+        // Anthropic endpoint was hit exactly twice: once 401, once 200
+        assert_eq!(counter.load(Ordering::SeqCst), 2,
+            "expected exactly 2 calls to Anthropic (1×401 + 1×200)");
+    }
+
+    // ─── T2: Persistent 401 — no infinite loop ────────────────────────────────
+    // Guard fires once: 2nd 401 must surface as a terminal error.
+    // Anthropic endpoint must be called exactly 2 times total (no loop).
+    #[tokio::test]
+    async fn on401_remote_persistent_401_is_terminal_not_loop() {
+        let broker_url = spawn_mock_broker("sk-fresh-but-useless").await;
+        // All calls → 401 (fail_count=999 is effectively "always")
+        let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
+
+        let source = CredentialSource::Remote {
+            endpoint: broker_url,
+            machine_token: "machine-tok".into(),
+        };
+        let cache = TokenCache::new();
+        cache.put("anthropic", crate::auth::BrokerToken {
+            access_token: "sk-stale".into(),
+            expires: 9_999_999_999_999,
+            ttl_ms: None,
+        });
+
+        let auth = auth_with_token("sk-stale");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        // Must be an error (not a success or an infinite retry)
+        assert!(result.is_err(), "expected terminal error on persistent 401");
+        // Exactly 2 upstream calls: original + single retry
+        assert_eq!(counter.load(Ordering::SeqCst), 2,
+            "persistent 401 must cause exactly 2 upstream calls, got {}",
+            counter.load(Ordering::SeqCst));
+    }
+
+    // ─── T3: Local source — 401 is NOT retried (regression guard) ────────────
+    // CredentialSource::Local must NOT trigger the C1 refetch path.
+    // With max_retries=0 the error surfaces immediately after 1 call.
+    #[tokio::test]
+    async fn on401_local_source_does_not_retry() {
+        // Always 401
+        let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
+
+        let source = CredentialSource::Local;
+        let cache = TokenCache::new();
+        let auth = auth_with_token("sk-local-key");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        assert!(result.is_err(), "401 with Local source must be an error");
+        assert_eq!(counter.load(Ordering::SeqCst), 1,
+            "Local source must never retry on 401, got {} calls",
+            counter.load(Ordering::SeqCst));
     }
 }

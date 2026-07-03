@@ -8,20 +8,49 @@
   <a href="https://github.com/HaseebKhalid1507/SynapsCLI/stargazers"><img src="https://img.shields.io/github/stars/HaseebKhalid1507/SynapsCLI?style=flat&color=yellow" alt="Stars"></a>
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/d/synaps?color=orange&label=installs" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/binary-15MB-success.svg" alt="15MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
 </p>
 
 <p align="center">
-  One Rust binary. Any model. Any provider.<br><br>
-  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki"><b>📖 Read the Wiki</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/Installation"><b>⚡ Quick Start</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/FAQ-and-Troubleshooting"><b>❓ FAQ</b></a>
+  A single 15MB Rust binary. No Python. No <code>node_modules</code>. No 400MB Electron shell.<br>
+  Just a fast, multi-agent runtime that lives in your terminal.<br><br>
+  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki"><b>📖 Wiki</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/Installation"><b>⚡ Quick Start</b></a> · <a href="ELI5.md"><b>🧒 ELI5</b></a> · <a href="#-benchmarks"><b>📊 Benchmarks</b></a>
 </p>
 
 ---
 
-<!-- TODO: Replace with demo GIF/video -->
+<!-- TODO: replace with the hero demo GIF (see task #115) — single strong view, high contrast, app not shell -->
 <p align="center">
   <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
 </p>
+
+---
+
+## Why this exists
+
+Every other agent CLI is a Python framework that adds 250ms of overhead per call, or a Node tool that drags a `node_modules` the size of a small OS, or an Electron app pretending to be a terminal tool. They're slow to start, heavy to install, and they abstract so much you can't see what your agent is actually doing.
+
+**Synaps is the opposite.** One compiled Rust binary. It starts in ~2ms, ships as 15MB, runs any model from any provider, and treats agents like what they are — **autonomous programs**, not chat windows. Multiple named agents live in it, work in parallel, and persist across sessions.
+
+If you've ever been annoyed that "an AI CLI" means a heavyweight runtime, this is for you.
+
+---
+
+## 📊 Benchmarks
+
+Cold-start / runtime overhead — the tax every tool pays *before it does any work*:
+
+| command | median | |
+|---|---|---|
+| `synaps --version` (Rust binary) | **2.3 ms** | |
+| `python3 -c pass` (bare interpreter) | 30.2 ms | ~13× slower, importing nothing |
+| `node -e ''` (bare interpreter) | 46.1 ms | ~20× slower, importing nothing |
+
+**synaps fully starts before a Python or Node interpreter finishes launching** — before a single dependency is imported. A LangChain/CrewAI import stacks *hundreds* of ms on top of that floor.
+
+- **15MB single static binary.** No `node_modules`, no venv, no runtime.
+- *Methodology:* 30 runs each, 3 warmups, median reported, `time.perf_counter` around `subprocess.run`. Reproduce with the three commands above. This measures **runtime/startup overhead**, not end-to-end agent latency (that's model-bound — identical across runtimes). The point: the runtime itself adds ~nothing.
 
 ---
 
@@ -32,53 +61,62 @@ cargo install synaps              # crates.io
 ```
 
 <details>
-<summary>More options</summary>
+<summary>More options (brew, AUR, .deb, shell installer, source)</summary>
 
 ```bash
 brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
 yay -S synaps                               # Arch / EndeavourOS
-```
 
-```bash
 # Debian/Ubuntu
 curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
 sudo dpkg -i synaps_amd64.deb
-```
 
-```bash
 # Shell installer (any platform)
 curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
-```
 
-```bash
 # From source
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
 cargo build --release && ./target/release/synaps
 ```
-
 </details>
 
-## Go
+## 60-second start
 
 ```bash
-synaps login                      # OAuth with Claude Pro/Max
-synaps                            # launch
+synaps login                            # OAuth with Claude Pro/Max …
+export GROQ_API_KEY="gsk_..."           # … or any provider key (free tiers work)
+synaps                                   # launch the TUI
+
+# headless — same engine, for scripts/CI/pipes:
+echo "summarize the git diff" | synaps chat
 ```
 
-Or skip OAuth — any API key works:
+Set a key, pick a model, go. Anthropic is native; 17 providers / 55+ models route through an OpenAI-compatible layer — swap mid-session with `/model`.
 
+### Sign in with what you already pay for — or nothing at all
+
+**Claude Pro/Max** (OAuth, no API key):
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."   # or GROQ_API_KEY, CEREBRAS_API_KEY, etc.
-synaps
+synaps login                      # or non-interactive: synaps login --provider claude
 ```
 
-17 providers. 55+ models. Set a key, pick a model, go.
+**ChatGPT Plus/Pro** (OAuth via Codex):
+```bash
+synaps login --provider openai-codex
+synaps                            # then: /model openai-codex/gpt-5.5
+```
+
+**Ollama / local models** (no account, no key, no cloud):
+```bash
+ollama serve                      # LM Studio, vLLM, llama.cpp all work too
+synaps                            # then: /model local/llama3.2
+```
+
+Synaps auto-targets `http://localhost:11434/v1` — Ollama's default — so a running Ollama just works. Point elsewhere with `provider.local.url` in config or the `LOCAL_ENDPOINT` env var.
 
 ---
 
-## What It Looks Like
-
-<!-- TODO: screenshot of TUI with subagent panel -->
+## What it looks like
 
 ```
 ╭ ◈ 4 agents ────────────────────────────────────╮
@@ -89,61 +127,35 @@ synaps
 ╰─────────────────────────────────────────────────╯
 ```
 
-You dispatch agents. They work in parallel. You watch them think.
-
----
-
-## The Pitch
-
-Most CLI agents are single-threaded conversations with a language model. Synaps is a **harness** — a place where multiple named agents live, collaborate, and persist across sessions.
-
-Think of it like LEGO: the **brain** is one piece (talks to AI models), the **tools** are blocks (read files, run commands, search), and **plugins** are stickers you snap on — voice, security, memory, whatever you need. Swap the AI behind it at any time. The cool part isn't *which AI you have* — it's *how cleverly you put your agents together*.
+You dispatch named agents. They work in parallel. You watch them think — and steer them mid-flight.
 
 ```bash
-# Dispatch a named agent with its own personality and tools
-subagent(agent: "spike", task: "refactor the auth module")
+subagent(agent: "spike", task: "refactor the auth module")        # dispatch + wait
 
-# Or dispatch reactively — don't wait, steer mid-flight
-subagent_start(agent: "chrollo", task: "audit this codebase for vulnerabilities")
-subagent_steer(handle_id: "sa_1", message: "focus on the API routes")
-subagent_collect(handle_id: "sa_1")
+subagent_start(agent: "chrollo", task: "audit this codebase")     # dispatch reactive
+subagent_steer(handle_id: "sa_1", message: "focus on the API routes")  # redirect mid-run
+subagent_collect(handle_id: "sa_1")                                # gather when ready
 ```
 
-The big agent dispatches little helper agents — like a chef with sous-chefs. You can poke them mid-task, redirect them, or let them run. And there's a **watcher** that supervises the fleet so they don't crash or burn through your budget.
+Agents aren't anonymous forks — they're crew members with names, system prompts, specializations, and memory. You build a team, not a chatbot. A **watcher** daemon supervises the fleet so they don't crash or blow your budget.
 
-```
-     🤖 Main Agent
-       │ "you chop, you stir, you watch the oven"
-   ┌───┼────┬──────┐
-   🤖   🤖   🤖    🤖
-  spike shady chrollo zero
-```
-
-Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. You build a team, not a chatbot.
-
-*New to AI agents? Read the [ELI5](ELI5.md). Want the full tour? Check the **[Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki)**.*
+*New to agents? → [ELI5](ELI5.md). Full tour → [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) (36 pages).*
 
 ---
 
-## Features
+## What's in the box
 
-**⚡ Fast.** ~81K lines of Rust across a 3-crate workspace. Sub-100ms cold start. Single binary, no runtime dependencies.
+- **⚡ Fast & lean.** ~87K lines of Rust across 3 library crates + a binary crate, 15MB single binary, ~2ms cold start, zero runtime deps.
+- **🌐 Multi-provider.** Anthropic-native + an OpenAI-compatible layer for 17 providers / 55+ models (Groq, Cerebras, NVIDIA NIM, OpenRouter, …) incl. free tiers. `/model` to swap.
+- **🎭 Named agents.** Crew members with souls — dispatch by name, watch in the live panel.
+- **🔄 Reactive orchestration.** dispatch → poll → **steer** → collect. Multi-agent workflows, not fire-and-forget.
+- **🔌 Process-isolated extensions.** JSON-RPC 2.0 over stdio — language-agnostic, crash-isolated, sandboxed. Hook 7 lifecycle events to add guardrails, memory, context injection, anything.
+- **📡 Event bus.** Any script/cron/service can poke a running session — the agent reacts in real time.
+- **🧠 Context that lasts.** 90%+ prompt-cache hit rate; `/compact` checkpoints history; chain sessions across days.
+- **🤖 Autonomous mode.** `synaps watcher` — heartbeats, crash recovery, cost limits, session handoff.
+- **🎨 18 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`… plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
-**🌐 Any model.** Claude, GPT-4, Gemini, Llama, Qwen, Mistral, DeepSeek — 17 providers including free tiers (Groq, Cerebras, NVIDIA NIM). Swap mid-session with `/model`.
-
-**🎭 Named agents.** `spike`, `chrollo`, `shady`, `zero` — each with a soul. Dispatch by name, watch them work in the live panel.
-
-**🔄 Reactive orchestration.** Dispatch → poll → steer → collect. Five tools that turn fire-and-forget into collaborative multi-agent workflows.
-
-**📡 Event bus.** Push events into a running session from any script, cron, or service. The agent reacts in real time.
-
-**🔌 Extensions.** JSON-RPC 2.0 over stdio. Hook into `before_tool_call`, `after_tool_call`, `before_message`, `on_message_complete`, `on_compaction`, `on_session_start`, `on_session_end`. Build guardrails, inject context, modify tool calls, and transform tool output (compression, redaction, summarization).
-
-**🧠 Context that lasts.** 90%+ prompt cache hit rate. `/compact` replaces history with a structured checkpoint. Chain sessions across days.
-
-**🤖 Autonomous mode.** `synaps watcher` supervises long-running agents with heartbeats, crash recovery, cost limits, and session handoff.
-
-**🎨 17 themes.** From `neon-rain` to `tokyo-night`. Hot-swap with `/theme`.
+> **Honest scope:** Synaps is Anthropic-first today — the Anthropic path has the deepest feature support (caching, retry, cost). The OpenAI-compatible path covers everything else and is actively being brought to full parity ([tracking](docs/open-provider-issues.md)). We'd rather tell you that than overclaim.
 
 ---
 
@@ -152,189 +164,80 @@ Agents aren't anonymous forks. They're crew members with names, system prompts, 
 | Command | What it does |
 |---------|-------------|
 | `synaps` | Interactive TUI — streaming, markdown, syntax highlighting, subagent panel |
-| `synaps chat` | Headless — same engine, stdin/stdout. For scripts, pipes, CI |
-| `synaps server` | WebSocket API with token auth, origin validation, streaming |
-| `synaps rpc` | Line-JSON IPC — one process per thread, for bridges (Slack, Discord) |
+| `synaps chat` | Headless — same engine, stdin/stdout. Scripts, pipes, CI |
+| `synaps server` | WebSocket API — token auth, origin validation, streaming |
+| `synaps rpc` | Line-JSON IPC — for bridges (Slack, Discord) |
 | `synaps watcher` | Supervisor daemon for autonomous agent fleets |
-
----
-
-## Tools
-
-18 built-in, zero config:
-
-| | | |
-|---|---|---|
-| `bash` | `read` / `write` / `edit` | `grep` / `find` / `ls` |
-| `subagent` / `subagent_resume` | `subagent_start` / `_status` / `_steer` / `_collect` | `shell_start` / `_send` / `_end` |
-| `connect_mcp_server` | `load_skill` | |
-
-Plus anything from MCP servers. `connect_mcp_server` and they're live.
-
-Need a locked-down agent? Disable any built-in by name in your config:
-`disabled_tools = bash, ls` removes them from the registry at boot, so the model
-never sees them (handy for read-only or no-shell profiles).
-
----
 
 ## Configuration
 
-```
-~/.synaps-cli/config
-```
+No YAML. No TOML. No JSON. `key = value` in `~/.synaps-cli/config`:
 
 ```ini
 model = claude-sonnet-4-6
 thinking = high
-theme = neon-rain
-context_window = 200k
+theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.
-cache_ttl = hybrid          # prompt-cache TTL: 5m (default) | 1h | hybrid
-max_fps = 60                # TUI redraw cap during streaming: 60 (default) | 144 | 240 | …
-disabled_tools = bash, ls   # built-in tools to remove from the registry at boot
-
+disabled_tools = bash, ls          # remove built-ins at boot (read-only profiles)
 provider.groq = gsk_...
-provider.cerebras = csk-...
-
-keybind.F5 = /compact
 ```
 
-That's it. No YAML. No TOML. No JSON. Key = value. Done.
+<details>
+<summary>Advanced: shared-credential broker, bridge mirror, all keys</summary>
 
-### Bridge mirror (optional)
-
-When the bridge daemon (synaps-skills) is running locally, the watcher
-can mirror per-agent heartbeats over its UDS `ControlSocket`
-(`heartbeat_emit` op). Off by default. Enable with:
-
-```ini
-bridge.heartbeat_mirror = true
-# bridge.uds_path = /custom/path/control.sock     # default: ~/.synaps-cli/bridge/control.sock
-# bridge.heartbeat_timeout_ms = 250               # connect+write+read budget
-```
-
-Mirroring is best-effort — the watcher never blocks or fails an agent
-if the bridge UDS is missing. See
-[`docs/smoke/watcher-bridge.md`](docs/smoke/watcher-bridge.md) for the
-verification playbook.
-
-### Shared credentials via a broker (`auth.*`)
-
-By default each machine reads and refreshes its own `~/.synaps-cli/auth.json`
-(`auth.remote_endpoint` unset). To share ONE OAuth credential across many
-machines without copying it to each disk, run a broker on one trusted host and
-point the others at it. Anthropic **and** OpenAI/codex tokens both route through
-the broker.
-
-```ini
-# on a CLIENT machine — fetch short-lived access tokens from the broker
-auth.remote_endpoint = https://broker-host:8181
-auth.machine_token   = <shared-secret>
-# env overrides (win over config): SYNAPS_AUTH_ENDPOINT / SYNAPS_MACHINE_TOKEN
-```
-
-```bash
-# on the BROKER host — holds the credential, refreshes centrally, serves tokens
-synaps auth-broker --bind 0.0.0.0:8181 --machine-token-file /etc/synaps/broker.token
-#   GET /healthz            -> { status }                  (non-200 if cred missing)
-#   GET /token?provider=X   -> { access_token, expires, ttl_ms }  (Bearer machine token)
-```
-
-A Remote client **never stores the credential**: it holds only short-lived
-access tokens in memory, never a refresh token, and never writes `auth.json`.
-The broker is the single refresher (Anthropic rotates the refresh token on every
-refresh, so exactly one party may refresh).
-
-**Token config (note the three env vars):**
-
-| Role | config key | env var |
-|---|---|---|
-| client → broker URL | `auth.remote_endpoint` | `SYNAPS_AUTH_ENDPOINT` |
-| client → its identity to the broker | `auth.machine_token` | `SYNAPS_MACHINE_TOKEN` |
-| broker → secret it requires of clients | `--machine-token` / `--machine-token-file` | `SYNAPS_BROKER_TOKEN` |
-
-Prefer `--machine-token-file` over `--machine-token` so the secret isn't exposed
-in `argv`/`ps`.
-
-**Security model — read before exposing it:**
-- The broker constant-time-compares the machine token, allowlists providers,
-  rate-limits in-flight requests, and refuses to start unauthenticated on a
-  non-loopback bind (override with `--insecure-no-auth`, don't).
-- **TLS is terminated externally** — the broker speaks plain HTTP to stay a lean
-  single static binary. Run it **behind WireGuard** (private overlay) **or front
-  it with a TLS-terminating reverse proxy / load balancer / service mesh.** A
-  bare non-loopback HTTP bind ships your machine token and access tokens in
-  cleartext — a DNS-spoof/MITM then harvests them. Example with Caddy:
-  ```
-  # Caddyfile — terminates TLS, proxies to the loopback broker
-  broker.internal {
-      reverse_proxy 127.0.0.1:8181
-  }
-  ```
-  Then run `synaps auth-broker --bind 127.0.0.1:8181 ...` and point clients at
-  `https://broker.internal`. (systemd unit: `deploy/synaps-auth-broker.service`.)
-
-> **⚠ Terms of Service.** This is for sharing ONE account's credential across
-> **your own** machines (a personal homelab / your own fleet). Sharing a Claude
-> Pro/Max or ChatGPT **subscription seat** across multiple distinct users — or
-> fanning one seat out across a large machine fleet — likely violates Anthropic's
-> / OpenAI's Terms and risks **account suspension**. At real scale use **org/
-> enterprise API keys**, not subscription-seat OAuth. Check the current ToS
-> before deploying beyond your own boxes.
+See the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) for the full config reference, the multi-machine **auth broker** (share one OAuth credential across a fleet over WireGuard/TLS), and the bridge heartbeat mirror.
+</details>
 
 ---
 
-## Extensions & Plugins
+## Extensions
 
-Plugins are like stickers you snap onto your agent — want code guardrails? Stick on a security plugin. Want memory? Stick on a memory plugin. Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot.
-
-Extensions hook into the agent loop via 7 lifecycle events. They can block tool calls, inject context, modify inputs, or just observe. Permission-gated. Sandboxed processes.
+Drop a folder in `~/.synaps-cli/plugins/` — live on next boot:
 
 ```
 ~/.synaps-cli/plugins/my-guard/
-├── .synaps-plugin/
-│   └── plugin.json    # manifest: hooks, permissions, keybinds
-└── index.js           # JSON-RPC 2.0 over stdio
+├── .synaps-plugin/plugin.json    # manifest: hooks, permissions, keybinds
+└── main.py | index.js | <any>    # JSON-RPC 2.0 over stdio — any language
 ```
 
-And anything in the world can poke your agent — monitoring systems, cron jobs, CI pipelines. `synaps send "the website is down" --source uptime-kuma` and your agent wakes up and handles it.
+Because extensions are **separate processes** (not linked code), they're language-agnostic, crash-isolated, and sandboxed. Hook `before_tool_call`, `before_message`, `on_session_start`, and 4 more. Real example: **finlens** — a 6-lens finance research workflow built entirely as an extension, no core changes.
 
-See [docs/extensions/](docs/extensions/) for the protocol spec, or the **[Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki)** for the full documentation — 36 pages covering everything from installation to multi-agent orchestration.
+Protocol spec: [docs/extensions/](docs/extensions/).
+
+---
+
+## Contributing
+
+Synaps is young (started April 2026) and moving fast — **1,300+ commits in its first ~3 months.** Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+
+```bash
+git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
+cargo build && cargo test
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome — the maintainer answers fast.
 
 ---
 
 ## Philosophy
 
-Synaps has opinions:
-
-- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services, not conversations.
-- **Speed is a feature.** If your agent runtime takes 2 seconds to boot, you've already lost the developer who wanted to use it in a git hook.
-- **Multi-agent is the default.** Single-agent is a special case of multi-agent with n=1. The architecture should reflect that.
+- **Agents are not chat.** Autonomous programs that happen to use language models. Treat them like services.
+- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
+- **Multi-agent is the default.** Single-agent is just n=1.
 - **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
-
----
 
 <details>
 <summary><b>Architecture</b></summary>
 
 ```
-src/
-├── main.rs          # CLI dispatch
-├── engine/          # shared boot, commands, stream, session
-├── runtime/         # LLM API + provider router (Anthropic native + OpenAI-compat)
-├── tui/             # terminal UI, themes, settings, plugin modals
-├── tools/           # 18 built-in tools
-├── extensions/      # JSON-RPC extension system
-├── events/          # event bus + priority queue
-├── mcp/             # Model Context Protocol client
-├── watcher/         # autonomous agent supervisor
-├── skills/          # markdown-driven behavioral guidelines
-├── memory/          # local plugin memory store
-└── sidecar/         # long-running plugin companion processes
+crates/
+├── agent-core/      # identity, models, auth, pricing
+├── agent-engine/    # LLM runtime (Anthropic-native + OpenAI-compat router),
+│                    #   tools, extensions, MCP, events, skills, sidecar
+├── agent-tui/       # ratatui terminal UI, themes, settings, plugin modals
+└── (root)           # the `synaps` binary crate — CLI dispatch, watcher, broker
 ```
-
-Two API paths: Anthropic (native) and OpenAI-compatible (17 providers). Both emit the same `StreamEvent` — the TUI and tool loop are provider-blind.
-
+Two API paths (Anthropic native + OpenAI-compatible for 17 providers) both emit the same `StreamEvent` — the TUI and tool loop are provider-blind.
 </details>
 
 ---
@@ -342,8 +245,6 @@ Two API paths: Anthropic (native) and OpenAI-compatible (17 providers). Both emi
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
-
----
 
 <p align="center">
   <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>

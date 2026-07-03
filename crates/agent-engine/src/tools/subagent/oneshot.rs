@@ -124,9 +124,11 @@ impl Tool for SubagentTool {
                         Err(e) => return Err(format!("Failed to create subagent runtime: {}", e)),
                     };
 
-                    // Inherit the user's credential source (Remote/broker) — a
-                    // fresh Runtime::new() defaults to Local. (#158 A3)
-                    runtime.apply_auth_config(&crate::config::load_config());
+                    // Apply subagent spawn policy: inherit credential source AND
+                    // unconditionally force cache TTL to 5m. Subagents are short-lived
+                    // one-shots — paying the 1h write premium (~2× input price) on them
+                    // is unrecoverable waste (~$0.23 per 10-spawn fan-out). (#110)
+                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model);
                     runtime.set_tools(crate::ToolRegistry::without_subagent());

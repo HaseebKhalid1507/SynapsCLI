@@ -139,6 +139,9 @@ pub struct TelemetryRecord {
     pub model: String,
     /// 1-based attempt number that succeeded (1 = no retries).
     pub attempt: u32,
+    /// Number of refusal retries consumed (0 = no refusals). Present only when > 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_retries_used: Option<u32>,
     /// Milliseconds from request send to first SSE byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
