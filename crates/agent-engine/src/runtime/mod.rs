@@ -596,6 +596,7 @@ impl Runtime {
                     saw_1h_honored: self.saw_1h_honored.clone(),
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
+                    anthropic_base_url: None,
                 },
             )
             .await?;
@@ -938,6 +939,7 @@ impl Runtime {
             saw_1h_honored: self.saw_1h_honored.clone(),
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
+            anthropic_base_url: None,
         };
 
         let session = crate::runtime::stream::StreamSession {

@@ -632,6 +632,12 @@ pub struct ApiOptions {
     pub credential_source: crate::auth::CredentialSource,
     /// Shared broker token cache (Remote only).
     pub token_cache: crate::auth::TokenCache,
+    /// Override the Anthropic API base URL. In production always `None`, which
+    /// causes the code to read `SYNAPS_ANTHROPIC_BASE_URL` from the environment
+    /// and then fall back to `"https://api.anthropic.com"`.
+    /// Set by tests to point at a local mock server without touching env vars.
+    #[doc(hidden)]
+    pub anthropic_base_url: Option<String>,
 }
 
 pub(super) struct ApiMethods;
@@ -809,8 +815,12 @@ impl ApiMethods {
                 }
 
                 // Rebuild request (consumed on send)
+                let anthropic_base = options.anthropic_base_url.clone()
+                    .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.anthropic.com".into());
+                let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
                 let mut req = client
-                    .post("https://api.anthropic.com/v1/messages")
+                    .post(&anthropic_url)
                     .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
@@ -2377,4 +2387,225 @@ mod tests {
         );
     }
 
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// on-401 refetch integration tests  (task #157, subtask 9)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Strategy: spin up two tiny axum servers — one that pretends to be Anthropic,
+// one that pretends to be the credential broker.  Point ApiOptions at them via
+// `anthropic_base_url` (test-only seam) + a Remote CredentialSource.
+//
+// This module tests the C1 guard in call_api_stream_inner directly.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod on401_tests {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use tokio::sync::{mpsc, RwLock};
+    use reqwest::Client;
+    use serde_json::json;
+    use axum::{
+        Router,
+        routing::post as axum_post,
+        routing::get as axum_get,
+        http::{StatusCode, HeaderMap},
+        response::IntoResponse,
+    };
+
+    use super::{ApiMethods, ApiOptions};
+    use crate::{ToolRegistry, StreamEvent};
+    use crate::runtime::types::AuthState;
+    use crate::auth::{CredentialSource, TokenCache};
+    use crate::runtime::telemetry::TelemetryLevel;
+
+    // ── minimal SSE body Anthropic would return for a "hello" text turn ──────
+    const SSE_SUCCESS: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// Spawn a mock Anthropic endpoint. Returns (base_url, call_counter).
+    /// Behaviour: first `fail_count` POSTs → 401; subsequent → SSE success.
+    async fn spawn_mock_anthropic(fail_count: usize) -> (String, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let app = Router::new()
+            .route("/v1/messages", axum_post(move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_count {
+                        (StatusCode::UNAUTHORIZED,
+                         [("content-type", "application/json")],
+                         "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}".to_string()
+                        ).into_response()
+                    } else {
+                        (StatusCode::OK,
+                         [("content-type", "text/event-stream")],
+                         SSE_SUCCESS.to_string()
+                        ).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), counter)
+    }
+
+    /// Spawn a mock broker that always vends a fresh token.
+    async fn spawn_mock_broker(token: &'static str) -> String {
+        let app = Router::new()
+            .route("/token", axum_get(move |_headers: HeaderMap| async move {
+                // Accept any machine-token for test simplicity
+                (StatusCode::OK,
+                 format!("{{\"access_token\":\"{token}\",\"expires\":9999999999999}}"))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Build an AuthState with the given token pre-loaded (simulates a Remote
+    /// client that already ran refresh_if_needed and cached a token).
+    fn auth_with_token(token: &str) -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: token.to_string(),
+            auth_type: "api_key".to_string(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+        }))
+    }
+
+    fn make_options(base_url: String, source: CredentialSource, cache: TokenCache) -> ApiOptions {
+        ApiOptions {
+            anthropic_base_url: Some(base_url),
+            credential_source: source,
+            token_cache: cache,
+            ..Default::default()
+        }
+    }
+
+    async fn drive_call(
+        auth: Arc<RwLock<AuthState>>,
+        options: ApiOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        let client = Client::new();
+        let tools = ToolRegistry::new();
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        ApiMethods::call_api_stream(
+            &auth,
+            &client,
+            "claude-haiku-4-5",   // fast/cheap model name; routing check just does prefix match
+            &tools,
+            &None,                 // system prompt
+            0,                     // thinking_budget
+            &messages,
+            tx,
+            0,                     // max_retries (surface errors fast)
+            0,                     // refusal_retries
+            &options,
+            TelemetryLevel::Off,
+        ).await
+    }
+
+    // ─── T1: Happy path — first call 401, second call succeeds ───────────────
+    // RED: before C1 guard is restored this MUST fail (no retry → error).
+    // GREEN: with C1 guard it retries once with the new token and succeeds.
+    #[tokio::test]
+    async fn on401_remote_retries_once_and_succeeds() {
+        let broker_url = spawn_mock_broker("sk-fresh-token").await;
+        let (anthropic_url, counter) = spawn_mock_anthropic(1).await; // 1 × 401, then SSE
+
+        let source = CredentialSource::Remote {
+            endpoint: broker_url.clone(),
+            machine_token: "machine-tok".into(),
+        };
+        // Pre-seed cache with the STALE token (the one that gets the 401)
+        let cache = TokenCache::new();
+        cache.put("anthropic", crate::auth::BrokerToken {
+            access_token: "sk-stale".into(),
+            expires: 9_999_999_999_999,
+            ttl_ms: None,
+        });
+
+        let auth = auth_with_token("sk-stale");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        // Call must succeed
+        assert!(result.is_ok(), "expected success after retry, got: {:?}", result.err());
+        // Anthropic endpoint was hit exactly twice: once 401, once 200
+        assert_eq!(counter.load(Ordering::SeqCst), 2,
+            "expected exactly 2 calls to Anthropic (1×401 + 1×200)");
+    }
+
+    // ─── T2: Persistent 401 — no infinite loop ────────────────────────────────
+    // Guard fires once: 2nd 401 must surface as a terminal error.
+    // Anthropic endpoint must be called exactly 2 times total (no loop).
+    #[tokio::test]
+    async fn on401_remote_persistent_401_is_terminal_not_loop() {
+        let broker_url = spawn_mock_broker("sk-fresh-but-useless").await;
+        // All calls → 401 (fail_count=999 is effectively "always")
+        let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
+
+        let source = CredentialSource::Remote {
+            endpoint: broker_url,
+            machine_token: "machine-tok".into(),
+        };
+        let cache = TokenCache::new();
+        cache.put("anthropic", crate::auth::BrokerToken {
+            access_token: "sk-stale".into(),
+            expires: 9_999_999_999_999,
+            ttl_ms: None,
+        });
+
+        let auth = auth_with_token("sk-stale");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        // Must be an error (not a success or an infinite retry)
+        assert!(result.is_err(), "expected terminal error on persistent 401");
+        // Exactly 2 upstream calls: original + single retry
+        assert_eq!(counter.load(Ordering::SeqCst), 2,
+            "persistent 401 must cause exactly 2 upstream calls, got {}",
+            counter.load(Ordering::SeqCst));
+    }
+
+    // ─── T3: Local source — 401 is NOT retried (regression guard) ────────────
+    // CredentialSource::Local must NOT trigger the C1 refetch path.
+    // With max_retries=0 the error surfaces immediately after 1 call.
+    #[tokio::test]
+    async fn on401_local_source_does_not_retry() {
+        // Always 401
+        let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
+
+        let source = CredentialSource::Local;
+        let cache = TokenCache::new();
+        let auth = auth_with_token("sk-local-key");
+        let options = make_options(anthropic_url, source, cache);
+
+        let result = drive_call(auth, options).await;
+
+        assert!(result.is_err(), "401 with Local source must be an error");
+        assert_eq!(counter.load(Ordering::SeqCst), 1,
+            "Local source must never retry on 401, got {} calls",
+            counter.load(Ordering::SeqCst));
+    }
 }
