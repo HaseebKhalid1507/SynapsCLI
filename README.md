@@ -153,6 +153,7 @@ Agents aren't anonymous forks — they're crew members with names, system prompt
 - **📡 Event bus.** Any script/cron/service can poke a running session — the agent reacts in real time.
 - **🧠 Context that lasts.** 90%+ prompt-cache hit rate; `/compact` checkpoints history; chain sessions across days.
 - **🤖 Autonomous mode.** `synaps watcher` — heartbeats, crash recovery, cost limits, session handoff.
+- **🎨 18 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`… plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
 > **Honest scope:** Synaps is Anthropic-first today — the Anthropic path has the deepest feature support (caching, retry, cost). The OpenAI-compatible path covers everything else and is actively being brought to full parity ([tracking](docs/open-provider-issues.md)). We'd rather tell you that than overclaim.
 
