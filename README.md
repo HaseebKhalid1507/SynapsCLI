@@ -227,8 +227,3 @@ Apache 2.0. See [LICENSE](LICENSE).
 <p align="center">
   <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
 </p>
-(LICENSE).
-
-<p align="center">
-  <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
-</p>
