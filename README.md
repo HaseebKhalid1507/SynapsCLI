@@ -93,6 +93,27 @@ echo "summarize the git diff" | synaps chat
 
 Set a key, pick a model, go. Anthropic is native; 17 providers / 55+ models route through an OpenAI-compatible layer — swap mid-session with `/model`.
 
+### Sign in with what you already pay for — or nothing at all
+
+**Claude Pro/Max** (OAuth, no API key):
+```bash
+synaps login                      # or non-interactive: synaps login --provider claude
+```
+
+**ChatGPT Plus/Pro** (OAuth via Codex):
+```bash
+synaps login --provider openai-codex
+synaps                            # then: /model openai-codex/gpt-5.5
+```
+
+**Ollama / local models** (no account, no key, no cloud):
+```bash
+ollama serve                      # LM Studio, vLLM, llama.cpp all work too
+synaps                            # then: /model local/llama3.2
+```
+
+Synaps auto-targets `http://localhost:11434/v1` — Ollama's default — so a running Ollama just works. Point elsewhere with `provider.local.url` in config or the `LOCAL_ENDPOINT` env var.
+
 ---
 
 ## What it looks like
