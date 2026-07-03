@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-07-03
+
 ### Added
 - **`synaps auth-broker` now supports TLS (HTTPS) via `--tls-cert`/`--tls-key` PEM flags.**
   When both flags are provided the broker binds with axum-server + rustls (rustls 0.23,
@@ -15,6 +17,96 @@ All notable changes to this project will be documented in this file.
   cert-as-key, valid pair), file-path loading, and a real HTTPS integration suite
   (rcgen self-signed CA, reqwest with `danger_accept_invalid_certs`) checking /healthz
   and machine-auth enforcement over TLS.  (#156 subtask 6)
+- **The runtime now retries when the model stops with `stop_reason=refusal`, up to a
+  configurable bounded budget.** Previously a refusal terminated the turn silently —
+  the user saw nothing and the agent stalled. The retry path resubmits the request
+  with an escalating context nudge, caps attempts to avoid runaway spend, and surfaces
+  the final refusal explicitly in the TUI if all retries are exhausted. Retry count and
+  budget ceiling are tunable in config. (#188)
+
+### Fixed
+- **SECURITY — Two Anthropic OAuth vulnerabilities patched.**
+  - **CSRF bypass in manual-paste login.** `parse_manual_input` previously accepted a
+    bare authorization code (no `state` parameter) and the login task fell back to
+    comparing `manual_state` against itself, silently nullifying the CSRF check. The
+    bare-code path is removed; `manual_paste_to_callback` now returns `Some` only when
+    both `code` and `state` are present in the pasted URL. Six unit tests cover the
+    accept/reject matrix including bare codes, missing-state URLs, and malformed input.
+  - **Non-atomic write in `ensure_fresh_token` could zero `auth.json`.** The old path
+    held an `fs4` exclusive lock on the live file, truncated it in place, then wrote
+    the new token — a crash between truncate and write completion left an empty
+    `auth.json`. Because Anthropic rotates the refresh token on every refresh call,
+    the zeroed state is unrecoverable. The fix: open `auth.json` read-only, drop the
+    lock, perform the network refresh, then delegate the write to
+    `save_provider_auth_at` in `storage.rs`, which uses a
+    `auth.json.lock → auth.json.tmp → rename(2)` sequence (atomic on POSIX). A crash
+    at any point leaves the pre-refresh credential intact. As a side effect this also
+    fixes silent provider-data loss (#184): the old `AuthFile` reconstruction silently
+    dropped any provider beyond `anthropic`/`openai_codex`; the read-merge-write path
+    in `save_provider_auth_at` preserves all providers. Four regression tests added.
+- **`login --provider` no longer wipes other providers' credentials.** The old
+  `save_auth` whole-file overwrite dropped every provider not included in the current
+  write. The bug was fixed by the `agent-core` extraction refactor; a regression suite
+  (codex-then-anthropic ordering, reverse ordering, third-provider preservation,
+  same-key upsert) has been added and verified RED against the pre-refactor
+  implementation. (#159)
+- **Spawned subagents now reliably enforce the 5-minute cache TTL policy.** Previously
+  the three subagent spawn paths (oneshot / start / resume) only called
+  `apply_auth_config`, so the 5m TTL was inherited by accident from `Runtime::new()`
+  defaults — any change to the parent's cache config could silently propagate to
+  short-lived spawns (~$0.23 wasted per 10-spawn fan-out on long-TTL parent configs).
+  A new `apply_subagent_runtime_policy()` function is the single enforcement point
+  called in all three paths, decoupled from whatever the parent runtime has set. (#110)
+- **Extension tools are no longer missing on turn 1 in headless/pipe mode.** When
+  input was piped to `synaps chat` (e.g. `echo "…" | synaps chat`), stdin was
+  immediately ready and the first API request could fire ~350ms before extension
+  processes finished registering their tools — the model never saw extension-provided
+  tools on that turn. `discover_and_load()` is now awaited before the read loop starts,
+  so every extension's tools are in the registry before any message reaches the API.
+  The interactive TUI is unaffected. (Found while containerizing a single-tool agent.)
+- **Three TUI safety bugs from the safety review.**
+  - **Busy-spin on zero-size or erroring terminal** (HIGH). A `0×0` or `Err` return
+    from `terminal_size()` hit a `continue` branch that skipped clearing
+    `needs_redraw`/`force_redraw` and updating `last_draw`, causing the event loop to
+    re-enter `should_draw()` at full CPU speed indefinitely. Both flags are now cleared
+    and `last_draw` bumped before the `continue`.
+  - **Char-boundary panic in `mask_key`** (MED). API keys containing non-ASCII
+    characters (accented chars, emoji) caused a byte-index slice on the render thread
+    to panic. `mask_key` now collects `chars()` and indexes by character position.
+  - **Modal width overflow on narrow terminals** (MED). Fixed-minimum clamps on the
+    secret-prompt modal, plugin editor, and picker could produce a modal wider than
+    `area.width`. Each site now caps its lower bound to the available width before
+    layout. A width-exhaustive test (0–200 columns) guards all three sites.
+- **Tool-execution error messages no longer repeat "Tool execution failed:" twice.** Five
+  call sites in `runtime/stream.rs` and `runtime/mod.rs` were wrapping errors that
+  already carry the prefix via `RuntimeError::Tool`'s `Display` impl, producing doubled
+  output like *"Tool execution failed: Tool execution failed: …"* in the TUI. The
+  redundant format strings are removed; the TUI's `starts_with` sentinel is unaffected.
+- **Stale truncation test fixed and `MAX_HOOK_OUTPUT` promoted to a public constant.**
+  `after_tool_call_truncates_utf8_safely` was testing against the old 32 KiB cap after
+  it was raised to 256 KiB — truncation never fired, leaving the test permanently green
+  for the wrong reason. The constant is now `pub const MAX_HOOK_OUTPUT` in `events.rs`
+  so tests anchor to the real value. The fixture is rewritten to straddle the cap with
+  a 2-byte UTF-8 sequence and also asserts the leading slice is valid UTF-8 (proving the
+  boundary logic never cuts through a multibyte char).
+- **`TriggerConfig::default()` now correctly sets `debounce_secs = 3`.** `#[derive(Default)]`
+  produced `debounce_secs = 0` (`u64::default()`), ignoring the `default_debounce()`
+  function wired to the `serde` attribute. A TOML with no `[trigger]` table therefore
+  got zero debounce, causing the file watcher to fire on every partial write instead of
+  settling for 3 seconds. `Default` is now hand-written, matching the pattern already
+  used by `SessionLimits`, `BootConfig`, and `HeartbeatConfig` in the same file.
+- **Multibyte characters no longer panic the error humanizer.** `&trimmed[..200]`
+  panicked when an emoji, CJK character, or smart quote straddled byte offset 200.
+  The slice is replaced with `truncate_str(trimmed, 200)`, which walks back to the
+  nearest valid char boundary before cutting.
+
+### Testing
+- **Integration tests for on-401 broker-token refetch added.** Three `wiremock`-style
+  `axum` tests (via a new `SYNAPS_ANTHROPIC_BASE_URL` test seam in `ApiOptions`) cover:
+  remote credential source retries once on 401 and succeeds; persistent 401 is terminal
+  after exactly two upstream calls (no infinite loop); local credential source does not
+  retry on 401. RED-GREEN verified against the live guard in `call_api_stream_inner`.
+  (#157 subtask 9)
 
 ## [0.5.0] — 2026-06-30
 
