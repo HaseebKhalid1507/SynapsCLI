@@ -117,7 +117,10 @@ enum Command {
     /// Show account usage and reset times
     Status,
     /// Credential broker — serve short-lived access tokens to client machines
-    /// over HTTP so they can share one OAuth credential without storing it.
+    /// over HTTP/HTTPS so they can share one OAuth credential without storing it.
+    ///
+    /// For non-loopback binds, pass --tls-cert + --tls-key to enable HTTPS (recommended),
+    /// or --insecure-http to acknowledge you are running behind WireGuard / a private network.
     AuthBroker {
         /// Address to bind, e.g. `0.0.0.0:8181` or `127.0.0.1:8181`.
         #[arg(long, default_value = "127.0.0.1:8181")]
@@ -133,6 +136,18 @@ enum Command {
         /// credentials unauthenticated to the network — NOT recommended).
         #[arg(long)]
         insecure_no_auth: bool,
+        /// PEM file containing the TLS certificate chain. Must be paired with --tls-key.
+        /// When both are set, the broker listens on HTTPS.
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// PEM file containing the TLS private key. Must be paired with --tls-cert.
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<std::path::PathBuf>,
+        /// Allow plain HTTP on a non-loopback bind without TLS.
+        /// Only use this when the broker is behind WireGuard or another encrypted
+        /// private network — the traffic will be unencrypted in-process.
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Headless line-JSON RPC server on stdin/stdout (synaps-bridge IPC)
     Rpc {
@@ -218,8 +233,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status) => {
             cmd::status::run().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth }) => {
-            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth).await?;
+        Some(Command::AuthBroker { bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http }) => {
+            cmd::auth_broker::run(bind, machine_token, machine_token_file, insecure_no_auth, tls_cert, tls_key, insecure_http).await?;
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;

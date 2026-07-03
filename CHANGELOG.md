@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`synaps auth-broker` now supports TLS (HTTPS) via `--tls-cert`/`--tls-key` PEM flags.**
+  When both flags are provided the broker binds with axum-server + rustls (rustls 0.23,
+  no OpenSSL dependency) instead of plain HTTP.  A new bind-policy enforcer refuses to
+  start on non-loopback addresses without either TLS or an explicit `--insecure-http`
+  acknowledgement; the latter prints WireGuard-only guidance.  Startup validation parses
+  the cert/key PEM before binding and fails fast with a readable error on bad files.
+  New tests cover: policy matrix (7 cases), PEM validation (garbage cert, garbage key,
+  cert-as-key, valid pair), file-path loading, and a real HTTPS integration suite
+  (rcgen self-signed CA, reqwest with `danger_accept_invalid_certs`) checking /healthz
+  and machine-auth enforcement over TLS.  (#156 subtask 6)
+
 ## [0.5.0] — 2026-06-30
 
 ### Added
