@@ -14,7 +14,7 @@
 
 <p align="center">
   One Rust binary. A whole crew of named agents, each with a role, running at once.<br>
-  15MB, boots in 2ms, works offline.<br><br>
+  Extend it into anything. 15MB, boots in 2ms, works offline.<br><br>
   <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki"><b>📖 Wiki</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/Installation"><b>⚡ Quick Start</b></a> · <a href="ELI5.md"><b>🧒 ELI5</b></a> · <a href="#benchmarks"><b>📊 Benchmarks</b></a>
 </p>
 
@@ -52,6 +52,18 @@ subagent_collect(handle_id: "sa_1")                                # gather when
 ```
 
 Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. A `watcher` daemon supervises the fleet so nothing crashes or blows your budget. You can even run a different model per agent: `chrollo` on Claude for the deep stuff, `spike` on a local Ollama for grunt work, same crew.
+
+---
+
+## Build anything on it
+
+The crew is half of it. The other half: Synaps is a platform, not a wall.
+
+Extensions are separate processes in any language, hooked into 7 points of the agent loop. MCP servers plug in with one command. The event bus lets any script, cron job, or webhook wake an agent up and hand it work. So you're not stuck with whatever ships in the box. You wire in what you need and build whatever you want on top.
+
+`finlens` is proof: a full 6-lens financial research workflow, built entirely as an extension, zero changes to the core. Point the same primitives at anything else. A security recon pipeline that drives your whole toolkit. A Discord bot. A CI gatekeeper that blocks a merge until an agent signs off. A research agent that reads papers while you sleep. Same crew, same runtime, whatever the job is.
+
+That's the whole idea. A small, fast core, and enough hooks that you can bolt on anything and glue it to anything.
 
 ---
 
@@ -96,8 +108,8 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 - **🎭 Named agents.** Crew members with roles. Dispatch by name, watch them think in a live panel.
 - **🔄 Steer them mid-flight.** dispatch, poll, steer, collect. Redirect an agent while it's still working. This is the part nobody else does.
+- **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got. `finlens`, a full finance research workflow, is just an extension.
 - **🌐 Any OpenAI-compatible model, cloud or local.** Claude and ChatGPT natively, plus Groq, Cerebras, NVIDIA NIM, OpenRouter, or your own Ollama. Run a different model per agent. Swap mid-session with `/model`.
-- **🔌 Process-isolated extensions.** JSON-RPC 2.0 over stdio, any language, crash-isolated, sandboxed. Hook 7 lifecycle events to add guardrails, memory, context injection, whatever you need.
 - **📡 Event bus.** Any script, cron, or service can poke a running session and the agent reacts in real time.
 - **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days.
 - **🤖 Autonomous mode.** `synaps watcher` runs a fleet with heartbeats, crash recovery, cost limits, and session handoff.
