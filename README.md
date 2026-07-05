@@ -2,7 +2,7 @@
   <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
 </p>
 
-<h3 align="center">Lightning fast agent harness</h3>
+<h3 align="center">Lightning fast terminal native agent harness</h3>
 
 <p align="center">
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
@@ -24,12 +24,43 @@
   <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
 </p>
 
+Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agents with built-in tools, subagents, and a full extension system, and works with any model, whether that's Claude, ChatGPT, or a local model through Ollama. Run it as an interactive TUI, headless for scripts and CI, a WebSocket server, an RPC bridge, or a supervisor daemon for autonomous fleets. Extend it with process-isolated plugins in any language, MCP servers, and an event bus, and adapt it to your workflow instead of the other way around.
+
+---
+
+## Install
+
+```bash
+cargo install synaps              # crates.io
+```
+
+<details>
+<summary>More options (brew, AUR, .deb, shell installer, source)</summary>
+
+```bash
+brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
+yay -S synaps                               # Arch / EndeavourOS
+
+# Debian/Ubuntu
+curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
+sudo dpkg -i synaps_amd64.deb
+
+# Shell installer (any platform)
+curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
+
+# From source
+git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
+cargo build --release && ./target/release/synaps
+```
+</details>
+
+*New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
+
 ---
 
 ## Quick start
 
 ```bash
-cargo install synaps
 synaps login          # Claude Pro/Max, or a provider key, or point at local Ollama
 synaps                # launch the TUI
 ```
@@ -72,36 +103,6 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 > **Honest scope:** Synaps is Anthropic-first today. The Anthropic path has the deepest feature support (caching, retry, cost). The OpenAI-compatible path covers everything else and is being brought to full parity ([tracking](docs/open-provider-issues.md)). Rather tell you that than overclaim.
 
 > Synaps is built with Synaps.
-
----
-
-## Install
-
-```bash
-cargo install synaps              # crates.io
-```
-
-<details>
-<summary>More options (brew, AUR, .deb, shell installer, source)</summary>
-
-```bash
-brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
-yay -S synaps                               # Arch / EndeavourOS
-
-# Debian/Ubuntu
-curl -LO https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps_amd64.deb
-sudo dpkg -i synaps_amd64.deb
-
-# Shell installer (any platform)
-curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
-
-# From source
-git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
-cargo build --release && ./target/release/synaps
-```
-</details>
-
-*New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
 
 ---
 
