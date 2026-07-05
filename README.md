@@ -21,7 +21,7 @@
 
 <!-- TODO: replace with the hero demo GIF (see task #115): single strong view, high contrast, app not shell -->
 <p align="center">
-  <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
+  <img src="https://github.com/user-attachments/assets/8e0ae020-cf63-4547-b769-782625cbd1f6" alt="SynapsCLI — a crew of agents running in parallel" width="900" />
 </p>
 
 Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agents with built-in tools, subagents, and extensions, and works with any model, from Claude and ChatGPT to a local Ollama. Run it as a TUI, headless in CI, a server, or a daemon. Extend it with plugins in any language, MCP, and an event bus, and adapt it to your workflow instead of the other way around.
