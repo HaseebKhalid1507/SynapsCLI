@@ -24,7 +24,7 @@
   <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
 </p>
 
-Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agents with built-in tools, subagents, and a full extension system, and works with any model, whether that's Claude, ChatGPT, or a local model through Ollama. Run it as an interactive TUI, headless for scripts and CI, a WebSocket server, an RPC bridge, or a supervisor daemon for autonomous fleets. Extend it with process-isolated plugins in any language, MCP servers, and an event bus, and adapt it to your workflow instead of the other way around.
+Synaps is a fast, terminal-native agent harness written in Rust. It runs AI agents with built-in tools, subagents, and extensions, and works with any model, from Claude and ChatGPT to a local Ollama. Run it as a TUI, headless in CI, a server, or a daemon. Extend it with plugins in any language, MCP, and an event bus, and adapt it to your workflow instead of the other way around.
 
 ---
 
