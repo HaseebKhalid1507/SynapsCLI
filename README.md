@@ -100,10 +100,6 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **⚡ Fast and lean.** ~87K lines of Rust, one 15MB binary, ~2ms cold start, zero runtime deps.
 - **🎨 18 themes.** `catppuccin`, `gruvbox`, `nord`, `rose-pine`, `dracula`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
 
-> **Honest scope:** Synaps is Anthropic-first today. The Anthropic path has the deepest feature support (caching, retry, cost). The OpenAI-compatible path covers everything else and is being brought to full parity ([tracking](docs/open-provider-issues.md)). Rather tell you that than overclaim.
-
-> Synaps is built with Synaps.
-
 ---
 
 ## Modes
@@ -192,6 +188,10 @@ Two API paths (Anthropic native and OpenAI-compatible for 17 providers) both emi
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+<p align="center">
+  <sub>Synaps is built with Synaps.</sub>
+</p>
 
 <p align="center">
   <sub>Because every other CLI agent was a 400MB Electron app pretending to be a terminal tool.</sub>
