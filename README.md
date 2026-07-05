@@ -2,7 +2,7 @@
   <img src="assets/banner.png" alt="SynapsCLI" width="100%" />
 </p>
 
-<h3 align="center">Run a crew of AI agents in your terminal. Dispatch them, steer them mid-task, watch them work in parallel.</h3>
+<h3 align="center">Lightning fast agent harness</h3>
 
 <p align="center">
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
@@ -13,9 +13,8 @@
 </p>
 
 <p align="center">
-  One Rust binary. A whole crew of named agents, each with a role, running at once.<br>
-  Extend it into anything. 15MB, boots in 2ms, works offline.<br><br>
-  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki"><b>📖 Wiki</b></a> · <a href="https://github.com/HaseebKhalid1507/SynapsCLI/wiki/Installation"><b>⚡ Quick Start</b></a> · <a href="ELI5.md"><b>🧒 ELI5</b></a> · <a href="#benchmarks"><b>📊 Benchmarks</b></a>
+  Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
+  Any model, 15MB, 2ms boot.
 </p>
 
 ---
@@ -24,46 +23,6 @@
 <p align="center">
   <img src="assets/demo.gif" alt="SynapsCLI Demo" width="720" />
 </p>
-
----
-
-## Why a crew?
-
-Every other agent CLI gives you one assistant in a box. One model, one train of thought, one thing at a time. That's fine until the job is bigger than one head.
-
-Synaps gives you a team. Dispatch `spike` to refactor while `chrollo` audits the codebase and `shady` tears the result apart, all at once, each with its own system prompt and tools. Poke them mid-task, redirect them, pull the results when they're done. You're not chatting with an AI. You're running a crew, and you're the one calling the shots.
-
-And yeah, it's a single 15MB Rust binary that boots in 2ms. The anti-bloat stuff is real. It's just not the point.
-
-```
-╭ ◈ 4 agents ────────────────────────────────────╮
-│  ✓ spike    done                         12.3s  │
-│  ⠹ chrollo  ⚙ read (tool #5)              8.1s  │
-│  ✓ shady    done                          9.7s  │
-│  ⠹ zero     thinking...                   4.2s  │
-╰─────────────────────────────────────────────────╯
-```
-
-```bash
-subagent(agent: "spike", task: "refactor the auth module")        # dispatch and wait
-subagent_start(agent: "chrollo", task: "audit this codebase")     # dispatch reactive
-subagent_steer(handle_id: "sa_1", message: "focus on the API routes")  # redirect mid-run
-subagent_collect(handle_id: "sa_1")                                # gather when ready
-```
-
-Agents aren't anonymous forks. They're crew members with names, system prompts, specializations, and memory. A `watcher` daemon supervises the fleet so nothing crashes or blows your budget. You can even run a different model per agent: `chrollo` on Claude for the deep stuff, `spike` on a local Ollama for grunt work, same crew.
-
----
-
-## Build anything on it
-
-The crew is half of it. The other half: Synaps is a platform, not a wall.
-
-Extensions are separate processes in any language, hooked into 7 points of the agent loop. MCP servers plug in with one command. The event bus lets any script, cron job, or webhook wake an agent up and hand it work. So you're not stuck with whatever ships in the box. You wire in what you need and build whatever you want on top.
-
-`finlens` is proof: a full 6-lens financial research workflow, built entirely as an extension, zero changes to the core. Point the same primitives at anything else. A security recon pipeline that drives your whole toolkit. A Discord bot. A CI gatekeeper that blocks a merge until an agent signs off. A research agent that reads papers while you sleep. Same crew, same runtime, whatever the job is.
-
-That's the whole idea. A small, fast core, and enough hooks that you can bolt on anything and glue it to anything.
 
 ---
 
@@ -83,19 +42,13 @@ echo "summarize the git diff" | synaps chat
 
 ### Sign in with what you already pay for, or nothing at all
 
-**Claude Pro/Max** (OAuth, no API key):
 ```bash
-synaps login                      # or non-interactive: synaps login --provider claude
-```
+synaps login                      # pick Claude or ChatGPT (Codex) from the provider menu
 
-**ChatGPT Plus/Pro** (OAuth via Codex):
-```bash
-synaps login --provider openai-codex
+# ChatGPT / Codex
 synaps                            # then: /model openai-codex/gpt-5.5
-```
 
-**Ollama or any local model** (no account, no key, no cloud):
-```bash
+# Ollama or any local model (no account, no key, no cloud)
 ollama serve                      # LM Studio, vLLM, llama.cpp all work too
 synaps                            # then: /model local/llama3.2
 ```
@@ -108,7 +61,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 - **🎭 Named agents.** Crew members with roles. Dispatch by name, watch them think in a live panel.
 - **🔄 Steer them mid-flight.** dispatch, poll, steer, collect. Redirect an agent while it's still working. This is the part nobody else does.
-- **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got. `finlens`, a full finance research workflow, is just an extension.
+- **🔌 Build anything on it.** Process-isolated extensions in any language, MCP servers, an event bus, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
 - **🌐 Any OpenAI-compatible model, cloud or local.** Claude and ChatGPT natively, plus Groq, Cerebras, NVIDIA NIM, OpenRouter, or your own Ollama. Run a different model per agent. Swap mid-session with `/model`.
 - **📡 Event bus.** Any script, cron, or service can poke a running session and the agent reacts in real time.
 - **🧠 Context that lasts.** 90%+ prompt-cache hit rate. `/compact` checkpoints history. Chain sessions across days.
@@ -118,23 +71,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 
 > **Honest scope:** Synaps is Anthropic-first today. The Anthropic path has the deepest feature support (caching, retry, cost). The OpenAI-compatible path covers everything else and is being brought to full parity ([tracking](docs/open-provider-issues.md)). Rather tell you that than overclaim.
 
-> Built with a crew: this release's changelog was written by a Synaps agent crew running in parallel. It uses itself.
-
----
-
-## Benchmarks
-
-Cold-start overhead, the tax every tool pays before it does any work:
-
-| command | median | |
-|---|---|---|
-| `synaps --version` (Rust binary) | **2.3 ms** | |
-| `python3 -c pass` (bare interpreter) | 30.2 ms | ~13× slower, importing nothing |
-| `node -e ''` (bare interpreter) | 46.1 ms | ~20× slower, importing nothing |
-
-Synaps fully starts before a Python or Node interpreter finishes launching, before a single dependency is imported. A LangChain or CrewAI import stacks hundreds of ms on top of that floor.
-
-*Methodology:* 30 runs each, 3 warmups, median reported, `time.perf_counter` around `subprocess.run`. Reproduce with the three commands above. This measures startup overhead, not end-to-end agent latency (that's model-bound, identical across runtimes). The point is the runtime itself adds almost nothing.
+> Synaps is built with Synaps.
 
 ---
 
@@ -209,7 +146,7 @@ Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot:
 └── main.py | index.js | <any>    # JSON-RPC 2.0 over stdio, any language
 ```
 
-Extensions are separate processes, not linked code, so they're language-agnostic, crash-isolated, and sandboxed. Hook `before_tool_call`, `before_message`, `on_session_start`, and 4 more. Real example: **finlens**, a 6-lens finance research workflow built entirely as an extension with no core changes.
+Extensions are separate processes, not linked code, so they're language-agnostic, crash-isolated, and sandboxed. Hook `before_tool_call`, `before_message`, `on_session_start`, and 4 more.
 
 Protocol spec: [docs/extensions/](docs/extensions/).
 
