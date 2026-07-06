@@ -48,6 +48,7 @@ pub(super) fn handle_event(
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
+    scroll_lines: u16,
 ) -> InputAction {
     // Route events to /help find while it's open.
     if let Some(state) = app.help_find.as_mut() {
@@ -208,7 +209,7 @@ pub(super) fn handle_event(
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
-            handle_mouse(mouse, app)
+            handle_mouse(mouse, app, scroll_lines)
         }
         Event::Paste(text) => {
             // Suppress paste events that fire immediately after a right-click copy.
@@ -249,16 +250,16 @@ pub(super) fn handle_event(
 }
 
 /// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
-fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputAction {
+fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_add(3);
+            app.scroll_back = app.scroll_back.saturating_add(scroll_lines);
             app.scroll_pinned = false;
         }
         MouseEventKind::ScrollDown => {
             app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_sub(3);
+            app.scroll_back = app.scroll_back.saturating_sub(scroll_lines);
             if app.scroll_back == 0 {
                 app.scroll_pinned = true;
             }
@@ -665,4 +666,59 @@ fn jump_word_right(app: &mut App) {
     while pos < len && chars[pos] != ' ' { pos += 1; }
     while pos < len && chars[pos] == ' ' { pos += 1; }
     app.cursor_pos = pos;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+    use synaps_cli::Session;
+
+    fn make_app() -> App {
+        App::new(Session::new("test-model", "low", None))
+    }
+
+    fn scroll_event(kind: MouseEventKind) -> crossterm::event::MouseEvent {
+        MouseEvent { kind, column: 5, row: 5, modifiers: KeyModifiers::NONE }
+    }
+
+    /// When scroll_lines=5 is configured, one ScrollUp event must add exactly 5
+    /// to scroll_back (not the hardcoded 3).
+    #[test]
+    fn scroll_up_uses_configured_step() {
+        let mut app = make_app();
+        app.scroll_back = 0;
+        handle_mouse(scroll_event(MouseEventKind::ScrollUp), &mut app, 5);
+        assert_eq!(app.scroll_back, 5, "scroll_back should be 5 with scroll_lines=5");
+    }
+
+    /// When scroll_lines=5 is configured, one ScrollDown event must subtract 5
+    /// (clamped to 0) from scroll_back.
+    #[test]
+    fn scroll_down_uses_configured_step() {
+        let mut app = make_app();
+        app.scroll_back = 10;
+        handle_mouse(scroll_event(MouseEventKind::ScrollDown), &mut app, 5);
+        assert_eq!(app.scroll_back, 5, "scroll_back should decrease by 5");
+    }
+
+    /// When scroll_lines is absent (None) the caller passes the default of 3.
+    /// Verify the default of 3 is what the caller should use.
+    #[test]
+    fn scroll_default_step_is_3() {
+        let cfg = synaps_cli::config::SynapsConfig::default();
+        let step = cfg.scroll_lines.unwrap_or(3);
+        assert_eq!(step, 3, "default scroll step must be 3 when unconfigured");
+    }
+
+    /// Configured value is read through SynapsConfig::scroll_lines.
+    #[test]
+    fn scroll_configured_step_is_used_via_config() {
+        let cfg = synaps_cli::config::SynapsConfig {
+            scroll_lines: Some(7),
+            ..Default::default()
+        };
+        let step = cfg.scroll_lines.unwrap_or(3);
+        assert_eq!(step, 7);
+    }
 }

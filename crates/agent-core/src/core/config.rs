@@ -234,6 +234,10 @@ pub struct SynapsConfig {
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
     pub max_fps: u32,
+    /// Lines to scroll per mouse-wheel event. Different terminal emulators
+    /// emit 1–9+ scroll events per physical notch; set this to compensate.
+    /// Default: 3. Range 1–20.
+    pub scroll_lines: Option<u16>,
     pub theme: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -271,6 +275,7 @@ impl Default for SynapsConfig {
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
             max_fps: 60,
+            scroll_lines: None,
             theme: None,
             agent_name: None,
             identity: None,
@@ -293,7 +298,7 @@ impl Default for SynapsConfig {
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "model", "thinking", "compaction_model", "context_window", "max_tool_output",
     "bash_timeout", "bash_max_timeout", "subagent_timeout", "api_retries", "refusal_retries",
-    "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "theme", "agent_name", "identity",
+    "telemetry", "cache_diagnostics", "cache_ttl", "max_fps", "scroll_lines", "theme", "agent_name", "identity",
     "disabled_plugins", "favorite_models", "disabled_skills", "disabled_tools",
 ];
 
@@ -574,6 +579,17 @@ pub fn load_config() -> SynapsConfig {
                     )),
                     Err(_) => config.warnings.push(format!(
                         "max_fps = {val} — not a number; using {}", config.max_fps
+                    )),
+                }
+            }
+            "scroll_lines" => {
+                match val.parse::<u16>() {
+                    Ok(n) if (1..=20).contains(&n) => config.scroll_lines = Some(n),
+                    Ok(_) => config.warnings.push(format!(
+                        "scroll_lines = {val} — expected 1–20; ignoring"
+                    )),
+                    Err(_) => config.warnings.push(format!(
+                        "scroll_lines = {val} — not a number; ignoring"
                     )),
                 }
             }

@@ -589,7 +589,7 @@ pub async fn run(
                         // yield point.
                         let action = {
                             let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
-                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard)
+                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard, config.scroll_lines.unwrap_or(3))
                         };
                         // Input events (keys, mouse, paste, resize) almost always
                         // change visible state (cursor, input buffer, scroll) and
