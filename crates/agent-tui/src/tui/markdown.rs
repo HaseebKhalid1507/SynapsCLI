@@ -683,10 +683,12 @@ fn expand_tabs_with_anchor(input: &str) -> (String, Option<usize>) {
     (out, anchor)
 }
 
-#[allow(unused_assignments)]
 pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+
     let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
-    if width == 0 || text.chars().count() <= width {
+    // Use display width (matching wrap_cell's policy) for the early-return check.
+    if width == 0 || UnicodeWidthStr::width(text.as_str()) <= width {
         return vec![text];
     }
 
@@ -708,32 +710,37 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current = String::new();
+    // Display-width accumulator for `current` — tracks rendered columns, not char count.
+    let mut current_w: usize = 0;
     let mut is_first_line = true;
 
     for word in text.split_inclusive(' ') {
-        let wlen = word.chars().count();
-        let col = current.chars().count();
+        // Display width of this word (including any trailing space from split_inclusive).
+        let wlen = UnicodeWidthStr::width(word);
         let effective_width = if is_first_line { width } else { wrap_width };
-        if col + wlen > effective_width && col > 0 {
+        if current_w + wlen > effective_width && current_w > 0 {
             lines.push(current.trim_end().to_string());
             current = indent.clone();
+            current_w = cont_indent_len;
             is_first_line = false;
         }
-        // Word longer than effective width — hard break it
+        // Word wider than effective width — hard break char by char.
         let effective_width = if is_first_line { width } else { wrap_width };
         if wlen > effective_width {
-            let chars: Vec<char> = word.chars().collect();
-            let chunk_size = effective_width.max(1); // Prevent panic on zero-width terminal
-            for chunk in chars.chunks(chunk_size) {
-                if !current.is_empty() && current != indent {
+            for ch in word.chars() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if current_w + ch_w > effective_width && !current.is_empty() {
                     lines.push(current.trim_end().to_string());
                     current = indent.clone();
+                    current_w = cont_indent_len;
                     is_first_line = false;
                 }
-                current.push_str(&chunk.iter().collect::<String>());
+                current.push(ch);
+                current_w += ch_w;
             }
         } else {
             current.push_str(word);
+            current_w += wlen;
         }
     }
     if !current.is_empty() {
@@ -1010,5 +1017,83 @@ mod tests {
                 cont
             );
         }
+    }
+
+    // ── P3 tests: wrap_text uses UnicodeWidthStr (display width, not char count) ──
+
+    /// CJK characters are 2 columns wide. A 4-char CJK string at width=6 should
+    /// wrap into two lines: [2-char CJK][space][1-char CJK], [1-char CJK word].
+    /// Before the fix (chars().count()) this would NOT wrap — 4 chars ≤ 6 chars.
+    /// After the fix (display width) it wraps correctly because 4×2 = 8 > 6 cols.
+    #[test]
+    fn wrap_text_cjk_wraps_by_display_width() {
+        // "你好 世界" — 2 CJK words × 2 chars each. Display width = 10; char count = 5.
+        let text = "你好 世界";
+        let lines = wrap_text(text, 6);
+        // Each output line must fit within 6 display columns.
+        for line in &lines {
+            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(
+                w <= 6,
+                "line {:?} has display width {} > 6",
+                line,
+                w
+            );
+        }
+        // Must actually be split — it wouldn't fit on one line.
+        assert!(lines.len() >= 2, "CJK text should have wrapped but got {:?}", lines);
+    }
+
+    /// Emoji are typically 2 columns wide. Verify that a run of emoji wraps at the
+    /// correct column boundary (display width), not char count.
+    #[test]
+    fn wrap_text_emoji_wraps_by_display_width() {
+        // 🚀 is 2 cols wide. Five rockets = 10 display cols. At width=6, wraps after first word.
+        let text = "🚀🚀🚀 🚀🚀";
+        let lines = wrap_text(text, 6);
+        for line in &lines {
+            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(
+                w <= 6,
+                "emoji line {:?} has display width {} > 6",
+                line,
+                w
+            );
+        }
+        assert!(lines.len() >= 2, "emoji text should have wrapped but got {:?}", lines);
+    }
+
+    /// Mixed ASCII + CJK: ensures the display-width accounting is correct when both
+    /// narrow (1-col) and wide (2-col) characters appear in the same text.
+    #[test]
+    fn wrap_text_mixed_ascii_cjk_display_width() {
+        // "AB 你好" — "AB" is 2 cols, space 1, "你好" is 4 cols → total 7 cols.
+        // At width=5 the CJK word must start on a new line.
+        let text = "AB 你好";
+        let lines = wrap_text(text, 5);
+        for line in &lines {
+            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(
+                w <= 5,
+                "mixed line {:?} has display width {} > 5",
+                line,
+                w
+            );
+        }
+        // "AB" fits in 5 cols; "你好" (4 cols) fits in 5 cols but combined they don't.
+        assert!(lines.len() >= 2, "mixed ASCII+CJK should wrap at width=5, got {:?}", lines);
+    }
+
+    /// Sanity: pure ASCII must still wrap the same way it always did.
+    /// 3×"hello" at width=12 — "hello hello " (12 cols) then "hello".
+    #[test]
+    fn wrap_text_ascii_unchanged() {
+        let lines = wrap_text("hello hello hello", 12);
+        // All lines ≤ 12 display cols.
+        for line in &lines {
+            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(w <= 12, "ASCII line {:?} has width {} > 12", line, w);
+        }
+        assert!(lines.len() >= 2, "should wrap, got {:?}", lines);
     }
 }
