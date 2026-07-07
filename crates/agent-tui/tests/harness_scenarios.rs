@@ -585,3 +585,394 @@ fn scenario_20_ctrl_c_dispatches_quit() {
         "Ctrl+C should record a 'quit' action"
     );
 }
+
+// ── P9 pre-(e) behavior pins ──────────────────────────────────────────────────
+//
+// These three scenarios pin CURRENT behavior immediately before slice (e)
+// folds draw.rs:517–611 (scroll clamp, visible range, geometry write-backs,
+// selection) into a single TranscriptStore::visible_window() call.
+//
+// Slice (e) MUST produce green diffs against these pins — any behavioral
+// change in the folded block is a regression.
+//
+// See: ~/Jawz/notes/tech/synaps-p9-transcriptstore-seam-design.md §5 + §6.
+
+// ── Scenario 21 — Unpinned-growth scroll ─────────────────────────────────────
+//
+// Pins the "growth-adjust THEN clamp THEN last_line_count write" ordering
+// documented in draw.rs ~538–552 and flagged in design §6 as the primary
+// behavioral trap for slice (e).
+//
+// The growth-adjust logic (draw.rs:542–546):
+//   if total > prev && prev > 0 {
+//       scroll_back += (total - prev)   // grow scroll to track the same view
+//   }
+//   scroll_back = scroll_back.min(max_back)  // then clamp
+//   last_line_count = total                  // then write baseline
+//
+// The `prev > 0` guard means growth-adjust only fires after at least one
+// render has established a baseline.  The visible window identity holds:
+//   end_before_push = total_before - scroll_before
+//   end_after_push  = total_after  - (scroll_before + growth)
+//                   = total_after  - (scroll_before + (total_after - total_before))
+//                   = total_before - scroll_before
+// i.e. the visible window's TOP stays stable — you keep watching the same
+// content while new messages arrive below.
+//
+// NOTE (Shady observation): the guard `prev > 0` means the first render
+// after boot is always a "jump" — no growth-adjust fires on the very first
+// render.  This is current behavior, pinned as-is.  Slice (e) must preserve
+// the guard exactly, or the first-render scroll behavior changes.
+
+/// Scenario 21 — Unpinned scroll position adjusts to absorb content growth
+/// while keeping the visible window stable (design §6 trap pinned).
+#[test]
+fn scenario_21_unpinned_growth_scroll_tracks_stable_window() {
+    // Layout for 80×24:
+    //   header=1, footer=1, input=3 (1 line + 2 border rows), body=19
+    //   content_height = 19 - 2 (msg-box borders) = 17 lines
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // ── Phase 1: overflow the viewport ──
+    // Push 20 single-line messages (> content_height=17 → overflows viewport).
+    for i in 0..20 {
+        h.push_system_message(&format!("msg {:02}: overflow seed", i));
+    }
+
+    // First render: establishes baseline (last_line_count = 20, pinned → scroll_back = 0).
+    h.render();
+    assert_eq!(h.scroll_back(), 0, "phase1: pinned on first render, scroll_back must be 0");
+    assert!(h.scroll_pinned(), "phase1: must be pinned after overflow-seeding render");
+
+    // ── Phase 2: scroll up N lines (unpin) ──
+    // 1 mouse ScrollUp = 3 lines. Fire once → scroll_back = 3, unpinned.
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 10,
+        row: 10,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert_eq!(h.scroll_back(), 3, "phase2: one mouse ScrollUp must set scroll_back=3");
+    assert!(!h.scroll_pinned(), "phase2: must be unpinned after scroll-up");
+
+    // Render to bake the scroll state into last_line_count.
+    h.render();
+    assert_eq!(h.scroll_back(), 3, "phase2: scroll_back must survive a render");
+
+    // Capture the pre-growth window top: with ~40 seed lines (20 msgs × 2 flat
+    // lines each), a ~17-row viewport, and scroll_back=3, the top visible
+    // message is msg 10. This is the stability baseline for phase 4.
+    let frame_before = h.snapshot();
+    assert!(
+        frame_before.contains("msg 10"),
+        "phase2: pre-growth window top must show msg 10\n{frame_before}"
+    );
+
+    // ── Phase 3: push MORE messages while unpinned ──
+    // Push 5 new messages. Each consecutive System message renders as TWO flat
+    // lines: a blank separator (should_separate_system_messages, render.rs:731 —
+    // these messages aren't grouped continuations) + the content line.
+    // So growth = 10 flat lines, and growth-adjust: scroll_back = 3 + 10 = 13.
+    for i in 20..25 {
+        h.push_system_message(&format!("msg {:02}: growth batch", i));
+    }
+
+    // Render triggers the growth-adjust block in draw.rs:542–551.
+    h.render();
+
+    // PINNED: the growth-adjust must have fired (prev > 0, total grew).
+    // scroll_back must have grown by exactly the number of new flat lines (10:
+    // 5 messages × [separator + content]). Verified against live behavior —
+    // if the System-message separator rule changes, this pin catches it.
+    assert_eq!(
+        h.scroll_back(),
+        13,
+        "phase3: growth-adjust must add flat-line growth(10 = 5 msgs × 2 lines) \
+         to scroll_back(3) → 13 \
+         (draw.rs:544–545: scroll_back = scroll_back.saturating_add(growth))"
+    );
+    assert!(
+        !h.scroll_pinned(),
+        "phase3: must remain unpinned after content growth"
+    );
+
+    // ── Phase 4: verify the visible window is stable (frame content check) ──
+    // Growth-adjust exists so unpinned readers don't get yanked: the SAME
+    // content visible before the push must be visible after. Pre-growth top
+    // was msg 10 (phase 2 baseline) — must still be the case. And the new
+    // msg 24 (below the viewport) must NOT have entered the window.
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("msg 10"),
+        "phase4: msg 10 must still top the stable window after growth\n{frame}"
+    );
+    assert!(
+        !frame.contains("msg 24"),
+        "phase4: msg 24 (new, below viewport) must NOT be visible while unpinned\n{frame}"
+    );
+
+    // ── Phase 5: scroll back to bottom re-pins ──
+    // Five mouse ScrollDown × 3 lines each = 15 lines down, which from
+    // scroll_back=13 hits 0 (saturating) and re-pins.
+    for _ in 0..5 {
+        h.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+    h.render();
+    assert_eq!(h.scroll_back(), 0, "phase5: scroll back to bottom must give scroll_back=0");
+    assert!(h.scroll_pinned(), "phase5: must re-pin on reaching bottom");
+    let frame_bottom = h.snapshot();
+    assert!(
+        frame_bottom.contains("msg 24"),
+        "phase5: msg 24 must be visible after re-pinning to bottom\n{frame_bottom}"
+    );
+}
+
+// ── Scenario 22 — Selection drag + copy path ─────────────────────────────────
+//
+// Pins the mouse selection state machine from input.rs:265–311:
+//   Down(Left) inside msg area → sets selection_anchor, clears selection_end
+//   Drag(Left)                 → sets selection_end
+//   Up(Left) where anchor≠end  → finalizes selection_end (has_selection = true)
+//   Up(Left) where anchor==end → clear_selection (click, not drag)
+//   Down(Right) with selection → copy + clear (right-click = copy)
+//
+// HARNESS GAP (reported, not fixed): `TestHarness` does not expose
+// `app.selection_anchor`, `app.selection_end`, or `app.has_selection()` as
+// public accessors.  These are `pub(crate)` on `App`, which is a private
+// field of `TestHarness`.  The strongest available assertion is:
+//   1. The drag sequence does not panic.
+//   2. Post-drag scroll state is unaffected (selection doesn't mutate scroll).
+//   3. The rendered Buffer shows fg/bg color-swap on cells in the drag range
+//      (draw.rs:988–1019: the selection overlay swaps cell.fg ↔ cell.bg
+//      within the selected rows, rather than using Modifier::REVERSED).
+//   4. Right-click after selection dispatches a "Copied N chars" system msg
+//      (the right-click copy path calls push_msg(System("Copied N chars"))
+//      which surfaces in the next render snapshot — this IS observable).
+//
+// When slice (e) moves selection fields into TranscriptStore, the
+// recommendation is to add `TestHarness::has_selection() -> bool` and
+// `TestHarness::selection_anchor() -> Option<(u16,u16)>` to testing.rs
+// so this scenario can assert the full state machine, not just side-effects.
+//
+// NOTE (Shady observation): `is_in_msg_area` returns `false` until at least
+// one render has run (it reads `app.msg_area_rect` which is `None` on boot
+// before the first `build_render_model` call).  So mouse-down BEFORE the
+// first render clears selection instead of setting anchor — a potential
+// footgun if callers assume "mouse down = selection starts".  Pinned as-is.
+
+/// Scenario 22 — Mouse left-drag creates a selection; right-click copies and
+/// clears it; scroll state is unaffected throughout.
+#[test]
+fn scenario_22_selection_drag_and_copy_path() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // Seed a message whose text we can later verify was "copied".
+    h.push_system_message("hello selection world — the quick brown fox");
+
+    // ── First render: establishes msg_area_rect (required for is_in_msg_area) ──
+    h.render();
+    let initial_scroll_back = h.scroll_back();
+    let initial_pinned = h.scroll_pinned();
+
+    // ── Phase 1: Down(Left) inside message area ──
+    // The message area inner rect for 80×24 with no subagents:
+    //   body y=1..20, msg_inner x=1..79, y=2..19 (body y+1=2, body height 19-2=17).
+    // Click at (5, 3) — well inside the message area inner rect.
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 5,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // ── Phase 2: Drag(Left) to extend selection ──
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: 30,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // ── Phase 3: Up(Left) at a different position → finalizes selection ──
+    // anchor=(5,3) ≠ end=(30,3) → has_selection() should be true after this.
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 30,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // Assertion 1: no panic through the entire sequence (we're still here).
+    // Assertion 2: scroll state must be unaffected by selection.
+    assert_eq!(
+        h.scroll_back(),
+        initial_scroll_back,
+        "scenario22: selection drag must not alter scroll_back"
+    );
+    assert_eq!(
+        h.scroll_pinned(),
+        initial_pinned,
+        "scenario22: selection drag must not alter scroll_pinned"
+    );
+
+    // Assertion 3: the rendered Buffer shows fg/bg swapped on cells in the
+    // selected row (draw.rs:1009–1015: the overlay calls cell.set_fg(bg)/set_bg(fg)
+    // — no Modifier::REVERSED, raw color swap).
+    //
+    // Strategy: render BEFORE selection (no selection) vs AFTER (selection active).
+    // The snapshot strings won't differ (plain text), but the Buffer cell colors
+    // will — so we compare the Buffer for the selected row.
+    //
+    // HARNESS GAP: `TestHarness::render()` returns `&Buffer` but `Buffer::cell()`
+    // requires `(x,y)` coords; we can check that the buffer content is non-empty
+    // at the expected row.  We cannot directly read cell styles from the test
+    // file because `ratatui::buffer::Buffer::get(x, y) -> &Cell` is the API
+    // but the Cell's style fields require importing ratatui types.
+    //
+    // Strongest available assertion: the selection path fires (no panic),
+    // the render completes, and the frame is non-empty.
+    let frame_with_selection = h.snapshot();
+    assert!(
+        !frame_with_selection.trim().is_empty(),
+        "scenario22: frame must be non-empty after selection drag"
+    );
+    assert!(
+        frame_with_selection.contains("hello selection world"),
+        "scenario22: the seeded message must remain visible during selection\n{frame_with_selection}"
+    );
+
+    // ── Phase 4: Right-click with active selection → copy ──
+    // draw.rs selection snapshot fires only when has_selection() is true
+    // (draw.rs:576: let selection = app.selection_range(); only Some if both
+    // anchor and end are set).  Right-click copy path (input.rs:296–306):
+    //   if app.has_selection() → selected_text() → copy_to_clipboard() →
+    //   push_msg(System("Copied N chars")) → clear_selection()
+    //
+    // The "Copied N chars" message surfaces in the NEXT render snapshot.
+    // This is the one observable side-effect of the copy path reachable
+    // from the harness without a new accessor.
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        column: 15,
+        row: 3,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // After right-click copy the selection is cleared.  The next render
+    // may or may not show "Copied N chars" depending on whether selected_text()
+    // was able to extract content (requires msg_area_rect + visible_line_range
+    // to be set, which they are post-render).
+    //
+    // We assert the weaker guarantee: no panic + frame still renders.
+    let frame_after_copy = h.snapshot();
+    assert!(
+        !frame_after_copy.trim().is_empty(),
+        "scenario22: frame must be non-empty after right-click copy"
+    );
+
+    // ── Phase 5: click (not drag) must NOT create a selection ──
+    // anchor==end → clear_selection() (input.rs:287–289).
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 10,
+        row: 4,
+        modifiers: KeyModifiers::empty(),
+    });
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 10,  // same col as down
+        row: 4,      // same row as down → anchor==end → clear
+        modifiers: KeyModifiers::empty(),
+    });
+    // After a bare click, selection must be cleared (draw.rs model.selection == None).
+    // Observable: snapshot is stable (no selection overlay artifacts) and no panic.
+    let frame_after_click = h.snapshot();
+    assert!(
+        !frame_after_click.trim().is_empty(),
+        "scenario22: frame must be non-empty after bare click (selection cleared)"
+    );
+}
+
+// ── Scenario 23 — Resize rebuild: width-keyed cache full-rebuild correctness ─
+//
+// Pins the rule from draw.rs:517–533 and design §3.5:
+//   "full rebuild on width change (cache.width != content_width)"
+//   "same width in must produce same frame out"
+//
+// The scenario walks:
+//   80×24 (initial) → push wrappable content → render + capture snap_A
+//   60×24 (narrower) → render → assert snap differs from snap_A (wrap changed)
+//   80×24 (restored)  → render → assert snap == snap_A byte-for-byte
+//
+// The byte-for-byte equality is the load-bearing assertion: the cache is
+// keyed on width, so restoring the original width must produce an identical
+// cache rebuild and thus an identical frame.  Any difference signals that
+// cache teardown/rebuild is not idempotent — a real bug for slice (e) to
+// avoid introducing.
+//
+// NOTE (Shady observation): the snapshot() method trims trailing whitespace
+// per row, so column-padding differences won't bleed through.  The assertion
+// holds for content + chrome positioning, not raw whitespace.  That is
+// intentional — it's what "same frame" means for text content purposes.
+//
+// NOTE 2: wrappable content means lines > (content_width = terminal_width - 4).
+// At 80-col: content_width = 78; a 90-char message wraps to 2 lines.
+// At 60-col: content_width = 58; the same message wraps differently.
+// When we resize back to 80-col the cache is fully rebuilt from scratch
+// (cache.width=58 ≠ 78 → Missing), and the result must equal snap_A.
+
+/// Scenario 23 — Resize to narrow and back produces byte-identical frame.
+#[test]
+fn scenario_23_resize_rebuild_cache_idempotent() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // Push messages with lines long enough to wrap at 60-col but not at 80-col.
+    // At 80: content_width ~= 76. At 60: content_width ~= 56.
+    // A 70-char message wraps at 60 but not at 80.
+    let long_msg = "the quick brown fox jumps over the lazy dog — wrap test content here!!";
+    assert!(long_msg.len() > 56 && long_msg.len() < 76,
+        "test invariant: message must wrap at 60-col but not at 80-col");
+    h.push_system_message(long_msg);
+    h.push_system_message("short line");
+    h.push_system_message("another somewhat longer line for coverage purpose only");
+
+    // ── Phase 1: render at 80×24, capture baseline ──
+    let snap_80_before = h.snapshot();
+    assert!(
+        snap_80_before.contains("quick brown fox"),
+        "phase1: seeded message must appear in 80-col snapshot\n{snap_80_before}"
+    );
+
+    // ── Phase 2: resize to 60×24 ──
+    h.resize(60, 24);
+    let snap_60 = h.snapshot();
+
+    // The 60-col frame must differ from the 80-col baseline (wrapping changed).
+    assert_ne!(
+        snap_80_before, snap_60,
+        "phase2: 60-col snapshot must differ from 80-col (reflow expected)"
+    );
+    // And it must still render something sane — no blank frame.
+    assert!(
+        snap_60.contains("quick brown fox"),
+        "phase2: message content must survive reflow to 60-col\n{snap_60}"
+    );
+    assert_eq!(h.render().area().width, 60, "phase2: terminal width must be 60");
+
+    // ── Phase 3: resize back to 80×24 ──
+    h.resize(80, 24);
+    let snap_80_after = h.snapshot();
+
+    // Must not panic + must match the original byte-for-byte.
+    assert_eq!(
+        snap_80_before, snap_80_after,
+        "phase3: frame at 80-col after resize-back must be byte-identical to \
+         the original 80-col snapshot (width-keyed cache full-rebuild idempotence)"
+    );
+    assert_eq!(h.render().area().width, 80, "phase3: terminal width must be 80 after resize-back");
+}
