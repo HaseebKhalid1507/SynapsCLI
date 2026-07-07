@@ -798,7 +798,7 @@ pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
 
     // Use display width (matching wrap_cell's policy) for the early-return check.
     if width == 0 || display_width(text.as_str()) <= width {
-        let src = eligible.then(|| 0..text.len());
+        let src = eligible.then_some(0..text.len());
         return vec![WrapRow { text, src, content_col: 0 }];
     }
 
@@ -897,7 +897,7 @@ pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
     if rows.is_empty() {
         rows.push(WrapRow {
             text: String::new(),
-            src: eligible.then(|| 0..0),
+            src: eligible.then_some(0..0),
             content_col: 0,
         });
     }
