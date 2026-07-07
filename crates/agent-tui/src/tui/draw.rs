@@ -517,6 +517,7 @@ pub(crate) fn build_render_model(
     // ── 3. Line-cache maintenance ──────────────────────────────────────────────
     {
         let needs_full_rebuild = app
+            .transcript
             .line_cache
             .as_ref()
             .map_or(true, |c| c.width != content_width);
@@ -527,13 +528,13 @@ pub(crate) fn build_render_model(
                 .map(|i| app.render_message_lines(i, content_width))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-            app.dirty_from = None;
-        } else if let Some(k) = app.dirty_from.take() {
+            app.transcript.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+            app.transcript.dirty_from = None;
+        } else if let Some(k) = app.transcript.dirty_from.take() {
             // Incremental rebuild: only re-render messages[k..]
             // Render all dirty slots first (immutable borrow of app), then apply.
             let n = app.transcript.messages.len();
-            let cache = app.line_cache.as_ref().expect("cache must be Some here");
+            let cache = app.transcript.line_cache.as_ref().expect("cache must be Some here");
             let needs_resize = cache.per_msg.len() != n;
 
             // Render fresh slots for [k..n]
@@ -542,7 +543,7 @@ pub(crate) fn build_render_model(
                 .collect();
 
             // Apply to cache (now mutable borrow)
-            let cache = app.line_cache.as_mut().expect("cache must be Some here");
+            let cache = app.transcript.line_cache.as_mut().expect("cache must be Some here");
             if needs_resize {
                 cache.per_msg.truncate(k);
                 cache.per_msg.extend(fresh);
@@ -559,17 +560,17 @@ pub(crate) fn build_render_model(
             }
         }
         // Paranoia fallback: guarantee Some (should never fire)
-        if app.line_cache.is_none() {
+        if app.transcript.line_cache.is_none() {
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, content_width))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-            app.dirty_from = None;
+            app.transcript.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
+            app.transcript.dirty_from = None;
         }
     }
     let all_lines_vec: &[ratatui::text::Line<'static>] =
-        app.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
+        app.transcript.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
     let total = all_lines_vec.len();
     // `lines` wraps only the visible window — sliced below once (start, end) exist.
 

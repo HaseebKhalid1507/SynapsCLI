@@ -203,8 +203,8 @@ mod tests {
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> =
             per_msg.iter().flatten().cloned().collect();
-        app.line_cache = Some(LineCache { width, per_msg, flat });
-        app.dirty_from = None; // "clean" — renderer thinks nothing changed
+        app.transcript.line_cache = Some(LineCache { width, per_msg, flat });
+        app.transcript.dirty_from = None; // "clean" — renderer thinks nothing changed
     }
 
     // -------------------------------------------------------------------------
@@ -230,8 +230,8 @@ mod tests {
         prime_clean_cache(&mut app, 80);
 
         // Sanity: cache is primed and marked clean.
-        assert!(app.line_cache.is_some(), "pre-condition: cache must be primed");
-        assert!(app.dirty_from.is_none(), "pre-condition: dirty_from must be None (clean)");
+        assert!(app.transcript.line_cache.is_some(), "pre-condition: cache must be primed");
+        assert!(app.transcript.dirty_from.is_none(), "pre-condition: dirty_from must be None (clean)");
 
         // Trigger: rebuild with an empty message list — the exact bug trigger.
         // Zero push_msg calls happen → without the fix, no invalidation occurs.
@@ -241,7 +241,7 @@ mod tests {
         // doesn't render the now-deleted "hello from the past" message.
         // The fix calls app.invalidate() which sets line_cache = None.
         assert!(
-            app.line_cache.is_none(),
+            app.transcript.line_cache.is_none(),
             "line_cache must be None after rebuild with empty api_messages — \
              stale cache would render deleted messages (fbcfa05 regression)"
         );
@@ -257,8 +257,8 @@ mod tests {
         app.push_msg(ChatMessage::User("previous content".to_string()));
         prime_clean_cache(&mut app, 80);
 
-        assert!(app.line_cache.is_some(), "pre-condition: cache must be primed");
-        assert!(app.dirty_from.is_none(), "pre-condition: dirty_from must be None (clean)");
+        assert!(app.transcript.line_cache.is_some(), "pre-condition: cache must be primed");
+        assert!(app.transcript.dirty_from.is_none(), "pre-condition: dirty_from must be None (clean)");
 
         // Every entry is filtered out by rebuild_display_messages.
         let api_messages = vec![
@@ -275,7 +275,7 @@ mod tests {
         rebuild_display_messages(&api_messages, &mut app);
 
         assert!(
-            app.line_cache.is_none(),
+            app.transcript.line_cache.is_none(),
             "line_cache must be None after rebuild with fully-filtered api_messages — \
              stale cache would render deleted messages (fbcfa05 regression)"
         );

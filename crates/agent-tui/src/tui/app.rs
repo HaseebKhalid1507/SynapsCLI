@@ -1,5 +1,4 @@
 use serde_json::Value;
-use chrono::Local;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 use super::text_metrics::char_width;
@@ -7,8 +6,12 @@ use super::text_metrics::char_width;
 // Types moved to transcript.rs (P9 slice a). Re-exported here so no import
 // churn happens in other modules this slice.
 pub(crate) use super::transcript::{
-    ChatMessage, LineCache, TimestampedMsg, TranscriptStore, THINKING_PLACEHOLDER,
+    ChatMessage, LineCache, TranscriptStore, THINKING_PLACEHOLDER,
 };
+// Shim kept from slice (a) so `app::TimestampedMsg` paths stay valid — only
+// test code references it after slice (b′) moved the mutation bodies out.
+#[allow(unused_imports)]
+pub(crate) use super::transcript::TimestampedMsg;
 
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
@@ -52,14 +55,6 @@ pub(crate) struct App {
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
-    /// Cached wrapped+highlighted message lines.
-    /// `None` means "stale — rebuild on next draw". `Some(cache)` means
-    /// "valid at cache.width". Replaced the old `(usize, Vec<Line>)` tuple
-    /// with a structured type that supports per-message incremental updates.
-    pub(crate) line_cache: Option<LineCache>,
-    /// Lowest message index whose rendered lines are stale. `None` = fully clean.
-    /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
-    pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
     /// When set, the next repaint bypasses the streaming redraw throttle.
     /// Set by user input (scroll/typing/cursor) so interaction stays instant
@@ -71,12 +66,6 @@ pub(crate) struct App {
     /// Active subagent status for the live panel
     pub(crate) subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
-    /// Tracks when the current tool started executing (for elapsed time display)
-    pub(crate) tool_start_time: Option<std::time::Instant>,
-    /// Per-tool start times keyed by `tool_id`. Lets parallel tool calls
-    /// each show their own elapsed-time on the result block, instead of
-    /// sharing a single timer that the last-started tool clobbers.
-    pub(crate) tool_start_times: std::collections::HashMap<String, std::time::Instant>,
     /// Saved context from an aborted response — injected into the next user message
     pub(crate) abort_context: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
@@ -197,16 +186,12 @@ impl App {
             agent_name: synaps_cli::config::load_config()
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
-            line_cache: None,
-            dirty_from: None,
             needs_redraw: true,
             force_redraw: false,
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
             subagents: Vec::new(),
-            tool_start_time: None,
-            tool_start_times: std::collections::HashMap::new(),
             abort_context: None,
             queued_message: None,
             input_before_paste: None,
@@ -409,85 +394,31 @@ impl App {
         );
     }
 
+    // ── Slice (b′) delegating wrappers ──────────────────────────────────
+    //
+    // Content mutations, tool routing, and the invalidate family moved to
+    // TranscriptStore (transcript.rs). These wrappers keep identical
+    // signatures so call sites don't churn (locked decision #3); redraw
+    // signaling (`needs_redraw`) stays here on App.
+
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
-        self.transcript.messages.push(TimestampedMsg {
-            msg,
-            time: Local::now().format("%H:%M").to_string(),
-        });
-        // Auto-scroll only when pinned to bottom
-        if self.transcript.scroll_pinned {
-            self.transcript.scroll_back = 0;
-        }
-        // New tail message — mark last slot dirty (append to per_msg on next rebuild).
-        self.invalidate_last();
+        self.transcript.push_msg(msg);
+        self.needs_redraw = true;
     }
 
-    /// Insert a freshly created `ToolResult` directly beneath its matching
-    /// `ToolUse` / `ToolUseStart` block (matched by `tool_id`) so parallel tool
-    /// calls render as **input → its output** pairs, instead of all inputs
-    /// stacked then all outputs stacked. Falls back to appending at the end
-    /// when no matching tool_use exists (legacy providers without tool_ids).
+    /// No external call sites today (the store routes internally) — kept per
+    /// locked decision #3 (identical wrapper surface); slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
-        let use_idx = if tool_id.is_empty() {
-            None
-        } else {
-            // Invariant: each tool_id should appear at most once. Assert in
-            // debug builds so duplicate IDs surface immediately.
-            debug_assert!(
-                self.transcript.messages.iter().filter(|m| matches!(
-                    &m.msg,
-                    ChatMessage::ToolUse { tool_id: tid, .. }
-                    | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                        if tid == &tool_id
-                )).count() <= 1,
-                "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
-            );
-            self.transcript.messages.iter().position(|m| matches!(
-                &m.msg,
-                ChatMessage::ToolUse { tool_id: tid, .. }
-                | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                    if tid == &tool_id
-            ))
-        };
-        let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
-        match use_idx {
-            Some(i) => {
-                let at = (i + 1).min(self.transcript.messages.len());
-                self.transcript.messages.insert(at, TimestampedMsg {
-                    msg,
-                    time: Local::now().format("%H:%M").to_string(),
-                });
-                if self.transcript.scroll_pinned {
-                    self.transcript.scroll_back = 0;
-                }
-                // Insert mid-list — invalidate_from(at) so draw re-renders from insert point.
-                self.invalidate_from(at);
-            }
-            None => self.push_msg(msg),
-        }
+        self.transcript.push_tool_result(tool_id, content, elapsed_ms);
+        self.needs_redraw = true;
     }
-    ///
-    /// `render_lines` markdown-renders + syntax-highlights EVERY display message
-    /// on the first frame. On `--continue` of a long session (hundreds of
-    /// messages) that made boot crawl. This keeps only the most recent `cap`
-    /// display messages and prepends a notice — the FULL history is untouched in
-    /// `api_messages`, so the model still sees everything; only the visible
-    /// scrollback is trimmed. (Proper fix is viewport virtualization — #98.)
+
+    /// Delegates to [`TranscriptStore::cap_resumed_display`]. Note: does not
+    /// signal a redraw — verbatim-preserves the pre-move behavior (the method
+    /// never invalidated; it runs at resume before any cache exists).
     pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
-        if self.transcript.messages.len() <= cap {
-            return;
-        }
-        let omitted = self.transcript.messages.len() - cap;
-        self.transcript.messages.drain(0..omitted);
-        self.transcript.messages.insert(
-            0,
-            TimestampedMsg {
-                msg: ChatMessage::System(format!(
-                    "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
-                )),
-                time: Local::now().format("%H:%M").to_string(),
-            },
-        );
+        self.transcript.cap_resumed_display(cap);
     }
 
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
@@ -495,25 +426,25 @@ impl App {
     /// Use for structural changes (theme, width, message list reshuffle). For
     /// streaming deltas prefer `invalidate_last()` which is O(1).
     pub(crate) fn invalidate(&mut self) {
-        self.line_cache = None;
-        self.dirty_from = None;
+        self.transcript.invalidate();
         self.needs_redraw = true;
     }
 
     /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
     /// Coalesces with any existing dirty_from by taking the minimum.
+    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn invalidate_from(&mut self, idx: usize) {
-        self.dirty_from = Some(match self.dirty_from {
-            Some(k) => k.min(idx),
-            None => idx,
-        });
+        self.transcript.invalidate_from(idx);
         self.needs_redraw = true;
     }
 
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
-        self.invalidate_from(self.transcript.messages.len().saturating_sub(1));
+        self.transcript.invalidate_last();
+        self.needs_redraw = true;
     }
+
 
     /// Request a redraw without invalidating the line cache (e.g. for
     /// panel-only changes like spinner/timer updates, scroll, cursor blink).
@@ -550,7 +481,7 @@ impl App {
             ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
             ChatMessage::ToolUseStart { .. } => true,
             ChatMessage::ToolUse { .. } => {
-                idx == self.transcript.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+                idx == self.transcript.messages.len().saturating_sub(1) && self.transcript.tool_start_time.is_some()
             }
             ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
             _ => false,
@@ -568,227 +499,68 @@ impl App {
         false
     }
 
-    /// Returns true when the chat message at `idx` is the tool result currently
-    /// being streamed/executed. Completed historical tool results must render as
-    /// done even while a later tool call is active.
+    /// Delegates to [`TranscriptStore::is_active_tool_result`].
     pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
-        if self.tool_start_time.is_none() {
-            return false;
-        }
-        match self.transcript.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, elapsed_ms: None, .. }) => {
-                self.tool_start_times.contains_key(tool_id)
-            }
-            _ => false,
-        }
+        self.transcript.is_active_tool_result(idx)
     }
 
-    /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
+    /// Delegates to [`TranscriptStore::find_preceding_read_extension`].
     pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
-        // Prefer matching by tool_id when the result carries one — under
-        // parallel tool calls a `ToolResult` may not be positionally
-        // adjacent to its matching `ToolUse`.
-        let target_id: Option<String> = match self.transcript.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => Some(tool_id.clone()),
-            _ => None,
-        };
-        if let Some(id) = target_id {
-            for m in self.transcript.messages.iter() {
-                if let ChatMessage::ToolUse { tool_id, tool_name, input } = &m.msg {
-                    if tool_id == &id && tool_name == "read" {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
-                            if let Some(path) = parsed["path"].as_str() {
-                                if let Some(ext) = std::path::Path::new(path).extension() {
-                                    return ext.to_string_lossy().to_string();
-                                }
-                            }
-                        }
-                        return String::new();
-                    }
-                }
-            }
-        }
-        // Fallback: walk backwards from idx to find the preceding ToolUse
-        if idx == 0 { return String::new(); }
-        for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.transcript.messages[i].msg {
-                if tool_name == "read" {
-                    // Extract path from the JSON input
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
-                        if let Some(path) = parsed["path"].as_str() {
-                            // Get the extension
-                            if let Some(ext) = std::path::Path::new(path).extension() {
-                                return ext.to_string_lossy().to_string();
-                            }
-                        }
-                    }
-                }
-                break; // Stop at first ToolUse regardless
-            }
-        }
-        String::new()
+        self.transcript.find_preceding_read_extension(idx)
     }
 
-    /// Find the tool name from the ToolUse message preceding a ToolResult at index `idx`.
+    /// Delegates to [`TranscriptStore::find_preceding_tool_name`].
     pub(crate) fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
-        // Prefer matching by tool_id when the result carries one — this
-        // is the only way to render parallel-tool outputs correctly,
-        // since results may not be positionally adjacent to their
-        // matching tool_use.
-        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.transcript.messages.get(idx).map(|m| &m.msg) {
-            if !tool_id.is_empty() {
-                for m in self.transcript.messages.iter() {
-                    match &m.msg {
-                        ChatMessage::ToolUse { tool_id: tid, tool_name, .. }
-                        | ChatMessage::ToolUseStart { tool_id: tid, tool_name, .. }
-                            if tid == tool_id =>
-                        {
-                            return Some(tool_name.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if idx == 0 { return None; }
-        for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, .. } = self.transcript.messages[i].msg {
-                return Some(tool_name.clone());
-            }
-            if let ChatMessage::ToolUseStart { ref tool_name, .. } = self.transcript.messages[i].msg {
-                return Some(tool_name.clone());
-            }
-        }
-        None
+        self.transcript.find_preceding_tool_name(idx)
     }
 
     // ── Tool-event routing ──────────────────────────────────────────────
     //
-    // Stream events arrive interleaved when the model fans out parallel
-    // tool calls. The chat UI keeps a flat `Vec<ChatMessage>`, so to keep
-    // each on-screen tool block correct we must route every delta /
-    // finalize / result event back to the block whose `tool_id` matches.
-    //
-    // The earlier "always update last message" approach worked for
-    // sequential tool calls but corrupts state under parallelism — input
-    // deltas from tool A would land on tool B's `ToolUseStart`, and the
-    // first arriving result would be silently overwritten by the second.
+    // Routing logic lives in TranscriptStore (transcript.rs) since slice (b′);
+    // these are signature-identical delegates.
 
-    /// Locate the index of a `ToolUseStart` block with this `tool_id`.
+    /// Delegates to [`TranscriptStore::find_tool_use_start_idx`].
+    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
-        self.transcript.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
-        ))
+        self.transcript.find_tool_use_start_idx(tool_id)
     }
 
-    /// Locate the latest `ToolResult` block for this `tool_id`.
+    /// Delegates to [`TranscriptStore::find_tool_result_idx`].
+    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
-        self.transcript.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
-        ))
+        self.transcript.find_tool_result_idx(tool_id)
     }
 
-    /// Begin streaming a new tool call. Records start time per-tool so
-    /// elapsed-ms is correct under parallel execution.
+    /// Delegates to [`TranscriptStore::on_tool_use_start`].
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
-        self.drop_empty_thinking();
-        let now = std::time::Instant::now();
-        self.tool_start_time = Some(now);
-        if !tool_id.is_empty() {
-            self.tool_start_times.insert(tool_id.clone(), now);
-        }
-        self.push_msg(ChatMessage::ToolUseStart {
-            tool_id,
-            tool_name,
-            partial_input: String::new(),
-        });
+        self.transcript.on_tool_use_start(tool_id, tool_name);
+        self.needs_redraw = true;
     }
 
-    /// Append a chunk of the tool's input JSON to the matching
-    /// `ToolUseStart` block. Falls back to "last ToolUseStart" only when
-    /// the event lacks a tool_id (legacy paths).
+    /// Delegates to [`TranscriptStore::on_tool_use_delta`].
     pub(crate) fn on_tool_use_delta(&mut self, tool_id: &str, delta: &str) {
-        let target_idx = if !tool_id.is_empty() {
-            self.find_tool_use_start_idx(tool_id)
-        } else {
-            self.transcript.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
-        };
-        if let Some(idx) = target_idx {
-            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.transcript.messages[idx].msg {
-                partial_input.push_str(delta);
-                self.invalidate();
-            }
-        }
+        self.transcript.on_tool_use_delta(tool_id, delta);
+        self.needs_redraw = true;
     }
 
-    /// Finalize a streaming tool call. Replaces the matching
-    /// `ToolUseStart` in place — keeping its position so on-screen order
-    /// matches the order the model emitted the calls.
+    /// Delegates to [`TranscriptStore::on_tool_use_finalized`].
     pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
-        self.drop_empty_thinking();
-        // Track start time even if we never saw a ToolUseStart (some
-        // providers go straight to a finalized tool_use).
-        if !tool_id.is_empty() {
-            self.tool_start_times.entry(tool_id.clone()).or_insert_with(std::time::Instant::now);
-        }
-        self.tool_start_time = Some(std::time::Instant::now());
-
-        if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
-            self.transcript.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
-            self.invalidate();
-            return;
-        }
-        // No matching start (e.g. provider only emits finalized blocks) —
-        // append a new finalized block at the end.
-        self.push_msg(ChatMessage::ToolUse { tool_id, tool_name, input: input_str });
+        self.transcript.on_tool_use_finalized(tool_id, tool_name, input_str);
+        self.needs_redraw = true;
     }
 
-    /// Stream a chunk of tool output. Appends to the matching
-    /// `ToolResult` if one exists, otherwise creates a new placeholder.
+    /// Delegates to [`TranscriptStore::on_tool_result_delta`].
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
-        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.transcript.messages[idx].msg {
-                if elapsed_ms.is_none() {
-                    content.push_str(&delta);
-                    self.invalidate();
-                    return;
-                }
-            }
-        }
-        self.push_tool_result(tool_id, delta, None);
+        self.transcript.on_tool_result_delta(tool_id, delta);
+        self.needs_redraw = true;
     }
 
-    /// Finalize a tool result. Replaces any in-flight `ToolResult` for
-    /// this `tool_id` (including a delta-buffered one) and stamps the
-    /// elapsed time using the per-tool start time.
+    /// Delegates to [`TranscriptStore::on_tool_result`].
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
-        let elapsed = self
-            .tool_start_times
-            .remove(&tool_id)
-            .map(|t| t.elapsed().as_millis() as u64);
-        // Clear the shared "active tool" timer once the *latest* tool
-        // finishes — otherwise the bash trace animation lingers.
-        if self.tool_start_times.is_empty() {
-            self.tool_start_time = None;
-        }
-
-        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.transcript.messages[idx].msg {
-                if elapsed_ms.is_none() {
-                    *content = result;
-                    self.transcript.messages[idx].msg = ChatMessage::ToolResult {
-                        tool_id,
-                        content: std::mem::take(content),
-                        elapsed_ms: elapsed,
-                    };
-                    self.invalidate();
-                    return;
-                }
-            }
-        }
-        self.push_tool_result(tool_id, result, elapsed);
+        self.transcript.on_tool_result(tool_id, result);
+        self.needs_redraw = true;
     }
 
     /// Capture all assistant output since the last user message as abort context.
@@ -905,7 +677,7 @@ impl App {
         let (sc, sr, ec, er) = self.selection_range()?;
         let rect = self.msg_area_rect?;
         let (vis_start, vis_end) = self.visible_line_range?;
-        let all_lines = &self.line_cache.as_ref()?.flat;
+        let all_lines = &self.transcript.line_cache.as_ref()?.flat;
 
         let content_x = rect.x;
         let content_y = rect.y;
@@ -962,55 +734,19 @@ impl App {
     }
 
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
-        // Model produced real output — clear any empty thinking placeholder
-        // so its spinner stops.
-        self.drop_empty_thinking();
-        if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.transcript.messages.last_mut() {
-            existing.push_str(text);
-        } else {
-            self.push_msg(ChatMessage::Text(text.to_string()));
-        }
-        self.invalidate_last();
+        self.transcript.append_or_update_text(text);
+        self.needs_redraw = true;
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
-        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.transcript.messages.last_mut() {
-            // First real delta replaces the sentinel placeholder rather than
-            // appending to it (otherwise content reads "…​<thinking>").
-            if existing == THINKING_PLACEHOLDER {
-                *existing = text.to_string();
-            } else {
-                existing.push_str(text);
-            }
-        } else {
-            self.push_msg(ChatMessage::Thinking(text.to_string()));
-        }
-        self.invalidate_last();
+        self.transcript.append_or_update_thinking(text);
+        self.needs_redraw = true;
     }
 
-    /// Remove a trailing thinking block that never received content — the
-    /// sentinel placeholder, or one left empty. Called when the model starts
-    /// producing real output or the turn ends, so the thinking spinner can't
-    /// run forever on an empty thinking step.
-    ///
-    /// Scans backward past trailing System/Notice messages so a placeholder
-    /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
-    /// found and removed (FIX 4).
+    /// Delegates to [`TranscriptStore::drop_empty_thinking`].
     pub(crate) fn drop_empty_thinking(&mut self) {
-        // Walk from the tail, skipping System messages, to find the first
-        // non-System message. If it's an empty/placeholder Thinking, drop it.
-        let candidate_idx = self.transcript.messages.iter().rposition(|m| {
-            !matches!(&m.msg, ChatMessage::System(_))
-        });
-        if let Some(idx) = candidate_idx {
-            if let ChatMessage::Thinking(t) = &self.transcript.messages[idx].msg {
-                if t == THINKING_PLACEHOLDER || t.is_empty() {
-                    self.transcript.messages.remove(idx);
-                    // Structural change (remove) — full invalidate to resync per_msg lengths.
-                    self.invalidate();
-                }
-            }
-        }
+        self.transcript.drop_empty_thinking();
+        self.needs_redraw = true;
     }
 
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {
@@ -1220,8 +956,8 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.tool_start_time = Some(std::time::Instant::now());
-        app.tool_start_times.insert("call_2".to_string(), std::time::Instant::now());
+        app.transcript.tool_start_time = Some(std::time::Instant::now());
+        app.transcript.tool_start_times.insert("call_2".to_string(), std::time::Instant::now());
 
         assert!(!app.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
         assert!(app.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
@@ -1248,9 +984,9 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.tool_start_time = Some(std::time::Instant::now());
-        app2.tool_start_times.insert("p1".to_string(), std::time::Instant::now());
-        app2.tool_start_times.insert("p2".to_string(), std::time::Instant::now());
+        app2.transcript.tool_start_time = Some(std::time::Instant::now());
+        app2.transcript.tool_start_times.insert("p1".to_string(), std::time::Instant::now());
+        app2.transcript.tool_start_times.insert("p2".to_string(), std::time::Instant::now());
         assert!(app2.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
         assert!(app2.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
@@ -1268,7 +1004,7 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.tool_start_time = Some(std::time::Instant::now());
+        app.transcript.tool_start_time = Some(std::time::Instant::now());
 
         assert!(!app.is_active_tool_result(1));
     }
@@ -1277,7 +1013,7 @@ mod tests {
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.line_cache = Some({
+        app.transcript.line_cache = Some({
             let w = 80;
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1297,7 +1033,7 @@ mod tests {
 
         assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
         assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
-        assert!(app.line_cache.is_some(), "message cache should remain valid for panel-only animation");
+        assert!(app.transcript.line_cache.is_some(), "message cache should remain valid for panel-only animation");
     }
 
     #[test]
@@ -1313,9 +1049,9 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.tool_start_time = Some(std::time::Instant::now());
-        app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.line_cache = Some({
+        app.transcript.tool_start_time = Some(std::time::Instant::now());
+        app.transcript.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
+        app.transcript.line_cache = Some({
             let w = 80;
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1341,16 +1077,16 @@ mod tests {
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
 
         // Build full cache first
-        app.line_cache = Some({
+        app.transcript.line_cache = Some({
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             LineCache { width: w, per_msg, flat }
         });
-        app.dirty_from = None;
+        app.transcript.dirty_from = None;
         let last = app.transcript.messages.len() - 1;
 
         // Snapshot per_msg[0..last]
-        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
@@ -1365,14 +1101,14 @@ mod tests {
         // But first assert dirty_from is still None (advance_animations doesn't set it).
         // Then we call invalidate_last() as the updated caller will.
         app.invalidate_last();
-        assert_eq!(app.dirty_from, Some(last), "dirty_from must point to tail message only");
+        assert_eq!(app.transcript.dirty_from, Some(last), "dirty_from must point to tail message only");
 
         // Simulate draw.rs incremental rebuild
         {
             let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
-            let cache = app.line_cache.as_mut().unwrap();
+            let cache = app.transcript.line_cache.as_mut().unwrap();
             for (offset, rendered) in fresh.into_iter().enumerate() {
                 cache.per_msg[last + offset] = rendered;
             }
@@ -1382,10 +1118,10 @@ mod tests {
                 cache.flat.extend(slot.iter().cloned());
             }
         }
-        app.dirty_from = None;
+        app.transcript.dirty_from = None;
 
         // per_msg[0..last] must be unchanged
-        let after: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let after: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
@@ -1790,9 +1526,9 @@ mod tests {
 
     /// Helper: simulate the incremental rebuild from draw.rs (slice 3 logic).
     fn rebuild_incremental(app: &mut App, width: usize) {
-        match app.line_cache.take() {
+        match app.transcript.line_cache.take() {
             Some(mut cache) if cache.width == width => {
-                if let Some(k) = app.dirty_from.take() {
+                if let Some(k) = app.transcript.dirty_from.take() {
                     // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
                     if cache.per_msg.len() != app.transcript.messages.len() {
                         cache.per_msg.truncate(k);
@@ -1812,11 +1548,11 @@ mod tests {
                         cache.flat.extend(slot.iter().cloned());
                     }
                 }
-                app.line_cache = Some(cache);
+                app.transcript.line_cache = Some(cache);
             }
             _ => {
-                app.dirty_from = None;
-                app.line_cache = Some(build_cache(app, width));
+                app.transcript.dirty_from = None;
+                app.transcript.line_cache = Some(build_cache(app, width));
             }
         }
     }
@@ -1831,13 +1567,13 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial answer".to_string()));
 
         // Full build
-        app.line_cache = Some(build_cache(&app, w));
-        app.dirty_from = None;
+        app.transcript.line_cache = Some(build_cache(&app, w));
+        app.transcript.dirty_from = None;
 
         let last = app.transcript.messages.len() - 1; // index of Text message
 
         // Snapshot per_msg[0..last] content strings (before update)
-        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
@@ -1846,12 +1582,12 @@ mod tests {
         if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.messages.last_mut() {
             t.push_str(" — more content appended");
         }
-        app.dirty_from = Some(last); // invalidate_last equivalent
+        app.transcript.dirty_from = Some(last); // invalidate_last equivalent
 
         // Incremental rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.line_cache.as_ref().unwrap();
+        let cache = app.transcript.line_cache.as_ref().unwrap();
 
         // per_msg[0..last] must be unchanged (content-equal to snapshot)
         let after: Vec<Vec<String>> = cache.per_msg[..last]
@@ -1887,8 +1623,8 @@ mod tests {
             input: r#"{"command":"ls"}"#.to_string(),
         });
 
-        app.line_cache = Some(build_cache(&app, w));
-        app.dirty_from = None;
+        app.transcript.line_cache = Some(build_cache(&app, w));
+        app.transcript.dirty_from = None;
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
@@ -1900,12 +1636,12 @@ mod tests {
             },
             time: "00:00".to_string(),
         });
-        app.dirty_from = Some(at); // invalidate_from(at)
+        app.transcript.dirty_from = Some(at); // invalidate_from(at)
 
         // Rebuild: since per_msg.len() (2) != messages.len() (3), should do full-from-k rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.line_cache.as_ref().unwrap();
+        let cache = app.transcript.line_cache.as_ref().unwrap();
         assert_eq!(cache.per_msg.len(), app.transcript.messages.len(), "per_msg must track messages after insert");
 
         let expected_flat = app.render_lines(w);

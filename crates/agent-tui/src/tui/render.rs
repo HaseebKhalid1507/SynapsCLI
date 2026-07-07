@@ -283,7 +283,7 @@ impl App {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // Show elapsed time while tool is running
-                let elapsed_str = if let Some(start) = self.tool_start_time {
+                let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
                     let secs = start.elapsed().as_secs_f64();
                     if secs >= 1.0 {
                         format!(" {:.1}s", secs)
@@ -365,8 +365,8 @@ impl App {
                 }
                 // If this is the last message and a tool is executing, show animation
                 let is_last = i == self.transcript.messages.len() - 1;
-                if is_last && self.tool_start_time.is_some() {
-                    let elapsed_str = if let Some(start) = self.tool_start_time {
+                if is_last && self.transcript.tool_start_time.is_some() {
+                    let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
                         let secs = start.elapsed().as_secs_f64();
                         if secs >= 1.0 { format!(" {:.1}s", secs) }
                         else { format!(" {}ms", (secs * 1000.0) as u64) }
@@ -565,7 +565,7 @@ impl App {
                 } else if !is_error && show > 0 {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
-                        let elapsed_str = if let Some(start) = self.tool_start_time {
+                        let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
                             let secs = start.elapsed().as_secs_f64();
                             if secs >= 1.0 { format!(" {:.1}s", secs) }
                             else { format!(" {}ms", (secs * 1000.0) as u64) }
