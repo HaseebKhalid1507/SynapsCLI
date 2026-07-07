@@ -3372,6 +3372,7 @@ dependencies = [
  "signal-hook",
  "synaps-core",
  "synaps-engine",
+ "synaps-tui",
  "syntect",
  "tachyonfx",
  "tempfile",

@@ -189,6 +189,11 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Tool-surface utilities (schema export, etc.)
+    Tools {
+        #[command(subcommand)]
+        action: cmd::tools::ToolsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +246,9 @@ async fn main() -> anyhow::Result<()> {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        }
+        Some(Command::Tools { action }) => {
+            cmd::tools::run(action).await?;
         }
         Some(Command::Rpc { continue_id, system, model, profile }) => {
             cmd::rpc::run(continue_id, system, model, profile).await?;

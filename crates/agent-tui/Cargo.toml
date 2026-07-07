@@ -53,7 +53,16 @@ signal-hook  = { version = "0.3", features = ["iterator"] }
 # Render-thread synchronisation (tui/render_thread.rs)
 parking_lot  = "0.12"
 
+[features]
+# Headless TUI test harness (tui::testing). Pulls in the engine's offline
+# Runtime constructor. Never enabled in production builds.
+testing = ["agent-engine/testing"]
+
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
 sha2        = "0.10"
+# Self dev-dependency: turns the `testing` feature on for every test target
+# (unit, integration, doc) via feature unification, so `#[cfg(test)]` code
+# and tests/ both see tui::testing without extra flags.
+synaps-tui  = { path = ".", features = ["testing"] }

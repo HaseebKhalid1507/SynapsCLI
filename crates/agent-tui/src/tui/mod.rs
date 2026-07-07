@@ -21,6 +21,10 @@ mod settings;
 mod sidecar;
 mod signals;
 mod stream_handler;
+/// Headless test harness — see [`testing::TestHarness`]. Compiled only for
+/// in-crate tests or downstream consumers of the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod theme;
 mod toast;
 mod viewport;

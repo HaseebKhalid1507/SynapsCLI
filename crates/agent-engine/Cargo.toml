@@ -82,6 +82,11 @@ tokio-tungstenite  = "0.21"
 # Misc
 arc-swap           = "1"
 
+[features]
+# Test-support surface: offline Runtime construction for headless harnesses.
+# Never enabled in production builds; enabled by synaps-tui's `testing` feature.
+testing = []
+
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
