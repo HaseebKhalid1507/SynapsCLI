@@ -251,6 +251,15 @@ pub(super) fn handle_event(
 
 /// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
 fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
+    // Selection events may need to promote a demoted slot on demand (P11
+    // lock L3: wheel + click in one input batch maps into rows demoted as of
+    // the last frame). The re-render crosses the seam via RenderCtx, same as
+    // the draw path — field borrows are disjoint from `app.transcript`.
+    let ctx = super::transcript::RenderCtx {
+        spinner_frame: app.spinner_frame,
+        streaming: app.streaming,
+        agent_name: &app.agent_name,
+    };
     match mouse.kind {
         // Wheel scroll no longer clears the selection (P10 lock L4):
         // endpoints are content-relative, so the selection scrolls with the
@@ -267,7 +276,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
             if app.transcript.hit_test(mouse.column, mouse.row) {
-                app.transcript.selection_begin(mouse.column, mouse.row);
+                app.transcript.selection_begin(mouse.column, mouse.row, &ctx);
             } else {
                 app.transcript.clear_selection();
             }
@@ -275,12 +284,12 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
 
         // Left-drag extends the selection (no-op without an anchor)
         MouseEventKind::Drag(MouseButton::Left) => {
-            app.transcript.selection_drag(mouse.column, mouse.row);
+            app.transcript.selection_drag(mouse.column, mouse.row, &ctx);
         }
 
         // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            app.transcript.selection_release(mouse.column, mouse.row);
+            app.transcript.selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not

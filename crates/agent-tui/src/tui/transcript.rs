@@ -184,11 +184,11 @@ fn source_line_range(source: &str, idx: usize) -> std::ops::Range<usize> {
 ///   `meta` + `source_text()` exclusively (P10 §7), so copy of off-screen —
 ///   even evicted — selections works with zero re-render. `lines: None`
 ///   means "measured but demoted": height/meta retained, pixels evicted.
-///   NOTE: demotion itself is second-half work — this slice keeps `lines`
-///   always `Some` (into_entry constructs it so; nothing sets `None` yet).
+///   Demotion is live: `visible_window` evicts slots outside the viewport ±
+///   halo each frame and promotes (re-renders) on demand.
 pub(crate) struct MsgSlot {
-    /// Present only while the message intersects viewport ± overscan
-    /// (always `Some` until the demotion slice lands).
+    /// Present only while the message intersects the viewport ± the
+    /// retention halo (design §3 step 7).
     pub(crate) lines: Option<Vec<ratatui::text::Line<'static>>>,
     /// Parallel to the rendered rows. Invariant: when `lines` is `Some`,
     /// `lines.len() == meta.len()`.
@@ -202,9 +202,11 @@ impl MsgSlot {
         self.meta.len()
     }
 
-    /// The rendered rows. Panics on a demoted slot — valid this slice
-    /// (nothing demotes yet); callers that can legitimately see a demoted
-    /// slot must match on the `Option` explicitly (lock L3) instead.
+    /// The rendered rows. Panics on a demoted slot — callers must hold the
+    /// "promoted first" invariant (`visible_window` promotes window slots
+    /// before assembly; the sync paths only touch freshly rendered slots).
+    /// Callers that can legitimately see a demoted slot must match on the
+    /// `Option` explicitly (lock L3) instead.
     #[track_caller]
     pub(crate) fn lines(&self) -> &[ratatui::text::Line<'static>] {
         self.lines
@@ -328,8 +330,8 @@ impl CacheState {
     }
 
     /// Mutable access to the cache, if one exists. Mirrors the old
-    /// `line_cache.as_mut()`. Test-side escape hatch until slice (f).
-    #[cfg(test)]
+    /// `line_cache.as_mut()`. Production consumer since the demotion slice:
+    /// promote/demote flips a slot's `lines` in place.
     pub(crate) fn line_cache_mut(&mut self) -> Option<&mut LineCache> {
         match self {
             CacheState::Missing => None,
@@ -932,6 +934,22 @@ impl TranscriptStore {
         self.viewport = Some(msg_inner);
         self.visible_range = Some((start, end));
 
+        // ── Ensure rendered (design §3 step 5) ──
+        // Promote any demoted slot intersecting the visible window: heights
+        // are already known, so scroll math above never waited on this; the
+        // re-render is debug-asserted to reproduce the measured height.
+        let to_promote: Vec<usize> = self
+            .line_cache()
+            .and_then(|c| {
+                Self::window_msg_range(c, start, end).map(|(f, l)| {
+                    (f..=l).filter(|&mi| c.per_msg[mi].lines.is_none()).collect()
+                })
+            })
+            .unwrap_or_default();
+        for mi in to_promote {
+            self.promote_slot(mi, content_width, ctx);
+        }
+
         // ── Window assembly (design §3 steps 4–6) ──
         // Resolve the visible message range by binary search over
         // `cum_heights` and copy partial first/last slices plus whole middles
@@ -955,6 +973,32 @@ impl TranscriptStore {
             );
         }
         let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = assembled.into();
+
+        // ── Demote (design §3 step 7, lock L3) ──
+        // Near-viewport retention: slots outside the window ± a halo drop
+        // their pixels (`lines = None`); meta/heights survive, so copy,
+        // selection painting, and scroll math are unaffected. The halo is
+        // one viewport of rows each side plus the locked ±1-message overscan
+        // floor — wide enough that a wheel notch on a Clean cache promotes
+        // nothing (perf: scroll tick = 0 renders); a jump past the halo
+        // re-renders on demand next frame, bounded by O(visible).
+        if let Some(cache) = self.cache.line_cache_mut() {
+            let n = cache.per_msg.len();
+            if n > 0 && total > 0 {
+                let halo = content_height.max(1);
+                let keep_lo = start.saturating_sub(halo);
+                let keep_hi = (end + halo).min(total).max(keep_lo + 1);
+                let (kf, kl) =
+                    Self::window_msg_range(cache, keep_lo, keep_hi).unwrap_or((0, n - 1));
+                let keep_first = kf.saturating_sub(1);
+                let keep_last = (kl + 1).min(n - 1);
+                for (mi, slot) in cache.per_msg.iter_mut().enumerate() {
+                    if mi < keep_first || mi > keep_last {
+                        slot.lines = None;
+                    }
+                }
+            }
+        }
 
         VisibleWindow {
             lines,
@@ -997,6 +1041,31 @@ impl TranscriptStore {
             out.extend(slot.lines()[lo..hi].iter().cloned());
         }
         out
+    }
+
+    /// Re-materialize a demoted slot's pixels (design §3 step 5). The height
+    /// is already known — the render is debug-asserted to reproduce it (the
+    /// measure-IS-render guarantee; a mismatch means a height-affecting
+    /// render input changed without an invalidate — the §1.4 rule violation).
+    fn promote_slot(&mut self, msg_idx: usize, width: usize, ctx: &RenderCtx<'_>) {
+        let needs = self
+            .line_cache()
+            .and_then(|c| c.per_msg.get(msg_idx))
+            .is_some_and(|s| s.lines.is_none());
+        if !needs {
+            return;
+        }
+        let fresh = self.render_message_lines(msg_idx, width, ctx);
+        if let Some(cache) = self.cache.line_cache_mut() {
+            if let Some(slot) = cache.per_msg.get_mut(msg_idx) {
+                debug_assert_eq!(
+                    fresh.meta.len(),
+                    slot.meta.len(),
+                    "promoted slot {msg_idx} must re-render to its measured height"
+                );
+                *slot = fresh;
+            }
+        }
     }
 
     // ── Selection (content-relative since P10 slice (b)) ─────────────────────
@@ -1047,7 +1116,21 @@ impl TranscriptStore {
     /// or on an empty transcript.
     fn map_event_to_selpos(&self, col: u16, row: u16) -> Option<SelPos> {
         let rect = self.viewport?;
-        let total = self.line_cache()?.flat.len();
+        if rect.width == 0 {
+            return None;
+        }
+        let (msg_idx, line_in_msg) = self.event_row_to_content(row)?;
+        let col = col.saturating_sub(rect.x).min(rect.width - 1);
+        let src_byte = self.resolve_src_byte(msg_idx, line_in_msg, col);
+        Some(SelPos { msg_idx, line_in_msg, col, src_byte })
+    }
+
+    /// Terminal row → (msg_idx, line_in_msg) through the viewport + LIVE
+    /// scroll offset (red-team 3e). Shared by event→SelPos mapping and
+    /// promote-on-demand; `total` is sourced from the cumulative offsets.
+    fn event_row_to_content(&self, row: u16) -> Option<(usize, usize)> {
+        let rect = self.viewport?;
+        let total = self.line_cache()?.total_height();
         if total == 0 || rect.width == 0 {
             return None;
         }
@@ -1056,10 +1139,24 @@ impl TranscriptStore {
         let start = end.saturating_sub(content_height);
         let row_off = row.saturating_sub(rect.y) as usize;
         let flat_idx = (start + row_off).min(end - 1);
-        let (msg_idx, line_in_msg) = self.flat_index_to_content(flat_idx)?;
-        let col = col.saturating_sub(rect.x).min(rect.width - 1);
-        let src_byte = self.resolve_src_byte(msg_idx, line_in_msg, col);
-        Some(SelPos { msg_idx, line_in_msg, col, src_byte })
+        self.flat_index_to_content(flat_idx)
+    }
+
+    /// Frame-lagged demotion fix (lock L3 / red-team 2b): a wheel event and
+    /// a Down/Drag in the same input batch — no draw between them, and wheel
+    /// does not clear an in-flight selection — can map into rows that were
+    /// demoted as of the last frame. Re-render such a slot on demand so
+    /// `src_byte` resolution stays char-precise; the line-granularity degrade
+    /// in [`Self::resolve_src_byte`] remains the backstop — never silently
+    /// wrong bytes.
+    fn promote_for_event(&mut self, row: u16, ctx: &RenderCtx<'_>) {
+        let Some((msg_idx, _)) = self.event_row_to_content(row) else {
+            return;
+        };
+        let Some(width) = self.line_cache().map(|c| c.width) else {
+            return;
+        };
+        self.promote_slot(msg_idx, width, ctx);
     }
 
     /// Resolve a display column on a rendered row to a source byte via the
@@ -1077,8 +1174,8 @@ impl TranscriptStore {
         };
         // Lock L3: a demoted slot (lines == None) resolves to no src_byte —
         // the copy path degrades to line granularity (ContentLine-style),
-        // never silently-wrong bytes. Unreachable this slice (nothing
-        // demotes yet); load-bearing once frame-lagged demotion lands.
+        // never silently-wrong bytes. The event path promotes on demand
+        // first (`promote_for_event`); this is the defensive backstop.
         let lines = entry.lines.as_ref()?;
         let text: String = lines[line_in_msg]
             .spans
@@ -1116,15 +1213,20 @@ impl TranscriptStore {
     /// Start a selection at `(col, row)` — Down(Left) inside the message
     /// area. Clears any previous end point. No-op (anchor cleared) when the
     /// event can't be mapped to content — empty transcript or pre-render.
-    pub(crate) fn selection_begin(&mut self, col: u16, row: u16) {
+    /// Promotes a demoted slot under the event first (lock L3): char-precise
+    /// `src_byte` capture needs the rendered row.
+    pub(crate) fn selection_begin(&mut self, col: u16, row: u16, ctx: &RenderCtx<'_>) {
+        self.promote_for_event(row, ctx);
         self.selection_anchor = self.map_event_to_selpos(col, row);
         self.selection_end = None;
     }
 
     /// Extend the selection to `(col, row)` — Drag(Left). No-op when no
-    /// anchor exists (drag without a preceding in-area down).
-    pub(crate) fn selection_drag(&mut self, col: u16, row: u16) {
+    /// anchor exists (drag without a preceding in-area down). Promotes a
+    /// demoted slot under the event on demand (lock L3).
+    pub(crate) fn selection_drag(&mut self, col: u16, row: u16, ctx: &RenderCtx<'_>) {
         if self.selection_anchor.is_some() {
+            self.promote_for_event(row, ctx);
             if let Some(pos) = self.map_event_to_selpos(col, row) {
                 self.selection_end = Some(pos);
             }
@@ -1133,8 +1235,9 @@ impl TranscriptStore {
 
     /// Finalize the selection at `(col, row)` — Up(Left). A release at the
     /// anchor position was a click, not a drag — clears the selection.
-    pub(crate) fn selection_release(&mut self, col: u16, row: u16) {
+    pub(crate) fn selection_release(&mut self, col: u16, row: u16, ctx: &RenderCtx<'_>) {
         if let Some(anchor) = self.selection_anchor.clone() {
+            self.promote_for_event(row, ctx);
             let Some(end) = self.map_event_to_selpos(col, row) else {
                 return;
             };
