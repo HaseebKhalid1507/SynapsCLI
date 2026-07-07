@@ -9,6 +9,7 @@ use ratatui::{
 use crossterm::{execute, terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate}};
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
+use super::text_metrics::{char_width, width as display_width};
 
 /// The six named panes that make up the outer app layout.
 ///
@@ -821,7 +822,6 @@ pub(crate) fn render_frame(
 
         // Recompute input_lines for layout using the snapshot input + cursor_pos.
         let (input_lines, _, _) = {
-            use unicode_width::UnicodeWidthChar;
             let w = input_inner_width.max(1) as usize;
             let prefix_width: usize = 2;
             let mut total_lines: u16 = 1;
@@ -832,7 +832,7 @@ pub(crate) fn render_frame(
                     col = prefix_width;
                     continue;
                 }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let cw = char_width(ch);
                 if col + cw > w {
                     total_lines += 1;
                     col = 0;
@@ -1040,10 +1040,9 @@ pub(crate) fn render_frame(
                 r"      ██    ██    ██  ████ ██   ██ ██           ██",
                 r" ███████    ██    ██   ███ ██   ██ ██      ███████",
             ];
-            use unicode_width::UnicodeWidthStr;
             let art_display_widths: Vec<usize> = ascii_art
                 .iter()
-                .map(|l| UnicodeWidthStr::width(*l))
+                .map(|l| display_width(*l))
                 .collect();
             let max_art_width = art_display_widths.iter().copied().max().unwrap_or(0);
             let avail_w = msg_area.width as usize;
@@ -1335,7 +1334,6 @@ pub(crate) fn render_frame(
         let prompt_style = Style::default().fg(THEME.load().prompt_fg);
         let input_style = Style::default().fg(THEME.load().input_fg);
         let input_lines_vec: Vec<ratatui::text::Line> = {
-            use unicode_width::UnicodeWidthChar;
             let mut rows: Vec<Vec<Span>> = Vec::new();
             let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
             let mut col: usize = prefix_width;
@@ -1346,7 +1344,7 @@ pub(crate) fn render_frame(
                     col = prefix_width;
                     continue;
                 }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let cw = char_width(ch);
                 if col + cw > w {
                     rows.push(std::mem::take(&mut current_row));
                     current_row = Vec::new();
@@ -1377,7 +1375,6 @@ pub(crate) fn render_frame(
 
         // Cursor position for scroll offset
         let (_, cursor_row, cursor_col) = {
-            use unicode_width::UnicodeWidthChar;
             let w2 = input_inner_width.max(1) as usize;
             let mut total_rows: u16 = 1;
             let mut cur_row: u16 = 0;
@@ -1393,7 +1390,7 @@ pub(crate) fn render_frame(
                     col = prefix_width;
                     continue;
                 }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let cw = char_width(ch);
                 if col + cw > w2 {
                     total_rows += 1;
                     col = 0;
@@ -1668,7 +1665,7 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
         let content_width = lines
             .iter()
             .flat_map(|line| line.spans.iter())
-            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .map(|span| display_width(span.content.as_ref()))
             .max()
             .unwrap_or(1) as u16;
         // Dimensions are clamped to always fit a terminal of ANY size — see

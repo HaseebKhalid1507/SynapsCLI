@@ -2,6 +2,7 @@ use serde_json::Value;
 use chrono::Local;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
+use super::text_metrics::char_width;
 
 /// Sentinel placeholder pushed into a `Thinking` block while the model is
 /// deciding whether to think. Using ellipsis + zero-width space makes it
@@ -366,7 +367,6 @@ impl App {
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
     pub(crate) fn input_wrap_info(&self, inner_width: u16) -> (u16, u16, u16) {
-        use unicode_width::UnicodeWidthChar;
         let w = inner_width.max(1) as usize;
         // prefix "❯ " is 2 display columns (only on first line)
         let prefix_width: usize = 2;
@@ -386,7 +386,7 @@ impl App {
                 col = prefix_width; // continuation lines also have 2-char indent
                 continue;
             }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let cw = char_width(ch);
             if col + cw > w {
                 row += 1;
                 col = 0;

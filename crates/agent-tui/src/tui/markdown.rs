@@ -2,8 +2,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthStr;
-
+use super::text_metrics::{width as display_width, char_width};
 use super::theme::THEME;
 use super::highlight::highlight_code_block;
 
@@ -116,7 +115,7 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
         return vec![String::new()];
     }
     let stripped = strip_inline_md(text);
-    let display_w = UnicodeWidthStr::width(stripped.as_str());
+    let display_w = display_width(stripped.as_str());
     if display_w <= max_width {
         return vec![text.to_string()];
     }
@@ -126,7 +125,7 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
     let mut current_w: usize = 0;
 
     for word in text.split_whitespace() {
-        let word_w = UnicodeWidthStr::width(word);
+        let word_w = display_width(word);
         if current.is_empty() {
             // First word on this line
             if word_w <= max_width {
@@ -135,7 +134,7 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
             } else {
                 // Word is wider than column — force-break it char by char
                 for ch in word.chars() {
-                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    let ch_w = char_width(ch);
                     if current_w + ch_w > max_width && !current.is_empty() {
                         lines.push(current);
                         current = String::new();
@@ -161,7 +160,7 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
             } else {
                 // Force-break long word
                 for ch in word.chars() {
-                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    let ch_w = char_width(ch);
                     if current_w + ch_w > max_width && !current.is_empty() {
                         lines.push(current);
                         current = String::new();
@@ -238,7 +237,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         for (j, cell) in row.iter().enumerate() {
             if j < num_cols {
                 let stripped = strip_inline_md(cell);
-                col_widths[j] = col_widths[j].max(UnicodeWidthStr::width(stripped.as_str()));
+                col_widths[j] = col_widths[j].max(display_width(stripped.as_str()));
             }
         }
     }
@@ -248,7 +247,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     // compact), then distribute the remaining budget among the wide columns.
     // This prevents short fields like "✅" or "5.0s" from being crushed to
     // "…" while giving long-text columns as much room as possible.
-    let prefix_overhead = UnicodeWidthStr::width(prefix) + 2; // prefix + "  "
+    let prefix_overhead = display_width(prefix) + 2; // prefix + "  "
     let per_col_overhead = 3; // " " + cell + " " + gap
     let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
     if width > 0 && total_table_width > width {
@@ -336,7 +335,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                 let w = col_widths[j];
                 let cell_text = col_lines.get(line_idx).map(|s| s.as_str()).unwrap_or("");
                 let stripped_text = strip_inline_md(cell_text);
-                let display_w = UnicodeWidthStr::width(stripped_text.as_str());
+                let display_w = display_width(stripped_text.as_str());
                 let padding = w.saturating_sub(display_w);
 
                 // Leading space
@@ -357,7 +356,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         // so adjacent rows don't blur together
         if max_lines > 1 && i >= body_start && i < rows.len() - 1 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
+            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
             result.push(Line::from(Span::styled(
                 sep,
                 Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -367,7 +366,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         // After header row, draw a single ─ rule
         if has_header && i == 0 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
+            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
             result.push(Line::from(Span::styled(sep, border_style)));
         }
 
@@ -376,7 +375,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             let body_idx = i - body_start; // 0-indexed body row
             if body_idx > 0 && body_idx % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
                     Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -386,7 +385,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             // No header case — stripe from row 0
             if i > 0 && i % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(UnicodeWidthStr::width(prefix) + 2))));
+                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
                 result.push(Line::from(Span::styled(
                     sep,
                     Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
@@ -432,7 +431,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 let lang_style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
 
                 // Calculate block width: use a reasonable portion of available width
-                let block_inner_width = width.saturating_sub(UnicodeWidthStr::width(prefix) + 4); // prefix + "  " + borders
+                let block_inner_width = width.saturating_sub(display_width(prefix) + 4); // prefix + "  " + borders
                 let rule_width = block_inner_width.clamp(20, 60);
 
                 // Top rule with optional language tag
@@ -684,11 +683,9 @@ fn expand_tabs_with_anchor(input: &str) -> (String, Option<usize>) {
 }
 
 pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
-
     let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
     // Use display width (matching wrap_cell's policy) for the early-return check.
-    if width == 0 || UnicodeWidthStr::width(text.as_str()) <= width {
+    if width == 0 || display_width(text.as_str()) <= width {
         return vec![text];
     }
 
@@ -716,7 +713,7 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
 
     for word in text.split_inclusive(' ') {
         // Display width of this word (including any trailing space from split_inclusive).
-        let wlen = UnicodeWidthStr::width(word);
+        let wlen = display_width(word);
         let effective_width = if is_first_line { width } else { wrap_width };
         if current_w + wlen > effective_width && current_w > 0 {
             lines.push(current.trim_end().to_string());
@@ -728,7 +725,7 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
         let effective_width = if is_first_line { width } else { wrap_width };
         if wlen > effective_width {
             for ch in word.chars() {
-                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let ch_w = char_width(ch);
                 if current_w + ch_w > effective_width && !current.is_empty() {
                     lines.push(current.trim_end().to_string());
                     current = indent.clone();
@@ -1032,7 +1029,7 @@ mod tests {
         let lines = wrap_text(text, 6);
         // Each output line must fit within 6 display columns.
         for line in &lines {
-            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            let w = display_width(line.as_str());
             assert!(
                 w <= 6,
                 "line {:?} has display width {} > 6",
@@ -1052,7 +1049,7 @@ mod tests {
         let text = "🚀🚀🚀 🚀🚀";
         let lines = wrap_text(text, 6);
         for line in &lines {
-            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            let w = display_width(line.as_str());
             assert!(
                 w <= 6,
                 "emoji line {:?} has display width {} > 6",
@@ -1072,7 +1069,7 @@ mod tests {
         let text = "AB 你好";
         let lines = wrap_text(text, 5);
         for line in &lines {
-            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            let w = display_width(line.as_str());
             assert!(
                 w <= 5,
                 "mixed line {:?} has display width {} > 5",
@@ -1091,7 +1088,7 @@ mod tests {
         let lines = wrap_text("hello hello hello", 12);
         // All lines ≤ 12 display cols.
         for line in &lines {
-            let w = unicode_width::UnicodeWidthStr::width(line.as_str());
+            let w = display_width(line.as_str());
             assert!(w <= 12, "ASCII line {:?} has width {} > 12", line, w);
         }
         assert!(lines.len() >= 2, "should wrap, got {:?}", lines);
