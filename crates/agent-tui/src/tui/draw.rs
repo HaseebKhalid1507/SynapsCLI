@@ -511,69 +511,20 @@ pub(crate) fn build_render_model(
     // old saturating_sub chain + .max(1), so the resulting Rect is identical.
     let area = ratatui::layout::Rect { x: 0, y: 0, width: term_size.width, height: term_size.height };
     let msg_area = AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
-    let content_height = msg_area.height.saturating_sub(2) as usize;
-    let content_width = msg_area.width.saturating_sub(2) as usize;
 
-    // ── 3. Line-cache maintenance ──────────────────────────────────────────────
-    // Ephemeral App state the renderer needs crosses the seam via RenderCtx;
-    // borrows are field-precise so `&app.agent_name` (read) coexists with
-    // `&mut app.transcript` (cache sync).
-    {
+    // ── 3. Transcript visible window ──────────────────────────────────────────
+    // One call folds the old §3–§6 block: cache sync → scroll growth/clamp
+    // bookkeeping → viewport geometry + visible range recording → O(viewport)
+    // slice clone + selection snapshot (design §3.5). Ephemeral App state the
+    // renderer needs crosses the seam via RenderCtx.
+    let vw = {
         let ctx = super::transcript::RenderCtx {
             spinner_frame: app.spinner_frame,
             streaming: app.streaming,
             agent_name: &app.agent_name,
         };
-        app.transcript.sync_cache(content_width, &ctx);
-    }
-    // Field-precise borrow (`.cache` not the whole store) so the slice-(e)
-    // scroll bookkeeping below can still mutate scroll fields while the flat
-    // slice is live — same disjointness the old raw `line_cache` read had.
-    let all_lines_vec: &[ratatui::text::Line<'static>] =
-        app.transcript.cache.line_cache().map_or(&[], |c| c.flat.as_slice());
-    let total = all_lines_vec.len();
-    // `lines` wraps only the visible window — sliced below once (start, end) exist.
-
-    // ── 4. Scroll bookkeeping (direct field access; visible_window() folds this in slice e) ──
-    // Order is load-bearing: growth-adjust THEN clamp THEN last_line_count write.
-    if app.transcript.scroll_pinned {
-        app.transcript.scroll_back = 0;
-    } else {
-        let prev = app.transcript.last_line_count;
-        if total > prev && prev > 0 {
-            let growth = (total - prev) as u16;
-            app.transcript.scroll_back = app.transcript.scroll_back.saturating_add(growth);
-        }
-        let max_back = total.saturating_sub(content_height).min(u16::MAX as usize) as u16;
-        if app.transcript.scroll_back > max_back {
-            app.transcript.scroll_back = max_back;
-        }
-    }
-    app.transcript.last_line_count = total;
-    let scroll_back = app.transcript.scroll_back;
-
-    // ── 5. Visible range + msg_area_rect write-back ───────────────────────────
-    let end = total.saturating_sub(scroll_back as usize);
-    let start = end.saturating_sub(content_height);
-    // Inner rect: TOP+BOTTOM borders (-2 height, +1 y), horizontal padding
-    // (-2 width, +1 x).  Matches `msg_block.inner(msg_area)` exactly.
-    let msg_inner = ratatui::layout::Rect {
-        x: msg_area.x + 1,
-        y: msg_area.y + 1,
-        width: msg_area.width.saturating_sub(2),
-        height: msg_area.height.saturating_sub(2),
+        app.transcript.visible_window(msg_area, &ctx)
     };
-    app.msg_area_rect = Some(msg_inner);
-    app.visible_line_range = Some((start, end));
-
-    // Clone only the visible window (~viewport height lines) into the Arc —
-    // O(viewport) not O(n).  `total` above is the full flat count, kept for
-    // scroll bookkeeping; `lines` is only the slice the render thread needs.
-    let visible_slice = all_lines_vec.get(start..end).unwrap_or(&[]);
-    let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = visible_slice.to_vec().into();
-
-    // ── 6. Selection range ────────────────────────────────────────────────────
-    let selection = app.selection_range();
 
     // ── 7. Subagent snapshots ─────────────────────────────────────────────────
     let subagents: Vec<SubagentSnap> = app
@@ -705,11 +656,11 @@ pub(crate) fn build_render_model(
         sidecar_pills,
         runtime_model,
         runtime_thinking,
-        lines,
-        lines_width: content_width,
-        scroll_back,
-        selection,
-        messages_empty: app.transcript.messages.is_empty(),
+        lines: vw.lines,
+        lines_width: vw.lines_width,
+        scroll_back: vw.scroll_back,
+        selection: vw.selection,
+        messages_empty: vw.is_empty,
         logo_build_t: app.logo_build_t,
         logo_dismiss_t: app.logo_dismiss_t,
         subagents,

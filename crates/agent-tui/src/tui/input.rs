@@ -253,56 +253,46 @@ pub(super) fn handle_event(
 fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.clear_selection();
+            app.transcript.clear_selection();
             app.transcript.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.clear_selection();
+            app.transcript.clear_selection();
             app.transcript.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
-            if is_in_msg_area(app, mouse.column, mouse.row) {
-                app.selection_anchor = Some((mouse.column, mouse.row));
-                app.selection_end = None;
+            if app.transcript.hit_test(mouse.column, mouse.row) {
+                app.transcript.selection_begin(mouse.column, mouse.row);
             } else {
-                app.clear_selection();
+                app.transcript.clear_selection();
             }
         }
 
-        // Left-drag extends the selection
-        MouseEventKind::Drag(MouseButton::Left)
-            if app.selection_anchor.is_some() => {
-                app.selection_end = Some((mouse.column, mouse.row));
-            }
+        // Left-drag extends the selection (no-op without an anchor)
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.transcript.selection_drag(mouse.column, mouse.row);
+        }
 
-        // Left-release finalizes the selection
+        // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            if let Some(anchor) = app.selection_anchor {
-                let end = (mouse.column, mouse.row);
-                // If start == end, it was a click not a drag — clear selection
-                if anchor == end {
-                    app.clear_selection();
-                } else {
-                    app.selection_end = Some(end);
-                }
-            }
+            app.transcript.selection_release(mouse.column, mouse.row);
         }
 
         // Right-click: copy if selection exists, paste if not
         MouseEventKind::Down(MouseButton::Right) => {
-            if app.has_selection() {
+            if app.transcript.has_selection() {
                 // Copy selected text to clipboard — right-click with selection is COPY ONLY
-                if let Some(text) = app.selected_text() {
+                if let Some(text) = app.transcript.selected_text() {
                     copy_to_clipboard(&text);
                     app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
-                app.clear_selection();
+                app.transcript.clear_selection();
             } else {
                 // No selection — paste from clipboard at cursor position
                 if let Some(text) = paste_from_clipboard() {
@@ -324,17 +314,6 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
         _ => {}
     }
     InputAction::None
-}
-
-/// Check if a terminal coordinate is inside the message content area.
-/// msg_area_rect stores the inner rect (after borders/padding), so no offset needed.
-fn is_in_msg_area(app: &App, col: u16, row: u16) -> bool {
-    if let Some(rect) = app.msg_area_rect {
-        col >= rect.x && col < rect.x + rect.width
-            && row >= rect.y && row < rect.y + rect.height
-    } else {
-        false
-    }
 }
 
 /// Copy text to system clipboard. Uses a singleton background thread that
@@ -378,7 +357,7 @@ fn handle_key(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
     // Clear text selection on any keypress (typing dismisses selection)
-    app.clear_selection();
+    app.transcript.clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {

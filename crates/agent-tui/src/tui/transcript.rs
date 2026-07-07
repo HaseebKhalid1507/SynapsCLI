@@ -189,6 +189,35 @@ pub(crate) struct TranscriptStore {
     /// each show their own elapsed-time on the result block, instead of
     /// sharing a single timer that the last-started tool clobbers.
     pub(crate) tool_start_times: std::collections::HashMap<String, std::time::Instant>,
+
+    // ── Viewport geometry (moved in slice e) ─────────────────────────────────
+    /// Inner content rect of the message area as of the last
+    /// [`Self::visible_window`] call (was `App.msg_area_rect`; store-side name
+    /// per design §1a, locked decision #4). `None` until the first render —
+    /// `hit_test` returns `false` before that.
+    pub(crate) viewport: Option<ratatui::layout::Rect>,
+    /// Flat-cache index range visible in the viewport (was
+    /// `App.visible_line_range`). Consumed only by `selected_text`.
+    pub(crate) visible_range: Option<(usize, usize)>,
+
+    // ── Selection (moved in slice e; terminal coords in P9, content-relative in P10) ──
+    pub(crate) selection_anchor: Option<(u16, u16)>,
+    pub(crate) selection_end: Option<(u16, u16)>,
+}
+
+/// Everything `build_render_model` needs from the transcript, computed in one
+/// call ([`TranscriptStore::visible_window`]). Fully owned — no borrows into
+/// the store reach the render thread (extends render_model.rs's "zero borrows
+/// back into App" invariant to the store).
+pub(crate) struct VisibleWindow {
+    /// O(viewport) clone of the visible slice — same Arc the RenderModel ships.
+    pub(crate) lines: std::sync::Arc<[ratatui::text::Line<'static>]>,
+    pub(crate) lines_width: usize,
+    /// Post-clamp scroll offset — what the scroll indicator shows.
+    pub(crate) scroll_back: u16,
+    pub(crate) selection: Option<(u16, u16, u16, u16)>,
+    /// Drives logo visibility.
+    pub(crate) is_empty: bool,
 }
 
 impl TranscriptStore {
@@ -202,6 +231,10 @@ impl TranscriptStore {
             show_full_output: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
+            viewport: None,
+            visible_range: None,
+            selection_anchor: None,
+            selection_end: None,
         }
     }
 
@@ -414,6 +447,223 @@ impl TranscriptStore {
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
         }
+    }
+
+    // ── Snapshot seam (slice e) ───────────────────────────────────────────────
+
+    /// Sync the line cache to the viewport width (full rebuild on width
+    /// change, incremental from the dirty watermark otherwise), apply
+    /// pin/growth/clamp scroll bookkeeping, record the viewport geometry +
+    /// visible range for selection mapping, and return the visible window.
+    ///
+    /// Folds the old draw.rs §3–§6 block (design §3.5) so the cache-sync →
+    /// scroll-clamp → slice ordering can't be re-interleaved wrongly at call
+    /// sites. `&mut self` is honest: scroll bookkeeping legitimately mutates
+    /// during model build. Ordering inside the unpinned branch is
+    /// load-bearing: growth-adjust THEN clamp THEN `last_line_count` write.
+    ///
+    /// `msg_area` is the outer body rect; the store derives the inner content
+    /// rect (-1 border/pad each side) exactly as `msg_block.inner(msg_area)`
+    /// does on the render side.
+    pub(crate) fn visible_window(
+        &mut self,
+        msg_area: ratatui::layout::Rect,
+        ctx: &RenderCtx<'_>,
+    ) -> VisibleWindow {
+        let content_height = msg_area.height.saturating_sub(2) as usize;
+        let content_width = msg_area.width.saturating_sub(2) as usize;
+
+        // ── Cache sync (old draw.rs §3) ──
+        self.sync_cache(content_width, ctx);
+        let total = self.line_cache().map_or(0, |c| c.flat.len());
+
+        // ── Scroll bookkeeping (old draw.rs §4) ──
+        // Order is load-bearing: growth-adjust THEN clamp THEN last_line_count write.
+        if self.scroll_pinned {
+            self.scroll_back = 0;
+        } else {
+            let prev = self.last_line_count;
+            if total > prev && prev > 0 {
+                let growth = (total - prev) as u16;
+                self.scroll_back = self.scroll_back.saturating_add(growth);
+            }
+            let max_back = total.saturating_sub(content_height).min(u16::MAX as usize) as u16;
+            if self.scroll_back > max_back {
+                self.scroll_back = max_back;
+            }
+        }
+        self.last_line_count = total;
+        let scroll_back = self.scroll_back;
+
+        // ── Visible range + viewport geometry (old draw.rs §5 write-backs) ──
+        let end = total.saturating_sub(scroll_back as usize);
+        let start = end.saturating_sub(content_height);
+        // Inner rect: TOP+BOTTOM borders (-2 height, +1 y), horizontal padding
+        // (-2 width, +1 x).  Matches `msg_block.inner(msg_area)` exactly.
+        let msg_inner = ratatui::layout::Rect {
+            x: msg_area.x + 1,
+            y: msg_area.y + 1,
+            width: msg_area.width.saturating_sub(2),
+            height: msg_area.height.saturating_sub(2),
+        };
+        self.viewport = Some(msg_inner);
+        self.visible_range = Some((start, end));
+
+        // Clone only the visible window (~viewport height lines) into the Arc —
+        // O(viewport) not O(n).  `total` above is the full flat count, kept for
+        // scroll bookkeeping; `lines` is only the slice the render thread needs.
+        let all_lines: &[ratatui::text::Line<'static>] =
+            self.line_cache().map_or(&[], |c| c.flat.as_slice());
+        let visible_slice = all_lines.get(start..end).unwrap_or(&[]);
+        let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = visible_slice.to_vec().into();
+
+        VisibleWindow {
+            lines,
+            lines_width: content_width,
+            scroll_back,
+            selection: self.selection_range(), // old draw.rs §6
+            is_empty: self.messages.is_empty(),
+        }
+    }
+
+    // ── Selection (moved in slice e; bodies verbatim from app.rs) ────────────
+    //
+    // Terminal coordinates in P9; P10 replaces the internals with
+    // content-relative coordinates behind these same signatures.
+
+    /// Start a selection at `(col, row)` — Down(Left) inside the message
+    /// area. Clears any previous end point.
+    pub(crate) fn selection_begin(&mut self, col: u16, row: u16) {
+        self.selection_anchor = Some((col, row));
+        self.selection_end = None;
+    }
+
+    /// Extend the selection to `(col, row)` — Drag(Left). No-op when no
+    /// anchor exists (drag without a preceding in-area down).
+    pub(crate) fn selection_drag(&mut self, col: u16, row: u16) {
+        if self.selection_anchor.is_some() {
+            self.selection_end = Some((col, row));
+        }
+    }
+
+    /// Finalize the selection at `(col, row)` — Up(Left). A release at the
+    /// anchor position was a click, not a drag — clears the selection.
+    pub(crate) fn selection_release(&mut self, col: u16, row: u16) {
+        if let Some(anchor) = self.selection_anchor {
+            let end = (col, row);
+            // If start == end, it was a click not a drag — clear selection
+            if anchor == end {
+                self.clear_selection();
+            } else {
+                self.selection_end = Some(end);
+            }
+        }
+    }
+
+    /// Returns true if there is an active text selection in the message area.
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some() && self.selection_end.is_some()
+    }
+
+    /// Clear the current text selection.
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_end = None;
+    }
+
+    /// Get the normalized selection range: (start_col, start_row, end_col, end_row)
+    /// where start <= end in reading order. Returns None if no selection.
+    pub(crate) fn selection_range(&self) -> Option<(u16, u16, u16, u16)> {
+        let (ac, ar) = self.selection_anchor?;
+        let (ec, er) = self.selection_end?;
+        // Normalize: start is the earlier position in reading order
+        if ar < er || (ar == er && ac <= ec) {
+            Some((ac, ar, ec, er))
+        } else {
+            Some((ec, er, ac, ar))
+        }
+    }
+
+    /// Check if a terminal coordinate is inside the message content area.
+    /// `viewport` stores the inner rect (after borders/padding), so no offset
+    /// arithmetic is needed. Replaces `input.rs::is_in_msg_area`; returns
+    /// `false` until the first render establishes the viewport (pinned
+    /// behavior — scenario 22's "Shady observation").
+    pub(crate) fn hit_test(&self, col: u16, row: u16) -> bool {
+        if let Some(rect) = self.viewport {
+            col >= rect.x && col < rect.x + rect.width
+                && row >= rect.y && row < rect.y + rect.height
+        } else {
+            false
+        }
+    }
+
+    /// Rendering margin used in render.rs for message continuation lines.
+    /// 3-char margin + 2-char content indent = 5 chars total.
+    const MSG_LINE_INDENT: &'static str = "     ";
+
+    /// Extract the selected text from the visible line cache.
+    /// Uses the viewport rect and visible range to map terminal coordinates
+    /// back to line content. The viewport stores the inner content rect
+    /// (after borders/padding), so no offset arithmetic is needed here.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (sc, sr, ec, er) = self.selection_range()?;
+        let rect = self.viewport?;
+        let (vis_start, vis_end) = self.visible_range?;
+        let all_lines = &self.line_cache()?.flat;
+
+        let content_x = rect.x;
+        let content_y = rect.y;
+        let content_h = rect.height;
+
+        // Convert terminal y-coordinates to line indices
+        let mut result = String::new();
+        for term_y in sr..=er {
+            if term_y < content_y || term_y >= content_y + content_h {
+                continue;
+            }
+            let line_offset = (term_y - content_y) as usize;
+            let line_idx = vis_start + line_offset;
+            if line_idx >= vis_end || line_idx >= all_lines.len() {
+                continue;
+            }
+            let line = &all_lines[line_idx];
+            // Extract text from the line spans
+            let full_text: String = line.spans.iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+
+            // Determine character range on this line
+            let line_start_col = if term_y == sr {
+                (sc.saturating_sub(content_x)) as usize
+            } else {
+                0
+            };
+            let line_end_col = if term_y == er {
+                (ec.saturating_sub(content_x)) as usize
+            } else {
+                full_text.len()
+            };
+
+            let chars: Vec<char> = full_text.chars().collect();
+            let start = line_start_col.min(chars.len());
+            let end = line_end_col.min(chars.len());
+            if start < end {
+                let selected: String = chars[start..end].iter().collect();
+                let trimmed = selected.trim_end();
+                let trimmed = if result.is_empty() {
+                    trimmed.trim_start()
+                } else {
+                    trimmed.strip_prefix(Self::MSG_LINE_INDENT).unwrap_or(trimmed)
+                };
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(trimmed);
+            }
+        }
+
+        if result.is_empty() { None } else { Some(result) }
     }
 
     // ── Render options (slice d; locked decision #1) ─────────────────────────
@@ -729,5 +979,100 @@ impl TranscriptStore {
 impl Default for TranscriptStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod visible_window_tests {
+    use super::*;
+
+    fn test_ctx() -> RenderCtx<'static> {
+        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+    }
+
+    /// Ported from app.rs with slice (e). The app.rs original *mirrored* the
+    /// draw.rs publish path because `build_render_model` needs a live
+    /// Runtime + CommandRegistry; now that the path IS a store method, the
+    /// test drives `visible_window()` directly and pins the same invariants:
+    ///   1. `lines.len()` == content_height (the viewport), NOT `total`.
+    ///      This is what makes the publish O(viewport) instead of O(n).
+    ///   2. `lines` content == `cache.flat[start..end]` for the scroll position.
+    ///   3. the render thread's `model.lines.to_vec()` (no re-slice) equals
+    ///      that same window — proving the [start..end] re-slice is redundant.
+    ///   4. a different scroll_back yields a different window of the same len.
+    #[test]
+    fn visible_window_publish_clones_only_viewport_not_full_buffer() {
+        let mut store = TranscriptStore::new();
+
+        // 20 Text messages → each renders as 1 flat line at w=80, so total >= 20.
+        for i in 0..20 {
+            store.push_msg(ChatMessage::Text(format!("line {i}")));
+        }
+
+        let content_width: usize = 80;
+        let content_height: usize = 5; // viewport is 5 rows — much less than 20
+        // Outer body rect: inner content = outer − 2 in each dimension
+        // (visible_window derives content_width/height the same way draw.rs did).
+        let msg_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: content_width as u16 + 2,
+            height: content_height as u16 + 2,
+        };
+
+        // Pinned at bottom → scroll_back = 0.
+        let vw = store.visible_window(msg_area, &test_ctx());
+
+        let total = store.line_cache().unwrap().flat.len();
+        assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
+        let end = total; // scroll_back = 0
+        let start = end.saturating_sub(content_height);
+
+        let to_str = |sl: &[ratatui::text::Line<'static>]| -> Vec<String> {
+            sl.iter()
+              .map(|l| {
+                  l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+              })
+              .collect()
+        };
+
+        // 1. Published len must equal the viewport, NOT the full buffer.
+        assert_eq!(
+            vw.lines.len(),
+            content_height,
+            "vw.lines.len() must equal content_height ({content_height}), \
+             got {} (full buffer len = {total}) — full-buffer publish regression",
+            vw.lines.len()
+        );
+        assert_eq!(vw.lines_width, content_width, "lines_width must be the content width");
+        assert_eq!(vw.scroll_back, 0, "pinned → post-clamp scroll_back must be 0");
+        assert!(!vw.is_empty, "20 messages → is_empty must be false");
+
+        // 2. Content must match cache.flat[start..end].
+        assert_eq!(
+            to_str(&vw.lines),
+            to_str(&store.line_cache().unwrap().flat[start..end]),
+            "published window content must equal cache.flat[start..end]"
+        );
+
+        // 3. Render-thread side: visible = model.lines.to_vec() (no re-slice).
+        let visible_render: Vec<ratatui::text::Line> = vw.lines.to_vec();
+        assert_eq!(
+            to_str(&visible_render),
+            to_str(&store.line_cache().unwrap().flat[start..end]),
+            "render-thread .to_vec() on vw.lines must equal the visible window"
+        );
+
+        // 4. Sanity: scroll into the middle, check a different window.
+        store.scroll_up(10); // unpins, scroll_back = 10
+        let vw2 = store.visible_window(msg_area, &test_ctx());
+        assert_eq!(vw2.lines.len(), content_height,
+            "mid-scroll window must also have viewport length");
+        assert_eq!(vw2.scroll_back, 10, "scroll_back 10 is within clamp range");
+        assert_ne!(
+            to_str(&vw2.lines),
+            to_str(&vw.lines),
+            "different scroll positions must yield different window content"
+        );
     }
 }
