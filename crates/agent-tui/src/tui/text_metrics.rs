@@ -17,8 +17,15 @@ pub(crate) fn width(s: &str) -> usize {
 
 /// Display width of a single character in terminal cells.
 ///
-/// Returns 0 for control / combining characters. Use `unwrap_or(0)` semantics
+/// Returns 0 for control / combining characters. The `unwrap_or(0)` semantics
 /// are baked in — callers don't need to handle `Option`.
+///
+/// # Footgun: tab is width 0
+/// `char_width('\t')` returns **0**, not a tab stop. `unicode-width` classifies
+/// TAB (U+0009) as a control character. Any caller that needs visual tab
+/// expansion (e.g. rendering `\t` as N columns) must handle it explicitly —
+/// this module deliberately does not, because tab width is a rendering policy,
+/// not a character property. Same applies to `\n`, `\r`, and other C0 controls.
 #[inline]
 pub(crate) fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
