@@ -252,12 +252,14 @@ pub(super) fn handle_event(
 /// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
 fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
     match mouse.kind {
+        // Wheel scroll no longer clears the selection (P10 lock L4):
+        // endpoints are content-relative, so the selection scrolls with the
+        // content and the highlight clamps to the window. Keypresses still
+        // clear (handle_key top) — including Shift+Up/Down keyboard scroll.
         MouseEventKind::ScrollUp => {
-            app.transcript.clear_selection();
             app.transcript.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.transcript.clear_selection();
             app.transcript.scroll_down(scroll_lines);
         }
 

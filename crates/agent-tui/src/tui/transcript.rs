@@ -13,13 +13,17 @@
 //! which is store-internal. This rule enables the inline-mode accommodation
 //! described on [`TranscriptStore`] without touching any call site.
 //!
-//! # Scroll / selection asymmetry (red-team finding)
-//! `scroll_up`/`scroll_down` do **not** touch selection state. Mouse-wheel
-//! scroll clears selection at the call site in `input.rs` (before calling
-//! `scroll_up`/`scroll_down`) because that clearing is specific to wheel
-//! events — `Shift+Up/Down` keyboard scroll intentionally preserves selection.
-//! Do not unify the two call sites by folding `clear_selection` into these
-//! methods.
+//! # Scroll / selection interaction (P10, DECISION LOCK L4)
+//! `scroll_up`/`scroll_down` do **not** touch selection state, and since P10
+//! slice (b) neither does mouse-wheel scroll (the wheel arms in `input.rs` no
+//! longer clear): selection endpoints are content-relative ([`SelPos`]), so
+//! scrolled or streaming-grown content carries its selection along and the
+//! overlay simply clamps to the visible window. Any KEYPRESS still clears the
+//! selection at the top of `input.rs::handle_key` — typing dismisses
+//! selection, and that includes Shift+Up/Down keyboard scroll. Structural
+//! changes remap or clear per lock L3: an insert/invalidate at index
+//! `k <= max(endpoint msg_idx)` shifts endpoints (pure insert below them) or
+//! clears the selection; width changes clear it explicitly in `sync_cache`.
 
 /// Read-only App state the transcript renderer needs. Constructed fresh at
 /// each cache-sync call site — cheap (a usize, a bool, a &str). This makes
@@ -253,9 +257,32 @@ pub(crate) struct TranscriptStore {
     /// `App.visible_line_range`). Consumed only by `selected_text`.
     visible_range: Option<(usize, usize)>,
 
-    // ── Selection (moved in slice e; terminal coords in P9, content-relative in P10) ──
-    selection_anchor: Option<(u16, u16)>,
-    selection_end: Option<(u16, u16)>,
+    // ── Selection (moved in slice e; content-relative since P10 slice (b)) ───
+    selection_anchor: Option<SelPos>,
+    selection_end: Option<SelPos>,
+}
+
+/// A selection endpoint in content space (P10 slice (b) — design §3.2).
+/// Captured at mouse-event time by mapping (col,row) through the viewport +
+/// the LIVE scroll offset + per_msg prefix sums (red-team 3e: the
+/// event→content window is computed from current `scroll_back`, not the
+/// stored `visible_range` tuple).
+///
+/// Deliberately redundant: `(msg_idx, line_in_msg, col)` drives the highlight
+/// inverse-map; `src_byte` drives the slice-(d) copy path. All coordinates
+/// are message-local — nothing here survives on flat indices (P11-proof).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelPos {
+    msg_idx: usize,
+    /// Index into `per_msg[msg_idx].lines` — for highlight painting.
+    line_in_msg: usize,
+    /// Display column within that row (viewport-relative) — for highlight
+    /// painting and the copy-time column walk.
+    col: u16,
+    /// Resolved source byte for `Content` rows (via [`LineMeta`]); `None` on
+    /// Chrome/ContentLine rows — copy snaps to line granularity there
+    /// (locks L1 fallback / L2 / L6).
+    src_byte: Option<usize>,
 }
 
 /// Everything `build_render_model` needs from the transcript, computed in one
@@ -293,8 +320,9 @@ impl TranscriptStore {
 
     // ── Scroll API ────────────────────────────────────────────────────────────
     //
-    // These methods do NOT touch selection state — see module-level doc note
-    // on the wheel-vs-Shift+Up asymmetry.
+    // These methods do NOT touch selection state — see the module-level
+    // scroll/selection note (lock L4): wheel scroll preserves selection,
+    // keypresses clear it in input.rs::handle_key.
 
     /// Scroll up (away from bottom) by `lines`. Unpins the viewport.
     pub(crate) fn scroll_up(&mut self, lines: u16) {
@@ -373,8 +401,15 @@ impl TranscriptStore {
                 if self.scroll_pinned {
                     self.scroll_back = 0;
                 }
-                // Insert mid-list — invalidate_from(at) so draw re-renders from insert point.
-                self.invalidate_from(at);
+                // L3: structural insert — shift selection endpoints past the
+                // insertion point (or clear when the selection spans it)
+                // BEFORE the watermark. Must bypass the selection-clearing
+                // `invalidate_from`, which would nuke a selection the remap
+                // just preserved: the re-render from `at` writes identical
+                // content into the shifted slots.
+                self.selection_remap_insert(at);
+                // Insert mid-list — watermark at `at` so draw re-renders from insert point.
+                self.invalidate_watermark(at);
             }
             None => self.push_msg(msg),
         }
@@ -409,7 +444,12 @@ impl TranscriptStore {
     /// Call this after any mutation that changes how `messages` renders.
     /// Use for structural changes (theme, width, message list reshuffle). For
     /// streaming deltas prefer `invalidate_last()` which is O(1).
+    ///
+    /// Lock L3: a full invalidate is an invalidate at k = 0 — any active
+    /// selection is cleared (content anywhere may have changed; no remap is
+    /// sound).
     pub(crate) fn invalidate(&mut self) {
+        self.selection_on_invalidate(0);
         self.cache = CacheState::Missing;
     }
 
@@ -417,12 +457,63 @@ impl TranscriptStore {
     /// Coalesces with any existing watermark by taking the minimum. A missing
     /// cache stays missing — the full rebuild subsumes any watermark (same as
     /// the old `None` cache + `Some(k)` state, which the rebuild path wiped).
+    ///
+    /// Lock L3: content changed at `idx..` — a selection with any endpoint at
+    /// `msg_idx >= idx` is cleared (its content coordinates may no longer
+    /// denote the same bytes). Streaming appends invalidate only the NEW tail
+    /// index, so selections over earlier messages survive growth — the point
+    /// of the content-relative migration.
     pub(crate) fn invalidate_from(&mut self, idx: usize) {
+        self.selection_on_invalidate(idx);
+        self.invalidate_watermark(idx);
+    }
+
+    /// Watermark-only invalidate — no selection interaction. Internal seam
+    /// for `push_tool_result`, whose insert remaps endpoints itself.
+    fn invalidate_watermark(&mut self, idx: usize) {
         self.cache = match std::mem::replace(&mut self.cache, CacheState::Missing) {
             CacheState::Missing => CacheState::Missing,
             CacheState::Clean(c) => CacheState::Dirty(c, idx),
             CacheState::Dirty(c, k) => CacheState::Dirty(c, k.min(idx)),
         };
+    }
+
+    /// Lock L3 (generalized D6(i)): clear the selection when an invalidate at
+    /// `k` reaches it — i.e. `k <= max(endpoint msg_idx)`. Mid-drag anchors
+    /// (no end yet) count.
+    fn selection_on_invalidate(&mut self, k: usize) {
+        let max_idx = match (&self.selection_anchor, &self.selection_end) {
+            (Some(a), Some(e)) => a.msg_idx.max(e.msg_idx),
+            (Some(a), None) => a.msg_idx,
+            _ => return,
+        };
+        if k <= max_idx {
+            self.clear_selection();
+        }
+    }
+
+    /// Lock L3, insert case: a message inserted at `at` shifts everything at
+    /// `>= at` down one slot. Endpoints entirely below the insertion point
+    /// are untouched; endpoints entirely at/after it shift by +1 (their
+    /// content is unchanged, just re-slotted); a selection SPANNING the
+    /// insertion point is cleared — it would now cover the inserted message.
+    fn selection_remap_insert(&mut self, at: usize) {
+        let (min_idx, max_idx) = match (&self.selection_anchor, &self.selection_end) {
+            (Some(a), Some(e)) => (a.msg_idx.min(e.msg_idx), a.msg_idx.max(e.msg_idx)),
+            (Some(a), None) => (a.msg_idx, a.msg_idx),
+            _ => return,
+        };
+        if at > max_idx {
+            // Insert strictly below the selection — nothing moves.
+        } else if at <= min_idx {
+            for p in [&mut self.selection_anchor, &mut self.selection_end] {
+                if let Some(p) = p.as_mut() {
+                    p.msg_idx += 1;
+                }
+            }
+        } else {
+            self.clear_selection();
+        }
     }
 
     /// Mark only the tail message dirty. O(1) during streaming.
@@ -447,6 +538,14 @@ impl TranscriptStore {
         let needs_full_rebuild = self
             .line_cache()
             .map_or(true, |c| c.width != content_width);
+
+        // Width change ⇒ rewrap ⇒ every content coordinate is re-derived;
+        // clear the selection explicitly — honest and cheap (design §3.3).
+        // (The invariant "width change invalidates selection" transfers to
+        // P11 as a rule, not this line of code — see design §7.)
+        if self.line_cache().is_some_and(|c| c.width != content_width) {
+            self.clear_selection();
+        }
 
         if needs_full_rebuild {
             // Width changed or no cache: full rebuild
@@ -581,15 +680,120 @@ impl TranscriptStore {
         }
     }
 
-    // ── Selection (moved in slice e; bodies verbatim from app.rs) ────────────
+    // ── Selection (content-relative since P10 slice (b)) ─────────────────────
     //
-    // Terminal coordinates in P9; P10 replaces the internals with
-    // content-relative coordinates behind these same signatures.
+    // Same signatures as P9; the internals map terminal coords to content
+    // space at event time and project back to a terminal quad per frame.
+
+    /// flat index → (msg_idx, line_in_msg) via per_msg prefix sums.
+    ///
+    /// Together with [`Self::content_to_flat_index`] this is THE transitional
+    /// flat-index dependency of the selection path — P11 swaps these two
+    /// helpers for summed `desired_height` arithmetic; content-space
+    /// endpoints survive unchanged (design §7). Do not add further flat math
+    /// outside this pair.
+    fn flat_index_to_content(&self, flat_idx: usize) -> Option<(usize, usize)> {
+        let cache = self.line_cache()?;
+        let mut off = flat_idx;
+        for (mi, entry) in cache.per_msg.iter().enumerate() {
+            if off < entry.lines.len() {
+                return Some((mi, off));
+            }
+            off -= entry.lines.len();
+        }
+        None
+    }
+
+    /// (msg_idx, line_in_msg) → flat index. Inverse of
+    /// [`Self::flat_index_to_content`]; `None` when the endpoint no longer
+    /// exists in the cache (L3 clears should prevent this — treated as
+    /// "paint nothing" rather than a panic).
+    fn content_to_flat_index(&self, msg_idx: usize, line_in_msg: usize) -> Option<usize> {
+        let cache = self.line_cache()?;
+        let entry = cache.per_msg.get(msg_idx)?;
+        if line_in_msg >= entry.lines.len() {
+            return None;
+        }
+        let prefix: usize = cache.per_msg[..msg_idx].iter().map(|e| e.lines.len()).sum();
+        Some(prefix + line_in_msg)
+    }
+
+    /// Map a terminal (col,row) to a content-space endpoint.
+    ///
+    /// The row window is computed from LIVE `scroll_back` (red-team 3e), not
+    /// the stored `visible_range`, so a wheel event followed by a click
+    /// before the next frame maps through post-scroll coordinates. Rows
+    /// above/below the content clamp to the first/last content row; cols
+    /// clamp into the viewport. `None` before the first render (no viewport)
+    /// or on an empty transcript.
+    fn map_event_to_selpos(&self, col: u16, row: u16) -> Option<SelPos> {
+        let rect = self.viewport?;
+        let total = self.line_cache()?.flat.len();
+        if total == 0 || rect.width == 0 {
+            return None;
+        }
+        let content_height = rect.height as usize;
+        let end = total - (self.scroll_back as usize).min(total.saturating_sub(1));
+        let start = end.saturating_sub(content_height);
+        let row_off = row.saturating_sub(rect.y) as usize;
+        let flat_idx = (start + row_off).min(end - 1);
+        let (msg_idx, line_in_msg) = self.flat_index_to_content(flat_idx)?;
+        let col = col.saturating_sub(rect.x).min(rect.width - 1);
+        let src_byte = self.resolve_src_byte(msg_idx, line_in_msg, col);
+        Some(SelPos { msg_idx, line_in_msg, col, src_byte })
+    }
+
+    /// Resolve a display column on a rendered row to a source byte via the
+    /// row's `Content` meta. The rendered row carries `source[range]`
+    /// verbatim starting at display column `content_col` (the slice-(a)
+    /// invariant), so walking the RENDERED suffix by display width IS walking
+    /// the source — CJK-safe, and a click on the second cell of a wide char
+    /// snaps down (red-team 1d). Tab-bearing rows never get here (L6:
+    /// they're ContentLine). `None` on Chrome/ContentLine rows.
+    fn resolve_src_byte(&self, msg_idx: usize, line_in_msg: usize, col: u16) -> Option<usize> {
+        use super::text_metrics::char_width;
+        let entry = self.line_cache()?.per_msg.get(msg_idx)?;
+        let LineMeta::Content { range, content_col } = entry.meta.get(line_in_msg)? else {
+            return None;
+        };
+        let text: String = entry.lines[line_in_msg]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Locate the content start byte by walking display columns.
+        let mut byte = 0usize;
+        let mut w: u16 = 0;
+        for ch in text.chars() {
+            if w >= *content_col {
+                break;
+            }
+            w += char_width(ch) as u16;
+            byte += ch.len_utf8();
+        }
+        if w != *content_col {
+            return None; // defensive: content start not on a column boundary
+        }
+        let slice = text.get(byte..byte + range.len())?;
+        // Walk the source suffix from content_col up to the clicked column.
+        let mut off = 0usize;
+        let mut cur = *content_col;
+        for ch in slice.chars() {
+            let cw = char_width(ch) as u16;
+            if cur + cw > col {
+                break;
+            }
+            cur += cw;
+            off += ch.len_utf8();
+        }
+        Some(range.start + off)
+    }
 
     /// Start a selection at `(col, row)` — Down(Left) inside the message
-    /// area. Clears any previous end point.
+    /// area. Clears any previous end point. No-op (anchor cleared) when the
+    /// event can't be mapped to content — empty transcript or pre-render.
     pub(crate) fn selection_begin(&mut self, col: u16, row: u16) {
-        self.selection_anchor = Some((col, row));
+        self.selection_anchor = self.map_event_to_selpos(col, row);
         self.selection_end = None;
     }
 
@@ -597,16 +801,20 @@ impl TranscriptStore {
     /// anchor exists (drag without a preceding in-area down).
     pub(crate) fn selection_drag(&mut self, col: u16, row: u16) {
         if self.selection_anchor.is_some() {
-            self.selection_end = Some((col, row));
+            if let Some(pos) = self.map_event_to_selpos(col, row) {
+                self.selection_end = Some(pos);
+            }
         }
     }
 
     /// Finalize the selection at `(col, row)` — Up(Left). A release at the
     /// anchor position was a click, not a drag — clears the selection.
     pub(crate) fn selection_release(&mut self, col: u16, row: u16) {
-        if let Some(anchor) = self.selection_anchor {
-            let end = (col, row);
-            // If start == end, it was a click not a drag — clear selection
+        if let Some(anchor) = self.selection_anchor.clone() {
+            let Some(end) = self.map_event_to_selpos(col, row) else {
+                return;
+            };
+            // If start == end (in content space), it was a click not a drag.
             if anchor == end {
                 self.clear_selection();
             } else {
@@ -626,17 +834,40 @@ impl TranscriptStore {
         self.selection_end = None;
     }
 
-    /// Get the normalized selection range: (start_col, start_row, end_col, end_row)
-    /// where start <= end in reading order. Returns None if no selection.
+    /// Get the normalized selection as a terminal quad
+    /// (start_col, start_row, end_col, end_row), start <= end in reading
+    /// order — now READING ORDER OVER CONTENT COORDS, projected through the
+    /// last-rendered window (design §4.1 asterisk 1). Endpoints outside the
+    /// window clamp to its edge rows; a selection entirely off-window returns
+    /// `None` and the overlay simply doesn't paint. Returns None if no selection.
     pub(crate) fn selection_range(&self) -> Option<(u16, u16, u16, u16)> {
-        let (ac, ar) = self.selection_anchor?;
-        let (ec, er) = self.selection_end?;
-        // Normalize: start is the earlier position in reading order
-        if ar < er || (ar == er && ac <= ec) {
-            Some((ac, ar, ec, er))
+        let a = self.selection_anchor.as_ref()?;
+        let b = self.selection_end.as_ref()?;
+        // Normalize: start is the earlier position in content reading order.
+        let (s, e) = if (a.msg_idx, a.line_in_msg, a.col) <= (b.msg_idx, b.line_in_msg, b.col) {
+            (a, b)
         } else {
-            Some((ec, er, ac, ar))
+            (b, a)
+        };
+        let rect = self.viewport?;
+        let (vis_start, vis_end) = self.visible_range?;
+        if vis_end <= vis_start || rect.width == 0 {
+            return None;
         }
+        let sf = self.content_to_flat_index(s.msg_idx, s.line_in_msg)?;
+        let ef = self.content_to_flat_index(e.msg_idx, e.line_in_msg)?;
+        if ef < vis_start || sf >= vis_end {
+            return None;
+        }
+        let max_col = rect.width - 1;
+        let (sf, sc) = if sf < vis_start { (vis_start, 0) } else { (sf, s.col.min(max_col)) };
+        let (ef, ec) = if ef >= vis_end { (vis_end - 1, max_col) } else { (ef, e.col.min(max_col)) };
+        Some((
+            rect.x + sc,
+            rect.y + (sf - vis_start) as u16,
+            rect.x + ec,
+            rect.y + (ef - vis_start) as u16,
+        ))
     }
 
     /// Check if a terminal coordinate is inside the message content area.
@@ -1056,6 +1287,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.clear_selection();
         self.cache = CacheState::Missing;
     }
 
