@@ -3,6 +3,7 @@
 mod app;
 mod commands;
 mod draw;
+pub(crate) mod text_metrics;
 mod gamba;
 mod help_find;
 mod helpers;
