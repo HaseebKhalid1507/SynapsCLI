@@ -174,6 +174,13 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     // hundreds of messages on the first frame (the slow-boot cause). Full
     // history stays in api_messages for the model. See App::cap_resumed_display.
     app.cap_resumed_display(120);
+
+    // Wholesale rebuild = a full message-list reshuffle. `messages.clear()` above
+    // does NOT touch the line cache, and push_msg's incremental invalidate_last()
+    // only covers the tail — so if api_messages was empty or fully filtered, the
+    // stale cache would render deleted messages. Force a full invalidate; this is
+    // exactly the "message list reshuffle" case invalidate() is documented for.
+    app.invalidate();
 }
 
 #[cfg(test)]
