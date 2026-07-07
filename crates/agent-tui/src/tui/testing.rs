@@ -250,6 +250,36 @@ impl TestHarness {
         self
     }
 
+    /// Open the settings modal directly (bypasses the async command dispatch).
+    pub fn open_settings_modal(&mut self) -> &mut Self {
+        self.app.settings = Some(super::settings::SettingsState::new());
+        self
+    }
+
+    /// Open the models modal directly.
+    pub fn open_models_modal(&mut self) -> &mut Self {
+        self.app.models = Some(super::models::ModelsModalState::new());
+        self
+    }
+
+    /// Open the plugins modal directly with default (empty) plugin state.
+    pub fn open_plugins_modal(&mut self) -> &mut Self {
+        self.app.plugins = Some(super::plugins::PluginsModalState::new(
+            synaps_cli::skills::state::PluginsState::default(),
+        ));
+        self
+    }
+
+    /// Current transcript scrollback offset (0 = pinned to bottom).
+    pub fn scroll_back(&self) -> u16 {
+        self.app.scroll_back
+    }
+
+    /// Whether the transcript is pinned to the latest message.
+    pub fn scroll_pinned(&self) -> bool {
+        self.app.scroll_pinned
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     fn record(&mut self, action: InputAction) {
