@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Terminal,
 };
+use crossterm::{execute, terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate}};
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
 
@@ -796,14 +797,28 @@ pub(crate) fn render_frame(
     let elapsed = last_frame.elapsed();
     *last_frame = std::time::Instant::now();
 
-    super::viewport::scrub_crossterm_terminal_edges(
-        terminal,
-        model.protected_bottom_rows,
-        Style::default().bg(THEME.load().bg),
-    )?;
+    // DEC 2026 synchronized output: bracket the edge-scrub AND the ratatui
+    // diff flush together so terminals that support it (kitty, wezterm, foot,
+    // iTerm2 ≥3.5, VTE ≥0.70) don't render partial frames. Terminals that
+    // don't support mode 2026 ignore the private-mode sequences harmlessly.
+    execute!(io::stdout(), BeginSynchronizedUpdate)?;
 
-    terminal.draw(|frame| render_frame_into(frame, model, boot_fx, exit_fx, elapsed))?;
-    Ok(())
+    let frame_result = (|| -> io::Result<()> {
+        super::viewport::scrub_crossterm_terminal_edges(
+            terminal,
+            model.protected_bottom_rows,
+            Style::default().bg(THEME.load().bg),
+        )?;
+
+        terminal.draw(|frame| render_frame_into(frame, model, boot_fx, exit_fx, elapsed))?;
+        Ok(())
+    })();
+
+    // Always end the synchronized update, even if rendering failed.
+    // Leaving mode 2026 open would freeze the terminal display.
+    execute!(io::stdout(), EndSynchronizedUpdate).ok();
+
+    frame_result
 }
 
 /// Backend-agnostic frame body — everything `render_frame` draws, minus the
