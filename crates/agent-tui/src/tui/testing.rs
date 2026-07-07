@@ -310,6 +310,20 @@ impl TestHarness {
         self
     }
 
+    /// Seed a raw-markdown assistant `Text` message. Used by the P10
+    /// copy-fidelity pins, which need known markdown source in the transcript.
+    pub fn push_text_message(&mut self, text: &str) -> &mut Self {
+        self.app.push_msg(ChatMessage::Text(text.to_string()));
+        self
+    }
+
+    /// The clipboard-bound text for the current selection — the seam the P10
+    /// copy pins assert against (design §5 (pre): `selected_text()` is
+    /// directly callable, no clipboard mock needed).
+    pub fn selected_text(&self) -> Option<String> {
+        self.app.transcript.selected_text()
+    }
+
     /// Open the settings modal directly (bypasses the async command dispatch).
     pub fn open_settings_modal(&mut self) -> &mut Self {
         self.app.settings = Some(super::settings::SettingsState::new());

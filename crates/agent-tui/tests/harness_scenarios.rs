@@ -898,6 +898,140 @@ fn scenario_22_selection_drag_and_copy_path() {
     );
 }
 
+// ── Scenario 24 — Copy-fidelity acceptance (P10 finish line) ─────────────────
+//
+// Pins the TARGET copy behavior of the P10 decision lock (design §2 table +
+// lock L5): copy emits the message's SOURCE bytes — the markdown the model
+// (or user) actually wrote. No prompt prefixes, no timestamps, no chrome;
+// soft wraps joined back into one logical line; code blocks byte-exact
+// INCLUDING tails the renderer clamps away (`clamp_line`, the one loss the
+// old rendered-text copy path could never recover).
+//
+// Written before the build per the P9 slice-(e) pattern; checked in
+// `#[ignore]`d and flipped on when slice (d) rewrites `selected_text()` to
+// reconstruct from source + `LineMeta` provenance.
+
+/// Scenario 24 — drag-selecting a whole message copies its source bytes
+/// verbatim: markdown markers reappear, soft-wraps vanish, clamped code
+/// tails are recovered, chrome contributes nothing.
+#[test]
+#[ignore = "P10: activates at slice (d) when source reconstruction lands"]
+fn scenario_24_copy_fidelity_emits_source_bytes() {
+    // ── Part 1: assistant Text message — paragraph + fenced code block ──
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // A code line wider than the 80-col pane: render clamps it (clamp_line
+    // truncation, markdown.rs code-block path), so the tail below is
+    // unrecoverable from rendered text — only source copy can return it.
+    let long_code = "let extremely_long_binding_for_clamping = compute(alpha_param, beta_param, gamma_param); // tail beyond the pane edge";
+    assert!(
+        long_code.len() > 80,
+        "test invariant: code line must exceed the pane width so render clamps it"
+    );
+    let src = format!(
+        "This paragraph is **bold-marked** and long enough that the renderer must \
+         soft-wrap it across at least two display rows at eighty columns of width.\n\
+         \n\
+         ```rust\n{long_code}\n```"
+    );
+    h.push_text_message(&src);
+
+    // First render establishes viewport + line cache (selection mapping
+    // returns nothing before that — scenario 22's "Shady observation").
+    h.render();
+
+    // Drag-select the entire message area. Rows above/below the rendered
+    // content clamp to the first/last content position (design §3.2), so a
+    // whole-viewport drag covers the whole message.
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 1,
+        row: 2,
+        modifiers: KeyModifiers::empty(),
+    });
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: 78,
+        row: 18,
+        modifiers: KeyModifiers::empty(),
+    });
+    h.mouse(MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 78,
+        row: 18,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    let copied = h
+        .selected_text()
+        .expect("scenario24: selection over content must yield text");
+
+    // Targeted sub-asserts first, for readable failure diffs:
+    // 1. Clamped code tail recovered byte-exact (the structural win of P10).
+    assert!(
+        copied.contains(long_code),
+        "scenario24: copy must recover the FULL code line incl. the clamped tail\n\
+         copied:\n{copied}"
+    );
+    // 2. Markdown source markers reappear (render strips them; copy must not).
+    assert!(
+        copied.contains("**bold-marked**"),
+        "scenario24: inline markdown markers must copy as written\ncopied:\n{copied}"
+    );
+    // 3. Soft-wraps joined: the wrapped paragraph is one logical line again.
+    assert!(
+        copied.contains("soft-wrap it across at least two display rows"),
+        "scenario24: soft-wrapped paragraph must reconstitute as one line\ncopied:\n{copied}"
+    );
+    // 4. No chrome: agent header glyph, agent name label, timestamps.
+    assert!(
+        !copied.contains('\u{25c8}') && !copied.contains("agent"),
+        "scenario24: agent header chrome must not be copied\ncopied:\n{copied}"
+    );
+
+    // The lock, made executable: whole-message selection copies the source
+    // verbatim — fences and language tag included (design §6 ledger).
+    assert_eq!(
+        copied, src,
+        "scenario24: whole-message copy must equal the message SOURCE byte-for-byte"
+    );
+
+    // ── Part 2: multi-line System message — hard breaks preserved, margins
+    //            and injected prefixes stripped ──
+    let mut h2 = TestHarness::boot_with_size(80, 24);
+    let sys_src = "first line of a notice\nsecond line with a few more words on it\nthird";
+    h2.push_system_message(sys_src);
+    h2.render();
+
+    h2.mouse(MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 1,
+        row: 2,
+        modifiers: KeyModifiers::empty(),
+    });
+    h2.mouse(MouseEvent {
+        kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column: 78,
+        row: 18,
+        modifiers: KeyModifiers::empty(),
+    });
+    h2.mouse(MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 78,
+        row: 18,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    let copied_sys = h2
+        .selected_text()
+        .expect("scenario24: system-message selection must yield text");
+    assert_eq!(
+        copied_sys, sys_src,
+        "scenario24: System copy must be source-verbatim — hard \\n breaks kept, \
+         5-char render margin stripped"
+    );
+}
+
 // ── Scenario 23 — Resize rebuild: width-keyed cache full-rebuild correctness ─
 //
 // Pins the rule from draw.rs:517–533 and design §3.5:
