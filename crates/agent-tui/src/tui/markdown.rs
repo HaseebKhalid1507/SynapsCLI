@@ -682,11 +682,51 @@ fn expand_tabs_with_anchor(input: &str) -> (String, Option<usize>) {
     (out, anchor)
 }
 
-pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
+/// One wrapped display row plus the byte range of the ORIGINAL input it
+/// presents (P10 slice (a) provenance seam — design §1.3).
+///
+/// Invariant (the slice-(a) property test): when `src` is `Some(range)`,
+/// `text` ends with `raw_text[range]` **byte-for-byte** — the rendered row is
+/// the injected continuation indent (all ASCII spaces, `content_col` of them)
+/// followed by the source slice verbatim. Gap bytes between consecutive
+/// ranges are whitespace-only (the destroyed soft-wrap whitespace), which is
+/// exactly what makes soft/hard break derivation possible downstream (§1.2).
+pub(crate) struct WrapRow {
+    /// What renders — identical to the corresponding `wrap_text` output row.
+    pub(crate) text: String,
+    /// Byte range of `raw_text` appearing verbatim as the suffix of `text`.
+    /// `None` when no byte-identical mapping exists — today exactly the tab
+    /// case (DECISION LOCK L6): tab expansion rewrites the text, so callers
+    /// must downgrade to line granularity (`LineMeta::ContentLine`). This
+    /// includes the early-return path, which returns the *expanded* string
+    /// (red-team Angle 4 note).
+    pub(crate) src: Option<std::ops::Range<usize>>,
+    /// Display column where input content starts on this row. Columns left of
+    /// it are injected continuation indent (ASCII spaces, so bytes == cells).
+    /// 0 on the first row — leading input whitespace is source, not indent.
+    pub(crate) content_col: u16,
+}
+
+/// Span-emitting core of [`wrap_text`] (P10 slice (a)). Same output rows,
+/// byte-for-byte — `wrap_text` is now a thin `.map(|r| r.text)` wrapper —
+/// plus per-row source byte ranges tracked through the wrap loop.
+///
+/// Tab handling: widths are computed on the tab-expanded form (unchanged),
+/// but when the input contains any `\t` the expanded text diverges from the
+/// raw bytes and every row reports `src: None` (lock L6). For tab-free input
+/// the expanded text IS the raw input, so cursor positions in the loop are
+/// raw byte offsets directly.
+pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
     let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
+    // `tab_anchor` is Some iff the input contained a tab — the eligibility
+    // gate for byte-range provenance (L6). Tab-free ⇒ text == raw_text.
+    let eligible = tab_anchor.is_none();
+    debug_assert_eq!(eligible, !raw_text.contains('\t'));
+
     // Use display width (matching wrap_cell's policy) for the early-return check.
     if width == 0 || display_width(text.as_str()) <= width {
-        return vec![text];
+        let src = eligible.then(|| 0..text.len());
+        return vec![WrapRow { text, src, content_col: 0 }];
     }
 
     // Continuation lines normally indent to match the leading whitespace of
@@ -705,35 +745,73 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
     let indent: String = " ".repeat(cont_indent_len);
     let wrap_width = width.saturating_sub(cont_indent_len);
 
-    let mut lines = Vec::new();
+    // Flush `current` as one row. Content bytes of `current` are
+    // text[row_start..pos] appended after `row_indent_bytes` of injected
+    // indent; trim_end shortens the covered range by the trimmed byte count
+    // (ASCII-space indent ⇒ indent bytes == indent display columns).
+    fn flush_row(
+        rows: &mut Vec<WrapRow>,
+        current: &str,
+        row_indent_bytes: usize,
+        row_start: usize,
+        eligible: bool,
+    ) {
+        let trimmed = current.trim_end();
+        let content_len = trimmed.len().saturating_sub(row_indent_bytes);
+        // When the row's content trims to nothing, trim_end eats into the
+        // injected indent itself — report only the indent that survived.
+        let indent_kept = trimmed.len().min(row_indent_bytes);
+        let src = eligible.then(|| row_start..row_start + content_len);
+        rows.push(WrapRow {
+            text: trimmed.to_string(),
+            src,
+            content_col: indent_kept as u16,
+        });
+    }
+
+    let mut rows: Vec<WrapRow> = Vec::new();
     let mut current = String::new();
     // Display-width accumulator for `current` — tracks rendered columns, not char count.
     let mut current_w: usize = 0;
     let mut is_first_line = true;
+    // Byte cursor into `text`: offset of the next unconsumed byte.
+    let mut pos: usize = 0;
+    // Byte offset in `text` of the first content byte of `current`.
+    let mut row_start: usize = 0;
+    // Injected-indent byte count at the head of `current` (0 on the first row).
+    let mut row_indent_bytes: usize = 0;
 
     for word in text.split_inclusive(' ') {
+        let word_start = pos;
+        pos += word.len();
         // Display width of this word (including any trailing space from split_inclusive).
         let wlen = display_width(word);
         let effective_width = if is_first_line { width } else { wrap_width };
         if current_w + wlen > effective_width && current_w > 0 {
-            lines.push(current.trim_end().to_string());
+            flush_row(&mut rows, &current, row_indent_bytes, row_start, eligible);
             current = indent.clone();
             current_w = cont_indent_len;
             is_first_line = false;
+            row_indent_bytes = indent.len();
+            row_start = word_start;
         }
         // Word wider than effective width — hard break char by char.
         let effective_width = if is_first_line { width } else { wrap_width };
         if wlen > effective_width {
+            let mut ch_pos = word_start;
             for ch in word.chars() {
                 let ch_w = char_width(ch);
                 if current_w + ch_w > effective_width && !current.is_empty() {
-                    lines.push(current.trim_end().to_string());
+                    flush_row(&mut rows, &current, row_indent_bytes, row_start, eligible);
                     current = indent.clone();
                     current_w = cont_indent_len;
                     is_first_line = false;
+                    row_indent_bytes = indent.len();
+                    row_start = ch_pos;
                 }
                 current.push(ch);
                 current_w += ch_w;
+                ch_pos += ch.len_utf8();
             }
         } else {
             current.push_str(word);
@@ -741,12 +819,23 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
         }
     }
     if !current.is_empty() {
-        lines.push(current.trim_end().to_string());
+        flush_row(&mut rows, &current, row_indent_bytes, row_start, eligible);
     }
-    if lines.is_empty() {
-        lines.push(String::new());
+    if rows.is_empty() {
+        rows.push(WrapRow {
+            text: String::new(),
+            src: eligible.then(|| 0..0),
+            content_col: 0,
+        });
     }
-    lines
+    rows
+}
+
+pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
+    wrap_text_spans(raw_text, width)
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
 }
 
 pub(crate) fn format_tokens(n: u64) -> String {
@@ -1092,5 +1181,128 @@ mod tests {
             assert!(w <= 12, "ASCII line {:?} has width {} > 12", line, w);
         }
         assert!(lines.len() >= 2, "should wrap, got {:?}", lines);
+    }
+
+    // ── P10 slice (a): wrap_text_spans provenance properties ────────────────
+    //
+    // The property is phrased over SRC RANGES, not WrapRow.text reconcatenation
+    // (red-team Angle 4: text contains injected indents / expanded tabs and
+    // never reconcatenates). For every eligible row:
+    //   1. input[range] is the row text's byte-identical suffix,
+    //   2. bytes left of that suffix are exactly `content_col` injected spaces,
+    //   3. ranges are monotonic and non-overlapping,
+    //   4. inter-range gap bytes are whitespace-only (destroyed soft-wrap
+    //      whitespace — the §1.2 soft/hard derivation substrate),
+    //   5. the input tail beyond the last range is whitespace-only
+    //      (⇒ ranges + gaps + trimmed tail reconstruct the input in full).
+
+    #[test]
+    fn wrap_text_spans_src_ranges_match_row_suffix_byte_for_byte() {
+        let corpus: &[&str] = &[
+            "hello world this is a plain ascii paragraph that goes on for a while to force wrapping",
+            "你好 世界 这是 一段 中文 文本 需要 换行 处理 才能 正确 显示 在 终端",
+            "🚀🚀🚀 🚀🚀 emoji mixed with ascii words to wrap 🚀 boundaries here",
+            "AB 你好 mixed ascii and CJK 世界 with some more words to overflow",
+            "    leading indent line that should carry its indent forward when wrapped",
+            "let extremely_long_identifier_that_never_breaks_naturally = call(alpha,beta,gamma);",
+            "short",
+            "",
+            "word  double  spaces   preserved    between; wrapped rows must reconcile",
+            "trailing whitespace case   ",
+        ];
+        for input in corpus {
+            for width in [6usize, 10, 24, 30, 80] {
+                let rows = wrap_text_spans(input, width);
+                // Wrapper equivalence: same rows, byte-for-byte.
+                assert_eq!(
+                    rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                    wrap_text(input, width),
+                    "wrap_text must be the .text projection of wrap_text_spans \
+                     (input {input:?}, width {width})"
+                );
+                let mut prev_end = 0usize;
+                for (i, row) in rows.iter().enumerate() {
+                    let src = row
+                        .src
+                        .clone()
+                        .unwrap_or_else(|| panic!("tab-free input must be eligible: {input:?}"));
+                    let slice = &input[src.clone()];
+                    // 1. byte-identical suffix.
+                    assert!(
+                        row.text.ends_with(slice),
+                        "row {i} text {:?} must end with input[{src:?}] = {slice:?} \
+                         (input {input:?}, width {width})",
+                        row.text
+                    );
+                    // 2. everything left of the suffix is injected indent
+                    //    (ASCII spaces ⇒ bytes == display cols == content_col).
+                    let indent = &row.text[..row.text.len() - slice.len()];
+                    assert_eq!(
+                        indent.len(),
+                        row.content_col as usize,
+                        "row {i} content_col mismatch (input {input:?}, width {width})"
+                    );
+                    assert!(
+                        indent.chars().all(|c| c == ' '),
+                        "row {i} injected indent must be spaces: {indent:?}"
+                    );
+                    // 3. monotonic, non-overlapping.
+                    assert!(
+                        src.start >= prev_end && src.end >= src.start,
+                        "row {i} range {src:?} regressed past {prev_end} \
+                         (input {input:?}, width {width})"
+                    );
+                    // 4. gap bytes are whitespace-only.
+                    assert!(
+                        input[prev_end..src.start].chars().all(char::is_whitespace),
+                        "row {i} gap {:?} must be whitespace-only (input {input:?}, width {width})",
+                        &input[prev_end..src.start]
+                    );
+                    prev_end = src.end;
+                }
+                // 5. only trailing whitespace is uncovered.
+                assert!(
+                    input[prev_end..].chars().all(char::is_whitespace),
+                    "uncovered tail {:?} must be whitespace-only (input {input:?}, width {width})",
+                    &input[prev_end..]
+                );
+            }
+        }
+    }
+
+    /// Lock L6: any input containing `\t` is ineligible — every row reports
+    /// `src: None` (tab expansion destroys the byte-identical mapping), while
+    /// the rendered text stays identical to `wrap_text`. Fixtures include the
+    /// early-return case (fits within width ⇒ returns the EXPANDED text) and
+    /// a tab at the wrap boundary (red-team Angle 4 fixture list).
+    #[test]
+    fn wrap_text_spans_tab_inputs_report_no_src_ranges() {
+        let corpus: &[&str] = &[
+            "ab\tcd",                                                    // early return, expanded
+            "\t",
+            "key:\tlong value with several words that should wrap onto a second line",
+            "aaaaaaaa\tbbbbbbbb cccccccc dddddddd eeeeeeee ffffffff",    // \t near wrap boundary
+            "a\tb\tc",
+        ];
+        for input in corpus {
+            for width in [8usize, 30, 80] {
+                let rows = wrap_text_spans(input, width);
+                assert!(
+                    rows.iter().all(|r| r.src.is_none()),
+                    "tab input must be ineligible per lock L6 (input {input:?}, width {width})"
+                );
+                assert_eq!(
+                    rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                    wrap_text(input, width),
+                    "tab-path wrapper equivalence (input {input:?}, width {width})"
+                );
+            }
+        }
+        // The early-return row must carry the tab-EXPANDED text (existing
+        // behavior, easy to get subtly wrong in the wrapper — red-team note).
+        let rows = wrap_text_spans("ab\tcd", 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "ab  cd", "early return must yield expanded text");
+        assert_eq!(rows[0].src, None);
     }
 }

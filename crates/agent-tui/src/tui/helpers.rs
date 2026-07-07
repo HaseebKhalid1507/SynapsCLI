@@ -186,7 +186,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{should_draw, rebuild_display_messages};
-    use super::super::app::{App, CacheState, ChatMessage, LineCache};
+    use super::super::app::{App, CacheState, ChatMessage, LineCache, MsgEntry};
     use synaps_cli::Session;
     use std::time::Duration;
 
@@ -198,11 +198,11 @@ mod tests {
     /// mark it Clean (old "dirty_from = None"). This simulates the state right
     /// after a successful draw — the renderer believes the cache is valid.
     fn prime_clean_cache(app: &mut App, width: usize) {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count())
+        let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> =
-            per_msg.iter().flatten().cloned().collect();
+            per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
         // Clean — renderer thinks nothing changed
         app.transcript.test_set_cache_clean(LineCache { width, per_msg, flat });
     }

@@ -76,16 +76,54 @@ pub(crate) struct TimestampedMsg {
     pub(crate) time: String,
 }
 
+/// Provenance of one display row: which bytes of the owning message's
+/// canonical source it presents (P10 design §1.2, variant shapes per the
+/// DECISION LOCK L1/L2/L6). All coordinates are message-local; nothing here
+/// references flat/global line indices (P11-proof).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LineMeta {
+    /// Decoration: headers, timestamps, padding, separators, panel chrome,
+    /// "+N lines" footers, ok/timeout footers, spinner rows. Copies nothing.
+    Chrome,
+    /// This row presents `source[range]` verbatim. `content_col` is the
+    /// display column (within the row, 0-based, display-width cells) where
+    /// source content begins — everything left of it is injected
+    /// prefix/margin/indent. Emitted ONLY under the lock L1 rule: the row's
+    /// rendered text carries the source slice byte-identically (no inline-md
+    /// transform, no `\t` in the source line, no post-pass that disturbs the
+    /// range↔column correspondence). Soft-vs-hard breaks are DERIVED between
+    /// consecutive Content rows of one message:
+    ///   gap bytes whitespace-only, no '\n'  ⇒ soft wrap
+    ///   gap bytes contain '\n'              ⇒ hard break
+    Content { range: std::ops::Range<usize>, content_col: u16 },
+    /// This row presents a *transformed* view of source line `src_line`
+    /// (clamped code, highlighted tool output, pretty-printed JSON row,
+    /// thinking excerpt) — line-level mapping is sound but column-level is
+    /// not. Copy at line granularity only (locks L1 fallback, L2 tool cards,
+    /// L6 tab-bearing lines).
+    ContentLine { msg_idx: usize, src_line: usize },
+}
+
+/// Per-message render cache entry: the rendered lines plus their per-row
+/// provenance (P10 slice (a)/(b)). This is the unit P11 caches/evicts —
+/// meta rides along with the lines it describes.
+pub(crate) struct MsgEntry {
+    pub(crate) lines: Vec<ratatui::text::Line<'static>>,
+    /// Parallel to `lines`. Invariant: `lines.len() == meta.len()`.
+    pub(crate) meta: Vec<LineMeta>,
+}
+
 /// Per-message render cache. Parallel to `TranscriptStore.messages`: each slot
-/// holds the rendered `Vec<Line>` for that message. `flat` is their
-/// concatenation, which is what downstream (draw/selection) consumes. The
-/// `width` at which these were rendered is stored so stale entries can be
-/// detected on terminal resize.
+/// holds the rendered [`MsgEntry`] for that message. `flat` is the
+/// concatenation of the entries' lines, which is what downstream
+/// (draw/selection) consumes — lines only, no meta; the render thread never
+/// learns about provenance. The `width` at which these were rendered is
+/// stored so stale entries can be detected on terminal resize.
 pub(crate) struct LineCache {
     pub(crate) width: usize,
-    /// Rendered lines per message — index parallel to TranscriptStore.messages.
-    pub(crate) per_msg: Vec<Vec<ratatui::text::Line<'static>>>,
-    /// Concatenation of per_msg; what downstream code consumes.
+    /// Rendered lines + meta per message — index parallel to TranscriptStore.messages.
+    pub(crate) per_msg: Vec<MsgEntry>,
+    /// Concatenation of per_msg lines; what downstream code consumes.
     pub(crate) flat: Vec<ratatui::text::Line<'static>>,
 }
 
@@ -412,10 +450,11 @@ impl TranscriptStore {
 
         if needs_full_rebuild {
             // Width changed or no cache: full rebuild
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..self.messages.len())
+            let per_msg: Vec<MsgEntry> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            let flat: Vec<ratatui::text::Line<'static>> =
+                per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
             self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
         } else if let CacheState::Dirty(cache, k) = &self.cache {
             // Incremental rebuild: only re-render messages[k..]
@@ -425,7 +464,7 @@ impl TranscriptStore {
             let needs_resize = cache.per_msg.len() != n;
 
             // Render fresh slots for [k..n]
-            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (k..n)
+            let fresh: Vec<MsgEntry> = (k..n)
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
 
@@ -445,10 +484,10 @@ impl TranscriptStore {
                 }
             }
             // Rebuild flat from k
-            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
+            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|e| e.lines.len()).sum();
             cache.flat.truncate(prefix_line_count);
             for slot in &cache.per_msg[k..] {
-                cache.flat.extend(slot.iter().cloned());
+                cache.flat.extend(slot.lines.iter().cloned());
             }
             self.cache = CacheState::Clean(cache);
         }
@@ -456,10 +495,11 @@ impl TranscriptStore {
         // the enum makes this provably dead, but deleting it is a later
         // commit, not this one; design §6).
         if matches!(self.cache, CacheState::Missing) {
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..self.messages.len())
+            let per_msg: Vec<MsgEntry> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            let flat: Vec<ratatui::text::Line<'static>> =
+                per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
             self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
         }
     }
