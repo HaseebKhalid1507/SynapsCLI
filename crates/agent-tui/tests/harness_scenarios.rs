@@ -915,7 +915,6 @@ fn scenario_22_selection_drag_and_copy_path() {
 /// verbatim: markdown markers reappear, soft-wraps vanish, clamped code
 /// tails are recovered, chrome contributes nothing.
 #[test]
-#[ignore = "P10: activates at slice (d) when source reconstruction lands"]
 fn scenario_24_copy_fidelity_emits_source_bytes() {
     // ── Part 1: assistant Text message — paragraph + fenced code block ──
     let mut h = TestHarness::boot_with_size(80, 24);

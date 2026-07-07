@@ -9,9 +9,12 @@
 //! `~/Jawz/notes/tech/synaps-p9-transcriptstore-seam-design.md` §3.6.
 //!
 //! **Flat-cache rule (design §3.6):** nothing outside the store may index into
-//! the flat cache. After P9, the only flat-cache consumer is `selected_text`,
-//! which is store-internal. This rule enables the inline-mode accommodation
-//! described on [`TranscriptStore`] without touching any call site.
+//! the flat cache. After P10 slice (d), copy reads message SOURCE + `LineMeta`
+//! provenance — the only remaining flat-cache consumers are `visible_window`
+//! and the quarantined `flat_index_to_content`/`content_to_flat_index` pair
+//! (P11 swaps those for `desired_height` sums). This rule enables the
+//! inline-mode accommodation described on [`TranscriptStore`] without
+//! touching any call site.
 //!
 //! # Scroll / selection interaction (P10, DECISION LOCK L4)
 //! `scroll_up`/`scroll_down` do **not** touch selection state, and since P10
@@ -153,6 +156,21 @@ pub(crate) enum LineMeta {
     /// not. Copy at line granularity only (locks L1 fallback, L2 tool cards,
     /// L6 tab-bearing lines).
     ContentLine { msg_idx: usize, src_line: usize },
+}
+
+/// Byte range of source line `idx` (`str::lines` numbering — matching the
+/// render arms and `ContentLine::src_line`). An index one past the last line
+/// resolves to the empty range at source end (defensive; the D4 "+N lines"
+/// row anchors at the first HIDDEN line, which exists whenever it renders).
+fn source_line_range(source: &str, idx: usize) -> std::ops::Range<usize> {
+    let base = source.as_ptr() as usize;
+    for (i, l) in source.lines().enumerate() {
+        if i == idx {
+            let start = l.as_ptr() as usize - base;
+            return start..start + l.len();
+        }
+    }
+    source.len()..source.len()
 }
 
 /// Per-message render cache entry: the rendered lines plus their per-row
@@ -931,72 +949,111 @@ impl TranscriptStore {
         }
     }
 
-    /// Rendering margin used in render.rs for message continuation lines.
-    /// 3-char margin + 2-char content indent = 5 chars total.
-    const MSG_LINE_INDENT: &'static str = "     ";
-
-    /// Extract the selected text from the visible line cache.
-    /// Uses the viewport rect and visible range to map terminal coordinates
-    /// back to line content. The viewport stores the inner content rect
-    /// (after borders/padding), so no offset arithmetic is needed here.
+    /// The clipboard-bound text for the current selection — SOURCE
+    /// reconstruction (P10 slice (d), design §1.4). Walks the
+    /// content-relative endpoints over per-row [`LineMeta`] provenance and
+    /// emits bytes of each message's canonical source (`source_text`)
+    /// verbatim:
+    ///
+    /// - `Content` rows: exact source bytes — endpoint columns resolve
+    ///   through the `src_byte` captured at event time (char-precise).
+    /// - `ContentLine` rows: whole source lines (locks L1 fallback / L2
+    ///   tool cards / L6 tabs). A selection reaching a message's LAST
+    ///   content row extends to the end of its source — the D4 whole-card
+    ///   rule: truncated tool output, hidden thinking lines, and clamped
+    ///   code tails come back in full.
+    /// - `Chrome` rows contribute nothing; a chrome-only selection returns
+    ///   `None` (D5: no clipboard write, no toast).
+    ///
+    /// Soft wraps vanish and hard breaks reappear for free because the
+    /// emitted slice IS the original text — no joins, no indent heuristics,
+    /// no viewport dependency (off-screen selections copy fine; design §3.3).
+    /// Messages join with "\n\n" (§1.4 step 4); middle messages contribute
+    /// their full source.
     pub(crate) fn selected_text(&self) -> Option<String> {
-        let (sc, sr, ec, er) = self.selection_range()?;
-        let rect = self.viewport?;
-        let (vis_start, vis_end) = self.visible_range?;
-        let all_lines = &self.line_cache()?.flat;
+        let a = self.selection_anchor.as_ref()?;
+        let b = self.selection_end.as_ref()?;
+        // Normalize to content reading order (same rule as selection_range).
+        let (s, e) = if (a.msg_idx, a.line_in_msg, a.col) <= (b.msg_idx, b.line_in_msg, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let cache = self.line_cache()?;
 
-        let content_x = rect.x;
-        let content_y = rect.y;
-        let content_h = rect.height;
-
-        // Convert terminal y-coordinates to line indices
-        let mut result = String::new();
-        for term_y in sr..=er {
-            if term_y < content_y || term_y >= content_y + content_h {
+        let mut parts: Vec<String> = Vec::new();
+        for mi in s.msg_idx..=e.msg_idx {
+            let Some(entry) = cache.per_msg.get(mi) else { continue };
+            let source = self.source_text(mi);
+            let src: &str = &source;
+            if src.is_empty() || entry.meta.is_empty() {
                 continue;
             }
-            let line_offset = (term_y - content_y) as usize;
-            let line_idx = vis_start + line_offset;
-            if line_idx >= vis_end || line_idx >= all_lines.len() {
+            // Middle messages contribute their full source (§1.4 step 2).
+            if mi != s.msg_idx && mi != e.msg_idx {
+                parts.push(src.to_string());
                 continue;
             }
-            let line = &all_lines[line_idx];
-            // Extract text from the line spans
-            let full_text: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
 
-            // Determine character range on this line
-            let line_start_col = if term_y == sr {
-                (sc.saturating_sub(content_x)) as usize
+            let last_row = entry.meta.len() - 1;
+            let row_lo = if mi == s.msg_idx { s.line_in_msg.min(last_row) } else { 0 };
+            let row_hi = if mi == e.msg_idx { e.line_in_msg.min(last_row) } else { last_row };
+            if row_lo > row_hi {
+                continue;
+            }
+            // Endpoints on chrome snap inward to the nearest content row.
+            let is_content = |r: usize| !matches!(entry.meta[r], LineMeta::Chrome);
+            let Some(first) = (row_lo..=row_hi).find(|&r| is_content(r)) else {
+                continue; // chrome end-to-end within this message (D5)
+            };
+            let last = (row_lo..=row_hi).rev().find(|&r| is_content(r)).unwrap_or(first);
+            // The message's final content row — the D4 tail-rule trigger.
+            let last_content_in_msg = entry.meta.iter().rposition(|m| !matches!(m, LineMeta::Chrome));
+
+            let lo = if mi == s.msg_idx {
+                match &entry.meta[first] {
+                    LineMeta::Content { range, .. } if first == s.line_in_msg => {
+                        s.src_byte.unwrap_or(range.start)
+                    }
+                    LineMeta::Content { range, .. } => range.start,
+                    LineMeta::ContentLine { src_line, .. } => {
+                        source_line_range(src, *src_line).start
+                    }
+                    LineMeta::Chrome => unreachable!("first is a content row"),
+                }
             } else {
                 0
             };
-            let line_end_col = if term_y == er {
-                (ec.saturating_sub(content_x)) as usize
+            let hi = if mi == e.msg_idx {
+                match &entry.meta[last] {
+                    LineMeta::Content { range, .. } if last == e.line_in_msg => {
+                        e.src_byte.unwrap_or(range.end)
+                    }
+                    LineMeta::Content { range, .. } => range.end,
+                    // D4: selecting through the card's last content row means
+                    // "I want this output" — copy through the end of source
+                    // (recovers renderer-truncated tails).
+                    LineMeta::ContentLine { .. } if Some(last) == last_content_in_msg => src.len(),
+                    LineMeta::ContentLine { src_line, .. } => {
+                        source_line_range(src, *src_line).end
+                    }
+                    LineMeta::Chrome => unreachable!("last is a content row"),
+                }
             } else {
-                full_text.len()
+                src.len()
             };
 
-            let chars: Vec<char> = full_text.chars().collect();
-            let start = line_start_col.min(chars.len());
-            let end = line_end_col.min(chars.len());
-            if start < end {
-                let selected: String = chars[start..end].iter().collect();
-                let trimmed = selected.trim_end();
-                let trimmed = if result.is_empty() {
-                    trimmed.trim_start()
-                } else {
-                    trimmed.strip_prefix(Self::MSG_LINE_INDENT).unwrap_or(trimmed)
-                };
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(trimmed);
+            let (lo, hi) = (lo.min(src.len()), hi.min(src.len()));
+            if lo < hi {
+                parts.push(src[lo..hi].to_string());
             }
         }
 
-        if result.is_empty() { None } else { Some(result) }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
     }
 
     // ── Render options (slice d; locked decision #1) ─────────────────────────
@@ -1319,9 +1376,6 @@ impl TranscriptStore {
     /// Canonical copy source for message `idx` — see
     /// [`ChatMessage::source_text`] (design §2; the string [`LineMeta`]
     /// provenance indexes into).
-    ///
-    /// Production caller is slice (d)'s `selected_text`; the allow drops there.
-    #[allow(dead_code)]
     pub(crate) fn source_text(&self, idx: usize) -> std::borrow::Cow<'_, str> {
         self.messages[idx].msg.source_text()
     }
