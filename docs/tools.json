@@ -1,0 +1,379 @@
+[
+  {
+    "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model.",
+    "name": "bash",
+    "parameters": {
+      "properties": {
+        "command": {
+          "description": "The bash command to execute",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds (default: 30). Use a larger value for long-running commands.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Make a surgical edit to a file by replacing an exact string match. The old_string must appear exactly once in the file. Provide enough surrounding context to make the match unique.",
+    "name": "edit",
+    "parameters": {
+      "properties": {
+        "new_string": {
+          "description": "The replacement text",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "The exact text to find and replace. Must match exactly once in the file.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to edit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Find files by name using glob patterns. Searches recursively from the given path. Excludes .git directories.",
+    "name": "find",
+    "parameters": {
+      "properties": {
+        "path": {
+          "description": "Directory to search in (default: current directory)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Glob pattern to match file names (e.g. \"*.rs\", \"Cargo.*\")",
+          "type": "string"
+        },
+        "type": {
+          "description": "Filter by type: \"f\" for files, \"d\" for directories",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search file contents using regex patterns. Returns matching lines with file paths and line numbers. Supports file type filtering and context lines.",
+    "name": "grep",
+    "parameters": {
+      "properties": {
+        "context": {
+          "description": "Number of context lines to show before and after each match",
+          "type": "integer"
+        },
+        "include": {
+          "description": "Glob pattern to filter files (e.g. \"*.rs\", \"*.py\")",
+          "type": "string"
+        },
+        "path": {
+          "description": "File or directory to search in (default: current directory)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regex pattern to search for",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List directory contents with details (permissions, size, modification date). Defaults to current directory.",
+    "name": "ls",
+    "parameters": {
+      "properties": {
+        "path": {
+          "description": "Directory path to list (default: current directory)",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections.",
+    "name": "read",
+    "parameters": {
+      "properties": {
+        "limit": {
+          "description": "Maximum number of lines to read (default: all lines)",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Line number to start reading from (0-indexed, default: 0)",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Path to the file to read",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Close an interactive shell session and clean up resources. Returns the final output if any.",
+    "name": "shell_end",
+    "parameters": {
+      "properties": {
+        "session_id": {
+          "description": "Session ID to close",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Send input to an active shell session. Returns the output produced after sending the input. The input is sent exactly as received after JSON parsing — a JSON string containing \\n will send an actual newline (Enter key). Use \\x03 for Ctrl-C, \\x04 for Ctrl-D.",
+    "name": "shell_send",
+    "parameters": {
+      "properties": {
+        "input": {
+          "description": "Text to send to the shell. Use \\n for Enter, \\x03 for Ctrl-C, \\x04 for Ctrl-D",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session ID from shell_start",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Override readiness timeout for this send (ms)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "input"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Start a new interactive shell session with a PTY. Returns a session ID and the initial output. Use shell_send to interact and shell_end to close.",
+    "name": "shell_start",
+    "parameters": {
+      "properties": {
+        "cols": {
+          "description": "Terminal columns (default: from config, fallback 80)",
+          "type": "integer"
+        },
+        "command": {
+          "description": "Command to run (default: user's default shell). Examples: 'bash', 'python3', 'ssh user@host'",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional environment variables as key-value pairs",
+          "type": "object"
+        },
+        "idle_timeout": {
+          "description": "Override idle timeout for this session (seconds)",
+          "type": "integer"
+        },
+        "readiness_timeout_ms": {
+          "description": "Override output readiness timeout for this session (ms)",
+          "type": "integer"
+        },
+        "rows": {
+          "description": "Terminal rows (default: from config, fallback 24)",
+          "type": "integer"
+        },
+        "working_directory": {
+          "description": "Working directory for the session (default: current directory)",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Dispatch a one-shot subagent with a specific system prompt to perform a task. The subagent gets its own tool suite (bash, read, write, edit, grep, find, ls) and runs autonomously until done. Use this when you need the result before continuing. Blocks until done. For parallel work, use subagent_start instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "name": "subagent",
+    "parameters": {
+      "properties": {
+        "agent": {
+          "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "type": "string"
+        },
+        "system_prompt": {
+          "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
+          "type": "string"
+        },
+        "task": {
+          "description": "The task/prompt to send to the subagent.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Check if a reactive subagent is done and return its result. Non-blocking — returns immediately. If still running, returns status and partial output. If finished, returns the full result. Call repeatedly to poll for completion.",
+    "name": "subagent_collect",
+    "parameters": {
+      "properties": {
+        "handle_id": {
+          "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Resume a finished or timed-out reactive subagent with new instructions. The previous subagent's conversation state is prepended as context so the new run has full history. Returns a new handle_id — the original handle remains readable for comparison. Only works on subagents in finished/timed_out/failed state.",
+    "name": "subagent_resume",
+    "parameters": {
+      "properties": {
+        "handle_id": {
+          "description": "Handle ID of the completed subagent to resume (e.g. \"sa_3\").",
+          "type": "string"
+        },
+        "instructions": {
+          "description": "New task or context to prepend to the resumed subagent. Injected before the prior conversation history.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle_id",
+        "instructions"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Dispatch a reactive subagent and return immediately with a handle_id. The subagent runs in the background — use subagent_status to poll, subagent_steer to inject guidance mid-run, and subagent_collect to poll for the result (non-blocking — call repeatedly until done). Use this for parallel execution or when you want to continue working while the subagent runs. For simple sequential delegation, use subagent instead. Provide either an agent name (resolves from ~/.synaps-cli/agents/<name>.md) or a system_prompt string directly.",
+    "name": "subagent_start",
+    "parameters": {
+      "properties": {
+        "agent": {
+          "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model override (default: claude-sonnet-4-6). Use claude-opus-4-7 for complex tasks.",
+          "type": "string"
+        },
+        "system_prompt": {
+          "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
+          "type": "string"
+        },
+        "task": {
+          "description": "The task/prompt to send to the subagent.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds (default: 300). Increase for long-running tasks.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Poll the current state of a reactive subagent. Returns status (running/finished/timed_out/failed), the last 500 characters of output produced so far, elapsed time in seconds, and the number of tool calls made. Non-blocking — returns immediately.",
+    "name": "subagent_status",
+    "parameters": {
+      "properties": {
+        "handle_id": {
+          "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Inject a guidance message into a running reactive subagent. Use this to correct course, provide new context, or impose constraints mid-run without stopping the subagent. Returns {\"acknowledged\": true} on success or an error payload if the subagent is no longer running.",
+    "name": "subagent_steer",
+    "parameters": {
+      "properties": {
+        "handle_id": {
+          "description": "Handle ID returned by subagent_start (e.g. \"sa_3\").",
+          "type": "string"
+        },
+        "message": {
+          "description": "Guidance message to inject into the subagent's context. Keep it concise — the subagent sees this as a mid-run user message.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle_id",
+        "message"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Create or overwrite a file with the given content. Creates parent directories if needed. Use this for creating new files or completely rewriting existing ones.",
+    "name": "write",
+    "parameters": {
+      "properties": {
+        "content": {
+          "description": "Content to write to the file",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to write",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    }
+  }
+]
