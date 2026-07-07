@@ -4,7 +4,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use super::app::{App, ChatMessage, SPINNER_FRAMES, THINKING_PLACEHOLDER};
+use super::app::SPINNER_FRAMES;
+use super::transcript::{ChatMessage, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER};
 use super::theme::THEME;
 use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
 use super::markdown::{render_markdown, wrap_text};
@@ -84,15 +85,17 @@ fn panel_block(inner: Vec<Line<'static>>, accent: Color, bg: Color, width: usize
         .collect()
 }
 
-impl App {
+impl TranscriptStore {
     /// Render the lines for a single message at `idx`, in isolation.
     /// The result is identical to the contribution that message[idx] would make
     /// inside `render_lines`, assuming the same prev-message context.
-    pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> Vec<Line<'static>> {
+    /// Ephemeral App state (spinner frame, streaming flag, agent name) crosses
+    /// the seam via `ctx` — see [`RenderCtx`].
+    pub(crate) fn render_message_lines(&self, idx: usize, width: usize, ctx: &RenderCtx<'_>) -> Vec<Line<'static>> {
         let mut lines: Vec<Line> = Vec::new();
         let m = "   "; // margin
 
-        let tmsg = &self.transcript.messages[idx];
+        let tmsg = &self.messages[idx];
         let i = idx;
         let ts = &tmsg.time;
         match &tmsg.msg {
@@ -131,7 +134,7 @@ impl App {
             ChatMessage::Thinking(text) => {
                 // Only add spacing if previous message wasn't a User block
                 // (User blocks already have bottom margin)
-                let prev_was_user = i > 0 && matches!(&self.transcript.messages[i - 1].msg, ChatMessage::User(_));
+                let prev_was_user = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::User(_));
                 if !prev_was_user {
                     lines.push(Line::from(""));
                 }
@@ -140,7 +143,7 @@ impl App {
                 // Header
                 let thinking_label = if text == THINKING_PLACEHOLDER {
                     let braille = ['\u{28fe}','\u{28f7}','\u{28ef}','\u{28df}','\u{287f}','\u{28bf}','\u{28fb}','\u{28fd}'];
-                    let idx = (self.spinner_frame / 4) % braille.len();
+                    let idx = (ctx.spinner_frame / 4) % braille.len();
                     let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
                     format!("{} thinking", wave)
                 } else {
@@ -211,7 +214,7 @@ impl App {
             ChatMessage::Text(text) => {
                 // Separator between user block and agent response
                 // After thinking: just a single blank line (no separator)
-                let prev_was_thinking = i > 0 && matches!(&self.transcript.messages[i - 1].msg, ChatMessage::Thinking(_));
+                let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
                 if prev_was_thinking {
                     lines.push(Line::from(""));
                 } else if i > 0 {
@@ -231,12 +234,12 @@ impl App {
                     lines.push(Line::from(""));
                 }
                 // Header
-                let label = format!("{}\u{25c8} {}", m, self.agent_name);
+                let label = format!("{}\u{25c8} {}", m, ctx.agent_name);
                 let ts_str = format!("{} ", ts);
                 let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                 // Pulse the agent label when streaming (same sin-wave as header dot)
-                let label_color = if self.streaming && i == self.transcript.messages.len() - 1 {
-                    let pulse = ((self.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
+                let label_color = if ctx.streaming && i == self.messages.len() - 1 {
+                    let pulse = ((ctx.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
                     if let Color::Rgb(r, g, b) = THEME.load().claude_label {
                         Color::Rgb(
                             (r as f64 * pulse) as u8,
@@ -283,7 +286,7 @@ impl App {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // Show elapsed time while tool is running
-                let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
+                let elapsed_str = if let Some(start) = self.tool_start_time {
                     let secs = start.elapsed().as_secs_f64();
                     if secs >= 1.0 {
                         format!(" {:.1}s", secs)
@@ -293,10 +296,10 @@ impl App {
                 } else {
                     String::new()
                 };
-                let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
                 // Bash gets a special animated execution trace
                 if tool_name == "bash" {
-                    let (trace, color) = bash_trace(self.spinner_frame);
+                    let (trace, color) = bash_trace(ctx.spinner_frame);
                     header.push(Span::styled(
                         format!(" {}{}", trace, elapsed_str),
                         Style::default().fg(color),
@@ -364,22 +367,22 @@ impl App {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // If this is the last message and a tool is executing, show animation
-                let is_last = i == self.transcript.messages.len() - 1;
-                if is_last && self.transcript.tool_start_time.is_some() {
-                    let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
+                let is_last = i == self.messages.len() - 1;
+                if is_last && self.tool_start_time.is_some() {
+                    let elapsed_str = if let Some(start) = self.tool_start_time {
                         let secs = start.elapsed().as_secs_f64();
                         if secs >= 1.0 { format!(" {:.1}s", secs) }
                         else { format!(" {}ms", (secs * 1000.0) as u64) }
                     } else { String::new() };
 
                     if tool_name == "bash" {
-                        let (trace, color) = bash_trace(self.spinner_frame);
+                        let (trace, color) = bash_trace(ctx.spinner_frame);
                         header.push(Span::styled(
                             format!(" {}{}", trace, elapsed_str),
                             Style::default().fg(color),
                         ));
                     } else {
-                        let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                        let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
                         header.push(Span::styled(
                             format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
                             Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
@@ -485,7 +488,7 @@ impl App {
                 };
 
                 let result_lines: Vec<&str> = result.lines().collect();
-                let show = if self.show_full_output {
+                let show = if self.show_full_output() {
                     result_lines.len()
                 } else {
                     let max_show = if result_lines.len() > 30 { 15 } else { 12 };
@@ -565,20 +568,20 @@ impl App {
                 } else if !is_error && show > 0 {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
-                        let elapsed_str = if let Some(start) = self.transcript.tool_start_time {
+                        let elapsed_str = if let Some(start) = self.tool_start_time {
                             let secs = start.elapsed().as_secs_f64();
                             if secs >= 1.0 { format!(" {:.1}s", secs) }
                             else { format!(" {}ms", (secs * 1000.0) as u64) }
                         } else { String::new() };
 
                         if preceding_tool.as_deref() == Some("bash") {
-                            let (trace, color) = bash_trace(self.spinner_frame);
+                            let (trace, color) = bash_trace(ctx.spinner_frame);
                             lines.push(Line::from(vec![
                                 Span::styled(format!("{}     ", m), Style::default()),
                                 Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(color)),
                             ]));
                         } else {
-                            let spinner_idx = (self.spinner_frame / 3) % SPINNER_FRAMES.len();
+                            let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
                             lines.push(Line::from(Span::styled(
                                 format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
                                 Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
@@ -650,7 +653,7 @@ impl App {
 
             ChatMessage::System(msg) => {
                 if should_separate_system_messages(
-                    self.transcript.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
+                    self.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
                     &tmsg.msg,
                 ) {
                     lines.push(Line::from(""));
@@ -716,10 +719,10 @@ impl App {
     /// per-message cache and never rebuilds the whole transcript at once.
     /// Retained as the reference oracle that the cache tests assert against.
     #[cfg(test)]
-    pub(crate) fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
+    pub(crate) fn render_lines(&self, width: usize, ctx: &RenderCtx<'_>) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for i in 0..self.transcript.messages.len() {
-            lines.extend(self.render_message_lines(i, width));
+        for i in 0..self.messages.len() {
+            lines.extend(self.render_message_lines(i, width, ctx));
         }
         lines
     }

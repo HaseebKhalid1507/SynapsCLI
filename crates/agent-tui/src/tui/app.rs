@@ -5,9 +5,12 @@ use super::text_metrics::char_width;
 
 // Types moved to transcript.rs (P9 slice a). Re-exported here so no import
 // churn happens in other modules this slice.
-pub(crate) use super::transcript::{
-    ChatMessage, LineCache, TranscriptStore, THINKING_PLACEHOLDER,
-};
+pub(crate) use super::transcript::{ChatMessage, TranscriptStore, THINKING_PLACEHOLDER};
+// Test-only re-exports after slice (d): production code reaches the cache via
+// store methods (sync_cache / line_cache); only the ported cache tests still
+// name these types directly.
+#[allow(unused_imports)]
+pub(crate) use super::transcript::{CacheState, LineCache, RenderCtx};
 // Shim kept from slice (a) so `app::TimestampedMsg` paths stay valid — only
 // test code references it after slice (b′) moved the mutation bodies out.
 #[allow(unused_imports)]
@@ -60,7 +63,6 @@ pub(crate) struct App {
     /// Set by user input (scroll/typing/cursor) so interaction stays instant
     /// even while the model is streaming; cleared after the paint.
     pub(crate) force_redraw: bool,
-    pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
     /// Active subagent status for the live panel
@@ -188,7 +190,6 @@ impl App {
                 .unwrap_or_else(|| "agent".to_string()),
             needs_redraw: true,
             force_redraw: false,
-            show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
             subagents: Vec::new(),
@@ -473,19 +474,7 @@ impl App {
             return false;
         }
 
-        self.render_lines_uses_spinner()
-    }
-
-    fn render_lines_uses_spinner(&self) -> bool {
-        self.transcript.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
-            ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
-            ChatMessage::ToolUseStart { .. } => true,
-            ChatMessage::ToolUse { .. } => {
-                idx == self.transcript.messages.len().saturating_sub(1) && self.transcript.tool_start_time.is_some()
-            }
-            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
-            _ => false,
-        })
+        self.transcript.uses_spinner()
     }
 
     /// True when a full terminal clear is needed before an animated redraw.
@@ -500,16 +489,25 @@ impl App {
     }
 
     /// Delegates to [`TranscriptStore::is_active_tool_result`].
+    /// No production call sites after slice (d) moved the renderer into the
+    /// store — kept per locked decision #3; slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
         self.transcript.is_active_tool_result(idx)
     }
 
     /// Delegates to [`TranscriptStore::find_preceding_read_extension`].
+    /// No production call sites after slice (d) — kept per locked decision #3;
+    /// slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
         self.transcript.find_preceding_read_extension(idx)
     }
 
     /// Delegates to [`TranscriptStore::find_preceding_tool_name`].
+    /// No production call sites after slice (d) — kept per locked decision #3;
+    /// slice (f) prunes.
+    #[allow(dead_code)]
     pub(crate) fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
         self.transcript.find_preceding_tool_name(idx)
     }
@@ -677,7 +675,7 @@ impl App {
         let (sc, sr, ec, er) = self.selection_range()?;
         let rect = self.msg_area_rect?;
         let (vis_start, vis_end) = self.visible_line_range?;
-        let all_lines = &self.transcript.line_cache.as_ref()?.flat;
+        let all_lines = &self.transcript.line_cache()?.flat;
 
         let content_x = rect.x;
         let content_y = rect.y;
@@ -823,6 +821,28 @@ impl App {
 
 }
 
+/// Test-only render delegates. Production rendering goes through
+/// `TranscriptStore::sync_cache` (draw.rs); tests keep calling through App so
+/// the incremental-cache regression suite ports with the move (slice d).
+#[cfg(test)]
+impl App {
+    pub(crate) fn render_ctx(&self) -> RenderCtx<'_> {
+        RenderCtx {
+            spinner_frame: self.spinner_frame,
+            streaming: self.streaming,
+            agent_name: &self.agent_name,
+        }
+    }
+
+    pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> Vec<ratatui::text::Line<'static>> {
+        self.transcript.render_message_lines(idx, width, &self.render_ctx())
+    }
+
+    pub(crate) fn render_lines(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
+        self.transcript.render_lines(width, &self.render_ctx())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,13 +859,13 @@ mod tests {
 
         // Case 1: text follows empty thinking.
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-        assert!(app.render_lines_uses_spinner(), "placeholder should animate while present");
+        assert!(app.transcript.uses_spinner(), "placeholder should animate while present");
         app.append_or_update_text("here is the answer");
         assert!(
             !matches!(app.transcript.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
             "empty thinking must be gone once text arrives"
         );
-        assert!(!app.render_lines_uses_spinner(), "spinner must stop after agent moves on");
+        assert!(!app.transcript.uses_spinner(), "spinner must stop after agent moves on");
 
         // Case 2: a tool follows empty thinking.
         let mut app = test_app();
@@ -1013,7 +1033,7 @@ mod tests {
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.transcript.line_cache = Some({
+        app.transcript.cache = CacheState::Clean({
             let w = 80;
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1033,7 +1053,7 @@ mod tests {
 
         assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
         assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
-        assert!(app.transcript.line_cache.is_some(), "message cache should remain valid for panel-only animation");
+        assert!(app.transcript.line_cache().is_some(), "message cache should remain valid for panel-only animation");
     }
 
     #[test]
@@ -1051,7 +1071,7 @@ mod tests {
         });
         app.transcript.tool_start_time = Some(std::time::Instant::now());
         app.transcript.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.transcript.line_cache = Some({
+        app.transcript.cache = CacheState::Clean({
             let w = 80;
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1076,22 +1096,21 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial response".to_string()));
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
 
-        // Build full cache first
-        app.transcript.line_cache = Some({
+        // Build full cache first (Clean = old Some + dirty_from None)
+        app.transcript.cache = CacheState::Clean({
             let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             LineCache { width: w, per_msg, flat }
         });
-        app.transcript.dirty_from = None;
         let last = app.transcript.messages.len() - 1;
 
         // Snapshot per_msg[0..last]
-        let snapshot: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
 
-        // Advance spinner (spinner_frame % 3 == 0 triggers render_lines_uses_spinner)
+        // Advance spinner (spinner_frame % 3 == 0 triggers uses_spinner)
         app.spinner_frame = 2; // next wrapping_add gives 3, which % 3 == 0
         let needs_redraw = app.advance_animations();
         assert!(needs_redraw, "spinner must signal redraw while THINKING_PLACEHOLDER present");
@@ -1101,14 +1120,14 @@ mod tests {
         // But first assert dirty_from is still None (advance_animations doesn't set it).
         // Then we call invalidate_last() as the updated caller will.
         app.invalidate_last();
-        assert_eq!(app.transcript.dirty_from, Some(last), "dirty_from must point to tail message only");
+        assert_eq!(app.transcript.cache.dirty_from(), Some(last), "dirty watermark must point to tail message only");
 
         // Simulate draw.rs incremental rebuild
         {
             let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
-            let cache = app.transcript.line_cache.as_mut().unwrap();
+            let cache = app.transcript.cache.line_cache_mut().unwrap();
             for (offset, rendered) in fresh.into_iter().enumerate() {
                 cache.per_msg[last + offset] = rendered;
             }
@@ -1118,10 +1137,10 @@ mod tests {
                 cache.flat.extend(slot.iter().cloned());
             }
         }
-        app.transcript.dirty_from = None;
+        app.transcript.cache.mark_clean();
 
         // per_msg[0..last] must be unchanged
-        let after: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
+        let after: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
@@ -1524,35 +1543,37 @@ mod tests {
         LineCache { width, per_msg, flat }
     }
 
-    /// Helper: simulate the incremental rebuild from draw.rs (slice 3 logic).
+    /// Helper: simulate the incremental rebuild from sync_cache (slice 3 logic,
+    /// ported to CacheState in slice d).
     fn rebuild_incremental(app: &mut App, width: usize) {
-        match app.transcript.line_cache.take() {
-            Some(mut cache) if cache.width == width => {
-                if let Some(k) = app.transcript.dirty_from.take() {
-                    // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
-                    if cache.per_msg.len() != app.transcript.messages.len() {
-                        cache.per_msg.truncate(k);
-                        for i in k..app.transcript.messages.len() {
-                            cache.per_msg.push(app.render_message_lines(i, width));
-                        }
-                    } else {
-                        // In-place partial re-render: only messages[k..]
-                        for i in k..app.transcript.messages.len() {
-                            cache.per_msg[i] = app.render_message_lines(i, width);
-                        }
+        match std::mem::replace(&mut app.transcript.cache, CacheState::Missing) {
+            CacheState::Dirty(mut cache, k) if cache.width == width => {
+                // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
+                if cache.per_msg.len() != app.transcript.messages.len() {
+                    cache.per_msg.truncate(k);
+                    for i in k..app.transcript.messages.len() {
+                        cache.per_msg.push(app.render_message_lines(i, width));
                     }
-                    // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
-                    let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
-                    cache.flat.truncate(prefix_len);
-                    for slot in &cache.per_msg[k..] {
-                        cache.flat.extend(slot.iter().cloned());
+                } else {
+                    // In-place partial re-render: only messages[k..]
+                    for i in k..app.transcript.messages.len() {
+                        cache.per_msg[i] = app.render_message_lines(i, width);
                     }
                 }
-                app.transcript.line_cache = Some(cache);
+                // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
+                let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
+                cache.flat.truncate(prefix_len);
+                for slot in &cache.per_msg[k..] {
+                    cache.flat.extend(slot.iter().cloned());
+                }
+                app.transcript.cache = CacheState::Clean(cache);
+            }
+            CacheState::Clean(cache) if cache.width == width => {
+                // Clean at the right width — nothing to do (old dirty_from == None path).
+                app.transcript.cache = CacheState::Clean(cache);
             }
             _ => {
-                app.transcript.dirty_from = None;
-                app.transcript.line_cache = Some(build_cache(app, width));
+                app.transcript.cache = CacheState::Clean(build_cache(app, width));
             }
         }
     }
@@ -1567,13 +1588,12 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial answer".to_string()));
 
         // Full build
-        app.transcript.line_cache = Some(build_cache(&app, w));
-        app.transcript.dirty_from = None;
+        app.transcript.cache = CacheState::Clean(build_cache(&app, w));
 
         let last = app.transcript.messages.len() - 1; // index of Text message
 
         // Snapshot per_msg[0..last] content strings (before update)
-        let snapshot: Vec<Vec<String>> = app.transcript.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
             .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
@@ -1582,12 +1602,12 @@ mod tests {
         if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.messages.last_mut() {
             t.push_str(" — more content appended");
         }
-        app.transcript.dirty_from = Some(last); // invalidate_last equivalent
+        app.transcript.invalidate_from(last); // invalidate_last equivalent
 
         // Incremental rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.transcript.line_cache.as_ref().unwrap();
+        let cache = app.transcript.line_cache().unwrap();
 
         // per_msg[0..last] must be unchanged (content-equal to snapshot)
         let after: Vec<Vec<String>> = cache.per_msg[..last]
@@ -1623,8 +1643,7 @@ mod tests {
             input: r#"{"command":"ls"}"#.to_string(),
         });
 
-        app.transcript.line_cache = Some(build_cache(&app, w));
-        app.transcript.dirty_from = None;
+        app.transcript.cache = CacheState::Clean(build_cache(&app, w));
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
@@ -1636,12 +1655,12 @@ mod tests {
             },
             time: "00:00".to_string(),
         });
-        app.transcript.dirty_from = Some(at); // invalidate_from(at)
+        app.transcript.invalidate_from(at);
 
         // Rebuild: since per_msg.len() (2) != messages.len() (3), should do full-from-k rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.transcript.line_cache.as_ref().unwrap();
+        let cache = app.transcript.line_cache().unwrap();
         assert_eq!(cache.per_msg.len(), app.transcript.messages.len(), "per_msg must track messages after insert");
 
         let expected_flat = app.render_lines(w);

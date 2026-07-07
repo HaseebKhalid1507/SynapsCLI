@@ -474,8 +474,10 @@ fn handle_key(
             jump_word_right(app);
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-            app.show_full_output = !app.show_full_output;
-            app.invalidate();
+            // Store-owned toggle invalidates internally (locked decision #1);
+            // App only signals the frame scheduler.
+            app.transcript.set_show_full_output(!app.transcript.show_full_output());
+            app.request_redraw();
         }
         (KeyCode::Char(c), _) => {
             let byte_pos = app.cursor_byte_pos();

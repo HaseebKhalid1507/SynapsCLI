@@ -16,6 +16,21 @@
 //! Do not unify the two call sites by folding `clear_selection` into these
 //! methods.
 
+/// Read-only App state the transcript renderer needs. Constructed fresh at
+/// each cache-sync call site — cheap (a usize, a bool, a &str). This makes
+/// the store's one rendering impurity visible in the signature instead of
+/// hidden in `self`.
+///
+/// Exactly three fields (locked decision #1 moved `show_full_output` into
+/// the store; locked decision #2 moved the tool timers): verified by grep —
+/// the renderer's only remaining App reads are `spinner_frame` (×8),
+/// `streaming` (×1) and `agent_name` (×1).
+pub(crate) struct RenderCtx<'a> {
+    pub(crate) spinner_frame: usize,
+    pub(crate) streaming: bool,
+    pub(crate) agent_name: &'a str,
+}
+
 /// Sentinel placeholder pushed into a `Thinking` block while the model is
 /// deciding whether to think. Using ellipsis + zero-width space makes it
 /// visually identical to "…" but never equal to real model output.
@@ -69,15 +84,80 @@ pub(crate) struct LineCache {
     pub(crate) flat: Vec<ratatui::text::Line<'static>>,
 }
 
+/// Cache lifecycle for the per-message line cache. Replaces the old
+/// `line_cache: Option<LineCache>` + `dirty_from: Option<usize>` tri-state
+/// with the same semantics made explicit (slice d):
+///
+/// - `Missing`      = full rebuild on next sync (old `None` + `None`)
+/// - `Clean(c)`     = serve as-is                (old `Some` + `None`)
+/// - `Dirty(c, k)`  = incremental re-render from message index `k`
+///                    (old `Some` + `Some(k)`)
+///
+/// Width mismatch (`c.width != content_width`) still forces a full rebuild
+/// regardless of Clean/Dirty — that check lives in `sync_cache`.
+/// `pub(crate)` until slice (f) seals the store.
+pub(crate) enum CacheState {
+    Missing,
+    Clean(LineCache),
+    Dirty(LineCache, usize),
+}
+
+impl CacheState {
+    /// The cache, if one exists (Clean or Dirty). Mirrors the old
+    /// `line_cache.as_ref()`.
+    pub(crate) fn line_cache(&self) -> Option<&LineCache> {
+        match self {
+            CacheState::Missing => None,
+            CacheState::Clean(c) | CacheState::Dirty(c, _) => Some(c),
+        }
+    }
+
+    /// Mutable access to the cache, if one exists. Mirrors the old
+    /// `line_cache.as_mut()`. Test-side escape hatch until slice (f).
+    #[cfg(test)]
+    pub(crate) fn line_cache_mut(&mut self) -> Option<&mut LineCache> {
+        match self {
+            CacheState::Missing => None,
+            CacheState::Clean(c) | CacheState::Dirty(c, _) => Some(c),
+        }
+    }
+
+    /// The incremental watermark, if dirty. Mirrors the old `dirty_from`.
+    /// Test-side inspection until slice (f).
+    #[cfg(test)]
+    pub(crate) fn dirty_from(&self) -> Option<usize> {
+        match self {
+            CacheState::Dirty(_, k) => Some(*k),
+            _ => None,
+        }
+    }
+
+    /// Dirty → Clean keeping the cache; Missing/Clean unchanged. Mirrors the
+    /// old `dirty_from = None` (watermark consumed) transition.
+    #[cfg(test)]
+    pub(crate) fn mark_clean(&mut self) {
+        if matches!(self, CacheState::Dirty(..)) {
+            let CacheState::Dirty(c, _) = std::mem::replace(self, CacheState::Missing) else {
+                unreachable!()
+            };
+            *self = CacheState::Clean(c);
+        }
+    }
+}
+
 /// Shell for the transcript store.
 ///
 /// Slice (a): `messages`.
 /// Slice (c): `scroll_back`, `scroll_pinned`, `last_line_count` + scroll API.
-/// Slice (b′): content mutations + tool timers + invalidate family +
-/// `line_cache`/`dirty_from`. The invalidate family here mutates ONLY store
+/// Slice (b′): content mutations + tool timers + invalidate family + the
+/// render cache. The invalidate family here mutates ONLY store
 /// state — redraw signaling (`needs_redraw`) stays on App via the thin
 /// delegating wrappers in app.rs. Fields are `pub(crate)` — sealing is
-/// slice (f); the cache tri-state → `CacheState` enum conversion is slice (d).
+/// slice (f).
+/// Slice (d): the cache tri-state became [`CacheState`]; the renderer
+/// (`render_message_lines`, render.rs) moved into this impl with
+/// [`RenderCtx`] threading; `sync_cache` folds in the draw.rs cache-sync
+/// block; `show_full_output` is store-owned (locked decision #1).
 pub(crate) struct TranscriptStore {
     pub(crate) messages: Vec<TimestampedMsg>,
 
@@ -91,16 +171,16 @@ pub(crate) struct TranscriptStore {
     /// unpinned during streaming growth. See draw.rs §4 (growth-adjust block).
     pub(crate) last_line_count: usize,
 
-    // ── Render cache (moved in slice b′) ─────────────────────────────────────
-    /// Cached wrapped+highlighted message lines.
-    /// `None` means "stale — rebuild on next draw". `Some(cache)` means
-    /// "valid at cache.width". Tri-state with `dirty_from`:
-    /// None + None = full rebuild; Some + None = clean; Some + Some(k) =
-    /// incremental from k. Slice (d) converts this to an explicit enum.
-    pub(crate) line_cache: Option<LineCache>,
-    /// Lowest message index whose rendered lines are stale. `None` = fully clean.
-    /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
-    pub(crate) dirty_from: Option<usize>,
+    // ── Render cache (moved in slice b′; enum shape since slice d) ───────────
+    /// Cached wrapped+highlighted message lines + incremental watermark.
+    /// See [`CacheState`] for the lifecycle. `pub(crate)` until slice (f).
+    pub(crate) cache: CacheState,
+
+    // ── Render options (moved in slice d; locked decision #1) ────────────────
+    /// Ctrl+O toggle: show full tool output instead of the truncated preview.
+    /// Store-owned because it changes cached line content — mutate only via
+    /// [`Self::set_show_full_output`], which invalidates internally.
+    show_full_output: bool,
 
     // ── Tool timing (moved in slice b′; locked decision #2) ──────────────────
     /// Tracks when the current tool started executing (for elapsed time display)
@@ -118,8 +198,8 @@ impl TranscriptStore {
             scroll_back: 0,
             scroll_pinned: true,
             last_line_count: 0,
-            line_cache: None,
-            dirty_from: None,
+            cache: CacheState::Missing,
+            show_full_output: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
         }
@@ -244,22 +324,126 @@ impl TranscriptStore {
     /// Use for structural changes (theme, width, message list reshuffle). For
     /// streaming deltas prefer `invalidate_last()` which is O(1).
     pub(crate) fn invalidate(&mut self) {
-        self.line_cache = None;
-        self.dirty_from = None;
+        self.cache = CacheState::Missing;
     }
 
     /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
-    /// Coalesces with any existing dirty_from by taking the minimum.
+    /// Coalesces with any existing watermark by taking the minimum. A missing
+    /// cache stays missing — the full rebuild subsumes any watermark (same as
+    /// the old `None` cache + `Some(k)` state, which the rebuild path wiped).
     pub(crate) fn invalidate_from(&mut self, idx: usize) {
-        self.dirty_from = Some(match self.dirty_from {
-            Some(k) => k.min(idx),
-            None => idx,
-        });
+        self.cache = match std::mem::replace(&mut self.cache, CacheState::Missing) {
+            CacheState::Missing => CacheState::Missing,
+            CacheState::Clean(c) => CacheState::Dirty(c, idx),
+            CacheState::Dirty(c, k) => CacheState::Dirty(c, k.min(idx)),
+        };
     }
 
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
         self.invalidate_from(self.messages.len().saturating_sub(1));
+    }
+
+    // ── Cache access + maintenance (slice d) ─────────────────────────────────
+
+    /// The line cache, if one exists (Clean or Dirty). Mirrors the old
+    /// `line_cache.as_ref()` reads in draw.rs / `selected_text`.
+    pub(crate) fn line_cache(&self) -> Option<&LineCache> {
+        self.cache.line_cache()
+    }
+
+    /// Sync the line cache to `content_width`: full rebuild on width change or
+    /// missing cache, incremental re-render from the dirty watermark otherwise.
+    /// Bodies verbatim from draw.rs §3 (the old lines 517–575), including the
+    /// two-phase immutable-render-then-mutable-apply structure — borrow rules
+    /// are identical inside the store (design §3.5).
+    pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) {
+        let needs_full_rebuild = self
+            .line_cache()
+            .map_or(true, |c| c.width != content_width);
+
+        if needs_full_rebuild {
+            // Width changed or no cache: full rebuild
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..self.messages.len())
+                .map(|i| self.render_message_lines(i, content_width, ctx))
+                .collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
+        } else if let CacheState::Dirty(cache, k) = &self.cache {
+            // Incremental rebuild: only re-render messages[k..]
+            // Render all dirty slots first (immutable borrow of self), then apply.
+            let k = *k;
+            let n = self.messages.len();
+            let needs_resize = cache.per_msg.len() != n;
+
+            // Render fresh slots for [k..n]
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (k..n)
+                .map(|i| self.render_message_lines(i, content_width, ctx))
+                .collect();
+
+            // Apply to cache (now mutable borrow); Dirty(c, k) → Clean(c)
+            // mirrors the old `dirty_from.take()`.
+            let CacheState::Dirty(mut cache, _) =
+                std::mem::replace(&mut self.cache, CacheState::Missing)
+            else {
+                unreachable!("cache must be Dirty here")
+            };
+            if needs_resize {
+                cache.per_msg.truncate(k);
+                cache.per_msg.extend(fresh);
+            } else {
+                for (offset, rendered) in fresh.into_iter().enumerate() {
+                    cache.per_msg[k + offset] = rendered;
+                }
+            }
+            // Rebuild flat from k
+            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
+            cache.flat.truncate(prefix_line_count);
+            for slot in &cache.per_msg[k..] {
+                cache.flat.extend(slot.iter().cloned());
+            }
+            self.cache = CacheState::Clean(cache);
+        }
+        // Paranoia fallback: guarantee a cache exists (should never fire —
+        // the enum makes this provably dead, but deleting it is a later
+        // commit, not this one; design §6).
+        if matches!(self.cache, CacheState::Missing) {
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..self.messages.len())
+                .map(|i| self.render_message_lines(i, content_width, ctx))
+                .collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
+            self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
+        }
+    }
+
+    // ── Render options (slice d; locked decision #1) ─────────────────────────
+
+    /// Ctrl+O state: show full tool output instead of the truncated preview.
+    pub(crate) fn show_full_output(&self) -> bool {
+        self.show_full_output
+    }
+
+    /// Self-invalidating setter — the toggle changes cached line content, so
+    /// the manual `invalidate()` at the call site is impossible to forget
+    /// because it no longer exists (red-team overrule of design §6 decision 1).
+    pub(crate) fn set_show_full_output(&mut self, v: bool) {
+        self.show_full_output = v;
+        self.invalidate();
+    }
+
+    /// True when any transcript line is spinner-animated, i.e. re-rendering
+    /// the message cache on a spinner tick would change output. Was
+    /// `App::render_lines_uses_spinner` (design §3.4).
+    pub(crate) fn uses_spinner(&self) -> bool {
+        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
+            ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
+            ChatMessage::ToolUseStart { .. } => true,
+            ChatMessage::ToolUse { .. } => {
+                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+            }
+            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
+            _ => false,
+        })
     }
 
     // ── Tool state queries + find_* helpers (moved in slice b′) ──────────────
