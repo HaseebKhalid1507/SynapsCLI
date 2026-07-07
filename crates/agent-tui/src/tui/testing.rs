@@ -164,6 +164,10 @@ impl TestHarness {
             streaming,
             &self.registry,
             &self.keybinds,
+            // Production reads config.scroll_lines.unwrap_or(3); the harness
+            // uses the same default. Scroll-step-sensitive tests can drive the
+            // mouse path (hardcoded 3 lines) directly instead.
+            3,
         );
         self.record(action);
         self
