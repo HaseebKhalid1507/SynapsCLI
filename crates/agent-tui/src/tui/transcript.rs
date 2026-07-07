@@ -75,6 +75,53 @@ pub(crate) enum ChatMessage {
     Event { source: String, severity: String, text: String },
 }
 
+impl ChatMessage {
+    /// The canonical "source" string this message contributes to copy — what
+    /// the model/user actually wrote, per the P10 decision lock (design §2
+    /// table). [`LineMeta`] ranges and `src_line` indices index into THIS
+    /// string; `selected_text` reconstructs from it verbatim. No prompt
+    /// prefixes, no timestamps, no tool-card chrome.
+    pub(crate) fn source_text(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match self {
+            // Raw input as submitted. Pasted messages copy their stored
+            // display form incl. "[Pasted N lines]" placeholders (D1 as
+            // locked: the full paste lives App-side in api_messages; P10
+            // does not reach across that boundary).
+            ChatMessage::User(t) => Cow::Borrowed(t.as_str()),
+            // Raw markdown the model wrote — markers, fences, tables intact.
+            ChatMessage::Text(t) => Cow::Borrowed(t.as_str()),
+            // Raw markdown; the spinner sentinel is chrome, not content.
+            ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER => Cow::Borrowed(""),
+            ChatMessage::Thinking(t) => Cow::Borrowed(t.as_str()),
+            // Transient accumulated fragment (design §2: not over-engineered;
+            // finalize replaces the message).
+            ChatMessage::ToolUseStart { partial_input, .. } => Cow::Borrowed(partial_input.as_str()),
+            // DECISION LOCK L5 — the flip point: ToolUse copies as the
+            // PRETTY-PRINTED input JSON (line-mappable, valid JSON, readable
+            // pasted). To flip to the raw compact form, replace this arm's
+            // body with `Cow::Borrowed(input.as_str())` — nothing else
+            // depends on the choice (it's copy-time only).
+            ChatMessage::ToolUse { input, .. } => {
+                match serde_json::from_str::<serde_json::Value>(input) {
+                    Ok(v) => Cow::Owned(
+                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| input.clone()),
+                    ),
+                    // Unparseable input: raw bytes are the only truth we have.
+                    Err(_) => Cow::Borrowed(input.as_str()),
+                }
+            }
+            // Raw stored tool output — un-truncated, un-highlighted.
+            ChatMessage::ToolResult { content, .. } => Cow::Borrowed(content.as_str()),
+            ChatMessage::Error(t) => Cow::Borrowed(t.as_str()),
+            ChatMessage::System(t) => Cow::Borrowed(t.as_str()),
+            // `[source]` tag + severity are routing metadata — chrome, same
+            // class as a timestamp (design §2, resolved as locked).
+            ChatMessage::Event { text, .. } => Cow::Borrowed(text.as_str()),
+        }
+    }
+}
+
 pub(crate) struct TimestampedMsg {
     pub(crate) msg: ChatMessage,
     pub(crate) time: String,
@@ -1269,6 +1316,16 @@ impl TranscriptStore {
         &self.messages
     }
 
+    /// Canonical copy source for message `idx` — see
+    /// [`ChatMessage::source_text`] (design §2; the string [`LineMeta`]
+    /// provenance indexes into).
+    ///
+    /// Production caller is slice (d)'s `selected_text`; the allow drops there.
+    #[allow(dead_code)]
+    pub(crate) fn source_text(&self, idx: usize) -> std::borrow::Cow<'_, str> {
+        self.messages[idx].msg.source_text()
+    }
+
     /// True when the transcript contains no messages.
     pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
@@ -1497,5 +1554,124 @@ mod visible_window_tests {
             to_str(&vw.lines),
             "different scroll positions must yield different window content"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_text_tests {
+    //! P10 slice (c): per-variant source extraction — the design §2 table,
+    //! made executable. `source_text` is the string copy emits; every
+    //! variant's canonical form is pinned here.
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn user_is_raw_input_verbatim() {
+        let m = ChatMessage::User("hello  world\nwith a second line".into());
+        assert_eq!(m.source_text(), "hello  world\nwith a second line");
+    }
+
+    #[test]
+    fn user_paste_placeholder_copies_as_stored_display_form() {
+        // D1 as locked: the transcript stores the display form; copy emits it.
+        let m = ChatMessage::User("[Pasted 42 lines]".into());
+        assert_eq!(m.source_text(), "[Pasted 42 lines]");
+    }
+
+    #[test]
+    fn text_is_raw_markdown_with_markers_fences_and_tables() {
+        let src = "some **bold** text\n\n```rust\nlet x = 1;\n```\n| a | b |\n|---|---|";
+        let m = ChatMessage::Text(src.into());
+        assert_eq!(m.source_text(), src);
+    }
+
+    #[test]
+    fn thinking_is_raw_markdown() {
+        let m = ChatMessage::Thinking("- consider\n- decide".into());
+        assert_eq!(m.source_text(), "- consider\n- decide");
+    }
+
+    #[test]
+    fn thinking_placeholder_is_empty_source() {
+        // The spinner sentinel is chrome, not content (design §2 table).
+        let m = ChatMessage::Thinking(THINKING_PLACEHOLDER.into());
+        assert_eq!(m.source_text(), "");
+    }
+
+    #[test]
+    fn tool_use_start_is_the_raw_partial_fragment() {
+        let m = ChatMessage::ToolUseStart {
+            tool_id: "t".into(),
+            tool_name: "write".into(),
+            partial_input: r#"{"path": "a.rs", "content": "fn ma"#.into(),
+        };
+        assert_eq!(m.source_text(), r#"{"path": "a.rs", "content": "fn ma"#);
+    }
+
+    #[test]
+    fn tool_use_is_pretty_printed_input_json_lock_l5() {
+        let m = ChatMessage::ToolUse {
+            tool_id: "t".into(),
+            tool_name: "bash".into(),
+            input: r#"{"command":"ls -la","timeout":30}"#.into(),
+        };
+        let src = m.source_text();
+        // Valid, pretty-printed, key/value line-mappable JSON.
+        assert_eq!(
+            src,
+            "{\n  \"command\": \"ls -la\",\n  \"timeout\": 30\n}",
+            "L5: ToolUse source must be serde_json pretty form"
+        );
+        // Owned (computed at copy time) — the raw compact form is one flip away.
+        assert!(matches!(src, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn tool_use_unparseable_input_falls_back_to_raw_bytes() {
+        let m = ChatMessage::ToolUse {
+            tool_id: "t".into(),
+            tool_name: "bash".into(),
+            input: "not json {".into(),
+        };
+        assert_eq!(m.source_text(), "not json {");
+        assert!(matches!(m.source_text(), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn tool_result_is_raw_stored_output_untruncated() {
+        let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let m = ChatMessage::ToolResult {
+            tool_id: "t".into(),
+            content: long.clone(),
+            elapsed_ms: Some(3),
+        };
+        // Un-truncated even though the renderer shows 12–15 lines.
+        assert_eq!(m.source_text(), long.as_str());
+    }
+
+    #[test]
+    fn error_system_are_verbatim() {
+        assert_eq!(ChatMessage::Error("boom\ntail".into()).source_text(), "boom\ntail");
+        assert_eq!(ChatMessage::System("notice".into()).source_text(), "notice");
+    }
+
+    #[test]
+    fn event_text_only_source_tag_is_chrome() {
+        let m = ChatMessage::Event {
+            source: "mail".into(),
+            severity: "high".into(),
+            text: "inbox message arrived".into(),
+        };
+        // Routing metadata ([source], severity) never copies (design §2).
+        assert_eq!(m.source_text(), "inbox message arrived");
+    }
+
+    #[test]
+    fn store_source_text_delegates_per_index() {
+        let mut store = TranscriptStore::new();
+        store.push_msg(ChatMessage::User("u".into()));
+        store.push_msg(ChatMessage::Text("t".into()));
+        assert_eq!(store.source_text(0), "u");
+        assert_eq!(store.source_text(1), "t");
     }
 }

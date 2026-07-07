@@ -5,6 +5,8 @@ use ratatui::{
 use super::text_metrics::{width as display_width, char_width};
 use super::theme::THEME;
 use super::highlight::highlight_code_block;
+use super::transcript::LineMeta;
+use super::render::classify_row;
 
 pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -401,30 +403,66 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
 }
 
 /// Render markdown text into Lines, handling code blocks, headings, lists, quotes, tables
-pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = Vec::new();
+pub(crate) fn render_markdown_spans(
+    text: &str,
+    prefix: &str,
+    width: usize,
+    msg_idx: usize,
+) -> Vec<(Line<'static>, LineMeta)> {
+    let mut lines: Vec<(Line, LineMeta)> = Vec::new();
     let base_style = Style::default().fg(THEME.load().claude_text);
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buf = String::new();
+    let mut code_open_line = 0usize;
     let mut table_buf: Vec<String> = Vec::new();
+    let mut table_start_line = 0usize;
 
     let all_lines: Vec<&str> = text.lines().collect();
+    // Byte offset of each source line within `text` — the composition step
+    // of design §1.3 (all_lines borrows `text`, so ptr arithmetic is exact).
+    let base_ptr = text.as_ptr() as usize;
+    let line_offs: Vec<usize> =
+        all_lines.iter().map(|l| l.as_ptr() as usize - base_ptr).collect();
+
+    /// Flush a buffered table run. Rendered table rows are transformed views
+    /// (cells re-split, padded, possibly wrapped) — ContentLine per lock L1's
+    /// fallback. Row j maps to source line `start + min(j, run_len-1)`:
+    /// header→header, separator→separator, data→data when nothing wraps;
+    /// wrapped overflow rows snap to the run's last line. Coarse, in-bounds.
+    fn flush_table(
+        lines: &mut Vec<(Line<'static>, LineMeta)>,
+        table_buf: &mut Vec<String>,
+        table_start: usize,
+        prefix: &str,
+        width: usize,
+        msg_idx: usize,
+    ) {
+        if table_buf.is_empty() {
+            return;
+        }
+        let last = table_buf.len() - 1;
+        for (j, l) in render_table(table_buf, prefix, width).into_iter().enumerate() {
+            let src_line = table_start + j.min(last);
+            lines.push((l, LineMeta::ContentLine { msg_idx, src_line }));
+        }
+        table_buf.clear();
+    }
 
     for (line_idx, line) in all_lines.iter().enumerate() {
         let trimmed = line.trim();
+        let line_off = line_offs[line_idx];
+        let content_line = LineMeta::ContentLine { msg_idx, src_line: line_idx };
 
         // Code block toggle
         if trimmed.starts_with("```") {
             // Flush any pending table
-            if !table_buf.is_empty() {
-                lines.extend(render_table(&table_buf, prefix, width));
-                table_buf.clear();
-            }
+            flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
             if !in_code_block {
                 in_code_block = true;
                 code_lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
                 code_buf.clear();
+                code_open_line = line_idx;
             } else {
                 // End of code block — render with language tag chip + border frame
                 let border_style = Style::default().fg(THEME.load().border);
@@ -434,8 +472,13 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 let block_inner_width = width.saturating_sub(display_width(prefix) + 4); // prefix + "  " + borders
                 let rule_width = block_inner_width.clamp(20, 60);
 
-                // Top rule with optional language tag
-                lines.push(Line::from("")); // breathing room above code block
+                // The chip + rules are transformed views of the FENCE source
+                // lines (the chip presents the opening fence's language tag) —
+                // ContentLine so whole-block selections cover the fences and
+                // copy reconstructs ``` delimiters (design §1.4/§2: fences are
+                // source, not chrome). Breathing blanks are injected: Chrome.
+                let open_fence = LineMeta::ContentLine { msg_idx, src_line: code_open_line };
+                lines.push((Line::from(""), LineMeta::Chrome)); // breathing room above code block
                 if !code_lang.is_empty() {
                     // Language label line (above the top rule)
                     let lang_upper = code_lang.to_uppercase();
@@ -443,29 +486,36 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                         .enumerate()
                         .map(|(i, c)| if i > 0 { format!(" {}", c) } else { c.to_string() })
                         .collect();
-                    lines.push(Line::from(vec![
+                    lines.push((Line::from(vec![
                         Span::styled(format!("{}  ", prefix), Style::default()),
                         Span::styled(spaced, lang_style),
-                    ]));
+                    ]), open_fence.clone()));
                 }
                 // Top border rule
-                lines.push(Line::from(Span::styled(
+                lines.push((Line::from(Span::styled(
                     format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
                     border_style,
-                )));
+                )), open_fence));
 
-                // Code body (highlight_code_block already adds prefix + │ per line)
-                for hl_line in highlight_code_block(&code_buf, &code_lang, prefix) {
-                    lines.push(super::highlight::clamp_line(hl_line, width));
+                // Code body (highlight_code_block already adds prefix + │ per line).
+                // One rendered row per code_buf line (LinesWithEndings), so the
+                // enumeration index maps 1:1 onto the source lines after the
+                // opening fence. Highlighted + clamped ⇒ ContentLine (lock L1);
+                // copy recovers the clamped tails from source.
+                for (j, hl_line) in highlight_code_block(&code_buf, &code_lang, prefix).into_iter().enumerate() {
+                    lines.push((
+                        super::highlight::clamp_line(hl_line, width),
+                        LineMeta::ContentLine { msg_idx, src_line: code_open_line + 1 + j },
+                    ));
                 }
 
-                // Bottom border rule
-                lines.push(Line::from(Span::styled(
+                // Bottom border rule — stands in for the closing fence line.
+                lines.push((Line::from(Span::styled(
                     format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
                     border_style,
-                )));
+                )), content_line.clone()));
 
-                lines.push(Line::from("")); // breathing room below code block
+                lines.push((Line::from(""), LineMeta::Chrome)); // breathing room below code block
                 in_code_block = false;
             }
             continue;
@@ -486,6 +536,9 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
         };
 
         if is_table_line {
+            if table_buf.is_empty() {
+                table_start_line = line_idx;
+            }
             table_buf.push(trimmed.to_string());
             // Check if next line is NOT a table line (or we're at the end) — flush
             let next_is_table = if line_idx + 1 < all_lines.len() {
@@ -498,47 +551,43 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 false
             };
             if !next_is_table {
-                lines.extend(render_table(&table_buf, prefix, width));
-                table_buf.clear();
+                flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
             }
             continue;
         }
 
         // Flush any pending table (shouldn't happen, but safety)
-        if !table_buf.is_empty() {
-            lines.extend(render_table(&table_buf, prefix, width));
-            table_buf.clear();
-        }
+        flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
 
-        // Headings
+        // Headings — '#' markers stripped: transformed view, ContentLine.
         if trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|&c| c == '#').count();
             let heading_text = trimmed[level..].trim();
             // Spacing above heading (unless it's the first line)
             if !lines.is_empty() {
-                lines.push(Line::from(""));
+                lines.push((Line::from(""), LineMeta::Chrome));
             }
             let full = format!("{}  {}", prefix, heading_text);
             for wline in wrap_text(&full, width) {
-                lines.push(Line::from(Span::styled(
+                lines.push((Line::from(Span::styled(
                     wline,
                     Style::default().fg(THEME.load().heading_color).add_modifier(Modifier::BOLD),
-                )));
+                )), content_line.clone()));
             }
             continue;
         }
 
-        // Blockquotes
+        // Blockquotes — '>' replaced by the │ glyph: ContentLine.
         if trimmed.starts_with('>') {
             let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
             let full = format!("{}  \u{2502} {}", prefix, quote_text);
             for wline in wrap_text(&full, width) {
-                lines.push(Line::from(Span::styled(wline, Style::default().fg(THEME.load().quote_color).add_modifier(Modifier::ITALIC))));
+                lines.push((Line::from(Span::styled(wline, Style::default().fg(THEME.load().quote_color).add_modifier(Modifier::ITALIC))), content_line.clone()));
             }
             continue;
         }
 
-        // List items
+        // List items — bullet glyph substituted, inline md flattened: ContentLine.
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let item_text = &trimmed[2..];
             let bullet_prefix = format!("{}  \u{2022} ", prefix);
@@ -549,7 +598,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                 let mut item_spans = parse_inline_md(item_text, base_style);
                 let mut all_spans = vec![bullet_span];
                 all_spans.append(&mut item_spans);
-                lines.push(Line::from(all_spans));
+                lines.push((Line::from(all_spans), content_line.clone()));
             } else {
                 for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
                     if li == 0 {
@@ -561,18 +610,18 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                         let bullet_span = Span::styled(bullet_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
                         let mut all_spans = vec![bullet_span];
                         all_spans.extend(parse_inline_md(inner, base_style));
-                        lines.push(Line::from(all_spans));
+                        lines.push((Line::from(all_spans), content_line.clone()));
                     } else {
                         let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
                         all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
-                        lines.push(Line::from(all_spans));
+                        lines.push((Line::from(all_spans), content_line.clone()));
                     }
                 }
             }
             continue;
         }
 
-        // Numbered lists
+        // Numbered lists — same treatment as bullets: ContentLine.
         if trimmed.len() > 2 {
             let num_end = trimmed.find(". ");
             if let Some(pos) = num_end {
@@ -586,7 +635,7 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                         let mut item_spans = parse_inline_md(item_text, base_style);
                         let mut all_spans = vec![num_span];
                         all_spans.append(&mut item_spans);
-                        lines.push(Line::from(all_spans));
+                        lines.push((Line::from(all_spans), content_line.clone()));
                     } else {
                         for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
                             if li == 0 {
@@ -598,11 +647,11 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                                 let num_span = Span::styled(num_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
                                 let mut all_spans = vec![num_span];
                                 all_spans.extend(parse_inline_md(inner, base_style));
-                                lines.push(Line::from(all_spans));
+                                lines.push((Line::from(all_spans), content_line.clone()));
                             } else {
                                 let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
                                 all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
-                                lines.push(Line::from(all_spans));
+                                lines.push((Line::from(all_spans), content_line.clone()));
                             }
                         }
                     }
@@ -611,9 +660,10 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
             }
         }
 
-        // Empty lines
+        // Empty SOURCE lines render as blank rows — they ARE content (the
+        // hard break the author wrote), unlike the injected spacing blanks.
         if trimmed.is_empty() {
-            lines.push(Line::from(""));
+            lines.push((Line::from(""), content_line));
             continue;
         }
 
@@ -623,15 +673,27 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
         // For simplicity, flatten spans into a string for wrapping, then re-parse
         // This loses some formatting on wrap boundaries but keeps it simple
         let flat: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        // Untransformed prose (no inline-md consumed) is eligible for
+        // char-precise Content meta under lock L1; anything parse_inline_md
+        // rewrote falls back to ContentLine. classify_row re-verifies the
+        // byte-identical-suffix rule against the FINAL rendered text either way.
+        let untransformed = flat == **line;
         let full = format!("{}{}", full_prefix, flat);
         if full.chars().count() <= width {
+            let meta = if untransformed {
+                let row = WrapRow { text: full.clone(), src: Some(0..full.len()), content_col: 0 };
+                classify_row(&full, &row, line, line_off, full_prefix.len(), msg_idx, line_idx)
+            } else {
+                content_line
+            };
             let mut line_spans = vec![Span::styled(full_prefix, base_style)];
             line_spans.extend(spans);
-            lines.push(Line::from(line_spans));
+            lines.push((Line::from(line_spans), meta));
         } else {
             // Wrap and re-parse each wrapped line
             // wrap_text carries the leading indent forward on continuation lines
-            for wline in wrap_text(&full, width) {
+            for row in wrap_text_spans(&full, width) {
+                let wline = &row.text;
                 let (prefix_part, inner) = if wline.starts_with(&full_prefix) {
                     (full_prefix.clone(), &wline[full_prefix.len()..])
                 } else {
@@ -642,9 +704,20 @@ pub(crate) fn render_markdown(text: &str, prefix: &str, width: usize) -> Vec<Lin
                     (indent, rest)
                 };
                 let parsed = parse_inline_md(inner, base_style);
+                let meta = if untransformed {
+                    // Classify against the text actually pushed (prefix +
+                    // re-parsed fragment), not the wrap output — the L1
+                    // suffix check must see what renders.
+                    let rendered: String = std::iter::once(prefix_part.as_str())
+                        .chain(parsed.iter().map(|s| s.content.as_ref()))
+                        .collect();
+                    classify_row(&rendered, &row, line, line_off, full_prefix.len(), msg_idx, line_idx)
+                } else {
+                    content_line.clone()
+                };
                 let mut line_spans = vec![Span::styled(prefix_part, base_style)];
                 line_spans.extend(parsed);
-                lines.push(Line::from(line_spans));
+                lines.push((Line::from(line_spans), meta));
             }
         }
     }

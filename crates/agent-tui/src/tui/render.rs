@@ -8,7 +8,7 @@ use super::app::SPINNER_FRAMES;
 use super::transcript::{ChatMessage, LineMeta, MsgEntry, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER};
 use super::theme::THEME;
 use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
-use super::markdown::{render_markdown, wrap_text, wrap_text_spans};
+use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
 use super::draw::{bash_trace, format_tool_name, tool_accent};
 
 /// Lighten (or darken, with negative `amt`) an RGB colour additively per
@@ -112,13 +112,6 @@ impl LineSink {
         self.meta.push(meta);
     }
 
-    /// Extend with rows whose provenance is not yet threaded — all Chrome.
-    fn extend_chrome(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
-        for l in lines {
-            self.push(l);
-        }
-    }
-
     fn len(&self) -> usize {
         self.lines.len()
     }
@@ -169,7 +162,7 @@ fn source_lines(text: &str) -> impl Iterator<Item = (usize, usize, &str)> + '_ {
 /// past: it sits right of the content and does not disturb the range↔column
 /// correspondence that `Content` encodes (D3 as locked: plain wrapped prose
 /// gets exact columns). Everything else falls back to line granularity.
-fn classify_row(
+pub(crate) fn classify_row(
     rendered_text: &str,
     row: &super::markdown::WrapRow,
     source_line: &str,
@@ -284,20 +277,31 @@ impl TranscriptStore {
                     Span::styled(thinking_label, dim.add_modifier(Modifier::DIM)),
                 ]));
                 // Body — structured with visual hierarchy
-                // TODO(P10c): thinking rows are trimmed + char-chunked, so
-                // they map to source lines at ContentLine granularity only
-                // (design §2 A2); threading src_line indices lands with the
-                // per-variant meta pass in slice (c). Chrome placeholder here.
-                let tlines: Vec<&str> = text.lines().collect();
-                let non_empty: Vec<&&str> = tlines.iter().filter(|l| !l.trim().is_empty()).collect();
+                // Slice (c): rows are trimmed + char-chunked — transformed
+                // views, so they map to their untrimmed source lines at
+                // ContentLine granularity only (design §2 A2, lock L1
+                // fallback). The spinner placeholder has empty source
+                // (`source_text`), so its rows stay Chrome. Hidden tail
+                // lines (>8) are reachable via the D4 whole-card rule.
+                let is_placeholder = text == THINKING_PLACEHOLDER;
+                let non_empty: Vec<(usize, &str)> = text
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, l)| !l.trim().is_empty())
+                    .collect();
                 let show = non_empty.len().min(8);
                 // Calculate usable width for thinking content
                 let prefix_len = m.len() + 4; // margin + "│ · " or "│ "
                 let content_width = width.saturating_sub(prefix_len);
 
-                for (i, line) in non_empty[..show].iter().enumerate() {
+                for (k, (src_line, line)) in non_empty[..show].iter().enumerate() {
+                    let meta = if is_placeholder {
+                        LineMeta::Chrome
+                    } else {
+                        LineMeta::ContentLine { msg_idx: i, src_line: *src_line }
+                    };
                     let trimmed = line.trim();
-                    let is_last = i == show - 1 && non_empty.len() <= 8;
+                    let is_last = k == show - 1 && non_empty.len() <= 8;
                     let connector = if is_last { "╰" } else { "│" };
                     let continuation = "│";
 
@@ -324,18 +328,18 @@ impl TranscriptStore {
                             let chunk_len = content_width.min(chars.len() - pos);
                             let chunk: String = chars[pos..pos + chunk_len].iter().collect();
                             let prefix = if is_first { &first_prefix } else { &cont_prefix };
-                            lines.push(Line::from(Span::styled(
+                            lines.push_meta(Line::from(Span::styled(
                                 format!("{}{}", prefix, chunk),
                                 line_style,
-                            )));
+                            )), meta.clone());
                             pos += chunk_len;
                             is_first = false;
                         }
                     } else {
-                        lines.push(Line::from(Span::styled(
+                        lines.push_meta(Line::from(Span::styled(
                             format!("{}{}", first_prefix, trimmed),
                             line_style,
-                        )));
+                        )), meta);
                     }
                 }
                 if non_empty.len() > 8 {
@@ -399,12 +403,14 @@ impl TranscriptStore {
                         format!("{}   \u{2026}", m), Style::default().fg(THEME.load().muted),
                     )));
                 } else {
-                    // TODO(P10c): render_markdown grows a span-emitting form
-                    // (`render_markdown_spans`) in slice (c) — inline-md
-                    // paragraphs/lists/tables/code are transformed views and
-                    // classify ContentLine under lock L1; rules/chips/spacing
-                    // stay Chrome. Placeholder: all Chrome until then.
-                    lines.extend_chrome(render_markdown(text, m, width));
+                    // Slice (c): render_markdown_spans classifies per lock L1 —
+                    // untransformed wrapped prose gets char-precise Content;
+                    // inline-md paragraphs/lists/tables/code/fence chrome map
+                    // ContentLine to their source lines; injected spacing
+                    // blanks stay Chrome.
+                    for (line, meta) in render_markdown_spans(text, m, width, i) {
+                        lines.push_meta(line, meta);
+                    }
                 }
             }
 
@@ -451,12 +457,17 @@ impl TranscriptStore {
                 }
                 lines.push(Line::from(header));
                 // Show accumulated partial input with newlines rendered
-                // TODO(P10c): the tail preview below is a transformed view of
-                // the transient `partial_input` (unescape + "content" scan) —
-                // per lock L2 these rows become ContentLine when the
-                // canonical source (`source_text`) lands in slice (c); never
-                // Content. Chrome placeholder until then.
+                // Slice (c): the tail preview is a transformed view (unescape
+                // + "content" scan) of the transient `partial_input` fragment
+                // — never Content (lock L2). Display lines don't correspond
+                // to raw fragment lines (the unescape is what CREATES them),
+                // so all preview rows anchor at source line 0: coarse
+                // whole-fragment granularity, per design §2 ("not
+                // over-engineered — it's transient; finalize replaces the
+                // message"). The D4 tail rule extends a selection over the
+                // card's last row to the fragment's end.
                 if !partial_input.is_empty() {
+                    let preview_meta = LineMeta::ContentLine { msg_idx: i, src_line: 0 };
                     let param_style = Style::default().fg(THEME.load().tool_param);
                     // Unescape \n in JSON string to real newlines for display
                     let unescaped = partial_input.replace("\\n", "\n").replace("\\t", "  ");
@@ -479,12 +490,18 @@ impl TranscriptStore {
                     let skip = total.saturating_sub(max_show);
                     if skip > 0 {
                         let omit = format!("{}     … {} lines above", m, skip);
-                        lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))));
+                        lines.push_meta(
+                            Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))),
+                            preview_meta.clone(),
+                        );
                     }
                     for cline in content_lines.iter().skip(skip) {
                         let line_str = format!("{}       {}", m, cline);
                         for wline in wrap_text(&line_str, width) {
-                            lines.push(Line::from(Span::styled(wline, param_style)));
+                            lines.push_meta(
+                                Line::from(Span::styled(wline, param_style)),
+                                preview_meta.clone(),
+                            );
                         }
                     }
                 }
@@ -538,13 +555,36 @@ impl TranscriptStore {
                 }
                 lines.push(Line::from(header));
                 // Params — key:value on one line each, dimmed
-                // TODO(P10c): lock L5 defines this card's source as the
-                // pretty-printed input JSON (`source_text`, slice (c)); the
-                // key/value + diff-marker rows then classify ContentLine
-                // against its line numbering (lock L2 — never Content).
-                // Chrome placeholder until the source definition exists.
+                // Slice (c), locks L2 + L5: this card's canonical source is
+                // the PRETTY-PRINTED input JSON (`source_text`); each key's
+                // rendered rows (kv line, code-preview rows, diff markers,
+                // "+N more") map ContentLine onto the pretty line that opens
+                // that key. The search cursor keeps the mapping monotonic if
+                // a nested value line happens to look like a later key.
+                // Never Content — panel_block re-clamps make char precision
+                // fake (L2). The "{" / "}" brace lines carry no rendered row.
                 let param_style = Style::default().fg(THEME.load().tool_param);
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
+                    let pretty = tmsg.msg.source_text();
+                    let pretty_lines: Vec<&str> = pretty.lines().collect();
+                    let mut search_from = 0usize;
+                    let key_line = |k: &str, from: &mut usize| -> usize {
+                        let needle = format!(
+                            "{}:",
+                            serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""))
+                        );
+                        match pretty_lines
+                            .iter()
+                            .skip(*from)
+                            .position(|l| l.trim_start().starts_with(&needle))
+                        {
+                            Some(p) => {
+                                *from += p;
+                                *from
+                            }
+                            None => 0,
+                        }
+                    };
                     if let Some(obj) = parsed.as_object() {
                         // Extract file extension from "path" param if present (for syntax highlighting)
                         let file_ext = obj.get("path")
@@ -554,6 +594,10 @@ impl TranscriptStore {
                             .unwrap_or_default();
 
                         for (k, v) in obj {
+                            let km = LineMeta::ContentLine {
+                                msg_idx: i,
+                                src_line: key_line(k, &mut search_from),
+                            };
                             if let Some(s) = v.as_str() {
                                 if s.contains('\n') {
                                     // Multi-line content: syntax highlight if we know the language
@@ -575,26 +619,26 @@ impl TranscriptStore {
                                         _ => k.as_str(),
                                     };
                                     let header = format!("{}     {}: ({} lines)", m, label, total);
-                                    lines.push(Line::from(Span::styled(header, param_style)));
+                                    lines.push_meta(Line::from(Span::styled(header, param_style)), km.clone());
 
                                     // Syntax highlight the code
                                     let is_code_param = k == "content" || k == "old_string" || k == "new_string";
                                     if is_code_param && !file_ext.is_empty() {
                                         let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, m, marker, marker_color);
                                         for hl_line in hl_lines {
-                                            lines.push(clamp_line(hl_line, width));
+                                            lines.push_meta(clamp_line(hl_line, width), km.clone());
                                         }
                                     } else {
                                         for (ci, cline) in content_lines.iter().take(show).enumerate() {
-                                            lines.push(clamp_line(Line::from(vec![
+                                            lines.push_meta(clamp_line(Line::from(vec![
                                                 Span::styled(format!("{}    {:>3} {} ", m, ci + 1, marker), Style::default().fg(marker_color)),
                                                 Span::styled(cline.to_string(), param_style),
-                                            ]), width));
+                                            ]), width), km.clone());
                                         }
                                     }
                                     if total > max_preview {
                                         let omit = format!("{}       … +{} more lines", m, total - max_preview);
-                                        lines.push(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))));
+                                        lines.push_meta(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))), km.clone());
                                     }
                                 } else {
                                     let val = if s.len() > 120 {
@@ -605,14 +649,14 @@ impl TranscriptStore {
                                     };
                                     let line_str = format!("{}     {}: {}", m, k, val);
                                     for wline in wrap_text(&line_str, width) {
-                                        lines.push(Line::from(Span::styled(wline, param_style)));
+                                        lines.push_meta(Line::from(Span::styled(wline, param_style)), km.clone());
                                     }
                                 }
                             } else {
                                 let val = v.to_string();
                                 let line_str = format!("{}     {}: {}", m, k, val);
                                 for wline in wrap_text(&line_str, width) {
-                                    lines.push(Line::from(Span::styled(wline, param_style)));
+                                    lines.push_meta(Line::from(Span::styled(wline, param_style)), km.clone());
                                 }
                             }
                         }
@@ -994,19 +1038,11 @@ mod meta_tests {
         for width in [40usize, 80] {
             for idx in 0..store.message_count() {
                 let msg = &store.messages()[idx].msg;
-                let source: String = match msg {
-                    ChatMessage::User(t)
-                    | ChatMessage::Thinking(t)
-                    | ChatMessage::Text(t)
-                    | ChatMessage::Error(t)
-                    | ChatMessage::System(t) => t.clone(),
-                    ChatMessage::Event { text, .. } => text.clone(),
-                    ChatMessage::ToolUseStart { partial_input, .. } => partial_input.clone(),
-                    // ToolUse source (pretty JSON) lands in slice (c); no
-                    // Content/range meta is emitted for it yet.
-                    ChatMessage::ToolUse { input, .. } => input.clone(),
-                    ChatMessage::ToolResult { content, .. } => content.clone(),
-                };
+                // Slice (c): meta invariants are checked against the CANONICAL
+                // copy source — `source_text` — which is what `selected_text`
+                // reconstructs from (for ToolUse that's the pretty-printed
+                // input JSON, lock L5).
+                let source: String = store.source_text(idx).into_owned();
                 let is_tool_card = matches!(
                     msg,
                     ChatMessage::ToolUse { .. }
