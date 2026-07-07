@@ -92,7 +92,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         let m = "   "; // margin
 
-        let tmsg = &self.messages[idx];
+        let tmsg = &self.transcript.messages[idx];
         let i = idx;
         let ts = &tmsg.time;
         match &tmsg.msg {
@@ -131,7 +131,7 @@ impl App {
             ChatMessage::Thinking(text) => {
                 // Only add spacing if previous message wasn't a User block
                 // (User blocks already have bottom margin)
-                let prev_was_user = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::User(_));
+                let prev_was_user = i > 0 && matches!(&self.transcript.messages[i - 1].msg, ChatMessage::User(_));
                 if !prev_was_user {
                     lines.push(Line::from(""));
                 }
@@ -211,7 +211,7 @@ impl App {
             ChatMessage::Text(text) => {
                 // Separator between user block and agent response
                 // After thinking: just a single blank line (no separator)
-                let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
+                let prev_was_thinking = i > 0 && matches!(&self.transcript.messages[i - 1].msg, ChatMessage::Thinking(_));
                 if prev_was_thinking {
                     lines.push(Line::from(""));
                 } else if i > 0 {
@@ -235,7 +235,7 @@ impl App {
                 let ts_str = format!("{} ", ts);
                 let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                 // Pulse the agent label when streaming (same sin-wave as header dot)
-                let label_color = if self.streaming && i == self.messages.len() - 1 {
+                let label_color = if self.streaming && i == self.transcript.messages.len() - 1 {
                     let pulse = ((self.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
                     if let Color::Rgb(r, g, b) = THEME.load().claude_label {
                         Color::Rgb(
@@ -364,7 +364,7 @@ impl App {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // If this is the last message and a tool is executing, show animation
-                let is_last = i == self.messages.len() - 1;
+                let is_last = i == self.transcript.messages.len() - 1;
                 if is_last && self.tool_start_time.is_some() {
                     let elapsed_str = if let Some(start) = self.tool_start_time {
                         let secs = start.elapsed().as_secs_f64();
@@ -650,7 +650,7 @@ impl App {
 
             ChatMessage::System(msg) => {
                 if should_separate_system_messages(
-                    self.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
+                    self.transcript.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
                     &tmsg.msg,
                 ) {
                     lines.push(Line::from(""));
@@ -718,7 +718,7 @@ impl App {
     #[cfg(test)]
     pub(crate) fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for i in 0..self.messages.len() {
+        for i in 0..self.transcript.messages.len() {
             lines.extend(self.render_message_lines(i, width));
         }
         lines

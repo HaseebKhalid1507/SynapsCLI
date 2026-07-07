@@ -1,4 +1,6 @@
 //! Chat TUI binary — event loop, terminal setup, module wiring.
+mod transcript;
+
 
 mod app;
 mod commands;
@@ -406,7 +408,7 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 // Active animations/effects always need a redraw each tick.
                 // messages.is_empty() = idle logo screen — its color gradient
                 // is time-based and needs ticking too (S206 regression: the
@@ -415,7 +417,7 @@ pub async fn run(
                 if boot_fx_sent && boot_done.load(Ordering::Acquire) {
                     boot_fx_sent = false;
                 }
-                if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.messages.is_empty() {
+                if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.messages.is_empty() {
                     app.request_redraw();
                 }
                 secret_prompts.poll_requests(&secret_prompt_rx);

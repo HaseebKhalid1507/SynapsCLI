@@ -122,7 +122,7 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
 }
 
 pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
-    app.messages.clear();
+    app.transcript.messages.clear();
     for msg in api_messages {
         // Skip compaction summary messages — internal context, not user-visible
         if let Some(content) = msg["content"].as_str() {
@@ -198,7 +198,7 @@ mod tests {
     /// mark it "clean" (dirty_from = None). This simulates the state right
     /// after a successful draw — the renderer believes the cache is valid.
     fn prime_clean_cache(app: &mut App, width: usize) {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
             .map(|i| app.render_message_lines(i, width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> =

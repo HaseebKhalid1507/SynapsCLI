@@ -523,7 +523,7 @@ pub(crate) fn build_render_model(
 
         if needs_full_rebuild {
             // Width changed or no cache: full rebuild
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, content_width))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -532,7 +532,7 @@ pub(crate) fn build_render_model(
         } else if let Some(k) = app.dirty_from.take() {
             // Incremental rebuild: only re-render messages[k..]
             // Render all dirty slots first (immutable borrow of app), then apply.
-            let n = app.messages.len();
+            let n = app.transcript.messages.len();
             let cache = app.line_cache.as_ref().expect("cache must be Some here");
             let needs_resize = cache.per_msg.len() != n;
 
@@ -560,7 +560,7 @@ pub(crate) fn build_render_model(
         }
         // Paranoia fallback: guarantee Some (should never fire)
         if app.line_cache.is_none() {
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, content_width))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -747,7 +747,7 @@ pub(crate) fn build_render_model(
         lines_width: content_width,
         scroll_back,
         selection,
-        messages_empty: app.messages.is_empty(),
+        messages_empty: app.transcript.messages.is_empty(),
         logo_build_t: app.logo_build_t,
         logo_dismiss_t: app.logo_dismiss_t,
         subagents,

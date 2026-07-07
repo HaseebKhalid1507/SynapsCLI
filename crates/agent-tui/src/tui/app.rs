@@ -4,60 +4,14 @@ use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 use super::text_metrics::char_width;
 
-/// Sentinel placeholder pushed into a `Thinking` block while the model is
-/// deciding whether to think. Using ellipsis + zero-width space makes it
-/// visually identical to "…" but never equal to real model output.
-pub(crate) const THINKING_PLACEHOLDER: &str = "\u{2026}\u{200B}";
-
-#[derive(Clone)]
-pub(crate) enum ChatMessage {
-    User(String),
-    Thinking(String),
-    Text(String),
-    /// Streaming tool-use placeholder. `tool_id` lets the chat UI route
-    /// subsequent input deltas and the final finalize event to *this*
-    /// block when multiple tools run in parallel — without it, the
-    /// "always update last message" hack misroutes deltas/results to
-    /// whichever tool block happens to be most recent.
-    ToolUseStart {
-        tool_id: String,
-        tool_name: String,
-        partial_input: String,
-    },
-    ToolUse {
-        tool_id: String,
-        tool_name: String,
-        input: String,
-    },
-    ToolResult {
-        tool_id: String,
-        content: String,
-        elapsed_ms: Option<u64>,
-    },
-    Error(String),
-    System(String),
-    Event { source: String, severity: String, text: String },
-}
-
-pub(crate) struct TimestampedMsg {
-    pub(crate) msg: ChatMessage,
-    pub(crate) time: String,
-}
-
-/// Per-message render cache. Parallel to `App.messages`: each slot holds the
-/// rendered `Vec<Line>` for that message. `flat` is their concatenation, which
-/// is what downstream (draw/selection) consumes. The `width` at which these
-/// were rendered is stored so stale entries can be detected on terminal resize.
-pub(crate) struct LineCache {
-    pub(crate) width: usize,
-    /// Rendered lines per message — index parallel to App.messages.
-    pub(crate) per_msg: Vec<Vec<ratatui::text::Line<'static>>>,
-    /// Concatenation of per_msg; what downstream code consumes.
-    pub(crate) flat: Vec<ratatui::text::Line<'static>>,
-}
+// Types moved to transcript.rs (P9 slice a). Re-exported here so no import
+// churn happens in other modules this slice.
+pub(crate) use super::transcript::{
+    ChatMessage, LineCache, TimestampedMsg, TranscriptStore, THINKING_PLACEHOLDER,
+};
 
 pub(crate) struct App {
-    pub(crate) messages: Vec<TimestampedMsg>,
+    pub(crate) transcript: TranscriptStore,
     pub(crate) input: String,
     /// Cursor position as a **char index** (not byte index).
     /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
@@ -222,7 +176,7 @@ impl App {
         let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            messages: Vec::new(),
+            transcript: TranscriptStore::new(),
             input: String::new(),
             cursor_pos: 0,
             scroll_back: 0,
@@ -465,7 +419,7 @@ impl App {
     }
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
-        self.messages.push(TimestampedMsg {
+        self.transcript.messages.push(TimestampedMsg {
             msg,
             time: Local::now().format("%H:%M").to_string(),
         });
@@ -489,7 +443,7 @@ impl App {
             // Invariant: each tool_id should appear at most once. Assert in
             // debug builds so duplicate IDs surface immediately.
             debug_assert!(
-                self.messages.iter().filter(|m| matches!(
+                self.transcript.messages.iter().filter(|m| matches!(
                     &m.msg,
                     ChatMessage::ToolUse { tool_id: tid, .. }
                     | ChatMessage::ToolUseStart { tool_id: tid, .. }
@@ -497,7 +451,7 @@ impl App {
                 )).count() <= 1,
                 "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
             );
-            self.messages.iter().position(|m| matches!(
+            self.transcript.messages.iter().position(|m| matches!(
                 &m.msg,
                 ChatMessage::ToolUse { tool_id: tid, .. }
                 | ChatMessage::ToolUseStart { tool_id: tid, .. }
@@ -507,8 +461,8 @@ impl App {
         let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
         match use_idx {
             Some(i) => {
-                let at = (i + 1).min(self.messages.len());
-                self.messages.insert(at, TimestampedMsg {
+                let at = (i + 1).min(self.transcript.messages.len());
+                self.transcript.messages.insert(at, TimestampedMsg {
                     msg,
                     time: Local::now().format("%H:%M").to_string(),
                 });
@@ -529,12 +483,12 @@ impl App {
     /// `api_messages`, so the model still sees everything; only the visible
     /// scrollback is trimmed. (Proper fix is viewport virtualization — #98.)
     pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
-        if self.messages.len() <= cap {
+        if self.transcript.messages.len() <= cap {
             return;
         }
-        let omitted = self.messages.len() - cap;
-        self.messages.drain(0..omitted);
-        self.messages.insert(
+        let omitted = self.transcript.messages.len() - cap;
+        self.transcript.messages.drain(0..omitted);
+        self.transcript.messages.insert(
             0,
             TimestampedMsg {
                 msg: ChatMessage::System(format!(
@@ -567,7 +521,7 @@ impl App {
 
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
-        self.invalidate_from(self.messages.len().saturating_sub(1));
+        self.invalidate_from(self.transcript.messages.len().saturating_sub(1));
     }
 
     /// Request a redraw without invalidating the line cache (e.g. for
@@ -601,11 +555,11 @@ impl App {
     }
 
     fn render_lines_uses_spinner(&self) -> bool {
-        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
+        self.transcript.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
             ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
             ChatMessage::ToolUseStart { .. } => true,
             ChatMessage::ToolUse { .. } => {
-                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+                idx == self.transcript.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
             }
             ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
             _ => false,
@@ -630,7 +584,7 @@ impl App {
         if self.tool_start_time.is_none() {
             return false;
         }
-        match self.messages.get(idx).map(|m| &m.msg) {
+        match self.transcript.messages.get(idx).map(|m| &m.msg) {
             Some(ChatMessage::ToolResult { tool_id, elapsed_ms: None, .. }) => {
                 self.tool_start_times.contains_key(tool_id)
             }
@@ -643,12 +597,12 @@ impl App {
         // Prefer matching by tool_id when the result carries one — under
         // parallel tool calls a `ToolResult` may not be positionally
         // adjacent to its matching `ToolUse`.
-        let target_id: Option<String> = match self.messages.get(idx).map(|m| &m.msg) {
+        let target_id: Option<String> = match self.transcript.messages.get(idx).map(|m| &m.msg) {
             Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => Some(tool_id.clone()),
             _ => None,
         };
         if let Some(id) = target_id {
-            for m in self.messages.iter() {
+            for m in self.transcript.messages.iter() {
                 if let ChatMessage::ToolUse { tool_id, tool_name, input } = &m.msg {
                     if tool_id == &id && tool_name == "read" {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
@@ -666,7 +620,7 @@ impl App {
         // Fallback: walk backwards from idx to find the preceding ToolUse
         if idx == 0 { return String::new(); }
         for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.messages[i].msg {
+            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.transcript.messages[i].msg {
                 if tool_name == "read" {
                     // Extract path from the JSON input
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
@@ -690,9 +644,9 @@ impl App {
         // is the only way to render parallel-tool outputs correctly,
         // since results may not be positionally adjacent to their
         // matching tool_use.
-        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.messages.get(idx).map(|m| &m.msg) {
+        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.transcript.messages.get(idx).map(|m| &m.msg) {
             if !tool_id.is_empty() {
-                for m in self.messages.iter() {
+                for m in self.transcript.messages.iter() {
                     match &m.msg {
                         ChatMessage::ToolUse { tool_id: tid, tool_name, .. }
                         | ChatMessage::ToolUseStart { tool_id: tid, tool_name, .. }
@@ -707,10 +661,10 @@ impl App {
         }
         if idx == 0 { return None; }
         for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, .. } = self.messages[i].msg {
+            if let ChatMessage::ToolUse { ref tool_name, .. } = self.transcript.messages[i].msg {
                 return Some(tool_name.clone());
             }
-            if let ChatMessage::ToolUseStart { ref tool_name, .. } = self.messages[i].msg {
+            if let ChatMessage::ToolUseStart { ref tool_name, .. } = self.transcript.messages[i].msg {
                 return Some(tool_name.clone());
             }
         }
@@ -731,7 +685,7 @@ impl App {
 
     /// Locate the index of a `ToolUseStart` block with this `tool_id`.
     pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
+        self.transcript.messages.iter().rposition(|m| matches!(
             &m.msg,
             ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
         ))
@@ -739,7 +693,7 @@ impl App {
 
     /// Locate the latest `ToolResult` block for this `tool_id`.
     pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
+        self.transcript.messages.iter().rposition(|m| matches!(
             &m.msg,
             ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
         ))
@@ -768,10 +722,10 @@ impl App {
         let target_idx = if !tool_id.is_empty() {
             self.find_tool_use_start_idx(tool_id)
         } else {
-            self.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
+            self.transcript.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
         };
         if let Some(idx) = target_idx {
-            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.transcript.messages[idx].msg {
                 partial_input.push_str(delta);
                 self.invalidate();
             }
@@ -791,7 +745,7 @@ impl App {
         self.tool_start_time = Some(std::time::Instant::now());
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
-            self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
+            self.transcript.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
             self.invalidate();
             return;
         }
@@ -804,7 +758,7 @@ impl App {
     /// `ToolResult` if one exists, otherwise creates a new placeholder.
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.transcript.messages[idx].msg {
                 if elapsed_ms.is_none() {
                     content.push_str(&delta);
                     self.invalidate();
@@ -830,10 +784,10 @@ impl App {
         }
 
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.transcript.messages[idx].msg {
                 if elapsed_ms.is_none() {
                     *content = result;
-                    self.messages[idx].msg = ChatMessage::ToolResult {
+                    self.transcript.messages[idx].msg = ChatMessage::ToolResult {
                         tool_id,
                         content: std::mem::take(content),
                         elapsed_ms: elapsed,
@@ -853,7 +807,7 @@ impl App {
         let mut parts: Vec<String> = Vec::new();
 
         // Walk backwards from the end to find content since last user message
-        for tmsg in self.messages.iter().rev() {
+        for tmsg in self.transcript.messages.iter().rev() {
             match &tmsg.msg {
                 ChatMessage::User(_) => break, // stop at the last user message
                 ChatMessage::Thinking(t)
@@ -1020,7 +974,7 @@ impl App {
         // Model produced real output — clear any empty thinking placeholder
         // so its spinner stops.
         self.drop_empty_thinking();
-        if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.messages.last_mut() {
+        if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.transcript.messages.last_mut() {
             existing.push_str(text);
         } else {
             self.push_msg(ChatMessage::Text(text.to_string()));
@@ -1029,7 +983,7 @@ impl App {
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
-        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.messages.last_mut() {
+        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.transcript.messages.last_mut() {
             // First real delta replaces the sentinel placeholder rather than
             // appending to it (otherwise content reads "…​<thinking>").
             if existing == THINKING_PLACEHOLDER {
@@ -1054,13 +1008,13 @@ impl App {
     pub(crate) fn drop_empty_thinking(&mut self) {
         // Walk from the tail, skipping System messages, to find the first
         // non-System message. If it's an empty/placeholder Thinking, drop it.
-        let candidate_idx = self.messages.iter().rposition(|m| {
+        let candidate_idx = self.transcript.messages.iter().rposition(|m| {
             !matches!(&m.msg, ChatMessage::System(_))
         });
         if let Some(idx) = candidate_idx {
-            if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
+            if let ChatMessage::Thinking(t) = &self.transcript.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
-                    self.messages.remove(idx);
+                    self.transcript.messages.remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate();
                 }
@@ -1161,7 +1115,7 @@ mod tests {
         assert!(app.render_lines_uses_spinner(), "placeholder should animate while present");
         app.append_or_update_text("here is the answer");
         assert!(
-            !matches!(app.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            !matches!(app.transcript.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
             "empty thinking must be gone once text arrives"
         );
         assert!(!app.render_lines_uses_spinner(), "spinner must stop after agent moves on");
@@ -1171,7 +1125,7 @@ mod tests {
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
         app.on_tool_use_start("t1".to_string(), "bash".to_string());
         let thinking_count = app
-            .messages
+            .transcript.messages
             .iter()
             .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
             .count();
@@ -1184,7 +1138,7 @@ mod tests {
         app.append_or_update_thinking("actually reasoning");
         app.append_or_update_text("done");
         assert!(
-            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            app.transcript.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
             "non-empty thinking must survive and not keep the … prefix"
         );
     }
@@ -1201,7 +1155,7 @@ mod tests {
             app.on_tool_result(id.to_string(), format!("out-{id}"));
         }
         let seq: Vec<(String, bool)> = app
-            .messages
+            .transcript.messages
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
@@ -1334,7 +1288,7 @@ mod tests {
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
         app.line_cache = Some({
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             LineCache { width: w, per_msg, flat }
         });
@@ -1372,7 +1326,7 @@ mod tests {
         app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
         app.line_cache = Some({
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             LineCache { width: w, per_msg, flat }
         });
@@ -1397,12 +1351,12 @@ mod tests {
 
         // Build full cache first
         app.line_cache = Some({
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
             LineCache { width: w, per_msg, flat }
         });
         app.dirty_from = None;
-        let last = app.messages.len() - 1;
+        let last = app.transcript.messages.len() - 1;
 
         // Snapshot per_msg[0..last]
         let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
@@ -1424,7 +1378,7 @@ mod tests {
 
         // Simulate draw.rs incremental rebuild
         {
-            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.messages.len())
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.transcript.messages.len())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
             let cache = app.line_cache.as_mut().unwrap();
@@ -1518,7 +1472,7 @@ mod tests {
     // ── Parallel tool-event routing (Bug 2 regression coverage) ─────────
 
     fn last_tool_use(app: &App, tool_id: &str) -> Option<(String, String)> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages.iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUse { tool_id: tid, tool_name, input } if tid == tool_id => {
                 Some((tool_name.clone(), input.clone()))
             }
@@ -1527,7 +1481,7 @@ mod tests {
     }
 
     fn tool_use_start_partial(app: &App, tool_id: &str) -> Option<String> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages.iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUseStart { tool_id: tid, partial_input, .. } if tid == tool_id => {
                 Some(partial_input.clone())
             }
@@ -1536,7 +1490,7 @@ mod tests {
     }
 
     fn tool_result_content(app: &App, tool_id: &str) -> Option<String> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages.iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id: tid, content, .. } if tid == tool_id => {
                 Some(content.clone())
             }
@@ -1594,7 +1548,7 @@ mod tests {
 
         // Both are now ToolUse, no lingering ToolUseStart.
         let lingering_starts = app
-            .messages
+            .transcript.messages
             .iter()
             .filter(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
             .count();
@@ -1613,7 +1567,7 @@ mod tests {
 
         // On-screen order matches call order (call_a appears before call_b).
         let positions: Vec<&str> = app
-            .messages
+            .transcript.messages
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some(tool_id.as_str()),
@@ -1705,11 +1659,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         app.on_tool_result("call_b".to_string(), "b".to_string());
 
-        let a_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+        let a_elapsed = app.transcript.messages.iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_a" => *elapsed_ms,
             _ => None,
         });
-        let b_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+        let b_elapsed = app.transcript.messages.iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_b" => *elapsed_ms,
             _ => None,
         });
@@ -1732,7 +1686,7 @@ mod tests {
         app.append_or_update_text("answer");
         // The Thinking block must survive with "…" content, not be dropped
         assert!(
-            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
+            app.transcript.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
             "real ellipsis thinking content must survive — sentinel and real output are distinct"
         );
     }
@@ -1747,7 +1701,7 @@ mod tests {
         app.push_msg(ChatMessage::System("retrying…".to_string()));
         // Now trigger the drop (e.g. text arrives / turn ends)
         app.drop_empty_thinking();
-        let has_placeholder = app.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages.iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "placeholder stranded under a System message must be removed by drop_empty_thinking");
@@ -1761,7 +1715,7 @@ mod tests {
         // Simulate what the abort handler does: drop + push error
         app.drop_empty_thinking();
         app.push_msg(ChatMessage::Error("aborted".to_string()));
-        let has_placeholder = app.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages.iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
@@ -1786,7 +1740,7 @@ mod tests {
 
         let w = 80;
         let flat = app.render_lines(w);
-        let concat: Vec<ratatui::text::Line<'static>> = (0..app.messages.len())
+        let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.messages.len())
             .flat_map(|i| app.render_message_lines(i, w))
             .collect();
 
@@ -1820,7 +1774,7 @@ mod tests {
         let expected_flat = app.render_lines(w);
 
         // Build a LineCache manually using the new struct
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
             .map(|i| app.render_message_lines(i, w))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1836,7 +1790,7 @@ mod tests {
 
     /// Helper: builds a LineCache for an app at a given width, simulating what draw.rs does.
     fn build_cache(app: &App, width: usize) -> LineCache {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
             .map(|i| app.render_message_lines(i, width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1849,14 +1803,14 @@ mod tests {
             Some(mut cache) if cache.width == width => {
                 if let Some(k) = app.dirty_from.take() {
                     // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
-                    if cache.per_msg.len() != app.messages.len() {
+                    if cache.per_msg.len() != app.transcript.messages.len() {
                         cache.per_msg.truncate(k);
-                        for i in k..app.messages.len() {
+                        for i in k..app.transcript.messages.len() {
                             cache.per_msg.push(app.render_message_lines(i, width));
                         }
                     } else {
                         // In-place partial re-render: only messages[k..]
-                        for i in k..app.messages.len() {
+                        for i in k..app.transcript.messages.len() {
                             cache.per_msg[i] = app.render_message_lines(i, width);
                         }
                     }
@@ -1889,7 +1843,7 @@ mod tests {
         app.line_cache = Some(build_cache(&app, w));
         app.dirty_from = None;
 
-        let last = app.messages.len() - 1; // index of Text message
+        let last = app.transcript.messages.len() - 1; // index of Text message
 
         // Snapshot per_msg[0..last] content strings (before update)
         let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
@@ -1898,7 +1852,7 @@ mod tests {
             .collect();
 
         // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
-        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.messages.last_mut() {
+        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.messages.last_mut() {
             t.push_str(" — more content appended");
         }
         app.dirty_from = Some(last); // invalidate_last equivalent
@@ -1947,7 +1901,7 @@ mod tests {
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
-        app.messages.insert(at, crate::tui::app::TimestampedMsg {
+        app.transcript.messages.insert(at, crate::tui::app::TimestampedMsg {
             msg: ChatMessage::ToolResult {
                 tool_id: "t1".to_string(),
                 content: "file.txt".to_string(),
@@ -1961,7 +1915,7 @@ mod tests {
         rebuild_incremental(&mut app, w);
 
         let cache = app.line_cache.as_ref().unwrap();
-        assert_eq!(cache.per_msg.len(), app.messages.len(), "per_msg must track messages after insert");
+        assert_eq!(cache.per_msg.len(), app.transcript.messages.len(), "per_msg must track messages after insert");
 
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
@@ -2004,7 +1958,7 @@ mod visible_window_tests {
         let content_height: usize = 5; // viewport is 5 rows — much less than 20
 
         // Mirror draw.rs §3: build cache.
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
             .map(|i| app.render_message_lines(i, content_width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> =

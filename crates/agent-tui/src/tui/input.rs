@@ -520,7 +520,7 @@ fn handle_key(
 
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
-    if app.messages.is_empty() {
+    if app.transcript.messages.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
     let input = app.input.clone();
