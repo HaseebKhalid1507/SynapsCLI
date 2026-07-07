@@ -311,6 +311,14 @@ impl ToolRegistry {
         names.sort();
         names
     }
+
+    /// Iterate all registered tools, sorted by name for deterministic output.
+    /// Used by `synaps tools export` to build the static schema manifest.
+    pub fn iter_tools_sorted(&self) -> Vec<&Arc<dyn Tool>> {
+        let mut tools: Vec<_> = self.tools.values().collect();
+        tools.sort_by_key(|t| t.name());
+        tools
+    }
 }
 #[cfg(test)]
 mod tests {
