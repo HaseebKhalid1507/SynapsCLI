@@ -50,9 +50,9 @@
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use ratatui::backend::TestBackend;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Size;
+use ratatui::layout::{Rect, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use synaps_cli::skills::keybinds::KeybindRegistry;
@@ -209,6 +209,62 @@ impl TestHarness {
         self.terminal.backend().buffer()
     }
 
+    /// Render one frame through `CrosstermBackend<Vec<u8>>` and return the
+    /// raw ANSI byte stream (P5 spike).
+    ///
+    /// Unlike [`render`](Self::render) — which yields a ratatui cell grid
+    /// that never touches the escape layer — this drives the *production
+    /// backend* with an in-memory `Write` sink, so the returned bytes are
+    /// the real escape sequences crossterm would send to the terminal.
+    /// Feed them to a `vt100::Parser` and assert on the parsed screen.
+    ///
+    /// Scope: **frame content only.** The render thread's edge scrub and
+    /// the lifecycle enter/leave sequences do not pass through here — see
+    /// `tests/vt100_spike.rs` for the full scoping note.
+    pub fn render_ansi(&mut self) -> Vec<u8> {
+        let model = build_render_model(
+            &mut self.app,
+            &self.runtime,
+            &self.registry,
+            &self.secret_prompts,
+            self.size,
+        )
+        .expect("build_render_model returned None — gamba never runs headless");
+
+        // Shared in-memory sink: `CrosstermBackend::writer_mut` is unstable
+        // in ratatui 0.30 (`backend-writer` feature), so instead of taking
+        // the Vec back out of the backend we hand it a cloneable handle and
+        // read the bytes through our copy after the draw.
+        let sink = SharedSink::default();
+
+        // Fixed viewport: `CrosstermBackend::size()` queries the actual TTY
+        // (crossterm::terminal::size()), which fails headless. A fixed
+        // viewport of the harness geometry sidesteps the query entirely.
+        let area = Rect::new(0, 0, self.size.width, self.size.height);
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("in-memory CrosstermBackend terminal construction is infallible");
+
+        let (mut boot_fx, mut exit_fx) = (None, None);
+        terminal
+            .draw(|frame| {
+                render_frame_into(
+                    frame,
+                    &model,
+                    &mut boot_fx,
+                    &mut exit_fx,
+                    std::time::Duration::ZERO,
+                )
+            })
+            .expect("draw to an in-memory sink is infallible");
+
+        sink.take()
+    }
+
     /// Render and return the visible frame as a plain string — one line per
     /// terminal row, trailing whitespace trimmed. Suited to insta-style
     /// snapshot assertions and failure diffs.
@@ -311,5 +367,30 @@ impl TestHarness {
             }
         };
         self.actions.push(desc);
+    }
+}
+
+/// Cloneable in-memory `Write` sink for [`TestHarness::render_ansi`].
+///
+/// Exists because `CrosstermBackend` in ratatui 0.30 only exposes its writer
+/// behind an unstable feature — so the harness keeps a handle to the shared
+/// buffer instead of retrieving it from the backend afterwards.
+#[derive(Clone, Default)]
+struct SharedSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl SharedSink {
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
+impl std::io::Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

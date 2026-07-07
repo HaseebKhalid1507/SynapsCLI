@@ -60,6 +60,9 @@ testing = ["agent-engine/testing"]
 
 [dev-dependencies]
 serial_test = "3.4.0"
+# P5 spike: escape-level render verification — parses the ANSI byte stream a
+# real CrosstermBackend emits so tests can assert on the *parsed* screen.
+vt100       = "0.16"
 tempfile    = "3"
 sha2        = "0.10"
 # Self dev-dependency: turns the `testing` feature on for every test target
