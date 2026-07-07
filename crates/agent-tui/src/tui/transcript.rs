@@ -893,7 +893,12 @@ impl TranscriptStore {
 
         // ── Cache sync (old draw.rs §3) ──
         self.sync_cache(content_width, ctx);
-        let total = self.line_cache().map_or(0, |c| c.flat.len());
+        // P11 (design §2.1): `total` is sourced from the cumulative-offset
+        // cache. Same numbers as `flat.len()` by the §0 identity — the
+        // growth-adjust/clamp code below is untouched, only re-sourced. The
+        // flat buffer is still authoritative for CONTENT this slice; the
+        // heights-assembled window is debug-checked against it below.
+        let total = self.line_cache().map_or(0, |c| c.total_height());
 
         // ── Scroll bookkeeping (old draw.rs §4) ──
         // Order is load-bearing: growth-adjust THEN clamp THEN last_line_count write.
@@ -927,13 +932,29 @@ impl TranscriptStore {
         self.viewport = Some(msg_inner);
         self.visible_range = Some((start, end));
 
-        // Clone only the visible window (~viewport height lines) into the Arc —
-        // O(viewport) not O(n).  `total` above is the full flat count, kept for
-        // scroll bookkeeping; `lines` is only the slice the render thread needs.
-        let all_lines: &[ratatui::text::Line<'static>] =
-            self.line_cache().map_or(&[], |c| c.flat.as_slice());
-        let visible_slice = all_lines.get(start..end).unwrap_or(&[]);
-        let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = visible_slice.to_vec().into();
+        // ── Window assembly (design §3 steps 4–6) ──
+        // Resolve the visible message range by binary search over
+        // `cum_heights` and copy partial first/last slices plus whole middles
+        // into a fresh Vec → Arc. O(log n) search + O(viewport) clone — the
+        // exact same fresh O(viewport) publish the flat slice produced
+        // (nothing changes downstream; the Arc story holds).
+        let assembled = self.assemble_window(start, end);
+        // Slice oracle (design §6 (d)): the two paths must agree while both
+        // exist. Dies with the flat buffer.
+        #[cfg(debug_assertions)]
+        {
+            let flat_slice: &[ratatui::text::Line<'static>] = self
+                .line_cache()
+                .and_then(|c| c.flat.get(start..end))
+                .unwrap_or(&[]);
+            debug_assert!(
+                assembled.iter().eq(flat_slice.iter()),
+                "window-from-heights must equal window-from-flat ({} vs {} rows, start={start} end={end})",
+                assembled.len(),
+                flat_slice.len(),
+            );
+        }
+        let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = assembled.into();
 
         VisibleWindow {
             lines,
@@ -942,6 +963,40 @@ impl TranscriptStore {
             selection: self.selection_range(), // old draw.rs §6
             is_empty: self.messages.is_empty(),
         }
+    }
+
+    /// Resolve height-space rows `[start..end)` to a message range via
+    /// binary search over `cum_heights` (design §3 step 4):
+    /// `cum[first] <= start < cum[first+1]` and `cum[last] < end <= cum[last+1]`.
+    /// Zero-height slots at the boundary resolve past themselves (they
+    /// contribute no rows). `None` when the window is empty.
+    fn window_msg_range(cache: &LineCache, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start >= end || cache.per_msg.is_empty() {
+            return None;
+        }
+        let first = cache.cum_heights.partition_point(|&c| c <= start).saturating_sub(1);
+        let last = cache.cum_heights.partition_point(|&c| c < end).saturating_sub(1);
+        Some((first, last))
+    }
+
+    /// Assemble the visible window `[start..end)` from per-slot lines
+    /// (design §3 steps 4–6): partial slices of the first/last slots plus
+    /// whole middles. A message straddling an edge is rendered fully and
+    /// sliced — line-granular windows require it, bounded by one message.
+    fn assemble_window(&self, start: usize, end: usize) -> Vec<ratatui::text::Line<'static>> {
+        let Some(cache) = self.line_cache() else { return Vec::new() };
+        let Some((first, last)) = Self::window_msg_range(cache, start, end) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(end - start);
+        for mi in first..=last {
+            let slot = &cache.per_msg[mi];
+            let base = cache.cum_heights[mi];
+            let lo = start.saturating_sub(base);
+            let hi = (end - base).min(slot.height());
+            out.extend(slot.lines()[lo..hi].iter().cloned());
+        }
+        out
     }
 
     // ── Selection (content-relative since P10 slice (b)) ─────────────────────
