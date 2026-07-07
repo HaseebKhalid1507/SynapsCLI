@@ -1117,10 +1117,9 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
 // `render_message_lines` call (measurement IS the render under P11), and
 // `cum_height_writes()` bumps once per cumulative-offset entry written.
 //
-// Landed `#[ignore]`d BEFORE the build per the P9/P10 pin-first pattern; the
-// perf-gate slice (design §6 (e)) flips them on. Two of the three fail loudly
-// against pre-P11 code (the tool-delta path full-invalidates → renders all
-// n=1000; cum_heights doesn't exist yet so its counter is trivially 0).
+// Landed `#[ignore]`d BEFORE the build per the P9/P10 pin-first pattern
+// (two of the three failed loudly against pre-P11 code); ACTIVE since the
+// flat-kill perf gate passed — these are the standing frame-cost pins.
 //
 // Workload note: 1000 messages deliberately bypasses `cap_resumed_display` —
 // the cap only runs on the resume path (helpers.rs:176); a live session
@@ -1129,7 +1128,6 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
 /// L4 pin 1 — steady frame: a second render with no mutation in between must
 /// render ZERO messages (Clean cache path) at n=1000.
 #[test]
-#[ignore = "P11: activates at perf gate"]
 fn perf_1000_msgs_steady_frame_renders_zero() {
     let mut h = TestHarness::boot_with_size(80, 24);
     for i in 0..1000 {
@@ -1150,7 +1148,6 @@ fn perf_1000_msgs_steady_frame_renders_zero() {
 /// re-render at most 2 messages on the next frame (watermark k..n where the
 /// delta dirties the tail — NOT a full O(total) rebuild).
 #[test]
-#[ignore = "P11: activates at perf gate"]
 fn perf_1000_msgs_stream_delta_renders_le_2() {
     let mut h = TestHarness::boot_with_size(80, 24);
     for i in 0..999 {
@@ -1176,7 +1173,6 @@ fn perf_1000_msgs_stream_delta_renders_le_2() {
 /// offsets, not an O(n) re-sum. A tail append then splices the offset cache
 /// from the dirty watermark: O(1) entries, not O(n).
 #[test]
-#[ignore = "P11: activates at perf gate"]
 fn perf_1000_msgs_cum_height_lookup_cached_no_per_frame_resum() {
     let mut h = TestHarness::boot_with_size(80, 24);
     for i in 0..1000 {
