@@ -872,8 +872,7 @@ mod tests {
         {
             let w = 80;
             let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
         }
         app.subagents.push(SubagentState {
             id: 1,
@@ -910,8 +909,7 @@ mod tests {
         {
             let w = 80;
             let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
         }
         app.spinner_frame = 2;
 
@@ -935,8 +933,7 @@ mod tests {
         // Build full cache first (Clean = old Some + dirty_from None)
         {
             let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
         }
         let last = app.transcript.message_count() - 1;
 
@@ -967,11 +964,6 @@ mod tests {
             if let CacheState::Dirty(ref mut cache, _) = cs {
                 for (offset, rendered) in fresh.into_iter().enumerate() {
                     cache.per_msg[last + offset] = rendered;
-                }
-                let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.height()).sum();
-                cache.flat.truncate(prefix_len);
-                for slot in &cache.per_msg[last..] {
-                    cache.flat.extend(slot.lines().iter().cloned());
                 }
             }
             // mark clean
@@ -1340,9 +1332,13 @@ mod tests {
     }
 
     #[test]
-    fn line_cache_build_produces_flat_equal_to_render_lines() {
-        // This test verifies that the LineCache struct's build path (per_msg concat -> flat)
-        // produces the same flat output as render_lines(width).
+    fn line_cache_build_produces_heights_equal_to_render_lines_prefix_sums() {
+        // P11 flat-kill port of the flat oracle: the LineCache build path
+        // must produce cum_heights equal to the prefix sums of the reference
+        // render (render_lines, the surviving §4 oracle), and the per_msg
+        // concatenation must equal the reference render line-for-line.
+        // PERMANENT test (red-team angle 5): this is the standing height
+        // oracle now that the flat buffer is gone.
         let mut app = test_app();
         app.push_msg(ChatMessage::User("hi".to_string()));
         app.push_msg(ChatMessage::Text("hello back".to_string()));
@@ -1364,14 +1360,24 @@ mod tests {
         let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, w))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-        let cache = LineCache::new(w, per_msg, flat);
+        let cache = LineCache::new(w, per_msg);
 
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "LineCache.flat must equal render_lines output");
+        // Height oracle: cum_heights ≡ prefix sums of the reference render.
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "total_height must equal the reference render's line count");
+        let mut acc = 0usize;
+        for (i, slot) in cache.per_msg.iter().enumerate() {
+            assert_eq!(cache.cum_heights[i], acc, "cum_heights[{i}] must be the prefix sum");
+            acc += slot.height();
+        }
+        // Content oracle: per_msg concatenation ≡ the reference render.
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal render_lines output");
         assert!(cache.width == w);
     }
 
@@ -1380,8 +1386,7 @@ mod tests {
         let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-        LineCache::new(width, per_msg, flat)
+        LineCache::new(width, per_msg)
     }
 
     /// Helper: simulate the incremental rebuild from sync_cache (slice 3 logic,
@@ -1401,12 +1406,7 @@ mod tests {
                         cache.per_msg[i] = app.render_message_lines(i, width);
                     }
                 }
-                // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
-                let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.height()).sum();
-                cache.flat.truncate(prefix_len);
-                for slot in &cache.per_msg[k..] {
-                    cache.flat.extend(slot.lines().iter().cloned());
-                }
+                // cum_heights is recomputed by test_set_cache_clean below.
                 app.transcript.test_set_cache_clean(cache);
             }
             CacheState::Clean(cache) if cache.width == width => {
@@ -1465,13 +1465,18 @@ mod tests {
         let contains_new = last_strs.iter().any(|s| s.contains("more content appended"));
         assert!(contains_new, "per_msg[last] must reflect the updated text");
 
-        // flat must equal full render_lines (correctness)
+        // Concatenated slots + cum_heights must equal the reference render
+        // (the surviving §4 oracle — flat is gone).
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "flat must equal full render_lines after incremental rebuild");
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal full render_lines after incremental rebuild");
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "cum_heights total must track the reference render after incremental rebuild");
     }
 
     #[test]
@@ -1509,7 +1514,11 @@ mod tests {
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "flat must equal render_lines after insert + incremental rebuild");
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal render_lines after insert + incremental rebuild");
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "cum_heights total must track the reference render after insert + incremental rebuild");
     }
 }

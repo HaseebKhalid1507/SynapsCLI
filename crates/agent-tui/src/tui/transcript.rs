@@ -8,13 +8,14 @@
 //! That invariant is enforced by slice (f); see
 //! `~/Jawz/notes/tech/synaps-p9-transcriptstore-seam-design.md` §3.6.
 //!
-//! **Flat-cache rule (design §3.6):** nothing outside the store may index into
-//! the flat cache. After P10 slice (d), copy reads message SOURCE + `LineMeta`
-//! provenance — the only remaining flat-cache consumers are `visible_window`
-//! and the quarantined `flat_index_to_content`/`content_to_flat_index` pair
-//! (P11 swaps those for `desired_height` sums). This rule enables the
-//! inline-mode accommodation described on [`TranscriptStore`] without
-//! touching any call site.
+//! **Flat-cache rule (design §3.6), post-P11:** the flat BUFFER is dead —
+//! `cum_heights` carries the flat COORDINATE system (same numbers, §0
+//! identity), `visible_window` assembles O(visible) frames from per-slot
+//! lines, and copy reads message SOURCE + `LineMeta` provenance. The
+//! quarantined `flat_index_to_content`/`content_to_flat_index` pair is the
+//! only flat-index arithmetic left. This rule enables the inline-mode
+//! accommodation described on [`TranscriptStore`] without touching any call
+//! site.
 //!
 //! # Scroll / selection interaction (P10, DECISION LOCK L4)
 //! `scroll_up`/`scroll_down` do **not** touch selection state, and since P10
@@ -216,38 +217,29 @@ impl MsgSlot {
 }
 
 /// Per-message render cache. Parallel to `TranscriptStore.messages`: each slot
-/// holds the rendered [`MsgSlot`] for that message. `flat` is the
-/// concatenation of the entries' lines, which is what downstream
-/// (draw/selection) consumes — lines only, no meta; the render thread never
-/// learns about provenance. The `width` at which these were rendered is
-/// stored so stale entries can be detected on terminal resize.
+/// holds the rendered [`MsgSlot`] for that message. There is NO flat
+/// materialization (killed in the P11 flat-kill slice): `cum_heights` is the
+/// flat coordinate system, and `visible_window` assembles the O(visible)
+/// window straight from per-slot lines. The `width` at which these were
+/// rendered is stored so stale entries can be detected on terminal resize.
 pub(crate) struct LineCache {
     pub(crate) width: usize,
     /// Rendered lines + meta per message — index parallel to TranscriptStore.messages.
     pub(crate) per_msg: Vec<MsgSlot>,
-    /// Concatenation of per_msg lines; what downstream code consumes.
-    /// Dies in the P11 flat-kill slice — `cum_heights` is its coordinate
-    /// system, kept identical by construction until then.
-    pub(crate) flat: Vec<ratatui::text::Line<'static>>,
     /// Cumulative height offsets (P11 §1.2): `cum_heights[i]` = summed
     /// heights of messages `[0..i)`; `cum_heights[n]` = total. Always
     /// `per_msg.len() + 1` entries. Rebuilt from the dirty watermark k in
-    /// O(n−k) usize writes — the same watermark discipline as the flat
-    /// rebuild, minus the Line clones. Because `height(i) == lines.len()`,
-    /// these ARE flat-buffer indices (the design's identity claim, §0) —
-    /// asserted per frame in debug builds (`debug_assert_cum_identity`).
+    /// O(n−k) usize writes. Because `height(i) == lines.len()`, these ARE
+    /// flat-line indices (the design's identity claim, §0) — every scroll,
+    /// selection, and growth-adjust number is unchanged from the flat era.
     pub(crate) cum_heights: Vec<usize>,
 }
 
 impl LineCache {
-    /// Build a cache from rendered slots + their flat concatenation,
-    /// computing `cum_heights` from scratch.
-    pub(crate) fn new(
-        width: usize,
-        per_msg: Vec<MsgSlot>,
-        flat: Vec<ratatui::text::Line<'static>>,
-    ) -> Self {
-        let mut cache = LineCache { width, per_msg, flat, cum_heights: Vec::new() };
+    /// Build a cache from rendered slots, computing `cum_heights` from
+    /// scratch.
+    pub(crate) fn new(width: usize, per_msg: Vec<MsgSlot>) -> Self {
+        let mut cache = LineCache { width, per_msg, cum_heights: Vec::new() };
         cache.rebuild_cum_from(0);
         cache
     }
@@ -273,10 +265,8 @@ impl LineCache {
         written
     }
 
-    /// Total height in rows — `cum_heights[n]`. Identical to `flat.len()`
-    /// by the §0 identity (debug-asserted); becomes the sole total when the
-    /// flat buffer dies.
-    #[allow(dead_code)] // consumer lands with the visible_window rewrite (second half)
+    /// Total height in rows — `cum_heights[n]`. The sole total: this IS
+    /// what `flat.len()` used to be (§0 identity).
     pub(crate) fn total_height(&self) -> usize {
         *self.cum_heights.last().unwrap_or(&0)
     }
@@ -765,9 +755,7 @@ impl TranscriptStore {
             let per_msg: Vec<MsgSlot> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
-            let flat: Vec<ratatui::text::Line<'static>> =
-                per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-            let cache = LineCache::new(content_width, per_msg, flat);
+            let cache = LineCache::new(content_width, per_msg);
             #[cfg(any(test, feature = "testing"))]
             self.probe
                 .cum_writes
@@ -802,12 +790,6 @@ impl TranscriptStore {
                     cache.per_msg[k + offset] = rendered;
                 }
             }
-            // Rebuild flat from k
-            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|e| e.height()).sum();
-            cache.flat.truncate(prefix_line_count);
-            for slot in &cache.per_msg[k..] {
-                cache.flat.extend(slot.lines().iter().cloned());
-            }
             // Splice the cumulative-offset cache from the same watermark.
             let _cum_written = cache.rebuild_cum_from(k);
             #[cfg(any(test, feature = "testing"))]
@@ -823,9 +805,7 @@ impl TranscriptStore {
             let per_msg: Vec<MsgSlot> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
-            let flat: Vec<ratatui::text::Line<'static>> =
-                per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
-            self.cache = CacheState::Clean(LineCache::new(content_width, per_msg, flat));
+            self.cache = CacheState::Clean(LineCache::new(content_width, per_msg));
         }
         self.debug_assert_cum_identity();
     }
@@ -861,11 +841,6 @@ impl TranscriptStore {
                     i + 1
                 );
             }
-            debug_assert_eq!(
-                acc,
-                c.flat.len(),
-                "identity (§0): summed heights must equal flat line count"
-            );
         }
     }
 
@@ -896,10 +871,9 @@ impl TranscriptStore {
         // ── Cache sync (old draw.rs §3) ──
         self.sync_cache(content_width, ctx);
         // P11 (design §2.1): `total` is sourced from the cumulative-offset
-        // cache. Same numbers as `flat.len()` by the §0 identity — the
-        // growth-adjust/clamp code below is untouched, only re-sourced. The
-        // flat buffer is still authoritative for CONTENT this slice; the
-        // heights-assembled window is debug-checked against it below.
+        // cache — the same numbers the flat buffer's len() used to be (§0
+        // identity). The growth-adjust/clamp code below is untouched, only
+        // re-sourced.
         let total = self.line_cache().map_or(0, |c| c.total_height());
 
         // ── Scroll bookkeeping (old draw.rs §4) ──
@@ -957,21 +931,6 @@ impl TranscriptStore {
         // exact same fresh O(viewport) publish the flat slice produced
         // (nothing changes downstream; the Arc story holds).
         let assembled = self.assemble_window(start, end);
-        // Slice oracle (design §6 (d)): the two paths must agree while both
-        // exist. Dies with the flat buffer.
-        #[cfg(debug_assertions)]
-        {
-            let flat_slice: &[ratatui::text::Line<'static>] = self
-                .line_cache()
-                .and_then(|c| c.flat.get(start..end))
-                .unwrap_or(&[]);
-            debug_assert!(
-                assembled.iter().eq(flat_slice.iter()),
-                "window-from-heights must equal window-from-flat ({} vs {} rows, start={start} end={end})",
-                assembled.len(),
-                flat_slice.len(),
-            );
-        }
         let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = assembled.into();
 
         // ── Demote (design §3 step 7, lock L3) ──
@@ -1927,7 +1886,8 @@ mod visible_window_tests {
     /// test drives `visible_window()` directly and pins the same invariants:
     ///   1. `lines.len()` == content_height (the viewport), NOT `total`.
     ///      This is what makes the publish O(viewport) instead of O(n).
-    ///   2. `lines` content == `cache.flat[start..end]` for the scroll position.
+    ///   2. `lines` content == the reference render's [start..end] window
+    ///      (`render_lines` is the surviving §4 oracle).
     ///   3. the render thread's `model.lines.to_vec()` (no re-slice) equals
     ///      that same window — proving the [start..end] re-slice is redundant.
     ///   4. a different scroll_back yields a different window of the same len.
@@ -1954,7 +1914,7 @@ mod visible_window_tests {
         // Pinned at bottom → scroll_back = 0.
         let vw = store.visible_window(msg_area, &test_ctx());
 
-        let total = store.line_cache().unwrap().flat.len();
+        let total = store.line_cache().unwrap().total_height();
         assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
         let end = total; // scroll_back = 0
         let start = end.saturating_sub(content_height);
@@ -1979,18 +1939,21 @@ mod visible_window_tests {
         assert_eq!(vw.scroll_back, 0, "pinned → post-clamp scroll_back must be 0");
         assert!(!vw.is_empty, "20 messages → is_empty must be false");
 
-        // 2. Content must match cache.flat[start..end].
+        // 2. Content must match the reference render's [start..end] window
+        //    (post flat-kill: render_lines is the oracle, not a live buffer).
+        let oracle = store.render_lines(content_width, &test_ctx());
+        assert_eq!(oracle.len(), total, "oracle render must reproduce total_height");
         assert_eq!(
             to_str(&vw.lines),
-            to_str(&store.line_cache().unwrap().flat[start..end]),
-            "published window content must equal cache.flat[start..end]"
+            to_str(&oracle[start..end]),
+            "published window content must equal the reference render's [start..end]"
         );
 
         // 3. Render-thread side: visible = model.lines.to_vec() (no re-slice).
         let visible_render: Vec<ratatui::text::Line> = vw.lines.to_vec();
         assert_eq!(
             to_str(&visible_render),
-            to_str(&store.line_cache().unwrap().flat[start..end]),
+            to_str(&oracle[start..end]),
             "render-thread .to_vec() on vw.lines must equal the visible window"
         );
 

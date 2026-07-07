@@ -201,10 +201,8 @@ mod tests {
         let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> =
-            per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
         // Clean — renderer thinks nothing changed
-        app.transcript.test_set_cache_clean(LineCache::new(width, per_msg, flat));
+        app.transcript.test_set_cache_clean(LineCache::new(width, per_msg));
     }
 
     // -------------------------------------------------------------------------
