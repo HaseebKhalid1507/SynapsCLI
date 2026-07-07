@@ -1,12 +1,17 @@
-//! Transcript vocabulary types and the [`TranscriptStore`] shell.
+//! # TranscriptStore — message pane ownership
 //!
-//! **P9 Slice (a):** types moved from `app.rs`; `TranscriptStore` holds only
-//! `messages` for now. All other fields migrate in later slices per the P9
-//! seam design. The field is `pub(crate)` — pure passthrough this slice.
+//! This module owns everything the message pane shows and nothing else:
+//! the message list, the per-message render cache, the viewport position, and
+//! the selection quad. External code reads and mutates the transcript
+//! **exclusively through the method surface defined here** — no code outside
+//! this file may index into the flat cache or touch store fields directly.
+//! That invariant is enforced by slice (f); see
+//! `~/Jawz/notes/tech/synaps-p9-transcriptstore-seam-design.md` §3.6.
 //!
-//! **P9 Slice (c):** scroll state (`scroll_back`, `scroll_pinned`,
-//! `last_line_count`) moves here; `scroll_up`, `scroll_down`,
-//! `scroll_to_bottom` added. Fields are `pub(crate)` — sealing is slice (f).
+//! **Flat-cache rule (design §3.6):** nothing outside the store may index into
+//! the flat cache. After P9, the only flat-cache consumer is `selected_text`,
+//! which is store-internal. This rule enables the inline-mode accommodation
+//! described on [`TranscriptStore`] without touching any call site.
 //!
 //! # Scroll / selection asymmetry (red-team finding)
 //! `scroll_up`/`scroll_down` do **not** touch selection state. Mouse-wheel
@@ -91,11 +96,10 @@ pub(crate) struct LineCache {
 /// - `Missing`      = full rebuild on next sync (old `None` + `None`)
 /// - `Clean(c)`     = serve as-is                (old `Some` + `None`)
 /// - `Dirty(c, k)`  = incremental re-render from message index `k`
-///                    (old `Some` + `Some(k)`)
+///   (old `Some` + `Some(k)`)
 ///
 /// Width mismatch (`c.width != content_width`) still forces a full rebuild
 /// regardless of Clean/Dirty — that check lives in `sync_cache`.
-/// `pub(crate)` until slice (f) seals the store.
 pub(crate) enum CacheState {
     Missing,
     Clean(LineCache),
@@ -152,29 +156,40 @@ impl CacheState {
 /// Slice (b′): content mutations + tool timers + invalidate family + the
 /// render cache. The invalidate family here mutates ONLY store
 /// state — redraw signaling (`needs_redraw`) stays on App via the thin
-/// delegating wrappers in app.rs. Fields are `pub(crate)` — sealing is
-/// slice (f).
+/// delegating wrappers in app.rs. All fields are private; access is
+/// exclusively through the method surface below.
 /// Slice (d): the cache tri-state became [`CacheState`]; the renderer
 /// (`render_message_lines`, render.rs) moved into this impl with
 /// [`RenderCtx`] threading; `sync_cache` folds in the draw.rs cache-sync
 /// block; `show_full_output` is store-owned (locked decision #1).
+///
+/// # Inline-mode accommodation (design §3.6)
+///
+/// The future `committed_upto: usize` field for inline-mode (Option C) will
+/// land entirely here. The change is: add the field, bound the cache-sync
+/// loops in `sync_cache` to `committed_upto..n` instead of `0..n`, add a
+/// `commit_through(idx) -> Vec<Line>` drain, and clamp `visible_window`'s
+/// scroll computation to the uncommitted tail. Because `per_msg` is already
+/// message-indexed and `visible_window` is the sole cache consumer, nothing
+/// outside this file changes — which is precisely why the P9 spike gates
+/// inline mode on this extraction.
 pub(crate) struct TranscriptStore {
-    pub(crate) messages: Vec<TimestampedMsg>,
+    messages: Vec<TimestampedMsg>,
 
     // ── Scroll state (moved in slice c) ──────────────────────────────────────
     /// Viewport offset from the bottom (0 = pinned to latest line).
-    pub(crate) scroll_back: u16,
+    scroll_back: u16,
     /// When `true`, viewport stays pinned to the bottom (auto-scroll).
     /// Cleared when the user scrolls up; restored when they reach bottom.
-    pub(crate) scroll_pinned: bool,
+    scroll_pinned: bool,
     /// Previous flat-line total — used to stabilise `scroll_back` when
     /// unpinned during streaming growth. See draw.rs §4 (growth-adjust block).
-    pub(crate) last_line_count: usize,
+    last_line_count: usize,
 
     // ── Render cache (moved in slice b′; enum shape since slice d) ───────────
     /// Cached wrapped+highlighted message lines + incremental watermark.
-    /// See [`CacheState`] for the lifecycle. `pub(crate)` until slice (f).
-    pub(crate) cache: CacheState,
+    /// See [`CacheState`] for the lifecycle.
+    cache: CacheState,
 
     // ── Render options (moved in slice d; locked decision #1) ────────────────
     /// Ctrl+O toggle: show full tool output instead of the truncated preview.
@@ -184,25 +199,25 @@ pub(crate) struct TranscriptStore {
 
     // ── Tool timing (moved in slice b′; locked decision #2) ──────────────────
     /// Tracks when the current tool started executing (for elapsed time display)
-    pub(crate) tool_start_time: Option<std::time::Instant>,
+    tool_start_time: Option<std::time::Instant>,
     /// Per-tool start times keyed by `tool_id`. Lets parallel tool calls
     /// each show their own elapsed-time on the result block, instead of
     /// sharing a single timer that the last-started tool clobbers.
-    pub(crate) tool_start_times: std::collections::HashMap<String, std::time::Instant>,
+    tool_start_times: std::collections::HashMap<String, std::time::Instant>,
 
     // ── Viewport geometry (moved in slice e) ─────────────────────────────────
     /// Inner content rect of the message area as of the last
     /// [`Self::visible_window`] call (was `App.msg_area_rect`; store-side name
     /// per design §1a, locked decision #4). `None` until the first render —
     /// `hit_test` returns `false` before that.
-    pub(crate) viewport: Option<ratatui::layout::Rect>,
+    viewport: Option<ratatui::layout::Rect>,
     /// Flat-cache index range visible in the viewport (was
     /// `App.visible_line_range`). Consumed only by `selected_text`.
-    pub(crate) visible_range: Option<(usize, usize)>,
+    visible_range: Option<(usize, usize)>,
 
     // ── Selection (moved in slice e; terminal coords in P9, content-relative in P10) ──
-    pub(crate) selection_anchor: Option<(u16, u16)>,
-    pub(crate) selection_end: Option<(u16, u16)>,
+    selection_anchor: Option<(u16, u16)>,
+    selection_end: Option<(u16, u16)>,
 }
 
 /// Everything `build_render_model` needs from the transcript, computed in one
@@ -973,6 +988,142 @@ impl TranscriptStore {
                 }
             }
         }
+    }
+
+    // ── Query surface (§3.4) ─────────────────────────────────────────────
+
+    /// Read-only slice of all messages. Use this for iteration and assertions;
+    /// mutation must go through the push/on_tool_*/append_or_update_* API.
+    pub(crate) fn messages(&self) -> &[TimestampedMsg] {
+        &self.messages
+    }
+
+    /// True when the transcript contains no messages.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Number of messages in the transcript.
+    ///
+    /// Part of the designed query surface (seam design §3.4) — no production
+    /// caller yet; P10 (selection/copy) and P11 (virtualization) consume it.
+    #[allow(dead_code)]
+    pub(crate) fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Clear all messages and fully invalidate the cache.
+    /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
+    pub(crate) fn clear(&mut self) {
+        self.messages.clear();
+        self.cache = CacheState::Missing;
+    }
+
+    /// Current scroll-back offset (0 = pinned to the latest line).
+    /// Named `scroll_back_pos` to avoid colliding with the private field
+    /// and the `scroll_back` field on [`VisibleWindow`].
+    /// Query surface (seam design §3.4) — P10/P11 consumers pending.
+    #[allow(dead_code)]
+    pub(crate) fn scroll_back_pos(&self) -> u16 {
+        self.scroll_back
+    }
+
+    /// Whether the viewport is pinned to the bottom (auto-scroll active).
+    /// Query surface (seam design §3.4) — P10/P11 consumers pending.
+    #[allow(dead_code)]
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.scroll_pinned
+    }
+
+    /// Returns the elapsed time since the current tool started, if one is active.
+    /// Used by render.rs (in `impl TranscriptStore`) to format elapsed displays —
+    /// must go through this accessor because render.rs is in a sibling module.
+    pub(crate) fn tool_start_time(&self) -> Option<std::time::Instant> {
+        self.tool_start_time
+    }
+
+    /// Returns the per-tool start time for `tool_id`, if present.
+    /// Query surface (seam design §3.4) — P10/P11 consumers pending.
+    #[allow(dead_code)]
+    pub(crate) fn tool_start_time_for(&self, tool_id: &str) -> Option<std::time::Instant> {
+        self.tool_start_times.get(tool_id).copied()
+    }
+
+    /// Returns the dirty watermark index if the cache is in the `Dirty` state.
+    /// `None` means either clean or missing. Tests use this to assert that
+    /// `invalidate_last`/`invalidate_from` set the correct watermark.
+    #[cfg(test)]
+    pub(crate) fn cache_dirty_from(&self) -> Option<usize> {
+        self.cache.dirty_from()
+    }
+
+    // ── Test-only seam (#[cfg(test)]) ────────────────────────────────────
+    //
+    // These methods give unit tests fine-grained control over internal state
+    // without leaking that surface to production callers. They are the only
+    // sanctioned back-doors through the sealed field boundary.
+
+    /// Set the cache to `Clean` with the given `LineCache`. Tests use this to
+    /// install a pre-built cache so they can assert incremental-rebuild logic
+    /// without going through `visible_window`.
+    #[cfg(test)]
+    pub(crate) fn test_set_cache_clean(&mut self, cache: LineCache) {
+        self.cache = CacheState::Clean(cache);
+    }
+
+    /// Set the cache to `Dirty(cache, watermark)`. Used by tests that simulate
+    /// the `invalidate_from` path without calling `visible_window`.
+    #[cfg(test)]
+    pub(crate) fn test_set_cache_dirty(&mut self, cache: LineCache, from: usize) {
+        self.cache = CacheState::Dirty(cache, from);
+    }
+
+    /// Consume and return the current `CacheState`, replacing it with `Missing`.
+    /// Tests use this to implement incremental-rebuild helpers inline.
+    #[cfg(test)]
+    pub(crate) fn test_take_cache(&mut self) -> CacheState {
+        std::mem::replace(&mut self.cache, CacheState::Missing)
+    }
+
+    /// Put a `CacheState` back after a test manipulation.
+    #[cfg(test)]
+    pub(crate) fn test_put_cache(&mut self, cs: CacheState) {
+        self.cache = cs;
+    }
+
+    /// Mutable access to the last message for test-side content updates
+    /// (e.g. simulating a streaming delta that `append_or_update_text` would
+    /// do through the real API in production).
+    #[cfg(test)]
+    pub(crate) fn test_last_msg_mut(&mut self) -> Option<&mut TimestampedMsg> {
+        self.messages.last_mut()
+    }
+
+    /// Insert a `TimestampedMsg` at `idx` for structural tests.
+    #[cfg(test)]
+    pub(crate) fn test_insert_at(&mut self, idx: usize, msg: TimestampedMsg) {
+        self.messages.insert(idx, msg);
+    }
+
+    /// Set `tool_start_time` for tests that exercise the spinner / elapsed path.
+    #[cfg(test)]
+    pub(crate) fn test_set_tool_start_time(&mut self, t: Option<std::time::Instant>) {
+        self.tool_start_time = t;
+    }
+
+    /// Insert a per-tool start-time entry for tests that exercise parallel-tool
+    /// elapsed rendering.
+    #[cfg(test)]
+    pub(crate) fn test_insert_tool_start_time(&mut self, id: String, t: std::time::Instant) {
+        self.tool_start_times.insert(id, t);
+    }
+
+    /// Directly set `scroll_back` for scroll unit tests that need to start from
+    /// a known offset without going through `scroll_up`.
+    #[cfg(test)]
+    pub(crate) fn test_set_scroll_back(&mut self, v: u16) {
+        self.scroll_back = v;
+        self.scroll_pinned = v == 0;
     }
 }
 

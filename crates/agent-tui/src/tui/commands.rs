@@ -371,7 +371,7 @@ pub(super) async fn handle_command(
     match cmd {
         "clear" => {
             app.save_session().await;
-            app.transcript.messages.clear();
+            app.transcript.clear();
             app.invalidate();
             app.api_messages.clear();
             app.total_input_tokens = 0;
@@ -492,7 +492,7 @@ pub(super) async fn handle_command(
                         }
                         app.save_session().await;
                         let old_id = app.session.id.clone();
-                        app.transcript.messages.clear();
+                        app.transcript.clear();
                         app.invalidate();
                         app.api_messages = session.api_messages.clone();
                         app.total_input_tokens = session.total_input_tokens;
@@ -916,7 +916,7 @@ pub(crate) fn build_stats_receipt(app: &App, runtime: &Runtime) -> String {
         }
     };
     // Count user/assistant exchanges (each user msg is one turn).
-    let turn_count = app.transcript.messages.iter().filter(|m| matches!(m.msg, ChatMessage::User(_))).count();
+    let turn_count = app.transcript.messages().iter().filter(|m| matches!(m.msg, ChatMessage::User(_))).count();
 
     // ── Token totals ──────────────────────────────────────────────────────
     let input   = app.total_input_tokens;
@@ -1140,7 +1140,7 @@ mod tests {
             &runtime,
         ).await;
 
-        let last = app.transcript.messages.last().expect("system message should be pushed");
+        let last = app.transcript.messages().last().expect("system message should be pushed");
         match &last.msg {
             crate::tui::app::ChatMessage::System(text) => {
                 assert!(text.contains("plugin command /policy:echo exited with 0"), "{text}");
@@ -1208,7 +1208,7 @@ mod tests {
 
         execute_interactive_plugin_command_events(&command, "models", &manager, &mut app).await;
 
-        assert!(app.transcript.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))));
+        assert!(app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Text(text) if text.contains("hello from demo"))));
         assert!(app.active_tasks.get("demo-task").is_some());
         assert!(app.active_tasks.get("demo-task").unwrap().done);
         manager.shutdown_all().await;
@@ -1616,7 +1616,7 @@ mod tests {
         )
         .await;
         // No "no plugin owns /capture" error pushed — lifecycle path won.
-        let pushed_legacy_error = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("no plugin owns /capture")));
+        let pushed_legacy_error = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("no plugin owns /capture")));
         assert!(!pushed_legacy_error);
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
     }
@@ -1642,7 +1642,7 @@ mod tests {
         )
         .await;
         assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /capture subcommand")));
+        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /capture subcommand")));
         assert!(pushed);
     }
 
@@ -1673,7 +1673,7 @@ mod tests {
     async fn sidecar_toggle_works_when_zero_claims_loaded() {
         let (action, app) = invoke_sidecar_with_plugins("toggle", vec![]).await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
+        let pushed_err = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for zero-claim back-compat");
     }
 
@@ -1684,7 +1684,7 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ).await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_hint = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::System(s) if s.contains("try /capture toggle")));
+        let pushed_hint = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::System(s) if s.contains("try /capture toggle")));
         assert!(pushed_hint, "expected a System hint mentioning `try /capture toggle`");
     }
 
@@ -1698,7 +1698,7 @@ mod tests {
             ],
         ).await;
         assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages.iter().find_map(|m| match &m.msg {
+        let pushed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             crate::tui::app::ChatMessage::Error(s) => Some(s.clone()),
             _ => None,
         });
@@ -1719,7 +1719,7 @@ mod tests {
             ],
         ).await;
         assert!(matches!(action, CommandAction::SidecarToggle { .. }));
-        let pushed_err = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
+        let pushed_err = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(_)));
         assert!(!pushed_err, "no errors expected for valid qualified form");
     }
 
@@ -1730,7 +1730,7 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ).await;
         assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
+        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown sidecar plugin")));
         assert!(pushed, "expected `unknown sidecar plugin` error");
     }
 
@@ -1750,7 +1750,7 @@ mod tests {
             vec![lifecycle_plugin("sample-sidecar", "capture")],
         ).await;
         assert!(matches!(action, CommandAction::None));
-        let pushed = app.transcript.messages.iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
+        let pushed = app.transcript.messages().iter().any(|m| matches!(&m.msg, crate::tui::app::ChatMessage::Error(s) if s.contains("unknown /sidecar subcommand")));
         assert!(pushed, "expected `unknown /sidecar subcommand` error");
     }
 

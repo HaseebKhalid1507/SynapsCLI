@@ -3,16 +3,14 @@ use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 use super::text_metrics::char_width;
 
-// Types moved to transcript.rs (P9 slice a). Re-exported here so no import
-// churn happens in other modules this slice.
+// Type re-export shims from slice (a). Kept this release — deleting is churn
+// for no gain. One-release grace per design §5(f).
+// TODO(P9-followup): drop re-exports; callers should import from transcript directly.
 pub(crate) use super::transcript::{ChatMessage, TranscriptStore, THINKING_PLACEHOLDER};
-// Test-only re-exports after slice (d): production code reaches the cache via
-// store methods (sync_cache / line_cache); only the ported cache tests still
-// name these types directly.
+// Test-only re-exports: production code reaches the cache via store methods;
+// only ported cache tests name these types directly.
 #[allow(unused_imports)]
 pub(crate) use super::transcript::{CacheState, LineCache, RenderCtx};
-// Shim kept from slice (a) so `app::TimestampedMsg` paths stay valid — only
-// test code references it after slice (b′) moved the mutation bodies out.
 #[allow(unused_imports)]
 pub(crate) use super::transcript::TimestampedMsg;
 
@@ -392,14 +390,6 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// No external call sites today (the store routes internally) — kept per
-    /// locked decision #3 (identical wrapper surface); slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
-        self.transcript.push_tool_result(tool_id, content, elapsed_ms);
-        self.needs_redraw = true;
-    }
-
     /// Delegates to [`TranscriptStore::cap_resumed_display`]. Note: does not
     /// signal a redraw — verbatim-preserves the pre-move behavior (the method
     /// never invalidated; it runs at resume before any cache exists).
@@ -413,15 +403,6 @@ impl App {
     /// streaming deltas prefer `invalidate_last()` which is O(1).
     pub(crate) fn invalidate(&mut self) {
         self.transcript.invalidate();
-        self.needs_redraw = true;
-    }
-
-    /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
-    /// Coalesces with any existing dirty_from by taking the minimum.
-    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn invalidate_from(&mut self, idx: usize) {
-        self.transcript.invalidate_from(idx);
         self.needs_redraw = true;
     }
 
@@ -473,48 +454,10 @@ impl App {
         false
     }
 
-    /// Delegates to [`TranscriptStore::is_active_tool_result`].
-    /// No production call sites after slice (d) moved the renderer into the
-    /// store — kept per locked decision #3; slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
-        self.transcript.is_active_tool_result(idx)
-    }
-
-    /// Delegates to [`TranscriptStore::find_preceding_read_extension`].
-    /// No production call sites after slice (d) — kept per locked decision #3;
-    /// slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
-        self.transcript.find_preceding_read_extension(idx)
-    }
-
-    /// Delegates to [`TranscriptStore::find_preceding_tool_name`].
-    /// No production call sites after slice (d) — kept per locked decision #3;
-    /// slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
-        self.transcript.find_preceding_tool_name(idx)
-    }
-
     // ── Tool-event routing ──────────────────────────────────────────────
     //
     // Routing logic lives in TranscriptStore (transcript.rs) since slice (b′);
     // these are signature-identical delegates.
-
-    /// Delegates to [`TranscriptStore::find_tool_use_start_idx`].
-    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
-        self.transcript.find_tool_use_start_idx(tool_id)
-    }
-
-    /// Delegates to [`TranscriptStore::find_tool_result_idx`].
-    /// No external call sites today — kept per locked decision #3; slice (f) prunes.
-    #[allow(dead_code)]
-    pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
-        self.transcript.find_tool_result_idx(tool_id)
-    }
 
     /// Delegates to [`TranscriptStore::on_tool_use_start`].
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
@@ -553,7 +496,7 @@ impl App {
         let mut parts: Vec<String> = Vec::new();
 
         // Walk backwards from the end to find content since last user message
-        for tmsg in self.transcript.messages.iter().rev() {
+        for tmsg in self.transcript.messages().iter().rev() {
             match &tmsg.msg {
                 ChatMessage::User(_) => break, // stop at the last user message
                 ChatMessage::Thinking(t)
@@ -755,7 +698,7 @@ mod tests {
         assert!(app.transcript.uses_spinner(), "placeholder should animate while present");
         app.append_or_update_text("here is the answer");
         assert!(
-            !matches!(app.transcript.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            !matches!(app.transcript.messages().last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
             "empty thinking must be gone once text arrives"
         );
         assert!(!app.transcript.uses_spinner(), "spinner must stop after agent moves on");
@@ -765,7 +708,7 @@ mod tests {
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
         app.on_tool_use_start("t1".to_string(), "bash".to_string());
         let thinking_count = app
-            .transcript.messages
+            .transcript.messages()
             .iter()
             .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
             .count();
@@ -778,7 +721,7 @@ mod tests {
         app.append_or_update_thinking("actually reasoning");
         app.append_or_update_text("done");
         assert!(
-            app.transcript.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
             "non-empty thinking must survive and not keep the … prefix"
         );
     }
@@ -795,7 +738,7 @@ mod tests {
             app.on_tool_result(id.to_string(), format!("out-{id}"));
         }
         let seq: Vec<(String, bool)> = app
-            .transcript.messages
+            .transcript.messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
@@ -869,11 +812,11 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.transcript.tool_start_time = Some(std::time::Instant::now());
-        app.transcript.tool_start_times.insert("call_2".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
+        app.transcript.test_insert_tool_start_time("call_2".to_string(), std::time::Instant::now());
 
-        assert!(!app.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
-        assert!(app.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
+        assert!(!app.transcript.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
+        assert!(app.transcript.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
 
         // Bonus: with BOTH in-flight (parallel), BOTH must be active
         let mut app2 = test_app();
@@ -897,11 +840,11 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.transcript.tool_start_time = Some(std::time::Instant::now());
-        app2.transcript.tool_start_times.insert("p1".to_string(), std::time::Instant::now());
-        app2.transcript.tool_start_times.insert("p2".to_string(), std::time::Instant::now());
-        assert!(app2.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
-        assert!(app2.is_active_tool_result(3), "parallel in-flight p2 last must be active");
+        app2.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
+        app2.transcript.test_insert_tool_start_time("p1".to_string(), std::time::Instant::now());
+        app2.transcript.test_insert_tool_start_time("p2".to_string(), std::time::Instant::now());
+        assert!(app2.transcript.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
+        assert!(app2.transcript.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
 
     #[test]
@@ -917,21 +860,21 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.transcript.tool_start_time = Some(std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
 
-        assert!(!app.is_active_tool_result(1));
+        assert!(!app.transcript.is_active_tool_result(1));
     }
 
     #[test]
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.transcript.cache = CacheState::Clean({
+        {
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
+            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+        }
         app.subagents.push(SubagentState {
             id: 1,
             name: "tester".to_string(),
@@ -962,14 +905,14 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.transcript.tool_start_time = Some(std::time::Instant::now());
-        app.transcript.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.transcript.cache = CacheState::Clean({
+        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
+        app.transcript.test_insert_tool_start_time("call_1".to_string(), std::time::Instant::now());
+        {
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
+            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+        }
         app.spinner_frame = 2;
 
         let invalidate_messages = app.advance_animations();
@@ -990,12 +933,12 @@ mod tests {
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
 
         // Build full cache first (Clean = old Some + dirty_from None)
-        app.transcript.cache = CacheState::Clean({
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
+        {
+            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
             let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
-        let last = app.transcript.messages.len() - 1;
+            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+        }
+        let last = app.transcript.message_count() - 1;
 
         // Snapshot per_msg[0..last]
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
@@ -1013,24 +956,29 @@ mod tests {
         // But first assert dirty_from is still None (advance_animations doesn't set it).
         // Then we call invalidate_last() as the updated caller will.
         app.invalidate_last();
-        assert_eq!(app.transcript.cache.dirty_from(), Some(last), "dirty watermark must point to tail message only");
+        assert_eq!(app.transcript.cache_dirty_from(), Some(last), "dirty watermark must point to tail message only");
 
         // Simulate draw.rs incremental rebuild
         {
-            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.transcript.messages.len())
+            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.transcript.message_count())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
-            let cache = app.transcript.cache.line_cache_mut().unwrap();
-            for (offset, rendered) in fresh.into_iter().enumerate() {
-                cache.per_msg[last + offset] = rendered;
+            let mut cs = app.transcript.test_take_cache();
+            if let CacheState::Dirty(ref mut cache, _) = cs {
+                for (offset, rendered) in fresh.into_iter().enumerate() {
+                    cache.per_msg[last + offset] = rendered;
+                }
+                let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.len()).sum();
+                cache.flat.truncate(prefix_len);
+                for slot in &cache.per_msg[last..] {
+                    cache.flat.extend(slot.iter().cloned());
+                }
             }
-            let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.len()).sum();
-            cache.flat.truncate(prefix_len);
-            for slot in &cache.per_msg[last..] {
-                cache.flat.extend(slot.iter().cloned());
+            // mark clean
+            if let CacheState::Dirty(cache, _) = cs {
+                app.transcript.test_set_cache_clean(cache);
             }
         }
-        app.transcript.cache.mark_clean();
 
         // per_msg[0..last] must be unchanged
         let after: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
@@ -1111,7 +1059,7 @@ mod tests {
     // ── Parallel tool-event routing (Bug 2 regression coverage) ─────────
 
     fn last_tool_use(app: &App, tool_id: &str) -> Option<(String, String)> {
-        app.transcript.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUse { tool_id: tid, tool_name, input } if tid == tool_id => {
                 Some((tool_name.clone(), input.clone()))
             }
@@ -1120,7 +1068,7 @@ mod tests {
     }
 
     fn tool_use_start_partial(app: &App, tool_id: &str) -> Option<String> {
-        app.transcript.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUseStart { tool_id: tid, partial_input, .. } if tid == tool_id => {
                 Some(partial_input.clone())
             }
@@ -1129,7 +1077,7 @@ mod tests {
     }
 
     fn tool_result_content(app: &App, tool_id: &str) -> Option<String> {
-        app.transcript.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id: tid, content, .. } if tid == tool_id => {
                 Some(content.clone())
             }
@@ -1187,7 +1135,7 @@ mod tests {
 
         // Both are now ToolUse, no lingering ToolUseStart.
         let lingering_starts = app
-            .transcript.messages
+            .transcript.messages()
             .iter()
             .filter(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
             .count();
@@ -1206,7 +1154,7 @@ mod tests {
 
         // On-screen order matches call order (call_a appears before call_b).
         let positions: Vec<&str> = app
-            .transcript.messages
+            .transcript.messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some(tool_id.as_str()),
@@ -1298,11 +1246,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         app.on_tool_result("call_b".to_string(), "b".to_string());
 
-        let a_elapsed = app.transcript.messages.iter().find_map(|m| match &m.msg {
+        let a_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_a" => *elapsed_ms,
             _ => None,
         });
-        let b_elapsed = app.transcript.messages.iter().find_map(|m| match &m.msg {
+        let b_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_b" => *elapsed_ms,
             _ => None,
         });
@@ -1325,7 +1273,7 @@ mod tests {
         app.append_or_update_text("answer");
         // The Thinking block must survive with "…" content, not be dropped
         assert!(
-            app.transcript.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
             "real ellipsis thinking content must survive — sentinel and real output are distinct"
         );
     }
@@ -1340,7 +1288,7 @@ mod tests {
         app.push_msg(ChatMessage::System("retrying…".to_string()));
         // Now trigger the drop (e.g. text arrives / turn ends)
         app.drop_empty_thinking();
-        let has_placeholder = app.transcript.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "placeholder stranded under a System message must be removed by drop_empty_thinking");
@@ -1354,7 +1302,7 @@ mod tests {
         // Simulate what the abort handler does: drop + push error
         app.drop_empty_thinking();
         app.push_msg(ChatMessage::Error("aborted".to_string()));
-        let has_placeholder = app.transcript.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
@@ -1379,7 +1327,7 @@ mod tests {
 
         let w = 80;
         let flat = app.render_lines(w);
-        let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.messages.len())
+        let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.message_count())
             .flat_map(|i| app.render_message_lines(i, w))
             .collect();
 
@@ -1413,7 +1361,7 @@ mod tests {
         let expected_flat = app.render_lines(w);
 
         // Build a LineCache manually using the new struct
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, w))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1429,7 +1377,7 @@ mod tests {
 
     /// Helper: builds a LineCache for an app at a given width, simulating what draw.rs does.
     fn build_cache(app: &App, width: usize) -> LineCache {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
@@ -1439,17 +1387,17 @@ mod tests {
     /// Helper: simulate the incremental rebuild from sync_cache (slice 3 logic,
     /// ported to CacheState in slice d).
     fn rebuild_incremental(app: &mut App, width: usize) {
-        match std::mem::replace(&mut app.transcript.cache, CacheState::Missing) {
+        match app.transcript.test_take_cache() {
             CacheState::Dirty(mut cache, k) if cache.width == width => {
                 // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
-                if cache.per_msg.len() != app.transcript.messages.len() {
+                if cache.per_msg.len() != app.transcript.message_count() {
                     cache.per_msg.truncate(k);
-                    for i in k..app.transcript.messages.len() {
+                    for i in k..app.transcript.message_count() {
                         cache.per_msg.push(app.render_message_lines(i, width));
                     }
                 } else {
                     // In-place partial re-render: only messages[k..]
-                    for i in k..app.transcript.messages.len() {
+                    for i in k..app.transcript.message_count() {
                         cache.per_msg[i] = app.render_message_lines(i, width);
                     }
                 }
@@ -1459,14 +1407,15 @@ mod tests {
                 for slot in &cache.per_msg[k..] {
                     cache.flat.extend(slot.iter().cloned());
                 }
-                app.transcript.cache = CacheState::Clean(cache);
+                app.transcript.test_set_cache_clean(cache);
             }
             CacheState::Clean(cache) if cache.width == width => {
                 // Clean at the right width — nothing to do (old dirty_from == None path).
-                app.transcript.cache = CacheState::Clean(cache);
+                app.transcript.test_set_cache_clean(cache);
             }
             _ => {
-                app.transcript.cache = CacheState::Clean(build_cache(app, width));
+                let c = build_cache(app, width);
+                app.transcript.test_set_cache_clean(c);
             }
         }
     }
@@ -1481,9 +1430,9 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial answer".to_string()));
 
         // Full build
-        app.transcript.cache = CacheState::Clean(build_cache(&app, w));
+        app.transcript.test_set_cache_clean(build_cache(&app, w));
 
-        let last = app.transcript.messages.len() - 1; // index of Text message
+        let last = app.transcript.message_count() - 1; // index of Text message
 
         // Snapshot per_msg[0..last] content strings (before update)
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
@@ -1492,10 +1441,10 @@ mod tests {
             .collect();
 
         // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
-        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.messages.last_mut() {
+        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.test_last_msg_mut() {
             t.push_str(" — more content appended");
         }
-        app.transcript.invalidate_from(last); // invalidate_last equivalent
+        app.transcript.invalidate_from(last); // invalidate_last equivalent (direct store call)
 
         // Incremental rebuild
         rebuild_incremental(&mut app, w);
@@ -1536,11 +1485,11 @@ mod tests {
             input: r#"{"command":"ls"}"#.to_string(),
         });
 
-        app.transcript.cache = CacheState::Clean(build_cache(&app, w));
+        app.transcript.test_set_cache_clean(build_cache(&app, w));
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
-        app.transcript.messages.insert(at, crate::tui::app::TimestampedMsg {
+        app.transcript.test_insert_at(at, crate::tui::app::TimestampedMsg {
             msg: ChatMessage::ToolResult {
                 tool_id: "t1".to_string(),
                 content: "file.txt".to_string(),
@@ -1554,7 +1503,7 @@ mod tests {
         rebuild_incremental(&mut app, w);
 
         let cache = app.transcript.line_cache().unwrap();
-        assert_eq!(cache.per_msg.len(), app.transcript.messages.len(), "per_msg must track messages after insert");
+        assert_eq!(cache.per_msg.len(), app.transcript.message_count(), "per_msg must track messages after insert");
 
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {

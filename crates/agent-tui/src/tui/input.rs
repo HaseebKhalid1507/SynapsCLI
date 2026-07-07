@@ -493,7 +493,7 @@ fn handle_key(
 
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
-    if app.transcript.messages.is_empty() {
+    if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
     let input = app.input.clone();
@@ -659,9 +659,9 @@ mod tests {
     #[test]
     fn scroll_up_uses_configured_step() {
         let mut app = make_app();
-        app.transcript.scroll_back = 0;
+        app.transcript.test_set_scroll_back(0);
         handle_mouse(scroll_event(MouseEventKind::ScrollUp), &mut app, 5);
-        assert_eq!(app.transcript.scroll_back, 5, "scroll_back should be 5 with scroll_lines=5");
+        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should be 5 with scroll_lines=5");
     }
 
     /// When scroll_lines=5 is configured, one ScrollDown event must subtract 5
@@ -669,9 +669,9 @@ mod tests {
     #[test]
     fn scroll_down_uses_configured_step() {
         let mut app = make_app();
-        app.transcript.scroll_back = 10;
+        app.transcript.test_set_scroll_back(10);
         handle_mouse(scroll_event(MouseEventKind::ScrollDown), &mut app, 5);
-        assert_eq!(app.transcript.scroll_back, 5, "scroll_back should decrease by 5");
+        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should decrease by 5");
     }
 
     /// When scroll_lines is absent (None) the caller passes the default of 3.

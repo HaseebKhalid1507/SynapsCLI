@@ -95,7 +95,7 @@ impl TranscriptStore {
         let mut lines: Vec<Line> = Vec::new();
         let m = "   "; // margin
 
-        let tmsg = &self.messages[idx];
+        let tmsg = &self.messages()[idx];
         let i = idx;
         let ts = &tmsg.time;
         match &tmsg.msg {
@@ -134,7 +134,7 @@ impl TranscriptStore {
             ChatMessage::Thinking(text) => {
                 // Only add spacing if previous message wasn't a User block
                 // (User blocks already have bottom margin)
-                let prev_was_user = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::User(_));
+                let prev_was_user = i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::User(_));
                 if !prev_was_user {
                     lines.push(Line::from(""));
                 }
@@ -214,7 +214,7 @@ impl TranscriptStore {
             ChatMessage::Text(text) => {
                 // Separator between user block and agent response
                 // After thinking: just a single blank line (no separator)
-                let prev_was_thinking = i > 0 && matches!(&self.messages[i - 1].msg, ChatMessage::Thinking(_));
+                let prev_was_thinking = i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
                 if prev_was_thinking {
                     lines.push(Line::from(""));
                 } else if i > 0 {
@@ -238,7 +238,7 @@ impl TranscriptStore {
                 let ts_str = format!("{} ", ts);
                 let gap = width.saturating_sub(label.chars().count() + ts_str.chars().count());
                 // Pulse the agent label when streaming (same sin-wave as header dot)
-                let label_color = if ctx.streaming && i == self.messages.len() - 1 {
+                let label_color = if ctx.streaming && i == self.messages().len() - 1 {
                     let pulse = ((ctx.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
                     if let Color::Rgb(r, g, b) = THEME.load().claude_label {
                         Color::Rgb(
@@ -286,7 +286,7 @@ impl TranscriptStore {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // Show elapsed time while tool is running
-                let elapsed_str = if let Some(start) = self.tool_start_time {
+                let elapsed_str = if let Some(start) = self.tool_start_time() {
                     let secs = start.elapsed().as_secs_f64();
                     if secs >= 1.0 {
                         format!(" {:.1}s", secs)
@@ -367,9 +367,9 @@ impl TranscriptStore {
                     header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
                 }
                 // If this is the last message and a tool is executing, show animation
-                let is_last = i == self.messages.len() - 1;
-                if is_last && self.tool_start_time.is_some() {
-                    let elapsed_str = if let Some(start) = self.tool_start_time {
+                let is_last = i == self.messages().len() - 1;
+                if is_last && self.tool_start_time().is_some() {
+                    let elapsed_str = if let Some(start) = self.tool_start_time() {
                         let secs = start.elapsed().as_secs_f64();
                         if secs >= 1.0 { format!(" {:.1}s", secs) }
                         else { format!(" {}ms", (secs * 1000.0) as u64) }
@@ -568,7 +568,7 @@ impl TranscriptStore {
                 } else if !is_error && show > 0 {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
-                        let elapsed_str = if let Some(start) = self.tool_start_time {
+                        let elapsed_str = if let Some(start) = self.tool_start_time() {
                             let secs = start.elapsed().as_secs_f64();
                             if secs >= 1.0 { format!(" {:.1}s", secs) }
                             else { format!(" {}ms", (secs * 1000.0) as u64) }
@@ -653,7 +653,7 @@ impl TranscriptStore {
 
             ChatMessage::System(msg) => {
                 if should_separate_system_messages(
-                    self.messages.get(i.saturating_sub(1)).map(|msg| &msg.msg),
+                    self.messages().get(i.saturating_sub(1)).map(|msg| &msg.msg),
                     &tmsg.msg,
                 ) {
                     lines.push(Line::from(""));
@@ -721,7 +721,7 @@ impl TranscriptStore {
     #[cfg(test)]
     pub(crate) fn render_lines(&self, width: usize, ctx: &RenderCtx<'_>) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for i in 0..self.messages.len() {
+        for i in 0..self.messages().len() {
             lines.extend(self.render_message_lines(i, width, ctx));
         }
         lines

@@ -122,7 +122,7 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
 }
 
 pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
-    app.transcript.messages.clear();
+    app.transcript.clear();
     for msg in api_messages {
         // Skip compaction summary messages — internal context, not user-visible
         if let Some(content) = msg["content"].as_str() {
@@ -198,13 +198,13 @@ mod tests {
     /// mark it Clean (old "dirty_from = None"). This simulates the state right
     /// after a successful draw — the renderer believes the cache is valid.
     fn prime_clean_cache(app: &mut App, width: usize) {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.messages.len())
+        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
         let flat: Vec<ratatui::text::Line<'static>> =
             per_msg.iter().flatten().cloned().collect();
         // Clean — renderer thinks nothing changed
-        app.transcript.cache = CacheState::Clean(LineCache { width, per_msg, flat });
+        app.transcript.test_set_cache_clean(LineCache { width, per_msg, flat });
     }
 
     // -------------------------------------------------------------------------
@@ -231,7 +231,7 @@ mod tests {
 
         // Sanity: cache is primed and marked clean.
         assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
-        assert!(app.transcript.cache.dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
 
         // Trigger: rebuild with an empty message list — the exact bug trigger.
         // Zero push_msg calls happen → without the fix, no invalidation occurs.
@@ -258,7 +258,7 @@ mod tests {
         prime_clean_cache(&mut app, 80);
 
         assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
-        assert!(app.transcript.cache.dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
 
         // Every entry is filtered out by rebuild_display_messages.
         let api_messages = vec![
