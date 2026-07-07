@@ -528,8 +528,15 @@ impl TranscriptStore {
                 // just preserved: the re-render from `at` writes identical
                 // content into the shifted slots.
                 self.selection_remap_insert(at);
-                // Insert mid-list — watermark at `at` so draw re-renders from insert point.
-                self.invalidate_watermark(at);
+                // Insert mid-list — watermark at the matched ToolUse index
+                // `i`, not the insert point `at` (lock L2): the arriving
+                // result flips the use's "⠋ running…" header to done, and
+                // with the tool-delta full invalidates narrowed this is the
+                // only thing left that repaints it. Same watermark-only seam
+                // (selection handled by the remap above — the re-render
+                // writes identical content rows into the shifted slots; the
+                // use's own change is header chrome, not content).
+                self.invalidate_watermark(i);
             }
             None => self.push_msg(msg),
         }
@@ -1293,7 +1300,12 @@ impl TranscriptStore {
         if let Some(idx) = target_idx {
             if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.messages[idx].msg {
                 partial_input.push_str(delta);
-                self.invalidate();
+                // P11 narrowing (design §1.3 prerequisite): the delta only
+                // changes messages[idx..] (idx itself, plus any later message
+                // whose render reads back to it — covered by the k..n
+                // re-render window, lock L1). A full invalidate here cost an
+                // O(total) rebuild PER DELTA during tool streaming.
+                self.invalidate_from(idx);
             }
         }
     }
@@ -1312,7 +1324,14 @@ impl TranscriptStore {
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
             self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
-            self.invalidate();
+            // P11 narrowing + lock L2: idx IS the matched use index, so
+            // dirtying from idx covers the stale-header trap directly. The
+            // in-place ToolUseStart→ToolUse swap can also change the render
+            // MODE of a matching ToolResult at any later index
+            // (find_preceding_read_extension matches ToolUse only, not
+            // ToolUseStart) — covered because the k..n re-render window
+            // (lock L1) re-renders everything at idx.. on the next frame.
+            self.invalidate_from(idx);
             return;
         }
         // No matching start (e.g. provider only emits finalized blocks) —
@@ -1327,7 +1346,10 @@ impl TranscriptStore {
             if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
                 if elapsed_ms.is_none() {
                     content.push_str(&delta);
-                    self.invalidate();
+                    // P11 narrowing: output deltas change messages[idx..]
+                    // only — the matched ToolUse's running header is keyed
+                    // on the tool-timer maps, which this path doesn't touch.
+                    self.invalidate_from(idx);
                     return;
                 }
             }
@@ -1349,6 +1371,23 @@ impl TranscriptStore {
             self.tool_start_time = None;
         }
 
+        // Lock L2 — the stale-header trap: stamping elapsed_ms (and dropping
+        // the tool timer above) flips the matched ToolUse's header from
+        // "⠋ running…" to done. The full invalidate this path used to issue
+        // repainted it by accident; narrowed, we must dirty
+        // min(use_idx, result_idx) explicitly or the header freezes at
+        // "running" forever. Resolved by tool_id before the replace below.
+        let use_idx = if tool_id.is_empty() {
+            None
+        } else {
+            self.messages.iter().position(|m| matches!(
+                &m.msg,
+                ChatMessage::ToolUse { tool_id: tid, .. }
+                | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                    if tid == &tool_id
+            ))
+        };
+
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
             if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
                 if elapsed_ms.is_none() {
@@ -1358,7 +1397,7 @@ impl TranscriptStore {
                         content: std::mem::take(content),
                         elapsed_ms: elapsed,
                     };
-                    self.invalidate();
+                    self.invalidate_from(use_idx.map_or(idx, |u| u.min(idx)));
                     return;
                 }
             }
