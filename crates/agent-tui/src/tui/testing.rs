@@ -354,6 +354,40 @@ impl TestHarness {
         self.app.transcript.is_pinned()
     }
 
+    // ── P11 perf-pin surface (design §5.2 / lock L4) ─────────────────────────
+
+    /// Message renders since the last [`Self::reset_perf_probe`] — one count
+    /// per `render_message_lines` call (measure == render under P11).
+    pub fn render_count(&self) -> usize {
+        self.app.transcript.probe_render_count()
+    }
+
+    /// Cumulative-offset entries written since the last
+    /// [`Self::reset_perf_probe`]. Zero on a Clean frame is the lock-L4
+    /// "cum-height lookup is cached, no O(n) re-sum per frame" invariant.
+    pub fn cum_height_writes(&self) -> usize {
+        self.app.transcript.probe_cum_write_count()
+    }
+
+    /// Zero the perf counters — call after warm-up, before the measured frame.
+    pub fn reset_perf_probe(&self) {
+        self.app.transcript.probe_reset()
+    }
+
+    /// Begin a streaming tool call — drives the store's real
+    /// `on_tool_use_start` routing, exactly as the stream handler does.
+    pub fn tool_use_start(&mut self, tool_id: &str, tool_name: &str) -> &mut Self {
+        self.app.on_tool_use_start(tool_id.to_string(), tool_name.to_string());
+        self
+    }
+
+    /// Stream a tool-input delta into the matching `ToolUseStart` block —
+    /// the P11 perf pins measure the render cost of exactly this path.
+    pub fn tool_use_delta(&mut self, tool_id: &str, delta: &str) -> &mut Self {
+        self.app.on_tool_use_delta(tool_id, delta);
+        self
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     fn record(&mut self, action: InputAction) {

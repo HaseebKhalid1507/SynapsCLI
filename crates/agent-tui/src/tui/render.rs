@@ -213,6 +213,10 @@ impl TranscriptStore {
     /// Ephemeral App state (spinner frame, streaming flag, agent name) crosses
     /// the seam via `ctx` — see [`RenderCtx`].
     pub(crate) fn render_message_lines(&self, idx: usize, width: usize, ctx: &RenderCtx<'_>) -> MsgEntry {
+        // P11 perf probe (§5.2 / lock L4): measurement IS the render, so
+        // counting calls here counts both. Compiled out of production.
+        #[cfg(any(test, feature = "testing"))]
+        self.probe_note_render();
         let mut lines = LineSink::default();
         let m = "   "; // margin
 

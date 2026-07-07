@@ -1109,3 +1109,104 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
     );
     assert_eq!(h.render().area().width, 80, "phase3: terminal width must be 80 after resize-back");
 }
+
+// ── P11 perf pins (design §5.2, DECISION LOCK L4) ────────────────────────────
+//
+// Count-based, deterministic — no wall-clock in CI. The probe is the store's
+// test-only `PerfProbe` (transcript.rs): `render_count()` bumps once per
+// `render_message_lines` call (measurement IS the render under P11), and
+// `cum_height_writes()` bumps once per cumulative-offset entry written.
+//
+// Landed `#[ignore]`d BEFORE the build per the P9/P10 pin-first pattern; the
+// perf-gate slice (design §6 (e)) flips them on. Two of the three fail loudly
+// against pre-P11 code (the tool-delta path full-invalidates → renders all
+// n=1000; cum_heights doesn't exist yet so its counter is trivially 0).
+//
+// Workload note: 1000 messages deliberately bypasses `cap_resumed_display` —
+// the cap only runs on the resume path (helpers.rs:176); a live session
+// accretes uncapped. The 1000-msg numbers prove the machinery (design §5.1).
+
+/// L4 pin 1 — steady frame: a second render with no mutation in between must
+/// render ZERO messages (Clean cache path) at n=1000.
+#[test]
+#[ignore = "P11: activates at perf gate"]
+fn perf_1000_msgs_steady_frame_renders_zero() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+    for i in 0..1000 {
+        h.push_system_message(&format!("perf seed msg {i:04}"));
+    }
+    h.render(); // warm-up: Missing → full measure (O(total), allowed once)
+    h.reset_perf_probe();
+    h.render();
+    assert_eq!(
+        h.render_count(),
+        0,
+        "steady frame at n=1000 must render 0 messages (Clean-cache path) — \
+         any nonzero count means a frame-time re-render leak"
+    );
+}
+
+/// L4 pin 2 — tool-input streaming: one `input_json` delta at n=1000 must
+/// re-render at most 2 messages on the next frame (watermark k..n where the
+/// delta dirties the tail — NOT a full O(total) rebuild).
+#[test]
+#[ignore = "P11: activates at perf gate"]
+fn perf_1000_msgs_stream_delta_renders_le_2() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+    for i in 0..999 {
+        h.push_system_message(&format!("perf seed msg {i:04}"));
+    }
+    h.tool_use_start("t_perf", "bash"); // message index 999 — the tail
+    h.render(); // warm-up
+    h.reset_perf_probe();
+    h.tool_use_delta("t_perf", "{\"command\":");
+    h.render();
+    let renders = h.render_count();
+    assert!(
+        renders <= 2,
+        "one tool-input delta at n=1000 must re-render ≤ 2 messages, \
+         rendered {renders} — the delta path is full-invalidating (O(total) \
+         rebuild per streaming delta)"
+    );
+}
+
+/// L4 pin 3 — cum-height lookup is CACHED: a Clean frame (here: after a
+/// wheel-scroll, the hottest steady gesture) performs zero cumulative-offset
+/// entry writes and zero renders — the frame's `total` comes from the cached
+/// offsets, not an O(n) re-sum. A tail append then splices the offset cache
+/// from the dirty watermark: O(1) entries, not O(n).
+#[test]
+#[ignore = "P11: activates at perf gate"]
+fn perf_1000_msgs_cum_height_lookup_cached_no_per_frame_resum() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+    for i in 0..1000 {
+        h.push_system_message(&format!("perf seed msg {i:04}"));
+    }
+    h.render(); // warm-up
+    h.mouse(scroll_up_event()); // Clean cache, scroll-only frame
+    h.reset_perf_probe();
+    h.render();
+    assert_eq!(
+        h.render_count(),
+        0,
+        "scroll tick on a Clean cache must render 0 messages"
+    );
+    assert_eq!(
+        h.cum_height_writes(),
+        0,
+        "Clean frame must write 0 cumulative-offset entries — total height \
+         must be served from the cache, not re-summed O(n) per frame (lock L4)"
+    );
+
+    // Tail growth: the offset cache splices from the watermark (k = n-1),
+    // bounded by a constant — an O(n) rebuild here writes ~1000 entries.
+    h.push_system_message("tail growth probe");
+    h.reset_perf_probe();
+    h.render();
+    let writes = h.cum_height_writes();
+    assert!(
+        writes <= 4,
+        "tail append at n=1000 must splice the cumulative-offset cache from \
+         the dirty watermark (O(1) entries), wrote {writes}"
+    );
+}

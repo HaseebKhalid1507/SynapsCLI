@@ -196,6 +196,26 @@ pub(crate) struct LineCache {
     pub(crate) flat: Vec<ratatui::text::Line<'static>>,
 }
 
+/// Test-only perf probe (P11 design §5.2, lock L4). Count-based — no
+/// wall-clock flake: the perf gate asserts *how many* message renders and
+/// cumulative-offset writes a frame performed, not how long it took. Same
+/// class of test-only seam as `test_take_cache`. Interior-mutable
+/// (`AtomicUsize`) because `render_message_lines` takes `&self`; per-store
+/// (not a global) so parallel tests can't cross-contaminate counts.
+///
+/// Compiled only under `test`/the `testing` feature — production builds
+/// carry neither the field nor the fetch_adds.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub(crate) struct PerfProbe {
+    /// Bumped once per `render_message_lines` call (measure == render).
+    pub(crate) renders: std::sync::atomic::AtomicUsize,
+    /// Bumped once per cumulative-offset entry written. Zero on a Clean
+    /// frame is the lock-L4 "no O(n) re-sum per frame" invariant. Wired up
+    /// when `cum_heights` lands (P11 MsgSlot slice); until then it stays 0.
+    pub(crate) cum_writes: std::sync::atomic::AtomicUsize,
+}
+
 /// Cache lifecycle for the per-message line cache. Replaces the old
 /// `line_cache: Option<LineCache>` + `dirty_from: Option<usize>` tri-state
 /// with the same semantics made explicit (slice d):
@@ -325,6 +345,10 @@ pub(crate) struct TranscriptStore {
     // ── Selection (moved in slice e; content-relative since P10 slice (b)) ───
     selection_anchor: Option<SelPos>,
     selection_end: Option<SelPos>,
+
+    // ── Perf probe (test-only; P11 §5.2 / lock L4) ───────────────────────────
+    #[cfg(any(test, feature = "testing"))]
+    probe: PerfProbe,
 }
 
 /// A selection endpoint in content space (P10 slice (b) — design §3.2).
@@ -380,7 +404,38 @@ impl TranscriptStore {
             visible_range: None,
             selection_anchor: None,
             selection_end: None,
+            #[cfg(any(test, feature = "testing"))]
+            probe: PerfProbe::default(),
         }
+    }
+
+    // ── Perf probe surface (test-only; P11 §5.2 / lock L4) ───────────────────
+
+    /// Message renders since the last [`Self::probe_reset`].
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn probe_render_count(&self) -> usize {
+        self.probe.renders.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cumulative-offset entry writes since the last [`Self::probe_reset`].
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn probe_cum_write_count(&self) -> usize {
+        self.probe.cum_writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Zero both perf counters — call after a warm-up frame, before the
+    /// frame under measurement.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn probe_reset(&self) {
+        self.probe.renders.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.probe.cum_writes.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Internal bump seam for `render_message_lines` (render.rs — a sibling
+    /// module; store fields are sealed, so the bump routes through a method).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn probe_note_render(&self) {
+        self.probe.renders.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ── Scroll API ────────────────────────────────────────────────────────────
