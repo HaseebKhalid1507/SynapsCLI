@@ -1903,8 +1903,7 @@ pub async fn run(
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
-                            app.scroll_back = 0;
-                            app.scroll_pinned = true;
+                            app.transcript.scroll_to_bottom();
                             let api_content = if let Some(ref ctx) = app.abort_context {
                                 let combined = format!("{}\n\n{}", ctx, queued);
                                 app.abort_context = None;

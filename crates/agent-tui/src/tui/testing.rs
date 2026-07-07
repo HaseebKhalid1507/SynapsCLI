@@ -332,12 +332,12 @@ impl TestHarness {
 
     /// Current transcript scrollback offset (0 = pinned to bottom).
     pub fn scroll_back(&self) -> u16 {
-        self.app.scroll_back
+        self.app.transcript.scroll_back
     }
 
     /// Whether the transcript is pinned to the latest message.
     pub fn scroll_pinned(&self) -> bool {
-        self.app.scroll_pinned
+        self.app.transcript.scroll_pinned
     }
 
     // ── Internals ────────────────────────────────────────────────────────────

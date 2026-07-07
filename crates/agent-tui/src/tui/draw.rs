@@ -573,22 +573,23 @@ pub(crate) fn build_render_model(
     let total = all_lines_vec.len();
     // `lines` wraps only the visible window — sliced below once (start, end) exist.
 
-    // ── 4. Scroll bookkeeping (App mutations lifted from draw()) ──────────────
-    if app.scroll_pinned {
-        app.scroll_back = 0;
+    // ── 4. Scroll bookkeeping (direct field access; visible_window() folds this in slice e) ──
+    // Order is load-bearing: growth-adjust THEN clamp THEN last_line_count write.
+    if app.transcript.scroll_pinned {
+        app.transcript.scroll_back = 0;
     } else {
-        let prev = app.last_line_count;
+        let prev = app.transcript.last_line_count;
         if total > prev && prev > 0 {
             let growth = (total - prev) as u16;
-            app.scroll_back = app.scroll_back.saturating_add(growth);
+            app.transcript.scroll_back = app.transcript.scroll_back.saturating_add(growth);
         }
         let max_back = total.saturating_sub(content_height).min(u16::MAX as usize) as u16;
-        if app.scroll_back > max_back {
-            app.scroll_back = max_back;
+        if app.transcript.scroll_back > max_back {
+            app.transcript.scroll_back = max_back;
         }
     }
-    app.last_line_count = total;
-    let scroll_back = app.scroll_back;
+    app.transcript.last_line_count = total;
+    let scroll_back = app.transcript.scroll_back;
 
     // ── 5. Visible range + msg_area_rect write-back ───────────────────────────
     let end = total.saturating_sub(scroll_back as usize);

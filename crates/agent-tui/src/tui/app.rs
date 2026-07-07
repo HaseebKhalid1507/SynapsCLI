@@ -16,10 +16,6 @@ pub(crate) struct App {
     /// Cursor position as a **char index** (not byte index).
     /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
     pub(crate) cursor_pos: usize,
-    pub(crate) scroll_back: u16,
-    /// When true, viewport stays pinned to the bottom (auto-scroll).
-    /// Set to false when user scrolls up, true when they scroll back to bottom.
-    pub(crate) scroll_pinned: bool,
     pub(crate) api_messages: Vec<Value>,
     pub(crate) streaming: bool,
     pub(crate) input_history: Vec<String>,
@@ -72,8 +68,6 @@ pub(crate) struct App {
     pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
-    /// Previous rendered line count — used to stabilize scroll when not pinned
-    pub(crate) last_line_count: usize,
     /// Active subagent status for the live panel
     pub(crate) subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
@@ -179,8 +173,6 @@ impl App {
             transcript: TranscriptStore::new(),
             input: String::new(),
             cursor_pos: 0,
-            scroll_back: 0,
-            scroll_pinned: true,
             api_messages: Vec::new(),
             streaming: false,
             input_history: Vec::new(),
@@ -212,7 +204,6 @@ impl App {
             show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
-            last_line_count: 0,
             subagents: Vec::new(),
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
@@ -424,8 +415,8 @@ impl App {
             time: Local::now().format("%H:%M").to_string(),
         });
         // Auto-scroll only when pinned to bottom
-        if self.scroll_pinned {
-            self.scroll_back = 0;
+        if self.transcript.scroll_pinned {
+            self.transcript.scroll_back = 0;
         }
         // New tail message — mark last slot dirty (append to per_msg on next rebuild).
         self.invalidate_last();
@@ -466,8 +457,8 @@ impl App {
                     msg,
                     time: Local::now().format("%H:%M").to_string(),
                 });
-                if self.scroll_pinned {
-                    self.scroll_back = 0;
+                if self.transcript.scroll_pinned {
+                    self.transcript.scroll_back = 0;
                 }
                 // Insert mid-list — invalidate_from(at) so draw re-renders from insert point.
                 self.invalidate_from(at);

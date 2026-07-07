@@ -102,8 +102,7 @@ pub(super) async fn handle_stream_event(
             if app.queued_message.as_ref() == Some(&message) {
                 app.queued_message = None;
             }
-            app.scroll_back = 0;
-            app.scroll_pinned = true;
+            app.transcript.scroll_to_bottom();
             app.invalidate();
         }
         StreamEvent::Session(SessionEvent::Usage {

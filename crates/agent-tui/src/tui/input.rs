@@ -254,15 +254,11 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_add(scroll_lines);
-            app.scroll_pinned = false;
+            app.transcript.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
             app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_sub(scroll_lines);
-            if app.scroll_back == 0 {
-                app.scroll_pinned = true;
-            }
+            app.transcript.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
@@ -498,14 +494,10 @@ fn handle_key(
             app.cursor_pos += 1;
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
-            app.scroll_back = app.scroll_back.saturating_add(1);
-            app.scroll_pinned = false;
+            app.transcript.scroll_up(1);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
-            app.scroll_back = app.scroll_back.saturating_sub(1);
-            if app.scroll_back == 0 {
-                app.scroll_pinned = true;
-            }
+            app.transcript.scroll_down(1);
         }
         (KeyCode::Up, _) => {
             app.history_up();
@@ -529,8 +521,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.input_stash.clear();
     app.input.clear();
     app.cursor_pos = 0;
-    app.scroll_back = 0;
-    app.scroll_pinned = true;
+    app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
@@ -687,9 +678,9 @@ mod tests {
     #[test]
     fn scroll_up_uses_configured_step() {
         let mut app = make_app();
-        app.scroll_back = 0;
+        app.transcript.scroll_back = 0;
         handle_mouse(scroll_event(MouseEventKind::ScrollUp), &mut app, 5);
-        assert_eq!(app.scroll_back, 5, "scroll_back should be 5 with scroll_lines=5");
+        assert_eq!(app.transcript.scroll_back, 5, "scroll_back should be 5 with scroll_lines=5");
     }
 
     /// When scroll_lines=5 is configured, one ScrollDown event must subtract 5
@@ -697,9 +688,9 @@ mod tests {
     #[test]
     fn scroll_down_uses_configured_step() {
         let mut app = make_app();
-        app.scroll_back = 10;
+        app.transcript.scroll_back = 10;
         handle_mouse(scroll_event(MouseEventKind::ScrollDown), &mut app, 5);
-        assert_eq!(app.scroll_back, 5, "scroll_back should decrease by 5");
+        assert_eq!(app.transcript.scroll_back, 5, "scroll_back should decrease by 5");
     }
 
     /// When scroll_lines is absent (None) the caller passes the default of 3.
