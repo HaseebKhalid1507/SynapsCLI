@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use super::app::SPINNER_FRAMES;
-use super::transcript::{ChatMessage, LineMeta, MsgEntry, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER};
+use super::transcript::{ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER};
 use super::theme::THEME;
 use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
 use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
@@ -133,9 +133,11 @@ impl LineSink {
         self.meta.extend(meta);
     }
 
-    fn into_entry(self) -> MsgEntry {
+    fn into_entry(self) -> MsgSlot {
         debug_assert_eq!(self.lines.len(), self.meta.len());
-        MsgEntry { lines: self.lines, meta: self.meta }
+        // Always materialized at render time; demotion (lines → None) is a
+        // separate second-half pass over slots leaving the viewport window.
+        MsgSlot { lines: Some(self.lines), meta: self.meta }
     }
 }
 
@@ -206,13 +208,13 @@ pub(crate) fn classify_row(
 
 impl TranscriptStore {
     /// Render the lines for a single message at `idx`, in isolation, plus
-    /// per-row source provenance (P10 slice (a): `MsgEntry` carries a
+    /// per-row source provenance (P10 slice (a): `MsgSlot` carries a
     /// [`LineMeta`] per line; nothing consumes the meta yet).
     /// The rendered lines are identical to the contribution that message[idx]
     /// would make inside `render_lines`, assuming the same prev-message context.
     /// Ephemeral App state (spinner frame, streaming flag, agent name) crosses
     /// the seam via `ctx` — see [`RenderCtx`].
-    pub(crate) fn render_message_lines(&self, idx: usize, width: usize, ctx: &RenderCtx<'_>) -> MsgEntry {
+    pub(crate) fn render_message_lines(&self, idx: usize, width: usize, ctx: &RenderCtx<'_>) -> MsgSlot {
         // P11 perf probe (§5.2 / lock L4): measurement IS the render, so
         // counting calls here counts both. Compiled out of production.
         #[cfg(any(test, feature = "testing"))]
@@ -965,7 +967,7 @@ impl TranscriptStore {
     pub(crate) fn render_lines(&self, width: usize, ctx: &RenderCtx<'_>) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for i in 0..self.messages().len() {
-            lines.extend(self.render_message_lines(i, width, ctx).lines);
+            lines.extend(self.render_message_lines(i, width, ctx).lines.expect("freshly rendered slot has lines"));
         }
         lines
     }
@@ -1055,7 +1057,7 @@ mod meta_tests {
                 );
                 let entry = store.render_message_lines(idx, width, &ctx());
                 assert_eq!(
-                    entry.lines.len(),
+                    entry.lines().len(),
                     entry.meta.len(),
                     "meta must stay parallel to lines (msg {idx}, width {width})"
                 );
@@ -1085,7 +1087,7 @@ mod meta_tests {
                             // L1, re-verified end-to-end: the final rendered
                             // row carries source[range] byte-identically
                             // (trailing space padding tolerated).
-                            let text = flatten(&entry.lines[row]);
+                            let text = flatten(&entry.lines()[row]);
                             let slice = &source[range.clone()];
                             assert!(
                                 text.ends_with(slice) || text.trim_end_matches(' ').ends_with(slice),

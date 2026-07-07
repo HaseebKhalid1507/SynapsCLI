@@ -173,17 +173,48 @@ fn source_line_range(source: &str, idx: usize) -> std::ops::Range<usize> {
     source.len()..source.len()
 }
 
-/// Per-message render cache entry: the rendered lines plus their per-row
-/// provenance (P10 slice (a)/(b)). This is the unit P11 caches/evicts —
-/// meta rides along with the lines it describes.
-pub(crate) struct MsgEntry {
-    pub(crate) lines: Vec<ratatui::text::Line<'static>>,
-    /// Parallel to `lines`. Invariant: `lines.len() == meta.len()`.
+/// Per-message render cache slot (P11 design §1.2). This is the unit P11
+/// caches and (in the second-half slices) evicts.
+///
+/// Two deliberate choices, per the decision lock:
+/// - **`meta.len()` IS the height** — no separate `height` field to desync
+///   (and no `u16` truncation concern). `meta` is always present after
+///   measurement and parallels the rendered rows.
+/// - **`meta` survives demotion; only `lines` dies.** `selected_text` reads
+///   `meta` + `source_text()` exclusively (P10 §7), so copy of off-screen —
+///   even evicted — selections works with zero re-render. `lines: None`
+///   means "measured but demoted": height/meta retained, pixels evicted.
+///   NOTE: demotion itself is second-half work — this slice keeps `lines`
+///   always `Some` (into_entry constructs it so; nothing sets `None` yet).
+pub(crate) struct MsgSlot {
+    /// Present only while the message intersects viewport ± overscan
+    /// (always `Some` until the demotion slice lands).
+    pub(crate) lines: Option<Vec<ratatui::text::Line<'static>>>,
+    /// Parallel to the rendered rows. Invariant: when `lines` is `Some`,
+    /// `lines.len() == meta.len()`.
     pub(crate) meta: Vec<LineMeta>,
 }
 
+impl MsgSlot {
+    /// The message's exact height in display rows — valid whether or not
+    /// the pixels are currently materialized.
+    pub(crate) fn height(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// The rendered rows. Panics on a demoted slot — valid this slice
+    /// (nothing demotes yet); callers that can legitimately see a demoted
+    /// slot must match on the `Option` explicitly (lock L3) instead.
+    #[track_caller]
+    pub(crate) fn lines(&self) -> &[ratatui::text::Line<'static>] {
+        self.lines
+            .as_deref()
+            .expect("MsgSlot demoted — promote (re-render) before reading lines")
+    }
+}
+
 /// Per-message render cache. Parallel to `TranscriptStore.messages`: each slot
-/// holds the rendered [`MsgEntry`] for that message. `flat` is the
+/// holds the rendered [`MsgSlot`] for that message. `flat` is the
 /// concatenation of the entries' lines, which is what downstream
 /// (draw/selection) consumes — lines only, no meta; the render thread never
 /// learns about provenance. The `width` at which these were rendered is
@@ -191,9 +222,62 @@ pub(crate) struct MsgEntry {
 pub(crate) struct LineCache {
     pub(crate) width: usize,
     /// Rendered lines + meta per message — index parallel to TranscriptStore.messages.
-    pub(crate) per_msg: Vec<MsgEntry>,
+    pub(crate) per_msg: Vec<MsgSlot>,
     /// Concatenation of per_msg lines; what downstream code consumes.
+    /// Dies in the P11 flat-kill slice — `cum_heights` is its coordinate
+    /// system, kept identical by construction until then.
     pub(crate) flat: Vec<ratatui::text::Line<'static>>,
+    /// Cumulative height offsets (P11 §1.2): `cum_heights[i]` = summed
+    /// heights of messages `[0..i)`; `cum_heights[n]` = total. Always
+    /// `per_msg.len() + 1` entries. Rebuilt from the dirty watermark k in
+    /// O(n−k) usize writes — the same watermark discipline as the flat
+    /// rebuild, minus the Line clones. Because `height(i) == lines.len()`,
+    /// these ARE flat-buffer indices (the design's identity claim, §0) —
+    /// asserted per frame in debug builds (`debug_assert_cum_identity`).
+    pub(crate) cum_heights: Vec<usize>,
+}
+
+impl LineCache {
+    /// Build a cache from rendered slots + their flat concatenation,
+    /// computing `cum_heights` from scratch.
+    pub(crate) fn new(
+        width: usize,
+        per_msg: Vec<MsgSlot>,
+        flat: Vec<ratatui::text::Line<'static>>,
+    ) -> Self {
+        let mut cache = LineCache { width, per_msg, flat, cum_heights: Vec::new() };
+        cache.rebuild_cum_from(0);
+        cache
+    }
+
+    /// Rebuild `cum_heights` from message index `k` — the cumulative-offset
+    /// cache is invalidated with the same watermark as the slots it sums.
+    /// Returns the number of entries written (perf probe, lock L4).
+    pub(crate) fn rebuild_cum_from(&mut self, k: usize) -> usize {
+        let k = k.min(self.per_msg.len())
+            .min(self.cum_heights.len().saturating_sub(1));
+        self.cum_heights.truncate(k + 1);
+        if self.cum_heights.is_empty() {
+            debug_assert_eq!(k, 0);
+            self.cum_heights.push(0);
+        }
+        let mut acc = self.cum_heights[k];
+        let mut written = 0usize;
+        for slot in &self.per_msg[k..] {
+            acc += slot.height();
+            self.cum_heights.push(acc);
+            written += 1;
+        }
+        written
+    }
+
+    /// Total height in rows — `cum_heights[n]`. Identical to `flat.len()`
+    /// by the §0 identity (debug-asserted); becomes the sole total when the
+    /// flat buffer dies.
+    #[allow(dead_code)] // consumer lands with the visible_window rewrite (second half)
+    pub(crate) fn total_height(&self) -> usize {
+        *self.cum_heights.last().unwrap_or(&0)
+    }
 }
 
 /// Test-only perf probe (P11 design §5.2, lock L4). Count-based — no
@@ -676,12 +760,17 @@ impl TranscriptStore {
 
         if needs_full_rebuild {
             // Width changed or no cache: full rebuild
-            let per_msg: Vec<MsgEntry> = (0..self.messages.len())
+            let per_msg: Vec<MsgSlot> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> =
-                per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-            self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
+                per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+            let cache = LineCache::new(content_width, per_msg, flat);
+            #[cfg(any(test, feature = "testing"))]
+            self.probe
+                .cum_writes
+                .fetch_add(cache.cum_heights.len(), std::sync::atomic::Ordering::Relaxed);
+            self.cache = CacheState::Clean(cache);
         } else if let CacheState::Dirty(cache, k) = &self.cache {
             // Incremental rebuild: only re-render messages[k..]
             // Render all dirty slots first (immutable borrow of self), then apply.
@@ -689,8 +778,10 @@ impl TranscriptStore {
             let n = self.messages.len();
             let needs_resize = cache.per_msg.len() != n;
 
-            // Render fresh slots for [k..n]
-            let fresh: Vec<MsgEntry> = (k..n)
+            // Render fresh slots for [k..n] — the lock-L1 re-render window:
+            // k..n, NOT k..=k+1 (the i−1-only dependency premise is falsified
+            // by whole-list reads in the render arms; see the P11 lock).
+            let fresh: Vec<MsgSlot> = (k..n)
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
 
@@ -710,23 +801,69 @@ impl TranscriptStore {
                 }
             }
             // Rebuild flat from k
-            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|e| e.lines.len()).sum();
+            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|e| e.height()).sum();
             cache.flat.truncate(prefix_line_count);
             for slot in &cache.per_msg[k..] {
-                cache.flat.extend(slot.lines.iter().cloned());
+                cache.flat.extend(slot.lines().iter().cloned());
             }
+            // Splice the cumulative-offset cache from the same watermark.
+            let _cum_written = cache.rebuild_cum_from(k);
+            #[cfg(any(test, feature = "testing"))]
+            self.probe
+                .cum_writes
+                .fetch_add(_cum_written, std::sync::atomic::Ordering::Relaxed);
             self.cache = CacheState::Clean(cache);
         }
         // Paranoia fallback: guarantee a cache exists (should never fire —
         // the enum makes this provably dead, but deleting it is a later
         // commit, not this one; design §6).
         if matches!(self.cache, CacheState::Missing) {
-            let per_msg: Vec<MsgEntry> = (0..self.messages.len())
+            let per_msg: Vec<MsgSlot> = (0..self.messages.len())
                 .map(|i| self.render_message_lines(i, content_width, ctx))
                 .collect();
             let flat: Vec<ratatui::text::Line<'static>> =
-                per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-            self.cache = CacheState::Clean(LineCache { width: content_width, per_msg, flat });
+                per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+            self.cache = CacheState::Clean(LineCache::new(content_width, per_msg, flat));
+        }
+        self.debug_assert_cum_identity();
+    }
+
+    /// The P11 §0 identity, executable: summed exact per-message heights and
+    /// flat-line indices are the SAME numbers. Debug builds verify it after
+    /// every cache sync; the whole pin-equivalence argument (21/22/23/24)
+    /// leans on it. O(n) usize compares, debug-only — compiled out of
+    /// release.
+    fn debug_assert_cum_identity(&self) {
+        #[cfg(debug_assertions)]
+        if let Some(c) = self.line_cache() {
+            debug_assert_eq!(
+                c.cum_heights.len(),
+                c.per_msg.len() + 1,
+                "cum_heights must have per_msg.len()+1 entries"
+            );
+            debug_assert_eq!(c.cum_heights.first(), Some(&0));
+            let mut acc = 0usize;
+            for (i, slot) in c.per_msg.iter().enumerate() {
+                if let Some(lines) = &slot.lines {
+                    debug_assert_eq!(
+                        lines.len(),
+                        slot.height(),
+                        "slot {i}: meta must stay parallel to rendered rows"
+                    );
+                }
+                acc += slot.height();
+                debug_assert_eq!(
+                    c.cum_heights[i + 1],
+                    acc,
+                    "cum_heights[{}] inconsistent with slot heights",
+                    i + 1
+                );
+            }
+            debug_assert_eq!(
+                acc,
+                c.flat.len(),
+                "identity (§0): summed heights must equal flat line count"
+            );
         }
     }
 
@@ -822,11 +959,11 @@ impl TranscriptStore {
     fn flat_index_to_content(&self, flat_idx: usize) -> Option<(usize, usize)> {
         let cache = self.line_cache()?;
         let mut off = flat_idx;
-        for (mi, entry) in cache.per_msg.iter().enumerate() {
-            if off < entry.lines.len() {
+        for (mi, slot) in cache.per_msg.iter().enumerate() {
+            if off < slot.height() {
                 return Some((mi, off));
             }
-            off -= entry.lines.len();
+            off -= slot.height();
         }
         None
     }
@@ -837,11 +974,11 @@ impl TranscriptStore {
     /// "paint nothing" rather than a panic).
     fn content_to_flat_index(&self, msg_idx: usize, line_in_msg: usize) -> Option<usize> {
         let cache = self.line_cache()?;
-        let entry = cache.per_msg.get(msg_idx)?;
-        if line_in_msg >= entry.lines.len() {
+        let slot = cache.per_msg.get(msg_idx)?;
+        if line_in_msg >= slot.height() {
             return None;
         }
-        let prefix: usize = cache.per_msg[..msg_idx].iter().map(|e| e.lines.len()).sum();
+        let prefix: usize = cache.per_msg[..msg_idx].iter().map(|e| e.height()).sum();
         Some(prefix + line_in_msg)
     }
 
@@ -883,7 +1020,12 @@ impl TranscriptStore {
         let LineMeta::Content { range, content_col } = entry.meta.get(line_in_msg)? else {
             return None;
         };
-        let text: String = entry.lines[line_in_msg]
+        // Lock L3: a demoted slot (lines == None) resolves to no src_byte —
+        // the copy path degrades to line granularity (ContentLine-style),
+        // never silently-wrong bytes. Unreachable this slice (nothing
+        // demotes yet); load-bearing once frame-lagged demotion lands.
+        let lines = entry.lines.as_ref()?;
+        let text: String = lines[line_in_msg]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -1542,16 +1684,19 @@ impl TranscriptStore {
 
     /// Set the cache to `Clean` with the given `LineCache`. Tests use this to
     /// install a pre-built cache so they can assert incremental-rebuild logic
-    /// without going through `visible_window`.
+    /// without going through `visible_window`. Recomputes `cum_heights` so a
+    /// hand-spliced cache can't violate the §0 identity assertion.
     #[cfg(test)]
-    pub(crate) fn test_set_cache_clean(&mut self, cache: LineCache) {
+    pub(crate) fn test_set_cache_clean(&mut self, mut cache: LineCache) {
+        cache.rebuild_cum_from(0);
         self.cache = CacheState::Clean(cache);
     }
 
     /// Set the cache to `Dirty(cache, watermark)`. Used by tests that simulate
     /// the `invalidate_from` path without calling `visible_window`.
     #[cfg(test)]
-    pub(crate) fn test_set_cache_dirty(&mut self, cache: LineCache, from: usize) {
+    pub(crate) fn test_set_cache_dirty(&mut self, mut cache: LineCache, from: usize) {
+        cache.rebuild_cum_from(0);
         self.cache = CacheState::Dirty(cache, from);
     }
 

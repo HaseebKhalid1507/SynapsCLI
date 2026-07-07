@@ -10,7 +10,7 @@ pub(crate) use super::transcript::{ChatMessage, TranscriptStore, THINKING_PLACEH
 // Test-only re-exports: production code reaches the cache via store methods;
 // only ported cache tests name these types directly.
 #[allow(unused_imports)]
-pub(crate) use super::transcript::{CacheState, LineCache, MsgEntry, RenderCtx};
+pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
 #[allow(unused_imports)]
 pub(crate) use super::transcript::TimestampedMsg;
 
@@ -670,7 +670,7 @@ impl App {
         }
     }
 
-    pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> MsgEntry {
+    pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> MsgSlot {
         self.transcript.render_message_lines(idx, width, &self.render_ctx())
     }
 
@@ -871,9 +871,9 @@ mod tests {
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
         {
             let w = 80;
-            let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
         }
         app.subagents.push(SubagentState {
             id: 1,
@@ -909,9 +909,9 @@ mod tests {
         app.transcript.test_insert_tool_start_time("call_1".to_string(), std::time::Instant::now());
         {
             let w = 80;
-            let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
         }
         app.spinner_frame = 2;
 
@@ -934,16 +934,16 @@ mod tests {
 
         // Build full cache first (Clean = old Some + dirty_from None)
         {
-            let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-            app.transcript.test_set_cache_clean(LineCache { width: w, per_msg, flat });
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg, flat));
         }
         let last = app.transcript.message_count() - 1;
 
         // Snapshot per_msg[0..last]
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
 
         // Advance spinner (spinner_frame % 3 == 0 triggers uses_spinner)
@@ -960,7 +960,7 @@ mod tests {
 
         // Simulate draw.rs incremental rebuild
         {
-            let fresh: Vec<MsgEntry> = (last..app.transcript.message_count())
+            let fresh: Vec<MsgSlot> = (last..app.transcript.message_count())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
             let mut cs = app.transcript.test_take_cache();
@@ -968,10 +968,10 @@ mod tests {
                 for (offset, rendered) in fresh.into_iter().enumerate() {
                     cache.per_msg[last + offset] = rendered;
                 }
-                let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.lines.len()).sum();
+                let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.height()).sum();
                 cache.flat.truncate(prefix_len);
                 for slot in &cache.per_msg[last..] {
-                    cache.flat.extend(slot.lines.iter().cloned());
+                    cache.flat.extend(slot.lines().iter().cloned());
                 }
             }
             // mark clean
@@ -983,7 +983,7 @@ mod tests {
         // per_msg[0..last] must be unchanged
         let after: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
         assert_eq!(snapshot, after, "earlier per_msg slots must not change on spinner tick");
     }
@@ -1328,7 +1328,7 @@ mod tests {
         let w = 80;
         let flat = app.render_lines(w);
         let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.message_count())
-            .flat_map(|i| app.render_message_lines(i, w).lines)
+            .flat_map(|i| app.render_message_lines(i, w).lines.expect("freshly rendered slot has lines"))
             .collect();
 
         // Compare by rendered string content (Line doesn't impl PartialEq for spans reliably)
@@ -1361,11 +1361,11 @@ mod tests {
         let expected_flat = app.render_lines(w);
 
         // Build a LineCache manually using the new struct
-        let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count())
+        let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, w))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-        let cache = LineCache { width: w, per_msg, flat };
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        let cache = LineCache::new(w, per_msg, flat);
 
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
@@ -1377,11 +1377,11 @@ mod tests {
 
     /// Helper: builds a LineCache for an app at a given width, simulating what draw.rs does.
     fn build_cache(app: &App, width: usize) -> LineCache {
-        let per_msg: Vec<MsgEntry> = (0..app.transcript.message_count())
+        let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines.iter().cloned()).collect();
-        LineCache { width, per_msg, flat }
+        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        LineCache::new(width, per_msg, flat)
     }
 
     /// Helper: simulate the incremental rebuild from sync_cache (slice 3 logic,
@@ -1402,10 +1402,10 @@ mod tests {
                     }
                 }
                 // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
-                let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.lines.len()).sum();
+                let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.height()).sum();
                 cache.flat.truncate(prefix_len);
                 for slot in &cache.per_msg[k..] {
-                    cache.flat.extend(slot.lines.iter().cloned());
+                    cache.flat.extend(slot.lines().iter().cloned());
                 }
                 app.transcript.test_set_cache_clean(cache);
             }
@@ -1437,7 +1437,7 @@ mod tests {
         // Snapshot per_msg[0..last] content strings (before update)
         let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
 
         // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
@@ -1454,12 +1454,12 @@ mod tests {
         // per_msg[0..last] must be unchanged (content-equal to snapshot)
         let after: Vec<Vec<String>> = cache.per_msg[..last]
             .iter()
-            .map(|slot| slot.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
         assert_eq!(snapshot, after, "per_msg[0..last] must not change on tail-only invalidation");
 
         // per_msg[last] must have changed (the text grew)
-        let last_strs: Vec<String> = cache.per_msg[last].lines.iter()
+        let last_strs: Vec<String> = cache.per_msg[last].lines().iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect();
         let contains_new = last_strs.iter().any(|s| s.contains("more content appended"));
