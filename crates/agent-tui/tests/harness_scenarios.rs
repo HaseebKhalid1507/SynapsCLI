@@ -150,63 +150,114 @@ fn scenario_04_esc_does_not_clear_input_main_view() {
 
 // ── 2. Modals ─────────────────────────────────────────────────────────────────
 //
-// Modal state lives on App::settings / App::plugins / App::models which are
-// private to the tui module.  TestHarness does not expose any open_*_modal()
-// helpers — the app field is private.  Opening a modal from an integration
-// test requires TestHarness to expose dedicated methods.
-//
-// These four tests are marked `#[ignore = "harness gap: ..."]` as required by
-// the P4 spec.  They document what Fable-5 needs to add.
+// Scenarios 5–7 use the open_settings_modal / open_models_modal /
+// open_plugins_modal accessors added to TestHarness in commit c4855eb.
+// Scenario 8 (help-find) remains ignored: it requires the async
+// execute_command path which the sync harness cannot drive.
 
 /// Scenario 5 — Settings modal: open via harness, assert drawn, close via Esc.
 ///
-/// Blocked on: TestHarness needs `pub fn open_settings_modal(&mut self)` that
-/// sets `self.app.settings = Some(settings::SettingsState::new())`.
+/// open_settings_modal() itself is fine (direct state set, no handle_event).
+/// BLOCKED: testing.rs::event() calls input::handle_event with 6 args but the
+/// function now requires 7 (scroll_lines: u16 added in input.rs:51).
+/// Spike's testing.rs is missing the scroll_lines argument — won't compile
+/// under --tests.  Fix testing.rs::event() then activate this scenario.
 #[test]
-#[ignore = "harness gap: no pub fn open_settings_modal(); app field is private — add open_settings_modal() to TestHarness"]
+#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_05_settings_modal_open_and_close() {
-    // h.open_settings_modal();
-    // let frame = h.snapshot();
-    // assert!(frame.to_lowercase().contains("settings") || frame.contains("Theme"));
-    // h.key(KeyCode::Esc, KeyModifiers::empty());
-    // let frame_after = h.snapshot();
-    // assert!(frame_after.contains("Synaps") || frame_after.contains("ready"));
-    unimplemented!()
+    let mut h = TestHarness::boot();
+
+    // Open the settings modal directly — no async dispatch needed.
+    h.open_settings_modal();
+
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Settings"),
+        "settings modal must be visible after open_settings_modal():\n{frame}"
+    );
+
+    // Esc should close the modal (settings/input.rs: KeyCode::Esc => InputOutcome::Close).
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+
+    let frame_after = h.snapshot();
+    // Modal is gone — main chrome should be back.
+    assert!(
+        frame_after.contains("Synaps") || frame_after.contains("ready"),
+        "main view should be restored after Esc closes settings modal:\n{frame_after}"
+    );
+    // "Settings" title block should no longer appear in the rendered frame.
+    // (If the title bleeds through this assertion is a real bug in the close path.)
+    assert!(
+        !frame_after.contains(" Settings "),
+        "settings modal title should not appear after Esc close:\n{frame_after}"
+    );
 }
 
 /// Scenario 6 — Models modal: open via harness, assert drawn, close via Esc.
 ///
-/// Blocked on: TestHarness needs `pub fn open_models_modal(&mut self)` that
-/// sets `self.app.models = Some(models::ModelsModalState::new())`.
+/// Blocked by same compile bug as scenario_05 (testing.rs missing scroll_lines arg).
 #[test]
-#[ignore = "harness gap: no pub fn open_models_modal(); app field is private — add open_models_modal() to TestHarness"]
+#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_06_models_modal_open_and_close() {
-    // h.open_models_modal();
-    // let frame = h.snapshot();
-    // assert!(frame.to_lowercase().contains("model") || frame.contains("Provider"));
-    // h.key(KeyCode::Esc, KeyModifiers::empty());
-    unimplemented!()
+    let mut h = TestHarness::boot();
+
+    h.open_models_modal();
+
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Models"),
+        "models modal must be visible after open_models_modal():\n{frame}"
+    );
+
+    // Esc from the list view → InputOutcome::Close → app.models = None.
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+
+    let frame_after = h.snapshot();
+    assert!(
+        frame_after.contains("Synaps") || frame_after.contains("ready"),
+        "main view should be restored after Esc closes models modal:\n{frame_after}"
+    );
+    assert!(
+        !frame_after.contains(" Models "),
+        "models modal title should not appear after Esc close:\n{frame_after}"
+    );
 }
 
 /// Scenario 7 — Plugins modal: open via harness, assert drawn, close via Esc.
 ///
-/// Blocked on: TestHarness needs `pub fn open_plugins_modal(&mut self)` that
-/// sets `self.app.plugins = Some(plugins::PluginsModalState::new(PluginsState::default()))`.
+/// Blocked by same compile bug as scenario_05 (testing.rs missing scroll_lines arg).
 #[test]
-#[ignore = "harness gap: no pub fn open_plugins_modal(); app field private + PluginsModalState::new() requires PluginsState arg — add open_plugins_modal() to TestHarness"]
+#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_07_plugins_modal_open_and_close() {
-    // h.open_plugins_modal();
-    // let frame = h.snapshot();
-    // assert!(frame.to_lowercase().contains("plugin") || frame.contains("Installed"));
-    // h.key(KeyCode::Esc, KeyModifiers::empty());
-    unimplemented!()
+    let mut h = TestHarness::boot();
+
+    h.open_plugins_modal();
+
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Plugins"),
+        "plugins modal must be visible after open_plugins_modal():\n{frame}"
+    );
+
+    // Esc at top-level list → InputOutcome::Close → app.plugins = None.
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+
+    let frame_after = h.snapshot();
+    assert!(
+        frame_after.contains("Synaps") || frame_after.contains("ready"),
+        "main view should be restored after Esc closes plugins modal:\n{frame_after}"
+    );
+    assert!(
+        !frame_after.contains(" Plugins "),
+        "plugins modal title should not appear after Esc close:\n{frame_after}"
+    );
 }
 
 /// Scenario 8 — Help-find lightbox requires the async slash-command resolution
 /// path (open_help_find_for_ambiguous_slash inside execute_command, which needs
 /// an ambiguous prefix + async executor).  The sync harness cannot drive it.
 #[test]
-#[ignore = "harness gap: help_find modal requires async slash-command resolution; open_help_find_for_ambiguous_slash only fires inside execute_command — unreachable from sync harness"]
+#[ignore = "harness gap: help-find opens via async execute_command — needs P6 async executor or dedicated accessor"]
 fn scenario_08_help_find_modal_open_and_close() {
     unimplemented!()
 }
@@ -258,21 +309,53 @@ fn scenario_09_scroll_back_and_forward_transcript() {
     );
 }
 
-/// Scenario 10 — scroll_back state is not directly inspectable.
+/// Scenario 10 — scroll_back / scroll_pinned accessors: direct state inspection.
 ///
-/// The harness exposes no `scroll_back()` accessor.  Flagged so Fable-5 can
-/// add `pub fn scroll_back(&self) -> u16` and `pub fn scroll_pinned(&self) -> bool`
-/// to TestHarness, enabling direct state assertions.
+/// Blocked by same compile bug as scenario_05 (testing.rs missing scroll_lines arg).
+/// scroll_back() and scroll_pinned() accessors themselves are fine — it's the
+/// h.mouse() / h.key() call chain (which routes through testing.rs::event() →
+/// input::handle_event) that won't compile.
 #[test]
-#[ignore = "harness gap: no pub fn scroll_back() / scroll_pinned() on TestHarness — add accessors to assert raw scroll state without needing content overflow"]
+#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_10_scroll_lines_step_directly_inspectable() {
-    // Would assert:
-    //   h.push_system_message("x");
-    //   h.mouse(scroll_up_event());
-    //   assert_eq!(h.scroll_back(), 3); // mouse hardcodes 3 per input.rs:256
-    //   h.key(KeyCode::Up, KeyModifiers::SHIFT);
-    //   assert_eq!(h.scroll_back(), 4); // Shift+Up hardcodes 1 per input.rs:500
-    unimplemented!()
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // Seed one message so the scroll handlers have something to operate on.
+    h.push_system_message("x");
+
+    // Initially pinned to bottom, scroll_back == 0.
+    assert_eq!(h.scroll_back(), 0, "scroll_back should start at 0");
+    assert!(h.scroll_pinned(), "scroll_pinned should start true");
+
+    // One mouse ScrollUp → 3 lines back.
+    h.mouse(scroll_up_event());
+    assert_eq!(
+        h.scroll_back(),
+        3,
+        "one mouse ScrollUp should increment scroll_back by 3 (hardcoded in input.rs)"
+    );
+    assert!(!h.scroll_pinned(), "scroll_pinned should be false after scrolling up");
+
+    // One Shift+Up → 1 more line back.
+    h.key(KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(
+        h.scroll_back(),
+        4,
+        "Shift+Up should increment scroll_back by 1 (hardcoded in input.rs)"
+    );
+
+    // One mouse ScrollDown → 3 lines forward.
+    h.mouse(scroll_down_event());
+    assert_eq!(
+        h.scroll_back(),
+        1,
+        "one mouse ScrollDown should decrement scroll_back by 3 (floor: 0)"
+    );
+
+    // One Shift+Down → back to 0 and re-pinned.
+    h.key(KeyCode::Down, KeyModifiers::SHIFT);
+    assert_eq!(h.scroll_back(), 0, "Shift+Down should bring scroll_back back to 0");
+    assert!(h.scroll_pinned(), "scroll_pinned should be true again at scroll_back == 0");
 }
 
 // ── 4. Resize ─────────────────────────────────────────────────────────────────
