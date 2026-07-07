@@ -163,7 +163,6 @@ fn scenario_04_esc_does_not_clear_input_main_view() {
 /// Spike's testing.rs is missing the scroll_lines argument — won't compile
 /// under --tests.  Fix testing.rs::event() then activate this scenario.
 #[test]
-#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_05_settings_modal_open_and_close() {
     let mut h = TestHarness::boot();
 
@@ -197,7 +196,6 @@ fn scenario_05_settings_modal_open_and_close() {
 ///
 /// Blocked by same compile bug as scenario_05 (testing.rs missing scroll_lines arg).
 #[test]
-#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_06_models_modal_open_and_close() {
     let mut h = TestHarness::boot();
 
@@ -227,7 +225,6 @@ fn scenario_06_models_modal_open_and_close() {
 ///
 /// Blocked by same compile bug as scenario_05 (testing.rs missing scroll_lines arg).
 #[test]
-#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_07_plugins_modal_open_and_close() {
     let mut h = TestHarness::boot();
 
@@ -316,7 +313,6 @@ fn scenario_09_scroll_back_and_forward_transcript() {
 /// h.mouse() / h.key() call chain (which routes through testing.rs::event() →
 /// input::handle_event) that won't compile.
 #[test]
-#[ignore = "P4 bug: testing.rs::event() calls input::handle_event with 6 args; input.rs now requires 7 (scroll_lines: u16) — crate won't compile under --tests; fix testing.rs then re-activate"]
 fn scenario_10_scroll_lines_step_directly_inspectable() {
     let mut h = TestHarness::boot_with_size(80, 24);
 
