@@ -3,8 +3,10 @@ mod transcript;
 
 
 mod app;
+mod clock;
 mod commands;
 mod draw;
+mod focus;
 pub(crate) mod text_metrics;
 mod gamba;
 mod help_find;
