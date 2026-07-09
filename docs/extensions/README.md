@@ -235,3 +235,5 @@ See [protocol.md](./protocol.md) for the full technical specification, including
 - Method signatures and schemas
 - A complete working Python example
 - Error handling expectations
+
+For the compatibility guarantees behind this protocol — the `extension_protocol_version` promise, config-format stability, the deprecation policy, and which surfaces are stable versus reference-implementation — see [../STABILITY.md](../STABILITY.md).
