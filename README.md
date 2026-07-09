@@ -10,6 +10,7 @@
   <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
   <img src="https://img.shields.io/badge/binary-15MB-success.svg" alt="15MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -159,6 +160,8 @@ cargo build && cargo test
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome, the maintainer answers fast.
+
+Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) — questions, ideas, show-and-tell, or just to watch the crew run.
 
 ---
 
