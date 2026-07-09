@@ -203,6 +203,85 @@ impl TermCaps {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// P16.3 — capability gates (render path consumers)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Each gate is a pure decision function over `Option<&TermCaps>`, where **`None`
+// means "no negotiated facts available" — the unknown baseline that MUST
+// reproduce today's unconditional behavior byte-for-byte.** Production threads
+// `Some(&caps)` from `run_setup` (env detection always ran, DA1 burst maybe);
+// the harness renders through `render_frame_into`, which never reaches these
+// gates, so its snapshots are unaffected regardless.
+//
+// The gates only CHANGE behavior when caps are *affirmatively* known:
+//   * edge-scrub: keyed on tmux provenance (env-detected, always known under
+//     `Some`) — affirmative no-tmux ⇒ skip the scrub the artifact needs.
+//   * sync-output / kitty: keyed on the DA1 fence — no fence (`da1_answered ==
+//     false`) ⇒ fall back to today's unconditional emit/push.
+
+/// Edge-scrub gate (`viewport::scrub_crossterm_terminal_edges`).
+///
+/// Edge-scrub exists *because of* tmux/pane scroll artifacts, so with negotiated
+/// facts we run it only under tmux provenance. Unknown (`None`) reproduces
+/// today's **unconditional** scrub.
+///
+/// | caps                              | scrub? | rationale                       |
+/// |-----------------------------------|--------|---------------------------------|
+/// | `None` (unknown / not threaded)   | yes    | = today's unconditional scrub   |
+/// | `Some` with `tmux: Some(_)`       | yes    | tmux artifacts present          |
+/// | `Some` with `tmux: None`          | no     | affirmatively not under tmux    |
+pub(crate) fn edge_scrub_enabled(caps: Option<&TermCaps>) -> bool {
+    match caps {
+        None => true,                   // unknown ⇒ current behavior (scrub)
+        Some(c) => c.tmux.is_some(),    // known ⇒ scrub only under tmux
+    }
+}
+
+/// Synchronized-output gate (`draw.rs` Begin/EndSynchronizedUpdate, mode 2026).
+///
+/// Default-ON preserves today: terminals that don't support 2026 ignore the
+/// bracket, so emitting it blind is harmless. We only *suppress* the bracket
+/// when the DA1 fence proved the terminal answered queries AND affirmatively
+/// reported 2026 unsupported (`sync_output == false`). No fence ⇒ emit.
+///
+/// | caps                                        | emit bracket? |
+/// |---------------------------------------------|---------------|
+/// | `None` (unknown / not threaded)             | yes (= today) |
+/// | `Some` with `da1_answered == false`         | yes (= today) |
+/// | `Some`, DA1-fenced, `sync_output == true`   | yes           |
+/// | `Some`, DA1-fenced, `sync_output == false`  | no            |
+pub(crate) fn sync_output_enabled(caps: Option<&TermCaps>) -> bool {
+    match caps {
+        None => true,                        // unknown ⇒ emit (current)
+        Some(c) if !c.da1_answered => true,  // DA1 timed out ⇒ emit (current)
+        Some(c) => c.sync_output,            // negotiated fact
+    }
+}
+
+/// Kitty-keyboard push gate (`lifecycle::setup_terminal`
+/// `PushKeyboardEnhancementFlags`).
+///
+/// Fact-based when the DA1 fence answered; otherwise the blind best-effort push
+/// (= today). Note the push site runs during `setup_terminal`, i.e. BEFORE the
+/// DA1 burst, so in production caps are not yet fenced there and this correctly
+/// degrades to the blind push. The gate is future-proofing + log-honesty and is
+/// exercised as a decision function.
+///
+/// | caps                                          | push? |
+/// |-----------------------------------------------|-------|
+/// | `None` (unknown / not threaded)               | yes (= today) |
+/// | `Some` with `da1_answered == false`           | yes (= today) |
+/// | `Some`, DA1-fenced, `kitty_keyboard == true`  | yes   |
+/// | `Some`, DA1-fenced, `kitty_keyboard == false` | no    |
+pub(crate) fn kitty_push_enabled(caps: Option<&TermCaps>) -> bool {
+    match caps {
+        None => true,                        // unknown ⇒ push (current)
+        Some(c) if !c.da1_answered => true,  // DA1 timed out ⇒ push (current)
+        Some(c) => c.kitty_keyboard,         // negotiated fact
+    }
+}
+
 /// Parse the version token out of a raw `tmux -V` string.
 ///
 /// `tmux -V` prints e.g. `"tmux 3.3a"`, `"tmux next-3.4"`, or on some builds
@@ -416,6 +495,112 @@ mod tests {
         assert!(s.contains("tmux=3.4"));
         assert!(s.contains("sync_output=true"));
         assert!(s.contains("da1_answered=false"));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    //! P16.3 gate-decision tests. Each gate has an explicit `unknown ⇒ current
+    //! behavior` case plus the affirmatively-known cases that change behavior.
+    use super::*;
+
+    // Helper: env-detected caps under real tmux (env detection always runs, so
+    // tmux provenance is "known" the moment we have a `Some`).
+    fn caps_tmux() -> TermCaps {
+        TermCaps {
+            tmux: Some("3.4".to_string()),
+            ..TermCaps::default()
+        }
+    }
+    // Helper: env-detected caps affirmatively NOT under tmux.
+    fn caps_no_tmux() -> TermCaps {
+        TermCaps { tmux: None, ..TermCaps::default() }
+    }
+
+    // ── Gate 1: edge-scrub (tmux provenance) ───────────────────────────────
+
+    #[test]
+    fn edge_scrub_unknown_caps_defaults_to_current_behavior() {
+        // No negotiated facts ⇒ today's UNCONDITIONAL scrub.
+        assert!(edge_scrub_enabled(None), "unknown caps must scrub (= today)");
+    }
+
+    #[test]
+    fn edge_scrub_runs_under_tmux() {
+        assert!(edge_scrub_enabled(Some(&caps_tmux())), "tmux provenance ⇒ scrub");
+    }
+
+    #[test]
+    fn edge_scrub_skipped_when_affirmatively_no_tmux() {
+        // The ONLY behavior change: affirmatively-known no-tmux ⇒ skip scrub.
+        assert!(
+            !edge_scrub_enabled(Some(&caps_no_tmux())),
+            "affirmative no-tmux ⇒ skip scrub"
+        );
+    }
+
+    #[test]
+    fn edge_scrub_default_termcaps_is_no_tmux() {
+        // Sanity: a real detect() with no $TMUX yields tmux=None ⇒ skip, but
+        // that is `Some(caps)`, distinct from the `None` unknown baseline.
+        assert!(!edge_scrub_enabled(Some(&TermCaps::default())));
+        assert!(edge_scrub_enabled(None));
+    }
+
+    // ── Gate 2: sync-output (mode 2026, default-ON) ────────────────────────
+
+    #[test]
+    fn sync_output_unknown_caps_defaults_to_emit() {
+        // No caps threaded ⇒ emit the bracket (= today's unconditional Begin).
+        assert!(sync_output_enabled(None), "unknown caps must emit (= today)");
+    }
+
+    #[test]
+    fn sync_output_da1_timeout_defaults_to_emit() {
+        // DA1 never answered (default caps) ⇒ still emit — preserves today.
+        let caps = TermCaps::default();
+        assert!(!caps.da1_answered);
+        assert!(sync_output_enabled(Some(&caps)), "no DA1 fence ⇒ emit (= today)");
+    }
+
+    #[test]
+    fn sync_output_negotiated_supported_emits() {
+        let caps = TermCaps { da1_answered: true, sync_output: true, ..TermCaps::default() };
+        assert!(sync_output_enabled(Some(&caps)));
+    }
+
+    #[test]
+    fn sync_output_negotiated_unsupported_suppressed() {
+        // Only affirmatively-negotiated 2026-unsupported suppresses the bracket.
+        let caps = TermCaps { da1_answered: true, sync_output: false, ..TermCaps::default() };
+        assert!(!sync_output_enabled(Some(&caps)), "2026 negotiated off ⇒ no bracket");
+    }
+
+    // ── Gate 3: kitty push (DA1-fenced fact, blind fallback) ───────────────
+
+    #[test]
+    fn kitty_push_unknown_caps_defaults_to_push() {
+        assert!(kitty_push_enabled(None), "unknown caps must push (= today)");
+    }
+
+    #[test]
+    fn kitty_push_da1_timeout_defaults_to_push() {
+        // Default caps (no fence) ⇒ blind best-effort push, exactly like today.
+        let caps = TermCaps::default();
+        assert!(!caps.da1_answered);
+        assert!(kitty_push_enabled(Some(&caps)), "no DA1 fence ⇒ blind push (= today)");
+    }
+
+    #[test]
+    fn kitty_push_negotiated_supported_pushes() {
+        let caps = TermCaps { da1_answered: true, kitty_keyboard: true, ..TermCaps::default() };
+        assert!(kitty_push_enabled(Some(&caps)));
+    }
+
+    #[test]
+    fn kitty_push_negotiated_unsupported_skipped() {
+        let caps = TermCaps { da1_answered: true, kitty_keyboard: false, ..TermCaps::default() };
+        assert!(!kitty_push_enabled(Some(&caps)), "kitty negotiated off ⇒ no push");
     }
 }
 

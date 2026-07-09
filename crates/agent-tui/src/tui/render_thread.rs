@@ -59,6 +59,7 @@ use tachyonfx::Effect;
 use super::draw::render_frame;
 use super::lifecycle;
 use super::render_model::RenderModel;
+use super::termcaps::TermCaps;
 
 // ── Public command enum ───────────────────────────────────────────────────────
 
@@ -284,6 +285,7 @@ fn install_panic_hook_once() {
 ///   effect finishes — the main task breaks the event loop on this.
 pub(crate) fn spawn_render_thread(
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    caps: TermCaps,
 ) -> (RenderHandle, Arc<AtomicBool>, Arc<AtomicBool>) {
     install_panic_hook_once();
     // Shared inner slot — same Arc goes into the FrameSlot (main) and the
@@ -320,7 +322,7 @@ pub(crate) fn spawn_render_thread(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Safety: we're the only thread touching terminal_opt here.
                 let term = terminal_opt.take().expect("terminal already taken");
-                render_thread_body(term, inner_thread, cmd_rx, boot_done_thread, Arc::clone(&exit_done_thread));
+                render_thread_body(term, caps, inner_thread, cmd_rx, boot_done_thread, Arc::clone(&exit_done_thread));
                 // render_thread_body returned normally — it already called
                 // do_teardown() before returning.  terminal was consumed.
             }));
@@ -364,11 +366,18 @@ pub(crate) fn spawn_render_thread(
 
 fn render_thread_body(
     mut terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    caps:         TermCaps,
     inner:        Arc<parking_lot::Mutex<Option<Arc<RenderModel>>>>,
     cmd_rx:       mpsc::Receiver<RenderCmd>,
     boot_done:    Arc<AtomicBool>,
     exit_done:    Arc<AtomicBool>,
 ) {
+    // P16.3: negotiated terminal capabilities are process-constant (settled at
+    // boot before this thread spawned), so we hold them here and hand a
+    // borrow to every `render_frame` call rather than shipping them in the
+    // per-frame `RenderModel`. Always `Some(&caps)` in production — the `None`
+    // (unknown) path exists only for the gate unit tests, which render through
+    // `render_frame_into` / call the gate fns directly.
     // The render thread's own monotonic clock for tachyonfx effect timing.
     // Independent of main-loop pressure: if the main task is busy, animations
     // still advance at the render thread's cadence.
@@ -453,6 +462,7 @@ fn render_thread_body(
             if let Err(e) = render_frame(
                 &mut terminal,
                 &model,
+                Some(&caps),
                 &mut boot_fx,
                 &mut exit_fx,
                 &mut last_frame,

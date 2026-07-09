@@ -712,6 +712,7 @@ pub(crate) fn build_render_model(
 pub(crate) fn render_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &RenderModel,
+    caps: Option<&super::termcaps::TermCaps>,
     boot_fx: &mut Option<Effect>,
     exit_fx: &mut Option<Effect>,
     last_frame: &mut std::time::Instant,
@@ -727,11 +728,25 @@ pub(crate) fn render_frame(
     // diff flush together so terminals that support it (kitty, wezterm, foot,
     // iTerm2 ≥3.5, VTE ≥0.70) don't render partial frames. Terminals that
     // don't support mode 2026 ignore the private-mode sequences harmlessly.
-    execute!(io::stdout(), BeginSynchronizedUpdate)?;
+    //
+    // P16.3 gate: emit the bracket unless the DA1-fenced negotiation
+    // AFFIRMATIVELY reported mode 2026 unsupported. Unknown caps / DA1 timeout
+    // (`sync_output_enabled(..) == true`) keep today's UNCONDITIONAL bracket —
+    // harmless log-honesty, since non-2026 terminals ignore it anyway. Begin
+    // and End are gated by the SAME `sync` bool so we never leave an unmatched
+    // Begin (which would freeze the display).
+    let sync = super::termcaps::sync_output_enabled(caps);
+    if sync {
+        execute!(io::stdout(), BeginSynchronizedUpdate)?;
+    }
 
     let frame_result = (|| -> io::Result<()> {
+        // P16.3 gate: the scrub itself is gated on tmux provenance inside
+        // `scrub_crossterm_terminal_edges` (short-circuits before any size
+        // query when caps affirmatively say no-tmux).
         super::viewport::scrub_crossterm_terminal_edges(
             terminal,
+            caps,
             model.protected_bottom_rows,
             Style::default().bg(THEME.load().bg),
         )?;
@@ -740,9 +755,11 @@ pub(crate) fn render_frame(
         Ok(())
     })();
 
-    // Always end the synchronized update, even if rendering failed.
-    // Leaving mode 2026 open would freeze the terminal display.
-    execute!(io::stdout(), EndSynchronizedUpdate).ok();
+    // Always end the synchronized update if we opened one, even if rendering
+    // failed. Leaving mode 2026 open would freeze the terminal display.
+    if sync {
+        execute!(io::stdout(), EndSynchronizedUpdate).ok();
+    }
 
     frame_result
 }

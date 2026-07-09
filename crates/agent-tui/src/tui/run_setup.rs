@@ -147,7 +147,11 @@ pub(crate) async fn run_setup(
     // Terminal size for build_render_model: we call crossterm::terminal::size()
     // directly — it reads the TTY fd without needing the Terminal object.
     // See render_thread.rs module comment for the design rationale.
-    let terminal = setup_terminal()?;
+    // P16.3: `setup_terminal` runs BEFORE the DA1 burst below (raw mode must be
+    // enabled first), so no negotiated facts exist at the kitty-push site yet.
+    // Pass `None` ⇒ blind best-effort push, byte-identical with today. See the
+    // `setup_terminal` doc for why the push can't be fact-gated at this site.
+    let terminal = setup_terminal(None)?;
 
     // ── P16.2: DA1-fenced terminal capability query burst ──
     //
@@ -170,7 +174,10 @@ pub(crate) async fn run_setup(
     let term_caps =
         termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
 
-    let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal);
+    // P16.3: hand the negotiated caps to the render thread so `render_frame`
+    // can gate edge-scrub (tmux provenance) and synchronized-output (mode 2026)
+    // on facts. Cloned because `term_caps` is also returned in `RunContext`.
+    let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal, term_caps.clone());
     // Boot effect is sent via the command channel so the render thread owns it.
     render_handle.send_boot_fx(boot_effect());
 
