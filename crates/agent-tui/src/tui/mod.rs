@@ -29,6 +29,8 @@ mod settings;
 mod sidecar;
 mod signals;
 mod stream_handler;
+/// P16.1: terminal capability facts (env-only detection; inert seam).
+mod termcaps;
 /// Headless test harness — see [`testing::TestHarness`]. Compiled only for
 /// in-crate tests or downstream consumers of the `testing` feature.
 #[cfg(any(test, feature = "testing"))]
@@ -97,6 +99,10 @@ pub async fn run(
         mut exit_fx_sent,
         mut last_draw,
     } = run_setup::run_setup(continue_session, system, profile, no_extensions).await?;
+    // P16.1: env-only terminal capability detection. Inert — nothing gates
+    // on this yet (queries land in P16.2, gates in P16.3). The only wiring is
+    // this `--verbose` (debug-level) boot line dumping the detected caps.
+    tracing::debug!(caps = %termcaps::TermCaps::detect().summary(), "detected terminal capabilities (env-only)");
     // P12.2: Option-wrapped so dispatch::handle_input_action can drop the
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.
