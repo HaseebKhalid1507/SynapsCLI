@@ -54,6 +54,15 @@ pub struct ExtensionManifest {
     /// Non-secret config declarations resolved by Synaps and passed to initialize.
     #[serde(default)]
     pub config: Vec<ExtensionConfigEntry>,
+    /// OPTIONAL (additive, protocol v1-compatible per docs/STABILITY.md §1):
+    /// theme tokens this extension declares, merged by the TUI into the
+    /// active theme under the `ext.<plugin-id>.<token>` namespace at load.
+    /// Keys are token names (no dots/slashes/spaces); values are hex colors
+    /// (`#rgb` or `#rrggbb`). A user theme-TOML key `ext.<plugin-id>.<token>`
+    /// always overrides the manifest value. Absent => empty map => behavior
+    /// identical to pre-P19.2 manifests.
+    #[serde(default)]
+    pub theme_tokens: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-host-triple prebuilt distribution asset for an extension. Lives
@@ -132,6 +141,26 @@ impl ExtensionManifest {
             return Err(format!("Extension '{}' must subscribe to at least one hook or request a registration permission", id));
         }
 
+        for (token, value) in &self.theme_tokens {
+            if token.trim().is_empty()
+                || token.contains('.')
+                || token.contains('/')
+                || token.contains('\\')
+                || token.contains(char::is_whitespace)
+            {
+                return Err(format!(
+                    "Extension '{}' theme token '{}' is invalid: token names must be non-empty and must not contain dots, slashes, or spaces",
+                    id, token,
+                ));
+            }
+            if !is_hex_color(value) {
+                return Err(format!(
+                    "Extension '{}' theme token '{}' has invalid color '{}': expected '#rgb' or '#rrggbb' hex",
+                    id, token, value,
+                ));
+            }
+        }
+
         let permissions = PermissionSet::try_from_strings(&self.permissions)?;
         let mut subscriptions = Vec::with_capacity(self.hooks.len());
         for sub in &self.hooks {
@@ -161,6 +190,18 @@ impl ExtensionManifest {
             subscriptions,
         })
     }
+}
+
+/// True when `value` is a `#rgb` or `#rrggbb` hex color literal. Used to
+/// fail-closed on malformed `theme_tokens` values at manifest validation
+/// (before the extension process is spawned) instead of silently rendering
+/// nothing.
+fn is_hex_color(value: &str) -> bool {
+    let hex = match value.trim().strip_prefix('#') {
+        Some(h) => h,
+        None => return false,
+    };
+    matches!(hex.len(), 3 | 6) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Supported extension runtime types.
@@ -338,6 +379,7 @@ mod tests {
     #[test]
     fn validate_rejects_unsupported_protocol_version() {
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 999,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -360,6 +402,7 @@ mod tests {
     #[test]
     fn validate_allows_hookless_provider_registration_extensions() {
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -377,6 +420,7 @@ mod tests {
     #[test]
     fn validate_rejects_tool_filter_on_non_tool_hook() {
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "ext".to_string(),
@@ -401,6 +445,7 @@ mod tests {
     #[test]
     fn serialize_roundtrip() {
         let original = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "my-ext".to_string(),
@@ -524,5 +569,79 @@ mod tests {
         let json = r#"{ "url": "https://example.com/x.tar.gz" }"#;
         let res: Result<PrebuiltAsset, _> = serde_json::from_str(json);
         assert!(res.is_err(), "PrebuiltAsset without sha256 must fail to parse");
+    }
+
+    // ── Theme tokens (P19.2, additive-optional per STABILITY.md §1) ─────────
+
+    #[test]
+    fn theme_tokens_absent_defaults_to_empty_and_validates() {
+        // The stability guarantee in one test: a pre-P19.2 manifest (no
+        // theme_tokens key) parses to an empty map and passes validation
+        // exactly as before — additive optional, no protocol bump.
+        let json = r#"{
+            "runtime": "process",
+            "command": "my-ext",
+            "permissions": ["tools.register"]
+        }"#;
+        let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert!(m.theme_tokens.is_empty(), "absent theme_tokens must default to empty");
+        assert!(m.validate("legacy-ext").is_ok(), "legacy manifests must validate unchanged");
+    }
+
+    #[test]
+    fn theme_tokens_deserialize_and_validate() {
+        let json = r##"{
+            "runtime": "process",
+            "command": "my-ext",
+            "permissions": ["tools.register"],
+            "theme_tokens": { "accent": "#22d3ee", "warn": "#fa0" }
+        }"##;
+        let m: ExtensionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.theme_tokens.get("accent").map(String::as_str), Some("#22d3ee"));
+        assert_eq!(m.theme_tokens.get("warn").map(String::as_str), Some("#fa0"));
+        assert!(m.validate("themed-ext").is_ok());
+    }
+
+    #[test]
+    fn theme_tokens_reject_bad_token_names() {
+        for bad in ["with.dot", "with/slash", "with space", ""] {
+            let json = format!(
+                r##"{{
+                    "runtime": "process",
+                    "command": "my-ext",
+                    "permissions": ["tools.register"],
+                    "theme_tokens": {{ "{bad}": "#ffffff" }}
+                }}"##
+            );
+            let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
+            let err = m.validate("bad-ext").unwrap_err();
+            assert!(err.contains("theme token"), "'{bad}' must be rejected: {err}");
+        }
+    }
+
+    #[test]
+    fn theme_tokens_reject_non_hex_colors() {
+        for bad in ["red", "#12345", "#gggggg", "22d3ee", "#"] {
+            let json = format!(
+                r#"{{
+                    "runtime": "process",
+                    "command": "my-ext",
+                    "permissions": ["tools.register"],
+                    "theme_tokens": {{ "accent": "{bad}" }}
+                }}"#
+            );
+            let m: ExtensionManifest = serde_json::from_str(&json).unwrap();
+            let err = m.validate("bad-ext").unwrap_err();
+            assert!(err.contains("invalid color"), "'{bad}' must be rejected: {err}");
+        }
+    }
+
+    #[test]
+    fn is_hex_color_accepts_short_and_long_forms() {
+        assert!(is_hex_color("#22d3ee"));
+        assert!(is_hex_color("#fa0"));
+        assert!(is_hex_color(" #ffffff "));
+        assert!(!is_hex_color("#22d3e"));
+        assert!(!is_hex_color("blue"));
     }
 }

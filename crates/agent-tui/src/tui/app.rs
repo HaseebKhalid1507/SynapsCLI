@@ -1,7 +1,6 @@
 use serde_json::Value;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
-use super::text_metrics::char_width;
 
 // Type re-export shims from slice (a). Kept this release — deleting is churn
 // for no gain. One-release grace per design §5(f).
@@ -14,6 +13,16 @@ pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
 #[allow(unused_imports)]
 pub(crate) use super::transcript::TimestampedMsg;
 
+/// Central TUI state.
+///
+/// T199.2 boundary: `App` is **loop state**, not render input. The render
+/// builder ([`super::draw::build_render_model`]) never takes `App`; it takes
+/// [`super::view_model::ViewInputs`], which names the exact render-input
+/// subset of these fields (input/chrome, session totals, panes, modal
+/// projections). Fields NOT in `ViewInputs` — per-turn accounting, history/
+/// paste/tab bookkeeping, channel endpoints, async task handles — are
+/// invisible to the renderer by construction. Builder-requested mutations
+/// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
     pub(crate) input: String,
@@ -52,7 +61,7 @@ pub(crate) struct App {
     /// denominator adapts when users switch models mid-session. See
     /// `synaps_cli::models::context_window_for_model`.
     pub(crate) last_turn_context_window: u64,
-    pub(crate) api_call_count: u32,
+    api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
@@ -87,6 +96,19 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// P7 modal-routing stack (finished, P7.8). The single source of input
+    /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
+    /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
+    /// (+ the `secret_prompts` queue), never a new owner (§6). Every open/close
+    /// site pushes/pops in lock-step; membership is cross-checked against the
+    /// backing fields by `debug_assert_stack_sync`. Empty ⇒ `top()` is
+    /// `PaneId::Chat` ⇒ input goes to the base chat pane.
+    pub(crate) modal_stack: super::focus::ModalStack,
+    /// P7.8 secret-prompt queue — folded onto App from the `run()` local
+    /// (§5). Drained from the mpsc channel via `poll_requests` in the tick
+    /// arm; `is_active()` is mirrored by `modal_stack.contains(SecretPrompt)`
+    /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
+    pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -126,6 +148,9 @@ pub(crate) struct App {
     pub(crate) widget_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Injectable clock (P6.2). Real in production, Test in the harness so
+    /// time-dependent state (toast expiry, tool timers) stays deterministic.
+    pub(crate) clock: super::clock::TuiClock,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -142,13 +167,22 @@ pub(crate) struct SubagentState {
 }
 
 impl App {
+    /// Test-only convenience constructor: production-equivalent App backed by
+    /// the real system clock. Production code uses `new_with_clock` directly.
+    #[cfg(test)]
     pub(crate) fn new(session: Session) -> Self {
+        Self::new_with_clock(session, super::clock::TuiClock::real())
+    }
+
+    /// Construct an App with an explicit clock (P6.2). `run()` passes
+    /// `TuiClock::real()`; the harness passes `TuiClock::test()`.
+    pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            transcript: TranscriptStore::new(),
+            transcript: TranscriptStore::new(clock.clone()),
             input: String::new(),
             cursor_pos: 0,
             api_messages: Vec::new(),
@@ -191,6 +225,11 @@ impl App {
             plugins: None,
             models: None,
             help_find: None,
+            // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
+            modal_stack: super::focus::ModalStack::new(),
+            // P7.8: folded off the `run()` local; production wires the mpsc
+            // channel separately (mod.rs). Starts empty (no active prompt).
+            secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
@@ -203,13 +242,14 @@ impl App {
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
             active_tasks: std::sync::Arc::new(synaps_cli::extensions::active_tasks::ActiveTasks::new()),
-            toasts: super::toast::ToastProvider::new(),
+            toasts: super::toast::ToastProvider::new(clock.clone()),
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,
             keybinds: None,
+            clock,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
@@ -280,48 +320,7 @@ impl App {
 
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
-    pub(crate) fn input_wrap_info(&self, inner_width: u16) -> (u16, u16, u16) {
-        let w = inner_width.max(1) as usize;
-        // prefix "❯ " is 2 display columns (only on first line)
-        let prefix_width: usize = 2;
-
-        let mut row: u16 = 0;
-        let mut col: usize = prefix_width;
-        let mut cursor_row: u16 = 0;
-        let mut cursor_col: u16 = prefix_width as u16;
-
-        for (i, ch) in self.input.chars().enumerate() {
-            if i == self.cursor_pos {
-                cursor_row = row;
-                cursor_col = col as u16;
-            }
-            if ch == '\n' {
-                row += 1;
-                col = prefix_width; // continuation lines also have 2-char indent
-                continue;
-            }
-            let cw = char_width(ch);
-            if col + cw > w {
-                row += 1;
-                col = 0;
-            }
-            col += cw;
-        }
-        // If cursor is at the end
-        if self.cursor_pos == self.input_char_count() {
-            cursor_row = row;
-            cursor_col = col as u16;
-            // If cursor is exactly at the wrap boundary
-            if col >= w {
-                cursor_row += 1;
-                cursor_col = 0;
-            }
-        }
-
-        let total_lines = row + 1;
-        (total_lines, cursor_row, cursor_col)
-    }
-
+    ///
     pub(crate) async fn save_session(&mut self) {
         if self.api_messages.is_empty() {
             return;
@@ -812,8 +811,8 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app.transcript.test_insert_tool_start_time("call_2".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_2".to_string(), app.clock.now());
 
         assert!(!app.transcript.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
         assert!(app.transcript.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
@@ -840,9 +839,9 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app2.transcript.test_insert_tool_start_time("p1".to_string(), std::time::Instant::now());
-        app2.transcript.test_insert_tool_start_time("p2".to_string(), std::time::Instant::now());
+        app2.transcript.test_set_tool_start_time(Some(app2.clock.now()));
+        app2.transcript.test_insert_tool_start_time("p1".to_string(), app2.clock.now());
+        app2.transcript.test_insert_tool_start_time("p2".to_string(), app2.clock.now());
         assert!(app2.transcript.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
         assert!(app2.transcript.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
@@ -860,7 +859,7 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
 
         assert!(!app.transcript.is_active_tool_result(1));
     }
@@ -878,7 +877,7 @@ mod tests {
             id: 1,
             name: "tester".to_string(),
             status: "running".to_string(),
-            start_time: std::time::Instant::now(),
+            start_time: app.clock.now(),
             done: false,
             duration_secs: None,
         });
@@ -904,8 +903,8 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app.transcript.test_insert_tool_start_time("call_1".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_1".to_string(), app.clock.now());
         {
             let w = 80;
             let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();

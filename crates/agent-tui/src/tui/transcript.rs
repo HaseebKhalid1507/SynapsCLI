@@ -423,6 +423,11 @@ pub(crate) struct TranscriptStore {
     selection_anchor: Option<SelPos>,
     selection_end: Option<SelPos>,
 
+    // ── Injectable clock (P6.2) ──────────────────────────────────────────────
+    /// Real in production, Test in the harness. Backs the per-tool start
+    /// timestamps so tool-timer state is deterministic under test.
+    clock: super::clock::TuiClock,
+
     // ── Perf probe (test-only; P11 §5.2 / lock L4) ───────────────────────────
     #[cfg(any(test, feature = "testing"))]
     probe: PerfProbe,
@@ -467,8 +472,9 @@ pub(crate) struct VisibleWindow {
 }
 
 impl TranscriptStore {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(clock: super::clock::TuiClock) -> Self {
         Self {
+            clock,
             messages: Vec::new(),
             scroll_back: 0,
             scroll_pinned: true,
@@ -1536,7 +1542,7 @@ impl TranscriptStore {
     /// elapsed-ms is correct under parallel execution.
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.drop_empty_thinking();
-        let now = std::time::Instant::now();
+        let now = self.clock.now();
         self.tool_start_time = Some(now);
         if !tool_id.is_empty() {
             self.tool_start_times.insert(tool_id.clone(), now);
@@ -1577,10 +1583,11 @@ impl TranscriptStore {
         self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
+        let now = self.clock.now();
         if !tool_id.is_empty() {
-            self.tool_start_times.entry(tool_id.clone()).or_insert_with(std::time::Instant::now);
+            self.tool_start_times.entry(tool_id.clone()).or_insert(now);
         }
-        self.tool_start_time = Some(std::time::Instant::now());
+        self.tool_start_time = Some(now);
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
             self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
@@ -1871,7 +1878,7 @@ impl TranscriptStore {
 
 impl Default for TranscriptStore {
     fn default() -> Self {
-        Self::new()
+        Self::new(super::clock::TuiClock::real())
     }
 }
 
@@ -1896,7 +1903,7 @@ mod visible_window_tests {
     ///   4. a different scroll_back yields a different window of the same len.
     #[test]
     fn visible_window_publish_clones_only_viewport_not_full_buffer() {
-        let mut store = TranscriptStore::new();
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
 
         // 20 Text messages → each renders as 1 flat line at w=80, so total >= 20.
         for i in 0..20 {
@@ -2085,7 +2092,7 @@ mod source_text_tests {
 
     #[test]
     fn store_source_text_delegates_per_index() {
-        let mut store = TranscriptStore::new();
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
         store.push_msg(ChatMessage::User("u".into()));
         store.push_msg(ChatMessage::Text("t".into()));
         assert_eq!(store.source_text(0), "u");

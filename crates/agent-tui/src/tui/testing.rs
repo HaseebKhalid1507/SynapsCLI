@@ -17,11 +17,16 @@
 //!
 //! # Scope and limitations
 //!
-//! - **Sync scenarios only.** [`InputAction`]s that the real event loop
-//!   resolves asynchronously (message submission → streaming, slash commands,
-//!   plugin outcomes, …) are *recorded* — see [`TestHarness::take_actions`] —
-//!   but not executed. Deterministic clocks and async wait-until-idle are the
-//!   P6 follow-up.
+//! - **Sync scenarios + the bounded slash drive (P6.3).** [`InputAction`]s
+//!   that the real event loop resolves asynchronously (message submission →
+//!   streaming, plugin outcomes, …) are *recorded* — see
+//!   [`TestHarness::take_actions`] — but not executed. The exception is the
+//!   SYNC-SAFE slash-command subset: [`TestHarness::drive_slash_commands`]
+//!   runs recorded slash commands through the production
+//!   `commands::handle_command` / `commands::execute_command_action` path on
+//!   a private current-thread tokio runtime, HARD-BOUNDED by
+//!   [`SLASH_DRIVE_TIMEOUT`] — the drive fails loudly, it never hangs.
+//!   Streaming/engine command outcomes stay P4-style recorded-not-executed.
 //! - The [`Runtime`] inside the harness is [`Runtime::new_headless`]: stub
 //!   credentials, no network, no reaper task. UI state that merely *reads*
 //!   the runtime (model name, thinking level) renders normally.
@@ -49,6 +54,12 @@
 
 use std::sync::Arc;
 
+/// P6.4 — replayable interaction tapes. Lives in a sibling file
+/// (`testing/tape.rs`) but is a child module of `testing`, so it reaches the
+/// harness's driver surface directly.
+#[path = "testing/tape.rs"]
+pub mod tape;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
@@ -58,7 +69,6 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use synaps_cli::skills::keybinds::KeybindRegistry;
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
-use synaps_cli::tools::SecretPromptQueue;
 use synaps_cli::{Runtime, Session};
 
 use super::app::{App, ChatMessage};
@@ -74,13 +84,46 @@ pub struct TestHarness {
     runtime: Runtime,
     registry: Arc<CommandRegistry>,
     keybinds: KeybindRegistry,
-    secret_prompts: SecretPromptQueue,
     terminal: Terminal<TestBackend>,
     size: Size,
     /// Human-readable records of dispatched [`InputAction`]s the harness
     /// cannot execute synchronously (submissions, slash commands, …).
     actions: Vec<String>,
+    /// Structured queue of dispatched slash commands awaiting the P6.3
+    /// bounded async drive ([`Self::drive_slash_commands`]).
+    pending_slash: Vec<(String, String)>,
     quit_requested: bool,
+}
+
+/// Hard upper bound on any single bounded async drive (P6.3). A slash
+/// command that has not resolved within this budget panics the test —
+/// deterministic failure instead of a hung harness.
+pub const SLASH_DRIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// P6.3 bounded executor: run one future to completion on a throwaway
+/// current-thread tokio runtime, capped by [`SLASH_DRIVE_TIMEOUT`].
+///
+/// Invariants:
+/// - **Never hangs.** `tokio::time::timeout` is the hard bound; on expiry we
+///   panic with `what` so the failure names the offending command.
+/// - **Drain-to-idle.** `block_on` returns only when the future is `Ready`;
+///   there are no detached tasks — the sync-safe subset spawns nothing.
+/// - Must be called from a NON-async test (`#[test]`, not `#[tokio::test]`):
+///   nesting runtimes panics immediately (deterministic, not a hang).
+fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread tokio runtime construction is infallible");
+    rt.block_on(async move {
+        match tokio::time::timeout(SLASH_DRIVE_TIMEOUT, fut).await {
+            Ok(out) => out,
+            Err(_) => panic!(
+                "bounded async drive timed out after {SLASH_DRIVE_TIMEOUT:?}: {what} — \
+                 this command is not in the sync-safe subset; keep it P4-style recorded"
+            ),
+        }
+    })
 }
 
 impl TestHarness {
@@ -92,7 +135,7 @@ impl TestHarness {
     /// Boot a headless App at an explicit geometry.
     pub fn boot_with_size(cols: u16, rows: u16) -> Self {
         let session = Session::new(synaps_cli::models::default_model(), "medium", None);
-        let mut app = App::new(session);
+        let mut app = App::new_with_clock(session, super::clock::TuiClock::test());
         // Determinism: `App::new` resolves agent_name from the user config —
         // pin it so snapshots don't vary per machine.
         app.agent_name = "agent".to_string();
@@ -113,10 +156,10 @@ impl TestHarness {
             runtime: Runtime::new_headless(),
             registry: Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, Vec::new())),
             keybinds: KeybindRegistry::new(),
-            secret_prompts: SecretPromptQueue::new(),
             terminal,
             size: Size::new(cols, rows),
             actions: Vec::new(),
+            pending_slash: Vec::new(),
             quit_requested: false,
         }
     }
@@ -182,14 +225,16 @@ impl TestHarness {
     /// maintenance), then draw it with the production frame body. Returns
     /// the rendered [`Buffer`] for cell-level assertions.
     pub fn render(&mut self) -> &Buffer {
-        let model = build_render_model(
-            &mut self.app,
+        let (model, patch) = build_render_model(
+            &mut super::view_model::ViewInputs::from_app(&mut self.app),
             &self.runtime,
             &self.registry,
-            &self.secret_prompts,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
+        // Mirror the main loop: apply the builder's patch to authoritative
+        // App state so modal geometry persists across harness frames.
+        patch.apply(&mut self.app);
 
         // Effects are render-thread state; the harness renders effect-free,
         // deterministic frames. Duration::ZERO keeps any effect math inert.
@@ -222,14 +267,16 @@ impl TestHarness {
     /// the lifecycle enter/leave sequences do not pass through here — see
     /// `tests/vt100_spike.rs` for the full scoping note.
     pub fn render_ansi(&mut self) -> Vec<u8> {
-        let model = build_render_model(
-            &mut self.app,
+        let (model, patch) = build_render_model(
+            &mut super::view_model::ViewInputs::from_app(&mut self.app),
             &self.runtime,
             &self.registry,
-            &self.secret_prompts,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
+        // Mirror the main loop: apply the builder's patch to authoritative
+        // App state so modal geometry persists across harness frames.
+        patch.apply(&mut self.app);
 
         // Shared in-memory sink: `CrosstermBackend::writer_mut` is unstable
         // in ratatui 0.30 (`backend-writer` feature), so instead of taking
@@ -327,12 +374,17 @@ impl TestHarness {
     /// Open the settings modal directly (bypasses the async command dispatch).
     pub fn open_settings_modal(&mut self) -> &mut Self {
         self.app.settings = Some(super::settings::SettingsState::new());
+        // P7.7 HARNESS HELPER RULE: mirror production — opening a migrated modal
+        // pushes onto the ModalStack, else `debug_assert_stack_sync` (run after
+        // every harness `event()`) trips on the missing Settings push.
+        self.app.modal_stack.push(super::focus::PaneId::Settings);
         self
     }
 
     /// Open the models modal directly.
     pub fn open_models_modal(&mut self) -> &mut Self {
         self.app.models = Some(super::models::ModelsModalState::new());
+        self.app.modal_stack.push(super::focus::PaneId::Models);
         self
     }
 
@@ -341,7 +393,122 @@ impl TestHarness {
         self.app.plugins = Some(super::plugins::PluginsModalState::new(
             synaps_cli::skills::state::PluginsState::default(),
         ));
+        // P7.6 HARNESS HELPER RULE: mirror production — every open of a migrated
+        // modal pushes onto the ModalStack, else `debug_assert_stack_sync`
+        // (run after every harness `event()`) trips on the missing Plugins push.
+        self.app.modal_stack.push(super::focus::PaneId::Plugins);
         self
+    }
+
+    /// P7.8: inject and activate an async secret prompt — the harness
+    /// equivalent of a tool calling `SecretPromptHandle::prompt`. Sends a
+    /// request through a throwaway channel, drains it into `app.secret_prompts`
+    /// via the same `poll_requests` the tick arm uses, then reconciles the modal
+    /// stack exactly as production does. The response receiver is dropped: the
+    /// harness asserts on UI state (buffer / stack / frame), not the tool reply.
+    pub fn activate_secret_prompt(&mut self, title: &str, prompt: &str) -> &mut Self {
+        use synaps_cli::tools::SecretPromptRequest;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            response_tx,
+        })
+        .expect("secret prompt request send is infallible on a fresh channel");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        self.app.secret_prompts.poll_requests(&rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        self
+    }
+
+    /// Whether a secret prompt is currently active (mirrors the SecretPrompt
+    /// stack membership by the P7.8 sync invariant).
+    pub fn secret_prompt_active(&self) -> bool {
+        self.app.secret_prompts.is_active()
+    }
+
+    /// Current modal-stack depth (0 = base Chat pane, no modals open).
+    pub fn modal_stack_depth(&self) -> usize {
+        self.app.modal_stack.depth()
+    }
+
+    /// Stable, machine-independent name of the pane that currently receives
+    /// input (`modal_stack.top()`). `"chat"` is the base pane (empty stack).
+    /// P7.9: lets integration tests assert *which* pane is top-of-stack without
+    /// naming the crate-private `PaneId` type.
+    pub fn top_pane_name(&self) -> &'static str {
+        use super::focus::PaneId;
+        match self.app.modal_stack.top() {
+            PaneId::Chat => "chat",
+            PaneId::HelpFind => "help-find",
+            PaneId::Models => "models",
+            PaneId::Plugins => "plugins",
+            PaneId::Settings => "settings",
+            PaneId::PluginEditor => "plugin-editor",
+            PaneId::SecretPrompt => "secret-prompt",
+        }
+    }
+
+    /// Left/Right focus side of the open settings modal as the draw layer reads
+    /// it (`settings.focus`, the synced projection of the FocusManager ring).
+    /// `None` when settings is closed. P7.9 focus-traversal witness.
+    pub fn settings_focus_side(&self) -> Option<&'static str> {
+        self.app.settings.as_ref().map(|st| match st.focus {
+            super::settings::Focus::Left => "left",
+            super::settings::Focus::Right => "right",
+        })
+    }
+
+    /// Left/Right focus side of the open plugins modal as the draw layer reads
+    /// it (`plugins.focus`, the synced projection of the FocusManager ring).
+    /// `None` when plugins is closed. P7.9 focus-traversal witness.
+    pub fn plugins_focus_side(&self) -> Option<&'static str> {
+        self.app.plugins.as_ref().map(|st| match st.focus {
+            super::plugins::state::Focus::Left => "left",
+            super::plugins::state::Focus::Right => "right",
+        })
+    }
+
+    /// Open the nested plugin-custom editor ON TOP of an already-open settings
+    /// modal — the harness equivalent of `InputAction::PluginEditorOpen`
+    /// resolving. Sets `edit_mode = PluginCustom(..)` and pushes
+    /// `PaneId::PluginEditor`, mirroring production (`mod.rs`) so
+    /// `debug_assert_stack_sync` stays satisfied. No-op if settings is closed.
+    pub fn open_plugin_editor(&mut self) -> &mut Self {
+        use super::settings::plugin_editor::PluginEditorSession;
+        use synaps_cli::extensions::settings_editor::SettingsEditorRenderParams;
+        if let Some(st) = self.app.settings.as_mut() {
+            let render = SettingsEditorRenderParams {
+                rows: Vec::new(),
+                cursor: None,
+                footer: None,
+            };
+            st.edit_mode = Some(super::settings::ActiveEditor::PluginCustom {
+                plugin_id: "demo".to_string(),
+                category: "general".to_string(),
+                field: "token".to_string(),
+                render: PluginEditorSession {
+                    plugin_id: "demo".to_string(),
+                    category: "general".to_string(),
+                    field: "token".to_string(),
+                    render,
+                },
+            });
+            self.app
+                .modal_stack
+                .push(super::focus::PaneId::PluginEditor);
+        }
+        self
+    }
+
+    /// Whether the nested PluginCustom editor is currently active — mirrors the
+    /// `PaneId::PluginEditor` stack membership by the P7.7 sync invariant.
+    pub fn plugin_editor_active(&self) -> bool {
+        matches!(
+            self.app.settings.as_ref().map(|st| &st.edit_mode),
+            Some(Some(super::settings::ActiveEditor::PluginCustom { .. }))
+        )
     }
 
     /// Current transcript scrollback offset (0 = pinned to bottom).
@@ -388,6 +555,161 @@ impl TestHarness {
         self
     }
 
+    // ── Deterministic clock / toast control (P6.2) ──────────────────────────
+
+    /// Advance the injectable [`TuiClock`] by `ms` milliseconds. Under the
+    /// harness the clock is frozen at boot, so time-dependent state (toast
+    /// expiry, tool timers) only moves when the test calls this.
+    pub fn advance_clock_ms(&mut self, ms: u64) -> &mut Self {
+        self.app.clock.advance(std::time::Duration::from_millis(ms));
+        self
+    }
+
+    /// Publish a toast with an explicit TTL (seconds) through the same
+    /// provider the app uses. Expiry is governed by the frozen clock.
+    pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
+        let toast = super::toast::Toast::new(id, text)
+            .ttl(Some(std::time::Duration::from_secs(ttl_secs)));
+        self.app.toasts.upsert(toast);
+        self
+    }
+
+    /// Publish a toast anchored dead-CENTER (overlapping the secret-prompt box's
+    /// centered draw rect). Used by the P7.9 toast-vs-prompt z-order pin: the
+    /// prompt is drawn AFTER toasts and issues a `Clear`, so a CENTER toast must
+    /// end up painted *under* the prompt. Long TTL under the frozen boot clock.
+    pub fn push_center_toast(&mut self, id: &str, text: &str) -> &mut Self {
+        let toast = super::toast::Toast::new(id, text)
+            .at(super::toast::ToastPosition::CENTER)
+            .ttl(Some(std::time::Duration::from_secs(3600)));
+        self.app.toasts.upsert(toast);
+        self
+    }
+
+    /// Run one toast expiry sweep against the current clock time. Returns
+    /// `true` if any toast was reaped.
+    pub fn tick_toasts(&mut self) -> bool {
+        self.app.toasts.tick()
+    }
+
+    /// Number of currently-live toasts.
+    pub fn toast_count(&self) -> usize {
+        self.app.toasts.visible().count()
+    }
+
+    // ── Bounded async slash drive (P6.3) ─────────────────────────────────────
+
+    /// Execute every slash command recorded since the last drive through the
+    /// REAL production resolution path — `commands::handle_command` and, for
+    /// plugin commands, `commands::execute_command_action` — against the
+    /// headless [`Runtime`]. Each command is bounded by [`SLASH_DRIVE_TIMEOUT`]
+    /// on a private current-thread runtime: the drive fails, it never hangs.
+    ///
+    /// Scope: the SYNC-SAFE, App-mutating subset. `CommandAction` arms that
+    /// production resolves against the live terminal or engine (gamba launch,
+    /// skill-load streaming, plugin reload, …) are recorded as
+    /// `command-action-unexecuted:*` in [`Self::take_actions`], never run.
+    pub fn drive_slash_commands(&mut self) -> &mut Self {
+        for (cmd, arg) in std::mem::take(&mut self.pending_slash) {
+            self.run_slash_command(&cmd, &arg);
+        }
+        self
+    }
+
+    /// Run one slash command (already prefix-resolved, no leading `/`)
+    /// through the bounded async path directly. Building block of
+    /// [`Self::drive_slash_commands`]; useful when a test wants the command
+    /// executed without typing it.
+    pub fn run_slash_command(&mut self, cmd: &str, arg: &str) -> &mut Self {
+        // Production threads the boot-resolved system-prompt path; the
+        // harness pins a temp-dir path so `/system save` never touches
+        // a real config. Nothing reads it unless the test invokes it.
+        let system_prompt_path = std::env::temp_dir().join("synaps-harness-system-prompt.md");
+        let what = format!("handle_command(/{cmd} {arg})");
+        let action = block_on_bounded(
+            &what,
+            super::commands::handle_command(
+                cmd,
+                arg,
+                &mut self.app,
+                &mut self.runtime,
+                &system_prompt_path,
+                &self.registry,
+                &self.keybinds,
+            ),
+        );
+        self.apply_command_action(action);
+        self
+    }
+
+    /// Apply a resolved [`super::commands::CommandAction`], mirroring the
+    /// production `SlashCommand` arm in `mod.rs` for the sync-safe subset —
+    /// including the ModalStack pushes, so `debug_assert_stack_sync` holds
+    /// after every drive exactly as it does after every real event.
+    fn apply_command_action(&mut self, action: super::commands::CommandAction) {
+        use super::commands::CommandAction;
+        match action {
+            CommandAction::None | CommandAction::StartStream => {}
+            CommandAction::Quit => {
+                // Production sends the exit effect; headless we record intent.
+                self.quit_requested = true;
+            }
+            CommandAction::OpenHelpFind { query } => {
+                // Mirrors mod.rs `CommandAction::OpenHelpFind` (P7.4 arm).
+                let help_registry = synaps_cli::help::HelpRegistry::new(
+                    synaps_cli::help::builtin_entries(),
+                    self.registry.plugin_help_entries(),
+                );
+                self.app.help_find = Some(synaps_cli::help::HelpFindState::new(
+                    help_registry.entries().to_vec(),
+                    &query,
+                ));
+                self.app.modal_stack.push(super::focus::PaneId::HelpFind);
+            }
+            CommandAction::OpenModels => {
+                self.app.models = Some(super::models::ModelsModalState::new());
+                self.app.modal_stack.push(super::focus::PaneId::Models);
+            }
+            CommandAction::OpenSettings => {
+                self.app.settings = Some(super::settings::SettingsState::new());
+                self.app.modal_stack.push(super::focus::PaneId::Settings);
+            }
+            CommandAction::OpenPlugins => {
+                // Production loads plugins.json from disk; the harness opens
+                // the deterministic default state instead of touching $HOME.
+                self.app.plugins = Some(super::plugins::PluginsModalState::new(
+                    synaps_cli::skills::state::PluginsState::default(),
+                ));
+                self.app.modal_stack.push(super::focus::PaneId::Plugins);
+            }
+            CommandAction::PluginCommand { command, arg } => {
+                // The commands.rs:114 executor — bounded like everything else.
+                // The default harness registry has no plugin commands, so this
+                // arm only fires for tests that register their own.
+                block_on_bounded(
+                    "execute_command_action(PluginCommand)",
+                    super::commands::execute_command_action(
+                        CommandAction::PluginCommand { command, arg },
+                        &mut self.app,
+                        &self.runtime,
+                    ),
+                );
+            }
+            // NOT sync-safe: terminal-mode swaps, engine streaming, config
+            // reloads. These stay P4-style recorded-not-executed.
+            CommandAction::LaunchGamba => self.record_unexecuted("launch-gamba"),
+            CommandAction::ReloadPlugins => self.record_unexecuted("reload-plugins"),
+            CommandAction::LoadSkill { .. } => self.record_unexecuted("load-skill"),
+            _ => self.record_unexecuted("other"),
+        }
+        #[cfg(debug_assertions)]
+        super::focus::debug_assert_stack_sync(&self.app);
+    }
+
+    fn record_unexecuted(&mut self, name: &str) {
+        self.actions.push(format!("command-action-unexecuted:{name}"));
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     fn record(&mut self, action: InputAction) {
@@ -398,7 +720,12 @@ impl TestHarness {
                 "quit".to_string()
             }
             InputAction::Submit(text) => format!("submit:{text}"),
-            InputAction::SlashCommand(cmd, arg) => format!("slash:{cmd}:{arg}"),
+            InputAction::SlashCommand(cmd, arg) => {
+                let desc = format!("slash:{cmd}:{arg}");
+                // P6.3: also queue structurally for the bounded async drive.
+                self.pending_slash.push((cmd, arg));
+                desc
+            }
             InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
@@ -441,4 +768,17 @@ impl std::io::Write for SharedSink {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// P16.2 test facade — re-exports the termcaps query-burst surface so
+/// integration tests (`tests/vt100_spike.rs`, and P16.4's negotiation matrix)
+/// can assert on the exact burst bytes and drive the pure reply parser with
+/// synthetic DA1-fenced streams. The `tui::termcaps` module itself stays
+/// private; this facade only exists under the `testing` feature. The async
+/// fd-0 `negotiate()` path is deliberately NOT exported — tests must never
+/// touch real stdin (single-consumer rule).
+pub mod termcaps {
+    pub use super::super::termcaps::{
+        parse_burst_replies, write_query_burst, BurstReplies, TermCaps, BURST_TIMEOUT, QUERY_BURST,
+    };
 }

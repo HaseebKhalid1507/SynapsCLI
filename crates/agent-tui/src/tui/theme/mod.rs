@@ -5,6 +5,18 @@ use std::sync::LazyLock;
 
 mod palettes;
 
+/// Identifies a piece of high-value modal chrome for per-part style
+/// resolution. Each variant maps to an optional `<modal>.border` /
+/// `<modal>.title` override key in the user theme file. When no override is
+/// set the resolver falls back to the shared base token, so the default look
+/// is byte-identical to before per-part overrides existed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModalKind {
+    Settings,
+    Plugins,
+    Models,
+}
+
 /// All colors used by the TUI, grouped so they can be overridden from a
 /// user theme file. Defaults match the current built-in look.
 ///
@@ -79,6 +91,29 @@ pub(crate) struct Theme {
     pub(crate) tool_generic: Color,
     pub(crate) tool_input_bg: Color,
     pub(crate) tool_output_bg: Color,
+
+    // --- Per-part chrome overrides (P19.1) --------------------------------
+    // Optional overlays keyed off dotted TOML names (e.g. `settings.border`).
+    // `None` is the default for every field, which means "resolve to the base
+    // token" — so an unconfigured theme renders exactly as it did before these
+    // fields existed. Only set when a user opts in per part.
+    pub(crate) settings_border: Option<Color>,
+    pub(crate) settings_title: Option<Color>,
+    pub(crate) plugins_border: Option<Color>,
+    pub(crate) plugins_title: Option<Color>,
+    pub(crate) models_border: Option<Color>,
+    pub(crate) models_title: Option<Color>,
+    /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
+    /// back to `muted`, the color the pill uses today.
+    pub(crate) sidecar_pill: Option<Color>,
+
+    // --- Namespaced extension tokens (P19.2) -------------------------------
+    /// User-TOML overrides for extension theme tokens, keyed by the full
+    /// dotted name `ext.<plugin-id>.<token>`. Parsed by `set` from any theme
+    /// file line whose key starts with `ext.`. These always WIN over
+    /// manifest-declared values (see [`Theme::ext_token`]). Empty by default,
+    /// so themes without `ext.*` keys are unaffected.
+    pub(crate) ext_overrides: std::collections::HashMap<String, Color>,
 }
 
 impl Default for Theme {
@@ -146,6 +181,19 @@ impl Default for Theme {
             tool_generic: Color::Reset,
             tool_input_bg: Color::Reset,
             tool_output_bg: Color::Reset,
+
+            // Per-part overrides are absent by default => resolvers fall back
+            // to base tokens => zero visual change across all 18 palettes.
+            settings_border: None,
+            settings_title: None,
+            plugins_border: None,
+            plugins_title: None,
+            models_border: None,
+            models_title: None,
+            sidecar_pill: None,
+
+            // No user overrides for extension tokens by default.
+            ext_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -248,8 +296,112 @@ impl Theme {
             "tool_generic" => self.tool_generic = c,
             "tool_input_bg" => self.tool_input_bg = c,
             "tool_output_bg" => self.tool_output_bg = c,
+
+            // Per-part chrome overrides (dotted keys). Present => Some(c).
+            "settings.border" => self.settings_border = Some(c),
+            "settings.title" => self.settings_title = Some(c),
+            "plugins.border" => self.plugins_border = Some(c),
+            "plugins.title" => self.plugins_title = Some(c),
+            "models.border" => self.models_border = Some(c),
+            "models.title" => self.models_title = Some(c),
+            "sidecar.pill" => self.sidecar_pill = Some(c),
+
+            // Extension token overrides (P19.2): any `ext.<id>.<token>` key
+            // is stored verbatim; resolution happens in `ext_token`.
+            k if k.starts_with("ext.") => {
+                self.ext_overrides.insert(k.to_string(), c);
+            }
             _ => {}, // unknown key, ignore
         }
+    }
+}
+
+/// Per-part style resolvers (P19.1).
+///
+/// Resolution rule: **part override if present, else the base token**. The
+/// border resolver always returns a concrete `Color` (base = `border_active`)
+/// so the call site is unconditional and identical to today when unset. The
+/// title resolver returns `Option<Color>`: today no modal sets a title style,
+/// so the call site applies `.title_style(..)` ONLY when `Some`, keeping the
+/// unset path byte-identical.
+impl Theme {
+    /// Border color for a modal's outer block. Falls back to `border_active`.
+    pub(crate) fn modal_border(&self, kind: ModalKind) -> Color {
+        let part = match kind {
+            ModalKind::Settings => self.settings_border,
+            ModalKind::Plugins => self.plugins_border,
+            ModalKind::Models => self.models_border,
+        };
+        part.unwrap_or(self.border_active)
+    }
+
+    /// Optional title color for a modal's block. `None` => leave the title
+    /// unstyled exactly as today (do not call `.title_style`).
+    pub(crate) fn modal_title(&self, kind: ModalKind) -> Option<Color> {
+        match kind {
+            ModalKind::Settings => self.settings_title,
+            ModalKind::Plugins => self.plugins_title,
+            ModalKind::Models => self.models_title,
+        }
+    }
+
+    /// Resting tint of the sidecar header pill. Falls back to `muted`.
+    pub(crate) fn sidecar_pill_color(&self) -> Color {
+        self.sidecar_pill.unwrap_or(self.muted)
+    }
+
+    /// Resolve a namespaced extension theme token `ext.<ext_id>.<token>`
+    /// (P19.2). Resolution order: user theme-TOML override (in
+    /// `ext_overrides`) → extension manifest declaration (in the load-time
+    /// registry) → `None`. Extension-rendered surfaces treat `None` as "use
+    /// whatever base token you use today", so extensions that declare no
+    /// tokens — and users that set no overrides — see zero change.
+    pub(crate) fn ext_token(&self, ext_id: &str, token: &str) -> Option<Color> {
+        let key = format!("ext.{ext_id}.{token}");
+        if let Some(c) = self.ext_overrides.get(&key) {
+            return Some(*c);
+        }
+        EXT_DECLARED_TOKENS
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).copied())
+    }
+}
+
+/// Extension-declared theme tokens, keyed `ext.<plugin-id>.<token>` (P19.2).
+///
+/// Lives OUTSIDE the `Theme` value on purpose: the theme in [`THEME`] is
+/// rebuilt wholesale on palette switches (`set_theme`), and manifest-declared
+/// tokens must survive that — they are a property of the loaded extensions,
+/// not of the palette. User overrides, by contrast, live inside `Theme`
+/// (parsed from the theme file) and therefore correctly reload with it.
+static EXT_DECLARED_TOKENS: LazyLock<std::sync::RwLock<std::collections::HashMap<String, Color>>> =
+    LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Merge one extension's manifest-declared theme tokens into the registry
+/// under `ext.<ext_id>.<token>` (P19.2). Values are `#rgb`/`#rrggbb` hex;
+/// unparseable entries are skipped (same forgiving posture as the theme-file
+/// loader — the manifest validator upstream already rejects them at load).
+/// Idempotent per (ext, token): reloading an extension re-registers cleanly.
+pub(crate) fn register_ext_theme_tokens<'a>(
+    ext_id: &str,
+    tokens: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
+    if let Ok(mut map) = EXT_DECLARED_TOKENS.write() {
+        for (token, value) in tokens {
+            if let Some(color) = parse_hex_color(value) {
+                map.insert(format!("ext.{ext_id}.{token}"), color);
+            }
+        }
+    }
+}
+
+/// Drop all declared tokens for one extension (unload hygiene).
+#[allow(dead_code)]
+pub(crate) fn clear_ext_theme_tokens(ext_id: &str) {
+    if let Ok(mut map) = EXT_DECLARED_TOKENS.write() {
+        let prefix = format!("ext.{ext_id}.");
+        map.retain(|k, _| !k.starts_with(&prefix));
     }
 }
 
@@ -370,5 +522,209 @@ mod theme_tests {
         let t = Theme::builtin("dracula").expect("dracula exists");
         assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_input_bg, Color::Reset);
+    }
+
+    // ---- Per-part chrome overrides (P19.1) --------------------------------
+
+    #[test]
+    fn per_part_overrides_absent_by_default() {
+        // The whole point: no part keys => every Option is None => resolvers
+        // fall back to base tokens => frames are byte-identical to today.
+        let t = Theme::default();
+        assert_eq!(t.settings_border, None);
+        assert_eq!(t.settings_title, None);
+        assert_eq!(t.plugins_border, None);
+        assert_eq!(t.plugins_title, None);
+        assert_eq!(t.models_border, None);
+        assert_eq!(t.models_title, None);
+        assert_eq!(t.sidecar_pill, None);
+    }
+
+    #[test]
+    fn modal_border_falls_back_to_base_token_when_unset() {
+        // Regression guard: absent part key => resolver returns border_active,
+        // identical to the value every modal used before P19.1.
+        let t = Theme::default();
+        assert_eq!(t.modal_border(ModalKind::Settings), t.border_active);
+        assert_eq!(t.modal_border(ModalKind::Plugins), t.border_active);
+        assert_eq!(t.modal_border(ModalKind::Models), t.border_active);
+    }
+
+    #[test]
+    fn modal_title_is_none_when_unset() {
+        // None => call sites skip `.title_style` => title unstyled as today.
+        let t = Theme::default();
+        assert_eq!(t.modal_title(ModalKind::Settings), None);
+        assert_eq!(t.modal_title(ModalKind::Plugins), None);
+        assert_eq!(t.modal_title(ModalKind::Models), None);
+    }
+
+    #[test]
+    fn sidecar_pill_falls_back_to_muted_when_unset() {
+        let t = Theme::default();
+        assert_eq!(t.sidecar_pill_color(), t.muted);
+    }
+
+    #[test]
+    fn fallback_holds_across_all_18_palettes() {
+        // Every built-in palette, with no part overrides, must resolve each
+        // part to its base token — the "zero regression across 18 palettes"
+        // guarantee, asserted directly against the resolvers.
+        // The 18 named palettes plus the built-in `default` (19 total).
+        const NAMES: [&str; 19] = [
+            "default", "night-city", "neon-rain", "amber", "phosphor",
+            "solarized-dark", "blood", "ocean", "rose-pine", "nord", "dracula",
+            "monokai", "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
+            "forest", "lavender",
+        ];
+        for name in NAMES {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
+            for kind in [ModalKind::Settings, ModalKind::Plugins, ModalKind::Models] {
+                assert_eq!(
+                    t.modal_border(kind),
+                    t.border_active,
+                    "{name}: {kind:?} border must fall back to border_active"
+                );
+                assert_eq!(t.modal_title(kind), None, "{name}: {kind:?} title must be None");
+            }
+            assert_eq!(t.sidecar_pill_color(), t.muted, "{name}: pill falls back to muted");
+        }
+    }
+
+    #[test]
+    fn settings_border_distinct_from_plugins_border() {
+        // Acceptance (a): a user TOML setting settings.border != plugins.border
+        // makes the resolver return *different* colors — so the two modals
+        // render distinctly. Parsed through the real `set`/dotted-key path.
+        let mut t = Theme::default();
+        t.set("settings.border", Color::Rgb(0xAA, 0x00, 0x00));
+        t.set("plugins.border", Color::Rgb(0x00, 0x00, 0xBB));
+        let sb = t.modal_border(ModalKind::Settings);
+        let pb = t.modal_border(ModalKind::Plugins);
+        assert_eq!(sb, Color::Rgb(0xAA, 0x00, 0x00));
+        assert_eq!(pb, Color::Rgb(0x00, 0x00, 0xBB));
+        assert_ne!(sb, pb, "settings border must differ from plugins border");
+        // Models was NOT overridden => still falls back to base token.
+        assert_eq!(t.modal_border(ModalKind::Models), t.border_active);
+    }
+
+    #[test]
+    fn per_part_keys_parse_from_theme_file_lines() {
+        // Exercise the same dotted-key path the TOML loader uses.
+        let mut t = Theme::default();
+        t.set("settings.title", Color::Rgb(1, 2, 3));
+        t.set("plugins.title", Color::Rgb(4, 5, 6));
+        t.set("models.border", Color::Rgb(7, 8, 9));
+        t.set("sidecar.pill", Color::Rgb(10, 11, 12));
+        assert_eq!(t.modal_title(ModalKind::Settings), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(t.modal_title(ModalKind::Plugins), Some(Color::Rgb(4, 5, 6)));
+        assert_eq!(t.modal_border(ModalKind::Models), Color::Rgb(7, 8, 9));
+        assert_eq!(t.sidecar_pill_color(), Color::Rgb(10, 11, 12));
+        // Unknown dotted keys are still ignored, not panics.
+        t.set("bogus.key", Color::Rgb(0, 0, 0));
+    }
+
+    // ---- Namespaced extension tokens (P19.2) -------------------------------
+    // NOTE: the declared-token registry is a process-wide static; every test
+    // below uses a unique ext id so tests stay independent under parallel run.
+
+    #[test]
+    fn ext_token_is_none_when_nothing_declared() {
+        // Baseline: no manifest declaration, no user override => None.
+        // This is the "existing extensions unaffected" guarantee.
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-none-ext", "accent"), None);
+    }
+
+    #[test]
+    fn manifest_declared_token_resolves() {
+        // Acceptance: an extension ships a token; it resolves via ext_token.
+        register_ext_theme_tokens("p192-decl-ext", [("accent", "#22d3ee")]);
+        let t = Theme::default();
+        assert_eq!(
+            t.ext_token("p192-decl-ext", "accent"),
+            Some(Color::Rgb(0x22, 0xd3, 0xee))
+        );
+        // A token the extension did NOT declare stays None.
+        assert_eq!(t.ext_token("p192-decl-ext", "other"), None);
+    }
+
+    #[test]
+    fn user_toml_override_wins_over_manifest() {
+        // Acceptance: user theme TOML `ext.<id>.<token>` beats the manifest.
+        register_ext_theme_tokens("p192-override-ext", [("accent", "#111111")]);
+        let mut t = Theme::default();
+        // Same dotted-key path the theme-file loader uses.
+        t.set("ext.p192-override-ext.accent", Color::Rgb(0xAA, 0xBB, 0xCC));
+        assert_eq!(
+            t.ext_token("p192-override-ext", "accent"),
+            Some(Color::Rgb(0xAA, 0xBB, 0xCC)),
+            "user override must win over the manifest-declared value"
+        );
+    }
+
+    #[test]
+    fn user_override_resolves_even_without_declaration() {
+        // A user may theme a token the extension never declared — still works.
+        let mut t = Theme::default();
+        t.set("ext.p192-useronly-ext.badge", Color::Rgb(1, 2, 3));
+        assert_eq!(
+            t.ext_token("p192-useronly-ext", "badge"),
+            Some(Color::Rgb(1, 2, 3))
+        );
+    }
+
+    #[test]
+    fn declared_tokens_survive_palette_switch() {
+        // The registry lives outside Theme, so switching palettes (a fresh
+        // Theme value) must not lose manifest-declared tokens.
+        register_ext_theme_tokens("p192-switch-ext", [("accent", "#fa0")]);
+        let fresh = Theme::builtin("dracula").expect("dracula exists");
+        assert_eq!(
+            fresh.ext_token("p192-switch-ext", "accent"),
+            Some(Color::Rgb(0xff, 0xaa, 0x00)), // #fa0 short-form expansion
+        );
+    }
+
+    #[test]
+    fn malformed_declared_values_are_skipped() {
+        // register_ext_theme_tokens is forgiving: bad hex never lands.
+        register_ext_theme_tokens("p192-badhex-ext", [("accent", "not-a-color")]);
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-badhex-ext", "accent"), None);
+    }
+
+    #[test]
+    fn clear_ext_theme_tokens_removes_only_that_extension() {
+        register_ext_theme_tokens("p192-clear-a", [("accent", "#111111")]);
+        register_ext_theme_tokens("p192-clear-b", [("accent", "#222222")]);
+        clear_ext_theme_tokens("p192-clear-a");
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-clear-a", "accent"), None);
+        assert_eq!(
+            t.ext_token("p192-clear-b", "accent"),
+            Some(Color::Rgb(0x22, 0x22, 0x22))
+        );
+    }
+
+    #[test]
+    fn hello_ext_demo_token_resolves_and_user_override_wins() {
+        // The P19.2 acceptance vehicle: hello-ext (examples/extensions/
+        // hello-ext) declares `accent = #22d3ee` in its manifest. Simulate
+        // exactly what the extension-loader arm does at load, then apply a
+        // user TOML override and confirm it wins.
+        register_ext_theme_tokens("hello-ext", [("accent", "#22d3ee")]);
+        let mut t = Theme::default();
+        assert_eq!(
+            t.ext_token("hello-ext", "accent"),
+            Some(Color::Rgb(0x22, 0xd3, 0xee)),
+            "hello-ext's manifest token must resolve"
+        );
+        t.set("ext.hello-ext.accent", Color::Rgb(0xff, 0x00, 0xff));
+        assert_eq!(
+            t.ext_token("hello-ext", "accent"),
+            Some(Color::Rgb(0xff, 0x00, 0xff)),
+            "user TOML `ext.hello-ext.accent` must override the manifest"
+        );
     }
 }

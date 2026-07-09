@@ -41,6 +41,14 @@ pub(super) enum InputAction {
 }
 
 /// Process a crossterm Event and return what the main loop should do.
+///
+/// P7.8: modal routing is now FULLY stack-driven. `handle_event` dispatches on
+/// `modal_stack.top()`: the empty-stack `Chat` case is the base pane
+/// (`handle_event_inner`), every modal has its own stack-routed pane handler,
+/// and the async SecretPrompt is folded in (§5). The legacy if-let modal chain
+/// is gone. BOTH the base path and every pane-handler path (including their pop
+/// paths) converge on `action` so the debug-only stack/app sync tripwire always
+/// runs afterwards.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -50,162 +58,44 @@ pub(super) fn handle_event(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // Route events to /help find while it's open.
-    if let Some(state) = app.help_find.as_mut() {
-        if let Event::Key(key) = event {
-            let outcome = super::help_find::handle_event(state, key);
-            return match outcome {
-                super::help_find::HelpFindAction::Close => {
-                    app.help_find = None;
-                    InputAction::None
-                }
-                super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
-            };
+    // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
+    // `Chat` (empty stack) is the base pane; every modal + the folded-in
+    // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.
+    let action = match app.modal_stack.top() {
+        super::focus::PaneId::Chat => {
+            handle_event_inner(event, app, streaming, registry, keybinds, scroll_lines)
         }
-        return InputAction::None;
-    }
-    // Route events to the models modal while it's open.
-    if let Some(state) = app.models.as_mut() {
-        if let Event::Key(key) = event {
-            match super::models::handle_event(state, key, runtime.model()) {
-                super::models::InputOutcome::Close => {
-                    app.models = None;
-                    return InputAction::None;
-                }
-                super::models::InputOutcome::Apply(model) => {
-                    app.models = None;
-                    return InputAction::ModelsApply(model);
-                }
-                super::models::InputOutcome::None => return InputAction::None,
-                super::models::InputOutcome::ExpandProvider(provider) => return InputAction::ModelsExpandProvider(provider),
-            }
-        }
-        return InputAction::None;
-    }
-    // Route events to the plugins modal while it's open. Most outcomes run
-    // async side-effects (fetch manifest, git clone, etc.), so we delegate
-    // them to the main loop via `InputAction::PluginsOutcome`.
-    if let Some(state) = app.plugins.as_mut() {
-        if let Event::Key(key) = event {
-            let outcome = super::plugins::handle_event(state, key);
-            return match outcome {
-                super::plugins::InputOutcome::Close => {
-                    app.plugins = None;
-                    InputAction::None
-                }
-                super::plugins::InputOutcome::None => InputAction::None,
-                other => InputAction::PluginsOutcome(other),
-            };
-        }
-        return InputAction::None;
-    }
-    // Route events to the settings modal while it's open.
-    if let Some(state) = app.settings.as_mut() {
-        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
-            if let Event::Key(key) = event {
-                if key.code == KeyCode::Esc {
-                    state.edit_mode = None;
-                    return InputAction::None;
-                }
-                return InputAction::PluginEditorKey {
-                    plugin_id: plugin_id.clone(),
-                    category: category.clone(),
-                    field: field.clone(),
-                    key,
-                };
-            }
-            return InputAction::None;
-        }
-        // Handle paste into active editors (API key, text, custom model)
-        if let Event::Paste(text) = event {
-            match &mut state.edit_mode {
-                Some(super::settings::ActiveEditor::ApiKey { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                Some(super::settings::ActiveEditor::Text { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                Some(super::settings::ActiveEditor::CustomModel { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                _ => {}
-            }
-            return InputAction::None;
-        }
-        if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
-            match super::settings::handle_event(state, key, &snap) {
-                super::settings::InputOutcome::Close => { app.settings = None; }
-                super::settings::InputOutcome::None => {}
-                super::settings::InputOutcome::Apply { key, value } => {
-                    return InputAction::SettingsApply(key, value);
-                }
-                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
-                    let row_key = format!("plugin.{}.{}", plugin_id, key);
-                    match synaps_cli::extensions::config_store::write_plugin_config(
-                        &plugin_id, &key, &value,
-                    ) {
-                        Ok(()) => {
-                            state.edit_mode = None;
-                            state.row_error = Some((row_key, "saved".to_string()));
-                        }
-                        Err(e) => {
-                            state.row_error = Some((row_key, e.to_string()));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
-                    return InputAction::PluginEditorOpen {
-                        plugin_id,
-                        category,
-                        field: key,
-                    };
-                }
-                super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
-                    let cfg_key = format!("provider.{}", provider_id);
-                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
-                        Ok(()) => {
-                            state.edit_mode = None;
-                            state.row_error = Some((cfg_key, "saved".to_string()));
-                        }
-                        Err(e) => {
-                            state.row_error = Some((cfg_key, e.to_string()));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::TogglePlugin { name, enabled } => {
-                    let mut config = synaps_cli::config::load_config();
-                    match super::plugins::actions::toggle_plugin_config(
-                        &name, enabled, &mut config, registry,
-                    ) {
-                        Ok(()) => {
-                            state.row_error = None;
-                        }
-                        Err(e) => {
-                            state.row_error = Some(("disabled_plugins".to_string(), e));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::PreviewTheme { name } => {
-                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
-                        super::theme::set_theme(theme);
-                    }
-                }
-                super::settings::InputOutcome::RevertTheme => {
-                    let theme = super::theme::load_theme_from_config();
-                    super::theme::set_theme(theme);
-                }
-                super::settings::InputOutcome::OpenPluginsMarketplace => {
-                    return InputAction::OpenPluginsMarketplace;
-                }
-                super::settings::InputOutcome::PingModels => {
-                    return InputAction::PingModels;
-                }
-            }
-        }
-        // Swallow all other events while settings is open.
-        return InputAction::None;
-    }
+        super::focus::PaneId::HelpFind => route_help_find(event, app),
+        super::focus::PaneId::Models => route_models(event, app, runtime),
+        super::focus::PaneId::Plugins => route_plugins(event, app),
+        super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
+        super::focus::PaneId::PluginEditor => route_settings(event, app, runtime, registry),
+        super::focus::PaneId::SecretPrompt => route_secret_prompt(event, app),
+    };
+
+    // Stack/app-field sync tripwire (§3 contract 4) — debug/test builds only.
+    // Runs after BOTH the chain path and the pane-handler pop path, so a missed
+    // push/pop fails the harness loudly instead of misrouting silently.
+    #[cfg(debug_assertions)]
+    super::focus::debug_assert_stack_sync(app);
+
+    action
+}
+
+/// Base Chat pane handler: keyboard / mouse / paste for the transcript + input
+/// box. Reached from `handle_event` when `modal_stack.top() == Chat` (empty
+/// stack). All modals — and the async secret prompt — are stack-routed via
+/// their own pane handlers (P7.8); the legacy if-let modal chain no longer
+/// exists, so `runtime` (its sole ex-consumer was the settings arm, now in
+/// `route_settings`) is no longer threaded here.
+fn handle_event_inner(
+    event: Event,
+    app: &mut App,
+    streaming: bool,
+    registry: &Arc<CommandRegistry>,
+    keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
+    scroll_lines: u16,
+) -> InputAction {
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
@@ -216,7 +106,7 @@ pub(super) fn handle_event(
             // Some terminals send both a Mouse(Down(Right)) AND an Event::Paste
             // when the user right-clicks, causing unintended paste into the input box.
             if let Some(deadline) = app.suppress_paste_until {
-                if std::time::Instant::now() < deadline {
+                if app.clock.now() < deadline {
                     app.suppress_paste_until = None;
                     return InputAction::None;
                 }
@@ -301,7 +191,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                     app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
                 app.transcript.clear_selection();
             } else {
@@ -318,7 +208,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                     }
                 }
                 // Suppress the terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
             }
         }
 
@@ -541,6 +431,307 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     InputAction::StreamingInput(input)
 }
 
+/// P7.4 stack-routed pane handler for the `/help find` lightbox.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `help_find::handle_event`), and additionally POPS the modal
+/// stack when the lightbox closes — keeping `modal_stack.contains(HelpFind)`
+/// in sync with `app.help_find.is_some()` (asserted by
+/// `debug_assert_stack_sync`). Returns the loop's existing `InputAction`
+/// directly: help_find never coexists with another modal (§6), so no
+/// `PaneOutcome` indirection is required.
+fn route_help_find(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == HelpFind ⇒ help_find is Some.
+    let Some(state) = &mut app.help_find else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::help_find::handle_event(state, key) {
+            super::help_find::HelpFindAction::Close => {
+                app.help_find = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+        };
+    }
+    InputAction::None
+}
+
+/// P7.5 stack-routed pane handler for the `/model` · `/models` modal.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `models::handle_event`), and additionally POPS the modal stack
+/// on the two close paths — keeping `modal_stack.contains(Models)` in sync
+/// with `app.models.is_some()` (asserted by `debug_assert_stack_sync`).
+///
+/// Outcome translation (§7 P7.5): `Close` → `PaneOutcome::Pop` (clear the
+/// field and pop, return `None`); `Apply` → `PaneOutcome::PopThen(ModelsApply)`
+/// (clear the field and pop, then defer the apply to the async loop);
+/// `ExpandProvider` → `PaneOutcome::Action(ModelsExpandProvider)` (defer only,
+/// modal stays open, no pop); `None` → `Consumed`. Models never coexists with
+/// another modal (§6), so the `InputAction` is returned directly — the
+/// `PaneOutcome` mapping above is realized inline, matching the P7.4
+/// `route_help_find` shape.
+fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Models ⇒ models is Some.
+    let Some(state) = &mut app.models else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::models::handle_event(state, key, runtime.model()) {
+            super::models::InputOutcome::Close => {
+                app.models = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::models::InputOutcome::Apply(model) => {
+                app.models = None;
+                app.modal_stack.pop();
+                InputAction::ModelsApply(model)
+            }
+            super::models::InputOutcome::None => InputAction::None,
+            super::models::InputOutcome::ExpandProvider(provider) => {
+                InputAction::ModelsExpandProvider(provider)
+            }
+        };
+    }
+    InputAction::None
+}
+
+/// P7.6 stack-routed pane handler for the `/plugins` marketplace modal.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `plugins::handle_event`), and additionally POPS the modal stack
+/// on the sole close path — keeping `modal_stack.contains(Plugins)` in sync
+/// with `app.plugins.is_some()` (asserted by `debug_assert_stack_sync`).
+///
+/// Outcome translation (§7 P7.6): `Close` → `PaneOutcome::Pop` (clear the field
+/// and pop, return `None`); `None` → `Consumed`; every OTHER `InputOutcome`
+/// (AddMarketplace, InstallRequested, Uninstall, …) → `PaneOutcome::Action`,
+/// i.e. deferred to the async loop verbatim via `InputAction::PluginsOutcome`,
+/// leaving the modal open (no pop). The `PaneOutcome` mapping is realized
+/// inline, matching the P7.4/P7.5 `route_help_find` / `route_models` shape.
+///
+/// Depth subtlety (post-P7.7): when plugins is opened from an already-open
+/// settings modal (marketplace-from-settings), settings is ITSELF a stack
+/// member — so the stack is a real two-deep `[Settings, Plugins]`, with Plugins
+/// on top. This `Close` path pops Plugins (`app.plugins = None` + pop) back to
+/// `[Settings]`, and `route_settings` resumes routing the still-open settings
+/// modal. The chain no longer exists; the fall-back is the stack level below.
+fn route_plugins(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Plugins ⇒ plugins is Some.
+    let Some(state) = &mut app.plugins else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::plugins::handle_event(state, key) {
+            super::plugins::InputOutcome::Close => {
+                app.plugins = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::plugins::InputOutcome::None => InputAction::None,
+            other => InputAction::PluginsOutcome(other),
+        };
+    }
+    InputAction::None
+}
+
+/// P7.7 stack-routed pane handler for the `/settings` modal AND its nested
+/// `PaneId::PluginEditor` (the `ActiveEditor::PluginCustom` editor promoted to
+/// a real second stack level). BOTH `PaneId::Settings` and `PaneId::PluginEditor`
+/// dispatch here: when a PluginCustom editor is active it is `top()` and this
+/// handler's first block forwards keys to it (Esc pops PluginEditor); otherwise
+/// Settings is `top()` and the normal settings handling runs.
+///
+/// The 12 `InputOutcome` match arms — INCLUDING the synchronous config-file
+/// writes (`write_plugin_config`, `write_config_value`, `toggle_plugin_config`)
+/// and the theme preview/revert side-effects — are moved VERBATIM from the
+/// deleted legacy chain arm. They execute at exactly the same point, in the same
+/// order, as before: nothing is reordered, deferred, or hoisted. The ONLY
+/// additions are the two `app.modal_stack.pop()` calls that mirror the two
+/// `= None` close assignments (`app.settings = None` on `Close`; `edit_mode =
+/// None` on the PluginCustom Esc) — keeping the stack in sync with the fields
+/// (asserted by `debug_assert_stack_sync`). `app.modal_stack` is a field
+/// disjoint from `app.settings`, so the pops borrow-check beside the live
+/// `state` borrow exactly as the existing `app.model_health.clone()` does.
+fn route_settings(
+    event: Event,
+    app: &mut App,
+    runtime: &synaps_cli::Runtime,
+    registry: &Arc<CommandRegistry>,
+) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Settings | PluginEditor ⇒
+    // settings is Some.
+    if let Some(state) = &mut app.settings {
+        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
+            if let Event::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    // P7.7: Esc on the nested PluginCustom editor POPS
+                    // PaneId::PluginEditor — clears edit_mode while Settings stays
+                    // open, byte-identical to the pre-migration chain behaviour.
+                    state.edit_mode = None;
+                    app.modal_stack.pop();
+                    return InputAction::None;
+                }
+                return InputAction::PluginEditorKey {
+                    plugin_id: plugin_id.clone(),
+                    category: category.clone(),
+                    field: field.clone(),
+                    key,
+                };
+            }
+            return InputAction::None;
+        }
+        // Handle paste into active editors (API key, text, custom model)
+        if let Event::Paste(text) = event {
+            match &mut state.edit_mode {
+                Some(super::settings::ActiveEditor::ApiKey { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::Text { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::CustomModel { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        if let Event::Key(key) = event {
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            match super::settings::handle_event(state, key, &snap) {
+                super::settings::InputOutcome::Close => { app.settings = None; app.modal_stack.pop(); }
+                super::settings::InputOutcome::None => {}
+                super::settings::InputOutcome::Apply { key, value } => {
+                    return InputAction::SettingsApply(key, value);
+                }
+                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
+                    let row_key = format!("plugin.{}.{}", plugin_id, key);
+                    match synaps_cli::extensions::config_store::write_plugin_config(
+                        &plugin_id, &key, &value,
+                    ) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((row_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((row_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                    return InputAction::PluginEditorOpen {
+                        plugin_id,
+                        category,
+                        field: key,
+                    };
+                }
+                super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
+                    let cfg_key = format!("provider.{}", provider_id);
+                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((cfg_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((cfg_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::TogglePlugin { name, enabled } => {
+                    let mut config = synaps_cli::config::load_config();
+                    match super::plugins::actions::toggle_plugin_config(
+                        &name, enabled, &mut config, registry,
+                    ) {
+                        Ok(()) => {
+                            state.row_error = None;
+                        }
+                        Err(e) => {
+                            state.row_error = Some(("disabled_plugins".to_string(), e));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PreviewTheme { name } => {
+                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
+                        super::theme::set_theme(theme);
+                    }
+                }
+                super::settings::InputOutcome::RevertTheme => {
+                    let theme = super::theme::load_theme_from_config();
+                    super::theme::set_theme(theme);
+                }
+                super::settings::InputOutcome::OpenPluginsMarketplace => {
+                    return InputAction::OpenPluginsMarketplace;
+                }
+                super::settings::InputOutcome::PingModels => {
+                    return InputAction::PingModels;
+                }
+            }
+        }
+        // Swallow all other events while settings is open.
+        return InputAction::None;
+    }
+    InputAction::None
+}
+
+/// P7.8: reconcile the SecretPrompt pane against the async queue (§5).
+///
+/// The secret-prompt queue is NOT user-opened: tools deep in the engine send
+/// requests over an mpsc channel, and `submit()` / `cancel()` auto-activate the
+/// next queued prompt — so activation and deactivation both happen OUTSIDE any
+/// input event. Rather than couple push/pop to a keypress, this reconciles the
+/// stack to the queue's `is_active()`: push when active but absent, remove when
+/// inactive but present. Called (a) after `poll_requests` in the tick arm
+/// (`mod.rs`), and (b) after every `submit()` / `cancel()` in the pane handler.
+/// Queue chaining is handled for free — the pane stays on the stack while
+/// `is_active()` remains true across consecutive prompts.
+pub(super) fn reconcile_secret_prompt(app: &mut App) {
+    let active = app.secret_prompts.is_active();
+    let on_stack = app.modal_stack.contains(super::focus::PaneId::SecretPrompt);
+    match (active, on_stack) {
+        (true, false) => app.modal_stack.push(super::focus::PaneId::SecretPrompt),
+        (false, true) => app.modal_stack.remove(super::focus::PaneId::SecretPrompt),
+        _ => {}
+    }
+}
+
+/// P7.8 stack-routed pane handler for the async secret / masked-input prompt.
+///
+/// Reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
+/// Esc cancels, Backspace deletes, Char / per-char Paste append, everything
+/// else is swallowed (`PaneOutcome::Consumed`). After `submit()` / `cancel()`
+/// (which may auto-activate the next queued prompt) it reconciles the stack so
+/// the pane stays while another prompt is pending and pops when the queue
+/// drains. Returns `InputAction::None`; the former inline `app.request_redraw()`
+/// is preserved by `request_immediate_redraw` on the input path (`mod.rs`).
+fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
+    match event {
+        Event::Key(key) => match key.code {
+            KeyCode::Enter => {
+                app.secret_prompts.submit();
+                reconcile_secret_prompt(app);
+            }
+            KeyCode::Esc => {
+                app.secret_prompts.cancel();
+                reconcile_secret_prompt(app);
+            }
+            KeyCode::Backspace => app.secret_prompts.backspace(),
+            KeyCode::Char(c) => app.secret_prompts.push_char(c),
+            _ => {}
+        },
+        Event::Paste(text) => {
+            for ch in text.chars() {
+                app.secret_prompts.push_char(ch);
+            }
+        }
+        _ => {}
+    }
+    InputAction::None
+}
+
 fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
     let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
         return false;
@@ -556,6 +747,10 @@ fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegis
         help_registry.entries().to_vec(),
         &query,
     ));
+    // P7.4: mirror the `= Some(..)` open with a stack push (§6: push accompanies
+    // every open of a migrated modal). help_find never coexists, so this is a
+    // depth 0 → 1 push.
+    app.modal_stack.push(super::focus::PaneId::HelpFind);
     true
 }
 

@@ -184,3 +184,26 @@ Implement resolution (A): make `build_render_model` non-mutating by returning th
 - **→ T199.3:** reconcile this table against post-P7/P12 reality; document residual `App` fields (the 23 loop-state + 8 channels that consciously stay) with rationale, and close T199.
 
 *The architecture was always sound. It was merely undocumented. Now the seam is drawn — the builders may proceed without asking a single question.*
+
+---
+
+## Closure (T199.3 — 2026-07-09, post P7/P12/T199.2)
+
+**Final disposition of the T199.1 boundary, reconciled against the shipped refactor:**
+
+- **Render-input fields → behind the seam:** `build_render_model` now consumes a narrow
+  `ViewInputs` (input text, cursor, settings snapshot, stack-ordered `modal_order`, status/
+  chrome) instead of `&mut App`. Coupling dropped from ~30 direct `App` field reads to one
+  typed seam (`view_model.rs`). The lone `&mut App` write-back (help_find visible-height) is
+  resolved through the seam — the hack is gone.
+- **Transcript state:** already extracted in P9 (`TranscriptStore`) — not re-touched.
+- **Modal state:** now stack-owned/ordered post-P7 (`ModalStack` + `modal_order`), read via the seam.
+- **Residual App fields (stay by design):** loop-state + channels + handles (event_reader,
+  widget_rx, extension_loader_rx, steer/ping channels, render_handle, cancel tokens, clock,
+  gamba_child, secret_prompts queue). These are *runtime plumbing*, not render input — correctly
+  on App. App `pub(crate)` count reduced; the remainder is demarcated by the `ViewInputs` boundary.
+- **T199 board task:** deliverable complete (T199.1 spec + T199.2 seam). Leave OPEN for Haseeb to
+  close after reviewing the arch branch (per the no-mark-done directive).
+
+**Verdict:** the "App is everything is render input" character is gone. The render seam is now a
+single narrow, queryable type — the substrate the modernization was aiming for.

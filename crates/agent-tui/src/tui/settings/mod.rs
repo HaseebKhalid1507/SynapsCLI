@@ -10,6 +10,8 @@ pub(crate) mod schema;
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
 
+use crate::tui::focus::FocusRing;
+
 const BUILTIN_THEMES: &[&str] = &[
     "default",
     "night-city",
@@ -206,7 +208,17 @@ pub(super) enum ActiveEditor {
 pub(super) struct SettingsState {
     pub category_idx: usize,
     pub setting_idx: usize,
+    /// Left/Right focus as read by draw code (`settings/draw.rs` reads it
+    /// directly). P7.7: now a synced projection of `focus_ring` — the
+    /// authoritative traversal store below.
     pub focus: Focus,
+    /// Authoritative Left/Right traversal store: a two-slot [`FocusRing`] from
+    /// the FocusManager (slot 0 = Left, slot 1 = Right). Tab / focus moves go
+    /// through this ring (P7.7), replacing the old direct `focus` assignments;
+    /// `focus` above is re-derived from it after every move. Focus survives
+    /// occlusion (e.g. marketplace/PluginEditor pushed on top) because it lives
+    /// in the retained `SettingsState` (§4).
+    focus_ring: FocusRing,
     pub edit_mode: Option<ActiveEditor>,
     /// Transient error/note shown under a row.
     pub row_error: Option<(String, String)>,
@@ -220,10 +232,47 @@ impl SettingsState {
             category_idx: 0,
             setting_idx: 0,
             focus: Focus::Left,
+            focus_ring: FocusRing::of_len(2),
             edit_mode: None,
             row_error: None,
             original_theme_name: None,
         }
+    }
+
+    /// Current Left/Right focus, read from the two-slot [`FocusRing`] backing
+    /// store (slot 0 = Left, slot 1 = Right). Equals the synced `focus` field.
+    #[cfg(test)]
+    pub fn focus(&self) -> Focus {
+        Self::focus_from_ring(&self.focus_ring)
+    }
+
+    fn focus_from_ring(ring: &FocusRing) -> Focus {
+        match ring.current().map(|slot| slot.id()) {
+            Some(1) => Focus::Right,
+            _ => Focus::Left,
+        }
+    }
+
+    /// Re-derive the public `focus` projection from the authoritative ring.
+    fn sync_focus_field(&mut self) {
+        self.focus = Self::focus_from_ring(&self.focus_ring);
+    }
+
+    /// Tab: toggle Left <-> Right. On the two-slot ring this is `next()`
+    /// (wraps), preserving today's exact toggle semantics.
+    pub fn toggle_focus(&mut self) {
+        self.focus_ring.next();
+        self.sync_focus_field();
+    }
+
+    /// Set focus to a specific side. On the two-slot ring, one `next()` flips
+    /// to the other slot, so we step only when currently on the wrong side.
+    #[cfg(test)]
+    pub fn set_focus(&mut self, target: Focus) {
+        if self.focus() != target {
+            self.focus_ring.next();
+        }
+        self.sync_focus_field();
     }
 
     /// Settings in the currently selected category.

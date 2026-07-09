@@ -996,6 +996,7 @@ mod tests {
             compatibility: None,
             commands: vec![],
             extension: Some(ExtensionManifest {
+                theme_tokens: Default::default(),
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: "bin/ext".to_string(),
@@ -1296,6 +1297,7 @@ mod tests {
             compatibility: None,
             commands: vec![],
             extension: Some(ExtensionManifest {
+                theme_tokens: Default::default(),
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: command.to_string(),
@@ -1446,6 +1448,7 @@ mod tests {
             compatibility: None,
             commands: vec![],
             extension: Some(ExtensionManifest {
+                theme_tokens: Default::default(),
                 protocol_version: 1,
                 runtime: ExtensionRuntime::Process,
                 command: command.to_string(),

@@ -1013,7 +1013,7 @@ mod meta_tests {
     /// tool cards never emit `Content` (lock L2).
     #[test]
     fn msg_entry_meta_parallel_and_content_ranges_sound() {
-        let mut store = TranscriptStore::new();
+        let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
         store.push_msg(ChatMessage::User(
             "hello there\nsecond user line that is long enough to wrap at forty columns easily".into(),
         ));

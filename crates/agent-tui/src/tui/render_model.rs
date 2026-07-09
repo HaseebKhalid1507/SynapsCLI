@@ -89,6 +89,13 @@ pub(crate) struct RenderModel {
     // ── Secret prompt modal ───────────────────────────────────────────────────
     pub(crate) secret_prompt: Option<SecretPromptSnap>,
 
+    // ── Stack-order modal draw list (P7.8) ────────────────────────────────────
+    /// Snapshot of `app.modal_stack` (bottom → top). `render_frame_into`
+    /// iterates this to paint modals in stack order, replacing the former
+    /// hardcoded paint order. SecretPrompt therefore paints LAST (topmost)
+    /// when it coexists with a modal — the one deliberate z-order fix (§5.5).
+    pub(crate) modal_order: Vec<super::focus::PaneId>,
+
     // ── Edge-scrub geometry ───────────────────────────────────────────────────
     /// Pre-computed `protected_bottom_rows` for `scrub_crossterm_terminal_edges`.
     pub(crate) protected_bottom_rows: u16,
