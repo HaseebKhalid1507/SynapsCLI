@@ -342,6 +342,10 @@ impl TestHarness {
         self.app.plugins = Some(super::plugins::PluginsModalState::new(
             synaps_cli::skills::state::PluginsState::default(),
         ));
+        // P7.6 HARNESS HELPER RULE: mirror production — every open of a migrated
+        // modal pushes onto the ModalStack, else `debug_assert_stack_sync`
+        // (run after every harness `event()`) trips on the missing Plugins push.
+        self.app.modal_stack.push(super::focus::PaneId::Plugins);
         self
     }
 

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use synaps_cli::skills::state::{CachedPlugin, InstalledPlugin, PluginsState};
 
 use super::progress::InstallProgressHandle;
+use crate::tui::focus::FocusRing;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum LeftRow {
@@ -116,7 +117,16 @@ pub struct PluginsModalState {
     pub file: PluginsState,
     pub selected_left: usize,
     pub selected_right: usize,
+    /// Left/Right focus as read by draw code (kept public and unchanged so
+    /// `plugins/draw.rs` reads it directly). P7.6: this is now a synced
+    /// projection of `focus_ring` — the authoritative traversal store below.
     pub focus: Focus,
+    /// Authoritative Left/Right traversal store: a two-slot [`FocusRing`] from
+    /// the FocusManager (slot 0 = Left, slot 1 = Right). Tab / focus moves go
+    /// through this ring (P7.6), replacing the old direct `focus` assignments;
+    /// `focus` above is re-derived from it after every move. Focus survives
+    /// occlusion because it lives in the retained `PluginsModalState` (§4).
+    focus_ring: FocusRing,
     pub mode: RightMode,
     pub row_error: Option<String>,
     /// Background install task (spawned by `run_install_flow`); `Some` while
@@ -136,6 +146,7 @@ impl Clone for PluginsModalState {
             selected_left: self.selected_left,
             selected_right: self.selected_right,
             focus: self.focus.clone(),
+            focus_ring: self.focus_ring.clone(),
             mode: self.mode.clone(),
             row_error: self.row_error.clone(),
             pending_install: None,
@@ -150,6 +161,7 @@ impl PluginsModalState {
             selected_left: 0,
             selected_right: 0,
             focus: Focus::Left,
+            focus_ring: FocusRing::of_len(2),
             mode: RightMode::List,
             row_error: None,
             pending_install: None,
@@ -228,9 +240,43 @@ impl PluginsModalState {
         let mut st = Self::new(file);
         st.selected_left = 1;
         if has_marketplaces {
-            st.focus = Focus::Right;
+            st.set_focus(Focus::Right);
         }
         st
+    }
+
+    /// Current Left/Right focus, read from the two-slot [`FocusRing`] backing
+    /// store (slot 0 = Left, slot 1 = Right). Equals the synced `focus` field.
+    pub fn focus(&self) -> Focus {
+        Self::focus_from_ring(&self.focus_ring)
+    }
+
+    fn focus_from_ring(ring: &FocusRing) -> Focus {
+        match ring.current().map(|slot| slot.id()) {
+            Some(1) => Focus::Right,
+            _ => Focus::Left,
+        }
+    }
+
+    /// Re-derive the public `focus` projection from the authoritative ring.
+    fn sync_focus_field(&mut self) {
+        self.focus = Self::focus_from_ring(&self.focus_ring);
+    }
+
+    /// Tab: toggle Left <-> Right. On the two-slot ring this is `next()`
+    /// (wraps), preserving today's exact toggle semantics.
+    pub fn toggle_focus(&mut self) {
+        self.focus_ring.next();
+        self.sync_focus_field();
+    }
+
+    /// Set focus to a specific side. On the two-slot ring, one `next()` flips to
+    /// the other slot, so we step only when currently on the wrong side.
+    pub fn set_focus(&mut self, target: Focus) {
+        if self.focus() != target {
+            self.focus_ring.next();
+        }
+        self.sync_focus_field();
     }
 
     pub fn left_rows(&self) -> Vec<LeftRow> {

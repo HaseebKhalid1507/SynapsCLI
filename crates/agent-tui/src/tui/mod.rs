@@ -694,6 +694,16 @@ pub async fn run(
                                         match synaps_cli::skills::state::PluginsState::load_from(&path) {
                                             Ok(file) => {
                                                 app.plugins = Some(plugins::PluginsModalState::new(file));
+                                                // P7.6: mirror the `= Some(..)` open with a
+                                                // stack push (§6). GATE-1 note B: plugins
+                                                // opens on this async command arm, so assert
+                                                // sync RIGHT HERE — a missed push is caught
+                                                // this event, not one event late. Only the
+                                                // Ok(..) branch opens the modal, so the push
+                                                // lives inside it (Err pushes nothing).
+                                                app.modal_stack.push(focus::PaneId::Plugins);
+                                                #[cfg(debug_assertions)]
+                                                focus::debug_assert_stack_sync(&app);
                                             }
                                             Err(e) => {
                                                 app.push_msg(ChatMessage::Error(format!(
@@ -1841,6 +1851,17 @@ pub async fn run(
                                 match synaps_cli::skills::state::PluginsState::load_from(&path) {
                                     Ok(file) => {
                                         app.plugins = Some(plugins::PluginsModalState::new_from_settings(file));
+                                        // P7.6: marketplace-from-settings push. DEPTH
+                                        // SUBTLETY (§7 P7.6): settings is NOT yet migrated
+                                        // (P7.7), so it stays chain-routed and is NEVER on
+                                        // the stack — plugins pushes to depth 1 (NOT 2).
+                                        // On Close, route_plugins pops back to an empty
+                                        // stack and the chain resumes routing the still-open
+                                        // settings modal. GATE-1 note B: opened on this async
+                                        // arm, so assert sync inline.
+                                        app.modal_stack.push(focus::PaneId::Plugins);
+                                        #[cfg(debug_assertions)]
+                                        focus::debug_assert_stack_sync(&app);
                                     }
                                     Err(e) => {
                                         if let Some(s) = app.settings.as_mut() {

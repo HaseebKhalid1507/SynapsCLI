@@ -420,15 +420,30 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.models.is_some()
     );
 
+    // P7.6: Plugins membership on the stack must exactly mirror `app.plugins`.
+    // NOTE (depth subtlety): settings is NOT yet migrated (P7.7), so when the
+    // marketplace is opened from an open settings modal, settings stays
+    // chain-routed (`app.settings` = Some but NEVER on the stack) while plugins
+    // pushes ⇒ stack == [Plugins], depth 1. The true two-deep stack arrives in
+    // P7.7. This clause therefore only cross-checks Plugins ⇔ app.plugins.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::Plugins),
+        app.plugins.is_some(),
+        "stack sync (P7.6): modal_stack.contains(Plugins)={} but plugins.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::Plugins),
+        app.plugins.is_some()
+    );
+
     // Every other pane is still chain-routed (unmigrated) ⇒ it must NEVER be on
-    // the stack yet. HelpFind and Models are the only permitted members; the
-    // stack is therefore some ordering of a subset of {HelpFind, Models}.
-    // (Extended per-modal in P7.6+.)
+    // the stack yet. HelpFind, Models and Plugins are the only permitted
+    // members; the stack is therefore some ordering of a subset of
+    // {HelpFind, Models, Plugins}. (Extended per-modal in P7.7+.)
     for pane in app.modal_stack.iter_bottom_up() {
         debug_assert!(
-            matches!(pane, PaneId::HelpFind | PaneId::Models),
-            "stack sync (P7.5): unmigrated pane {pane:?} found on the ModalStack \
-             — only HelpFind and Models are stack-routed so far"
+            matches!(pane, PaneId::HelpFind | PaneId::Models | PaneId::Plugins),
+            "stack sync (P7.6): unmigrated pane {pane:?} found on the ModalStack \
+             — only HelpFind, Models and Plugins are stack-routed so far"
         );
     }
 

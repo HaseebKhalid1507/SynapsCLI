@@ -45,8 +45,8 @@ pub(super) enum InputAction {
 /// Thin outer wrapper: the modal-routing SHIM dispatches stack-routed panes to
 /// their pane handler and unmigrated panes to the legacy `handle_event_inner`
 /// chain; BOTH paths converge on `action` so the debug-only stack/app sync
-/// tripwire runs afterwards on every path (including the pop path). As of P7.5
-/// HelpFind and Models are stack-routed.
+/// tripwire runs afterwards on every path (including the pop path). As of P7.6
+/// HelpFind, Models and Plugins are stack-routed.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -60,7 +60,7 @@ pub(super) fn handle_event(
     // panes fall through to the legacy chain (via handle_event_inner). A pane
     // is EITHER stack-routed OR chain-routed, never both. BOTH paths flow into
     // `action` so the sync tripwire below runs after the pop path too (note A /
-    // §6). As of P7.5, HelpFind and Models are stack-routed; the other
+    // §6). As of P7.6, HelpFind, Models and Plugins are stack-routed; the other
     // modals still fall through. Deleted in P7.8.
     let action = match app.modal_stack.top() {
         super::focus::PaneId::Chat => {
@@ -68,6 +68,7 @@ pub(super) fn handle_event(
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
+        super::focus::PaneId::Plugins => route_plugins(event, app),
         other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
     };
 
@@ -80,9 +81,9 @@ pub(super) fn handle_event(
     action
 }
 
-/// Legacy routing body: the if-let modal chain (plugins → settings)
-/// followed by base Chat handling. Reached only via the `handle_event` wrapper
-/// when `top() == Chat` (help_find + models migrated to the stack in P7.4/P7.5).
+/// Legacy routing body: the if-let modal chain (settings) followed by base Chat
+/// handling. Reached only via the `handle_event` wrapper when `top() == Chat`
+/// (help_find + models + plugins migrated to the stack in P7.4/P7.5/P7.6).
 fn handle_event_inner(
     event: Event,
     app: &mut App,
@@ -92,23 +93,6 @@ fn handle_event_inner(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // Route events to the plugins modal while it's open. Most outcomes run
-    // async side-effects (fetch manifest, git clone, etc.), so we delegate
-    // them to the main loop via `InputAction::PluginsOutcome`.
-    if let Some(state) = app.plugins.as_mut() {
-        if let Event::Key(key) = event {
-            let outcome = super::plugins::handle_event(state, key);
-            return match outcome {
-                super::plugins::InputOutcome::Close => {
-                    app.plugins = None;
-                    InputAction::None
-                }
-                super::plugins::InputOutcome::None => InputAction::None,
-                other => InputAction::PluginsOutcome(other),
-            };
-        }
-        return InputAction::None;
-    }
     // Route events to the settings modal while it's open.
     if let Some(state) = app.settings.as_mut() {
         if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
@@ -614,6 +598,45 @@ fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> I
             super::models::InputOutcome::ExpandProvider(provider) => {
                 InputAction::ModelsExpandProvider(provider)
             }
+        };
+    }
+    InputAction::None
+}
+
+/// P7.6 stack-routed pane handler for the `/plugins` marketplace modal.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `plugins::handle_event`), and additionally POPS the modal stack
+/// on the sole close path — keeping `modal_stack.contains(Plugins)` in sync
+/// with `app.plugins.is_some()` (asserted by `debug_assert_stack_sync`).
+///
+/// Outcome translation (§7 P7.6): `Close` → `PaneOutcome::Pop` (clear the field
+/// and pop, return `None`); `None` → `Consumed`; every OTHER `InputOutcome`
+/// (AddMarketplace, InstallRequested, Uninstall, …) → `PaneOutcome::Action`,
+/// i.e. deferred to the async loop verbatim via `InputAction::PluginsOutcome`,
+/// leaving the modal open (no pop). The `PaneOutcome` mapping is realized
+/// inline, matching the P7.4/P7.5 `route_help_find` / `route_models` shape.
+///
+/// Depth subtlety (§7 P7.6): when plugins is opened from an already-open
+/// settings modal (marketplace-from-settings), settings is NOT yet migrated
+/// (P7.7) and stays chain-routed — so it is NEVER on the stack. Plugins pushes
+/// to depth 1; on Close this pops back to an empty stack and the legacy chain
+/// resumes routing the still-open settings modal. Identical to today's chain
+/// fallthrough (settings arm sits directly below the old plugins arm).
+fn route_plugins(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Plugins ⇒ plugins is Some.
+    let Some(state) = &mut app.plugins else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::plugins::handle_event(state, key) {
+            super::plugins::InputOutcome::Close => {
+                app.plugins = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::plugins::InputOutcome::None => InputAction::None,
+            other => InputAction::PluginsOutcome(other),
         };
     }
     InputAction::None
