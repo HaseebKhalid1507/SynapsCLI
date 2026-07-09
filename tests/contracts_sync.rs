@@ -46,3 +46,31 @@ fn plugin_builder_extension_contract_matches_synaps_contract() {
     let builder_json: serde_json::Value = serde_json::from_str(&builder).unwrap();
     assert_eq!(builder_json, synaps_json);
 }
+
+#[test]
+fn extension_protocol_version_present_and_synced_with_stability_docs() {
+    let contract_raw = std::fs::read_to_string("docs/extensions/contract.json")
+        .expect("docs/extensions/contract.json should exist");
+    let stability_raw = std::fs::read_to_string("docs/STABILITY.md")
+        .expect("docs/STABILITY.md should exist");
+
+    let contract: serde_json::Value =
+        serde_json::from_str(&contract_raw).expect("contract.json should be valid JSON");
+
+    // (a) extension_protocol_version must exist and be an integer
+    let version = contract
+        .get("extension_protocol_version")
+        .expect("contract.json must contain 'extension_protocol_version'")
+        .as_i64()
+        .expect("'extension_protocol_version' must be an integer");
+
+    // (b) the same number must appear in STABILITY.md so they can't drift apart
+    let needle = format!("`{}`", version);
+    assert!(
+        stability_raw.contains(&needle),
+        "docs/STABILITY.md must reference extension_protocol_version {} (looked for `{}`). \
+         If you bumped the protocol version, update STABILITY.md to match.",
+        version,
+        version
+    );
+}

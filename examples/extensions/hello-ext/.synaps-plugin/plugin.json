@@ -1,0 +1,17 @@
+{
+  "name": "hello-ext",
+  "version": "0.1.0",
+  "description": "Minimal reference SynapsCLI extension: registers one tool (hello) and one hook (before_tool_call on bash) that blocks 'rm -rf' outside /tmp.",
+  "author": "SynapsCLI docs",
+  "license": "MIT",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["main.py"],
+    "permissions": ["tools.register", "tools.intercept"],
+    "hooks": [
+      { "hook": "before_tool_call", "tool": "bash" }
+    ]
+  }
+}
