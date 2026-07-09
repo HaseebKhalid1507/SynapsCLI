@@ -17,11 +17,16 @@
 //!
 //! # Scope and limitations
 //!
-//! - **Sync scenarios only.** [`InputAction`]s that the real event loop
-//!   resolves asynchronously (message submission → streaming, slash commands,
-//!   plugin outcomes, …) are *recorded* — see [`TestHarness::take_actions`] —
-//!   but not executed. Deterministic clocks and async wait-until-idle are the
-//!   P6 follow-up.
+//! - **Sync scenarios + the bounded slash drive (P6.3).** [`InputAction`]s
+//!   that the real event loop resolves asynchronously (message submission →
+//!   streaming, plugin outcomes, …) are *recorded* — see
+//!   [`TestHarness::take_actions`] — but not executed. The exception is the
+//!   SYNC-SAFE slash-command subset: [`TestHarness::drive_slash_commands`]
+//!   runs recorded slash commands through the production
+//!   `commands::handle_command` / `commands::execute_command_action` path on
+//!   a private current-thread tokio runtime, HARD-BOUNDED by
+//!   [`SLASH_DRIVE_TIMEOUT`] — the drive fails loudly, it never hangs.
+//!   Streaming/engine command outcomes stay P4-style recorded-not-executed.
 //! - The [`Runtime`] inside the harness is [`Runtime::new_headless`]: stub
 //!   credentials, no network, no reaper task. UI state that merely *reads*
 //!   the runtime (model name, thinking level) renders normally.
@@ -78,7 +83,41 @@ pub struct TestHarness {
     /// Human-readable records of dispatched [`InputAction`]s the harness
     /// cannot execute synchronously (submissions, slash commands, …).
     actions: Vec<String>,
+    /// Structured queue of dispatched slash commands awaiting the P6.3
+    /// bounded async drive ([`Self::drive_slash_commands`]).
+    pending_slash: Vec<(String, String)>,
     quit_requested: bool,
+}
+
+/// Hard upper bound on any single bounded async drive (P6.3). A slash
+/// command that has not resolved within this budget panics the test —
+/// deterministic failure instead of a hung harness.
+pub const SLASH_DRIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// P6.3 bounded executor: run one future to completion on a throwaway
+/// current-thread tokio runtime, capped by [`SLASH_DRIVE_TIMEOUT`].
+///
+/// Invariants:
+/// - **Never hangs.** `tokio::time::timeout` is the hard bound; on expiry we
+///   panic with `what` so the failure names the offending command.
+/// - **Drain-to-idle.** `block_on` returns only when the future is `Ready`;
+///   there are no detached tasks — the sync-safe subset spawns nothing.
+/// - Must be called from a NON-async test (`#[test]`, not `#[tokio::test]`):
+///   nesting runtimes panics immediately (deterministic, not a hang).
+fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread tokio runtime construction is infallible");
+    rt.block_on(async move {
+        match tokio::time::timeout(SLASH_DRIVE_TIMEOUT, fut).await {
+            Ok(out) => out,
+            Err(_) => panic!(
+                "bounded async drive timed out after {SLASH_DRIVE_TIMEOUT:?}: {what} — \
+                 this command is not in the sync-safe subset; keep it P4-style recorded"
+            ),
+        }
+    })
 }
 
 impl TestHarness {
@@ -114,6 +153,7 @@ impl TestHarness {
             terminal,
             size: Size::new(cols, rows),
             actions: Vec::new(),
+            pending_slash: Vec::new(),
             quit_requested: false,
         }
     }
@@ -545,6 +585,119 @@ impl TestHarness {
         self.app.toasts.visible().count()
     }
 
+    // ── Bounded async slash drive (P6.3) ─────────────────────────────────────
+
+    /// Execute every slash command recorded since the last drive through the
+    /// REAL production resolution path — `commands::handle_command` and, for
+    /// plugin commands, `commands::execute_command_action` — against the
+    /// headless [`Runtime`]. Each command is bounded by [`SLASH_DRIVE_TIMEOUT`]
+    /// on a private current-thread runtime: the drive fails, it never hangs.
+    ///
+    /// Scope: the SYNC-SAFE, App-mutating subset. `CommandAction` arms that
+    /// production resolves against the live terminal or engine (gamba launch,
+    /// skill-load streaming, plugin reload, …) are recorded as
+    /// `command-action-unexecuted:*` in [`Self::take_actions`], never run.
+    pub fn drive_slash_commands(&mut self) -> &mut Self {
+        for (cmd, arg) in std::mem::take(&mut self.pending_slash) {
+            self.run_slash_command(&cmd, &arg);
+        }
+        self
+    }
+
+    /// Run one slash command (already prefix-resolved, no leading `/`)
+    /// through the bounded async path directly. Building block of
+    /// [`Self::drive_slash_commands`]; useful when a test wants the command
+    /// executed without typing it.
+    pub fn run_slash_command(&mut self, cmd: &str, arg: &str) -> &mut Self {
+        // Production threads the boot-resolved system-prompt path; the
+        // harness pins a temp-dir path so `/system save` never touches
+        // a real config. Nothing reads it unless the test invokes it.
+        let system_prompt_path = std::env::temp_dir().join("synaps-harness-system-prompt.md");
+        let what = format!("handle_command(/{cmd} {arg})");
+        let action = block_on_bounded(
+            &what,
+            super::commands::handle_command(
+                cmd,
+                arg,
+                &mut self.app,
+                &mut self.runtime,
+                &system_prompt_path,
+                &self.registry,
+                &self.keybinds,
+            ),
+        );
+        self.apply_command_action(action);
+        self
+    }
+
+    /// Apply a resolved [`super::commands::CommandAction`], mirroring the
+    /// production `SlashCommand` arm in `mod.rs` for the sync-safe subset —
+    /// including the ModalStack pushes, so `debug_assert_stack_sync` holds
+    /// after every drive exactly as it does after every real event.
+    fn apply_command_action(&mut self, action: super::commands::CommandAction) {
+        use super::commands::CommandAction;
+        match action {
+            CommandAction::None | CommandAction::StartStream => {}
+            CommandAction::Quit => {
+                // Production sends the exit effect; headless we record intent.
+                self.quit_requested = true;
+            }
+            CommandAction::OpenHelpFind { query } => {
+                // Mirrors mod.rs `CommandAction::OpenHelpFind` (P7.4 arm).
+                let help_registry = synaps_cli::help::HelpRegistry::new(
+                    synaps_cli::help::builtin_entries(),
+                    self.registry.plugin_help_entries(),
+                );
+                self.app.help_find = Some(synaps_cli::help::HelpFindState::new(
+                    help_registry.entries().to_vec(),
+                    &query,
+                ));
+                self.app.modal_stack.push(super::focus::PaneId::HelpFind);
+            }
+            CommandAction::OpenModels => {
+                self.app.models = Some(super::models::ModelsModalState::new());
+                self.app.modal_stack.push(super::focus::PaneId::Models);
+            }
+            CommandAction::OpenSettings => {
+                self.app.settings = Some(super::settings::SettingsState::new());
+                self.app.modal_stack.push(super::focus::PaneId::Settings);
+            }
+            CommandAction::OpenPlugins => {
+                // Production loads plugins.json from disk; the harness opens
+                // the deterministic default state instead of touching $HOME.
+                self.app.plugins = Some(super::plugins::PluginsModalState::new(
+                    synaps_cli::skills::state::PluginsState::default(),
+                ));
+                self.app.modal_stack.push(super::focus::PaneId::Plugins);
+            }
+            CommandAction::PluginCommand { command, arg } => {
+                // The commands.rs:114 executor — bounded like everything else.
+                // The default harness registry has no plugin commands, so this
+                // arm only fires for tests that register their own.
+                block_on_bounded(
+                    "execute_command_action(PluginCommand)",
+                    super::commands::execute_command_action(
+                        CommandAction::PluginCommand { command, arg },
+                        &mut self.app,
+                        &self.runtime,
+                    ),
+                );
+            }
+            // NOT sync-safe: terminal-mode swaps, engine streaming, config
+            // reloads. These stay P4-style recorded-not-executed.
+            CommandAction::LaunchGamba => self.record_unexecuted("launch-gamba"),
+            CommandAction::ReloadPlugins => self.record_unexecuted("reload-plugins"),
+            CommandAction::LoadSkill { .. } => self.record_unexecuted("load-skill"),
+            _ => self.record_unexecuted("other"),
+        }
+        #[cfg(debug_assertions)]
+        super::focus::debug_assert_stack_sync(&self.app);
+    }
+
+    fn record_unexecuted(&mut self, name: &str) {
+        self.actions.push(format!("command-action-unexecuted:{name}"));
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     fn record(&mut self, action: InputAction) {
@@ -555,7 +708,12 @@ impl TestHarness {
                 "quit".to_string()
             }
             InputAction::Submit(text) => format!("submit:{text}"),
-            InputAction::SlashCommand(cmd, arg) => format!("slash:{cmd}:{arg}"),
+            InputAction::SlashCommand(cmd, arg) => {
+                let desc = format!("slash:{cmd}:{arg}");
+                // P6.3: also queue structurally for the bounded async drive.
+                self.pending_slash.push((cmd, arg));
+                desc
+            }
             InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),

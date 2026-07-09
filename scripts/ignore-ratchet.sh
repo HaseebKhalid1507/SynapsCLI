@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-BASELINE=1
+BASELINE=0  # P6.3: scenario_08 unignored (bounded async slash drive) — keep at zero
 TARGET_DIR="crates/agent-tui/tests"
 
 # Resolve relative to repo root regardless of CWD.

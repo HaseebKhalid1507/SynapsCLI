@@ -250,13 +250,54 @@ fn scenario_07_plugins_modal_open_and_close() {
     );
 }
 
-/// Scenario 8 — Help-find lightbox requires the async slash-command resolution
-/// path (open_help_find_for_ambiguous_slash inside execute_command, which needs
-/// an ambiguous prefix + async executor).  The sync harness cannot drive it.
+/// Scenario 8 — Help-find lightbox via the REAL async slash path (P6.3).
+///
+/// `/help find` is typed and submitted exactly like a user would; the recorded
+/// `SlashCommand` is then executed through the harness's bounded async drive
+/// (`drive_slash_commands` → production `handle_command` →
+/// `CommandAction::OpenHelpFind`), which opens help_find and pushes it onto
+/// the ModalStack. Esc then closes it through the routed pane handler.
+/// The drive is hard-bounded by `SLASH_DRIVE_TIMEOUT` — it fails, never hangs.
 #[test]
-#[ignore = "harness gap: help-find opens via async execute_command — needs P6 async executor or dedicated accessor"]
 fn scenario_08_help_find_modal_open_and_close() {
-    unimplemented!()
+    let mut h = TestHarness::boot();
+
+    // Submit the slash command through the real input path.
+    h.type_str("/help find");
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+
+    // Dispatch is recorded but nothing has executed yet — the P4 contract.
+    assert_eq!(
+        h.modal_stack_depth(),
+        0,
+        "modal must not open before the bounded async drive runs"
+    );
+
+    // Bounded async drive: runs handle_command against the headless Runtime.
+    h.drive_slash_commands();
+
+    assert_eq!(
+        h.modal_stack_depth(),
+        1,
+        "help-find should be the open modal after the drive"
+    );
+    assert_eq!(h.top_pane_name(), "help-find");
+    let frame = h.snapshot();
+    assert!(
+        frame.contains("Find help"),
+        "help-find lightbox must be visible after the async drive:\n{frame}"
+    );
+
+    // Esc closes via the routed help_find pane handler (pop + state clear).
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+
+    assert_eq!(h.modal_stack_depth(), 0, "Esc must close help-find");
+    assert_eq!(h.top_pane_name(), "chat");
+    let frame_after = h.snapshot();
+    assert!(
+        !frame_after.contains("Find help"),
+        "help-find lightbox must be gone after Esc:\n{frame_after}"
+    );
 }
 
 // ── 3. Scrolling ─────────────────────────────────────────────────────────────
