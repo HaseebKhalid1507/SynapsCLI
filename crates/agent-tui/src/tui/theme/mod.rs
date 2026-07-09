@@ -5,6 +5,18 @@ use std::sync::LazyLock;
 
 mod palettes;
 
+/// Identifies a piece of high-value modal chrome for per-part style
+/// resolution. Each variant maps to an optional `<modal>.border` /
+/// `<modal>.title` override key in the user theme file. When no override is
+/// set the resolver falls back to the shared base token, so the default look
+/// is byte-identical to before per-part overrides existed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModalKind {
+    Settings,
+    Plugins,
+    Models,
+}
+
 /// All colors used by the TUI, grouped so they can be overridden from a
 /// user theme file. Defaults match the current built-in look.
 ///
@@ -79,6 +91,21 @@ pub(crate) struct Theme {
     pub(crate) tool_generic: Color,
     pub(crate) tool_input_bg: Color,
     pub(crate) tool_output_bg: Color,
+
+    // --- Per-part chrome overrides (P19.1) --------------------------------
+    // Optional overlays keyed off dotted TOML names (e.g. `settings.border`).
+    // `None` is the default for every field, which means "resolve to the base
+    // token" — so an unconfigured theme renders exactly as it did before these
+    // fields existed. Only set when a user opts in per part.
+    pub(crate) settings_border: Option<Color>,
+    pub(crate) settings_title: Option<Color>,
+    pub(crate) plugins_border: Option<Color>,
+    pub(crate) plugins_title: Option<Color>,
+    pub(crate) models_border: Option<Color>,
+    pub(crate) models_title: Option<Color>,
+    /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
+    /// back to `muted`, the color the pill uses today.
+    pub(crate) sidecar_pill: Option<Color>,
 }
 
 impl Default for Theme {
@@ -146,6 +173,16 @@ impl Default for Theme {
             tool_generic: Color::Reset,
             tool_input_bg: Color::Reset,
             tool_output_bg: Color::Reset,
+
+            // Per-part overrides are absent by default => resolvers fall back
+            // to base tokens => zero visual change across all 18 palettes.
+            settings_border: None,
+            settings_title: None,
+            plugins_border: None,
+            plugins_title: None,
+            models_border: None,
+            models_title: None,
+            sidecar_pill: None,
         }
     }
 }
@@ -248,8 +285,52 @@ impl Theme {
             "tool_generic" => self.tool_generic = c,
             "tool_input_bg" => self.tool_input_bg = c,
             "tool_output_bg" => self.tool_output_bg = c,
+
+            // Per-part chrome overrides (dotted keys). Present => Some(c).
+            "settings.border" => self.settings_border = Some(c),
+            "settings.title" => self.settings_title = Some(c),
+            "plugins.border" => self.plugins_border = Some(c),
+            "plugins.title" => self.plugins_title = Some(c),
+            "models.border" => self.models_border = Some(c),
+            "models.title" => self.models_title = Some(c),
+            "sidecar.pill" => self.sidecar_pill = Some(c),
             _ => {}, // unknown key, ignore
         }
+    }
+}
+
+/// Per-part style resolvers (P19.1).
+///
+/// Resolution rule: **part override if present, else the base token**. The
+/// border resolver always returns a concrete `Color` (base = `border_active`)
+/// so the call site is unconditional and identical to today when unset. The
+/// title resolver returns `Option<Color>`: today no modal sets a title style,
+/// so the call site applies `.title_style(..)` ONLY when `Some`, keeping the
+/// unset path byte-identical.
+impl Theme {
+    /// Border color for a modal's outer block. Falls back to `border_active`.
+    pub(crate) fn modal_border(&self, kind: ModalKind) -> Color {
+        let part = match kind {
+            ModalKind::Settings => self.settings_border,
+            ModalKind::Plugins => self.plugins_border,
+            ModalKind::Models => self.models_border,
+        };
+        part.unwrap_or(self.border_active)
+    }
+
+    /// Optional title color for a modal's block. `None` => leave the title
+    /// unstyled exactly as today (do not call `.title_style`).
+    pub(crate) fn modal_title(&self, kind: ModalKind) -> Option<Color> {
+        match kind {
+            ModalKind::Settings => self.settings_title,
+            ModalKind::Plugins => self.plugins_title,
+            ModalKind::Models => self.models_title,
+        }
+    }
+
+    /// Resting tint of the sidecar header pill. Falls back to `muted`.
+    pub(crate) fn sidecar_pill_color(&self) -> Color {
+        self.sidecar_pill.unwrap_or(self.muted)
     }
 }
 
@@ -370,5 +451,105 @@ mod theme_tests {
         let t = Theme::builtin("dracula").expect("dracula exists");
         assert_eq!(t.tool_bash, Color::Reset);
         assert_eq!(t.tool_input_bg, Color::Reset);
+    }
+
+    // ---- Per-part chrome overrides (P19.1) --------------------------------
+
+    #[test]
+    fn per_part_overrides_absent_by_default() {
+        // The whole point: no part keys => every Option is None => resolvers
+        // fall back to base tokens => frames are byte-identical to today.
+        let t = Theme::default();
+        assert_eq!(t.settings_border, None);
+        assert_eq!(t.settings_title, None);
+        assert_eq!(t.plugins_border, None);
+        assert_eq!(t.plugins_title, None);
+        assert_eq!(t.models_border, None);
+        assert_eq!(t.models_title, None);
+        assert_eq!(t.sidecar_pill, None);
+    }
+
+    #[test]
+    fn modal_border_falls_back_to_base_token_when_unset() {
+        // Regression guard: absent part key => resolver returns border_active,
+        // identical to the value every modal used before P19.1.
+        let t = Theme::default();
+        assert_eq!(t.modal_border(ModalKind::Settings), t.border_active);
+        assert_eq!(t.modal_border(ModalKind::Plugins), t.border_active);
+        assert_eq!(t.modal_border(ModalKind::Models), t.border_active);
+    }
+
+    #[test]
+    fn modal_title_is_none_when_unset() {
+        // None => call sites skip `.title_style` => title unstyled as today.
+        let t = Theme::default();
+        assert_eq!(t.modal_title(ModalKind::Settings), None);
+        assert_eq!(t.modal_title(ModalKind::Plugins), None);
+        assert_eq!(t.modal_title(ModalKind::Models), None);
+    }
+
+    #[test]
+    fn sidecar_pill_falls_back_to_muted_when_unset() {
+        let t = Theme::default();
+        assert_eq!(t.sidecar_pill_color(), t.muted);
+    }
+
+    #[test]
+    fn fallback_holds_across_all_18_palettes() {
+        // Every built-in palette, with no part overrides, must resolve each
+        // part to its base token — the "zero regression across 18 palettes"
+        // guarantee, asserted directly against the resolvers.
+        // The 18 named palettes plus the built-in `default` (19 total).
+        const NAMES: [&str; 19] = [
+            "default", "night-city", "neon-rain", "amber", "phosphor",
+            "solarized-dark", "blood", "ocean", "rose-pine", "nord", "dracula",
+            "monokai", "gruvbox", "catppuccin", "tokyo-night", "sunset", "ice",
+            "forest", "lavender",
+        ];
+        for name in NAMES {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
+            for kind in [ModalKind::Settings, ModalKind::Plugins, ModalKind::Models] {
+                assert_eq!(
+                    t.modal_border(kind),
+                    t.border_active,
+                    "{name}: {kind:?} border must fall back to border_active"
+                );
+                assert_eq!(t.modal_title(kind), None, "{name}: {kind:?} title must be None");
+            }
+            assert_eq!(t.sidecar_pill_color(), t.muted, "{name}: pill falls back to muted");
+        }
+    }
+
+    #[test]
+    fn settings_border_distinct_from_plugins_border() {
+        // Acceptance (a): a user TOML setting settings.border != plugins.border
+        // makes the resolver return *different* colors — so the two modals
+        // render distinctly. Parsed through the real `set`/dotted-key path.
+        let mut t = Theme::default();
+        t.set("settings.border", Color::Rgb(0xAA, 0x00, 0x00));
+        t.set("plugins.border", Color::Rgb(0x00, 0x00, 0xBB));
+        let sb = t.modal_border(ModalKind::Settings);
+        let pb = t.modal_border(ModalKind::Plugins);
+        assert_eq!(sb, Color::Rgb(0xAA, 0x00, 0x00));
+        assert_eq!(pb, Color::Rgb(0x00, 0x00, 0xBB));
+        assert_ne!(sb, pb, "settings border must differ from plugins border");
+        // Models was NOT overridden => still falls back to base token.
+        assert_eq!(t.modal_border(ModalKind::Models), t.border_active);
+    }
+
+    #[test]
+    fn per_part_keys_parse_from_theme_file_lines() {
+        // Exercise the same dotted-key path the TOML loader uses.
+        let mut t = Theme::default();
+        t.set("settings.title", Color::Rgb(1, 2, 3));
+        t.set("plugins.title", Color::Rgb(4, 5, 6));
+        t.set("models.border", Color::Rgb(7, 8, 9));
+        t.set("sidecar.pill", Color::Rgb(10, 11, 12));
+        assert_eq!(t.modal_title(ModalKind::Settings), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(t.modal_title(ModalKind::Plugins), Some(Color::Rgb(4, 5, 6)));
+        assert_eq!(t.modal_border(ModalKind::Models), Color::Rgb(7, 8, 9));
+        assert_eq!(t.sidecar_pill_color(), Color::Rgb(10, 11, 12));
+        // Unknown dotted keys are still ignored, not panics.
+        t.set("bogus.key", Color::Rgb(0, 0, 0));
     }
 }

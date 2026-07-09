@@ -69,7 +69,9 @@ fn sidecar_pill_segment(
                     (base.2 as f64 * pulse) as u8,
                 )
             } else {
-                THEME.load().muted
+                // P19.1: resting pill tint — `sidecar.pill` override if set,
+                // else `muted` (the color used today).
+                THEME.load().sidecar_pill_color()
             }
         }
         super::sidecar::SidecarUiStatus::Active { .. } => {

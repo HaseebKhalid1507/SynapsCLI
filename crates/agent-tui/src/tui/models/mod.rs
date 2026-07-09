@@ -58,7 +58,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
 };
 
-use super::theme::THEME;
+use super::theme::{ModalKind, THEME};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelsView {
@@ -592,11 +592,16 @@ struct ModelsModalWidget<'a> {
 impl Widget for ModelsModalWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let theme = THEME.load();
-        let block = Block::default()
+        // P19.1: `models.border` override (else `border_active` base token);
+        // `models.title` applied only when set (else title unchanged).
+        let mut block = Block::default()
             .title(" Models ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border_active))
+            .border_style(Style::default().fg(theme.modal_border(ModalKind::Models)))
             .padding(Padding { left: 2, right: 2, top: 1, bottom: 1 });
+        if let Some(tc) = theme.modal_title(ModalKind::Models) {
+            block = block.title_style(Style::default().fg(tc));
+        }
         let inner = block.inner(area);
         block.render(area, buf);
 

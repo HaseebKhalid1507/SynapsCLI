@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap
 use super::PluginsModalState;
 use super::progress::{ClonePhase, InstallProgressHandle};
 use super::state::{Focus, LeftRow, RightMode, RightRow};
-use super::super::theme::THEME;
+use super::super::theme::{ModalKind, THEME};
 
 const OVERLAY_MAX_WIDTH: u16 = 70;
 const OVERLAY_HEIGHT: u16 = 7;
@@ -56,12 +56,18 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &PluginsModalState) {
     let modal = Rect { x, y, width: w, height: h };
 
     frame.render_widget(Clear, modal);
-    let block = Block::default()
+    // P19.1: `plugins.border` override (else `border_active` base token);
+    // `plugins.title` applied only when set (else title unchanged).
+    let theme = THEME.load();
+    let mut block = Block::default()
         .title(" Plugins ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().border_active))
-        .style(Style::default().bg(THEME.load().bg));
+        .border_style(Style::default().fg(theme.modal_border(ModalKind::Plugins)))
+        .style(Style::default().bg(theme.bg));
+    if let Some(tc) = theme.modal_title(ModalKind::Plugins) {
+        block = block.title_style(Style::default().fg(tc));
+    }
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
