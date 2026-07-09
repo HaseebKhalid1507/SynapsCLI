@@ -139,6 +139,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
     let hook_bus = Arc::new(HookBus::new());
     let mut manager = ExtensionManager::new(hook_bus.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -237,6 +238,7 @@ async fn after_tool_call_replace_substitutes_output_via_real_extension() {
     let hook_bus = Arc::new(HookBus::new());
     let mut manager = ExtensionManager::new(hook_bus.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -308,6 +310,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
     let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
     let mut manager = ExtensionManager::new_with_tools(hook_bus, tools.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -369,6 +372,7 @@ async fn extension_registering_tools_requires_tools_register_permission() {
     let pid_file = temp.path().join("extension.pid");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "env".to_string(),
@@ -420,6 +424,7 @@ async fn extension_tool_specs_are_validated() {
         let tools = Arc::new(tokio::sync::RwLock::new(synaps_cli::ToolRegistry::without_subagent()));
         let mut manager = ExtensionManager::new_with_tools(hook_bus, tools);
         let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "env".to_string(),
@@ -451,6 +456,7 @@ async fn extension_provider_metadata_is_registered_when_permission_is_declared()
     let hook_bus = Arc::new(HookBus::new());
     let mut manager = ExtensionManager::new(hook_bus);
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -493,6 +499,7 @@ async fn provider_capability_specs_are_validated() {
         let hook_bus = Arc::new(HookBus::new());
         let mut manager = ExtensionManager::new(hook_bus);
         let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "env".to_string(),
@@ -541,6 +548,7 @@ async fn extension_config_is_resolved_and_passed_to_initialize() {
     let hook_bus = Arc::new(HookBus::new());
     let mut manager = ExtensionManager::new(hook_bus);
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -599,6 +607,7 @@ async fn extension_missing_required_config_fails_before_spawn() {
     let plugin_dir = tempfile::tempdir().unwrap();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "/definitely/not/spawned".to_string(),
@@ -644,6 +653,7 @@ async fn extension_provider_complete_routes_to_process() {
     let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new(hook_bus)));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -708,6 +718,7 @@ async fn provider_disabled_in_trust_state_blocks_route() {
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
 
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -795,6 +806,7 @@ async fn extension_provider_tool_use_is_executed_by_router_before_final_response
     let manager = Arc::new(tokio::sync::RwLock::new(ExtensionManager::new_with_tools(hook_bus, tools.clone())));
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),
@@ -1154,6 +1166,7 @@ async fn audit_log_records_disabled_route() {
     synaps_cli::runtime::openai::set_extension_manager_for_routing(manager.clone());
 
     let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
         command: "python3".to_string(),

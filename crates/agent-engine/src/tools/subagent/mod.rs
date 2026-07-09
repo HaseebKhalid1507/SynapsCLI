@@ -61,8 +61,10 @@ mod cache_ttl_policy_tests {
     #[tokio::test]
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_one_hour() {
         // Build a config representing a parent session with 1h cache TTL.
-        let mut parent_config = crate::config::SynapsConfig::default();
-        parent_config.cache_ttl = CacheTtl::OneHour;
+        let parent_config = crate::config::SynapsConfig {
+            cache_ttl: CacheTtl::OneHour,
+            ..Default::default()
+        };
 
         // Create a fresh runtime (as each subagent spawn does).
         let mut runtime = crate::Runtime::new().await
@@ -94,8 +96,10 @@ mod cache_ttl_policy_tests {
 
     #[tokio::test]
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_hybrid() {
-        let mut parent_config = crate::config::SynapsConfig::default();
-        parent_config.cache_ttl = CacheTtl::Hybrid;
+        let parent_config = crate::config::SynapsConfig {
+            cache_ttl: CacheTtl::Hybrid,
+            ..Default::default()
+        };
 
         let mut runtime = crate::Runtime::new().await
             .expect("Runtime::new() must succeed in test environment");

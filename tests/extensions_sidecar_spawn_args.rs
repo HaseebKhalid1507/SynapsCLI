@@ -30,6 +30,7 @@ fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
         args.push(format!("--mode={m}"));
     }
     ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),

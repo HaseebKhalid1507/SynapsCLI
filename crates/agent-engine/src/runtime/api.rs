@@ -1462,8 +1462,7 @@ mod tests {
         let events = drain(&mut rx);
         let last_usage = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
-            .next_back()
+            .rfind(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
             .expect("delta must emit a Usage event");
         assert!(matches!(
             last_usage,

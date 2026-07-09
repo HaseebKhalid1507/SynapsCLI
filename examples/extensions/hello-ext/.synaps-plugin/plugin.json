@@ -12,6 +12,7 @@
     "permissions": ["tools.register", "tools.intercept"],
     "hooks": [
       { "hook": "before_tool_call", "tool": "bash" }
-    ]
+    ],
+    "theme_tokens": { "accent": "#22d3ee" }
   }
 }

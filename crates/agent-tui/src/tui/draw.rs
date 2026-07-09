@@ -1673,7 +1673,11 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(THEME.load().border_active))
+            // P19.2: extension widgets may carry an accent resolved from
+            // `ext.<id>.accent`; None => border_active, identical to before.
+            .border_style(
+                Style::default().fg(toast.accent.unwrap_or(THEME.load().border_active)),
+            )
             .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(Clear, rect);
         let paragraph = if toast.has_rich_lines() {

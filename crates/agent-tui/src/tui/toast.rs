@@ -25,6 +25,10 @@ pub(crate) struct Toast {
     /// colors for pixel art, status indicators, and themed widgets.
     pub(crate) rich_lines: Option<Vec<Line<'static>>>,
     pub(crate) position: ToastPosition,
+    /// Optional border accent (P19.2). Extension widgets resolve this
+    /// through the namespaced theme token `ext.<id>.accent`; `None` keeps
+    /// the default `border_active` border, byte-identical to before.
+    pub(crate) accent: Option<ratatui::style::Color>,
     created_at: Option<Instant>,
     ttl: Option<Duration>,
 }
@@ -37,6 +41,7 @@ impl Toast {
             lines: vec![line.into()],
             rich_lines: None,
             position: ToastPosition::default(),
+            accent: None,
             created_at: None,
             ttl: Some(Duration::from_secs(4)),
         }
@@ -62,6 +67,12 @@ impl Toast {
     /// Whether this toast has rich (pre-styled) content.
     pub(crate) fn has_rich_lines(&self) -> bool {
         self.rich_lines.is_some()
+    }
+
+    /// Set the border accent color (P19.2, resolved ext theme token).
+    pub(crate) fn accent(mut self, color: Option<ratatui::style::Color>) -> Self {
+        self.accent = color;
+        self
     }
 
     pub(crate) fn at(mut self, position: ToastPosition) -> Self {

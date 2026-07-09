@@ -1184,6 +1184,7 @@ mod tests {
         let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
         let mut manager = synaps_cli::extensions::manager::ExtensionManager::new(bus);
         let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),

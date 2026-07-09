@@ -12,6 +12,7 @@ fn handle_widget_event(
     event: synaps_cli::extensions::widgets::ExtensionWidgetEvent,
 ) -> bool {
     use synaps_cli::extensions::widgets::WidgetEvent;
+    let ext_id = event.extension_id.clone();
     match event.event {
         WidgetEvent::Upsert {
             id,
@@ -74,6 +75,10 @@ fn handle_widget_event(
             if let Some(title) = title {
                 t = t.titled(title);
             }
+            // P19.2: extension-rendered surface resolves through the
+            // namespaced token — border accent from `ext.<id>.accent`
+            // (user TOML override > manifest declaration > default border).
+            t = t.accent(theme::THEME.load().ext_token(&ext_id, "accent"));
             app.toasts.upsert(t)
         }
         WidgetEvent::Dismiss { id } => {
@@ -192,6 +197,22 @@ async fn handle_extension_loader_event(
                 ]
             };
             handle_extension_loader_toast(app, "Extensions", lines, false);
+
+            // P19.2: merge manifest-declared theme tokens into the theme
+            // registry under `ext.<plugin-id>.<token>`. User theme-TOML
+            // `ext.<id>.<token>` overrides still win — they live inside the
+            // Theme value and are checked first by `Theme::ext_token`.
+            // Extensions with no `theme_tokens` contribute nothing here.
+            let ext_theme_tokens = ext_mgr.read().await.theme_tokens();
+            if !ext_theme_tokens.is_empty() {
+                for (ext_id, tokens) in &ext_theme_tokens {
+                    theme::register_ext_theme_tokens(
+                        ext_id,
+                        tokens.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                    );
+                }
+                app.invalidate();
+            }
 
             // Spawn a background notification watcher for each loaded extension.
             // The watcher forwards widget.* notifications to the TUI via widget_tx.

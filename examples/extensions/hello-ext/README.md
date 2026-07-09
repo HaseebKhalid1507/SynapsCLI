@@ -24,6 +24,12 @@ cd examples/extensions/hello-ext
 python3 test_hello.py
 ```
 
+It also declares one theme token in its manifest (`theme_tokens`):
+`accent = #22d3ee`. At load, SynapsCLI merges it into the active theme as
+`ext.hello-ext.accent`; a user theme-file line `ext.hello-ext.accent = "#ff00ff"`
+overrides it. The field is optional — extensions without it are unaffected
+(see `docs/extensions/contract.json` → `theme_tokens`).
+
 Install it:
 
 ```bash

@@ -106,6 +106,14 @@ pub(crate) struct Theme {
     /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
     /// back to `muted`, the color the pill uses today.
     pub(crate) sidecar_pill: Option<Color>,
+
+    // --- Namespaced extension tokens (P19.2) -------------------------------
+    /// User-TOML overrides for extension theme tokens, keyed by the full
+    /// dotted name `ext.<plugin-id>.<token>`. Parsed by `set` from any theme
+    /// file line whose key starts with `ext.`. These always WIN over
+    /// manifest-declared values (see [`Theme::ext_token`]). Empty by default,
+    /// so themes without `ext.*` keys are unaffected.
+    pub(crate) ext_overrides: std::collections::HashMap<String, Color>,
 }
 
 impl Default for Theme {
@@ -183,6 +191,9 @@ impl Default for Theme {
             models_border: None,
             models_title: None,
             sidecar_pill: None,
+
+            // No user overrides for extension tokens by default.
+            ext_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -294,6 +305,12 @@ impl Theme {
             "models.border" => self.models_border = Some(c),
             "models.title" => self.models_title = Some(c),
             "sidecar.pill" => self.sidecar_pill = Some(c),
+
+            // Extension token overrides (P19.2): any `ext.<id>.<token>` key
+            // is stored verbatim; resolution happens in `ext_token`.
+            k if k.starts_with("ext.") => {
+                self.ext_overrides.insert(k.to_string(), c);
+            }
             _ => {}, // unknown key, ignore
         }
     }
@@ -331,6 +348,60 @@ impl Theme {
     /// Resting tint of the sidecar header pill. Falls back to `muted`.
     pub(crate) fn sidecar_pill_color(&self) -> Color {
         self.sidecar_pill.unwrap_or(self.muted)
+    }
+
+    /// Resolve a namespaced extension theme token `ext.<ext_id>.<token>`
+    /// (P19.2). Resolution order: user theme-TOML override (in
+    /// `ext_overrides`) → extension manifest declaration (in the load-time
+    /// registry) → `None`. Extension-rendered surfaces treat `None` as "use
+    /// whatever base token you use today", so extensions that declare no
+    /// tokens — and users that set no overrides — see zero change.
+    pub(crate) fn ext_token(&self, ext_id: &str, token: &str) -> Option<Color> {
+        let key = format!("ext.{ext_id}.{token}");
+        if let Some(c) = self.ext_overrides.get(&key) {
+            return Some(*c);
+        }
+        EXT_DECLARED_TOKENS
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).copied())
+    }
+}
+
+/// Extension-declared theme tokens, keyed `ext.<plugin-id>.<token>` (P19.2).
+///
+/// Lives OUTSIDE the `Theme` value on purpose: the theme in [`THEME`] is
+/// rebuilt wholesale on palette switches (`set_theme`), and manifest-declared
+/// tokens must survive that — they are a property of the loaded extensions,
+/// not of the palette. User overrides, by contrast, live inside `Theme`
+/// (parsed from the theme file) and therefore correctly reload with it.
+static EXT_DECLARED_TOKENS: LazyLock<std::sync::RwLock<std::collections::HashMap<String, Color>>> =
+    LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Merge one extension's manifest-declared theme tokens into the registry
+/// under `ext.<ext_id>.<token>` (P19.2). Values are `#rgb`/`#rrggbb` hex;
+/// unparseable entries are skipped (same forgiving posture as the theme-file
+/// loader — the manifest validator upstream already rejects them at load).
+/// Idempotent per (ext, token): reloading an extension re-registers cleanly.
+pub(crate) fn register_ext_theme_tokens<'a>(
+    ext_id: &str,
+    tokens: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
+    if let Ok(mut map) = EXT_DECLARED_TOKENS.write() {
+        for (token, value) in tokens {
+            if let Some(color) = parse_hex_color(value) {
+                map.insert(format!("ext.{ext_id}.{token}"), color);
+            }
+        }
+    }
+}
+
+/// Drop all declared tokens for one extension (unload hygiene).
+#[allow(dead_code)]
+pub(crate) fn clear_ext_theme_tokens(ext_id: &str) {
+    if let Ok(mut map) = EXT_DECLARED_TOKENS.write() {
+        let prefix = format!("ext.{ext_id}.");
+        map.retain(|k, _| !k.starts_with(&prefix));
     }
 }
 
@@ -551,5 +622,109 @@ mod theme_tests {
         assert_eq!(t.sidecar_pill_color(), Color::Rgb(10, 11, 12));
         // Unknown dotted keys are still ignored, not panics.
         t.set("bogus.key", Color::Rgb(0, 0, 0));
+    }
+
+    // ---- Namespaced extension tokens (P19.2) -------------------------------
+    // NOTE: the declared-token registry is a process-wide static; every test
+    // below uses a unique ext id so tests stay independent under parallel run.
+
+    #[test]
+    fn ext_token_is_none_when_nothing_declared() {
+        // Baseline: no manifest declaration, no user override => None.
+        // This is the "existing extensions unaffected" guarantee.
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-none-ext", "accent"), None);
+    }
+
+    #[test]
+    fn manifest_declared_token_resolves() {
+        // Acceptance: an extension ships a token; it resolves via ext_token.
+        register_ext_theme_tokens("p192-decl-ext", [("accent", "#22d3ee")]);
+        let t = Theme::default();
+        assert_eq!(
+            t.ext_token("p192-decl-ext", "accent"),
+            Some(Color::Rgb(0x22, 0xd3, 0xee))
+        );
+        // A token the extension did NOT declare stays None.
+        assert_eq!(t.ext_token("p192-decl-ext", "other"), None);
+    }
+
+    #[test]
+    fn user_toml_override_wins_over_manifest() {
+        // Acceptance: user theme TOML `ext.<id>.<token>` beats the manifest.
+        register_ext_theme_tokens("p192-override-ext", [("accent", "#111111")]);
+        let mut t = Theme::default();
+        // Same dotted-key path the theme-file loader uses.
+        t.set("ext.p192-override-ext.accent", Color::Rgb(0xAA, 0xBB, 0xCC));
+        assert_eq!(
+            t.ext_token("p192-override-ext", "accent"),
+            Some(Color::Rgb(0xAA, 0xBB, 0xCC)),
+            "user override must win over the manifest-declared value"
+        );
+    }
+
+    #[test]
+    fn user_override_resolves_even_without_declaration() {
+        // A user may theme a token the extension never declared — still works.
+        let mut t = Theme::default();
+        t.set("ext.p192-useronly-ext.badge", Color::Rgb(1, 2, 3));
+        assert_eq!(
+            t.ext_token("p192-useronly-ext", "badge"),
+            Some(Color::Rgb(1, 2, 3))
+        );
+    }
+
+    #[test]
+    fn declared_tokens_survive_palette_switch() {
+        // The registry lives outside Theme, so switching palettes (a fresh
+        // Theme value) must not lose manifest-declared tokens.
+        register_ext_theme_tokens("p192-switch-ext", [("accent", "#fa0")]);
+        let fresh = Theme::builtin("dracula").expect("dracula exists");
+        assert_eq!(
+            fresh.ext_token("p192-switch-ext", "accent"),
+            Some(Color::Rgb(0xff, 0xaa, 0x00)), // #fa0 short-form expansion
+        );
+    }
+
+    #[test]
+    fn malformed_declared_values_are_skipped() {
+        // register_ext_theme_tokens is forgiving: bad hex never lands.
+        register_ext_theme_tokens("p192-badhex-ext", [("accent", "not-a-color")]);
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-badhex-ext", "accent"), None);
+    }
+
+    #[test]
+    fn clear_ext_theme_tokens_removes_only_that_extension() {
+        register_ext_theme_tokens("p192-clear-a", [("accent", "#111111")]);
+        register_ext_theme_tokens("p192-clear-b", [("accent", "#222222")]);
+        clear_ext_theme_tokens("p192-clear-a");
+        let t = Theme::default();
+        assert_eq!(t.ext_token("p192-clear-a", "accent"), None);
+        assert_eq!(
+            t.ext_token("p192-clear-b", "accent"),
+            Some(Color::Rgb(0x22, 0x22, 0x22))
+        );
+    }
+
+    #[test]
+    fn hello_ext_demo_token_resolves_and_user_override_wins() {
+        // The P19.2 acceptance vehicle: hello-ext (examples/extensions/
+        // hello-ext) declares `accent = #22d3ee` in its manifest. Simulate
+        // exactly what the extension-loader arm does at load, then apply a
+        // user TOML override and confirm it wins.
+        register_ext_theme_tokens("hello-ext", [("accent", "#22d3ee")]);
+        let mut t = Theme::default();
+        assert_eq!(
+            t.ext_token("hello-ext", "accent"),
+            Some(Color::Rgb(0x22, 0xd3, 0xee)),
+            "hello-ext's manifest token must resolve"
+        );
+        t.set("ext.hello-ext.accent", Color::Rgb(0xff, 0x00, 0xff));
+        assert_eq!(
+            t.ext_token("hello-ext", "accent"),
+            Some(Color::Rgb(0xff, 0x00, 0xff)),
+            "user TOML `ext.hello-ext.accent` must override the manifest"
+        );
     }
 }
