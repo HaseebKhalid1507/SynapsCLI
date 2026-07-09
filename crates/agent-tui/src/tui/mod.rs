@@ -703,6 +703,10 @@ pub async fn run(
                                             registry.entries().to_vec(),
                                             &query,
                                         ));
+                                        // P7.4: mirror the open with a stack push
+                                        // (§6). Covered by the tripwire one event
+                                        // late (acceptable per note B).
+                                        app.modal_stack.push(focus::PaneId::HelpFind);
                                     }
                                     CommandAction::ReloadPlugins => {
                                         synaps_cli::skills::reload_registry(&registry, &config);

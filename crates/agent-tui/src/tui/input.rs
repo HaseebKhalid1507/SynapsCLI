@@ -42,11 +42,11 @@ pub(super) enum InputAction {
 
 /// Process a crossterm Event and return what the main loop should do.
 ///
-/// P7.3 thin outer wrapper: the modal-routing SHIM runs first, then the legacy
-/// chain (via `handle_event_inner`), then the debug-only stack/app sync
-/// tripwire. The stack is wired but PERMANENTLY EMPTY until P7.4, so the shim
-/// is a pure no-op today and this wrapper is behavior-identical to the old
-/// direct call.
+/// Thin outer wrapper: the modal-routing SHIM dispatches stack-routed panes to
+/// their pane handler and unmigrated panes to the legacy `handle_event_inner`
+/// chain; BOTH paths converge on `action` so the debug-only stack/app sync
+/// tripwire runs afterwards on every path (including the pop path). As of P7.4
+/// only HelpFind is stack-routed.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -56,28 +56,32 @@ pub(super) fn handle_event(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // P7 SHIM (P7.3) — stack-routed panes dispatch here; unmigrated panes fall
-    // through to the legacy chain below. Stack is EMPTY until P7.4, so top()
-    // is always Chat and this is a pure no-op. Deleted in P7.8.
-    match app.modal_stack.top() {
-        super::focus::PaneId::Chat => { /* fall through to legacy chain */ }
+    // P7 SHIM — stack-routed panes dispatch to their pane handler; unmigrated
+    // panes fall through to the legacy chain (via handle_event_inner). A pane
+    // is EITHER stack-routed OR chain-routed, never both. BOTH paths flow into
+    // `action` so the sync tripwire below runs after the pop path too (note A /
+    // §6). As of P7.4, HelpFind is stack-routed; the other modals still fall
+    // through. Deleted in P7.8.
+    let action = match app.modal_stack.top() {
+        super::focus::PaneId::Chat => {
+            handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines)
+        }
+        super::focus::PaneId::HelpFind => route_help_find(event, app),
         other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
-    }
+    };
 
-    let action =
-        handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines);
-
-    // P7.3 stack/app-field sync tripwire (§3 contract 4) — debug/test builds
-    // only. No modal is migrated yet, so the invariant is simply "stack empty".
+    // Stack/app-field sync tripwire (§3 contract 4) — debug/test builds only.
+    // Runs after BOTH the chain path and the pane-handler pop path, so a missed
+    // push/pop fails the harness loudly instead of misrouting silently.
     #[cfg(debug_assertions)]
     super::focus::debug_assert_stack_sync(app);
 
     action
 }
 
-/// Legacy routing body: the if-let modal chain (help_find → models → plugins →
-/// settings) followed by base Chat handling. Unchanged by P7.3; reached only
-/// via the `handle_event` wrapper (stack empty ⇒ shim falls through here).
+/// Legacy routing body: the if-let modal chain (models → plugins → settings)
+/// followed by base Chat handling. Reached only via the `handle_event` wrapper
+/// when `top() == Chat` (help_find migrated to the stack in P7.4).
 fn handle_event_inner(
     event: Event,
     app: &mut App,
@@ -87,20 +91,6 @@ fn handle_event_inner(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // Route events to /help find while it's open.
-    if let Some(state) = app.help_find.as_mut() {
-        if let Event::Key(key) = event {
-            let outcome = super::help_find::handle_event(state, key);
-            return match outcome {
-                super::help_find::HelpFindAction::Close => {
-                    app.help_find = None;
-                    InputAction::None
-                }
-                super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
-            };
-        }
-        return InputAction::None;
-    }
     // Route events to the models modal while it's open.
     if let Some(state) = app.models.as_mut() {
         if let Event::Key(key) = event {
@@ -578,6 +568,33 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     InputAction::StreamingInput(input)
 }
 
+/// P7.4 stack-routed pane handler for the `/help find` lightbox.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `help_find::handle_event`), and additionally POPS the modal
+/// stack when the lightbox closes — keeping `modal_stack.contains(HelpFind)`
+/// in sync with `app.help_find.is_some()` (asserted by
+/// `debug_assert_stack_sync`). Returns the loop's existing `InputAction`
+/// directly: help_find never coexists with another modal (§6), so no
+/// `PaneOutcome` indirection is required.
+fn route_help_find(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == HelpFind ⇒ help_find is Some.
+    let Some(state) = &mut app.help_find else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::help_find::handle_event(state, key) {
+            super::help_find::HelpFindAction::Close => {
+                app.help_find = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+        };
+    }
+    InputAction::None
+}
+
 fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegistry>) -> bool {
     let Some(query) = synaps_cli::help::prefilter_query_for_slash_command(&app.input) else {
         return false;
@@ -593,6 +610,10 @@ fn open_help_find_for_ambiguous_slash(app: &mut App, registry: &Arc<CommandRegis
         help_registry.entries().to_vec(),
         &query,
     ));
+    // P7.4: mirror the `= Some(..)` open with a stack push (§6: push accompanies
+    // every open of a migrated modal). help_find never coexists, so this is a
+    // depth 0 → 1 push.
+    app.modal_stack.push(super::focus::PaneId::HelpFind);
     true
 }
 

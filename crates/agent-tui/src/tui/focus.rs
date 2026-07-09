@@ -399,14 +399,29 @@ impl FocusManager {
 /// duplicates) via [`debug_assert_stack_internal`].
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
-    // P7.3: no modal migrated → stack must be empty. (Extended per-modal in P7.4+.)
-    debug_assert!(
-        app.modal_stack.is_empty(),
-        "stack sync (P7.3): ModalStack must be empty until a modal is migrated \
-         (P7.4+); top={:?}, depth={}",
-        app.modal_stack.top(),
-        app.modal_stack.depth()
+    // P7.4: HelpFind is the only migrated modal so far. Its membership on the
+    // stack must exactly mirror its backing App field (§3 contract 4).
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::HelpFind),
+        app.help_find.is_some(),
+        "stack sync (P7.4): modal_stack.contains(HelpFind)={} but help_find.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::HelpFind),
+        app.help_find.is_some()
     );
+
+    // Every other pane is still chain-routed (unmigrated) ⇒ it must NEVER be on
+    // the stack yet. HelpFind is the only permitted member; the stack is
+    // therefore empty OR exactly [HelpFind]. (Extended per-modal in P7.5+.)
+    for pane in app.modal_stack.iter_bottom_up() {
+        debug_assert_eq!(
+            pane,
+            PaneId::HelpFind,
+            "stack sync (P7.4): unmigrated pane {pane:?} found on the ModalStack \
+             — only HelpFind is stack-routed so far"
+        );
+    }
+
     debug_assert_stack_internal(&app.modal_stack);
 }
 
