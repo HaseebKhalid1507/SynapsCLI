@@ -270,6 +270,7 @@ pub(crate) fn insert_text_into_input(app: &mut App, text: &str) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // test mod precedes helper items in this file
 mod tests {
     use super::*;
     use synaps_cli::Session;
