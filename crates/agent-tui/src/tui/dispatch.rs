@@ -106,9 +106,24 @@ pub(crate) async fn handle_input_action(
                                 *steer_tx = None;
                                 app.streaming = false;
                                 app.subagents.clear();
-                                // Cancel all running reactive subagents
+                                // Cancel all running reactive subagents. A poisoned
+                                // registry mutex must not turn a user abort into a
+                                // panic (the old `.unwrap()`), but nor should it
+                                // silently skip cancellation and leave orphaned
+                                // subagents burning tokens — recover the guard and
+                                // cancel anyway, logging the poison. Scoped in its
+                                // own block so the guard drops before any `.await`
+                                // below (clippy::await_holding_lock).
                                 {
-                                    let mut registry = runtime.subagent_registry().lock().unwrap();
+                                    let mut registry = match runtime.subagent_registry().lock() {
+                                        Ok(g) => g,
+                                        Err(poisoned) => {
+                                            tracing::warn!(
+                                                "subagent registry mutex poisoned during abort; recovering to cancel running handles"
+                                            );
+                                            poisoned.into_inner()
+                                        }
+                                    };
                                     for handle in registry.iter_mut_handles() {
                                         if handle.status() == synaps_cli::runtime::subagent::SubagentStatus::Running {
                                             handle.cancel();

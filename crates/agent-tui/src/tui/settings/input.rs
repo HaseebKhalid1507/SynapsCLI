@@ -260,7 +260,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Left, _) | (KeyCode::Right, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting() {
+            if let Some(def) = state.current_setting(snap) {
                 if let EditorKind::Cycler(options) = def.editor {
                     let current = cycler_current_value(def.key, snap);
                     let idx = options.iter().position(|o| *o == current).unwrap_or(0);
@@ -281,7 +281,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Enter, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting() {
+            if let Some(def) = state.current_setting(snap) {
                 match def.editor {
                     EditorKind::Text { numeric } => {
                         state.row_error = None;
@@ -528,13 +528,17 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
             .unwrap_or(0);
     }
     let visible = visible_categories(&snap.lifecycle_claims);
-    let cat = visible[state.category_idx];
+    // Guard against a stale `category_idx` parked past the list (e.g. a plugin
+    // category hot-reloaded away while the modal is open): no category => no rows.
+    let Some(&cat) = visible.get(state.category_idx) else {
+        return 0;
+    };
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
     } else if cat == super::schema::Category::Providers {
         synaps_cli::runtime::openai::registry::providers().len() + 1 // +1 for Local row
     } else {
-        state.current_settings().len()
+        state.current_settings(snap).len()
     }
 }
 
