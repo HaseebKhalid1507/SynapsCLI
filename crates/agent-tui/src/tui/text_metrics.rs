@@ -30,10 +30,14 @@ pub(crate) fn width(s: &str) -> usize {
 /// # Load-bearing: ZWSP width 0
 /// ZWSP (U+200B, ZERO WIDTH SPACE) correctly returns **0** here. This is
 /// **load-bearing** for `THINKING_PLACEHOLDER` (`transcript.rs:50` =
-/// `"\u{2026}\u{200B}"`) — the placeholder uses ZWSP to produce a non-empty
-/// string that still measures as 1 display cell (the ellipsis only), allowing
-/// the render path to distinguish "placeholder" from "truly empty". Changing
-/// the width-0 policy here would silently break thinking-state rendering.
+/// `"\u{2026}\u{200B}"`): the ellipsis + trailing ZWSP is a spinner sentinel
+/// that is, per its own doc, "visually identical to '…' but never equal to real
+/// model output" (real output could legitimately be a bare "…"). The width-0
+/// policy is exactly what keeps the sentinel visually identical to a plain
+/// ellipsis — the ZWSP disambiguates it from genuine "…" output while adding no
+/// visible column. If this policy stopped returning 0, the placeholder would
+/// render one column wider than a real ellipsis and the spinner chrome would
+/// visibly diverge.
 #[inline]
 pub(crate) fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
