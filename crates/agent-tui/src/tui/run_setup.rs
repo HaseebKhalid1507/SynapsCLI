@@ -168,7 +168,7 @@ pub(crate) async fn run_setup(
     let ext_mgr_shared = boot.ext_manager;
 
     // Legacy sidecar key migration
-    migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
+    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&registry.lifecycle_claims());
 
     if !boot.no_extensions {
         app.extension_loader_running = true;

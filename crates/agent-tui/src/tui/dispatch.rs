@@ -877,7 +877,7 @@ pub(crate) async fn handle_input_action(
                                             ).await {
                                                 Ok(mut state) => {
                                                     let claims = registry.lifecycle_claims();
-                                                    let display = pick_display_name_for_plugin(
+                                                    let display = loop_arms::pick_display_name_for_plugin(
                                                         &state.sidecar.plugin_name,
                                                         &claims,
                                                     );

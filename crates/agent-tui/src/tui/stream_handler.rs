@@ -1,9 +1,12 @@
 //! Stream event handling — processes StreamEvent variants from the runtime.
 
 
-use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+use serde_json::json;
+use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
 
-use super::app::{App, ChatMessage, SubagentState};
+use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
+use super::draw::build_render_model;
+use super::render_thread::RenderHandle;
 
 /// What the event loop should do after processing a stream event.
 pub(super) enum StreamAction {
@@ -190,6 +193,178 @@ pub(super) async fn handle_stream_event(
         }
     }
     StreamAction::Continue
+}
+
+
+// ── P12.4: stream-lifecycle select! arms — pure code-motion from run(). ──
+// The select! arm EXPRESSIONS (the event-queue `notified()` wake and the
+// `stream.next()` polling future) stay inline in mod.rs; only the arm
+// BODIES moved here, verbatim, apart from `*`-derefs for the loop-owned
+// locals now borrowed via `&mut` and dropping the `stream_handler::` path
+// prefix at the new scope. Behavior byte-identical — streaming lifecycle
+// (delta → tool_use → done/abort) is the product's hot path.
+
+/// The in-flight response stream, owned by the `run()` loop and lent to the
+/// arm handlers below so they can clear/replace it exactly as the inline
+/// arms did.
+pub(super) type ActiveStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;
+
+/// Event-bus wake arm body: drain queued engine events into the transcript,
+/// steer them into an active stream (or buffer), and auto-trigger a model
+/// turn when idle.
+pub(super) async fn handle_event_queue_arm(
+    app: &mut App,
+    runtime: &Runtime,
+    secret_prompt_handle: &synaps_cli::tools::SecretPromptHandle,
+    stream: &mut Option<ActiveStream>,
+    cancel_token: &mut Option<CancellationToken>,
+    steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) {
+                let mut event_received = false;
+                while let Some(event) = runtime.event_queue().pop() {
+                    event_received = true;
+                    let formatted = synaps_cli::events::format_event_for_agent(&event);
+                    let severity_str = event.content.severity
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "medium".to_string());
+                    app.push_msg(ChatMessage::Event {
+                        source: event.source.source_type.clone(),
+                        severity: severity_str,
+                        text: event.content.text.clone(),
+                    });
+
+                    if app.streaming || app.compact_task.is_some() {
+                        // Steer into active stream if possible, otherwise buffer
+                        let steered = steer_tx.as_ref()
+                            .map(|tx| tx.send(formatted.clone()).is_ok())
+                            .unwrap_or(false);
+                        if !steered {
+                            app.pending_events.push(formatted);
+                        }
+                    } else {
+                        app.api_messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": formatted
+                        }));
+                    }
+                    app.invalidate();
+                }
+
+                // Auto-trigger model turn when idle — only if we actually received events
+                if event_received && !app.streaming && stream.is_none() && app.compact_task.is_none() && !app.api_messages.is_empty() {
+                    if let Some(last) = app.api_messages.last() {
+                        if last["role"].as_str() == Some("user") {
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                            *cancel_token = Some(ct);
+                            *steer_tx = Some(s_tx);
+                        }
+                    }
+                }
+}
+
+/// Stream-event arm body: route one `StreamEvent` through
+/// [`handle_stream_event`] and act on the returned [`StreamAction`] —
+/// continue (incl. Done/Error stream-state teardown + gamba reclaim),
+/// auto-send a queued message, or auto-trigger buffered events.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_stream_arm(
+    maybe_event: Option<StreamEvent>,
+    app: &mut App,
+    runtime: &Runtime,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &RenderHandle,
+    secret_prompt_handle: &synaps_cli::tools::SecretPromptHandle,
+    stream: &mut Option<ActiveStream>,
+    cancel_token: &mut Option<CancellationToken>,
+    steer_tx: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) {
+                if let Some(event) = maybe_event {
+                    let do_draw = needs_immediate_draw(&event);
+                    let action = handle_stream_event(event, app, runtime).await;
+
+                    match action {
+                        StreamAction::Continue => {
+                            // For Done/Error, clear stream state
+                            if !app.streaming {
+                                *stream = None;
+                                *cancel_token = None;
+                                *steer_tx = None;
+                                // Reclaim gamba if running — resume render thread
+                                // after reclaim restores the terminal.
+                                if let Some(msg) = app.reclaim_gamba() {
+                                    render_handle.resume();
+                                    app.push_msg(ChatMessage::System(msg));
+                                    app.invalidate();
+                                }
+                            }
+                        }
+                        StreamAction::AutoSendQueued(queued) => {
+                            // Drop old stream state (important for cleanup)
+                            drop(stream.take());
+                            drop(cancel_token.take());
+                            drop(steer_tx.take());
+                            // Reclaim gamba if running — resume render thread
+                            // after reclaim restores the terminal.
+                            if let Some(msg) = app.reclaim_gamba() {
+                                render_handle.resume();
+                                app.push_msg(ChatMessage::System(msg));
+                                app.invalidate();
+                            }
+                            // Auto-send the queued message
+                            app.push_msg(ChatMessage::User(queued.clone()));
+                            app.transcript.scroll_to_bottom();
+                            let api_content = if let Some(ref ctx) = app.abort_context {
+                                let combined = format!("{}\n\n{}", ctx, queued);
+                                app.abort_context = None;
+                                combined
+                            } else {
+                                queued
+                            };
+                            app.api_messages.push(json!({"role": "user", "content": api_content}));
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.status_text = Some("connecting…".to_string());
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                            if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                                render_handle.publish(model);
+                            }
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            app.status_text = None;
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                            *cancel_token = Some(ct);
+                            *steer_tx = Some(s_tx);
+                        }
+                        StreamAction::AutoTriggerEvents => {
+                            drop(stream.take());
+                            drop(cancel_token.take());
+                            drop(steer_tx.take());
+                            let ct = CancellationToken::new();
+                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            app.streaming = true;
+                            app.spinner_frame = 0;
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                            *cancel_token = Some(ct);
+                            *steer_tx = Some(s_tx);
+                        }
+                    }
+
+                    if do_draw {
+                        let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
+                        if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                            render_handle.publish(model);
+                        }
+                    }
+                }
 }
 
 /// Strip ASCII control characters (except `\n` and `\t`) from notice text
