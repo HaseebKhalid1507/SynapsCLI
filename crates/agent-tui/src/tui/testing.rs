@@ -381,6 +381,84 @@ impl TestHarness {
         self.app.modal_stack.depth()
     }
 
+    /// Stable, machine-independent name of the pane that currently receives
+    /// input (`modal_stack.top()`). `"chat"` is the base pane (empty stack).
+    /// P7.9: lets integration tests assert *which* pane is top-of-stack without
+    /// naming the crate-private `PaneId` type.
+    pub fn top_pane_name(&self) -> &'static str {
+        use super::focus::PaneId;
+        match self.app.modal_stack.top() {
+            PaneId::Chat => "chat",
+            PaneId::HelpFind => "help-find",
+            PaneId::Models => "models",
+            PaneId::Plugins => "plugins",
+            PaneId::Settings => "settings",
+            PaneId::PluginEditor => "plugin-editor",
+            PaneId::SecretPrompt => "secret-prompt",
+        }
+    }
+
+    /// Left/Right focus side of the open settings modal as the draw layer reads
+    /// it (`settings.focus`, the synced projection of the FocusManager ring).
+    /// `None` when settings is closed. P7.9 focus-traversal witness.
+    pub fn settings_focus_side(&self) -> Option<&'static str> {
+        self.app.settings.as_ref().map(|st| match st.focus {
+            super::settings::Focus::Left => "left",
+            super::settings::Focus::Right => "right",
+        })
+    }
+
+    /// Left/Right focus side of the open plugins modal as the draw layer reads
+    /// it (`plugins.focus`, the synced projection of the FocusManager ring).
+    /// `None` when plugins is closed. P7.9 focus-traversal witness.
+    pub fn plugins_focus_side(&self) -> Option<&'static str> {
+        self.app.plugins.as_ref().map(|st| match st.focus {
+            super::plugins::state::Focus::Left => "left",
+            super::plugins::state::Focus::Right => "right",
+        })
+    }
+
+    /// Open the nested plugin-custom editor ON TOP of an already-open settings
+    /// modal — the harness equivalent of `InputAction::PluginEditorOpen`
+    /// resolving. Sets `edit_mode = PluginCustom(..)` and pushes
+    /// `PaneId::PluginEditor`, mirroring production (`mod.rs`) so
+    /// `debug_assert_stack_sync` stays satisfied. No-op if settings is closed.
+    pub fn open_plugin_editor(&mut self) -> &mut Self {
+        use super::settings::plugin_editor::PluginEditorSession;
+        use synaps_cli::extensions::settings_editor::SettingsEditorRenderParams;
+        if let Some(st) = self.app.settings.as_mut() {
+            let render = SettingsEditorRenderParams {
+                rows: Vec::new(),
+                cursor: None,
+                footer: None,
+            };
+            st.edit_mode = Some(super::settings::ActiveEditor::PluginCustom {
+                plugin_id: "demo".to_string(),
+                category: "general".to_string(),
+                field: "token".to_string(),
+                render: PluginEditorSession {
+                    plugin_id: "demo".to_string(),
+                    category: "general".to_string(),
+                    field: "token".to_string(),
+                    render,
+                },
+            });
+            self.app
+                .modal_stack
+                .push(super::focus::PaneId::PluginEditor);
+        }
+        self
+    }
+
+    /// Whether the nested PluginCustom editor is currently active — mirrors the
+    /// `PaneId::PluginEditor` stack membership by the P7.7 sync invariant.
+    pub fn plugin_editor_active(&self) -> bool {
+        matches!(
+            self.app.settings.as_ref().map(|st| &st.edit_mode),
+            Some(Some(super::settings::ActiveEditor::PluginCustom { .. }))
+        )
+    }
+
     /// Current transcript scrollback offset (0 = pinned to bottom).
     pub fn scroll_back(&self) -> u16 {
         self.app.transcript.scroll_back_pos()
@@ -440,6 +518,18 @@ impl TestHarness {
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
         let toast = super::toast::Toast::new(id, text)
             .ttl(Some(std::time::Duration::from_secs(ttl_secs)));
+        self.app.toasts.upsert(toast);
+        self
+    }
+
+    /// Publish a toast anchored dead-CENTER (overlapping the secret-prompt box's
+    /// centered draw rect). Used by the P7.9 toast-vs-prompt z-order pin: the
+    /// prompt is drawn AFTER toasts and issues a `Clear`, so a CENTER toast must
+    /// end up painted *under* the prompt. Long TTL under the frozen boot clock.
+    pub fn push_center_toast(&mut self, id: &str, text: &str) -> &mut Self {
+        let toast = super::toast::Toast::new(id, text)
+            .at(super::toast::ToastPosition::CENTER)
+            .ttl(Some(std::time::Duration::from_secs(3600)));
         self.app.toasts.upsert(toast);
         self
     }

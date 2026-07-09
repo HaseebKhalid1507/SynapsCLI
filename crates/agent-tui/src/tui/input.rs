@@ -513,12 +513,12 @@ fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> I
 /// leaving the modal open (no pop). The `PaneOutcome` mapping is realized
 /// inline, matching the P7.4/P7.5 `route_help_find` / `route_models` shape.
 ///
-/// Depth subtlety (§7 P7.6): when plugins is opened from an already-open
-/// settings modal (marketplace-from-settings), settings is NOT yet migrated
-/// (P7.7) and stays chain-routed — so it is NEVER on the stack. Plugins pushes
-/// to depth 1; on Close this pops back to an empty stack and the legacy chain
-/// resumes routing the still-open settings modal. Identical to today's chain
-/// fallthrough (settings arm sits directly below the old plugins arm).
+/// Depth subtlety (post-P7.7): when plugins is opened from an already-open
+/// settings modal (marketplace-from-settings), settings is ITSELF a stack
+/// member — so the stack is a real two-deep `[Settings, Plugins]`, with Plugins
+/// on top. This `Close` path pops Plugins (`app.plugins = None` + pop) back to
+/// `[Settings]`, and `route_settings` resumes routing the still-open settings
+/// modal. The chain no longer exists; the fall-back is the stack level below.
 fn route_plugins(event: Event, app: &mut App) -> InputAction {
     // Invariant (checked by the tripwire): top() == Plugins ⇒ plugins is Some.
     let Some(state) = &mut app.plugins else {

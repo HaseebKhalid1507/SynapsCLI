@@ -1,4 +1,3 @@
-#![allow(dead_code)] // UNWIRED foundation — remove when P7.3 wires ModalStack into App/input.rs.
 //! Focus + modal-stack foundation for the TUI (P7.1 + P7.2).
 //!
 //! This module is the **unwired** foundation for the P7 FocusManager /
@@ -10,7 +9,7 @@
 //! state; the stack is designed to be an *index over* the existing
 //! `Option<…State>` fields on App, never a new owner (§6 behavior-preservation).
 //!
-//! Design references: §2 (`PaneId`), §3 (`ModalStack` + `PaneOutcome`),
+//! Design references: §2 (`PaneId`), §3 (`ModalStack`),
 //! §4 (`FocusManager`).
 
 use std::collections::HashMap;
@@ -63,32 +62,6 @@ pub(crate) enum PaneId {
 }
 
 // ---------------------------------------------------------------------------
-// §3 — PaneOutcome
-// ---------------------------------------------------------------------------
-
-/// What a stack-routed pane handler tells the routing layer to do after
-/// consuming an event. Pane handlers are thin adapters from today's per-modal
-/// `InputOutcome` types to this shape (§3).
-///
-/// `InputAction` (`input.rs:10`) is kept **unchanged**; the async main-loop
-/// dispatch (`mod.rs`) is out of P7's blast radius. The `Action` /
-/// `PopThen` variants defer to that existing loop verbatim.
-///
-/// Note: `InputAction` is `pub(super)` in `super::input`; because `focus` is a
-/// sibling submodule of `input` under `tui`, the path `super::input::InputAction`
-/// is reachable here without any visibility change — no gating required.
-pub(crate) enum PaneOutcome {
-    /// Stay open, nothing for the loop.
-    Consumed,
-    /// Close me (routing clears my `Option` field + pops the stack).
-    Pop,
-    /// Defer to the async loop (PluginsOutcome, ModelsApply, …).
-    Action(super::input::InputAction),
-    /// Close AND defer (e.g. models Apply → `PopThen(ModelsApply(..))`).
-    PopThen(super::input::InputAction),
-}
-
-// ---------------------------------------------------------------------------
 // §3 — ModalStack
 // ---------------------------------------------------------------------------
 
@@ -98,9 +71,10 @@ pub(crate) enum PaneOutcome {
 /// 1. **Top-of-stack gets input** — routing dispatches on [`ModalStack::top`];
 ///    nothing below the top ever sees an event (hidden-widget rule). Occluded
 ///    panes keep their state but are input-dead.
-/// 2. **Escape pops uniformly** — each pane maps its close action to
-///    [`PaneOutcome::Pop`]; the routing layer performs the pop AND clears the
-///    matching `Option` field. One Esc = one level.
+/// 2. **Escape pops uniformly** — each pane's close path pops the stack;
+///    the routing layer performs the pop AND clears the matching `Option`
+///    field. One Esc = one level. (The per-pane outcome→pop mapping is
+///    realized inline in each `input.rs` route handler, §7.)
 /// 3. **Duplicate-push rejected** — `debug_assert!` + no-op in release
 ///    (matches today: opening `/settings` while settings is open is impossible).
 ///    Pushing [`PaneId::Chat`] is likewise rejected — Chat is the implicit
@@ -179,6 +153,7 @@ impl ModalStack {
     }
 
     /// Whether no modal panes are open (input falls through to `Chat`).
+    #[allow(dead_code)] // test-only today; reserved for stack-empty guards
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
@@ -215,6 +190,7 @@ impl FocusSlot {
     }
 
     /// Whether this slot is currently visible / traversable.
+    #[allow(dead_code)] // read via the field internally; public accessor unused
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -258,6 +234,7 @@ impl FocusRing {
     }
 
     /// Move focus to the previous visible slot (Shift-Tab / BackTab), wrapping.
+    #[allow(dead_code)] // no modal binds BackTab yet; reverse traversal reserved
     pub fn prev(&mut self) {
         self.step(false);
     }
@@ -265,6 +242,7 @@ impl FocusRing {
     /// Set the visibility of the slot with id `id`. Returns `true` if a slot
     /// matched. If hiding the currently-focused slot, focus is advanced to the
     /// next visible slot so `current()` never points at a hidden widget.
+    #[allow(dead_code)] // both live rings are all-visible; reserved for hidden slots
     pub fn set_visible(&mut self, id: u8, visible: bool) -> bool {
         let mut matched = false;
         for slot in &mut self.slots {
@@ -321,11 +299,16 @@ impl FocusRing {
 /// help_find / models / secret_prompt get single-slot rings registered purely
 /// for uniformity. Explicitly NOT built: no global focus tree, no id-paths, no
 /// focus events/observers, no inter-pane Tab (Tab never leaves the active pane).
+// UNWIRED (P7-complete): the central FocusManager registry is not adopted —
+// panes embed a `FocusRing` directly (plugins/state.rs, settings/mod.rs).
+// Kept as the §4 reference shape for a future multi-ring pane.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct FocusManager {
     rings: HashMap<PaneId, FocusRing>,
 }
 
+#[allow(dead_code)]
 impl FocusManager {
     /// Empty manager — panes register their rings lazily.
     pub fn new() -> Self {

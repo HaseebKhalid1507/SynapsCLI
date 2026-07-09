@@ -87,10 +87,13 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
-    /// P7 modal-routing stack (P7.3). Wired but PERMANENTLY EMPTY until a modal
-    /// is migrated (P7.4+): an *index over* the `Option<…State>` modal fields
-    /// above, never a new owner (§6 behavior-preservation). Empty ⇒ `top()` is
-    /// `PaneId::Chat` ⇒ routing falls through to the legacy chain in `input.rs`.
+    /// P7 modal-routing stack (finished, P7.8). The single source of input
+    /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
+    /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
+    /// (+ the `secret_prompts` queue), never a new owner (§6). Every open/close
+    /// site pushes/pops in lock-step; membership is cross-checked against the
+    /// backing fields by `debug_assert_stack_sync`. Empty ⇒ `top()` is
+    /// `PaneId::Chat` ⇒ input goes to the base chat pane.
     pub(crate) modal_stack: super::focus::ModalStack,
     /// P7.8 secret-prompt queue — folded onto App from the `run()` local
     /// (§5). Drained from the mpsc channel via `poll_requests` in the tick
