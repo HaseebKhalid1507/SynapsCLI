@@ -284,7 +284,8 @@ mod sidecar_pill_tests {
     }
 }
 
-use super::app::{App, SPINNER_FRAMES};
+use super::app::SPINNER_FRAMES;
+use super::view_model::{RenderPatch, ViewInputs};
 use super::markdown::format_tokens;
 use super::theme::THEME;
 
@@ -470,37 +471,41 @@ use super::render_model::{
     GhostHint, RenderModel, SecretPromptSnap, SidecarPillSnap, SubagentSnap,
 };
 
-/// Build a [`RenderModel`] snapshot from `app` and associated services.
+/// Build a [`RenderModel`] snapshot from the narrow render-input view.
 ///
-/// This is the **main-side extraction step**.  It reads `App` + computes
-/// every derived value the renderer needs, applies the five App mutations
-/// that `draw()` used to do, and returns a fully-owned snapshot.
+/// This is the **main-side extraction step**.  It reads [`ViewInputs`] — the
+/// T199.2 seam that names exactly which `App` state the render may consume —
+/// computes every derived value the renderer needs, and returns a fully-owned
+/// snapshot plus a [`RenderPatch`] of the mutations the caller must apply to
+/// authoritative `App` state (the builder itself mutates nothing on `App`;
+/// the only `&mut` it holds is the transcript store's cache-sync seam).
 ///
 /// Returns `None` when the frame should be skipped (gamba casino owns the
 /// terminal, same semantics as the old early-return in `draw()`).
 pub(crate) fn build_render_model(
-    app: &mut App,
+    inputs: &mut ViewInputs<'_>,
     runtime: &synaps_cli::Runtime,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     term_size: ratatui::layout::Size,
-) -> Option<std::sync::Arc<RenderModel>> {
+) -> Option<(std::sync::Arc<RenderModel>, RenderPatch)> {
     // ── 1. gamba gate ─────────────────────────────────────────────────────────
-    if app.gamba_child.is_some() {
+    if inputs.gamba_active {
         return None;
     }
 
     // ── 2. Layout math (mirrors draw.rs pre-closure block) ────────────────────
-    let has_subagents = !app.subagents.is_empty();
+    let has_subagents = !inputs.subagents.is_empty();
     let subagent_height: u16 = if has_subagents {
-        (app.subagents.len() as u16 + 2).min(8)
+        (inputs.subagents.len() as u16 + 2).min(8)
     } else {
         0
     };
     let input_inner_width = term_size.width.saturating_sub(2);
-    let (input_lines, _, _) = app.input_wrap_info(input_inner_width);
+    let (input_lines, _, _) =
+        super::view_model::input_wrap_info(inputs.input, inputs.cursor_pos, input_inner_width);
     let max_input_lines: u16 = 10;
     let input_height = input_lines.min(max_input_lines) + 2;
-    let download_height: u16 = if !app.active_tasks.is_empty() { 1 } else { 0 };
+    let download_height: u16 = if !inputs.active_tasks.is_empty() { 1 } else { 0 };
     let protected_bottom_rows = subagent_height
         .saturating_add(download_height)
         .saturating_add(input_height)
@@ -519,15 +524,15 @@ pub(crate) fn build_render_model(
     // renderer needs crosses the seam via RenderCtx.
     let vw = {
         let ctx = super::transcript::RenderCtx {
-            spinner_frame: app.spinner_frame,
-            streaming: app.streaming,
-            agent_name: &app.agent_name,
+            spinner_frame: inputs.spinner_frame,
+            streaming: inputs.streaming,
+            agent_name: inputs.agent_name,
         };
-        app.transcript.visible_window(msg_area, &ctx)
+        inputs.transcript.visible_window(msg_area, &ctx)
     };
 
     // ── 7. Subagent snapshots ─────────────────────────────────────────────────
-    let subagents: Vec<SubagentSnap> = app
+    let subagents: Vec<SubagentSnap> = inputs
         .subagents
         .iter()
         .map(|sa| SubagentSnap {
@@ -542,20 +547,20 @@ pub(crate) fn build_render_model(
 
     // ── 8. Sidecar pills ──────────────────────────────────────────────────────
     let sidecar_pills: Vec<SidecarPillSnap> = {
-        if app.sidecars.is_empty() {
+        if inputs.sidecars.is_empty() {
             Vec::new()
         } else {
             let claims = registry.lifecycle_claims();
-            let inputs: Vec<(String, Option<String>)> = app
+            let pill_inputs: Vec<(String, Option<String>)> = inputs
                 .sidecars
                 .iter()
                 .map(|(pid, st)| (pid.clone(), st.display_name.clone()))
                 .collect();
-            let order = order_sidecar_pills(&inputs, &claims);
+            let order = order_sidecar_pills(&pill_inputs, &claims);
             order
                 .into_iter()
                 .filter_map(|pid| {
-                    let st = app.sidecars.get(&pid)?;
+                    let st = inputs.sidecars.get(&pid)?;
                     Some(SidecarPillSnap {
                         plugin_id: pid,
                         display_name: st.display_name.clone(),
@@ -569,8 +574,8 @@ pub(crate) fn build_render_model(
 
     // ── 9. Ghost hint ─────────────────────────────────────────────────────────
     let ghost_hint: Option<GhostHint> = {
-        if app.input.starts_with('/') && app.input.len() > 1 && !app.input[1..].contains(' ') {
-            let partial = &app.input[1..];
+        if inputs.input.starts_with('/') && inputs.input.len() > 1 && !inputs.input[1..].contains(' ') {
+            let partial = &inputs.input[1..];
             let commands = super::commands::all_commands_with_skills(registry);
             let prefix_matches: Vec<&String> =
                 commands.iter().filter(|c| c.starts_with(partial)).collect();
@@ -603,27 +608,32 @@ pub(crate) fn build_render_model(
     };
 
     // ── 10. Toasts ────────────────────────────────────────────────────────────
-    let toasts: Vec<super::toast::Toast> = app.toasts.visible().cloned().collect();
+    let toasts: Vec<super::toast::Toast> = inputs.toasts.visible().cloned().collect();
 
     // ── 11. Modals ────────────────────────────────────────────────────────────
-    let settings = app.settings.clone().map(|s| {
+    let settings = inputs.settings.clone().map(|s| {
         let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(
             runtime,
             registry,
-            app.model_health.clone(),
+            inputs.model_health.clone(),
         );
         (s, snap)
     });
-    let plugins = app.plugins.clone();
-    let models = app.models.clone();
-    // ── help_find visible_height write-back ───────────────────────────────────
+    let plugins = inputs.plugins.clone();
+    let models = inputs.models.clone();
+    // ── help_find visible_height (returned as a RenderPatch, spec §4-A) ──────
     // `help_find::render` computes visible_height from the terminal geometry
     // and calls `set_visible_height` on its &mut state.  Because the render
     // runs on a separate thread it was previously mutating a throwaway clone,
-    // so the modal's scroll window was wrong on first open at a non-default size.
-    // Fix: mirror the geometry computation here on the main side and call
-    // `set_visible_height` on the authoritative App state before snapshotting.
-    if let Some(ref mut hf) = app.help_find {
+    // so the modal's scroll window was wrong on first open at a non-default
+    // size.  The geometry is mirrored here on the main side; the value is
+    // applied to the snapshot clone (so this frame matches the old in-builder
+    // write-back byte-for-byte) and returned in the RenderPatch for the
+    // caller to apply to the authoritative App state.  The builder itself no
+    // longer mutates App.
+    let mut patch = RenderPatch::default();
+    let mut help_find = inputs.help_find.clone();
+    if let Some(ref mut hf) = help_find {
         let area_w = term_size.width;
         let area_h = term_size.height;
         let _modal_w = ((area_w as u32 * 8 / 10) as u16).max(50).min(area_w);
@@ -632,13 +642,13 @@ pub(crate) fn build_render_model(
         // padded_rect(inner, 2, 1) subtracts 1px vertical pad each side → -2 height
         let inner_h = modal_h.saturating_sub(2).saturating_sub(2);
         // Layout [Length(2), Min(1), Length(1)]: chunk[1] = inner_h - 3
-        let visible_h = inner_h.saturating_sub(3) as usize;
-        hf.set_visible_height(visible_h.max(1));
+        let visible_h = (inner_h.saturating_sub(3) as usize).max(1);
+        hf.set_visible_height(visible_h);
+        patch.help_find_visible_height = Some(visible_h);
     }
-    let help_find = app.help_find.clone();
 
     // ── 12. Secret prompt ─────────────────────────────────────────────────────
-    let secret_prompt = app.secret_prompts.active().map(|p| SecretPromptSnap {
+    let secret_prompt = inputs.secret_prompts.active().map(|p| SecretPromptSnap {
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
@@ -649,10 +659,10 @@ pub(crate) fn build_render_model(
     let runtime_thinking = runtime.thinking_level().to_string();
 
     // ── 14. Assemble ──────────────────────────────────────────────────────────
-    Some(std::sync::Arc::new(RenderModel {
-        status_text: app.status_text.clone(),
-        streaming: app.streaming,
-        spinner_frame: app.spinner_frame,
+    let model = std::sync::Arc::new(RenderModel {
+        status_text: inputs.status_text.clone(),
+        streaming: inputs.streaming,
+        spinner_frame: inputs.spinner_frame,
         sidecar_pills,
         runtime_model,
         runtime_thinking,
@@ -661,22 +671,22 @@ pub(crate) fn build_render_model(
         scroll_back: vw.scroll_back,
         selection: vw.selection,
         messages_empty: vw.is_empty,
-        logo_build_t: app.logo_build_t,
-        logo_dismiss_t: app.logo_dismiss_t,
+        logo_build_t: inputs.logo_build_t,
+        logo_dismiss_t: inputs.logo_dismiss_t,
         subagents,
-        active_tasks: std::sync::Arc::clone(&app.active_tasks),
-        input: app.input.clone(),
-        cursor_pos: app.cursor_pos,
+        active_tasks: std::sync::Arc::clone(inputs.active_tasks),
+        input: inputs.input.clone(),
+        cursor_pos: inputs.cursor_pos,
         ghost_hint,
-        show_full_output: app.transcript.show_full_output(),
-        session_cost: app.session_cost,
-        total_input_tokens: app.total_input_tokens,
-        total_output_tokens: app.total_output_tokens,
-        total_cache_read_tokens: app.total_cache_read_tokens,
-        total_cache_creation_tokens: app.total_cache_creation_tokens,
-        total_cache_write_1h: app.total_cache_write_1h,
-        last_turn_context: app.last_turn_context,
-        last_turn_context_window: app.last_turn_context_window,
+        show_full_output: inputs.transcript.show_full_output(),
+        session_cost: inputs.session_cost,
+        total_input_tokens: inputs.total_input_tokens,
+        total_output_tokens: inputs.total_output_tokens,
+        total_cache_read_tokens: inputs.total_cache_read_tokens,
+        total_cache_creation_tokens: inputs.total_cache_creation_tokens,
+        total_cache_write_1h: inputs.total_cache_write_1h,
+        last_turn_context: inputs.last_turn_context,
+        last_turn_context_window: inputs.last_turn_context_window,
         toasts,
         settings,
         plugins,
@@ -684,9 +694,10 @@ pub(crate) fn build_render_model(
         help_find,
         secret_prompt,
         // P7.8: stack-order snapshot driving the modal draw loop below.
-        modal_order: app.modal_stack.iter_bottom_up().collect(),
+        modal_order: inputs.modal_stack.iter_bottom_up().collect(),
         protected_bottom_rows,
-    }))
+    });
+    Some((model, patch))
 }
 
 /// Render one frame from a [`RenderModel`] snapshot.

@@ -225,13 +225,16 @@ impl TestHarness {
     /// maintenance), then draw it with the production frame body. Returns
     /// the rendered [`Buffer`] for cell-level assertions.
     pub fn render(&mut self) -> &Buffer {
-        let model = build_render_model(
-            &mut self.app,
+        let (model, patch) = build_render_model(
+            &mut super::view_model::ViewInputs::from_app(&mut self.app),
             &self.runtime,
             &self.registry,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
+        // Mirror the main loop: apply the builder's patch to authoritative
+        // App state so modal geometry persists across harness frames.
+        patch.apply(&mut self.app);
 
         // Effects are render-thread state; the harness renders effect-free,
         // deterministic frames. Duration::ZERO keeps any effect math inert.
@@ -264,13 +267,16 @@ impl TestHarness {
     /// the lifecycle enter/leave sequences do not pass through here — see
     /// `tests/vt100_spike.rs` for the full scoping note.
     pub fn render_ansi(&mut self) -> Vec<u8> {
-        let model = build_render_model(
-            &mut self.app,
+        let (model, patch) = build_render_model(
+            &mut super::view_model::ViewInputs::from_app(&mut self.app),
             &self.runtime,
             &self.registry,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
+        // Mirror the main loop: apply the builder's patch to authoritative
+        // App state so modal geometry persists across harness frames.
+        patch.apply(&mut self.app);
 
         // Shared in-memory sink: `CrosstermBackend::writer_mut` is unstable
         // in ratatui 0.30 (`backend-writer` feature), so instead of taking

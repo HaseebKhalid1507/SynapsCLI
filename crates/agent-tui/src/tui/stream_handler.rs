@@ -6,6 +6,7 @@ use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
+use super::view_model::ViewInputs;
 use super::render_thread::RenderHandle;
 
 /// What the event loop should do after processing a stream event.
@@ -334,7 +335,9 @@ pub(super) async fn handle_stream_arm(
                             app.streaming = true;
                             app.spinner_frame = 0;
                             let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                            if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                            let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
+                            if let Some((model, patch)) = built {
+                                patch.apply(app);
                                 render_handle.publish(model);
                             }
                             *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
@@ -360,7 +363,9 @@ pub(super) async fn handle_stream_arm(
 
                     if do_draw {
                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                        if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                        let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
+                        if let Some((model, patch)) = built {
+                            patch.apply(app);
                             render_handle.publish(model);
                         }
                     }

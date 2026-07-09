@@ -23,6 +23,7 @@
 //! No logic changed.
 
 use super::*;
+use super::view_model::ViewInputs;
 
 use std::ops::ControlFlow;
 
@@ -253,7 +254,9 @@ pub(crate) async fn handle_input_action(
                                         app.streaming = true;
                                         app.spinner_frame = 0;
                                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                                        if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                                        let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
+                                        if let Some((model, patch)) = built {
+                                            patch.apply(app);
                                             render_handle.publish(model);
                                         }
                                         *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
@@ -970,7 +973,9 @@ pub(crate) async fn handle_input_action(
                                 app.streaming = true;
                                 app.spinner_frame = 0;
                                 let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                                if let Some(model) = build_render_model(app, runtime, registry, term_size) {
+                                let built = build_render_model(&mut ViewInputs::from_app(app), runtime, registry, term_size);
+                                if let Some((model, patch)) = built {
+                                    patch.apply(app);
                                     render_handle.publish(model);
                                 }
                                 *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);

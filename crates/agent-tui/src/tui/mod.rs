@@ -7,6 +7,7 @@ mod clock;
 mod commands;
 mod dispatch;
 mod draw;
+mod view_model;
 mod focus;
 pub(crate) mod text_metrics;
 mod gamba;
@@ -134,12 +135,14 @@ pub async fn run(
             app.needs_redraw = false;
             app.force_redraw = false;
             last_draw = Instant::now();
-            if let Some(model) = build_render_model(
-                &mut app,
+            let built = build_render_model(
+                &mut view_model::ViewInputs::from_app(&mut app),
                 &runtime,
                 &registry,
                 term_size,
-            ) {
+            );
+            if let Some((model, patch)) = built {
+                patch.apply(&mut app);
                 render_handle.publish(model);
             }
         }

@@ -1,7 +1,6 @@
 use serde_json::Value;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
-use super::text_metrics::char_width;
 
 // Type re-export shims from slice (a). Kept this release — deleting is churn
 // for no gain. One-release grace per design §5(f).
@@ -14,6 +13,16 @@ pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
 #[allow(unused_imports)]
 pub(crate) use super::transcript::TimestampedMsg;
 
+/// Central TUI state.
+///
+/// T199.2 boundary: `App` is **loop state**, not render input. The render
+/// builder ([`super::draw::build_render_model`]) never takes `App`; it takes
+/// [`super::view_model::ViewInputs`], which names the exact render-input
+/// subset of these fields (input/chrome, session totals, panes, modal
+/// projections). Fields NOT in `ViewInputs` — per-turn accounting, history/
+/// paste/tab bookkeeping, channel endpoints, async task handles — are
+/// invisible to the renderer by construction. Builder-requested mutations
+/// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
     pub(crate) transcript: TranscriptStore,
     pub(crate) input: String,
@@ -52,7 +61,7 @@ pub(crate) struct App {
     /// denominator adapts when users switch models mid-session. See
     /// `synaps_cli::models::context_window_for_model`.
     pub(crate) last_turn_context_window: u64,
-    pub(crate) api_call_count: u32,
+    api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
@@ -311,48 +320,7 @@ impl App {
 
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
-    pub(crate) fn input_wrap_info(&self, inner_width: u16) -> (u16, u16, u16) {
-        let w = inner_width.max(1) as usize;
-        // prefix "❯ " is 2 display columns (only on first line)
-        let prefix_width: usize = 2;
-
-        let mut row: u16 = 0;
-        let mut col: usize = prefix_width;
-        let mut cursor_row: u16 = 0;
-        let mut cursor_col: u16 = prefix_width as u16;
-
-        for (i, ch) in self.input.chars().enumerate() {
-            if i == self.cursor_pos {
-                cursor_row = row;
-                cursor_col = col as u16;
-            }
-            if ch == '\n' {
-                row += 1;
-                col = prefix_width; // continuation lines also have 2-char indent
-                continue;
-            }
-            let cw = char_width(ch);
-            if col + cw > w {
-                row += 1;
-                col = 0;
-            }
-            col += cw;
-        }
-        // If cursor is at the end
-        if self.cursor_pos == self.input_char_count() {
-            cursor_row = row;
-            cursor_col = col as u16;
-            // If cursor is exactly at the wrap boundary
-            if col >= w {
-                cursor_row += 1;
-                cursor_col = 0;
-            }
-        }
-
-        let total_lines = row + 1;
-        (total_lines, cursor_row, cursor_col)
-    }
-
+    ///
     pub(crate) async fn save_session(&mut self) {
         if self.api_messages.is_empty() {
             return;
