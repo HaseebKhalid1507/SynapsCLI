@@ -45,8 +45,8 @@ pub(super) enum InputAction {
 /// Thin outer wrapper: the modal-routing SHIM dispatches stack-routed panes to
 /// their pane handler and unmigrated panes to the legacy `handle_event_inner`
 /// chain; BOTH paths converge on `action` so the debug-only stack/app sync
-/// tripwire runs afterwards on every path (including the pop path). As of P7.4
-/// only HelpFind is stack-routed.
+/// tripwire runs afterwards on every path (including the pop path). As of P7.5
+/// HelpFind and Models are stack-routed.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -60,13 +60,14 @@ pub(super) fn handle_event(
     // panes fall through to the legacy chain (via handle_event_inner). A pane
     // is EITHER stack-routed OR chain-routed, never both. BOTH paths flow into
     // `action` so the sync tripwire below runs after the pop path too (note A /
-    // §6). As of P7.4, HelpFind is stack-routed; the other modals still fall
-    // through. Deleted in P7.8.
+    // §6). As of P7.5, HelpFind and Models are stack-routed; the other
+    // modals still fall through. Deleted in P7.8.
     let action = match app.modal_stack.top() {
         super::focus::PaneId::Chat => {
             handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines)
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
+        super::focus::PaneId::Models => route_models(event, app, runtime),
         other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
     };
 
@@ -79,9 +80,9 @@ pub(super) fn handle_event(
     action
 }
 
-/// Legacy routing body: the if-let modal chain (models → plugins → settings)
+/// Legacy routing body: the if-let modal chain (plugins → settings)
 /// followed by base Chat handling. Reached only via the `handle_event` wrapper
-/// when `top() == Chat` (help_find migrated to the stack in P7.4).
+/// when `top() == Chat` (help_find + models migrated to the stack in P7.4/P7.5).
 fn handle_event_inner(
     event: Event,
     app: &mut App,
@@ -91,24 +92,6 @@ fn handle_event_inner(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // Route events to the models modal while it's open.
-    if let Some(state) = app.models.as_mut() {
-        if let Event::Key(key) = event {
-            match super::models::handle_event(state, key, runtime.model()) {
-                super::models::InputOutcome::Close => {
-                    app.models = None;
-                    return InputAction::None;
-                }
-                super::models::InputOutcome::Apply(model) => {
-                    app.models = None;
-                    return InputAction::ModelsApply(model);
-                }
-                super::models::InputOutcome::None => return InputAction::None,
-                super::models::InputOutcome::ExpandProvider(provider) => return InputAction::ModelsExpandProvider(provider),
-            }
-        }
-        return InputAction::None;
-    }
     // Route events to the plugins modal while it's open. Most outcomes run
     // async side-effects (fetch manifest, git clone, etc.), so we delegate
     // them to the main loop via `InputAction::PluginsOutcome`.
@@ -590,6 +573,47 @@ fn route_help_find(event: Event, app: &mut App) -> InputAction {
                 InputAction::None
             }
             super::help_find::HelpFindAction::None => InputAction::HelpFindOutcome,
+        };
+    }
+    InputAction::None
+}
+
+/// P7.5 stack-routed pane handler for the `/model` · `/models` modal.
+///
+/// Performs exactly what the deleted legacy chain arm did (byte-identical
+/// dispatch to `models::handle_event`), and additionally POPS the modal stack
+/// on the two close paths — keeping `modal_stack.contains(Models)` in sync
+/// with `app.models.is_some()` (asserted by `debug_assert_stack_sync`).
+///
+/// Outcome translation (§7 P7.5): `Close` → `PaneOutcome::Pop` (clear the
+/// field and pop, return `None`); `Apply` → `PaneOutcome::PopThen(ModelsApply)`
+/// (clear the field and pop, then defer the apply to the async loop);
+/// `ExpandProvider` → `PaneOutcome::Action(ModelsExpandProvider)` (defer only,
+/// modal stays open, no pop); `None` → `Consumed`. Models never coexists with
+/// another modal (§6), so the `InputAction` is returned directly — the
+/// `PaneOutcome` mapping above is realized inline, matching the P7.4
+/// `route_help_find` shape.
+fn route_models(event: Event, app: &mut App, runtime: &synaps_cli::Runtime) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Models ⇒ models is Some.
+    let Some(state) = &mut app.models else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::models::handle_event(state, key, runtime.model()) {
+            super::models::InputOutcome::Close => {
+                app.models = None;
+                app.modal_stack.pop();
+                InputAction::None
+            }
+            super::models::InputOutcome::Apply(model) => {
+                app.models = None;
+                app.modal_stack.pop();
+                InputAction::ModelsApply(model)
+            }
+            super::models::InputOutcome::None => InputAction::None,
+            super::models::InputOutcome::ExpandProvider(provider) => {
+                InputAction::ModelsExpandProvider(provider)
+            }
         };
     }
     InputAction::None

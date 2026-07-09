@@ -399,8 +399,8 @@ impl FocusManager {
 /// duplicates) via [`debug_assert_stack_internal`].
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
-    // P7.4: HelpFind is the only migrated modal so far. Its membership on the
-    // stack must exactly mirror its backing App field (§3 contract 4).
+    // P7.4: HelpFind membership on the stack must exactly mirror its backing
+    // App field (§3 contract 4).
     debug_assert_eq!(
         app.modal_stack.contains(PaneId::HelpFind),
         app.help_find.is_some(),
@@ -410,15 +410,25 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.help_find.is_some()
     );
 
+    // P7.5: Models membership on the stack must exactly mirror `app.models`.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::Models),
+        app.models.is_some(),
+        "stack sync (P7.5): modal_stack.contains(Models)={} but models.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::Models),
+        app.models.is_some()
+    );
+
     // Every other pane is still chain-routed (unmigrated) ⇒ it must NEVER be on
-    // the stack yet. HelpFind is the only permitted member; the stack is
-    // therefore empty OR exactly [HelpFind]. (Extended per-modal in P7.5+.)
+    // the stack yet. HelpFind and Models are the only permitted members; the
+    // stack is therefore some ordering of a subset of {HelpFind, Models}.
+    // (Extended per-modal in P7.6+.)
     for pane in app.modal_stack.iter_bottom_up() {
-        debug_assert_eq!(
-            pane,
-            PaneId::HelpFind,
-            "stack sync (P7.4): unmigrated pane {pane:?} found on the ModalStack \
-             — only HelpFind is stack-routed so far"
+        debug_assert!(
+            matches!(pane, PaneId::HelpFind | PaneId::Models),
+            "stack sync (P7.5): unmigrated pane {pane:?} found on the ModalStack \
+             — only HelpFind and Models are stack-routed so far"
         );
     }
 

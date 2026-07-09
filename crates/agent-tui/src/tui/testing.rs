@@ -333,6 +333,7 @@ impl TestHarness {
     /// Open the models modal directly.
     pub fn open_models_modal(&mut self) -> &mut Self {
         self.app.models = Some(super::models::ModelsModalState::new());
+        self.app.modal_stack.push(super::focus::PaneId::Models);
         self
     }
 

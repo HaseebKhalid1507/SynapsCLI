@@ -677,6 +677,14 @@ pub async fn run(
                                     }
                                     CommandAction::OpenModels => {
                                         app.models = Some(models::ModelsModalState::new());
+                                        // P7.5: mirror the `= Some(..)` open with a
+                                        // stack push (§6). GATE-1 note B: models
+                                        // opens on this async arm, so assert sync
+                                        // RIGHT HERE — a missed push is caught this
+                                        // event, not one event late.
+                                        app.modal_stack.push(focus::PaneId::Models);
+                                        #[cfg(debug_assertions)]
+                                        focus::debug_assert_stack_sync(&app);
                                     }
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
