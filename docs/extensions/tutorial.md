@@ -437,3 +437,6 @@ registration, and hook dispatch.)
   "Extension config" section of [`protocol.md`](./protocol.md).
 - Read the compatibility guarantees you're building on in
   [`../STABILITY.md`](../STABILITY.md).
+- Style your extension's UI surfaces with the `ext.<id>.<token>` theme namespace — declare defaults
+  in `extension.theme_tokens` (manifest) and let users override them from their theme file. See
+  [**Themes — §3 Extension Theme Tokens**](../../wiki/Themes.md#3--extension-theme-tokens-extidtoken).
