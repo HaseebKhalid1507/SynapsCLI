@@ -190,7 +190,11 @@ impl TermCaps {
     }
 
     /// One-line human-readable summary for the `--verbose` boot log.
-    pub(crate) fn summary(&self) -> String {
+    ///
+    /// `pub` so the P16.4 negotiation-matrix integration tests can assert the
+    /// exact diagnostic string end-to-end (all six fields present); production
+    /// uses it from the `mod.rs` boot line. Pure formatter — no behavior.
+    pub fn summary(&self) -> String {
         format!(
             "sync_output={} kitty_keyboard={} mode_2027={} term_program={} tmux={} da1_answered={}",
             self.sync_output,
