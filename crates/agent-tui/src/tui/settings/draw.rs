@@ -93,7 +93,10 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_plugin_category(frame, area, state, snap);
         return;
     }
-    let current_cat = visible_categories(&snap.lifecycle_claims)[state.category_idx];
+    let current_cat = visible_categories(&snap.lifecycle_claims)
+        .get(state.category_idx)
+        .copied()
+        .unwrap_or(super::schema::Category::Plugins);
     if current_cat == super::schema::Category::Plugins {
         render_plugins_list(frame, area, state, snap);
         return;
@@ -102,7 +105,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_providers_list(frame, area, state, snap);
         return;
     }
-    let settings = state.current_settings();
+    let settings = state.current_settings(snap);
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = Vec::new();
     for (i, def) in settings.iter().enumerate() {
