@@ -229,6 +229,8 @@ Each subdirectory in `synaps-deck` is a self-contained extension with its own ma
 
 Extensions communicate with SynapsCLI over stdio using JSON-RPC 2.0 with Content-Length framing. Any language that can read from stdin and write to stdout can implement an extension.
 
+New here? Start with the step-by-step [tutorial.md](./tutorial.md) — it takes you from zero to a loadable extension (manifest → handshake → one tool + one hook → install/test), with a complete checked-in example at [`examples/extensions/hello-ext/`](../../examples/extensions/hello-ext/).
+
 See [protocol.md](./protocol.md) for the full technical specification, including:
 
 - Exact wire format and framing
