@@ -382,17 +382,39 @@ impl FocusManager {
 // §3 invariant 4 — sync tripwire (stub; App cross-check wired in P7.3)
 // ---------------------------------------------------------------------------
 
-/// Debug-only stack invariant tripwire (§3 contract 4).
+/// Debug-only stack/app-field sync tripwire (§3 contract 4).
 ///
-/// The full version — which cross-checks each [`PaneId`] on the stack against
-/// its corresponding `Option<…State>` field on `App` (and `SecretPrompt` against
-/// `app.secret_prompts.is_active()`) — is wired in **P7.3**, once `App` owns the
-/// stack. In this unwired foundation module there is no `App` to consult, so we
-/// assert only the stack's *internal* invariants: no `Chat` on the stack and no
-/// duplicates. This keeps the tripwire meaningful and testable today without
-/// prematurely coupling to `App`.
+/// Cross-checks the [`ModalStack`] against `App`. The invariant is
+/// `stack.contains(X) ⇔ X's backing App state is present`; it is **extended
+/// per-modal as each pane is migrated (P7.4+)**.
+///
+/// In **P7.3** no modal is migrated yet — the stack is wired but permanently
+/// empty (every open modal is still routed by the legacy `input.rs` chain and
+/// never pushes). So the P7.3 invariant is simply: **the stack is empty**.
+/// Each migration step adds one `⇔` clause here (e.g.
+/// `stack.contains(HelpFind) == app.help_find.is_some()`), and the tripwire
+/// fails the harness loudly if any open/close site is missed.
+///
+/// Always also checks the stack's internal invariants (no `Chat`, no
+/// duplicates) via [`debug_assert_stack_internal`].
 #[cfg(debug_assertions)]
-pub(crate) fn debug_assert_stack_sync(stack: &ModalStack) {
+pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
+    // P7.3: no modal migrated → stack must be empty. (Extended per-modal in P7.4+.)
+    debug_assert!(
+        app.modal_stack.is_empty(),
+        "stack sync (P7.3): ModalStack must be empty until a modal is migrated \
+         (P7.4+); top={:?}, depth={}",
+        app.modal_stack.top(),
+        app.modal_stack.depth()
+    );
+    debug_assert_stack_internal(&app.modal_stack);
+}
+
+/// Internal stack-only invariants (no `Chat`, no duplicates), independent of
+/// `App`. Split out so it can be exercised by unit tests that build a bare
+/// [`ModalStack`] without an `App`.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_stack_internal(stack: &ModalStack) {
     debug_assert!(
         !stack.contains(PaneId::Chat),
         "stack sync: Chat must never be stored on the ModalStack"
@@ -527,8 +549,9 @@ mod tests {
         let mut s = ModalStack::new();
         s.push(PaneId::Settings);
         s.push(PaneId::Plugins);
-        // Should not panic — no Chat, no duplicates.
-        debug_assert_stack_sync(&s);
+        // Should not panic — no Chat, no duplicates. (P7.3 split the App-facing
+        // `debug_assert_stack_sync(&App)` from this bare-stack internal check.)
+        debug_assert_stack_internal(&s);
     }
 
     // --- FocusManager / FocusRing (§4) ------------------------------------

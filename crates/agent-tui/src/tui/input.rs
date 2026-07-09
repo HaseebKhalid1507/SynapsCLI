@@ -41,7 +41,44 @@ pub(super) enum InputAction {
 }
 
 /// Process a crossterm Event and return what the main loop should do.
+///
+/// P7.3 thin outer wrapper: the modal-routing SHIM runs first, then the legacy
+/// chain (via `handle_event_inner`), then the debug-only stack/app sync
+/// tripwire. The stack is wired but PERMANENTLY EMPTY until P7.4, so the shim
+/// is a pure no-op today and this wrapper is behavior-identical to the old
+/// direct call.
 pub(super) fn handle_event(
+    event: Event,
+    app: &mut App,
+    runtime: &synaps_cli::Runtime,
+    streaming: bool,
+    registry: &Arc<CommandRegistry>,
+    keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
+    scroll_lines: u16,
+) -> InputAction {
+    // P7 SHIM (P7.3) — stack-routed panes dispatch here; unmigrated panes fall
+    // through to the legacy chain below. Stack is EMPTY until P7.4, so top()
+    // is always Chat and this is a pure no-op. Deleted in P7.8.
+    match app.modal_stack.top() {
+        super::focus::PaneId::Chat => { /* fall through to legacy chain */ }
+        other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
+    }
+
+    let action =
+        handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines);
+
+    // P7.3 stack/app-field sync tripwire (§3 contract 4) — debug/test builds
+    // only. No modal is migrated yet, so the invariant is simply "stack empty".
+    #[cfg(debug_assertions)]
+    super::focus::debug_assert_stack_sync(app);
+
+    action
+}
+
+/// Legacy routing body: the if-let modal chain (help_find → models → plugins →
+/// settings) followed by base Chat handling. Unchanged by P7.3; reached only
+/// via the `handle_event` wrapper (stack empty ⇒ shim falls through here).
+fn handle_event_inner(
     event: Event,
     app: &mut App,
     runtime: &synaps_cli::Runtime,

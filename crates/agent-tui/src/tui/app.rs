@@ -87,6 +87,11 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// P7 modal-routing stack (P7.3). Wired but PERMANENTLY EMPTY until a modal
+    /// is migrated (P7.4+): an *index over* the `Option<…State>` modal fields
+    /// above, never a new owner (§6 behavior-preservation). Empty ⇒ `top()` is
+    /// `PaneId::Chat` ⇒ routing falls through to the legacy chain in `input.rs`.
+    pub(crate) modal_stack: super::focus::ModalStack,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -203,6 +208,8 @@ impl App {
             plugins: None,
             models: None,
             help_find: None,
+            // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
+            modal_stack: super::focus::ModalStack::new(),
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
