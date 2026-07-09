@@ -5,6 +5,7 @@
 use std::io;
 
 use crossterm::{
+    cursor,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -67,6 +68,12 @@ pub(super) fn emergency_teardown_terminal() {
         LeaveAlternateScreen
     )
     .ok();
+    // Restore cursor visibility. setup_terminal() hides the cursor for the
+    // entire TUI lifecycle; if a main-thread panic triggers this path the
+    // cursor must be shown again so the user's shell is usable afterward.
+    // do_teardown() (render_thread.rs) covers the normal exit path; this
+    // covers every other path (panic hook, signal, render-thread catch_unwind).
+    execute!(stdout, cursor::Show).ok();
 }
 
 // `teardown_terminal` was removed in the #116 render-thread work — the render

@@ -48,6 +48,7 @@ pub(super) fn handle_event(
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
+    scroll_lines: u16,
 ) -> InputAction {
     // Route events to /help find while it's open.
     if let Some(state) = app.help_find.as_mut() {
@@ -208,7 +209,7 @@ pub(super) fn handle_event(
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
-            handle_mouse(mouse, app)
+            handle_mouse(mouse, app, scroll_lines)
         }
         Event::Paste(text) => {
             // Suppress paste events that fire immediately after a right-click copy.
@@ -249,63 +250,60 @@ pub(super) fn handle_event(
 }
 
 /// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
-fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputAction {
+fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
+    // Selection events may need to promote a demoted slot on demand (P11
+    // lock L3: wheel + click in one input batch maps into rows demoted as of
+    // the last frame). The re-render crosses the seam via RenderCtx, same as
+    // the draw path — field borrows are disjoint from `app.transcript`.
+    let ctx = super::transcript::RenderCtx {
+        spinner_frame: app.spinner_frame,
+        streaming: app.streaming,
+        agent_name: &app.agent_name,
+    };
     match mouse.kind {
+        // Wheel scroll no longer clears the selection (P10 lock L4):
+        // endpoints are content-relative, so the selection scrolls with the
+        // content and the highlight clamps to the window. Keypresses still
+        // clear (handle_key top) — including Shift+Up/Down keyboard scroll.
         MouseEventKind::ScrollUp => {
-            app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_add(3);
-            app.scroll_pinned = false;
+            app.transcript.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.clear_selection();
-            app.scroll_back = app.scroll_back.saturating_sub(3);
-            if app.scroll_back == 0 {
-                app.scroll_pinned = true;
-            }
+            app.transcript.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
-            if is_in_msg_area(app, mouse.column, mouse.row) {
-                app.selection_anchor = Some((mouse.column, mouse.row));
-                app.selection_end = None;
+            if app.transcript.hit_test(mouse.column, mouse.row) {
+                app.transcript.selection_begin(mouse.column, mouse.row, &ctx);
             } else {
-                app.clear_selection();
+                app.transcript.clear_selection();
             }
         }
 
-        // Left-drag extends the selection
-        MouseEventKind::Drag(MouseButton::Left)
-            if app.selection_anchor.is_some() => {
-                app.selection_end = Some((mouse.column, mouse.row));
-            }
+        // Left-drag extends the selection (no-op without an anchor)
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.transcript.selection_drag(mouse.column, mouse.row, &ctx);
+        }
 
-        // Left-release finalizes the selection
+        // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            if let Some(anchor) = app.selection_anchor {
-                let end = (mouse.column, mouse.row);
-                // If start == end, it was a click not a drag — clear selection
-                if anchor == end {
-                    app.clear_selection();
-                } else {
-                    app.selection_end = Some(end);
-                }
-            }
+            app.transcript.selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not
         MouseEventKind::Down(MouseButton::Right) => {
-            if app.has_selection() {
+            if app.transcript.has_selection() {
                 // Copy selected text to clipboard — right-click with selection is COPY ONLY
-                if let Some(text) = app.selected_text() {
+                if let Some(text) = app.transcript.selected_text() {
                     copy_to_clipboard(&text);
                     app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
-                app.clear_selection();
+                app.transcript.clear_selection();
             } else {
                 // No selection — paste from clipboard at cursor position
                 if let Some(text) = paste_from_clipboard() {
@@ -327,17 +325,6 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App) -> InputActi
         _ => {}
     }
     InputAction::None
-}
-
-/// Check if a terminal coordinate is inside the message content area.
-/// msg_area_rect stores the inner rect (after borders/padding), so no offset needed.
-fn is_in_msg_area(app: &App, col: u16, row: u16) -> bool {
-    if let Some(rect) = app.msg_area_rect {
-        col >= rect.x && col < rect.x + rect.width
-            && row >= rect.y && row < rect.y + rect.height
-    } else {
-        false
-    }
 }
 
 /// Copy text to system clipboard. Uses a singleton background thread that
@@ -381,7 +368,7 @@ fn handle_key(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
 ) -> InputAction {
     // Clear text selection on any keypress (typing dismisses selection)
-    app.clear_selection();
+    app.transcript.clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
@@ -477,8 +464,10 @@ fn handle_key(
             jump_word_right(app);
         }
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-            app.show_full_output = !app.show_full_output;
-            app.invalidate();
+            // Store-owned toggle invalidates internally (locked decision #1);
+            // App only signals the frame scheduler.
+            app.transcript.set_show_full_output(!app.transcript.show_full_output());
+            app.request_redraw();
         }
         (KeyCode::Char(c), _) => {
             let byte_pos = app.cursor_byte_pos();
@@ -497,14 +486,10 @@ fn handle_key(
             app.cursor_pos += 1;
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
-            app.scroll_back = app.scroll_back.saturating_add(1);
-            app.scroll_pinned = false;
+            app.transcript.scroll_up(1);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
-            app.scroll_back = app.scroll_back.saturating_sub(1);
-            if app.scroll_back == 0 {
-                app.scroll_pinned = true;
-            }
+            app.transcript.scroll_down(1);
         }
         (KeyCode::Up, _) => {
             app.history_up();
@@ -519,7 +504,7 @@ fn handle_key(
 
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
-    if app.messages.is_empty() {
+    if app.transcript.is_empty() {
         app.logo_dismiss_t = Some(0.001);
     }
     let input = app.input.clone();
@@ -528,8 +513,7 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.input_stash.clear();
     app.input.clear();
     app.cursor_pos = 0;
-    app.scroll_back = 0;
-    app.scroll_pinned = true;
+    app.transcript.scroll_to_bottom();
 
     if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
@@ -665,4 +649,59 @@ fn jump_word_right(app: &mut App) {
     while pos < len && chars[pos] != ' ' { pos += 1; }
     while pos < len && chars[pos] == ' ' { pos += 1; }
     app.cursor_pos = pos;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+    use synaps_cli::Session;
+
+    fn make_app() -> App {
+        App::new(Session::new("test-model", "low", None))
+    }
+
+    fn scroll_event(kind: MouseEventKind) -> crossterm::event::MouseEvent {
+        MouseEvent { kind, column: 5, row: 5, modifiers: KeyModifiers::NONE }
+    }
+
+    /// When scroll_lines=5 is configured, one ScrollUp event must add exactly 5
+    /// to scroll_back (not the hardcoded 3).
+    #[test]
+    fn scroll_up_uses_configured_step() {
+        let mut app = make_app();
+        app.transcript.test_set_scroll_back(0);
+        handle_mouse(scroll_event(MouseEventKind::ScrollUp), &mut app, 5);
+        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should be 5 with scroll_lines=5");
+    }
+
+    /// When scroll_lines=5 is configured, one ScrollDown event must subtract 5
+    /// (clamped to 0) from scroll_back.
+    #[test]
+    fn scroll_down_uses_configured_step() {
+        let mut app = make_app();
+        app.transcript.test_set_scroll_back(10);
+        handle_mouse(scroll_event(MouseEventKind::ScrollDown), &mut app, 5);
+        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should decrease by 5");
+    }
+
+    /// When scroll_lines is absent (None) the caller passes the default of 3.
+    /// Verify the default of 3 is what the caller should use.
+    #[test]
+    fn scroll_default_step_is_3() {
+        let cfg = synaps_cli::config::SynapsConfig::default();
+        let step = cfg.scroll_lines.unwrap_or(3);
+        assert_eq!(step, 3, "default scroll step must be 3 when unconfigured");
+    }
+
+    /// Configured value is read through SynapsConfig::scroll_lines.
+    #[test]
+    fn scroll_configured_step_is_used_via_config() {
+        let cfg = synaps_cli::config::SynapsConfig {
+            scroll_lines: Some(7),
+            ..Default::default()
+        };
+        let step = cfg.scroll_lines.unwrap_or(3);
+        assert_eq!(step, 7);
+    }
 }

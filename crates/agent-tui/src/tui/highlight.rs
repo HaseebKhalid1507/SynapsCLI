@@ -9,7 +9,7 @@ use syntect::util::LinesWithEndings;
 use std::sync::LazyLock;
 
 use super::theme::THEME;
-use unicode_width::UnicodeWidthStr;
+use super::text_metrics::{width as display_width, char_width};
 
 /// Clamp a `Line` to fit within `width` terminal columns.
 /// Walks spans left-to-right, truncating/dropping once the budget is exceeded.
@@ -21,7 +21,7 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     let mut remaining = width;
     let mut clamped: Vec<Span<'static>> = Vec::new();
     for span in line.spans {
-        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        let span_width = display_width(span.content.as_ref());
         if remaining == 0 {
             break;
         }
@@ -35,7 +35,7 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
             let mut used = 0;
             let mut truncated = String::new();
             for ch in span.content.chars() {
-                let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                let ch_width = char_width(ch);
                 if used + ch_width > remaining {
                     break;
                 }
@@ -353,7 +353,6 @@ pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> 
 mod tests {
     use super::*;
     use ratatui::{style::Style, text::{Line, Span}};
-    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn clamp_line_truncates_by_display_width_not_char_count() {
@@ -367,7 +366,7 @@ mod tests {
             .collect();
 
         assert_eq!(rendered, "ab漢");
-        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+        assert_eq!(display_width(rendered.as_str()), 4);
     }
 
     #[test]
@@ -386,7 +385,7 @@ mod tests {
             .collect();
 
         assert_eq!(rendered, "ab漢");
-        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+        assert_eq!(display_width(rendered.as_str()), 4);
     }
 
     #[test]

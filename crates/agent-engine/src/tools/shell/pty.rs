@@ -256,8 +256,10 @@ impl Drop for PtyHandle {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_spawn_echo_hello() {
         let mut handle = PtyHandle::spawn(
             "echo hello",
@@ -281,6 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cat_echo_back() {
         let mut handle = PtyHandle::spawn(
             "cat",
@@ -306,6 +309,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_exit_code_detection() {
         let mut handle = PtyHandle::spawn(
             "bash -c exit 42",

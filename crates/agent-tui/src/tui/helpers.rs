@@ -122,7 +122,7 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
 }
 
 pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
-    app.messages.clear();
+    app.transcript.clear();
     for msg in api_messages {
         // Skip compaction summary messages — internal context, not user-visible
         if let Some(content) = msg["content"].as_str() {
@@ -174,12 +174,110 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
     // hundreds of messages on the first frame (the slow-boot cause). Full
     // history stays in api_messages for the model. See App::cap_resumed_display.
     app.cap_resumed_display(120);
+
+    // Wholesale rebuild = a full message-list reshuffle. `messages.clear()` above
+    // does NOT touch the line cache, and push_msg's incremental invalidate_last()
+    // only covers the tail — so if api_messages was empty or fully filtered, the
+    // stale cache would render deleted messages. Force a full invalidate; this is
+    // exactly the "message list reshuffle" case invalidate() is documented for.
+    app.invalidate();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_draw;
+    use super::{should_draw, rebuild_display_messages};
+    use super::super::app::{App, CacheState, ChatMessage, LineCache, MsgSlot};
+    use synaps_cli::Session;
     use std::time::Duration;
+
+    fn test_app() -> App {
+        App::new(Session::new("test-model", "low", None))
+    }
+
+    /// Build a populated LineCache for all messages in `app` at `width`, then
+    /// mark it Clean (old "dirty_from = None"). This simulates the state right
+    /// after a successful draw — the renderer believes the cache is valid.
+    fn prime_clean_cache(app: &mut App, width: usize) {
+        let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
+            .map(|i| app.render_message_lines(i, width))
+            .collect();
+        // Clean — renderer thinks nothing changed
+        app.transcript.test_set_cache_clean(LineCache::new(width, per_msg));
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: rebuild_display_messages must invalidate the line cache even
+    // when api_messages is empty (or all entries are filtered out).
+    //
+    // Before fbcfa05 the function only relied on push_msg's incremental
+    // invalidate_last() to dirty the cache. When zero pushes happened (empty
+    // or fully-filtered input) the stale cache survived: line_cache stayed
+    // Some(...) and dirty_from stayed None — "clean" — so the next frame
+    // rendered deleted messages. The fix adds app.invalidate() at the end of
+    // rebuild_display_messages, which sets line_cache = None unconditionally.
+    // -------------------------------------------------------------------------
+
+    /// EMPTY api_messages case: no pushes happen, so without the explicit
+    /// app.invalidate() the cache would stay "clean" and render stale content.
+    #[test]
+    fn rebuild_display_messages_empty_input_invalidates_line_cache() {
+        let mut app = test_app();
+
+        // Give the app a message so the cache is non-trivial.
+        app.push_msg(ChatMessage::User("hello from the past".to_string()));
+        prime_clean_cache(&mut app, 80);
+
+        // Sanity: cache is primed and marked clean.
+        assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
+        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+
+        // Trigger: rebuild with an empty message list — the exact bug trigger.
+        // Zero push_msg calls happen → without the fix, no invalidation occurs.
+        rebuild_display_messages(&[], &mut app);
+
+        // Post-condition: cache must be fully invalidated so the next draw
+        // doesn't render the now-deleted "hello from the past" message.
+        // The fix calls app.invalidate() which sets line_cache = None.
+        assert!(
+            app.transcript.line_cache().is_none(),
+            "cache must be Missing after rebuild with empty api_messages — \
+             stale cache would render deleted messages (fbcfa05 regression)"
+        );
+    }
+
+    /// FULLY-FILTERED api_messages case: every entry contains <context-summary>
+    /// or <event ...>...</event> and is skipped, so again zero push_msg calls
+    /// happen. Same latent bug, same fix.
+    #[test]
+    fn rebuild_display_messages_fully_filtered_input_invalidates_line_cache() {
+        let mut app = test_app();
+
+        app.push_msg(ChatMessage::User("previous content".to_string()));
+        prime_clean_cache(&mut app, 80);
+
+        assert!(app.transcript.line_cache().is_some(), "pre-condition: cache must be primed");
+        assert!(app.transcript.cache_dirty_from().is_none(), "pre-condition: cache must be Clean (no dirty watermark)");
+
+        // Every entry is filtered out by rebuild_display_messages.
+        let api_messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "<context-summary>compacted context</context-summary>"
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "<event tool_use_id=\"x\">data</event>"
+            }),
+        ];
+
+        rebuild_display_messages(&api_messages, &mut app);
+
+        assert!(
+            app.transcript.line_cache().is_none(),
+            "cache must be Missing after rebuild with fully-filtered api_messages — \
+             stale cache would render deleted messages (fbcfa05 regression)"
+        );
+    }
 
     const T: Duration = Duration::from_millis(100);
 

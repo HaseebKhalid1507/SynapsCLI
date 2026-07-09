@@ -1,8 +1,11 @@
 //! Chat TUI binary — event loop, terminal setup, module wiring.
+mod transcript;
+
 
 mod app;
 mod commands;
 mod draw;
+pub(crate) mod text_metrics;
 mod gamba;
 mod help_find;
 mod helpers;
@@ -20,6 +23,10 @@ mod settings;
 mod sidecar;
 mod signals;
 mod stream_handler;
+/// Headless test harness — see [`testing::TestHarness`]. Compiled only for
+/// in-crate tests or downstream consumers of the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod theme;
 mod toast;
 mod viewport;
@@ -401,7 +408,7 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.messages.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 // Active animations/effects always need a redraw each tick.
                 // messages.is_empty() = idle logo screen — its color gradient
                 // is time-based and needs ticking too (S206 regression: the
@@ -410,7 +417,7 @@ pub async fn run(
                 if boot_fx_sent && boot_done.load(Ordering::Acquire) {
                     boot_fx_sent = false;
                 }
-                if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.messages.is_empty() {
+                if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.is_empty() {
                     app.request_redraw();
                 }
                 secret_prompts.poll_requests(&secret_prompt_rx);
@@ -589,7 +596,7 @@ pub async fn run(
                         // yield point.
                         let action = {
                             let kb_guard = keybind_registry.read().expect("keybind registry poisoned");
-                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard)
+                            input::handle_event(event, &mut app, &runtime, is_streaming, &registry, &kb_guard, config.scroll_lines.unwrap_or(3))
                         };
                         // Input events (keys, mouse, paste, resize) almost always
                         // change visible state (cursor, input buffer, scroll) and
@@ -1896,8 +1903,7 @@ pub async fn run(
                             }
                             // Auto-send the queued message
                             app.push_msg(ChatMessage::User(queued.clone()));
-                            app.scroll_back = 0;
-                            app.scroll_pinned = true;
+                            app.transcript.scroll_to_bottom();
                             let api_content = if let Some(ref ctx) = app.abort_context {
                                 let combined = format!("{}\n\n{}", ctx, queued);
                                 app.abort_context = None;

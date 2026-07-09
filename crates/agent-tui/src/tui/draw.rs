@@ -6,8 +6,11 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Terminal,
 };
+use crossterm::{execute, terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate}};
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
+
+use super::text_metrics::{width as display_width, char_width};
 
 /// The six named panes that make up the outer app layout.
 ///
@@ -508,107 +511,20 @@ pub(crate) fn build_render_model(
     // old saturating_sub chain + .max(1), so the resulting Rect is identical.
     let area = ratatui::layout::Rect { x: 0, y: 0, width: term_size.width, height: term_size.height };
     let msg_area = AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
-    let content_height = msg_area.height.saturating_sub(2) as usize;
-    let content_width = msg_area.width.saturating_sub(2) as usize;
 
-    // ── 3. Line-cache maintenance ──────────────────────────────────────────────
-    {
-        let needs_full_rebuild = app
-            .line_cache
-            .as_ref()
-            .map_or(true, |c| c.width != content_width);
-
-        if needs_full_rebuild {
-            // Width changed or no cache: full rebuild
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
-                .map(|i| app.render_message_lines(i, content_width))
-                .collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-            app.dirty_from = None;
-        } else if let Some(k) = app.dirty_from.take() {
-            // Incremental rebuild: only re-render messages[k..]
-            // Render all dirty slots first (immutable borrow of app), then apply.
-            let n = app.messages.len();
-            let cache = app.line_cache.as_ref().expect("cache must be Some here");
-            let needs_resize = cache.per_msg.len() != n;
-
-            // Render fresh slots for [k..n]
-            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (k..n)
-                .map(|i| app.render_message_lines(i, content_width))
-                .collect();
-
-            // Apply to cache (now mutable borrow)
-            let cache = app.line_cache.as_mut().expect("cache must be Some here");
-            if needs_resize {
-                cache.per_msg.truncate(k);
-                cache.per_msg.extend(fresh);
-            } else {
-                for (offset, rendered) in fresh.into_iter().enumerate() {
-                    cache.per_msg[k + offset] = rendered;
-                }
-            }
-            // Rebuild flat from k
-            let prefix_line_count: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
-            cache.flat.truncate(prefix_line_count);
-            for slot in &cache.per_msg[k..] {
-                cache.flat.extend(slot.iter().cloned());
-            }
-        }
-        // Paranoia fallback: guarantee Some (should never fire)
-        if app.line_cache.is_none() {
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
-                .map(|i| app.render_message_lines(i, content_width))
-                .collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            app.line_cache = Some(super::app::LineCache { width: content_width, per_msg, flat });
-            app.dirty_from = None;
-        }
-    }
-    let all_lines_vec: &[ratatui::text::Line<'static>] =
-        app.line_cache.as_ref().map_or(&[], |c| c.flat.as_slice());
-    let total = all_lines_vec.len();
-    // `lines` wraps only the visible window — sliced below once (start, end) exist.
-
-    // ── 4. Scroll bookkeeping (App mutations lifted from draw()) ──────────────
-    if app.scroll_pinned {
-        app.scroll_back = 0;
-    } else {
-        let prev = app.last_line_count;
-        if total > prev && prev > 0 {
-            let growth = (total - prev) as u16;
-            app.scroll_back = app.scroll_back.saturating_add(growth);
-        }
-        let max_back = total.saturating_sub(content_height).min(u16::MAX as usize) as u16;
-        if app.scroll_back > max_back {
-            app.scroll_back = max_back;
-        }
-    }
-    app.last_line_count = total;
-    let scroll_back = app.scroll_back;
-
-    // ── 5. Visible range + msg_area_rect write-back ───────────────────────────
-    let end = total.saturating_sub(scroll_back as usize);
-    let start = end.saturating_sub(content_height);
-    // Inner rect: TOP+BOTTOM borders (-2 height, +1 y), horizontal padding
-    // (-2 width, +1 x).  Matches `msg_block.inner(msg_area)` exactly.
-    let msg_inner = ratatui::layout::Rect {
-        x: msg_area.x + 1,
-        y: msg_area.y + 1,
-        width: msg_area.width.saturating_sub(2),
-        height: msg_area.height.saturating_sub(2),
+    // ── 3. Transcript visible window ──────────────────────────────────────────
+    // One call folds the old §3–§6 block: cache sync → scroll growth/clamp
+    // bookkeeping → viewport geometry + visible range recording → O(viewport)
+    // slice clone + selection snapshot (design §3.5). Ephemeral App state the
+    // renderer needs crosses the seam via RenderCtx.
+    let vw = {
+        let ctx = super::transcript::RenderCtx {
+            spinner_frame: app.spinner_frame,
+            streaming: app.streaming,
+            agent_name: &app.agent_name,
+        };
+        app.transcript.visible_window(msg_area, &ctx)
     };
-    app.msg_area_rect = Some(msg_inner);
-    app.visible_line_range = Some((start, end));
-
-    // Clone only the visible window (~viewport height lines) into the Arc —
-    // O(viewport) not O(n).  `total` above is the full flat count, kept for
-    // scroll bookkeeping; `lines` is only the slice the render thread needs.
-    let visible_slice = all_lines_vec.get(start..end).unwrap_or(&[]);
-    let lines: std::sync::Arc<[ratatui::text::Line<'static>]> = visible_slice.to_vec().into();
-
-    // ── 6. Selection range ────────────────────────────────────────────────────
-    let selection = app.selection_range();
 
     // ── 7. Subagent snapshots ─────────────────────────────────────────────────
     let subagents: Vec<SubagentSnap> = app
@@ -740,11 +656,11 @@ pub(crate) fn build_render_model(
         sidecar_pills,
         runtime_model,
         runtime_thinking,
-        lines,
-        lines_width: content_width,
-        scroll_back,
-        selection,
-        messages_empty: app.messages.is_empty(),
+        lines: vw.lines,
+        lines_width: vw.lines_width,
+        scroll_back: vw.scroll_back,
+        selection: vw.selection,
+        messages_empty: vw.is_empty,
         logo_build_t: app.logo_build_t,
         logo_dismiss_t: app.logo_dismiss_t,
         subagents,
@@ -752,7 +668,7 @@ pub(crate) fn build_render_model(
         input: app.input.clone(),
         cursor_pos: app.cursor_pos,
         ghost_hint,
-        show_full_output: app.show_full_output,
+        show_full_output: app.transcript.show_full_output(),
         session_cost: app.session_cost,
         total_input_tokens: app.total_input_tokens,
         total_output_tokens: app.total_output_tokens,
@@ -794,146 +710,163 @@ pub(crate) fn render_frame(
     let elapsed = last_frame.elapsed();
     *last_frame = std::time::Instant::now();
 
-    super::viewport::scrub_crossterm_terminal_edges(
-        terminal,
-        model.protected_bottom_rows,
-        Style::default().bg(THEME.load().bg),
-    )?;
+    // DEC 2026 synchronized output: bracket the edge-scrub AND the ratatui
+    // diff flush together so terminals that support it (kitty, wezterm, foot,
+    // iTerm2 ≥3.5, VTE ≥0.70) don't render partial frames. Terminals that
+    // don't support mode 2026 ignore the private-mode sequences harmlessly.
+    execute!(io::stdout(), BeginSynchronizedUpdate)?;
 
-    terminal.draw(|frame| {
-        // ── Layout ────────────────────────────────────────────────────────────
-        let has_subagents = !model.subagents.is_empty();
-        let subagent_height: u16 = if has_subagents {
-            (model.subagents.len() as u16 + 2).min(8)
-        } else {
-            0
-        };
-        let input_inner_width = frame.area().width.saturating_sub(2);
-        let max_input_lines: u16 = 10;
+    let frame_result = (|| -> io::Result<()> {
+        super::viewport::scrub_crossterm_terminal_edges(
+            terminal,
+            model.protected_bottom_rows,
+            Style::default().bg(THEME.load().bg),
+        )?;
 
-        // Recompute input_lines for layout using the snapshot input + cursor_pos.
-        let (input_lines, _, _) = {
-            use unicode_width::UnicodeWidthChar;
-            let w = input_inner_width.max(1) as usize;
-            let prefix_width: usize = 2;
-            let mut total_lines: u16 = 1;
-            let mut col: usize = prefix_width;
-            for ch in model.input.chars() {
-                if ch == '\n' {
-                    total_lines += 1;
-                    col = prefix_width;
-                    continue;
-                }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col + cw > w {
-                    total_lines += 1;
-                    col = 0;
-                }
-                col += cw;
+        terminal.draw(|frame| render_frame_into(frame, model, boot_fx, exit_fx, elapsed))?;
+        Ok(())
+    })();
+
+    // Always end the synchronized update, even if rendering failed.
+    // Leaving mode 2026 open would freeze the terminal display.
+    execute!(io::stdout(), EndSynchronizedUpdate).ok();
+
+    frame_result
+}
+
+/// Backend-agnostic frame body — everything `render_frame` draws, minus the
+/// crossterm-specific edge scrub and terminal ownership.
+///
+/// This is the seam the headless test harness renders through: production
+/// calls it from `render_frame` inside `Terminal::<CrosstermBackend>::draw`;
+/// tests call it inside `Terminal::<TestBackend>::draw`. Same pixels, no TTY.
+///
+/// **Invariant**: takes NO `&App` — all data comes from the [`RenderModel`]
+/// snapshot, same completeness proof as `render_frame`.
+pub(crate) fn render_frame_into(
+    frame: &mut ratatui::Frame<'_>,
+    model: &RenderModel,
+    boot_fx: &mut Option<Effect>,
+    exit_fx: &mut Option<Effect>,
+    elapsed: std::time::Duration,
+) {
+    // ── Layout ────────────────────────────────────────────────────────────
+    let has_subagents = !model.subagents.is_empty();
+    let subagent_height: u16 = if has_subagents {
+        (model.subagents.len() as u16 + 2).min(8)
+    } else {
+        0
+    };
+    let input_inner_width = frame.area().width.saturating_sub(2);
+    let max_input_lines: u16 = 10;
+
+    // Recompute input_lines for layout using the snapshot input + cursor_pos.
+    let (input_lines, _, _) = {
+        
+        let w = input_inner_width.max(1) as usize;
+        let prefix_width: usize = 2;
+        let mut total_lines: u16 = 1;
+        let mut col: usize = prefix_width;
+        for ch in model.input.chars() {
+            if ch == '\n' {
+                total_lines += 1;
+                col = prefix_width;
+                continue;
             }
-            // cursor_row / cursor_col not needed for layout — use dummy values.
-            (total_lines, 0u16, 0u16)
-        };
-        let input_height = input_lines.min(max_input_lines) + 2;
-        let download_height: u16 = if !model.active_tasks.is_empty() { 1 } else { 0 };
+            let cw = char_width(ch);
+            if col + cw > w {
+                total_lines += 1;
+                col = 0;
+            }
+            col += cw;
+        }
+        // cursor_row / cursor_col not needed for layout — use dummy values.
+        (total_lines, 0u16, 0u16)
+    };
+    let input_height = input_lines.min(max_input_lines) + 2;
+    let download_height: u16 = if !model.active_tasks.is_empty() { 1 } else { 0 };
 
-        let AppAreas {
-            header: header_area,
-            body,
-            subagent: subagent_area,
-            download: download_area,
-            input: input_area,
-            footer: footer_area,
-        } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
+    let AppAreas {
+        header: header_area,
+        body,
+        subagent: subagent_area,
+        download: download_area,
+        input: input_area,
+        footer: footer_area,
+    } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
 
-        // ── Header ────────────────────────────────────────────────────────────
-        let spinner_idx = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
-        let status_span = if let Some(ref status) = model.status_text {
-            Span::styled(
-                format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
-                Style::default().fg(THEME.load().status_streaming),
-            )
-        } else if has_subagents {
-            let active = model.subagents.iter().filter(|s| !s.done).count();
-            let done = model.subagents.iter().filter(|s| s.done).count();
-            let spinner = if active > 0 {
-                SPINNER_FRAMES[spinner_idx]
-            } else {
-                "\u{2714}"
-            };
-            Span::styled(
-                format!(
-                    " {} {} agent{} ({} done) ",
-                    spinner,
-                    active,
-                    if active != 1 { "s" } else { "" },
-                    done
-                ),
-                Style::default().fg(THEME.load().subagent_name),
-            )
-        } else if model.streaming {
-            let pulse = ((model.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-            let (sr, sg, sb) = match THEME.load().status_streaming {
-                Color::Rgb(r, g, b) => (r, g, b),
-                _ => (128, 128, 128),
-            };
-            Span::styled(
-                " \u{25cf} streaming ",
-                Style::default().fg(Color::Rgb(
-                    (sr as f64 * pulse) as u8,
-                    (sg as f64 * pulse) as u8,
-                    (sb as f64 * pulse) as u8,
-                )),
-            )
+    // ── Header ────────────────────────────────────────────────────────────
+    let spinner_idx = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
+    let status_span = if let Some(ref status) = model.status_text {
+        Span::styled(
+            format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
+            Style::default().fg(THEME.load().status_streaming),
+        )
+    } else if has_subagents {
+        let active = model.subagents.iter().filter(|s| !s.done).count();
+        let done = model.subagents.iter().filter(|s| s.done).count();
+        let spinner = if active > 0 {
+            SPINNER_FRAMES[spinner_idx]
         } else {
-            Span::styled(
-                " \u{25cb} ready ",
-                Style::default().fg(THEME.load().status_ready),
-            )
+            "\u{2714}"
         };
-        let version_span = Span::styled(
-            concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"), " "),
-            Style::default().fg(THEME.load().muted),
-        );
-        let header = Paragraph::new(Line::from({
-            let mut spans = vec![
-                Span::styled(
-                    "  Synaps",
-                    Style::default()
-                        .fg(THEME.load().header_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-                Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-                status_span,
-            ];
-            // Sidecar pills from snapshot
-            for pill in &model.sidecar_pills {
-                spans.push(Span::styled(
-                    "\u{2502}",
-                    Style::default().fg(THEME.load().border),
-                ));
-                let label = pill.display_name.as_deref().unwrap_or("sidecar");
-                let text = sidecar_pill_text(label, &pill.status, pill.armed, model.spinner_frame);
-                let color = match &pill.status {
-                    super::sidecar::SidecarUiStatus::Idle => {
-                        if pill.armed {
-                            let pulse =
-                                ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                            let base = match THEME.load().status_streaming {
-                                Color::Rgb(r, g, b) => (r, g, b),
-                                _ => (220, 80, 80),
-                            };
-                            Color::Rgb(
-                                (base.0 as f64 * pulse) as u8,
-                                (base.1 as f64 * pulse) as u8,
-                                (base.2 as f64 * pulse) as u8,
-                            )
-                        } else {
-                            THEME.load().muted
-                        }
-                    }
-                    super::sidecar::SidecarUiStatus::Active { .. } => {
+        Span::styled(
+            format!(
+                " {} {} agent{} ({} done) ",
+                spinner,
+                active,
+                if active != 1 { "s" } else { "" },
+                done
+            ),
+            Style::default().fg(THEME.load().subagent_name),
+        )
+    } else if model.streaming {
+        let pulse = ((model.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
+        let (sr, sg, sb) = match THEME.load().status_streaming {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (128, 128, 128),
+        };
+        Span::styled(
+            " \u{25cf} streaming ",
+            Style::default().fg(Color::Rgb(
+                (sr as f64 * pulse) as u8,
+                (sg as f64 * pulse) as u8,
+                (sb as f64 * pulse) as u8,
+            )),
+        )
+    } else {
+        Span::styled(
+            " \u{25cb} ready ",
+            Style::default().fg(THEME.load().status_ready),
+        )
+    };
+    let version_span = Span::styled(
+        concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"), " "),
+        Style::default().fg(THEME.load().muted),
+    );
+    let header = Paragraph::new(Line::from({
+        let mut spans = vec![
+            Span::styled(
+                "  Synaps",
+                Style::default()
+                    .fg(THEME.load().header_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
+            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
+            status_span,
+        ];
+        // Sidecar pills from snapshot
+        for pill in &model.sidecar_pills {
+            spans.push(Span::styled(
+                "\u{2502}",
+                Style::default().fg(THEME.load().border),
+            ));
+            let label = pill.display_name.as_deref().unwrap_or("sidecar");
+            let text = sidecar_pill_text(label, &pill.status, pill.armed, model.spinner_frame);
+            let color = match &pill.status {
+                super::sidecar::SidecarUiStatus::Idle => {
+                    if pill.armed {
                         let pulse =
                             ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
                         let base = match THEME.load().status_streaming {
@@ -945,244 +878,196 @@ pub(crate) fn render_frame(
                             (base.1 as f64 * pulse) as u8,
                             (base.2 as f64 * pulse) as u8,
                         )
+                    } else {
+                        THEME.load().muted
                     }
-                    super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
+                }
+                super::sidecar::SidecarUiStatus::Active { .. } => {
+                    let pulse =
+                        ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                    let base = match THEME.load().status_streaming {
+                        Color::Rgb(r, g, b) => (r, g, b),
+                        _ => (220, 80, 80),
+                    };
+                    Color::Rgb(
+                        (base.0 as f64 * pulse) as u8,
+                        (base.1 as f64 * pulse) as u8,
+                        (base.2 as f64 * pulse) as u8,
+                    )
+                }
+                super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
+            };
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let used: usize = spans.iter().map(|s| s.content.len()).sum();
+        let total_w = header_area.width as usize;
+        if total_w > used + version_span.content.len() {
+            let pad = total_w - used - version_span.content.len();
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        spans.push(version_span);
+        spans
+    }))
+    .style(Style::default().bg(THEME.load().bg));
+    frame.render_widget(header, header_area);
+
+    // ── Messages ──────────────────────────────────────────────────────────
+    let msg_area = body;
+    // model.lines IS the visible window (sliced on the main side) — render the whole arc.
+    let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
+    let visible_is_empty = visible.is_empty();
+
+    let msg_block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(THEME.load().border))
+        .padding(Padding::horizontal(1));
+    let msg_inner = msg_block.inner(msg_area);
+    let messages_widget = Paragraph::new(visible).block(msg_block.clone());
+    frame.render_widget(Clear, msg_area);
+    if model.secret_prompt.is_some() {
+        let blank = Paragraph::new(Vec::<ratatui::text::Line>::new()).block(msg_block);
+        frame.render_widget(blank, msg_area);
+    } else {
+        frame.render_widget(messages_widget, msg_area);
+    }
+
+    // Text selection overlay
+    if let Some((sc, sr, ec, er)) = model.selection {
+        let content_x = msg_inner.x;
+        let content_y = msg_inner.y;
+        let content_h = msg_inner.height;
+        let content_w = msg_inner.width;
+        for y in sr..=er {
+            if y < content_y || y >= content_y + content_h {
+                continue;
+            }
+            let row_start = if y == sr {
+                sc.max(content_x)
+            } else {
+                content_x
+            };
+            let row_end = if y == er {
+                ec.min(content_x + content_w)
+            } else {
+                content_x + content_w
+            };
+            for x in row_start..row_end {
+                if x >= content_x && x < content_x + content_w {
+                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                        let fg = cell.fg;
+                        let bg = cell.bg;
+                        cell.set_fg(bg);
+                        cell.set_bg(match fg {
+                            Color::Reset => THEME.load().border_active,
+                            other => other,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Logo
+    let show_logo = model.messages_empty || model.logo_dismiss_t.is_some();
+    if show_logo && visible_is_empty {
+        let ascii_art: Vec<&str> = vec![
+            r" ███████ ██    ██ ███   ██  █████  ██████  ███████",
+            r" ██       ██  ██  ████  ██ ██   ██ ██   ██ ██    ",
+            r" ███████   ████   ██ ██ ██ ███████ ██████  ███████",
+            r"      ██    ██    ██  ████ ██   ██ ██           ██",
+            r" ███████    ██    ██   ███ ██   ██ ██      ███████",
+        ];
+        
+        let art_display_widths: Vec<usize> = ascii_art
+            .iter()
+            .map(|l| display_width(l))
+            .collect();
+        let max_art_width = art_display_widths.iter().copied().max().unwrap_or(0);
+        let avail_w = msg_area.width as usize;
+        let avail_h = msg_area.height as usize;
+        let art_height = ascii_art.len();
+        let sub_text = "neural interface ready";
+        let sub_width = sub_text.chars().count();
+        let total_block = art_height + 3;
+
+        if avail_h >= total_block && avail_w >= max_art_width + 2 {
+            let center_y = msg_area.y + msg_area.height / 2;
+            let dismiss_t = model.logo_dismiss_t.unwrap_or(0.0);
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+
+            if dismiss_t < 0.001 {
+                let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
+                let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
+                let breathe = phase1 * 0.7 + phase2 * 0.3;
+                let (ar, ag, ab) = match THEME.load().border_active {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (128, 128, 128),
                 };
-                spans.push(Span::styled(
-                    text,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                let breathe_scale = 0.7 + 0.3 * breathe;
+                let art_style = Style::default()
+                    .fg(Color::Rgb(
+                        (ar as f64 * breathe_scale) as u8,
+                        (ag as f64 * breathe_scale) as u8,
+                        (ab as f64 * breathe_scale) as u8,
+                    ))
+                    .add_modifier(Modifier::BOLD);
+                let (mr, mg, mb) = match THEME.load().muted {
+                    Color::Rgb(r, g, b) => (r, g, b),
+                    _ => (64, 64, 64),
+                };
+                let sub_style = Style::default().fg(Color::Rgb(
+                    (mr as f64 * breathe_scale) as u8,
+                    (mg as f64 * breathe_scale) as u8,
+                    (mb as f64 * breathe_scale) as u8,
                 ));
-            }
-            let used: usize = spans.iter().map(|s| s.content.len()).sum();
-            let total_w = header_area.width as usize;
-            if total_w > used + version_span.content.len() {
-                let pad = total_w - used - version_span.content.len();
-                spans.push(Span::raw(" ".repeat(pad)));
-            }
-            spans.push(version_span);
-            spans
-        }))
-        .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(header, header_area);
-
-        // ── Messages ──────────────────────────────────────────────────────────
-        let msg_area = body;
-        // model.lines IS the visible window (sliced on the main side) — render the whole arc.
-        let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
-        let visible_is_empty = visible.is_empty();
-
-        let msg_block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(THEME.load().border))
-            .padding(Padding::horizontal(1));
-        let msg_inner = msg_block.inner(msg_area);
-        let messages_widget = Paragraph::new(visible).block(msg_block.clone());
-        frame.render_widget(Clear, msg_area);
-        if model.secret_prompt.is_some() {
-            let blank = Paragraph::new(Vec::<ratatui::text::Line>::new()).block(msg_block);
-            frame.render_widget(blank, msg_area);
-        } else {
-            frame.render_widget(messages_widget, msg_area);
-        }
-
-        // Text selection overlay
-        if let Some((sc, sr, ec, er)) = model.selection {
-            let content_x = msg_inner.x;
-            let content_y = msg_inner.y;
-            let content_h = msg_inner.height;
-            let content_w = msg_inner.width;
-            for y in sr..=er {
-                if y < content_y || y >= content_y + content_h {
-                    continue;
-                }
-                let row_start = if y == sr {
-                    sc.max(content_x)
-                } else {
-                    content_x
-                };
-                let row_end = if y == er {
-                    ec.min(content_x + content_w)
-                } else {
-                    content_x + content_w
-                };
-                for x in row_start..row_end {
-                    if x >= content_x && x < content_x + content_w {
-                        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                            let fg = cell.fg;
-                            let bg = cell.bg;
-                            cell.set_fg(bg);
-                            cell.set_bg(match fg {
-                                Color::Reset => THEME.load().border_active,
-                                other => other,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Logo
-        let show_logo = model.messages_empty || model.logo_dismiss_t.is_some();
-        if show_logo && visible_is_empty {
-            let ascii_art: Vec<&str> = vec![
-                r" ███████ ██    ██ ███   ██  █████  ██████  ███████",
-                r" ██       ██  ██  ████  ██ ██   ██ ██   ██ ██    ",
-                r" ███████   ████   ██ ██ ██ ███████ ██████  ███████",
-                r"      ██    ██    ██  ████ ██   ██ ██           ██",
-                r" ███████    ██    ██   ███ ██   ██ ██      ███████",
-            ];
-            use unicode_width::UnicodeWidthStr;
-            let art_display_widths: Vec<usize> = ascii_art
-                .iter()
-                .map(|l| UnicodeWidthStr::width(*l))
-                .collect();
-            let max_art_width = art_display_widths.iter().copied().max().unwrap_or(0);
-            let avail_w = msg_area.width as usize;
-            let avail_h = msg_area.height as usize;
-            let art_height = ascii_art.len();
-            let sub_text = "neural interface ready";
-            let sub_width = sub_text.chars().count();
-            let total_block = art_height + 3;
-
-            if avail_h >= total_block && avail_w >= max_art_width + 2 {
-                let center_y = msg_area.y + msg_area.height / 2;
-                let dismiss_t = model.logo_dismiss_t.unwrap_or(0.0);
-                let t = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-
-                if dismiss_t < 0.001 {
-                    let phase1 = ((t % 4000) as f64 / 4000.0 * std::f64::consts::PI * 2.0).sin();
-                    let phase2 = ((t % 6500) as f64 / 6500.0 * std::f64::consts::PI * 2.0).sin();
-                    let breathe = phase1 * 0.7 + phase2 * 0.3;
-                    let (ar, ag, ab) = match THEME.load().border_active {
-                        Color::Rgb(r, g, b) => (r, g, b),
-                        _ => (128, 128, 128),
-                    };
-                    let breathe_scale = 0.7 + 0.3 * breathe;
-                    let art_style = Style::default()
-                        .fg(Color::Rgb(
-                            (ar as f64 * breathe_scale) as u8,
-                            (ag as f64 * breathe_scale) as u8,
-                            (ab as f64 * breathe_scale) as u8,
-                        ))
-                        .add_modifier(Modifier::BOLD);
-                    let (mr, mg, mb) = match THEME.load().muted {
-                        Color::Rgb(r, g, b) => (r, g, b),
-                        _ => (64, 64, 64),
-                    };
-                    let sub_style = Style::default().fg(Color::Rgb(
-                        (mr as f64 * breathe_scale) as u8,
-                        (mg as f64 * breathe_scale) as u8,
-                        (mb as f64 * breathe_scale) as u8,
-                    ));
-                    let build_t = model.logo_build_t.unwrap_or(1.0);
-                    let start_y = center_y.saturating_sub((total_block as u16) / 2);
-                    let art_x =
-                        msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
-                    for (j, line) in ascii_art.iter().enumerate() {
-                        let x = art_x;
-                        let y = start_y + j as u16;
-                        if y >= msg_area.y && y < msg_area.y + msg_area.height {
-                            let clamped_w = max_art_width.min(avail_w);
-                            if build_t >= 1.0 {
-                                let text: String = line.chars().take(clamped_w).collect();
-                                let area = ratatui::layout::Rect {
-                                    x,
-                                    y,
-                                    width: clamped_w as u16,
-                                    height: 1,
-                                };
-                                frame.render_widget(
-                                    Paragraph::new(Line::from(Span::styled(text, art_style))),
-                                    area,
-                                );
-                            } else {
-                                let mut built = String::with_capacity(clamped_w);
-                                let build_chars: &[char] = &['░', '▒', '▓'];
-                                for (ci, ch) in line.chars().take(clamped_w).enumerate() {
-                                    let inv_row = (art_height - 1 - j) as f64;
-                                    let inv_col = (max_art_width.saturating_sub(ci + 1)) as f64;
-                                    let diag = (inv_row + inv_col)
-                                        / (art_height as f64 + max_art_width as f64);
-                                    if build_t >= diag {
-                                        let lp = ((build_t - diag) / 0.15).min(1.0);
-                                        if lp < 1.0 && ch != ' ' {
-                                            built.push(
-                                                build_chars
-                                                    [(lp * build_chars.len() as f64) as usize],
-                                            );
-                                        } else {
-                                            built.push(ch);
-                                        }
-                                    } else {
-                                        built.push(' ');
-                                    }
-                                }
-                                let area = ratatui::layout::Rect {
-                                    x,
-                                    y,
-                                    width: clamped_w as u16,
-                                    height: 1,
-                                };
-                                frame.render_widget(
-                                    Paragraph::new(Span::styled(built, art_style)),
-                                    area,
-                                );
-                            }
-                        }
-                    }
-                    if build_t >= 1.0 {
-                        let sub_y = start_y + art_height as u16 + 1;
-                        if sub_y >= msg_area.y
-                            && sub_y < msg_area.y + msg_area.height
-                            && avail_w >= sub_width
-                        {
-                            let sub_x =
-                                msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
+                let build_t = model.logo_build_t.unwrap_or(1.0);
+                let start_y = center_y.saturating_sub((total_block as u16) / 2);
+                let art_x =
+                    msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
+                for (j, line) in ascii_art.iter().enumerate() {
+                    let x = art_x;
+                    let y = start_y + j as u16;
+                    if y >= msg_area.y && y < msg_area.y + msg_area.height {
+                        let clamped_w = max_art_width.min(avail_w);
+                        if build_t >= 1.0 {
+                            let text: String = line.chars().take(clamped_w).collect();
                             let area = ratatui::layout::Rect {
-                                x: sub_x,
-                                y: sub_y,
-                                width: sub_width as u16,
+                                x,
+                                y,
+                                width: clamped_w as u16,
                                 height: 1,
                             };
                             frame.render_widget(
-                                Paragraph::new(Span::styled(sub_text, sub_style)),
+                                Paragraph::new(Line::from(Span::styled(text, art_style))),
                                 area,
                             );
-                        }
-                    }
-                } else {
-                    let art_style = Style::default()
-                        .fg(THEME.load().muted)
-                        .add_modifier(Modifier::BOLD);
-                    let start_y = center_y.saturating_sub((total_block as u16) / 2);
-                    for (j, line) in ascii_art.iter().enumerate() {
-                        let char_w = art_display_widths[j];
-                        let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
-                        let y = start_y + j as u16;
-                        if y >= msg_area.y && y < msg_area.y + msg_area.height {
-                            let clamped_w = char_w.min(avail_w);
-                            let mut dis = String::with_capacity(clamped_w);
-                            let dis_chars: &[char] = &['▓', '▒', '░'];
+                        } else {
+                            let mut built = String::with_capacity(clamped_w);
+                            let build_chars: &[char] = &['░', '▒', '▓'];
                             for (ci, ch) in line.chars().take(clamped_w).enumerate() {
-                                let row = j as f64;
-                                let col = ci as f64;
-                                let diag = (row + col) / (art_height as f64 + max_art_width as f64);
-                                let threshold = diag;
-                                if dismiss_t < (1.0 - threshold) {
-                                    let rem = (1.0 - threshold) - dismiss_t;
-                                    if rem < 0.15 && ch != ' ' {
-                                        let idx =
-                                            ((1.0 - rem / 0.15) * dis_chars.len() as f64) as usize;
-                                        dis.push(dis_chars[idx.min(dis_chars.len() - 1)]);
+                                let inv_row = (art_height - 1 - j) as f64;
+                                let inv_col = (max_art_width.saturating_sub(ci + 1)) as f64;
+                                let diag = (inv_row + inv_col)
+                                    / (art_height as f64 + max_art_width as f64);
+                                if build_t >= diag {
+                                    let lp = ((build_t - diag) / 0.15).min(1.0);
+                                    if lp < 1.0 && ch != ' ' {
+                                        built.push(
+                                            build_chars
+                                                [(lp * build_chars.len() as f64) as usize],
+                                        );
                                     } else {
-                                        dis.push(ch);
+                                        built.push(ch);
                                     }
                                 } else {
-                                    dis.push(' ');
+                                    built.push(' ');
                                 }
                             }
                             let area = ratatui::layout::Rect {
@@ -1191,444 +1076,506 @@ pub(crate) fn render_frame(
                                 width: clamped_w as u16,
                                 height: 1,
                             };
-                            frame.render_widget(Paragraph::new(Span::styled(dis, art_style)), area);
+                            frame.render_widget(
+                                Paragraph::new(Span::styled(built, art_style)),
+                                area,
+                            );
                         }
                     }
                 }
-            }
-        }
-
-        // Scroll indicator
-        if model.scroll_back > 0 {
-            let indicator = format!(" \u{2191}{} ", model.scroll_back);
-            let indicator_widget = Paragraph::new(Span::styled(
-                indicator,
-                Style::default().fg(THEME.load().muted),
-            ))
-            .alignment(Alignment::Right);
-            let indicator_area = ratatui::layout::Rect {
-                x: msg_area.x,
-                y: msg_area.y,
-                width: msg_area.width,
-                height: 1,
-            };
-            frame.render_widget(indicator_widget, indicator_area);
-        }
-
-        // ── Subagent Panel ────────────────────────────────────────────────────
-        if has_subagents {
-            let spinner_idx2 = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
-            let mut agent_lines: Vec<ratatui::text::Line> = Vec::new();
-            for sa in &model.subagents {
-                let elapsed_s = sa.elapsed_secs;
-                let time_str = if elapsed_s < 60.0 {
-                    format!("{:.1}s", elapsed_s)
-                } else {
-                    format!("{}m{:.0}s", (elapsed_s / 60.0) as u32, elapsed_s % 60.0)
-                };
-                if sa.done {
-                    let is_timeout = sa.status.contains("timed out");
-                    let is_error = sa.status.starts_with("\u{2718}");
-                    let done_color = if is_timeout {
-                        THEME.load().warning_color
-                    } else if is_error {
-                        THEME.load().error_color
-                    } else {
-                        THEME.load().subagent_done
-                    };
-                    let icon = if is_timeout {
-                        "  \u{26a0} "
-                    } else if is_error {
-                        "  \u{2718} "
-                    } else {
-                        "  \u{2714} "
-                    };
-                    agent_lines.push(ratatui::text::Line::from(vec![
-                        Span::styled(icon, Style::default().fg(done_color)),
-                        Span::styled(
-                            format!("{} ", sa.name),
-                            Style::default()
-                                .fg(THEME.load().subagent_name)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            &sa.status,
-                            Style::default().fg(done_color).add_modifier(Modifier::DIM),
-                        ),
-                        Span::styled(
-                            format!("  {}", time_str),
-                            Style::default().fg(THEME.load().subagent_time),
-                        ),
-                    ]));
-                } else {
-                    let spinner = SPINNER_FRAMES[spinner_idx2];
-                    agent_lines.push(ratatui::text::Line::from(vec![
-                        Span::styled(
-                            format!("  {} ", spinner),
-                            Style::default().fg(THEME.load().subagent_name),
-                        ),
-                        Span::styled(
-                            format!("{} ", sa.name),
-                            Style::default()
-                                .fg(THEME.load().subagent_name)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            &sa.status,
-                            Style::default().fg(THEME.load().subagent_status),
-                        ),
-                        Span::styled(
-                            format!("  {}", time_str),
-                            Style::default().fg(THEME.load().subagent_time),
-                        ),
-                    ]));
+                if build_t >= 1.0 {
+                    let sub_y = start_y + art_height as u16 + 1;
+                    if sub_y >= msg_area.y
+                        && sub_y < msg_area.y + msg_area.height
+                        && avail_w >= sub_width
+                    {
+                        let sub_x =
+                            msg_area.x + (avail_w as u16).saturating_sub(sub_width as u16) / 2;
+                        let area = ratatui::layout::Rect {
+                            x: sub_x,
+                            y: sub_y,
+                            width: sub_width as u16,
+                            height: 1,
+                        };
+                        frame.render_widget(
+                            Paragraph::new(Span::styled(sub_text, sub_style)),
+                            area,
+                        );
+                    }
                 }
-            }
-            let active = model.subagents.iter().filter(|s| !s.done).count();
-            let done = model.subagents.iter().filter(|s| s.done).count();
-            let title = if done > 0 && active > 0 {
-                format!(" \u{25c8} {} running, {} done ", active, done)
-            } else if active > 0 {
-                format!(
-                    " \u{25c8} {} agent{} ",
-                    active,
-                    if active != 1 { "s" } else { "" }
-                )
             } else {
-                format!(" \u{2714} {} done ", done)
-            };
-            let agent_block = Block::default()
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(THEME.load().subagent_name)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(THEME.load().subagent_border))
-                .style(Style::default().bg(THEME.load().bg));
-            frame.render_widget(Paragraph::new(agent_lines).block(agent_block), subagent_area);
-        }
-
-        // ── Input ─────────────────────────────────────────────────────────────
-        let input_border_color = if model.streaming {
-            THEME.load().border
-        } else {
-            THEME.load().border_active
-        };
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(input_border_color))
-            .style(Style::default().bg(THEME.load().bg));
-        let w = input_inner_width.max(1) as usize;
-        let prefix_width: usize = 2;
-        let prompt_style = Style::default().fg(THEME.load().prompt_fg);
-        let input_style = Style::default().fg(THEME.load().input_fg);
-        let input_lines_vec: Vec<ratatui::text::Line> = {
-            use unicode_width::UnicodeWidthChar;
-            let mut rows: Vec<Vec<Span>> = Vec::new();
-            let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
-            let mut col: usize = prefix_width;
-            for ch in model.input.chars() {
-                if ch == '\n' {
-                    rows.push(std::mem::take(&mut current_row));
-                    current_row = vec![Span::styled("  ", prompt_style)];
-                    col = prefix_width;
-                    continue;
-                }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col + cw > w {
-                    rows.push(std::mem::take(&mut current_row));
-                    current_row = Vec::new();
-                    col = 0;
-                }
-                let mut s = String::new();
-                s.push(ch);
-                current_row.push(Span::styled(s, input_style));
-                col += cw;
-            }
-            rows.push(current_row);
-
-            // Apply ghost hint from model
-            if let Some(ref hint) = model.ghost_hint {
-                let ghost_style = Style::default()
-                    .fg(THEME.load().border)
-                    .add_modifier(Modifier::DIM);
-                if let Some(last_row) = rows.last_mut() {
-                    if let Some(ref badge) = hint.match_badge {
-                        last_row.push(Span::styled(badge.clone(), ghost_style));
-                    } else if !hint.ghost_text.is_empty() {
-                        last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
+                let art_style = Style::default()
+                    .fg(THEME.load().muted)
+                    .add_modifier(Modifier::BOLD);
+                let start_y = center_y.saturating_sub((total_block as u16) / 2);
+                for (j, line) in ascii_art.iter().enumerate() {
+                    let char_w = art_display_widths[j];
+                    let x = msg_area.x + (avail_w as u16).saturating_sub(char_w as u16) / 2;
+                    let y = start_y + j as u16;
+                    if y >= msg_area.y && y < msg_area.y + msg_area.height {
+                        let clamped_w = char_w.min(avail_w);
+                        let mut dis = String::with_capacity(clamped_w);
+                        let dis_chars: &[char] = &['▓', '▒', '░'];
+                        for (ci, ch) in line.chars().take(clamped_w).enumerate() {
+                            let row = j as f64;
+                            let col = ci as f64;
+                            let diag = (row + col) / (art_height as f64 + max_art_width as f64);
+                            let threshold = diag;
+                            if dismiss_t < (1.0 - threshold) {
+                                let rem = (1.0 - threshold) - dismiss_t;
+                                if rem < 0.15 && ch != ' ' {
+                                    let idx =
+                                        ((1.0 - rem / 0.15) * dis_chars.len() as f64) as usize;
+                                    dis.push(dis_chars[idx.min(dis_chars.len() - 1)]);
+                                } else {
+                                    dis.push(ch);
+                                }
+                            } else {
+                                dis.push(' ');
+                            }
+                        }
+                        let area = ratatui::layout::Rect {
+                            x,
+                            y,
+                            width: clamped_w as u16,
+                            height: 1,
+                        };
+                        frame.render_widget(Paragraph::new(Span::styled(dis, art_style)), area);
                     }
                 }
             }
-            rows.into_iter().map(ratatui::text::Line::from).collect()
-        };
+        }
+    }
 
-        // Cursor position for scroll offset
-        let (_, cursor_row, cursor_col) = {
-            use unicode_width::UnicodeWidthChar;
-            let w2 = input_inner_width.max(1) as usize;
-            let mut total_rows: u16 = 1;
-            let mut cur_row: u16 = 0;
-            let mut cur_col: u16 = 0;
-            let mut col: usize = prefix_width;
-            for (i, ch) in model.input.chars().enumerate() {
-                if i == model.cursor_pos {
-                    cur_row = total_rows - 1;
-                    cur_col = col as u16;
-                }
-                if ch == '\n' {
-                    total_rows += 1;
-                    col = prefix_width;
-                    continue;
-                }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if col + cw > w2 {
-                    total_rows += 1;
-                    col = 0;
-                }
-                col += cw;
+    // Scroll indicator
+    if model.scroll_back > 0 {
+        let indicator = format!(" \u{2191}{} ", model.scroll_back);
+        let indicator_widget = Paragraph::new(Span::styled(
+            indicator,
+            Style::default().fg(THEME.load().muted),
+        ))
+        .alignment(Alignment::Right);
+        let indicator_area = ratatui::layout::Rect {
+            x: msg_area.x,
+            y: msg_area.y,
+            width: msg_area.width,
+            height: 1,
+        };
+        frame.render_widget(indicator_widget, indicator_area);
+    }
+
+    // ── Subagent Panel ────────────────────────────────────────────────────
+    if has_subagents {
+        let spinner_idx2 = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
+        let mut agent_lines: Vec<ratatui::text::Line> = Vec::new();
+        for sa in &model.subagents {
+            let elapsed_s = sa.elapsed_secs;
+            let time_str = if elapsed_s < 60.0 {
+                format!("{:.1}s", elapsed_s)
+            } else {
+                format!("{}m{:.0}s", (elapsed_s / 60.0) as u32, elapsed_s % 60.0)
+            };
+            if sa.done {
+                let is_timeout = sa.status.contains("timed out");
+                let is_error = sa.status.starts_with("\u{2718}");
+                let done_color = if is_timeout {
+                    THEME.load().warning_color
+                } else if is_error {
+                    THEME.load().error_color
+                } else {
+                    THEME.load().subagent_done
+                };
+                let icon = if is_timeout {
+                    "  \u{26a0} "
+                } else if is_error {
+                    "  \u{2718} "
+                } else {
+                    "  \u{2714} "
+                };
+                agent_lines.push(ratatui::text::Line::from(vec![
+                    Span::styled(icon, Style::default().fg(done_color)),
+                    Span::styled(
+                        format!("{} ", sa.name),
+                        Style::default()
+                            .fg(THEME.load().subagent_name)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        &sa.status,
+                        Style::default().fg(done_color).add_modifier(Modifier::DIM),
+                    ),
+                    Span::styled(
+                        format!("  {}", time_str),
+                        Style::default().fg(THEME.load().subagent_time),
+                    ),
+                ]));
+            } else {
+                let spinner = SPINNER_FRAMES[spinner_idx2];
+                agent_lines.push(ratatui::text::Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", spinner),
+                        Style::default().fg(THEME.load().subagent_name),
+                    ),
+                    Span::styled(
+                        format!("{} ", sa.name),
+                        Style::default()
+                            .fg(THEME.load().subagent_name)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        &sa.status,
+                        Style::default().fg(THEME.load().subagent_status),
+                    ),
+                    Span::styled(
+                        format!("  {}", time_str),
+                        Style::default().fg(THEME.load().subagent_time),
+                    ),
+                ]));
             }
-            if model.cursor_pos >= model.input.chars().count() {
+        }
+        let active = model.subagents.iter().filter(|s| !s.done).count();
+        let done = model.subagents.iter().filter(|s| s.done).count();
+        let title = if done > 0 && active > 0 {
+            format!(" \u{25c8} {} running, {} done ", active, done)
+        } else if active > 0 {
+            format!(
+                " \u{25c8} {} agent{} ",
+                active,
+                if active != 1 { "s" } else { "" }
+            )
+        } else {
+            format!(" \u{2714} {} done ", done)
+        };
+        let agent_block = Block::default()
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(THEME.load().subagent_name)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(THEME.load().subagent_border))
+            .style(Style::default().bg(THEME.load().bg));
+        frame.render_widget(Paragraph::new(agent_lines).block(agent_block), subagent_area);
+    }
+
+    // ── Input ─────────────────────────────────────────────────────────────
+    let input_border_color = if model.streaming {
+        THEME.load().border
+    } else {
+        THEME.load().border_active
+    };
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(input_border_color))
+        .style(Style::default().bg(THEME.load().bg));
+    let w = input_inner_width.max(1) as usize;
+    let prefix_width: usize = 2;
+    let prompt_style = Style::default().fg(THEME.load().prompt_fg);
+    let input_style = Style::default().fg(THEME.load().input_fg);
+    let input_lines_vec: Vec<ratatui::text::Line> = {
+        
+        let mut rows: Vec<Vec<Span>> = Vec::new();
+        let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
+        let mut col: usize = prefix_width;
+        for ch in model.input.chars() {
+            if ch == '\n' {
+                rows.push(std::mem::take(&mut current_row));
+                current_row = vec![Span::styled("  ", prompt_style)];
+                col = prefix_width;
+                continue;
+            }
+            let cw = char_width(ch);
+            if col + cw > w {
+                rows.push(std::mem::take(&mut current_row));
+                current_row = Vec::new();
+                col = 0;
+            }
+            let mut s = String::new();
+            s.push(ch);
+            current_row.push(Span::styled(s, input_style));
+            col += cw;
+        }
+        rows.push(current_row);
+
+        // Apply ghost hint from model
+        if let Some(ref hint) = model.ghost_hint {
+            let ghost_style = Style::default()
+                .fg(THEME.load().border)
+                .add_modifier(Modifier::DIM);
+            if let Some(last_row) = rows.last_mut() {
+                if let Some(ref badge) = hint.match_badge {
+                    last_row.push(Span::styled(badge.clone(), ghost_style));
+                } else if !hint.ghost_text.is_empty() {
+                    last_row.push(Span::styled(hint.ghost_text.clone(), ghost_style));
+                }
+            }
+        }
+        rows.into_iter().map(ratatui::text::Line::from).collect()
+    };
+
+    // Cursor position for scroll offset
+    let (_, cursor_row, cursor_col) = {
+        
+        let w2 = input_inner_width.max(1) as usize;
+        let mut total_rows: u16 = 1;
+        let mut cur_row: u16 = 0;
+        let mut cur_col: u16 = 0;
+        let mut col: usize = prefix_width;
+        for (i, ch) in model.input.chars().enumerate() {
+            if i == model.cursor_pos {
                 cur_row = total_rows - 1;
                 cur_col = col as u16;
             }
-            (total_rows, cur_row, cur_col)
-        };
-
-        let visible_lines = max_input_lines;
-        let input_scroll: u16 = if cursor_row >= visible_lines {
-            cursor_row - visible_lines + 1
-        } else {
-            0
-        };
-        let input_widget = Paragraph::new(input_lines_vec)
-            .scroll((input_scroll, 0))
-            .block(input_block);
-        frame.render_widget(input_widget, input_area);
-
-        // Software cursor
-        let cursor_x = input_area.x + 1 + cursor_col;
-        let cursor_y = input_area.y + 1 + cursor_row - input_scroll;
-        if cursor_x < input_area.x.saturating_add(input_area.width)
-            && cursor_y < input_area.y.saturating_add(input_area.height)
-        {
-            if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
-                let symbol = cell.symbol().to_string();
-                let cursor_symbol = if symbol.trim().is_empty() {
-                    " "
-                } else {
-                    symbol.as_str()
-                };
-                cell.set_symbol(cursor_symbol)
-                    .set_fg(THEME.load().bg)
-                    .set_bg(THEME.load().input_fg);
+            if ch == '\n' {
+                total_rows += 1;
+                col = prefix_width;
+                continue;
             }
+            let cw = char_width(ch);
+            if col + cw > w2 {
+                total_rows += 1;
+                col = 0;
+            }
+            col += cw;
         }
-
-        // ── Active task bar ───────────────────────────────────────────────────
-        if !model.active_tasks.is_empty() {
-            let bar = render_active_tasks_line(&model.active_tasks, download_area.width);
-            frame.render_widget(bar, download_area);
+        if model.cursor_pos >= model.input.chars().count() {
+            cur_row = total_rows - 1;
+            cur_col = col as u16;
         }
+        (total_rows, cur_row, cur_col)
+    };
 
-        // ── Footer ────────────────────────────────────────────────────────────
-        let [keybinds_area, info_area] = Layout::horizontal([
-            Constraint::Min(1),
-            Constraint::Length(model.runtime_model.len() as u16 + 75),
-        ])
-        .areas(footer_area);
+    let visible_lines = max_input_lines;
+    let input_scroll: u16 = if cursor_row >= visible_lines {
+        cursor_row - visible_lines + 1
+    } else {
+        0
+    };
+    let input_widget = Paragraph::new(input_lines_vec)
+        .scroll((input_scroll, 0))
+        .block(input_block);
+    frame.render_widget(input_widget, input_area);
 
-        let key_style = Style::default().fg(THEME.load().muted);
-        let label_style = Style::default().fg(THEME.load().help_fg);
-        let dot_style = Style::default().fg(THEME.load().help_fg);
-        let keybinds = Paragraph::new(ratatui::text::Line::from(vec![
-            Span::styled(" ctrl+c ", key_style),
-            Span::styled("quit", label_style),
-            Span::styled(" \u{00b7} ", dot_style),
-            Span::styled("esc ", key_style),
-            Span::styled("abort", label_style),
-            Span::styled(" \u{00b7} ", dot_style),
-            Span::styled("shift+\u{2191}\u{2193} ", key_style),
-            Span::styled("scroll", label_style),
-            Span::styled(" \u{00b7} ", dot_style),
-            Span::styled("ctrl+o ", key_style),
-            Span::styled(
-                if model.show_full_output {
-                    "full"
-                } else {
-                    "compact"
-                },
-                label_style,
-            ),
-            Span::styled(" \u{00b7} ", dot_style),
-            Span::styled("enter ", key_style),
-            Span::styled("send", label_style),
-        ]))
-        .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(keybinds, keybinds_area);
-
-        let cost_str = if model.session_cost > 0.0 {
-            format!("${:.4} ", model.session_cost)
-        } else {
-            String::new()
-        };
-        let cache_rate = {
-            let total_input = model.total_input_tokens
-                + model.total_cache_read_tokens
-                + model.total_cache_creation_tokens;
-            if total_input > 0 && model.total_cache_read_tokens > 0 {
-                let rate =
-                    (model.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
-                let ttl_hint = if model.total_cache_write_1h > 0 {
-                    "·1h"
-                } else {
-                    ""
-                };
-                format!(" {}%↺{}", rate, ttl_hint)
+    // Software cursor
+    let cursor_x = input_area.x + 1 + cursor_col;
+    let cursor_y = input_area.y + 1 + cursor_row - input_scroll;
+    if cursor_x < input_area.x.saturating_add(input_area.width)
+        && cursor_y < input_area.y.saturating_add(input_area.height)
+    {
+        if let Some(cell) = frame.buffer_mut().cell_mut((cursor_x, cursor_y)) {
+            let symbol = cell.symbol().to_string();
+            let cursor_symbol = if symbol.trim().is_empty() {
+                " "
             } else {
-                String::new()
-            }
-        };
-        let token_str = if model.total_input_tokens > 0 || model.total_output_tokens > 0 {
-            format!(
-                "{}\u{2191} {}\u{2193}{}  ",
-                format_tokens(model.total_input_tokens),
-                format_tokens(model.total_output_tokens),
-                cache_rate,
-            )
+                symbol.as_str()
+            };
+            cell.set_symbol(cursor_symbol)
+                .set_fg(THEME.load().bg)
+                .set_bg(THEME.load().input_fg);
+        }
+    }
+
+    // ── Active task bar ───────────────────────────────────────────────────
+    if !model.active_tasks.is_empty() {
+        let bar = render_active_tasks_line(&model.active_tasks, download_area.width);
+        frame.render_widget(bar, download_area);
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────
+    let [keybinds_area, info_area] = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(model.runtime_model.len() as u16 + 75),
+    ])
+    .areas(footer_area);
+
+    let key_style = Style::default().fg(THEME.load().muted);
+    let label_style = Style::default().fg(THEME.load().help_fg);
+    let dot_style = Style::default().fg(THEME.load().help_fg);
+    let keybinds = Paragraph::new(ratatui::text::Line::from(vec![
+        Span::styled(" ctrl+c ", key_style),
+        Span::styled("quit", label_style),
+        Span::styled(" \u{00b7} ", dot_style),
+        Span::styled("esc ", key_style),
+        Span::styled("abort", label_style),
+        Span::styled(" \u{00b7} ", dot_style),
+        Span::styled("shift+\u{2191}\u{2193} ", key_style),
+        Span::styled("scroll", label_style),
+        Span::styled(" \u{00b7} ", dot_style),
+        Span::styled("ctrl+o ", key_style),
+        Span::styled(
+            if model.show_full_output {
+                "full"
+            } else {
+                "compact"
+            },
+            label_style,
+        ),
+        Span::styled(" \u{00b7} ", dot_style),
+        Span::styled("enter ", key_style),
+        Span::styled("send", label_style),
+    ]))
+    .style(Style::default().bg(THEME.load().bg));
+    frame.render_widget(keybinds, keybinds_area);
+
+    let cost_str = if model.session_cost > 0.0 {
+        format!("${:.4} ", model.session_cost)
+    } else {
+        String::new()
+    };
+    let cache_rate = {
+        let total_input = model.total_input_tokens
+            + model.total_cache_read_tokens
+            + model.total_cache_creation_tokens;
+        if total_input > 0 && model.total_cache_read_tokens > 0 {
+            let rate =
+                (model.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
+            let ttl_hint = if model.total_cache_write_1h > 0 {
+                "·1h"
+            } else {
+                ""
+            };
+            format!(" {}%↺{}", rate, ttl_hint)
         } else {
             String::new()
-        };
-        let info = Paragraph::new(ratatui::text::Line::from(vec![
-            Span::styled(&cost_str, Style::default().fg(THEME.load().cost_color)),
-            Span::styled(&token_str, Style::default().fg(THEME.load().muted)),
-            {
-                let turn_context = model.last_turn_context;
-                let context_window = model.last_turn_context_window.max(1);
-                if turn_context > 0 {
-                    let usage_ratio = (turn_context as f64 / context_window as f64).min(1.0);
-                    let bar_width: usize = 14;
-                    let filled = (usage_ratio * bar_width as f64).round() as usize;
-                    let empty = bar_width.saturating_sub(filled);
-                    let bar_color = if usage_ratio < 0.5 {
-                        THEME.load().border_active
-                    } else if usage_ratio < 0.75 {
-                        THEME.load().status_streaming
-                    } else {
-                        THEME.load().error_color
-                    };
-                    let pct = (usage_ratio * 100.0) as u32;
-                    Span::styled(
-                        format!(
-                            "{}{} {}% ",
-                            "\u{2593}".repeat(filled),
-                            "\u{2591}".repeat(empty),
-                            pct
-                        ),
-                        Style::default().fg(bar_color),
-                    )
+        }
+    };
+    let token_str = if model.total_input_tokens > 0 || model.total_output_tokens > 0 {
+        format!(
+            "{}\u{2191} {}\u{2193}{}  ",
+            format_tokens(model.total_input_tokens),
+            format_tokens(model.total_output_tokens),
+            cache_rate,
+        )
+    } else {
+        String::new()
+    };
+    let info = Paragraph::new(ratatui::text::Line::from(vec![
+        Span::styled(&cost_str, Style::default().fg(THEME.load().cost_color)),
+        Span::styled(&token_str, Style::default().fg(THEME.load().muted)),
+        {
+            let turn_context = model.last_turn_context;
+            let context_window = model.last_turn_context_window.max(1);
+            if turn_context > 0 {
+                let usage_ratio = (turn_context as f64 / context_window as f64).min(1.0);
+                let bar_width: usize = 14;
+                let filled = (usage_ratio * bar_width as f64).round() as usize;
+                let empty = bar_width.saturating_sub(filled);
+                let bar_color = if usage_ratio < 0.5 {
+                    THEME.load().border_active
+                } else if usage_ratio < 0.75 {
+                    THEME.load().status_streaming
                 } else {
-                    Span::raw("")
-                }
-            },
-            Span::styled("\u{03b8}:", Style::default().fg(THEME.load().muted)),
-            Span::styled(
-                model.runtime_thinking.clone(),
-                Style::default().fg(THEME.load().help_fg),
-            ),
-            Span::styled(" \u{2502} ", Style::default().fg(THEME.load().border)),
-            Span::styled(
-                model.runtime_model.clone(),
-                Style::default().fg(THEME.load().header_fg),
-            ),
-            Span::styled(" ", Style::default()),
-        ]))
-        .alignment(Alignment::Right)
-        .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(info, info_area);
-
-        // ── Effects ───────────────────────────────────────────────────────────
-        if let Some(ref mut fx) = boot_fx {
-            let area = frame.area();
-            fx.process(elapsed.into(), frame.buffer_mut(), area);
-            if fx.done() {
-                *boot_fx = None;
+                    THEME.load().error_color
+                };
+                let pct = (usage_ratio * 100.0) as u32;
+                Span::styled(
+                    format!(
+                        "{}{} {}% ",
+                        "\u{2593}".repeat(filled),
+                        "\u{2591}".repeat(empty),
+                        pct
+                    ),
+                    Style::default().fg(bar_color),
+                )
+            } else {
+                Span::raw("")
             }
-        }
-        if let Some(ref mut fx) = exit_fx {
-            let area = frame.area();
-            fx.process(elapsed.into(), frame.buffer_mut(), area);
-        }
+        },
+        Span::styled("\u{03b8}:", Style::default().fg(THEME.load().muted)),
+        Span::styled(
+            model.runtime_thinking.clone(),
+            Style::default().fg(THEME.load().help_fg),
+        ),
+        Span::styled(" \u{2502} ", Style::default().fg(THEME.load().border)),
+        Span::styled(
+            model.runtime_model.clone(),
+            Style::default().fg(THEME.load().header_fg),
+        ),
+        Span::styled(" ", Style::default()),
+    ]))
+    .alignment(Alignment::Right)
+    .style(Style::default().bg(THEME.load().bg));
+    frame.render_widget(info, info_area);
 
-        // ── Secret prompt modal ───────────────────────────────────────────────
-        if let Some(ref prompt) = model.secret_prompt {
-            let area = frame.area();
-            let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
-            let height = 7u16;
-            let x = area.x + area.width.saturating_sub(width) / 2;
-            let y = area.y + area.height.saturating_sub(height) / 2;
-            let modal_area = ratatui::layout::Rect {
-                x,
-                y,
-                width,
-                height,
-            };
-            frame.render_widget(Clear, modal_area);
-            let block = Block::default()
-                .title(Span::styled(
-                    format!(" {} ", prompt.title),
-                    Style::default()
-                        .fg(THEME.load().warning_color)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(THEME.load().warning_color))
-                .style(Style::default().bg(THEME.load().bg));
-            let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
-            let text = vec![
-                ratatui::text::Line::from(Span::styled(
-                    prompt.prompt.clone(),
-                    Style::default().fg(THEME.load().help_fg),
-                )),
-                ratatui::text::Line::from(""),
-                ratatui::text::Line::from(vec![
-                    Span::styled("password: ", Style::default().fg(THEME.load().muted)),
-                    Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
-                ]),
-                ratatui::text::Line::from(Span::styled(
-                    "Enter submit · Esc cancel",
-                    Style::default().fg(THEME.load().muted),
-                )),
-            ];
-            frame.render_widget(
-                Paragraph::new(text).block(block).alignment(Alignment::Left),
-                modal_area,
-            );
+    // ── Effects ───────────────────────────────────────────────────────────
+    if let Some(ref mut fx) = boot_fx {
+        let area = frame.area();
+        fx.process(elapsed.into(), frame.buffer_mut(), area);
+        if fx.done() {
+            *boot_fx = None;
         }
+    }
+    if let Some(ref mut fx) = exit_fx {
+        let area = frame.area();
+        fx.process(elapsed.into(), frame.buffer_mut(), area);
+    }
 
-        // ── Toasts ────────────────────────────────────────────────────────────
-        render_toasts_from_snap(frame, &model.toasts);
+    // ── Secret prompt modal ───────────────────────────────────────────────
+    if let Some(ref prompt) = model.secret_prompt {
+        let area = frame.area();
+        let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
+        let height = 7u16;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let modal_area = ratatui::layout::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, modal_area);
+        let block = Block::default()
+            .title(Span::styled(
+                format!(" {} ", prompt.title),
+                Style::default()
+                    .fg(THEME.load().warning_color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(THEME.load().warning_color))
+            .style(Style::default().bg(THEME.load().bg));
+        let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
+        let text = vec![
+            ratatui::text::Line::from(Span::styled(
+                prompt.prompt.clone(),
+                Style::default().fg(THEME.load().help_fg),
+            )),
+            ratatui::text::Line::from(""),
+            ratatui::text::Line::from(vec![
+                Span::styled("password: ", Style::default().fg(THEME.load().muted)),
+                Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
+            ]),
+            ratatui::text::Line::from(Span::styled(
+                "Enter submit · Esc cancel",
+                Style::default().fg(THEME.load().muted),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(text).block(block).alignment(Alignment::Left),
+            modal_area,
+        );
+    }
 
-        // ── Modals ────────────────────────────────────────────────────────────
-        if let Some((ref state, ref snap)) = model.settings {
-            super::settings::render(frame, frame.area(), state, snap);
-        }
-        if let Some(ref state) = model.models {
-            super::models::render(frame, frame.area(), state, &model.runtime_model);
-        }
-        if let Some(ref state) = model.plugins {
-            super::plugins::render(frame, frame.area(), state);
-        }
-        if let Some(mut state) = model.help_find.clone() {
-            super::help_find::render(frame, frame.area(), &mut state);
-        }
-    })?;
-    Ok(())
+    // ── Toasts ────────────────────────────────────────────────────────────
+    render_toasts_from_snap(frame, &model.toasts);
+
+    // ── Modals ────────────────────────────────────────────────────────────
+    if let Some((ref state, ref snap)) = model.settings {
+        super::settings::render(frame, frame.area(), state, snap);
+    }
+    if let Some(ref state) = model.models {
+        super::models::render(frame, frame.area(), state, &model.runtime_model);
+    }
+    if let Some(ref state) = model.plugins {
+        super::plugins::render(frame, frame.area(), state);
+    }
+    if let Some(mut state) = model.help_find.clone() {
+        super::help_find::render(frame, frame.area(), &mut state);
+    }
 }
 
 /// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.
@@ -1653,7 +1600,7 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
         let content_width = lines
             .iter()
             .flat_map(|line| line.spans.iter())
-            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .map(|span| display_width(span.content.as_ref()))
             .max()
             .unwrap_or(1) as u16;
         // Dimensions are clamped to always fit a terminal of ANY size — see
