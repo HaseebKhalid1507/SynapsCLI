@@ -1240,3 +1240,124 @@ fn scenario_p6_2_toast_expiry_only_advances_via_clock() {
     assert!(h.tick_toasts(), "toast must expire exactly when the clock reaches its TTL");
     assert_eq!(h.toast_count(), 0, "toast reaped after clock crosses TTL");
 }
+
+// ── P7.8. Secret-prompt pane (folded into the ModalStack) ─────────────────────
+//
+// These scenarios are testable for the FIRST time: pre-P7.8 the secret prompt
+// was intercepted inline in `mod.rs` (unreachable headless — testing.rs::event
+// calls input::handle_event directly). P7.8 folds it into the ModalStack as a
+// stack-routed pane, so `activate_secret_prompt` + the normal key path now
+// drive the Enter/Esc/Backspace/paste flows end-to-end.
+
+/// Scenario P7.8-a — Activation renders the masked modal and pushes the stack.
+#[test]
+fn scenario_p7_8_secret_prompt_activates_and_renders() {
+    let mut h = TestHarness::boot();
+    h.activate_secret_prompt("Sudo", "enter your password");
+
+    assert!(h.secret_prompt_active(), "queue must be active after injection");
+    assert_eq!(h.modal_stack_depth(), 1, "SecretPrompt must be pushed onto the stack");
+
+    let frame = h.snapshot();
+    assert!(frame.contains("Sudo"), "prompt title must render:\n{frame}");
+    assert!(
+        frame.contains("enter your password"),
+        "prompt body must render:\n{frame}"
+    );
+    assert!(frame.contains("password:"), "masked field label must render:\n{frame}");
+}
+
+/// Scenario P7.8-b — Typing masks input; Backspace deletes one bullet.
+#[test]
+fn scenario_p7_8_secret_prompt_type_and_backspace_mask() {
+    let mut h = TestHarness::boot();
+    h.activate_secret_prompt("Sudo", "password?");
+
+    // Four chars → four bullets, and the plaintext must NEVER appear.
+    h.type_str("h4x0");
+    let frame = h.snapshot();
+    assert!(frame.contains("••••"), "four masked bullets expected:\n{frame}");
+    assert!(!frame.contains("h4x0"), "plaintext secret must never render:\n{frame}");
+    assert!(h.secret_prompt_active(), "prompt stays open while typing");
+
+    // Backspace removes exactly one bullet (four → three).
+    h.key(KeyCode::Backspace, KeyModifiers::empty());
+    let frame = h.snapshot();
+    assert!(frame.contains("•••"), "three bullets after one backspace:\n{frame}");
+    assert!(!frame.contains("••••"), "must no longer show four bullets:\n{frame}");
+}
+
+/// Scenario P7.8-c — Paste appends per-character (still masked).
+#[test]
+fn scenario_p7_8_secret_prompt_paste_masks_per_char() {
+    let mut h = TestHarness::boot();
+    h.activate_secret_prompt("Token", "paste it");
+
+    h.paste("abc");
+    let frame = h.snapshot();
+    assert!(frame.contains("•••"), "pasted 3 chars → 3 bullets:\n{frame}");
+    assert!(!frame.contains("abc"), "pasted secret must never render:\n{frame}");
+    assert!(h.secret_prompt_active(), "prompt stays open after paste");
+}
+
+/// Scenario P7.8-d — Enter submits, drains the queue, pops the stack.
+#[test]
+fn scenario_p7_8_secret_prompt_enter_submits_and_pops() {
+    let mut h = TestHarness::boot();
+    h.activate_secret_prompt("Sudo", "password?");
+    h.type_str("secret");
+
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+
+    assert!(!h.secret_prompt_active(), "queue drained after Enter submit");
+    assert_eq!(h.modal_stack_depth(), 0, "SecretPrompt popped off the stack");
+
+    let frame = h.snapshot();
+    assert!(!frame.contains(" Sudo "), "prompt title gone after submit:\n{frame}");
+    assert!(
+        frame.contains("Synaps") || frame.contains("ready"),
+        "base chat view restored after submit:\n{frame}"
+    );
+}
+
+/// Scenario P7.8-e — Esc cancels, drains the queue, pops the stack.
+#[test]
+fn scenario_p7_8_secret_prompt_esc_cancels_and_pops() {
+    let mut h = TestHarness::boot();
+    h.activate_secret_prompt("Sudo", "password?");
+    h.type_str("abc");
+
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+
+    assert!(!h.secret_prompt_active(), "queue drained after Esc cancel");
+    assert_eq!(h.modal_stack_depth(), 0, "SecretPrompt popped off the stack");
+
+    let frame = h.snapshot();
+    assert!(!frame.contains(" Sudo "), "prompt title gone after cancel:\n{frame}");
+}
+
+/// Scenario P7.8-f — Consecutive queued prompts: submit chains to the next one
+/// (the pane stays on the stack across the auto-activated successor, §5).
+#[test]
+fn scenario_p7_8_secret_prompt_chains_to_next_queued() {
+    let mut h = TestHarness::boot();
+    // Two prompts queued back-to-back; only the first is active.
+    h.activate_secret_prompt("First", "one?");
+    h.activate_secret_prompt("Second", "two?");
+    assert_eq!(h.modal_stack_depth(), 1, "still a single SecretPrompt pane");
+
+    let frame = h.snapshot();
+    assert!(frame.contains("First"), "first prompt active first:\n{frame}");
+
+    // Submit the first → the queue auto-activates the second; the pane STAYS.
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+    assert!(h.secret_prompt_active(), "second prompt keeps the queue active");
+    assert_eq!(h.modal_stack_depth(), 1, "pane stays on the stack across chaining");
+    let frame = h.snapshot();
+    assert!(frame.contains("Second"), "second prompt now active:\n{frame}");
+
+    // Submit the second → queue drains, pane pops.
+    h.key(KeyCode::Enter, KeyModifiers::empty());
+    assert!(!h.secret_prompt_active(), "queue fully drained");
+    assert_eq!(h.modal_stack_depth(), 0, "pane popped after last prompt");
+}

@@ -464,11 +464,21 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         plugin_editor_active
     );
 
-    // Every other pane is still chain-routed (unmigrated) ⇒ it must NEVER be on
-    // the stack yet. HelpFind, Models, Plugins, Settings and PluginEditor are
-    // the only permitted members; the stack is therefore some ordering of a
-    // subset of {HelpFind, Models, Plugins, Settings, PluginEditor}. Only
-    // SecretPrompt remains chain/inline-routed (folded in at P7.8).
+    // P7.8: SecretPrompt membership on the stack must exactly mirror the async
+    // queue's `is_active()` (§5 reconcile). This is the tripwire for a missed
+    // reconcile after `poll_requests` / `submit` / `cancel`.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::SecretPrompt),
+        app.secret_prompts.is_active(),
+        "stack sync (P7.8): modal_stack.contains(SecretPrompt)={} but \
+         secret_prompts.is_active()={} — a reconcile_secret_prompt call was missed",
+        app.modal_stack.contains(PaneId::SecretPrompt),
+        app.secret_prompts.is_active()
+    );
+
+    // Every pane is now stack-routed (P7.8): the stack is some ordering of a
+    // subset of {HelpFind, Models, Plugins, Settings, PluginEditor, SecretPrompt}.
+    // Nothing is chain-routed any more — Chat is the implicit base, never stored.
     for pane in app.modal_stack.iter_bottom_up() {
         debug_assert!(
             matches!(
@@ -478,10 +488,11 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
                     | PaneId::Plugins
                     | PaneId::Settings
                     | PaneId::PluginEditor
+                    | PaneId::SecretPrompt
             ),
-            "stack sync (P7.7): unmigrated pane {pane:?} found on the ModalStack \
-             — only HelpFind, Models, Plugins, Settings and PluginEditor are \
-             stack-routed so far"
+            "stack sync (P7.8): unexpected pane {pane:?} found on the ModalStack \
+             — only HelpFind, Models, Plugins, Settings, PluginEditor and \
+             SecretPrompt are valid stack members"
         );
     }
 

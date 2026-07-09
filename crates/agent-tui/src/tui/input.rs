@@ -42,11 +42,13 @@ pub(super) enum InputAction {
 
 /// Process a crossterm Event and return what the main loop should do.
 ///
-/// Thin outer wrapper: the modal-routing SHIM dispatches stack-routed panes to
-/// their pane handler and unmigrated panes to the legacy `handle_event_inner`
-/// chain; BOTH paths converge on `action` so the debug-only stack/app sync
-/// tripwire runs afterwards on every path (including the pop path). As of P7.7
-/// HelpFind, Models, Plugins, Settings and its nested PluginEditor are stack-routed.
+/// P7.8: modal routing is now FULLY stack-driven. `handle_event` dispatches on
+/// `modal_stack.top()`: the empty-stack `Chat` case is the base pane
+/// (`handle_event_inner`), every modal has its own stack-routed pane handler,
+/// and the async SecretPrompt is folded in (§5). The legacy if-let modal chain
+/// is gone. BOTH the base path and every pane-handler path (including their pop
+/// paths) converge on `action` so the debug-only stack/app sync tripwire always
+/// runs afterwards.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -56,23 +58,19 @@ pub(super) fn handle_event(
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // P7 SHIM — stack-routed panes dispatch to their pane handler; unmigrated
-    // panes fall through to the legacy chain (via handle_event_inner). A pane
-    // is EITHER stack-routed OR chain-routed, never both. BOTH paths flow into
-    // `action` so the sync tripwire below runs after the pop path too (note A /
-    // §6). As of P7.7, HelpFind, Models, Plugins, Settings and its nested
-    // PluginEditor are stack-routed; only SecretPrompt still falls through
-    // (P7.8). Deleted in P7.8.
+    // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
+    // `Chat` (empty stack) is the base pane; every modal + the folded-in
+    // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.
     let action = match app.modal_stack.top() {
         super::focus::PaneId::Chat => {
-            handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines)
+            handle_event_inner(event, app, streaming, registry, keybinds, scroll_lines)
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
         super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
         super::focus::PaneId::PluginEditor => route_settings(event, app, runtime, registry),
-        other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
+        super::focus::PaneId::SecretPrompt => route_secret_prompt(event, app),
     };
 
     // Stack/app-field sync tripwire (§3 contract 4) — debug/test builds only.
@@ -84,18 +82,15 @@ pub(super) fn handle_event(
     action
 }
 
-/// Legacy routing body: base Chat handling only. The if-let modal chain is now
-/// EMPTY — every modal (help_find, models, plugins, settings + nested
-/// PluginEditor) is stack-routed as of P7.7. Reached only via the `handle_event`
-/// wrapper when `top() == Chat`. The whole wrapper/shim is deleted in P7.8.
+/// Base Chat pane handler: keyboard / mouse / paste for the transcript + input
+/// box. Reached from `handle_event` when `modal_stack.top() == Chat` (empty
+/// stack). All modals — and the async secret prompt — are stack-routed via
+/// their own pane handlers (P7.8); the legacy if-let modal chain no longer
+/// exists, so `runtime` (its sole ex-consumer was the settings arm, now in
+/// `route_settings`) is no longer threaded here.
 fn handle_event_inner(
     event: Event,
     app: &mut App,
-    // P7.7: `runtime` is no longer read here — the settings arm (its sole
-    // consumer, for RuntimeSnapshot) moved to `route_settings`. Kept in the
-    // signature (underscored) to preserve the wrapper call shape; deleted with
-    // the whole shim in P7.8.
-    _runtime: &synaps_cli::Runtime,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
@@ -678,6 +673,61 @@ fn route_settings(
         }
         // Swallow all other events while settings is open.
         return InputAction::None;
+    }
+    InputAction::None
+}
+
+/// P7.8: reconcile the SecretPrompt pane against the async queue (§5).
+///
+/// The secret-prompt queue is NOT user-opened: tools deep in the engine send
+/// requests over an mpsc channel, and `submit()` / `cancel()` auto-activate the
+/// next queued prompt — so activation and deactivation both happen OUTSIDE any
+/// input event. Rather than couple push/pop to a keypress, this reconciles the
+/// stack to the queue's `is_active()`: push when active but absent, remove when
+/// inactive but present. Called (a) after `poll_requests` in the tick arm
+/// (`mod.rs`), and (b) after every `submit()` / `cancel()` in the pane handler.
+/// Queue chaining is handled for free — the pane stays on the stack while
+/// `is_active()` remains true across consecutive prompts.
+pub(super) fn reconcile_secret_prompt(app: &mut App) {
+    let active = app.secret_prompts.is_active();
+    let on_stack = app.modal_stack.contains(super::focus::PaneId::SecretPrompt);
+    match (active, on_stack) {
+        (true, false) => app.modal_stack.push(super::focus::PaneId::SecretPrompt),
+        (false, true) => app.modal_stack.remove(super::focus::PaneId::SecretPrompt),
+        _ => {}
+    }
+}
+
+/// P7.8 stack-routed pane handler for the async secret / masked-input prompt.
+///
+/// Reproduces the former inline `mod.rs` interception VERBATIM: Enter submits,
+/// Esc cancels, Backspace deletes, Char / per-char Paste append, everything
+/// else is swallowed (`PaneOutcome::Consumed`). After `submit()` / `cancel()`
+/// (which may auto-activate the next queued prompt) it reconciles the stack so
+/// the pane stays while another prompt is pending and pops when the queue
+/// drains. Returns `InputAction::None`; the former inline `app.request_redraw()`
+/// is preserved by `request_immediate_redraw` on the input path (`mod.rs`).
+fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
+    match event {
+        Event::Key(key) => match key.code {
+            KeyCode::Enter => {
+                app.secret_prompts.submit();
+                reconcile_secret_prompt(app);
+            }
+            KeyCode::Esc => {
+                app.secret_prompts.cancel();
+                reconcile_secret_prompt(app);
+            }
+            KeyCode::Backspace => app.secret_prompts.backspace(),
+            KeyCode::Char(c) => app.secret_prompts.push_char(c),
+            _ => {}
+        },
+        Event::Paste(text) => {
+            for ch in text.chars() {
+                app.secret_prompts.push_char(ch);
+            }
+        }
+        _ => {}
     }
     InputAction::None
 }

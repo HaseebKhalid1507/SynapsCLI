@@ -58,7 +58,6 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use synaps_cli::skills::keybinds::KeybindRegistry;
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
-use synaps_cli::tools::SecretPromptQueue;
 use synaps_cli::{Runtime, Session};
 
 use super::app::{App, ChatMessage};
@@ -74,7 +73,6 @@ pub struct TestHarness {
     runtime: Runtime,
     registry: Arc<CommandRegistry>,
     keybinds: KeybindRegistry,
-    secret_prompts: SecretPromptQueue,
     terminal: Terminal<TestBackend>,
     size: Size,
     /// Human-readable records of dispatched [`InputAction`]s the harness
@@ -113,7 +111,6 @@ impl TestHarness {
             runtime: Runtime::new_headless(),
             registry: Arc::new(CommandRegistry::new(BUILTIN_COMMANDS, Vec::new())),
             keybinds: KeybindRegistry::new(),
-            secret_prompts: SecretPromptQueue::new(),
             terminal,
             size: Size::new(cols, rows),
             actions: Vec::new(),
@@ -186,7 +183,6 @@ impl TestHarness {
             &mut self.app,
             &self.runtime,
             &self.registry,
-            &self.secret_prompts,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
@@ -226,7 +222,6 @@ impl TestHarness {
             &mut self.app,
             &self.runtime,
             &self.registry,
-            &self.secret_prompts,
             self.size,
         )
         .expect("build_render_model returned None — gamba never runs headless");
@@ -351,6 +346,39 @@ impl TestHarness {
         // (run after every harness `event()`) trips on the missing Plugins push.
         self.app.modal_stack.push(super::focus::PaneId::Plugins);
         self
+    }
+
+    /// P7.8: inject and activate an async secret prompt — the harness
+    /// equivalent of a tool calling `SecretPromptHandle::prompt`. Sends a
+    /// request through a throwaway channel, drains it into `app.secret_prompts`
+    /// via the same `poll_requests` the tick arm uses, then reconciles the modal
+    /// stack exactly as production does. The response receiver is dropped: the
+    /// harness asserts on UI state (buffer / stack / frame), not the tool reply.
+    pub fn activate_secret_prompt(&mut self, title: &str, prompt: &str) -> &mut Self {
+        use synaps_cli::tools::SecretPromptRequest;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            response_tx,
+        })
+        .expect("secret prompt request send is infallible on a fresh channel");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        self.app.secret_prompts.poll_requests(&rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        self
+    }
+
+    /// Whether a secret prompt is currently active (mirrors the SecretPrompt
+    /// stack membership by the P7.8 sync invariant).
+    pub fn secret_prompt_active(&self) -> bool {
+        self.app.secret_prompts.is_active()
+    }
+
+    /// Current modal-stack depth (0 = base Chat pane, no modals open).
+    pub fn modal_stack_depth(&self) -> usize {
+        self.app.modal_stack.depth()
     }
 
     /// Current transcript scrollback offset (0 = pinned to bottom).

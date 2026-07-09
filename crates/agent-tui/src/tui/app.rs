@@ -92,6 +92,11 @@ pub(crate) struct App {
     /// above, never a new owner (§6 behavior-preservation). Empty ⇒ `top()` is
     /// `PaneId::Chat` ⇒ routing falls through to the legacy chain in `input.rs`.
     pub(crate) modal_stack: super::focus::ModalStack,
+    /// P7.8 secret-prompt queue — folded onto App from the `run()` local
+    /// (§5). Drained from the mpsc channel via `poll_requests` in the tick
+    /// arm; `is_active()` is mirrored by `modal_stack.contains(SecretPrompt)`
+    /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
+    pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -210,6 +215,9 @@ impl App {
             help_find: None,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
+            // P7.8: folded off the `run()` local; production wires the mpsc
+            // channel separately (mod.rs). Starts empty (no active prompt).
+            secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),

@@ -482,7 +482,6 @@ pub(crate) fn build_render_model(
     app: &mut App,
     runtime: &synaps_cli::Runtime,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
-    secret_prompts: &synaps_cli::tools::SecretPromptQueue,
     term_size: ratatui::layout::Size,
 ) -> Option<std::sync::Arc<RenderModel>> {
     // ── 1. gamba gate ─────────────────────────────────────────────────────────
@@ -639,7 +638,7 @@ pub(crate) fn build_render_model(
     let help_find = app.help_find.clone();
 
     // ── 12. Secret prompt ─────────────────────────────────────────────────────
-    let secret_prompt = secret_prompts.active().map(|p| SecretPromptSnap {
+    let secret_prompt = app.secret_prompts.active().map(|p| SecretPromptSnap {
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
@@ -684,6 +683,8 @@ pub(crate) fn build_render_model(
         models,
         help_find,
         secret_prompt,
+        // P7.8: stack-order snapshot driving the modal draw loop below.
+        modal_order: app.modal_stack.iter_bottom_up().collect(),
         protected_bottom_rows,
     }))
 }
@@ -1514,69 +1515,100 @@ pub(crate) fn render_frame_into(
         fx.process(elapsed.into(), frame.buffer_mut(), area);
     }
 
-    // ── Secret prompt modal ───────────────────────────────────────────────
-    if let Some(ref prompt) = model.secret_prompt {
-        let area = frame.area();
-        let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
-        let height = 7u16;
-        let x = area.x + area.width.saturating_sub(width) / 2;
-        let y = area.y + area.height.saturating_sub(height) / 2;
-        let modal_area = ratatui::layout::Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-        frame.render_widget(Clear, modal_area);
-        let block = Block::default()
-            .title(Span::styled(
-                format!(" {} ", prompt.title),
-                Style::default()
-                    .fg(THEME.load().warning_color)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(THEME.load().warning_color))
-            .style(Style::default().bg(THEME.load().bg));
-        let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
-        let text = vec![
-            ratatui::text::Line::from(Span::styled(
-                prompt.prompt.clone(),
-                Style::default().fg(THEME.load().help_fg),
-            )),
-            ratatui::text::Line::from(""),
-            ratatui::text::Line::from(vec![
-                Span::styled("password: ", Style::default().fg(THEME.load().muted)),
-                Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
-            ]),
-            ratatui::text::Line::from(Span::styled(
-                "Enter submit · Esc cancel",
-                Style::default().fg(THEME.load().muted),
-            )),
-        ];
-        frame.render_widget(
-            Paragraph::new(text).block(block).alignment(Alignment::Left),
-            modal_area,
-        );
-    }
-
     // ── Toasts ────────────────────────────────────────────────────────────
     render_toasts_from_snap(frame, &model.toasts);
 
-    // ── Modals ────────────────────────────────────────────────────────────
-    if let Some((ref state, ref snap)) = model.settings {
-        super::settings::render(frame, frame.area(), state, snap);
+    // ── Modals (stack order: bottom → top; topmost paints last) ───────────
+    // P7.8: driven by the `ModalStack` snapshot (`model.modal_order`) instead
+    // of a hardcoded order, dispatching to the same render fns. For every
+    // reachable state the stack order equals the old hardcoded order EXCEPT
+    // the secret-prompt-over-modal case: SecretPrompt now paints LAST
+    // (topmost) when it coexists with a modal (§5.5 z-order fix) — the one
+    // deliberate divergence, blessed at Gate 2. No existing harness scenario
+    // opens a modal mid-prompt, so snapshots stay byte-identical.
+    for pane in &model.modal_order {
+        match pane {
+            super::focus::PaneId::Settings => {
+                if let Some((ref state, ref snap)) = model.settings {
+                    super::settings::render(frame, frame.area(), state, snap);
+                }
+            }
+            super::focus::PaneId::Models => {
+                if let Some(ref state) = model.models {
+                    super::models::render(frame, frame.area(), state, &model.runtime_model);
+                }
+            }
+            super::focus::PaneId::Plugins => {
+                if let Some(ref state) = model.plugins {
+                    super::plugins::render(frame, frame.area(), state);
+                }
+            }
+            super::focus::PaneId::HelpFind => {
+                if let Some(mut state) = model.help_find.clone() {
+                    super::help_find::render(frame, frame.area(), &mut state);
+                }
+            }
+            super::focus::PaneId::SecretPrompt => {
+                if let Some(ref prompt) = model.secret_prompt {
+                    render_secret_prompt(frame, prompt);
+                }
+            }
+            // PluginEditor is drawn as the Settings `edit_mode` overlay by
+            // `settings::render` above (no standalone pass); Chat is the base
+            // pane and is never on the stack.
+            super::focus::PaneId::PluginEditor | super::focus::PaneId::Chat => {}
+        }
     }
-    if let Some(ref state) = model.models {
-        super::models::render(frame, frame.area(), state, &model.runtime_model);
-    }
-    if let Some(ref state) = model.plugins {
-        super::plugins::render(frame, frame.area(), state);
-    }
-    if let Some(mut state) = model.help_find.clone() {
-        super::help_find::render(frame, frame.area(), &mut state);
-    }
+}
+
+/// Render the secret / masked-input prompt modal.
+///
+/// P7.8: extracted verbatim from the former inline block so it can be
+/// dispatched from the stack-order modal loop in [`render_frame_into`].
+fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
+    let area = frame.area();
+    let width = area.width.min(62); // cap to available width; prefer 30-62 but never overflow (#tui-safety fix 3)
+    let height = 7u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let modal_area = ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal_area);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} ", prompt.title),
+            Style::default()
+                .fg(THEME.load().warning_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(THEME.load().warning_color))
+        .style(Style::default().bg(THEME.load().bg));
+    let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
+    let text = vec![
+        ratatui::text::Line::from(Span::styled(
+            prompt.prompt.clone(),
+            Style::default().fg(THEME.load().help_fg),
+        )),
+        ratatui::text::Line::from(""),
+        ratatui::text::Line::from(vec![
+            Span::styled("password: ", Style::default().fg(THEME.load().muted)),
+            Span::styled(masked, Style::default().fg(THEME.load().input_fg)),
+        ]),
+        ratatui::text::Line::from(Span::styled(
+            "Enter submit · Esc cancel",
+            Style::default().fg(THEME.load().muted),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(text).block(block).alignment(Alignment::Left),
+        modal_area,
+    );
 }
 
 /// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.

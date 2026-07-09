@@ -169,7 +169,9 @@ pub async fn run(
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
     let secret_prompt_handle = synaps_cli::tools::SecretPromptHandle::new(secret_prompt_tx);
     let secret_prompt_rx = std::sync::Arc::new(std::sync::Mutex::new(secret_prompt_rx));
-    let mut secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
+    // P7.8: the secret-prompt queue now lives on `app.secret_prompts` (§5).
+    // The mpsc channel wiring above is unchanged; only the queue moved onto
+    // App so the pane handler / harness share production state.
     let mut cancel_token: Option<CancellationToken> = None;
     let mut steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
 
@@ -241,7 +243,6 @@ pub async fn run(
                 &mut app,
                 &runtime,
                 &registry,
-                &secret_prompts,
                 term_size,
             ) {
                 render_handle.publish(model);
@@ -410,7 +411,7 @@ pub async fn run(
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compact_task.is_some() || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) => {
                 // Active animations/effects always need a redraw each tick.
                 // messages.is_empty() = idle logo screen — its color gradient
                 // is time-based and needs ticking too (S206 regression: the
@@ -422,7 +423,11 @@ pub async fn run(
                 if exit_fx_sent || boot_fx_sent || app.streaming || app.logo_build_t.is_some() || app.logo_dismiss_t.is_some() || app.gamba_child.is_some() || app.transcript.is_empty() {
                     app.request_redraw();
                 }
-                secret_prompts.poll_requests(&secret_prompt_rx);
+                app.secret_prompts.poll_requests(&secret_prompt_rx);
+                // P7.8: activation/deactivation happen OUTSIDE any input event
+                // (async queue + auto-chaining); reconcile the stack to the
+                // queue's is_active() so SecretPrompt is pushed/popped (§5).
+                input::reconcile_secret_prompt(&mut app);
                 if app.toasts.tick() {
                     app.invalidate();
                 }
@@ -572,25 +577,9 @@ pub async fn run(
             maybe_event = event_reader.next(), if app.gamba_child.is_none() => {
                 match maybe_event {
                     Some(Ok(event)) => {
-                        if secret_prompts.is_active() {
-                            match event {
-                                crossterm::event::Event::Key(key) => match key.code {
-                                    crossterm::event::KeyCode::Enter => secret_prompts.submit(),
-                                    crossterm::event::KeyCode::Esc => secret_prompts.cancel(),
-                                    crossterm::event::KeyCode::Backspace => secret_prompts.backspace(),
-                                    crossterm::event::KeyCode::Char(c) => secret_prompts.push_char(c),
-                                    _ => {}
-                                },
-                                crossterm::event::Event::Paste(text) => {
-                                    for ch in text.chars() {
-                                        secret_prompts.push_char(ch);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            app.request_redraw();
-                            continue;
-                        }
+                        // P7.8: the secret-prompt interception is gone — SecretPrompt
+                        // is a stack-routed pane (`route_secret_prompt`), dispatched
+                        // below by `input::handle_event` on `modal_stack.top()`.
                         let is_streaming = app.streaming;
                         // Scope the registry read guard to this block so it is
                         // provably released before any later `.await`
@@ -777,7 +766,7 @@ pub async fn run(
                                         app.streaming = true;
                                         app.spinner_frame = 0;
                                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, term_size) {
                                             render_handle.publish(model);
                                         }
                                         stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
@@ -1494,7 +1483,7 @@ pub async fn run(
                                 app.streaming = true;
                                 app.spinner_frame = 0;
                                 let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                                if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                                if let Some(model) = build_render_model(&mut app, &runtime, &registry, term_size) {
                                     render_handle.publish(model);
                                 }
                                 stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
@@ -1984,7 +1973,7 @@ pub async fn run(
                             app.streaming = true;
                             app.spinner_frame = 0;
                             let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                            if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                            if let Some(model) = build_render_model(&mut app, &runtime, &registry, term_size) {
                                 render_handle.publish(model);
                             }
                             stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
@@ -2010,7 +1999,7 @@ pub async fn run(
 
                     if do_draw {
                         let term_size = crossterm::terminal::size().map(|(w, h)| ratatui::layout::Size { width: w, height: h }).unwrap_or_default();
-                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, &secret_prompts, term_size) {
+                        if let Some(model) = build_render_model(&mut app, &runtime, &registry, term_size) {
                             render_handle.publish(model);
                         }
                     }
