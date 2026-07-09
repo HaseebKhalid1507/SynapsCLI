@@ -92,7 +92,7 @@ impl TestHarness {
     /// Boot a headless App at an explicit geometry.
     pub fn boot_with_size(cols: u16, rows: u16) -> Self {
         let session = Session::new(synaps_cli::models::default_model(), "medium", None);
-        let mut app = App::new(session);
+        let mut app = App::new_with_clock(session, super::clock::TuiClock::test());
         // Determinism: `App::new` resolves agent_name from the user config —
         // pin it so snapshots don't vary per machine.
         app.agent_name = "agent".to_string();
@@ -386,6 +386,36 @@ impl TestHarness {
     pub fn tool_use_delta(&mut self, tool_id: &str, delta: &str) -> &mut Self {
         self.app.on_tool_use_delta(tool_id, delta);
         self
+    }
+
+    // ── Deterministic clock / toast control (P6.2) ──────────────────────────
+
+    /// Advance the injectable [`TuiClock`] by `ms` milliseconds. Under the
+    /// harness the clock is frozen at boot, so time-dependent state (toast
+    /// expiry, tool timers) only moves when the test calls this.
+    pub fn advance_clock_ms(&mut self, ms: u64) -> &mut Self {
+        self.app.clock.advance(std::time::Duration::from_millis(ms));
+        self
+    }
+
+    /// Publish a toast with an explicit TTL (seconds) through the same
+    /// provider the app uses. Expiry is governed by the frozen clock.
+    pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
+        let toast = super::toast::Toast::new(id, text)
+            .ttl(Some(std::time::Duration::from_secs(ttl_secs)));
+        self.app.toasts.upsert(toast);
+        self
+    }
+
+    /// Run one toast expiry sweep against the current clock time. Returns
+    /// `true` if any toast was reaped.
+    pub fn tick_toasts(&mut self) -> bool {
+        self.app.toasts.tick()
+    }
+
+    /// Number of currently-live toasts.
+    pub fn toast_count(&self) -> usize {
+        self.app.toasts.visible().count()
     }
 
     // ── Internals ────────────────────────────────────────────────────────────

@@ -1,4 +1,7 @@
-#![allow(dead_code)] // UNWIRED foundation — remove when P6.2 migrates Instant sites onto TuiClock.
+// `real()`/`now()` are live in production (App, TranscriptStore, ToastProvider);
+// `test()`/`advance()` are exercised only by the harness + unit tests, so they
+// read as dead in a plain non-test build — hence the module-level allow.
+#![allow(dead_code)]
 //! Injectable clock abstraction for the TUI.
 //!
 //! Production code uses [`TuiClock::real()`], which delegates to

@@ -70,7 +70,7 @@ pub(super) async fn handle_stream_event(
                 id: subagent_id,
                 name: agent_name,
                 status: format!("starting: {}", task_preview),
-                start_time: std::time::Instant::now(),
+                start_time: app.clock.now(),
                 done: false,
                 duration_secs: None,
             });

@@ -216,7 +216,7 @@ pub(super) fn handle_event(
             // Some terminals send both a Mouse(Down(Right)) AND an Event::Paste
             // when the user right-clicks, causing unintended paste into the input box.
             if let Some(deadline) = app.suppress_paste_until {
-                if std::time::Instant::now() < deadline {
+                if app.clock.now() < deadline {
                     app.suppress_paste_until = None;
                     return InputAction::None;
                 }
@@ -301,7 +301,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                     app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
                 app.transcript.clear_selection();
             } else {
@@ -318,7 +318,7 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                     }
                 }
                 // Suppress the terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
             }
         }
 

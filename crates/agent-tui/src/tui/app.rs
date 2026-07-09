@@ -126,6 +126,9 @@ pub(crate) struct App {
     pub(crate) widget_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Injectable clock (P6.2). Real in production, Test in the harness so
+    /// time-dependent state (toast expiry, tool timers) stays deterministic.
+    pub(crate) clock: super::clock::TuiClock,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -142,13 +145,22 @@ pub(crate) struct SubagentState {
 }
 
 impl App {
+    /// Test-only convenience constructor: production-equivalent App backed by
+    /// the real system clock. Production code uses `new_with_clock` directly.
+    #[cfg(test)]
     pub(crate) fn new(session: Session) -> Self {
+        Self::new_with_clock(session, super::clock::TuiClock::real())
+    }
+
+    /// Construct an App with an explicit clock (P6.2). `run()` passes
+    /// `TuiClock::real()`; the harness passes `TuiClock::test()`.
+    pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            transcript: TranscriptStore::new(),
+            transcript: TranscriptStore::new(clock.clone()),
             input: String::new(),
             cursor_pos: 0,
             api_messages: Vec::new(),
@@ -203,13 +215,14 @@ impl App {
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
             active_tasks: std::sync::Arc::new(synaps_cli::extensions::active_tasks::ActiveTasks::new()),
-            toasts: super::toast::ToastProvider::new(),
+            toasts: super::toast::ToastProvider::new(clock.clone()),
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,
             keybinds: None,
+            clock,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
@@ -812,8 +825,8 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app.transcript.test_insert_tool_start_time("call_2".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_2".to_string(), app.clock.now());
 
         assert!(!app.transcript.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
         assert!(app.transcript.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
@@ -840,9 +853,9 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app2.transcript.test_insert_tool_start_time("p1".to_string(), std::time::Instant::now());
-        app2.transcript.test_insert_tool_start_time("p2".to_string(), std::time::Instant::now());
+        app2.transcript.test_set_tool_start_time(Some(app2.clock.now()));
+        app2.transcript.test_insert_tool_start_time("p1".to_string(), app2.clock.now());
+        app2.transcript.test_insert_tool_start_time("p2".to_string(), app2.clock.now());
         assert!(app2.transcript.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
         assert!(app2.transcript.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
@@ -860,7 +873,7 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
 
         assert!(!app.transcript.is_active_tool_result(1));
     }
@@ -878,7 +891,7 @@ mod tests {
             id: 1,
             name: "tester".to_string(),
             status: "running".to_string(),
-            start_time: std::time::Instant::now(),
+            start_time: app.clock.now(),
             done: false,
             duration_secs: None,
         });
@@ -904,8 +917,8 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.transcript.test_set_tool_start_time(Some(std::time::Instant::now()));
-        app.transcript.test_insert_tool_start_time("call_1".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_1".to_string(), app.clock.now());
         {
             let w = 80;
             let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();

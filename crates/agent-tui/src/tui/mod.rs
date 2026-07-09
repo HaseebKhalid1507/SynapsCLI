@@ -83,7 +83,7 @@ pub async fn run(
 
     // Build App from engine boot results
     let mut app = if boot.continued {
-        let mut app = App::new(boot.session.clone());
+        let mut app = App::new_with_clock(boot.session.clone(), clock::TuiClock::real());
         app.api_messages = boot.api_messages;
         app.total_input_tokens = boot.total_input_tokens;
         app.total_output_tokens = boot.total_output_tokens;
@@ -114,7 +114,7 @@ pub async fn run(
         }
         app
     } else {
-        App::new(boot.session)
+        App::new_with_clock(boot.session, clock::TuiClock::real())
     };
     app.keybinds = Some(keybind_registry.clone());
     app.last_turn_context_window = runtime.context_window();

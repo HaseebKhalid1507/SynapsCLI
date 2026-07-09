@@ -1206,3 +1206,37 @@ fn perf_1000_msgs_cum_height_lookup_cached_no_per_frame_resum() {
          the dirty watermark (O(1) entries), wrote {writes}"
     );
 }
+
+// ── P6.2 — deterministic clock: toast expiry is clock-driven ──────────────────
+
+/// Scenario — Toast lifetime is governed ONLY by the injectable clock.
+///
+/// Under the harness the clock is frozen at boot (`TuiClock::test()`), so a
+/// TTL'd toast must survive an unbounded number of `tick` sweeps until the
+/// test explicitly advances the clock past its TTL. This is the P6.2
+/// determinism guarantee: no wall-clock leakage into time-dependent state.
+#[test]
+fn scenario_p6_2_toast_expiry_only_advances_via_clock() {
+    let mut h = TestHarness::boot();
+
+    // A 4-second toast enters the provider.
+    h.push_toast_with_ttl_secs("determinism", "still here", 4);
+    assert_eq!(h.toast_count(), 1, "toast should be live immediately after push");
+
+    // The frozen clock never ticks on its own: sweep many times, no wall time.
+    for _ in 0..1000 {
+        let reaped = h.tick_toasts();
+        assert!(!reaped, "toast must NOT expire while the clock is frozen");
+    }
+    assert_eq!(h.toast_count(), 1, "toast must survive ticks without clock advance");
+
+    // Advance to just under the TTL — still alive.
+    h.advance_clock_ms(3_999);
+    assert!(!h.tick_toasts(), "toast must survive at t=3.999s (< 4s TTL)");
+    assert_eq!(h.toast_count(), 1, "toast still live just under its TTL");
+
+    // Cross the TTL boundary — now, and only now, it expires.
+    h.advance_clock_ms(1);
+    assert!(h.tick_toasts(), "toast must expire exactly when the clock reaches its TTL");
+    assert_eq!(h.toast_count(), 0, "toast reaped after clock crosses TTL");
+}
