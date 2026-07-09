@@ -1402,3 +1402,83 @@ fn scenario_p7_8_secret_prompt_chains_to_next_queued() {
     assert!(!h.secret_prompt_active(), "queue fully drained");
     assert_eq!(h.modal_stack_depth(), 0, "pane popped after last prompt");
 }
+
+// ── P6.4 — replayable interaction tapes ───────────────────────────────────────
+
+use agent_tui::tui::testing::tape::{ModalKind, Tape};
+
+/// Tape round-trip — record a scripted scenario, serialize → deserialize, then
+/// replay into a FRESH harness and assert a byte-identical final frame.
+///
+/// This is the P6.4 acceptance test: it proves the tape captures enough of the
+/// session (synthetic events + the frozen-clock advance + a harness driver
+/// step) to reproduce the exact final frame deterministically.
+#[test]
+fn scenario_tape_round_trip_replays_byte_identical() {
+    // 1. Record a scripted scenario against a live harness.
+    let mut h = TestHarness::boot();
+    let tape = {
+        let mut rec = h.record_tape();
+        rec.type_str("hello tape");
+        rec.advance_clock_ms(500);
+        rec.key(KeyCode::Left, KeyModifiers::empty());
+        rec.key(KeyCode::Left, KeyModifiers::empty());
+        rec.open_modal(ModalKind::Settings);
+        rec.snapshot();
+        rec.key(KeyCode::Esc, KeyModifiers::empty()); // close settings
+        rec.finish()
+    };
+    // The harness carries the recorded end state → this is the ground-truth frame.
+    let recorded_frame = h.snapshot();
+
+    // 2. Serialize → deserialize (JSON round-trip) via the library's own
+    //    helpers, so the integration test never names serde_json directly.
+    let json = tape.to_json();
+    let tape2: Tape = Tape::from_json(&json).expect("tape deserializes");
+    assert_eq!(tape, tape2, "tape must survive the JSON round-trip structurally");
+
+    // 3. Replay the deserialized tape into a fresh harness.
+    let replayed_frame = TestHarness::replay(&tape2);
+
+    // 4. Byte-identical final frame.
+    assert_eq!(
+        replayed_frame, recorded_frame,
+        "replayed final frame diverged from the recorded one\n\
+         --- recorded ---\n{recorded_frame}\n--- replayed ---\n{replayed_frame}"
+    );
+}
+
+/// The `replay_expect` happy path passes silently when frames match — and the
+/// same call is what dumps `target/` artifacts + names them in the panic on a
+/// mismatch (exercised implicitly; we assert the matching path here).
+#[test]
+fn scenario_tape_replay_expect_matches() {
+    let mut h = TestHarness::boot();
+    let tape = {
+        let mut rec = h.record_tape();
+        rec.type_str("expect me").advance_clock_ms(250);
+        rec.finish()
+    };
+    let expected = h.snapshot();
+    // Must not panic: frames match.
+    TestHarness::replay_expect(&tape, &expected, "tape_expect_match");
+}
+
+/// A committed fixture under `tests/fixtures/tapes/` deserializes and replays
+/// deterministically — proving the on-disk schema is stable and hand-authorable.
+#[test]
+fn scenario_tape_fixture_replays() {
+    let raw = include_str!("fixtures/tapes/hello_settings.tape.json");
+    let tape = Tape::from_json(raw).expect("fixture tape parses");
+
+    // Replaying twice yields the identical frame → deterministic.
+    let frame_a = TestHarness::replay(&tape);
+    let frame_b = TestHarness::replay(&tape);
+    assert_eq!(frame_a, frame_b, "fixture replay must be deterministic");
+
+    // The typed text survives into the input box region of the final frame.
+    assert!(
+        frame_a.contains("hi"),
+        "fixture-typed text missing from replayed frame:\n{frame_a}"
+    );
+}

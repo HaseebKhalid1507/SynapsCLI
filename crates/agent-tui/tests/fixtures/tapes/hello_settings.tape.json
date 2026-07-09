@@ -1,0 +1,10 @@
+[
+  { "Event": { "Key": { "code": { "Char": "h" }, "mods": 0 } } },
+  { "Event": { "Key": { "code": { "Char": "i" }, "mods": 0 } } },
+  { "AdvanceClockMs": 750 },
+  "Snapshot",
+  { "OpenModal": "Settings" },
+  "Snapshot",
+  { "Event": { "Key": { "code": "Esc", "mods": 0 } } },
+  "Snapshot"
+]

@@ -54,6 +54,12 @@
 
 use std::sync::Arc;
 
+/// P6.4 — replayable interaction tapes. Lives in a sibling file
+/// (`testing/tape.rs`) but is a child module of `testing`, so it reaches the
+/// harness's driver surface directly.
+#[path = "testing/tape.rs"]
+pub mod tape;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
