@@ -149,6 +149,7 @@ pub(crate) fn sidecar_pill_text(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // test mod precedes helper items in this file
 mod sidecar_pill_tests {
     use super::*;
 

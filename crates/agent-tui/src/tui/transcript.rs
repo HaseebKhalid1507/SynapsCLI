@@ -342,6 +342,7 @@ impl CacheState {
     /// Dirty → Clean keeping the cache; Missing/Clean unchanged. Mirrors the
     /// old `dirty_from = None` (watermark consumed) transition.
     #[cfg(test)]
+#[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn mark_clean(&mut self) {
         if matches!(self, CacheState::Dirty(..)) {
             let CacheState::Dirty(c, _) = std::mem::replace(self, CacheState::Missing) else {
@@ -1812,6 +1813,7 @@ impl TranscriptStore {
     /// Set the cache to `Dirty(cache, watermark)`. Used by tests that simulate
     /// the `invalidate_from` path without calling `visible_window`.
     #[cfg(test)]
+#[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn test_set_cache_dirty(&mut self, mut cache: LineCache, from: usize) {
         cache.rebuild_cum_from(0);
         self.cache = CacheState::Dirty(cache, from);
@@ -1826,6 +1828,7 @@ impl TranscriptStore {
 
     /// Put a `CacheState` back after a test manipulation.
     #[cfg(test)]
+#[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn test_put_cache(&mut self, cs: CacheState) {
         self.cache = cs;
     }

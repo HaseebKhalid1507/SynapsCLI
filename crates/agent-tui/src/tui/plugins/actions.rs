@@ -1259,12 +1259,13 @@ fn set_editor_or_row_error(state: &mut PluginsModalState, msg: String) {
 
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)] // test-only: guards held across await in tests are benign
 mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use synaps_cli::skills::registry::CommandRegistry;
     use synaps_cli::skills::state::{CachedPlugin, Marketplace, PluginsState};
     use synaps_cli::skills::plugin_index::{

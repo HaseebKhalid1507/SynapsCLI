@@ -186,7 +186,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{should_draw, rebuild_display_messages};
-    use super::super::app::{App, CacheState, ChatMessage, LineCache, MsgSlot};
+    use super::super::app::{App, ChatMessage, LineCache, MsgSlot};
     use synaps_cli::Session;
     use std::time::Duration;
 
