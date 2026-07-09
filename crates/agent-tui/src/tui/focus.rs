@@ -420,12 +420,10 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.models.is_some()
     );
 
-    // P7.6: Plugins membership on the stack must exactly mirror `app.plugins`.
-    // NOTE (depth subtlety): settings is NOT yet migrated (P7.7), so when the
-    // marketplace is opened from an open settings modal, settings stays
-    // chain-routed (`app.settings` = Some but NEVER on the stack) while plugins
-    // pushes ⇒ stack == [Plugins], depth 1. The true two-deep stack arrives in
-    // P7.7. This clause therefore only cross-checks Plugins ⇔ app.plugins.
+    // Plugins membership on the stack must exactly mirror `app.plugins`.
+    // As of P7.7 settings is ALSO a stack member, so marketplace-from-settings
+    // is a real two-deep stack [Settings, Plugins]; this clause cross-checks the
+    // Plugins level, the Settings clause below checks the Settings level.
     debug_assert_eq!(
         app.modal_stack.contains(PaneId::Plugins),
         app.plugins.is_some(),
@@ -435,15 +433,55 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.plugins.is_some()
     );
 
+    // P7.7: Settings membership on the stack must exactly mirror `app.settings`.
+    // Settings is now a TRUE stack member; marketplace-from-settings therefore
+    // becomes a real two-deep stack [Settings, Plugins], and the nested
+    // PluginCustom editor a [.., Settings, PluginEditor] two-deep stack.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::Settings),
+        app.settings.is_some(),
+        "stack sync (P7.7): modal_stack.contains(Settings)={} but settings.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::Settings),
+        app.settings.is_some()
+    );
+
+    // P7.7: PluginEditor is the `ActiveEditor::PluginCustom` editor promoted to
+    // a real stack level above Settings (§2). Its membership must mirror
+    // edit_mode == Some(PluginCustom); it can only be active while Settings is
+    // open. Pushed at PluginEditorOpen's Ok branch; popped at the Esc path
+    // (route_settings) and both commit paths (ConfigWrite / InvokeCommand).
+    let plugin_editor_active = matches!(
+        app.settings.as_ref().map(|st| &st.edit_mode),
+        Some(Some(super::settings::ActiveEditor::PluginCustom { .. }))
+    );
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::PluginEditor),
+        plugin_editor_active,
+        "stack sync (P7.7): modal_stack.contains(PluginEditor)={} but PluginCustom \
+         edit_mode active={} — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::PluginEditor),
+        plugin_editor_active
+    );
+
     // Every other pane is still chain-routed (unmigrated) ⇒ it must NEVER be on
-    // the stack yet. HelpFind, Models and Plugins are the only permitted
-    // members; the stack is therefore some ordering of a subset of
-    // {HelpFind, Models, Plugins}. (Extended per-modal in P7.7+.)
+    // the stack yet. HelpFind, Models, Plugins, Settings and PluginEditor are
+    // the only permitted members; the stack is therefore some ordering of a
+    // subset of {HelpFind, Models, Plugins, Settings, PluginEditor}. Only
+    // SecretPrompt remains chain/inline-routed (folded in at P7.8).
     for pane in app.modal_stack.iter_bottom_up() {
         debug_assert!(
-            matches!(pane, PaneId::HelpFind | PaneId::Models | PaneId::Plugins),
-            "stack sync (P7.6): unmigrated pane {pane:?} found on the ModalStack \
-             — only HelpFind, Models and Plugins are stack-routed so far"
+            matches!(
+                pane,
+                PaneId::HelpFind
+                    | PaneId::Models
+                    | PaneId::Plugins
+                    | PaneId::Settings
+                    | PaneId::PluginEditor
+            ),
+            "stack sync (P7.7): unmigrated pane {pane:?} found on the ModalStack \
+             — only HelpFind, Models, Plugins, Settings and PluginEditor are \
+             stack-routed so far"
         );
     }
 

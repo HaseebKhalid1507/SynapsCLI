@@ -221,10 +221,9 @@ pub(crate) fn handle_event(
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => InputOutcome::Close,
         (KeyCode::Tab, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            state.focus = match state.focus {
-                Focus::Left => Focus::Right,
-                Focus::Right => Focus::Left,
-            };
+            // P7.7: focus toggle now goes through the FocusManager ring
+            // (two-slot next()); `state.focus` is re-derived from it.
+            state.toggle_focus();
             state.row_error = None;
             InputOutcome::None
         }
@@ -583,7 +582,7 @@ mod tests {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES
             .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
-        state.focus = Focus::Right;
+        state.set_focus(Focus::Right);
         state.setting_idx = idx;
         state
     }
@@ -664,7 +663,7 @@ mod tests {
     fn at_first_plugin_cat(s: &RuntimeSnapshot) -> SettingsState {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES.len();
-        state.focus = Focus::Right;
+        state.set_focus(Focus::Right);
         state.setting_idx = 0;
         // sanity
         assert!(state.is_plugin_category(s));

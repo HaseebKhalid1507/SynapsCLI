@@ -327,6 +327,10 @@ impl TestHarness {
     /// Open the settings modal directly (bypasses the async command dispatch).
     pub fn open_settings_modal(&mut self) -> &mut Self {
         self.app.settings = Some(super::settings::SettingsState::new());
+        // P7.7 HARNESS HELPER RULE: mirror production — opening a migrated modal
+        // pushes onto the ModalStack, else `debug_assert_stack_sync` (run after
+        // every harness `event()`) trips on the missing Settings push.
+        self.app.modal_stack.push(super::focus::PaneId::Settings);
         self
     }
 

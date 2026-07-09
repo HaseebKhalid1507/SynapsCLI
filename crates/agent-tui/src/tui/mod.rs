@@ -688,6 +688,13 @@ pub async fn run(
                                     }
                                     CommandAction::OpenSettings => {
                                         app.settings = Some(settings::SettingsState::new());
+                                        // P7.7: mirror the `= Some(..)` open with a stack
+                                        // push (§6). GATE-1 note B: settings opens on this
+                                        // async command arm, so assert sync RIGHT HERE — a
+                                        // missed push is caught this event, not one later.
+                                        app.modal_stack.push(focus::PaneId::Settings);
+                                        #[cfg(debug_assertions)]
+                                        focus::debug_assert_stack_sync(&app);
                                     }
                                     CommandAction::OpenPlugins => {
                                         let path = synaps_cli::skills::state::PluginsState::default_path();
@@ -1694,6 +1701,16 @@ pub async fn run(
                                                     render,
                                                 },
                                             });
+                                            // P7.7: PluginCustom editor is a REAL nested pane
+                                            // ON TOP of Settings — push PaneId::PluginEditor so
+                                            // the stack becomes [.., Settings, PluginEditor]
+                                            // (two-deep). Mirrors `edit_mode = Some(PluginCustom)`;
+                                            // the matching pops live at the Esc path (route_settings)
+                                            // and the two commit paths below. Only the Ok branch
+                                            // opens the editor, so the push lives inside it.
+                                            app.modal_stack.push(focus::PaneId::PluginEditor);
+                                            #[cfg(debug_assertions)]
+                                            focus::debug_assert_stack_sync(&app);
                                         }
                                     }
                                     Err(err) => {
@@ -1735,6 +1752,12 @@ pub async fn run(
                                                                 if let Some(state) = app.settings.as_mut() {
                                                                     state.edit_mode = None;
                                                                     state.row_error = Some((format!("plugin.{}.{}", plugin_id, key), "saved".to_string()));
+                                                                    // P7.7: commit cleared the PluginCustom editor ⇒ POP
+                                                                    // PaneId::PluginEditor to keep contains(PluginEditor)
+                                                                    // ⇔ edit_mode==Some(PluginCustom) (settings stays open).
+                                                                    app.modal_stack.pop();
+                                                                    #[cfg(debug_assertions)]
+                                                                    focus::debug_assert_stack_sync(&app);
                                                                 }
                                                             }
                                                             Err(err) => {
@@ -1748,6 +1771,12 @@ pub async fn run(
                                                         if let Some(state) = app.settings.as_mut() {
                                                             state.edit_mode = None;
                                                             state.row_error = Some((format!("plugin.{}.{}", plugin_id, field), "download started".to_string()));
+                                                            // P7.7: InvokeCommand also clears the PluginCustom editor
+                                                            // ⇒ POP PaneId::PluginEditor (settings stays open) before
+                                                            // dispatching the interactive command below.
+                                                            app.modal_stack.pop();
+                                                            #[cfg(debug_assertions)]
+                                                            focus::debug_assert_stack_sync(&app);
                                                         }
                                                         commands::execute_interactive_plugin_command_by_parts(
                                                             &plugin_id,
@@ -1851,14 +1880,16 @@ pub async fn run(
                                 match synaps_cli::skills::state::PluginsState::load_from(&path) {
                                     Ok(file) => {
                                         app.plugins = Some(plugins::PluginsModalState::new_from_settings(file));
-                                        // P7.6: marketplace-from-settings push. DEPTH
-                                        // SUBTLETY (§7 P7.6): settings is NOT yet migrated
-                                        // (P7.7), so it stays chain-routed and is NEVER on
-                                        // the stack — plugins pushes to depth 1 (NOT 2).
-                                        // On Close, route_plugins pops back to an empty
-                                        // stack and the chain resumes routing the still-open
-                                        // settings modal. GATE-1 note B: opened on this async
-                                        // arm, so assert sync inline.
+                                        // P7.7: marketplace-from-settings is now a TRUE
+                                        // two-deep push. Settings is stack-routed (still
+                                        // Some here — the marketplace opens ON TOP), so the
+                                        // stack becomes [Settings, Plugins] (depth 2).
+                                        // Plugins is top() and gets input; on Close
+                                        // route_plugins pops back to [Settings] and
+                                        // route_settings resumes routing the still-open
+                                        // settings modal — behaviour-identical to the old
+                                        // chain fallthrough. GATE-1 note B: opened on this
+                                        // async arm, so assert sync inline.
                                         app.modal_stack.push(focus::PaneId::Plugins);
                                         #[cfg(debug_assertions)]
                                         focus::debug_assert_stack_sync(&app);

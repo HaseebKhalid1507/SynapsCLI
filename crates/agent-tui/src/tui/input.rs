@@ -45,8 +45,8 @@ pub(super) enum InputAction {
 /// Thin outer wrapper: the modal-routing SHIM dispatches stack-routed panes to
 /// their pane handler and unmigrated panes to the legacy `handle_event_inner`
 /// chain; BOTH paths converge on `action` so the debug-only stack/app sync
-/// tripwire runs afterwards on every path (including the pop path). As of P7.6
-/// HelpFind, Models and Plugins are stack-routed.
+/// tripwire runs afterwards on every path (including the pop path). As of P7.7
+/// HelpFind, Models, Plugins, Settings and its nested PluginEditor are stack-routed.
 pub(super) fn handle_event(
     event: Event,
     app: &mut App,
@@ -60,8 +60,9 @@ pub(super) fn handle_event(
     // panes fall through to the legacy chain (via handle_event_inner). A pane
     // is EITHER stack-routed OR chain-routed, never both. BOTH paths flow into
     // `action` so the sync tripwire below runs after the pop path too (note A /
-    // §6). As of P7.6, HelpFind, Models and Plugins are stack-routed; the other
-    // modals still fall through. Deleted in P7.8.
+    // §6). As of P7.7, HelpFind, Models, Plugins, Settings and its nested
+    // PluginEditor are stack-routed; only SecretPrompt still falls through
+    // (P7.8). Deleted in P7.8.
     let action = match app.modal_stack.top() {
         super::focus::PaneId::Chat => {
             handle_event_inner(event, app, runtime, streaming, registry, keybinds, scroll_lines)
@@ -69,6 +70,8 @@ pub(super) fn handle_event(
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
+        super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
+        super::focus::PaneId::PluginEditor => route_settings(event, app, runtime, registry),
         other => unreachable!("pane {other:?} routed before its migration (P7.4+)"),
     };
 
@@ -81,125 +84,23 @@ pub(super) fn handle_event(
     action
 }
 
-/// Legacy routing body: the if-let modal chain (settings) followed by base Chat
-/// handling. Reached only via the `handle_event` wrapper when `top() == Chat`
-/// (help_find + models + plugins migrated to the stack in P7.4/P7.5/P7.6).
+/// Legacy routing body: base Chat handling only. The if-let modal chain is now
+/// EMPTY — every modal (help_find, models, plugins, settings + nested
+/// PluginEditor) is stack-routed as of P7.7. Reached only via the `handle_event`
+/// wrapper when `top() == Chat`. The whole wrapper/shim is deleted in P7.8.
 fn handle_event_inner(
     event: Event,
     app: &mut App,
-    runtime: &synaps_cli::Runtime,
+    // P7.7: `runtime` is no longer read here — the settings arm (its sole
+    // consumer, for RuntimeSnapshot) moved to `route_settings`. Kept in the
+    // signature (underscored) to preserve the wrapper call shape; deleted with
+    // the whole shim in P7.8.
+    _runtime: &synaps_cli::Runtime,
     streaming: bool,
     registry: &Arc<CommandRegistry>,
     keybinds: &synaps_cli::skills::keybinds::KeybindRegistry,
     scroll_lines: u16,
 ) -> InputAction {
-    // Route events to the settings modal while it's open.
-    if let Some(state) = app.settings.as_mut() {
-        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
-            if let Event::Key(key) = event {
-                if key.code == KeyCode::Esc {
-                    state.edit_mode = None;
-                    return InputAction::None;
-                }
-                return InputAction::PluginEditorKey {
-                    plugin_id: plugin_id.clone(),
-                    category: category.clone(),
-                    field: field.clone(),
-                    key,
-                };
-            }
-            return InputAction::None;
-        }
-        // Handle paste into active editors (API key, text, custom model)
-        if let Event::Paste(text) = event {
-            match &mut state.edit_mode {
-                Some(super::settings::ActiveEditor::ApiKey { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                Some(super::settings::ActiveEditor::Text { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                Some(super::settings::ActiveEditor::CustomModel { buffer, .. }) => {
-                    buffer.push_str(&text);
-                }
-                _ => {}
-            }
-            return InputAction::None;
-        }
-        if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
-            match super::settings::handle_event(state, key, &snap) {
-                super::settings::InputOutcome::Close => { app.settings = None; }
-                super::settings::InputOutcome::None => {}
-                super::settings::InputOutcome::Apply { key, value } => {
-                    return InputAction::SettingsApply(key, value);
-                }
-                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
-                    let row_key = format!("plugin.{}.{}", plugin_id, key);
-                    match synaps_cli::extensions::config_store::write_plugin_config(
-                        &plugin_id, &key, &value,
-                    ) {
-                        Ok(()) => {
-                            state.edit_mode = None;
-                            state.row_error = Some((row_key, "saved".to_string()));
-                        }
-                        Err(e) => {
-                            state.row_error = Some((row_key, e.to_string()));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
-                    return InputAction::PluginEditorOpen {
-                        plugin_id,
-                        category,
-                        field: key,
-                    };
-                }
-                super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
-                    let cfg_key = format!("provider.{}", provider_id);
-                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
-                        Ok(()) => {
-                            state.edit_mode = None;
-                            state.row_error = Some((cfg_key, "saved".to_string()));
-                        }
-                        Err(e) => {
-                            state.row_error = Some((cfg_key, e.to_string()));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::TogglePlugin { name, enabled } => {
-                    let mut config = synaps_cli::config::load_config();
-                    match super::plugins::actions::toggle_plugin_config(
-                        &name, enabled, &mut config, registry,
-                    ) {
-                        Ok(()) => {
-                            state.row_error = None;
-                        }
-                        Err(e) => {
-                            state.row_error = Some(("disabled_plugins".to_string(), e));
-                        }
-                    }
-                }
-                super::settings::InputOutcome::PreviewTheme { name } => {
-                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
-                        super::theme::set_theme(theme);
-                    }
-                }
-                super::settings::InputOutcome::RevertTheme => {
-                    let theme = super::theme::load_theme_from_config();
-                    super::theme::set_theme(theme);
-                }
-                super::settings::InputOutcome::OpenPluginsMarketplace => {
-                    return InputAction::OpenPluginsMarketplace;
-                }
-                super::settings::InputOutcome::PingModels => {
-                    return InputAction::PingModels;
-                }
-            }
-        }
-        // Swallow all other events while settings is open.
-        return InputAction::None;
-    }
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
         Event::Mouse(mouse) => {
@@ -638,6 +539,145 @@ fn route_plugins(event: Event, app: &mut App) -> InputAction {
             super::plugins::InputOutcome::None => InputAction::None,
             other => InputAction::PluginsOutcome(other),
         };
+    }
+    InputAction::None
+}
+
+/// P7.7 stack-routed pane handler for the `/settings` modal AND its nested
+/// `PaneId::PluginEditor` (the `ActiveEditor::PluginCustom` editor promoted to
+/// a real second stack level). BOTH `PaneId::Settings` and `PaneId::PluginEditor`
+/// dispatch here: when a PluginCustom editor is active it is `top()` and this
+/// handler's first block forwards keys to it (Esc pops PluginEditor); otherwise
+/// Settings is `top()` and the normal settings handling runs.
+///
+/// The 12 `InputOutcome` match arms — INCLUDING the synchronous config-file
+/// writes (`write_plugin_config`, `write_config_value`, `toggle_plugin_config`)
+/// and the theme preview/revert side-effects — are moved VERBATIM from the
+/// deleted legacy chain arm. They execute at exactly the same point, in the same
+/// order, as before: nothing is reordered, deferred, or hoisted. The ONLY
+/// additions are the two `app.modal_stack.pop()` calls that mirror the two
+/// `= None` close assignments (`app.settings = None` on `Close`; `edit_mode =
+/// None` on the PluginCustom Esc) — keeping the stack in sync with the fields
+/// (asserted by `debug_assert_stack_sync`). `app.modal_stack` is a field
+/// disjoint from `app.settings`, so the pops borrow-check beside the live
+/// `state` borrow exactly as the existing `app.model_health.clone()` does.
+fn route_settings(
+    event: Event,
+    app: &mut App,
+    runtime: &synaps_cli::Runtime,
+    registry: &Arc<CommandRegistry>,
+) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Settings | PluginEditor ⇒
+    // settings is Some.
+    if let Some(state) = &mut app.settings {
+        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
+            if let Event::Key(key) = event {
+                if key.code == KeyCode::Esc {
+                    // P7.7: Esc on the nested PluginCustom editor POPS
+                    // PaneId::PluginEditor — clears edit_mode while Settings stays
+                    // open, byte-identical to the pre-migration chain behaviour.
+                    state.edit_mode = None;
+                    app.modal_stack.pop();
+                    return InputAction::None;
+                }
+                return InputAction::PluginEditorKey {
+                    plugin_id: plugin_id.clone(),
+                    category: category.clone(),
+                    field: field.clone(),
+                    key,
+                };
+            }
+            return InputAction::None;
+        }
+        // Handle paste into active editors (API key, text, custom model)
+        if let Event::Paste(text) = event {
+            match &mut state.edit_mode {
+                Some(super::settings::ActiveEditor::ApiKey { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::Text { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                Some(super::settings::ActiveEditor::CustomModel { buffer, .. }) => {
+                    buffer.push_str(&text);
+                }
+                _ => {}
+            }
+            return InputAction::None;
+        }
+        if let Event::Key(key) = event {
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            match super::settings::handle_event(state, key, &snap) {
+                super::settings::InputOutcome::Close => { app.settings = None; app.modal_stack.pop(); }
+                super::settings::InputOutcome::None => {}
+                super::settings::InputOutcome::Apply { key, value } => {
+                    return InputAction::SettingsApply(key, value);
+                }
+                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
+                    let row_key = format!("plugin.{}.{}", plugin_id, key);
+                    match synaps_cli::extensions::config_store::write_plugin_config(
+                        &plugin_id, &key, &value,
+                    ) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((row_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((row_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                    return InputAction::PluginEditorOpen {
+                        plugin_id,
+                        category,
+                        field: key,
+                    };
+                }
+                super::settings::InputOutcome::SetProviderKey { provider_id, value } => {
+                    let cfg_key = format!("provider.{}", provider_id);
+                    match synaps_cli::config::write_config_value(&cfg_key, &value) {
+                        Ok(()) => {
+                            state.edit_mode = None;
+                            state.row_error = Some((cfg_key, "saved".to_string()));
+                        }
+                        Err(e) => {
+                            state.row_error = Some((cfg_key, e.to_string()));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::TogglePlugin { name, enabled } => {
+                    let mut config = synaps_cli::config::load_config();
+                    match super::plugins::actions::toggle_plugin_config(
+                        &name, enabled, &mut config, registry,
+                    ) {
+                        Ok(()) => {
+                            state.row_error = None;
+                        }
+                        Err(e) => {
+                            state.row_error = Some(("disabled_plugins".to_string(), e));
+                        }
+                    }
+                }
+                super::settings::InputOutcome::PreviewTheme { name } => {
+                    if let Some(theme) = super::theme::load_theme_by_name(&name) {
+                        super::theme::set_theme(theme);
+                    }
+                }
+                super::settings::InputOutcome::RevertTheme => {
+                    let theme = super::theme::load_theme_from_config();
+                    super::theme::set_theme(theme);
+                }
+                super::settings::InputOutcome::OpenPluginsMarketplace => {
+                    return InputAction::OpenPluginsMarketplace;
+                }
+                super::settings::InputOutcome::PingModels => {
+                    return InputAction::PingModels;
+                }
+            }
+        }
+        // Swallow all other events while settings is open.
+        return InputAction::None;
     }
     InputAction::None
 }
