@@ -1482,3 +1482,221 @@ fn scenario_tape_fixture_replays() {
         "fixture-typed text missing from replayed frame:\n{frame_a}"
     );
 }
+
+// ── P6.5 — deterministic compound scenario (stream + resize + modal) ──────────
+//
+// Zero's P6 done-criterion: ONE streaming + resize + modal compound scenario,
+// reproduced deterministically from a checked-in tape. This test COMPOSES the
+// three P6 seams the prior tasks built:
+//
+//   • the frozen injectable clock (P6.2)  — time only moves on advance_clock_ms
+//   • the replayable tape (P6.4)          — record → JSON → replay, byte-stable
+//   • the injected streaming drivers       — tool_use_start / tool_use_delta
+//     (P4/P11)                              feed the transcript store directly,
+//                                           NOT via real async wall-clock streaming
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// DETERMINISM CONTRACT (why this can't flake):
+//
+//   1. No wall-clock drives control flow. The test clock is frozen at boot and
+//      only advances through explicit `advance_clock_ms` calls. There is no
+//      real async streaming — tool deltas are *injected* synchronously, so the
+//      transcript reaches an identical state every run.
+//
+//   2. The byte-identical determinism PROOF replays a checked-in, frozen-clock
+//      tape (`fixtures/tapes/stream_resize_modal.tape.json`) N times and asserts
+//      every replayed frame is byte-for-byte equal. That tape is intentionally
+//      streaming-free: the running tool card renders `Instant::elapsed()` for
+//      its "…running Nms" readout (render.rs ~440), which is genuine wall-clock
+//      and therefore NOT byte-stable. So streaming determinism is proven the
+//      only way it legitimately can be — *structurally* (the injected deltas
+//      always yield the same transcript content), while the tape locks the
+//      clock+resize+modal composition at the byte level.
+//
+//   3. The live compound scenario asserts the frame at EACH phase (streaming
+//      visible → resized layout → modal overlay → modal gone → final stream
+//      state) via robust substrings / geometry, never via the wall-clock
+//      elapsed readout.
+//
+// KNOWN P6.4 SEAM GAP (bounce-back note for the tape owner): a `Resize` event
+// replayed through a tape is INERT — `input::handle_event` has no `Resize` arm
+// and `build_render_model` takes geometry from `TestHarness::size`, which only
+// `TestHarness::resize()` mutates (not the `event()` dispatch that `apply_tape`
+// uses). The tape below still records the mid-scenario resize as an `Event`
+// (it documents author intent and round-trips structurally), but the geometry
+// axis is proven deterministically via `replay_with_size`, and the *live*
+// mid-stream resize is exercised through `h.resize` in the compound driver
+// where it actually re-lays-out. If P6.x wires `Resize` into `apply_tape`,
+// this test's `replay_with_size` proof can fold back into a plain `replay`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Number of consecutive replays the determinism proof demands. The acceptance
+/// criterion is "replays green 50/50 consecutive runs". Each replay is a fresh
+/// bounded boot (no async, no wall-clock) so 50 is cheap.
+const P65_DETERMINISM_RUNS: usize = 50;
+
+/// Drive the full compound scenario on a FRESH harness, asserting the frame at
+/// each phase. Structural/substring + geometry assertions only — never the
+/// wall-clock "running Nms" readout — so this is reproducible every run.
+fn drive_compound_stream_resize_modal() {
+    let mut h = TestHarness::boot_with_size(80, 24);
+
+    // ── PHASE 1 — stream START: inject a tool call + first input delta ────────
+    // Injected streaming: no async, no real provider — the transcript store
+    // receives the events directly, exactly as the live stream handler routes
+    // them. This is what makes the streaming half deterministic.
+    h.tool_use_start("tool-1", "read_file");
+    h.tool_use_delta("tool-1", "{\"path\": \"src/");
+    let f1 = h.snapshot();
+    assert!(
+        f1.contains("read_file"),
+        "PHASE 1 (stream start): running tool card must be visible\n{f1}"
+    );
+    assert!(
+        f1.contains("src/"),
+        "PHASE 1 (stream start): streamed partial input must render\n{f1}"
+    );
+    assert_eq!(h.modal_stack_depth(), 0, "PHASE 1: no modal open yet");
+
+    // ── PHASE 2 — RESIZE mid-stream ──────────────────────────────────────────
+    // Real geometry change through the harness resize path (updates size +
+    // backend + dispatches the event). The in-flight tool card must survive.
+    h.resize(120, 40);
+    assert_eq!(h.render().area().width, 120, "PHASE 2: width must be 120 after resize");
+    assert_eq!(h.render().area().height, 40, "PHASE 2: height must be 40 after resize");
+    let f2 = h.snapshot();
+    assert!(
+        f2.contains("read_file"),
+        "PHASE 2 (resized layout): stream must survive the mid-stream resize\n{f2}"
+    );
+
+    // ── PHASE 3 — modal OPEN (with clock advance) ────────────────────────────
+    h.advance_clock_ms(500);
+    h.open_settings_modal();
+    let f3 = h.snapshot();
+    assert!(
+        f3.contains("Settings"),
+        "PHASE 3 (modal overlay): settings modal must be drawn over the stream\n{f3}"
+    );
+    assert_eq!(h.modal_stack_depth(), 1, "PHASE 3: modal stack depth must be 1");
+
+    // ── PHASE 4 — modal CLOSE via Esc (with clock advance) ───────────────────
+    h.advance_clock_ms(500);
+    h.key(KeyCode::Esc, KeyModifiers::empty());
+    let f4 = h.snapshot();
+    assert_eq!(h.modal_stack_depth(), 0, "PHASE 4 (modal gone): stack must pop to 0");
+    assert!(
+        !f4.contains(" Settings "),
+        "PHASE 4 (modal gone): settings title must not bleed through after Esc\n{f4}"
+    );
+
+    // ── PHASE 5 — stream END: final delta completes the tool input ───────────
+    // "Stream end" = the last delta lands; the fully-streamed input is the
+    // final stream state. (finalize is a separate P4 path not needed here.)
+    h.tool_use_delta("tool-1", "main.rs\"}");
+    let f5 = h.snapshot();
+    assert!(
+        f5.contains("main.rs"),
+        "PHASE 5 (final stream state): completed streamed input must render\n{f5}"
+    );
+    assert!(
+        f5.contains("read_file"),
+        "PHASE 5 (final stream state): tool card still present after stream end\n{f5}"
+    );
+}
+
+/// P6.5 acceptance test.
+///
+/// Half 1 — LIVE compound scenario with a frame assertion at every phase
+/// (stream start → resize mid-stream → modal open/close → stream end).
+///
+/// Half 2 — DETERMINISM PROOF from a checked-in tape: the frozen-clock
+/// resize+modal spine is replayed `P65_DETERMINISM_RUNS` times and asserted
+/// byte-identical, and the same spine is proven deterministic at a second
+/// geometry via `replay_with_size`. The checked-in fixture is proven to equal
+/// the canonical recording, so it stays hand-maintainable.
+#[test]
+fn compound_stream_resize_modal() {
+    // ══ Half 1 — live compound scenario, frame-asserted at each phase ═══════
+    drive_compound_stream_resize_modal();
+
+    // ══ Half 2 — checked-in tape → deterministic replay (the P6 proof) ══════
+
+    // (a) Load the committed fixture.
+    let raw = include_str!("fixtures/tapes/stream_resize_modal.tape.json");
+    let fixture = Tape::from_json(raw).expect("P6.5 fixture tape must parse");
+
+    // (b) The fixture is EXACTLY the canonical recording of the tape-expressible
+    //     spine (type + mid-scenario resize + clock + modal open/close). This
+    //     keeps the on-disk JSON authoritative and hand-editable — if the
+    //     recorder drifts, this equality trips.
+    let recorded = {
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let mut rec = h.record_tape();
+        rec.type_str("go");
+        rec.resize(120, 40); // recorded as an Event; replay-inert (see seam note)
+        rec.advance_clock_ms(500);
+        rec.open_modal(ModalKind::Settings);
+        rec.advance_clock_ms(500);
+        rec.snapshot();
+        rec.key(KeyCode::Esc, KeyModifiers::empty());
+        rec.advance_clock_ms(250);
+        rec.finish()
+    };
+    assert_eq!(
+        recorded, fixture,
+        "checked-in fixture must equal the canonical recording of the spine"
+    );
+
+    // (c) JSON round-trip stability (mirrors the P6.4 template).
+    let round_tripped = Tape::from_json(&fixture.to_json()).expect("tape re-parses");
+    assert_eq!(fixture, round_tripped, "fixture must survive a JSON round-trip");
+
+    // (d) DETERMINISM PROOF — replay 50× at the default geometry, byte-identical.
+    let frame0 = TestHarness::replay(&fixture);
+    for run in 0..P65_DETERMINISM_RUNS {
+        let frame_n = TestHarness::replay(&fixture);
+        assert_eq!(
+            frame_n, frame0,
+            "replay run {run} diverged — the tape spine must be byte-deterministic"
+        );
+    }
+
+    // The replayed final frame: main view restored, modal gone, typed marker
+    // present. (Substrings — no wall-clock content in this streaming-free spine.)
+    assert!(
+        frame0.contains("Synaps") || frame0.contains("ready"),
+        "replayed spine must restore the main chrome:\n{frame0}"
+    );
+    assert!(
+        !frame0.contains(" Settings "),
+        "replayed spine must have the settings modal closed:\n{frame0}"
+    );
+    assert!(
+        frame0.contains("go"),
+        "replayed spine must carry the typed marker into the input row:\n{frame0}"
+    );
+
+    // (e) GEOMETRY axis — same tape, second geometry via replay_with_size.
+    //     Proves the clock+modal composition is deterministic at a non-default
+    //     size too (and that geometry is honored: a 40-row frame differs from
+    //     the 24-row one). This is where the resize axis is proven at the byte
+    //     level, given the replay-inert Resize-event seam gap noted above.
+    let wide0 = TestHarness::replay_with_size(&fixture, 120, 40);
+    for run in 0..P65_DETERMINISM_RUNS {
+        let wide_n = TestHarness::replay_with_size(&fixture, 120, 40);
+        assert_eq!(
+            wide_n, wide0,
+            "replay_with_size run {run} diverged — must be byte-deterministic at 120x40"
+        );
+    }
+    assert_ne!(
+        wide0, frame0,
+        "a 120x40 replay must differ from the 80x24 replay (geometry is honored)"
+    );
+    assert_eq!(
+        wide0.lines().count(),
+        40,
+        "120x40 replay must render exactly 40 rows"
+    );
+}
