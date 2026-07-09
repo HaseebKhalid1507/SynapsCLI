@@ -12,6 +12,9 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
 rust-version = "1.80"
 
+[features]
+testing = ["agent-tui/testing", "agent-engine/testing"]
+
 [dependencies]
 agent-core = { path = "crates/agent-core", version = "0.5.1", package = "synaps-core" }
 agent-engine = { path = "crates/agent-engine", version = "0.5.1", package = "synaps-engine" }
