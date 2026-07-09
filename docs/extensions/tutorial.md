@@ -351,6 +351,15 @@ Install by copying (or symlinking) your directory into one of them:
 cp -r hello-ext ~/.synaps-cli/plugins/hello-ext
 ```
 
+**Two naming things people trip on:**
+- The two roots use *intentionally different* paths — `~/.synaps-cli/plugins/` for
+  user-wide plugins, `./.synaps/plugins/` for project-local ones. The `-cli` on the user
+  path is **not a typo**.
+- The **install directory name is the plugin-id** (`hello-ext` above). SynapsCLI derives
+  the id from the directory, not from the manifest `name` field. Keep them matching by
+  convention (`install-dir == manifest.name == plugin-id`) so tool namespacing like
+  `hello-ext:hello` stays predictable.
+
 Start SynapsCLI normally and it loads on session start. To confirm the extension
 is the cause of some behavior, start with everything off:
 
@@ -373,8 +382,9 @@ Trace records include the hook kind, extension id, action, duration, and health
 
 You don't need SynapsCLI to prove your extension speaks the protocol. Drive it
 over stdio from a script: send `initialize`, `tool.call`, `hook.handle`, and
-`shutdown`, and check the responses. A ready-made harness lives beside the
-example:
+`shutdown`, and check the responses. A ready-made harness — whose source you can
+read and adapt — lives beside the example at
+`examples/extensions/hello-ext/test_hello.py`:
 
 ```bash
 cd examples/extensions/hello-ext
