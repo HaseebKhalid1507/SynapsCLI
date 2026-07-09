@@ -130,3 +130,91 @@ fn vt100_parses_captured_frame_content() {
         "ready status missing from parsed screen:\n{contents}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P16.2 — DA1-fenced boot query burst, at the byte/escape level.
+//
+// Same lesson as the render spike: assert on the REAL bytes the production
+// writer emits (write_query_burst is exactly what run_setup flushes to the
+// tty), and on the parsed result of a realistic synthetic reply stream —
+// not on an abstraction of either.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use agent_tui::tui::testing::termcaps::{
+    parse_burst_replies, write_query_burst, TermCaps, QUERY_BURST,
+};
+
+/// The burst as emitted: all five capability queries present, DA1 strictly
+/// LAST (the fence — in-band ordering is what makes "no reply by fence time"
+/// mean "unsupported"), one flushed write.
+#[test]
+fn termcaps_burst_emits_da1_fenced_query_bytes() {
+    let mut sink: Vec<u8> = Vec::new();
+    write_query_burst(&mut sink).expect("write into Vec cannot fail");
+    assert_eq!(
+        sink.as_slice(),
+        QUERY_BURST,
+        "production writer must emit the canonical burst verbatim"
+    );
+
+    let s = String::from_utf8(sink).expect("burst is pure ASCII");
+    // Every query present…
+    assert!(s.contains("\x1b[>0q"), "XTVERSION query missing: {s:?}");
+    assert!(s.contains("\x1b[?2026$p"), "DECRQM 2026 (sync output) query missing: {s:?}");
+    assert!(s.contains("\x1b[?2027$p"), "DECRQM 2027 (unicode width) query missing: {s:?}");
+    assert!(s.contains("\x1b[?u"), "kitty keyboard query missing: {s:?}");
+    assert!(s.contains("\x1b[>c"), "DA2 query missing: {s:?}");
+    // …and the fence is last, exactly once.
+    assert!(s.ends_with("\x1b[c"), "DA1 must be the FINAL query (the fence): {s:?}");
+    assert_eq!(s.matches("\x1b[c").count(), 1, "exactly one DA1 in the burst");
+}
+
+/// The burst must be invisible: feeding the query bytes through a real vt100
+/// terminal leaves the screen blank — queries render nothing and move nothing.
+#[test]
+fn termcaps_burst_is_invisible_on_a_vt100_screen() {
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    parser.process(QUERY_BURST);
+    let contents = parser.screen().contents();
+    assert!(
+        contents.trim().is_empty(),
+        "query burst painted visible cells: {contents:?}"
+    );
+    assert_eq!(parser.screen().cursor_position(), (0, 0), "burst moved the cursor");
+}
+
+/// A realistic kitty-style answer stream (XTVERSION DCS, kitty flags,
+/// DECRPM 2026/2027, DA2, DA1 fence) parses into fact-based TermCaps.
+#[test]
+fn termcaps_synthetic_da1_reply_parses_into_caps() {
+    let replies: &[u8] =
+        b"\x1bP>|kitty(0.32.2)\x1b\\\x1b[?1u\x1b[?2026;2$y\x1b[?2027;1$y\x1b[>1;4000;13c\x1b[?62;22c";
+
+    let parsed = parse_burst_replies(replies);
+    assert!(parsed.da1, "DA1 fence not detected");
+    assert!(parsed.kitty, "kitty flags reply not detected");
+    assert_eq!(parsed.mode_2026, Some(2));
+    assert_eq!(parsed.mode_2027, Some(1));
+
+    let mut caps = TermCaps::default();
+    caps.merge_burst(&parsed);
+    assert!(caps.da1_answered);
+    assert!(caps.kitty_keyboard, "kitty reply must flip kitty_keyboard to fact-true");
+    assert!(caps.sync_output, "DECRPM 2 (reset, settable) counts as supported");
+    assert!(caps.mode_2027, "DECRPM 1 (set) counts as supported");
+}
+
+/// The safety property behind the boot-hang gate: WITHOUT the DA1 fence
+/// (timeout / dumb terminal / partial replies) the merge is a strict no-op —
+/// caps stay at the env-detected defaults and boot behaves exactly as today.
+#[test]
+fn termcaps_unfenced_partial_replies_leave_defaults_untouched() {
+    let parsed = parse_burst_replies(b"\x1b[?1u\x1b[?2026;1$y"); // no DA1 reply
+    assert!(!parsed.da1);
+
+    let mut caps = TermCaps::default();
+    let before = caps.clone();
+    caps.merge_burst(&parsed);
+    assert_eq!(caps, before, "unfenced replies must be discarded wholesale");
+    assert!(!caps.da1_answered);
+}

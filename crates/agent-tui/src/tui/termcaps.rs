@@ -18,14 +18,32 @@
 //! today when it assumes nothing and just sends the bytes." Every default below
 //! is annotated with the concrete call site it mirrors.
 //!
-//! ## What this does NOT do (yet)
+//! ## Two detection layers
 //!
-//! No terminal queries. We do **not** send DA1 / XTVERSION / mode-2027 /
-//! kitty-query bursts here — that is P16.2, and it must be DA1-fenced to avoid
-//! the crossterm query-race (issues #963 / #993, see the substrate memo).
-//! Detection here is **env-only**: `$TERM_PROGRAM`, `$TMUX` presence, and the
-//! `tmux -V` provenance string. Env detection can't hang and can't race, so it
-//! is safe to run unconditionally at boot.
+//! 1. **Env-only** (P16.1): `$TERM_PROGRAM`, `$TMUX` presence, and the
+//!    `tmux -V` provenance string. Can't hang, can't race — safe anywhere.
+//! 2. **DA1-fenced query burst** (P16.2): [`negotiate`] emits the batched
+//!    query burst (XTVERSION, DECRQM 2026/2027, kitty-keyboard query, DA2,
+//!    then DA1 **last** as the fence — the libvaxis pattern) and reads the
+//!    replies directly from fd 0 with a hard deadline ([`BURST_TIMEOUT`]).
+//!    Timeout or partial (unfenced) replies ⇒ the env-detected caps are
+//!    returned **unchanged**, i.e. today's blind-optimism behavior, and boot
+//!    proceeds normally.
+//!
+//! ## The single-consumer rule (load-bearing — crossterm #963 / #993)
+//!
+//! The burst reads raw bytes from fd 0 itself. That is only safe because it
+//! runs in `run_setup()` AFTER raw-mode enable and BEFORE the crossterm
+//! `EventStream` (the process's one long-lived stdin consumer) is created —
+//! and because nothing else in this crate calls `crossterm::event::{poll,
+//! read}` or `supports_keyboard_enhancement()` (which would lazily spawn
+//! crossterm's internal reader). The bounded read completes (fence or
+//! deadline) and releases fd 0 before `EventStream::new()` executes. It also
+//! deliberately bypasses `io::Stdin`'s BufReader — a buffered read could slurp
+//! user keystrokes typed during boot into a buffer the EventStream never sees.
+//! **Never** call [`negotiate`] after the EventStream exists, and never spawn
+//! a blocking reader thread for it (an orphaned `read(2)` after timeout would
+//! steal bytes from the EventStream — the exact #963 failure mode).
 
 /// Facts we know (or conservatively assume) about the attached terminal.
 ///
@@ -34,7 +52,7 @@
 /// [`TermCaps::default`] is the "we know nothing, behave exactly as today"
 /// baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TermCaps {
+pub struct TermCaps {
     /// DEC 2026 synchronized output (`BeginSynchronizedUpdate` /
     /// `EndSynchronizedUpdate`).
     ///
@@ -43,7 +61,7 @@ pub(crate) struct TermCaps {
     /// that don't support 2026 ignore the escape, so emitting it is harmless.
     /// Keeping the default `true` means a future `if caps.sync_output` gate is a
     /// no-op that still emits the bracket.
-    pub(crate) sync_output: bool,
+    pub sync_output: bool,
 
     /// Kitty keyboard protocol (disambiguate-escape / report-alternate-keys)
     /// enhancement flags.
@@ -53,7 +71,7 @@ pub(crate) struct TermCaps {
     /// error; terminals that don't support it ignore the sequence. Default
     /// `true` means a future `if caps.kitty_keyboard` gate still performs the
     /// push (the blind push becomes the timeout fallback in P16.3).
-    pub(crate) kitty_keyboard: bool,
+    pub kitty_keyboard: bool,
 
     /// Unicode / grapheme width mode 2027.
     ///
@@ -61,14 +79,14 @@ pub(crate) struct TermCaps {
     /// width is handled unconditionally by the existing metrics path. `false`
     /// means "not negotiated," so a future `if caps.mode_2027` gate stays off
     /// and leaves today's width behavior untouched.
-    pub(crate) mode_2027: bool,
+    pub mode_2027: bool,
 
     /// Value of `$TERM_PROGRAM` (e.g. `"iTerm.app"`, `"WezTerm"`, `"tmux"`,
     /// `"vscode"`), if present and non-empty. `None` = unset.
     ///
     /// **Default `None`** — informational provenance only; nothing gates on it
     /// today.
-    pub(crate) term_program: Option<String>,
+    pub term_program: Option<String>,
 
     /// tmux provenance. `Some(version)` when `$TMUX` is present (running inside
     /// a tmux client); the version string is parsed from `tmux -V`
@@ -82,7 +100,7 @@ pub(crate) struct TermCaps {
     /// `Some(..)` so the eventual gate matches today's scrub-under-tmux path.
     ///
     /// [`detect_from_env`]: TermCaps::detect_from_env
-    pub(crate) tmux: Option<String>,
+    pub tmux: Option<String>,
 
     /// Whether a DA1 (Primary Device Attributes) reply has been observed.
     ///
@@ -91,7 +109,7 @@ pub(crate) struct TermCaps {
     /// performed" state that all P16.3 fallbacks key off of (unknown ⇒ do the
     /// unconditional thing). This flips to `true` only in P16.2 once the
     /// DA1-fenced boot burst lands.
-    pub(crate) da1_answered: bool,
+    pub da1_answered: bool,
 }
 
 impl Default for TermCaps {
@@ -398,5 +416,376 @@ mod tests {
         assert!(s.contains("tmux=3.4"));
         assert!(s.contains("sync_output=true"));
         assert!(s.contains("da1_answered=false"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P16.2 — DA1-fenced boot query burst
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The batched capability query burst, emitted as ONE write.
+///
+/// libvaxis ordering: every capability query first, **DA1 last as the fence**.
+/// Terminals process in-band queries in order, so by the time the DA1 reply
+/// (`CSI ? … c`) arrives, every query the terminal was ever going to answer
+/// has been answered. Terminals ignore queries they don't recognize, and
+/// (essentially) every terminal answers DA1.
+///
+/// | bytes           | query                                  | reply shape            |
+/// |-----------------|----------------------------------------|-------------------------|
+/// | `ESC [ > 0 q`   | XTVERSION (name/version)               | `DCS > \| … ST` (skipped)|
+/// | `ESC [ ?2026$p` | DECRQM: synchronized output (2026)     | `CSI ? 2026 ; v $ y`    |
+/// | `ESC [ ?2027$p` | DECRQM: grapheme/unicode width (2027)  | `CSI ? 2027 ; v $ y`    |
+/// | `ESC [ ? u`     | kitty keyboard protocol flags          | `CSI ? flags u`         |
+/// | `ESC [ > c`     | DA2 (secondary device attributes)      | `CSI > … c` (skipped)   |
+/// | `ESC [ c`       | **DA1 — the fence**                    | `CSI ? … c`             |
+pub const QUERY_BURST: &[u8] = b"\x1b[>0q\x1b[?2026$p\x1b[?2027$p\x1b[?u\x1b[>c\x1b[c";
+
+/// Hard deadline for the whole reply read. Local terminals answer DA1 in
+/// single-digit milliseconds; 150ms covers tmux/ssh indirection while keeping
+/// the worst-case boot cost (a terminal that never answers DA1) imperceptible.
+/// Within the plan's 100–250ms band.
+pub const BURST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Write the query burst to `w` and flush. Split out (and generic) so the
+/// vt100 tests can capture the exact bytes production emits.
+pub fn write_query_burst<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    w.write_all(QUERY_BURST)?;
+    w.flush()
+}
+
+/// Replies extracted from the raw bytes read back after the burst.
+///
+/// `da1` is the fence: [`TermCaps::merge_burst`] applies **nothing** unless it
+/// is set — partial (unfenced) replies are discarded wholesale, so the timeout
+/// path degenerates to "env caps unchanged".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BurstReplies {
+    /// DA1 reply (`CSI ? … c`) observed — the fence.
+    pub da1: bool,
+    /// Kitty keyboard flags reply (`CSI ? flags u`) observed.
+    pub kitty: bool,
+    /// DECRPM value for mode 2026, if a `CSI ? 2026 ; v $ y` reply was seen.
+    /// DECRPM values: 0 = not recognized, 1 = set, 2 = reset (settable),
+    /// 3 = permanently set, 4 = permanently reset.
+    pub mode_2026: Option<u8>,
+    /// DECRPM value for mode 2027 (same value semantics as `mode_2026`).
+    pub mode_2027: Option<u8>,
+}
+
+/// DECRPM value ⇒ "the terminal supports this mode". 1/2/3 are supported
+/// (set, resettable, permanently set); 0/4 are not.
+fn decrpm_supported(v: u8) -> bool {
+    matches!(v, 1..=3)
+}
+
+/// Parse the accumulated reply bytes. Pure function — the test seam.
+///
+/// Tolerant by design: unknown CSI sequences and stray bytes (a user
+/// keystroke racing the burst) are skipped; DCS payloads (the XTVERSION
+/// reply) are skipped to their `ST` terminator; a truncated trailing sequence
+/// is ignored (the caller re-parses as more bytes arrive).
+pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
+    let mut out = BurstReplies::default();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] != 0x1b {
+            i += 1; // stray byte (e.g. racing keystroke) — skip
+            continue;
+        }
+        match buf.get(i + 1) {
+            Some(b'[') => {
+                // CSI: parameter/intermediate bytes (0x20..=0x3f) until a
+                // final byte (0x40..=0x7e).
+                let start = i + 2;
+                let mut j = start;
+                while j < buf.len() && !(0x40..=0x7e).contains(&buf[j]) {
+                    j += 1;
+                }
+                if j >= buf.len() {
+                    break; // truncated — wait for more bytes
+                }
+                classify_csi(&buf[start..j], buf[j], &mut out);
+                i = j + 1;
+            }
+            Some(b'P') => {
+                // DCS (XTVERSION reply) — skip to ST (ESC \).
+                let mut j = i + 2;
+                while j + 1 < buf.len() && !(buf[j] == 0x1b && buf[j + 1] == b'\\') {
+                    j += 1;
+                }
+                if j + 1 >= buf.len() {
+                    break; // truncated DCS — wait for more bytes
+                }
+                i = j + 2;
+            }
+            Some(_) => i += 2, // other escape — skip introducer
+            None => break,
+        }
+    }
+    out
+}
+
+/// Classify one complete CSI sequence (`body` = bytes between `ESC [` and the
+/// final byte).
+fn classify_csi(body: &[u8], final_byte: u8, out: &mut BurstReplies) {
+    match final_byte {
+        // DA1 reply: CSI ? … c  (DA2 replies are `CSI > … c` — ignored)
+        b'c' if body.first() == Some(&b'?') => out.da1 = true,
+        // kitty keyboard flags reply: CSI ? flags u
+        b'u' if body.first() == Some(&b'?') => out.kitty = true,
+        // DECRPM reply: CSI ? <mode> ; <value> $ y
+        b'y' if body.first() == Some(&b'?') && body.last() == Some(&b'$') => {
+            let inner = std::str::from_utf8(&body[1..body.len() - 1]).unwrap_or("");
+            let mut parts = inner.split(';');
+            let mode = parts.next().and_then(|p| p.parse::<u32>().ok());
+            let value = parts.next().and_then(|p| p.parse::<u8>().ok());
+            match (mode, value) {
+                (Some(2026), Some(v)) => out.mode_2026 = Some(v),
+                (Some(2027), Some(v)) => out.mode_2027 = Some(v),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+impl TermCaps {
+    /// Merge burst replies onto env-detected caps — **only if DA1-fenced**.
+    ///
+    /// No fence ⇒ no-op: timeout/partial replies leave the caps exactly as
+    /// env detection produced them (= today's blind behavior). With the
+    /// fence, every earlier query has had its chance to answer (in-band
+    /// ordering), so:
+    /// * `kitty_keyboard` becomes fact: reply seen ⇔ supported.
+    /// * `mode_2027` / `sync_output` flip on an **explicit** DECRPM value;
+    ///   a terminal that answers DA1 but ignores DECRQM entirely leaves
+    ///   `sync_output` at its harmless default-true (terminals that don't
+    ///   support 2026 ignore the bracket anyway — this is log-honesty).
+    pub fn merge_burst(&mut self, replies: &BurstReplies) {
+        if !replies.da1 {
+            return;
+        }
+        self.da1_answered = true;
+        self.kitty_keyboard = replies.kitty;
+        if let Some(v) = replies.mode_2026 {
+            self.sync_output = decrpm_supported(v);
+        }
+        if let Some(v) = replies.mode_2027 {
+            self.mode_2027 = decrpm_supported(v);
+        }
+    }
+}
+
+/// Emit the query burst and read the DA1-fenced replies, merging facts onto
+/// `caps`. **Placement contract:** call ONLY from `run_setup()`, after
+/// raw-mode enable, before `EventStream::new()` — see the module docs
+/// ("single-consumer rule"). Every failure mode (not a tty, reactor error,
+/// timeout, partial replies, EOF) returns `caps` unchanged: boot never hangs
+/// and never changes behavior versus today.
+pub(crate) async fn negotiate(caps: TermCaps, timeout: std::time::Duration) -> TermCaps {
+    #[cfg(unix)]
+    {
+        negotiate_unix(caps, timeout).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = timeout;
+        caps
+    }
+}
+
+#[cfg(unix)]
+async fn negotiate_unix(mut caps: TermCaps, timeout: std::time::Duration) -> TermCaps {
+    use crossterm::tty::IsTty;
+    use std::io::Write;
+
+    // Not a real terminal (pipe, CI, tests): no one will answer — don't emit
+    // queries and don't pay the timeout.
+    if !std::io::stdin().is_tty() {
+        return caps;
+    }
+
+    // Emit the burst as one flushed write. Failure ⇒ keep env caps.
+    {
+        let mut out = std::io::stdout().lock();
+        if write_query_burst(&mut out).is_err() {
+            return caps;
+        }
+        let _ = out.flush();
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let replies = read_replies_fd0(deadline).await;
+    caps.merge_burst(&replies); // no-op unless DA1-fenced
+    tracing::debug!(
+        fenced = replies.da1,
+        ?replies,
+        "P16.2 query burst complete (timeout {:?})",
+        timeout
+    );
+    caps
+}
+
+/// Bounded raw read of fd 0 until the DA1 fence or `deadline`.
+///
+/// Uses the tokio reactor (`AsyncFd`) for readiness so every wait is
+/// deadline-bounded — no blocking reader thread exists to orphan (see module
+/// docs). Reads go straight to fd 0 via [`stdin_raw::read_fd0`], bypassing
+/// `io::Stdin`'s BufReader, so we never buffer bytes away from the future
+/// `EventStream`. Readiness is cleared after every read; if reply bytes are
+/// split across chunks and no further edge arrives, the deadline fires and
+/// the unfenced partial is discarded by `merge_burst` — safe fallback, never
+/// a hang.
+#[cfg(unix)]
+async fn read_replies_fd0(deadline: std::time::Instant) -> BurstReplies {
+    let afd = match tokio::io::unix::AsyncFd::with_interest(
+        stdin_raw::StdinFd,
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(afd) => afd,
+        Err(e) => {
+            tracing::debug!("P16.2: could not register fd 0 with reactor: {e}");
+            return BurstReplies::default();
+        }
+    };
+    let mut acc: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return parse_burst_replies(&acc);
+        }
+        let mut guard = match tokio::time::timeout(deadline - now, afd.readable()).await {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(_)) | Err(_) => return parse_burst_replies(&acc), // reactor err / deadline
+        };
+        let mut chunk = [0u8; 512];
+        match stdin_raw::read_fd0(&mut chunk) {
+            Ok(0) => return parse_burst_replies(&acc), // EOF
+            Ok(n) => {
+                acc.extend_from_slice(&chunk[..n]);
+                let replies = parse_burst_replies(&acc);
+                if replies.da1 {
+                    return replies; // fence — done, fd 0 is released
+                }
+                // Mandatory: without this, the next `readable()` returns
+                // immediately and a second read on the (blocking) fd with no
+                // data would hang boot. Clearing waits for the next edge.
+                guard.clear_ready();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => guard.clear_ready(),
+            Err(_) => return parse_burst_replies(&acc),
+        }
+    }
+}
+
+/// Raw, unbuffered fd-0 access for the burst read.
+#[cfg(unix)]
+mod stdin_raw {
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::mem::ManuallyDrop;
+    use std::os::fd::{AsRawFd, RawFd};
+
+    /// Registration token handing fd 0 to `AsyncFd` (readiness only — the
+    /// reactor never reads the fd itself).
+    pub(super) struct StdinFd;
+    impl AsRawFd for StdinFd {
+        fn as_raw_fd(&self) -> RawFd {
+            0
+        }
+    }
+
+    /// One `read(2)` straight off fd 0. `ManuallyDrop` prevents the borrowed
+    /// `File` from closing fd 0. Bypasses `io::Stdin`'s BufReader on purpose:
+    /// a buffered read could pull user keystrokes into a userspace buffer the
+    /// later `EventStream` (which reads the fd directly) would never see.
+    /// Only called after the reactor reported fd 0 readable, while this burst
+    /// is the process's sole stdin consumer (EventStream not yet created), so
+    /// the bytes that raised POLLIN are still there and the read returns
+    /// without blocking.
+    pub(super) fn read_fd0(buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::FromRawFd;
+        let mut f = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+        f.read(buf)
+    }
+}
+
+#[cfg(test)]
+mod burst_tests {
+    use super::*;
+
+    #[test]
+    fn burst_bytes_contain_every_query_with_da1_fence_last() {
+        let mut sink: Vec<u8> = Vec::new();
+        write_query_burst(&mut sink).unwrap();
+        assert_eq!(sink.as_slice(), QUERY_BURST);
+        let s = String::from_utf8(sink).unwrap();
+        assert!(s.contains("\x1b[>0q"), "XTVERSION query missing");
+        assert!(s.contains("\x1b[?2026$p"), "DECRQM 2026 query missing");
+        assert!(s.contains("\x1b[?2027$p"), "DECRQM 2027 query missing");
+        assert!(s.contains("\x1b[?u"), "kitty keyboard query missing");
+        assert!(s.contains("\x1b[>c"), "DA2 query missing");
+        assert!(s.ends_with("\x1b[c"), "DA1 must be the LAST query (the fence)");
+        assert_eq!(s.matches("\x1b[c").count(), 1, "exactly one DA1 query");
+    }
+
+    #[test]
+    fn full_reply_stream_parses_and_merges() {
+        // XTVERSION DCS, kitty flags, DECRPM 2026=2 (reset/settable),
+        // DECRPM 2027=0 (not recognized), DA2, DA1 fence.
+        let bytes = b"\x1bP>|kitty(0.32.2)\x1b\\\x1b[?1u\x1b[?2026;2$y\x1b[?2027;0$y\x1b[>1;4000;13c\x1b[?62;22c";
+        let r = parse_burst_replies(bytes);
+        assert!(r.da1 && r.kitty);
+        assert_eq!(r.mode_2026, Some(2));
+        assert_eq!(r.mode_2027, Some(0));
+        let mut caps = TermCaps::default();
+        caps.merge_burst(&r);
+        assert!(caps.da1_answered);
+        assert!(caps.kitty_keyboard);
+        assert!(caps.sync_output, "DECRPM 2 = reset-but-settable = supported");
+        assert!(!caps.mode_2027, "DECRPM 0 = not recognized");
+    }
+
+    #[test]
+    fn unfenced_partial_replies_are_discarded() {
+        // Everything answered EXCEPT the DA1 fence (e.g. deadline fired).
+        let r = parse_burst_replies(b"\x1b[?1u\x1b[?2026;1$y\x1b[?2027;1$y");
+        assert!(!r.da1);
+        let mut caps = TermCaps::default();
+        let before = caps.clone();
+        caps.merge_burst(&r);
+        assert_eq!(caps, before, "no DA1 fence ⇒ merge must be a no-op");
+    }
+
+    #[test]
+    fn da1_fence_without_kitty_reply_turns_kitty_off() {
+        // Terminal answers DA1 but ignored the kitty query (in-band ordering
+        // means "no reply by fence time" == "unsupported").
+        let mut caps = TermCaps::default();
+        caps.merge_burst(&parse_burst_replies(b"\x1b[?62;4c"));
+        assert!(caps.da1_answered);
+        assert!(!caps.kitty_keyboard);
+        assert!(caps.sync_output, "no DECRQM answer ⇒ keep harmless default-on");
+    }
+
+    #[test]
+    fn interleaved_keystroke_bytes_and_unknown_sequences_are_skipped() {
+        // A racing keystroke ('q'), an unknown CSI, then real replies.
+        let bytes = b"q\x1b[38;2;1;2;3m\x1b[?2026;1$y\x1b[?0u\x1b[?6c";
+        let r = parse_burst_replies(bytes);
+        assert!(r.da1 && r.kitty);
+        assert_eq!(r.mode_2026, Some(1));
+    }
+
+    #[test]
+    fn truncated_trailing_sequence_is_tolerated() {
+        let r = parse_burst_replies(b"\x1b[?1u\x1b[?2026"); // cut mid-CSI
+        assert!(r.kitty);
+        assert!(!r.da1);
+        assert_eq!(r.mode_2026, None);
+        // Truncated DCS likewise.
+        let r = parse_burst_replies(b"\x1bP>|WezTerm 2024");
+        assert_eq!(r, BurstReplies::default());
     }
 }

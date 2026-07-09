@@ -85,6 +85,7 @@ pub async fn run(
         render_handle,
         boot_done,
         exit_done,
+        term_caps,
         event_reader,
         mut shutdown_signal_rx,
         shutdown_signal_task,
@@ -99,10 +100,12 @@ pub async fn run(
         mut exit_fx_sent,
         mut last_draw,
     } = run_setup::run_setup(continue_session, system, profile, no_extensions).await?;
-    // P16.1: env-only terminal capability detection. Inert — nothing gates
-    // on this yet (queries land in P16.2, gates in P16.3). The only wiring is
-    // this `--verbose` (debug-level) boot line dumping the detected caps.
-    tracing::debug!(caps = %termcaps::TermCaps::detect().summary(), "detected terminal capabilities (env-only)");
+    // P16.1+P16.2: terminal capabilities — env detection merged with the
+    // DA1-fenced query burst run inside run_setup() (after raw-mode enable,
+    // BEFORE the EventStream above was created; see run_setup.rs). Still
+    // inert: nothing gates on this until P16.3. The only wiring is this
+    // `--verbose` (debug-level) boot line dumping the negotiated caps.
+    tracing::debug!(caps = %term_caps.summary(), "negotiated terminal capabilities (env + DA1-fenced burst)");
     // P12.2: Option-wrapped so dispatch::handle_input_action can drop the
     // reader early (gamba terminal handoff) through a `&mut` without moving
     // it out of the loop. Always Some outside the dispatch call.

@@ -769,3 +769,16 @@ impl std::io::Write for SharedSink {
         Ok(())
     }
 }
+
+/// P16.2 test facade — re-exports the termcaps query-burst surface so
+/// integration tests (`tests/vt100_spike.rs`, and P16.4's negotiation matrix)
+/// can assert on the exact burst bytes and drive the pure reply parser with
+/// synthetic DA1-fenced streams. The `tui::termcaps` module itself stays
+/// private; this facade only exists under the `testing` feature. The async
+/// fd-0 `negotiate()` path is deliberately NOT exported — tests must never
+/// touch real stdin (single-consumer rule).
+pub mod termcaps {
+    pub use super::super::termcaps::{
+        parse_burst_replies, write_query_burst, BurstReplies, TermCaps, BURST_TIMEOUT, QUERY_BURST,
+    };
+}

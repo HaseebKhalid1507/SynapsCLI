@@ -26,6 +26,9 @@ pub(crate) struct RunContext {
     pub render_handle: render_thread::RenderHandle,
     pub boot_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub exit_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// P16.2: negotiated terminal capabilities — env detection merged with
+    /// the DA1-fenced query burst (or env-only if the burst timed out).
+    pub term_caps: termcaps::TermCaps,
     pub event_reader: EventStream,
     pub shutdown_signal_rx: tokio::sync::mpsc::UnboundedReceiver<signals::ShutdownSignal>,
     pub shutdown_signal_task: signals::SignalHandle,
@@ -145,6 +148,28 @@ pub(crate) async fn run_setup(
     // directly — it reads the TTY fd without needing the Terminal object.
     // See render_thread.rs module comment for the design rationale.
     let terminal = setup_terminal()?;
+
+    // ── P16.2: DA1-fenced terminal capability query burst ──
+    //
+    // SINGLE-CONSUMER ORDERING — LOAD-BEARING (crossterm #963/#993, see
+    // termcaps.rs module docs + the substrate memo). This emits the batched
+    // query burst and reads the replies DIRECTLY from fd 0 under a hard
+    // deadline. That is safe if and only if, by construction:
+    //   1. raw mode is already enabled — `setup_terminal()` ABOVE — so
+    //      replies arrive unechoed and unbuffered by the line discipline;
+    //   2. NO other stdin consumer exists yet — `EventStream::new()` is
+    //      created BELOW, and nothing in this crate touches
+    //      crossterm::event::{poll,read} before it, so crossterm's internal
+    //      reader has not been spawned. The bounded read completes (DA1
+    //      fence or timeout) and releases fd 0 before the EventStream is
+    //      constructed. It even runs before `spawn_render_thread` so no
+    //      other thread writes to the terminal during the reply window.
+    // Timeout / partial replies ⇒ env-detected caps unchanged (= today's
+    // behavior) ⇒ boot proceeds normally. NEVER move this below
+    // `EventStream::new()`; NEVER add a second stdin reader for it.
+    let term_caps =
+        termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
+
     let (render_handle, boot_done, exit_done) = spawn_render_thread(terminal);
     // Boot effect is sent via the command channel so the render thread owns it.
     render_handle.send_boot_fx(boot_effect());
@@ -204,6 +229,7 @@ pub(crate) async fn run_setup(
         render_handle,
         boot_done,
         exit_done,
+        term_caps,
         event_reader,
         shutdown_signal_rx,
         shutdown_signal_task,
