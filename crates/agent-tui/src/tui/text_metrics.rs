@@ -26,6 +26,14 @@ pub(crate) fn width(s: &str) -> usize {
 /// expansion (e.g. rendering `\t` as N columns) must handle it explicitly —
 /// this module deliberately does not, because tab width is a rendering policy,
 /// not a character property. Same applies to `\n`, `\r`, and other C0 controls.
+///
+/// # Load-bearing: ZWSP width 0
+/// ZWSP (U+200B, ZERO WIDTH SPACE) correctly returns **0** here. This is
+/// **load-bearing** for `THINKING_PLACEHOLDER` (`transcript.rs:50` =
+/// `"\u{2026}\u{200B}"`) — the placeholder uses ZWSP to produce a non-empty
+/// string that still measures as 1 display cell (the ellipsis only), allowing
+/// the render path to distinguish "placeholder" from "truly empty". Changing
+/// the width-0 policy here would silently break thinking-state rendering.
 #[inline]
 pub(crate) fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)

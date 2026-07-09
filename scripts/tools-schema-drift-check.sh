@@ -47,6 +47,7 @@ else
     echo "Diff (generated vs committed):"
     diff <(echo "$GENERATED") "$COMMITTED" || true
     echo ""
+    echo "Note: the committed manifest is BUILTIN-ONLY by construction — dynamically-registered extension/MCP tools are not included." >&2
     echo "To fix: run \`synaps tools export --pretty > docs/tools.json\` and commit."
     exit 1
 fi

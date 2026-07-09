@@ -1914,7 +1914,7 @@ mod visible_window_tests {
         // Pinned at bottom → scroll_back = 0.
         let vw = store.visible_window(msg_area, &test_ctx());
 
-        let total = store.line_cache().unwrap().total_height();
+        let total = store.line_cache().expect("line cache populated after layout").total_height();
         assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
         let end = total; // scroll_back = 0
         let start = end.saturating_sub(content_height);
