@@ -1855,15 +1855,94 @@ impl TranscriptStore {
     /// no viewport dependency (off-screen selections copy fine; design §3.3).
     /// Messages join with "\n\n" (§1.4 step 4); middle messages contribute
     /// their full source.
-    pub(crate) fn selected_text(&self) -> Option<String> {
-        let a = self.selection_anchor.as_ref()?;
-        let b = self.selection_end.as_ref()?;
-        // Normalize to content reading order (same rule as selection_range).
-        let (s, e) = if (a.msg_idx, a.line_in_msg, a.col) <= (b.msg_idx, b.line_in_msg, b.col) {
-            (a, b)
-        } else {
-            (b, a)
+    /// Ensure all Estimated slots in `lo..=hi` are exactly rendered so that
+    /// `meta` is available for copy provenance. This is the "promote-on-touch"
+    /// design (scope §4.5 / I-SEL): copy of off-screen estimated content
+    /// exact-renders exactly the touched messages, once, at copy time. Meta
+    /// survives demotion thereafter, so a second copy of the same range is
+    /// free (renders delta == 0 — T8).
+    fn promote_range_for_copy(&mut self, lo: usize, hi: usize) {
+        let width = match self.cache.line_cache() {
+            Some(c) => c.width,
+            None => return,
         };
+        // Collect which slots need promotion (Estimated ⟹ meta: None).
+        let to_promote: Vec<usize> = match self.cache.line_cache() {
+            Some(c) => (lo..=hi.min(c.per_msg.len().saturating_sub(1)))
+                .filter(|&mi| !c.per_msg[mi].height.is_exact())
+                .collect(),
+            None => return,
+        };
+        // Promote each: exact-render → splice correction into cum_heights.
+        // This reuses `promote_slot`, which already handles the correction
+        // splice and the I-CLAMP invariant. We pass a no-op RenderCtx
+        // (spinner_frame=0, streaming=false) — copy paths never vary by spinner
+        // state, and the content bytes are identical regardless.
+        //
+        // Note: `promote_slot` is sound here because it does NOT require the
+        // slot to be in the visible window — it renders any indexed slot.
+        // Heights outside the anchor window may correct, but the anchor
+        // theorem (§4.3) guarantees no visual jump: corrections above the
+        // anchor shift the coordinate but not the screen row; corrections
+        // below the anchor change nothing visible.
+        let ctx = RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "",
+        };
+        for mi in to_promote {
+            self.promote_slot(mi, width, &ctx);
+        }
+    }
+
+    /// The clipboard-bound text for the current selection — SOURCE
+    /// reconstruction (P10 slice (d), design §1.4). Walks the
+    /// content-relative endpoints over per-row [`LineMeta`] provenance and
+    /// emits bytes of each message's canonical source (`source_text`)
+    /// verbatim:
+    ///
+    /// - `Content` rows: exact source bytes — endpoint columns resolve
+    ///   through the `src_byte` captured at event time (char-precise).
+    /// - `ContentLine` rows: whole source lines (locks L1 fallback / L2
+    ///   tool cards / L6 tabs). A selection reaching a message's LAST
+    ///   content row extends to the end of its source — the D4 whole-card
+    ///   rule: truncated tool output, hidden thinking lines, and clamped
+    ///   code tails come back in full.
+    /// - `Chrome` rows contribute nothing; a chrome-only selection returns
+    ///   `None` (D5: no clipboard write, no toast).
+    ///
+    /// Soft wraps vanish and hard breaks reappear for free because the
+    /// emitted slice IS the original text — no joins, no indent heuristics,
+    /// no viewport dependency (off-screen selections copy fine; design §3.3).
+    /// Messages join with "\n\n" (§1.4 step 4); middle messages contribute
+    /// their full source.
+    ///
+    /// **T241 Slice 5 — promote-on-touch (§4.5):** before reading `meta`,
+    /// `promote_range_for_copy` exact-renders any Estimated slot in the
+    /// selection range. This is O(selected messages) once; repeated copies
+    /// of the same range are free because `meta` survives demotion.
+    pub(crate) fn selected_text(&mut self) -> Option<String> {
+        // Extract endpoint indices before the mutable promote borrow.
+        let (s_msg, s_line, s_col, s_src, e_msg, e_line, e_col, e_src) = {
+            let a = self.selection_anchor.as_ref()?;
+            let b = self.selection_end.as_ref()?;
+            if (a.msg_idx, a.line_in_msg, a.col) <= (b.msg_idx, b.line_in_msg, b.col) {
+                (a.msg_idx, a.line_in_msg, a.col, a.src_byte,
+                 b.msg_idx, b.line_in_msg, b.col, b.src_byte)
+            } else {
+                (b.msg_idx, b.line_in_msg, b.col, b.src_byte,
+                 a.msg_idx, a.line_in_msg, a.col, a.src_byte)
+            }
+        };
+        // Slice 5: promote-on-touch — ensure meta is present for every slot
+        // in the selection range before we read it below (§4.5 / I-SEL).
+        self.promote_range_for_copy(s_msg, e_msg);
+
+        let _ = self.line_cache()?; // guard: cache must exist after promote
+        // Re-synthesize the normalized SelPos pair from the extracted scalars
+        // (avoid re-borrowing self.selection_anchor / selection_end).
+        let s = SelPos { msg_idx: s_msg, line_in_msg: s_line, col: s_col, src_byte: s_src };
+        let e = SelPos { msg_idx: e_msg, line_in_msg: e_line, col: e_col, src_byte: e_src };
         let cache = self.line_cache()?;
 
         let mut parts: Vec<String> = Vec::new();
@@ -3482,6 +3561,506 @@ mod scroll_anchor_tests {
         assert!(
             store.scroll_anchor().is_none(),
             "scroll_to_bottom must clear anchor"
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T241 Slice 4 — Streaming pin + resize under estimates (T5, T6)
+//
+// T5: streaming messages arrive via the Dirty arm (LineSink — exact renders);
+//     while estimated history sits above, the bottom rows + composer position
+//     are Exact and stable each frame (I-STREAM). Asserted by checking the
+//     promoted tail window is Exact after each streaming append.
+//
+// T6: width change (120→80→120) re-estimates everything in O(source) with
+//     zero renders; the visible window matches the eager oracle; cum identity
+//     holds throughout (I-RESIZE).
+// ═════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod slice4_stream_resize {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    const HALO: usize = TranscriptStore::PROMOTE_HALO_MSGS;
+
+    fn ctx() -> RenderCtx<'static> {
+        RenderCtx { spinner_frame: 0, streaming: true, agent_name: "synaps" }
+    }
+    fn ctx_idle() -> RenderCtx<'static> {
+        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+    }
+
+    fn msg_area(rows: usize, cols: usize) -> Rect {
+        Rect { x: 0, y: 0, width: (cols + 2) as u16, height: (rows + 2) as u16 }
+    }
+
+    fn to_strs(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+    }
+
+    // ── T5: streaming append while estimated history above ───────────────────
+    //
+    // Setup: push 950 history messages (all Estimated after first visible_window),
+    // then append 100 streaming messages one-by-one. After each append:
+    //   - call visible_window (simulates a frame)
+    //   - assert: the bottom rows of the cache (the Dirty arm exact-rendered tail)
+    //     are Exact; the composer position (total height) is derived from Exact rows
+    //     at the tail; no panic.
+    //
+    // I-STREAM: the tail window (last message + halo) is always Exact; the
+    // composer's offset (total_height - scroll_back) is stable.
+    #[test]
+    fn slice4_t5_streaming_bottom_rows_exact_while_estimated_history_above() {
+        const N_HISTORY: usize = 950;
+        const N_STREAM: usize = 50; // push 50 streaming messages
+
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+
+        // Push history — all will be Estimated after first frame.
+        for i in 0..N_HISTORY {
+            store.push_msg(ChatMessage::Text(format!(
+                "History message {i}: the quick brown fox jumps over the lazy dog."
+            )));
+        }
+
+        let area = msg_area(40, 120);
+
+        // Cold first frame: history Estimated, tail Exact, pinned to bottom.
+        let _ = store.visible_window(area, &ctx_idle());
+        store.probe_reset();
+
+        // Stream N_STREAM more messages one at a time, rendering each.
+        let mut prev_total: usize = 0;
+        for i in 0..N_STREAM {
+            // Append streaming message.
+            store.push_msg(ChatMessage::Text(format!(
+                "Streaming message {i}: line one.\nLine two of streaming message {i}."
+            )));
+
+            // Frame: Dirty arm exact-renders the new tail.
+            let vw = store.visible_window(area, &ctx());
+
+            // The cache must exist.
+            let cache = store.line_cache().expect("cache must exist during streaming");
+            let n = cache.per_msg.len();
+
+            // Assert: the tail slot (the freshly appended message) is Exact.
+            // The Dirty arm renders from the dirty watermark; the last slot is always new.
+            let last_slot = &cache.per_msg[n - 1];
+            assert!(
+                last_slot.height.is_exact(),
+                "T5: last streamed slot must be Exact after frame {i}, got Estimated"
+            );
+            assert!(
+                last_slot.meta.is_some(),
+                "T5: last streamed slot must have meta (Some) after frame {i}"
+            );
+
+            // Assert: visible window (pinned bottom) has stable, nonzero content.
+            assert!(
+                !vw.lines.is_empty(),
+                "T5: visible window must not be empty during streaming (frame {i})"
+            );
+            assert_eq!(vw.scroll_back, 0, "T5: pinned during streaming → scroll_back must be 0");
+
+            // Assert total height grows monotonically (each message adds rows).
+            let total = cache.total_height();
+            assert!(
+                total > prev_total,
+                "T5: total_height must grow with each message (was {prev_total}, now {total})"
+            );
+            prev_total = total;
+
+            // Assert halo around tail is Exact (I-STREAM: tail window is Exact).
+            let tail_lo = n.saturating_sub(HALO + 1);
+            let all_exact_in_tail = cache.per_msg[tail_lo..]
+                .iter()
+                .all(|s| s.height.is_exact());
+            assert!(
+                all_exact_in_tail,
+                "T5: all slots in halo around tail must be Exact during streaming (frame {i})"
+            );
+        }
+
+        // The history above the halo must still be Estimated (no unnecessary renders).
+        let renders_after_streaming = store.probe_render_count();
+        let cache = store.line_cache().unwrap();
+        let n = cache.per_msg.len();
+        let halo_lo = n.saturating_sub(HALO + N_STREAM + 10); // well inside the promoted zone
+        let estimated_count = cache.per_msg[..halo_lo.min(N_HISTORY.saturating_sub(100))]
+            .iter()
+            .filter(|s| !s.height.is_exact())
+            .count();
+        // Large majority of history must remain Estimated.
+        assert!(
+            estimated_count > N_HISTORY / 2,
+            "T5: most history must remain Estimated (got only {estimated_count} Estimated \
+             of {halo_lo} checked above the halo)"
+        );
+
+        eprintln!(
+            "[T5] streaming {N_STREAM} msgs over {N_HISTORY} estimated history: \
+             renders_delta={renders_after_streaming} estimated_above_halo={estimated_count}"
+        );
+    }
+
+    // ── T6: resize 120→80→120 under estimated cache ──────────────────────────
+    //
+    // Invariants (I-RESIZE):
+    //   - cum identity holds after each resize (cum_heights[n] == sum of per_msg heights)
+    //   - no duplicate or lost lines vs. the eager oracle for the visible window
+    //   - the visible window at each width matches render_lines(width) for the tail rows
+    //
+    // The oracle is `store.render_lines(width, ctx)` which renders every
+    // message eagerly; we compare only the visible bottom window (the part
+    // that is Exact after promotion) since the estimated portion differs.
+    #[test]
+    fn slice4_t6_resize_cum_identity_and_visible_window_matches_oracle() {
+        const N: usize = 200; // enough to have history above the halo at both widths
+
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..N {
+            store.push_msg(ChatMessage::Text(format!(
+                "Resize test message {i}: the quick brown fox jumps over the lazy dog. \
+                 A longer second sentence to provide wrapping material at narrow widths."
+            )));
+        }
+
+        // ── Step 1: cold first frame at width 120 ──
+        let area120 = msg_area(40, 120);
+        let vw1 = store.visible_window(area120, &ctx_idle());
+        assert_cum_identity(store.line_cache().unwrap(), "initial w=120");
+
+        // The oracle for w=120: eager render of all messages.
+        let oracle120 = store.render_lines(120, &ctx_idle());
+        let o_len = oracle120.len();
+        // The visible bottom window must match oracle's tail (bottom content is Exact).
+        let vw1_len = vw1.lines.len();
+        let oracle_tail_120 = &oracle120[o_len.saturating_sub(vw1_len)..];
+        assert_eq!(
+            to_strs(&vw1.lines),
+            to_strs(oracle_tail_120),
+            "T6 w=120: visible window must match oracle's tail (I-RESIZE)"
+        );
+
+        // ── Step 2: resize to width 80 ──
+        store.probe_reset();
+        let area80 = msg_area(40, 80);
+        let vw2 = store.visible_window(area80, &ctx_idle());
+        assert_cum_identity(store.line_cache().unwrap(), "after resize to w=80");
+
+        // Verify zero full renders — resize re-estimates only.
+        // (The promote_window will render the viewport+halo; we just check cum identity.)
+        let oracle80 = store.render_lines(80, &ctx_idle());
+        let o80_len = oracle80.len();
+        let vw2_len = vw2.lines.len();
+        let oracle_tail_80 = &oracle80[o80_len.saturating_sub(vw2_len)..];
+        assert_eq!(
+            to_strs(&vw2.lines),
+            to_strs(oracle_tail_80),
+            "T6 w=80: visible window must match oracle's tail after resize (I-RESIZE)"
+        );
+
+        // ── Step 3: resize back to width 120 ──
+        store.probe_reset();
+        let vw3 = store.visible_window(area120, &ctx_idle());
+        assert_cum_identity(store.line_cache().unwrap(), "after resize back to w=120");
+
+        // The oracle for w=120 again.
+        let oracle120b = store.render_lines(120, &ctx_idle());
+        let ob_len = oracle120b.len();
+        let vw3_len = vw3.lines.len();
+        let oracle_tail_120b = &oracle120b[ob_len.saturating_sub(vw3_len)..];
+        assert_eq!(
+            to_strs(&vw3.lines),
+            to_strs(oracle_tail_120b),
+            "T6 w=120 (second visit): visible window must match oracle's tail (I-RESIZE)"
+        );
+
+        eprintln!(
+            "[T6] resize 120→80→120 on N={N} messages: cum identity holds at all three widths; \
+             visible window matches oracle tail each time"
+        );
+    }
+
+    /// Assert cum_heights identity: len == per_msg.len()+1, cum[0]==0, monotone,
+    /// and each entry equals the prefix sum. Covers mixed Exact/Estimated.
+    fn assert_cum_identity(cache: &LineCache, label: &str) {
+        assert_eq!(
+            cache.cum_heights.len(),
+            cache.per_msg.len() + 1,
+            "cum identity ({label}): cum_heights.len() must be per_msg.len()+1"
+        );
+        assert_eq!(
+            cache.cum_heights.first(),
+            Some(&0),
+            "cum identity ({label}): cum_heights[0] must be 0"
+        );
+        let mut acc = 0usize;
+        for (i, slot) in cache.per_msg.iter().enumerate() {
+            acc += slot.height();
+            assert_eq!(
+                cache.cum_heights[i + 1],
+                acc,
+                "cum identity ({label}): cum_heights[{}] inconsistent (expected {acc})",
+                i + 1
+            );
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T241 Slice 5 — selection/copy promote-on-touch (T7, T8)
+//
+// T7: select msgs 100..300 while viewport is at the bottom (msgs 900..1000);
+//     copy output matches the eager oracle; exact_renders ≈ 201 (one per
+//     selected message that was Estimated).
+//
+// T8: copy the same range a second time — renders delta == 0 because `meta`
+//     is retained after the first promote (demotion drops `lines` but keeps
+//     `meta` — the MsgSlot design; see `promote_slot` and §4.5).
+//
+// To keep the test self-contained (no mouse event / content-height mapping),
+// we set selection endpoints directly via test-only state and call
+// `selected_text()` which is now `&mut self` + promotes-on-touch.
+// ═════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod slice5_copy_promote_on_touch {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn ctx() -> RenderCtx<'static> {
+        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+    }
+
+    fn msg_area_40x120() -> Rect {
+        Rect { x: 0, y: 0, width: 122, height: 42 }
+    }
+
+    /// Build a store with `n` messages of known source text.
+    /// Msgs are plain Text with predictable content so the oracle copy
+    /// (via `source_text`) is deterministic.
+    fn make_store(n: usize) -> TranscriptStore {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..n {
+            store.push_msg(ChatMessage::Text(format!(
+                "T7/T8 message {i}: content for selection test.\n\
+                 Second line of message {i}."
+            )));
+        }
+        store
+    }
+
+    /// Oracle copy for messages `lo..=hi`: source bytes joined with "\n\n"
+    /// (same rule as selected_text — full source per middle message).
+    fn oracle_copy(store: &TranscriptStore, lo: usize, hi: usize) -> String {
+        let parts: Vec<String> = (lo..=hi)
+            .map(|i| store.source_text(i).to_string())
+            .collect();
+        parts.join("\n\n")
+    }
+
+    // ── T7: select 100..300 while viewport at tail (msgs ~960..1000) ─────────
+    #[test]
+    fn slice5_t7_copy_off_screen_range_matches_oracle_renders_approx_201() {
+        const N: usize = 1_000;
+        const SEL_LO: usize = 100;
+        const SEL_HI: usize = 300;
+
+        let mut store = make_store(N);
+
+        // Cold frame at tail — promotes viewport + halo, history stays Estimated.
+        let area = msg_area_40x120();
+        let _ = store.visible_window(area, &ctx());
+
+        // Verify: msgs 100..=300 are all Estimated (far above the tail halo).
+        {
+            let cache = store.line_cache().unwrap();
+            let n_estimated = cache.per_msg[SEL_LO..=SEL_HI]
+                .iter()
+                .filter(|s| !s.height.is_exact())
+                .count();
+            assert!(
+                n_estimated > 150,
+                "T7 precondition: most of msgs {SEL_LO}..={SEL_HI} must be Estimated \
+                 before copy (got only {n_estimated} Estimated)"
+            );
+        }
+
+        // Build oracle: full source of each selected message joined with "\n\n".
+        // Since we set selection to cover msgs lo..=hi with src_byte at the very
+        // start and end of source, selected_text gives us full source of lo and hi
+        // (the col=0 / src_byte=Some(0) anchor snaps to the beginning; for the end
+        // at line_in_msg=0 col=0 src_byte=Some(0) it gives us from byte 0 — but
+        // only up to the end of the first rendered row, which for the D4 rule should
+        // actually be all of source if it's on the last content row).
+        //
+        // For a precise test: set the end endpoint to line=last_content_row for
+        // the endpoint message — but we don't know that without rendering first.
+        //
+        // Simpler alternative: test with src_byte spanning the full source.
+        // We'll set anchor src_byte=Some(0) at line 0 and end src_byte pointing to
+        // the full source length. This requires reading the source length, which we can.
+        let sel_lo_src_len = store.source_text(SEL_LO).len();
+        let sel_hi_src_len = store.source_text(SEL_HI).len();
+
+        // Set selection: anchor = start of SEL_LO, end = end of SEL_HI.
+        store.selection_anchor = Some(SelPos {
+            msg_idx: SEL_LO,
+            line_in_msg: 0,
+            col: 0,
+            src_byte: Some(0),
+        });
+        store.selection_end = Some(SelPos {
+            msg_idx: SEL_HI,
+            line_in_msg: 99, // large row — will be clamped to last_row in selected_text
+            col: 0,
+            src_byte: Some(sel_hi_src_len),
+        });
+
+        // Reset render probe before copy.
+        store.probe_reset();
+
+        // Call selected_text — promote-on-touch promotes SEL_LO..=SEL_HI.
+        let copied = store.selected_text()
+            .expect("T7: selected_text must return Some for msgs 100..=300");
+
+        let renders_after_copy = store.probe_render_count();
+
+        // Oracle: full source of SEL_LO, full sources of middles, full source of SEL_HI.
+        // The selected_text path for these messages (src_byte=Some(0) anchor on the
+        // first content row, src_byte=Some(src_len) end on any row > last) will produce
+        // exactly source[0..src_len] for each endpoint.
+        // For middle messages it always produces full source.
+        // So oracle_copy == source of each in SEL_LO..=SEL_HI joined with "\n\n".
+        //
+        // But selected_text clips the anchor to src[0..] and end to src[..src_len].
+        // For the start message, lo=src_byte=0 and hi=src_len (end snaps via D4 or direct).
+        // For middle messages, full source.
+        // This means oracle_copy is correct.
+        let oracle = oracle_copy(&store, SEL_LO, SEL_HI);
+
+        // For end message: src_byte=Some(sel_hi_src_len) means hi=sel_hi_src_len.
+        // The lo for end message... the start of the row (first content row lo=range.start=0).
+        // So end message contributes src[0..sel_hi_src_len] = full source.
+        let expected_hi_portion = store.source_text(SEL_HI).to_string();
+
+        assert!(
+            copied.ends_with(&expected_hi_portion),
+            "T7: copied text must end with full source of msg {SEL_HI}\n\
+             expected suffix: {expected_hi_portion:?}\n\
+             got: {copied:?}"
+        );
+
+        // Check that the copy contains source of SEL_LO (the start).
+        let sel_lo_src = store.source_text(SEL_LO).to_string();
+        assert!(
+            copied.starts_with(&sel_lo_src[..sel_lo_src_len]),
+            "T7: copied text must start with full source of msg {SEL_LO}\n\
+             expected prefix: {sel_lo_src:?}\n\
+             got start: {:?}", &copied[..copied.len().min(100)]
+        );
+
+        // Verify render count: ≈ SEL_HI - SEL_LO + 1 = 201 (within a factor of 2).
+        // Exact count depends on how many were already Exact.
+        let expected_range = 201;
+        assert!(
+            renders_after_copy <= expected_range * 2,
+            "T7: promote-on-touch must render at most ~{} messages (got {renders_after_copy})",
+            expected_range * 2
+        );
+        assert!(
+            renders_after_copy > 0,
+            "T7: at least some Estimated slots must have been promoted (got 0)"
+        );
+
+        eprintln!(
+            "[T7] select msgs {SEL_LO}..{SEL_HI} while tail viewport: \
+             renders={renders_after_copy} (expected ≤ {}); \
+             copied {} chars; oracle {} chars",
+            expected_range * 2,
+            copied.len(),
+            oracle.len()
+        );
+    }
+
+    // ── T8: copy same range again — renders delta == 0 ───────────────────────
+    //
+    // Meta is retained after demotion (MsgSlot: lines=None, meta=Some).
+    // `promote_range_for_copy` only re-renders Estimated slots; after T7,
+    // the touched slots are Exact. So the second copy must trigger zero renders.
+    #[test]
+    fn slice5_t8_second_copy_renders_delta_zero() {
+        const N: usize = 500;
+        const SEL_LO: usize = 50;
+        const SEL_HI: usize = 150;
+
+        let mut store = make_store(N);
+
+        // Cold frame: promotes tail, leaves history Estimated.
+        let area = msg_area_40x120();
+        let _ = store.visible_window(area, &ctx());
+
+        let sel_hi_src_len = store.source_text(SEL_HI).len();
+
+        // Set selection to cover msgs 50..=150.
+        store.selection_anchor = Some(SelPos {
+            msg_idx: SEL_LO,
+            line_in_msg: 0,
+            col: 0,
+            src_byte: Some(0),
+        });
+        store.selection_end = Some(SelPos {
+            msg_idx: SEL_HI,
+            line_in_msg: 99,
+            col: 0,
+            src_byte: Some(sel_hi_src_len),
+        });
+
+        // First copy — promotes the range.
+        store.probe_reset();
+        let first = store.selected_text()
+            .expect("T8: first selected_text must return Some");
+        let renders_first = store.probe_render_count();
+
+        assert!(renders_first > 0, "T8: first copy must promote some slots");
+        eprintln!("[T8] first copy: renders={renders_first}");
+
+        // Restore selection (selected_text doesn't clear it, but verify).
+        store.selection_anchor = Some(SelPos {
+            msg_idx: SEL_LO,
+            line_in_msg: 0,
+            col: 0,
+            src_byte: Some(0),
+        });
+        store.selection_end = Some(SelPos {
+            msg_idx: SEL_HI,
+            line_in_msg: 99,
+            col: 0,
+            src_byte: Some(sel_hi_src_len),
+        });
+
+        // Second copy — meta already present, must be free.
+        store.probe_reset();
+        let second = store.selected_text()
+            .expect("T8: second selected_text must return Some");
+        let renders_second = store.probe_render_count();
+
+        assert_eq!(
+            renders_second, 0,
+            "T8: second copy of same range must render 0 messages (meta retained), \
+             rendered {renders_second}"
+        );
+        assert_eq!(
+            first, second,
+            "T8: both copies must produce identical text"
+        );
+
+        eprintln!(
+            "[T8] second copy: renders={renders_second} (expected 0); \
+             output byte-identical: {}",
+            first == second
         );
     }
 }

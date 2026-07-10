@@ -367,7 +367,10 @@ impl TestHarness {
     /// The clipboard-bound text for the current selection — the seam the P10
     /// copy pins assert against (design §5 (pre): `selected_text()` is
     /// directly callable, no clipboard mock needed).
-    pub fn selected_text(&self) -> Option<String> {
+    ///
+    /// T241 Slice 5: `&mut self` because `selected_text` now promotes
+    /// estimated off-screen slots on demand (promote-on-touch §4.5).
+    pub fn selected_text(&mut self) -> Option<String> {
         self.app.transcript.selected_text()
     }
 
