@@ -179,9 +179,6 @@ impl StreamMethods {
             };
             let _ = did_inject;
 
-            // Shim to slice 3 request path: it still expects `&[Value]`.
-            let messages_for_api: Vec<Value> =
-                messages.iter().map(|m| (**m).clone()).collect();
             let response = match ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
@@ -189,7 +186,7 @@ impl StreamMethods {
                 &tools_snapshot,
                 &injected_system,
                 thinking_budget,
-                &messages_for_api,
+                &messages,
                 tx.clone(),
                 &cancel,
                 api_retries,

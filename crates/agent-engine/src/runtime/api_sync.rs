@@ -40,7 +40,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
-        messages: &[Value],
+        messages: &[crate::SharedMessage],
         max_retries: u32,
         options: &ApiOptions,
     ) -> Result<Value> {
@@ -76,6 +76,8 @@ impl ApiMethods {
         };
 
         // Avoid modifying past messages to maintain a 100% stable prefix for Anthropic caching.
+        // Arc-shared (#128): to_vec() is N refcount bumps, not a deep copy;
+        // sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
@@ -251,7 +253,7 @@ impl ApiMethods {
         model: &str,
         system_prompt: &str,
         thinking_budget: u32,
-        messages: &[Value],
+        messages: &[crate::SharedMessage],
         max_retries: u32,
     ) -> Result<String> {
         let tools_schema = Arc::new(Vec::new());

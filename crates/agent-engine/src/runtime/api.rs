@@ -651,7 +651,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
-        messages: &[Value],
+        messages: &[crate::SharedMessage],
         tx: mpsc::UnboundedSender<StreamEvent>,
         max_retries: u32,
         refusal_retries: u32,
@@ -672,7 +672,7 @@ impl ApiMethods {
         tools: &ToolRegistry,
         system_prompt: &Option<String>,
         thinking_budget: u32,
-        messages: &[Value],
+        messages: &[crate::SharedMessage],
         tx: mpsc::UnboundedSender<StreamEvent>,
         cancel: &CancellationToken,
         max_retries: u32,
@@ -706,6 +706,8 @@ impl ApiMethods {
 
         // Manual cache breakpoints for optimal prompt caching.
         // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
+        // Arc-shared (#128): to_vec() on &[SharedMessage] is N refcount bumps,
+        // not a deep copy; sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
         // Strip empty/invalid thinking blocks before they hit the API. See
         // `sanitize_thinking_blocks` for the failure mode this guards against.
@@ -2504,7 +2506,7 @@ mod on401_tests {
     ) -> crate::error::Result<serde_json::Value> {
         let client = Client::new();
         let tools = ToolRegistry::new();
-        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let messages = vec![std::sync::Arc::new(json!({"role": "user", "content": "hi"}))];
         let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
         ApiMethods::call_api_stream(
             &auth,

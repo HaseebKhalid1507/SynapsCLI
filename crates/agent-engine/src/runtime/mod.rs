@@ -624,6 +624,11 @@ impl Runtime {
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
 
+        // Boundary adapter (#128 slice 3): Arc::new(value) moves each Value —
+        // zero deep copies. Outer callers convert to SharedMessage in slice 5.
+        let messages: Vec<crate::SharedMessage> =
+            messages.into_iter().map(std::sync::Arc::new).collect();
+
         ApiMethods::call_api_simple(
             &self.auth,
             &self.client,
@@ -642,7 +647,8 @@ impl Runtime {
         // Refresh OAuth token if expired
         self.refresh_if_needed().await?;
 
-        let mut messages = vec![json!({"role": "user", "content": prompt})];
+        let mut messages: Vec<crate::SharedMessage> =
+            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))];
 
         loop {
             let response = ApiMethods::call_api(
@@ -692,10 +698,10 @@ impl Runtime {
                 }
 
                 // Add assistant's response to conversation (only content, role)
-                messages.push(json!({
+                messages.push(std::sync::Arc::new(json!({
                     "role": "assistant",
                     "content": content
-                }));
+                })));
 
                 // Execute tools — parallel when multiple are requested
                 let mut tool_results = Vec::new();
@@ -925,10 +931,10 @@ impl Runtime {
                 }
 
                 // Add tool results to conversation
-                messages.push(json!({
+                messages.push(std::sync::Arc::new(json!({
                     "role": "user",
                     "content": tool_results
-                }));
+                })));
 
                 // Continue the loop to get Claude's response with tool results
             } else {

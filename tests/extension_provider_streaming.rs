@@ -20,10 +20,10 @@ fn sample_params() -> ProviderCompleteParams {
         provider_id: "stream-echo".to_string(),
         model_id: "stream-echo-mini".to_string(),
         model: "stream-echo:stream-echo-mini".to_string(),
-        messages: vec![serde_json::json!({
+        messages: vec![std::sync::Arc::new(serde_json::json!({
             "role": "user",
             "content": [{"type": "text", "text": "hi"}]
-        })],
+        }))],
         system_prompt: None,
         tools: vec![],
         temperature: None,

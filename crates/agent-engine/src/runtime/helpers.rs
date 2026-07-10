@@ -96,7 +96,7 @@ impl HelperMethods {
     ///      (the API rejects empty content arrays too).
     ///   4. Remove the marked messages, and merge any resulting consecutive
     ///      same-role messages so we don't violate Anthropic's alternation rule.
-    pub(super) fn sanitize_thinking_blocks(messages: &mut Vec<Value>) {
+    pub(super) fn sanitize_thinking_blocks(messages: &mut Vec<SharedMessage>) {
         // Equivalent to the original 3-pass implementation
         // (filter-empty-blocks → drop-empty-assistants → merge-adjacent-same-role),
         // fused into a single forward pass.
@@ -105,7 +105,7 @@ impl HelperMethods {
         //   * Non-assistant messages: untouched in both. Here we don't enter the
         //     retain branch and push the message through. ✓
         //   * Assistant with non-array `content`: original `as_array_mut()` is
-        //     `None` → `continue` (no retain, no removal). Here `as_array_mut()`
+        //     `None` → `continue` (no retain, no removal). Here `as_array()`
         //     also `None` → fall through to the merge stage unchanged. ✓
         //   * Assistant whose block filter empties `content`: original marks for
         //     removal in pass 2. Here we `continue` and skip the push. ✓
@@ -114,36 +114,48 @@ impl HelperMethods {
         //     against `out.last()` (the previous kept message), which IS the
         //     post-removal predecessor — same pairing, same order. ✓
         //
-        // Wins vs original:
-        //   * No O(N) `Vec::remove` shifts (was O(N²) worst-case).
-        //   * `coerce_content_to_blocks` is fed via `mem::take` instead of
-        //     `Value::clone()` — no recursive subtree clones during merges.
-        //   * Single allocation: `Vec::with_capacity(messages.len())`.
+        // Arc-sharing invariant (task #128 slice 3): messages this function does
+        // NOT edit are moved through untouched — the output element is literally
+        // the same `Arc` allocation as the input element (`Arc::ptr_eq`). Only a
+        // message that actually needs a block filtered or a merge applied is
+        // deep-cloned, via `Arc::make_mut` (bounded: that one message). In the
+        // healthy path this function edits nothing, so the whole pass is free.
+        fn block_is_valid(block: &Value) -> bool {
+            match block["type"].as_str() {
+                Some("thinking") => block["thinking"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                Some("redacted_thinking") => block["data"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                Some("text") => block["text"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                _ => true,
+            }
+        }
+
         let original = std::mem::take(messages);
-        let mut out: Vec<Value> = Vec::with_capacity(original.len());
+        let mut out: Vec<SharedMessage> = Vec::with_capacity(original.len());
         for mut msg in original {
             if msg["role"].as_str() == Some("assistant") {
-                if let Some(content) = msg["content"].as_array_mut() {
-                    content.retain(|block| match block["type"].as_str() {
-                        Some("thinking") => block["thinking"]
-                            .as_str()
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false),
-                        Some("redacted_thinking") => block["data"]
-                            .as_str()
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false),
-                        Some("text") => block["text"]
-                            .as_str()
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false),
-                        _ => true,
-                    });
-                    if content.is_empty() {
+                if let Some(content) = msg["content"].as_array() {
+                    let survivors = content.iter().filter(|b| block_is_valid(b)).count();
+                    if survivors == 0 {
                         // No salvageable content. The API rejects empty content
                         // arrays and empty text placeholders alike, so drop the
                         // whole message (matches Pass 2 of the original).
                         continue;
+                    }
+                    if survivors < content.len() {
+                        // Only clone-on-write when a block actually gets dropped.
+                        let m = Arc::make_mut(&mut msg);
+                        if let Some(content) = m["content"].as_array_mut() {
+                            content.retain(block_is_valid);
+                        }
                     }
                 }
             }
@@ -153,7 +165,13 @@ impl HelperMethods {
             // the original; preserves Anthropic's role-alternation rule).
             if let Some(last) = out.last_mut() {
                 if last["role"] == msg["role"] {
-                    let next_content = std::mem::take(&mut msg["content"]);
+                    // Take `msg`'s content without cloning when we hold the only
+                    // Arc; otherwise clone just this one message's content.
+                    let next_content = match Arc::try_unwrap(msg) {
+                        Ok(mut owned) => std::mem::take(&mut owned["content"]),
+                        Err(shared) => shared["content"].clone(),
+                    };
+                    let last = Arc::make_mut(last);
                     let prev_content = std::mem::take(&mut last["content"]);
                     let mut merged = Self::coerce_content_to_blocks(prev_content);
                     merged.extend(Self::coerce_content_to_blocks(next_content));
@@ -186,10 +204,14 @@ impl HelperMethods {
     ///
     /// The marker is the message-tail site: bare 5m under both `FiveMinutes`
     /// and `Hybrid`, `"ttl":"1h"` only under uniform `OneHour`.
-    pub(super) fn annotate_cache_breakpoint(messages: &mut [Value], ttl: CacheTtl) {
+    pub(super) fn annotate_cache_breakpoint(messages: &mut [SharedMessage], ttl: CacheTtl) {
         let Some(last) = messages.last_mut() else {
             return;
         };
+        // The last message is always edited (marker stamp), so the CoW clone
+        // here is the one unavoidable per-request message copy — exactly one
+        // message, never the history. Earlier messages are never touched.
+        let last = Arc::make_mut(last);
 
         // Coerce raw string content into a block array so we can attach cache_control.
         if let Some(text) = last["content"].as_str().map(str::to_owned) {
@@ -348,6 +370,76 @@ mod tests {
     use crate::core::config::CacheTtl;
     use serde_json::json;
 
+    /// Mechanical port shims (task #128 slice 3): the helpers now operate on
+    /// `[SharedMessage]`. These wrap the original `Vec<Value>` fixtures into
+    /// Arcs, run the real function, and unwrap back so every assertion below
+    /// stays byte-identical to the pre-Arc test suite.
+    fn sanitize_vals(msgs: &mut Vec<Value>) {
+        let mut shared: Vec<SharedMessage> = msgs.drain(..).map(Arc::new).collect();
+        HelperMethods::sanitize_thinking_blocks(&mut shared);
+        *msgs = shared
+            .into_iter()
+            .map(|m| Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()))
+            .collect();
+    }
+
+    fn annotate_vals(msgs: &mut Vec<Value>, ttl: CacheTtl) {
+        let mut shared: Vec<SharedMessage> = msgs.drain(..).map(Arc::new).collect();
+        HelperMethods::annotate_cache_breakpoint(&mut shared, ttl);
+        *msgs = shared
+            .into_iter()
+            .map(|m| Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()))
+            .collect();
+    }
+
+    /// Arc-sharing proof (task #128 slice 3): running the cleaned-messages
+    /// pipeline (share → sanitize no-op → annotate last) must NOT copy any
+    /// message it didn't edit. Every untouched message stays literally the
+    /// same allocation (`Arc::ptr_eq`); only the annotated last message
+    /// diverges — and the input side of it remains unmodified.
+    #[test]
+    fn cleaned_pipeline_shares_untouched_messages_ptr_eq() {
+        let input: Vec<SharedMessage> = vec![
+            Arc::new(json!({"role": "user", "content": "one"})),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "two"}]})),
+            Arc::new(json!({"role": "user", "content": "three"})),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "four"}]})),
+            Arc::new(json!({"role": "user", "content": "five"})),
+        ];
+
+        // Mirror of the request path: cleaned = share, sanitize, annotate.
+        let mut cleaned = input.to_vec();
+        HelperMethods::sanitize_thinking_blocks(&mut cleaned);
+        assert_eq!(cleaned.len(), input.len(), "sanitize must be a no-op here");
+        for (i, (a, b)) in input.iter().zip(cleaned.iter()).enumerate() {
+            assert!(
+                Arc::ptr_eq(a, b),
+                "message {i} must be shared (same Arc) after a no-op sanitize"
+            );
+        }
+
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned, CacheTtl::FiveMinutes);
+        for (i, (a, b)) in input.iter().zip(cleaned.iter()).enumerate() {
+            if i < input.len() - 1 {
+                assert!(
+                    Arc::ptr_eq(a, b),
+                    "untouched message {i} must remain the same Arc allocation"
+                );
+            } else {
+                assert!(
+                    !Arc::ptr_eq(a, b),
+                    "annotated last message must be a diverged copy"
+                );
+            }
+        }
+
+        // The edit was CoW: the input's last message is untouched...
+        assert!(input[4]["content"].is_string());
+        assert!(input[4]["content"].as_str() == Some("five"));
+        // ...while the cleaned copy carries the marker.
+        assert_eq!(cleaned[4]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
     #[test]
     fn sanitize_drops_empty_thinking_blocks() {
         let mut msgs = vec![json!({
@@ -357,7 +449,7 @@ mod tests {
                 {"type": "text", "text": "hello"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
@@ -372,7 +464,7 @@ mod tests {
                 {"type": "text", "text": "hello"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
     }
 
@@ -385,7 +477,7 @@ mod tests {
                 {"type": "text", "text": "hello"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
@@ -403,7 +495,7 @@ mod tests {
             }),
             json!({"role": "user", "content": "second"}),
         ];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         // Empty assistant message must be dropped entirely (cannot be turned into
         // an empty text block — the API rejects those too).
         // The two surrounding user messages must then be merged.
@@ -424,7 +516,7 @@ mod tests {
                 {"type": "text", "text": "real content"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "real content");
@@ -438,7 +530,7 @@ mod tests {
             json!({"role": "user", "content": [{"type": "text", "text": "b"}]}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
         ];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
@@ -452,7 +544,7 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
             json!({"role": "user", "content": "c"}),
         ];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         assert_eq!(msgs.len(), 3);
     }
 
@@ -464,7 +556,7 @@ mod tests {
                 {"type": "thinking", "thinking": "", "signature": "sig1"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         // We only police assistant messages — user messages would be malformed for
         // a different reason and aren't ours to rewrite.
         assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 1);
@@ -479,7 +571,7 @@ mod tests {
                 {"type": "text", "text": "hi"},
             ]
         })];
-        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        sanitize_vals(&mut msgs);
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
@@ -497,14 +589,14 @@ mod tests {
     #[test]
     fn cache_empty_messages_is_noop() {
         let mut msgs: Vec<Value> = vec![];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         assert!(msgs.is_empty());
     }
 
     #[test]
     fn cache_single_user_string_content_coerced_and_marked() {
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         let content = msgs[0]["content"]
             .as_array()
             .expect("coerced to block array");
@@ -523,7 +615,7 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "four"}]}),
             json!({"role": "user", "content": "five"}),
         ];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         for msg in &msgs[..4] {
             assert!(
                 !has_marker(msg),
@@ -542,7 +634,7 @@ mod tests {
             json!({"role": "user", "content": "question"}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
         ];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         assert!(!has_marker(&msgs[0]));
         assert!(has_marker(&msgs[1]), "single-last marks ANY trailing role");
         assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
@@ -558,7 +650,7 @@ mod tests {
                 {"type": "text", "text": "third"},
             ]
         })];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         let content = msgs[0]["content"].as_array().unwrap();
         assert!(content[0].get("cache_control").is_none());
         assert!(content[1].get("cache_control").is_none());
@@ -625,7 +717,7 @@ mod tests {
     #[test]
     fn cache_breakpoint_5m_has_no_ttl_key() {
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::FiveMinutes);
+        annotate_vals(&mut msgs, CacheTtl::FiveMinutes);
         let cc = &msgs[0]["content"][0]["cache_control"];
         assert_eq!(cc["type"], "ephemeral");
         assert!(
@@ -638,7 +730,7 @@ mod tests {
     #[test]
     fn cache_breakpoint_1h_emits_ttl() {
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::OneHour);
+        annotate_vals(&mut msgs, CacheTtl::OneHour);
         let cc = &msgs[0]["content"][0]["cache_control"];
         assert_eq!(cc["type"], "ephemeral");
         assert_eq!(cc["ttl"], "1h");
@@ -648,7 +740,7 @@ mod tests {
     fn cache_breakpoint_hybrid_message_tail_has_no_ttl_key() {
         // Hybrid's message-tail marker is the 5m one — bare ephemeral.
         let mut msgs = vec![json!({"role": "user", "content": "hello"})];
-        HelperMethods::annotate_cache_breakpoint(&mut msgs, CacheTtl::Hybrid);
+        annotate_vals(&mut msgs, CacheTtl::Hybrid);
         let cc = &msgs[0]["content"][0]["cache_control"];
         assert_eq!(cc["type"], "ephemeral");
         assert!(cc.get("ttl").is_none());
@@ -665,7 +757,7 @@ mod tests {
                     {"type": "text", "text": "b"},
                 ]}),
             ];
-            HelperMethods::annotate_cache_breakpoint(&mut msgs, ttl);
+            annotate_vals(&mut msgs, ttl);
             assert!(
                 !has_marker(&msgs[0]),
                 "earlier message unmarked under {ttl:?}"
@@ -794,7 +886,7 @@ mod tests {
         let prompt = Some("sys".to_string());
         body["system"] = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
         let mut messages = vec![json!({"role": "user", "content": "hi"})];
-        HelperMethods::annotate_cache_breakpoint(&mut messages, ttl);
+        annotate_vals(&mut messages, ttl);
         body["messages"] = json!(messages);
 
         // Collect (logical_order, ttl_str) for every marker in the body.
@@ -855,7 +947,7 @@ mod tests {
             }
         }
         let mut messages = vec![json!({"role": "user", "content": "hi"})];
-        HelperMethods::annotate_cache_breakpoint(&mut messages, ttl);
+        annotate_vals(&mut messages, ttl);
         assert_eq!(
             serde_json::to_string(&messages[0]["content"][0]["cache_control"]).unwrap(),
             r#"{"type":"ephemeral"}"#,
