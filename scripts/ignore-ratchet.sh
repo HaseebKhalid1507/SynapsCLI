@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-BASELINE=0  # P6.3: scenario_08 unignored (bounded async slash drive) — keep at zero
+BASELINE=1  # T241 slice 0: mem_transcript synthetic benchmark is #[ignore]d (slow, loads syntect)
 TARGET_DIR="crates/agent-tui/tests"
 
 # Resolve relative to repo root regardless of CWD.
