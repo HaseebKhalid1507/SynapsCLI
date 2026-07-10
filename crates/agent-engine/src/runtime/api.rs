@@ -715,44 +715,20 @@ impl ApiMethods {
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
         // Derive the thinking level from the budget for effort mapping.
-        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
-
-        let mut body = json!({
-            "model": model,
-            "max_tokens": HelperMethods::max_tokens_for_model(model),
-            "messages": cleaned_messages,
-            "tools": &*tools_schema,
-            "stream": true,
-            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
-                json!({ "type": "adaptive", "display": "summarized" })
-            } else {
-                // Legacy path requires budget_tokens >= 1024 (Anthropic enforced).
-                // If user picked "adaptive" (sentinel 0) on a legacy model, fall back
-                // to "high" (16384) — the model's effective thinking depth without
-                // the deprecated-but-functional adaptive shape it doesn't support.
-                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                    "display": "summarized"
-                })
-            }
-        });
-
-        // For adaptive models, control thinking depth via effort (GA, no beta).
-        // "adaptive" level = omit effort entirely (model decides).
-        if crate::core::models::model_supports_adaptive_thinking(model) {
-            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
-                body["output_config"] = json!({"effort": effort});
-            }
-        }
-
-        // Prompt caching: mark the last tool so all tool schemas are cached
-        HelperMethods::mark_last_tool(&mut body, options.cache_ttl);
-
-        if let Some(system) = HelperMethods::build_system_blocks(&auth_type, system_prompt, options.cache_ttl) {
-            body["system"] = system;
-        }
+        // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
+        // and the tool schemas instead of the old `json!` assembly that deep-
+        // rebuilt the entire history into a `Value` tree (copy C8). Byte-
+        // identical output is enforced by `runtime::body_golden`.
+        let body = super::request::RequestBody::new(
+            model,
+            &cleaned_messages,
+            &tools_schema,
+            system_prompt,
+            &auth_type,
+            thinking_budget,
+            options.cache_ttl,
+            true,
+        );
 
         // Did THIS request actually carry at least one 1h marker? Arms the
         // silent-downgrade detector. Mirrors cache_control_value(): OneHour
@@ -760,8 +736,8 @@ impl ApiMethods {
         // only on stable-prefix sites (tools, system). Degenerate hybrid +
         // API-key + no system prompt + zero tools → no 1h marker anywhere →
         // detector must stay disarmed (zero 1h bucket proves nothing).
-        let has_tool_marker = body["tools"].as_array().is_some_and(|t| !t.is_empty());
-        let has_system_marker = body.get("system").is_some();
+        let has_tool_marker = body.has_tool_marker();
+        let has_system_marker = body.has_system_marker();
         let request_has_1h_marker = match options.cache_ttl {
             crate::core::config::CacheTtl::FiveMinutes => false,
             crate::core::config::CacheTtl::OneHour => {

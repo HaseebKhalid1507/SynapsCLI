@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 mod api;
 mod api_sync;
 mod auth;
+#[cfg(test)]
+mod body_golden;
 pub mod compaction;
 pub(crate) mod helpers;
 pub mod openai;

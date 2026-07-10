@@ -84,39 +84,26 @@ impl ApiMethods {
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
 
-        let thinking_level = crate::core::models::thinking_level_for_budget(thinking_budget);
+        // Body assembly (#128 Slice 4): borrow the history instead of the old
+        // `json!` deep rebuild. Sync transport → no "stream" key. Byte-identity
+        // enforced by `runtime::body_golden` (sync_no_stream_1h fixture).
+        let tools_schema = tools.tools_schema();
+        let body = super::request::RequestBody::new(
+            model,
+            &cleaned_messages,
+            &tools_schema,
+            system_prompt,
+            &auth_type,
+            thinking_budget,
+            options.cache_ttl,
+            false,
+        );
 
-        let mut body = json!({
-            "model": model,
-            "max_tokens": HelperMethods::max_tokens_for_model(model),
-            "messages": cleaned_messages,
-            "tools": &*tools.tools_schema(),
-            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
-                json!({ "type": "adaptive", "display": "summarized" })
-            } else {
-                // Legacy path: budget_tokens must be >= 1024. Fall back to "high"
-                // if the sentinel 0 (adaptive) leaked through for a legacy model.
-                let budget = if thinking_budget == 0 { crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK } else { thinking_budget };
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                    "display": "summarized"
-                })
-            }
-        });
-
-        if crate::core::models::model_supports_adaptive_thinking(model) {
-            if let Some(effort) = crate::core::models::effort_for_thinking_level(thinking_level) {
-                body["output_config"] = json!({"effort": effort});
-            }
-        }
-
-        // Prompt caching: mark the last tool so all tool schemas are cached
-        HelperMethods::mark_last_tool(&mut body, options.cache_ttl);
-
-        if let Some(system) = HelperMethods::build_system_blocks(&auth_type, system_prompt, options.cache_ttl) {
-            body["system"] = system;
-        }
+        // Serialize once up-front; each retry attempt reuses the same bytes
+        // via a cheap `Bytes::clone()` (refcount bump, no copy).
+        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+            .map_err(|e| RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e)))?
+            .into();
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
         // 429 gets a higher budget (MAX_429_RETRIES) and honours rate-limit
@@ -143,7 +130,7 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.json(&body).send().await {
+                match req.body(body_bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {

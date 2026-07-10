@@ -223,16 +223,6 @@ impl HelperMethods {
         }
     }
 
-    /// Mark the last tool in `body["tools"]` so all tool schemas are cached.
-    /// Stable-prefix site — carries `"ttl":"1h"` under OneHour and Hybrid.
-    pub(super) fn mark_last_tool(body: &mut Value, ttl: CacheTtl) {
-        if let Some(tool_list) = body["tools"].as_array_mut() {
-            if let Some(last_tool) = tool_list.last_mut() {
-                last_tool["cache_control"] = cache_control_value(ttl, MarkerSite::StablePrefix);
-            }
-        }
-    }
-
     /// Build the `system` value for a request, with the cache marker on the
     /// last block. Shared by both transports so the auth-specific block
     /// layout (and the OAuth identity-first invariant) has exactly one truth.
@@ -775,43 +765,46 @@ mod tests {
         }
     }
 
-    // ── mark_last_tool (stable-prefix site, both transports) ────────────────
+    // ── last-tool marker (stable-prefix site, both transports) ──────────────
+    // Legacy `mark_last_tool` mutated the assembled body; #128 Slice 4 replaced
+    // it with `request::MarkedTools`, which stamps a clone of the last tool at
+    // serialization time. Same assertions, pre-assembly form.
 
-    fn tools_body() -> Value {
-        json!({"tools": [
-            {"name": "bash", "input_schema": {}},
-            {"name": "read", "input_schema": {}},
-        ]})
+    fn tools_list() -> Vec<Value> {
+        vec![
+            json!({"name": "bash", "input_schema": {}}),
+            json!({"name": "read", "input_schema": {}}),
+        ]
+    }
+
+    fn marked_tools_value(tools: &[Value], ttl: CacheTtl) -> Value {
+        serde_json::to_value(crate::runtime::request::MarkedTools::new(tools, ttl)).unwrap()
     }
 
     #[test]
     fn mark_last_tool_5m_is_bare_ephemeral() {
-        let mut body = tools_body();
-        HelperMethods::mark_last_tool(&mut body, CacheTtl::FiveMinutes);
-        assert!(body["tools"][0].get("cache_control").is_none());
+        let tools = tools_list();
+        let marked = marked_tools_value(&tools, CacheTtl::FiveMinutes);
+        assert!(marked[0].get("cache_control").is_none());
         assert_eq!(
-            serde_json::to_string(&body["tools"][1]["cache_control"]).unwrap(),
+            serde_json::to_string(&marked[1]["cache_control"]).unwrap(),
             r#"{"type":"ephemeral"}"#,
         );
+        // Input schemas are borrowed, never mutated.
+        assert!(tools[1].get("cache_control").is_none());
     }
 
     #[test]
     fn mark_last_tool_1h_and_hybrid_carry_ttl() {
         for ttl in [CacheTtl::OneHour, CacheTtl::Hybrid] {
-            let mut body = tools_body();
-            HelperMethods::mark_last_tool(&mut body, ttl);
-            assert_eq!(
-                body["tools"][1]["cache_control"]["ttl"], "1h",
-                "under {ttl:?}"
-            );
+            let marked = marked_tools_value(&tools_list(), ttl);
+            assert_eq!(marked[1]["cache_control"]["ttl"], "1h", "under {ttl:?}");
         }
     }
 
     #[test]
     fn mark_last_tool_no_tools_is_noop() {
-        let mut body = json!({"tools": []});
-        HelperMethods::mark_last_tool(&mut body, CacheTtl::OneHour);
-        assert_eq!(body, json!({"tools": []}));
+        assert_eq!(marked_tools_value(&[], CacheTtl::OneHour), json!([]));
     }
 
     // ── build_system_blocks (OAuth + API-key sites, both transports) ────────
@@ -881,8 +874,7 @@ mod tests {
     #[test]
     fn hybrid_ordering_invariant_1h_prefix_precedes_5m_tail() {
         let ttl = CacheTtl::Hybrid;
-        let mut body = tools_body();
-        HelperMethods::mark_last_tool(&mut body, ttl);
+        let mut body = json!({ "tools": marked_tools_value(&tools_list(), ttl) });
         let prompt = Some("sys".to_string());
         body["system"] = HelperMethods::build_system_blocks("oauth", &prompt, ttl).unwrap();
         let mut messages = vec![json!({"role": "user", "content": "hi"})];
@@ -932,8 +924,7 @@ mod tests {
     #[test]
     fn default_mode_full_body_markers_byte_identical_to_legacy() {
         let ttl = CacheTtl::FiveMinutes;
-        let mut body = tools_body();
-        HelperMethods::mark_last_tool(&mut body, ttl);
+        let body = json!({ "tools": marked_tools_value(&tools_list(), ttl) });
         let prompt = Some("sys".to_string());
         for auth in ["oauth", "api_key"] {
             let system = HelperMethods::build_system_blocks(auth, &prompt, ttl).unwrap();
