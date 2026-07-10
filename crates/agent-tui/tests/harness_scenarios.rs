@@ -1223,16 +1223,21 @@ fn perf_1000_msgs_cum_height_lookup_cached_no_per_frame_resum() {
     h.mouse(scroll_up_event()); // Clean cache, scroll-only frame
     h.reset_perf_probe();
     h.render();
-    assert_eq!(
-        h.render_count(),
-        0,
-        "scroll tick on a Clean cache must render 0 messages"
+    // Slice 3 (lazy transcript): a scroll tick that slides the viewport+halo
+    // window over a not-yet-promoted slot legitimately exact-renders it.
+    // The pin is that this stays O(halo-edge) — a handful — never O(n).
+    let renders = h.render_count();
+    assert!(
+        renders <= 4,
+        "scroll tick on a Clean cache must render at most the halo edge \
+         (≤ 4 messages), rendered {renders} — O(n) re-render leak"
     );
-    assert_eq!(
-        h.cum_height_writes(),
-        0,
-        "Clean frame must write 0 cumulative-offset entries — total height \
-         must be served from the cache, not re-summed O(n) per frame (lock L4)"
+    let writes = h.cum_height_writes();
+    assert!(
+        writes <= 64,
+        "scroll frame's correction splice must stay bounded by the distance \
+         from the corrected slot to the tail (§4.4 — here: window+halo near \
+         the bottom, ≤ 64 entries), wrote {writes} — O(n) re-sum leak (lock L4)"
     );
 
     // Tail growth: the offset cache splices from the watermark (k = n-1),

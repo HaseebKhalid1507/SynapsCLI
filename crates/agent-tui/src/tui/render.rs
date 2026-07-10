@@ -5,11 +5,16 @@ use ratatui::{
 };
 
 use super::app::SPINNER_FRAMES;
-use super::transcript::{ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER};
-use super::theme::THEME;
-use super::highlight::{highlight_tool_code, highlight_bash_output, highlight_read_output, try_highlight_grep_line, is_read_tool_output, clamp_line};
-use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
 use super::draw::{bash_trace, format_tool_name, tool_accent};
+use super::highlight::{
+    clamp_line, highlight_bash_output, highlight_read_output, highlight_tool_code,
+    is_read_tool_output, try_highlight_grep_line,
+};
+use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
+use super::theme::THEME;
+use super::transcript::{
+    ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
+};
 
 /// Lighten (or darken, with negative `amt`) an RGB colour additively per
 /// channel, clamped. Used to derive subtle panel backgrounds from the theme.
@@ -56,7 +61,13 @@ fn tool_panel_margin(viewport: usize) -> usize {
 /// text and padding) fronted by a coloured gutter bar in `accent`. The left
 /// `margin` stays transparent so the panel reads as inset; content is padded to
 /// `width` for a clean rectangle.
-fn panel_block(inner: Vec<Line<'static>>, accent: Color, bg: Color, width: usize, margin: usize) -> Vec<Line<'static>> {
+fn panel_block(
+    inner: Vec<Line<'static>>,
+    accent: Color,
+    bg: Color,
+    width: usize,
+    margin: usize,
+) -> Vec<Line<'static>> {
     if inner.is_empty() {
         return inner;
     }
@@ -137,7 +148,11 @@ impl LineSink {
         debug_assert_eq!(self.lines.len(), self.meta.len());
         // Always materialized at render time; demotion (lines → None) is a
         // separate second-half pass over slots leaving the viewport window.
-        MsgSlot { lines: Some(self.lines), meta: self.meta }
+        MsgSlot {
+            lines: Some(self.lines),
+            height: super::transcript::HeightState::Exact(self.meta.len()),
+            meta: Some(self.meta),
+        }
     }
 }
 
@@ -198,12 +213,13 @@ pub(crate) fn classify_row(
     let slice = &source_line[start..end];
     // L1, literal: the rendered row must end with the source slice
     // byte-identically (trailing space padding tolerated per above).
-    if !rendered_text.ends_with(slice)
-        && !rendered_text.trim_end_matches(' ').ends_with(slice)
-    {
+    if !rendered_text.ends_with(slice) && !rendered_text.trim_end_matches(' ').ends_with(slice) {
         return fallback;
     }
-    LineMeta::Content { range: (line_off + start)..(line_off + end), content_col }
+    LineMeta::Content {
+        range: (line_off + start)..(line_off + end),
+        content_col,
+    }
 }
 
 impl TranscriptStore {
@@ -214,7 +230,12 @@ impl TranscriptStore {
     /// would make inside `render_lines`, assuming the same prev-message context.
     /// Ephemeral App state (spinner frame, streaming flag, agent name) crosses
     /// the seam via `ctx` — see [`RenderCtx`].
-    pub(crate) fn render_message_lines(&self, idx: usize, width: usize, ctx: &RenderCtx<'_>) -> MsgSlot {
+    pub(crate) fn render_message_lines(
+        &self,
+        idx: usize,
+        width: usize,
+        ctx: &RenderCtx<'_>,
+    ) -> MsgSlot {
         // P11 perf probe (§5.2 / lock L4): measurement IS the render, so
         // counting calls here counts both. Compiled out of production.
         #[cfg(any(test, feature = "testing"))]
@@ -231,7 +252,10 @@ impl TranscriptStore {
                 // Top margin
                 lines.push(Line::from(""));
                 // Top padding
-                lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                lines.push(Line::from(Span::styled(
+                    format!("{:<width$}", "", width = width),
+                    bg,
+                )));
                 // Header: chevron + name + timestamp right-aligned
                 let label = format!("{}\u{276f} you", m);
                 let ts_str = format!("{} ", ts);
@@ -239,23 +263,37 @@ impl TranscriptStore {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{}{}", label, " ".repeat(gap)),
-                        Style::default().fg(THEME.load().user_color).bg(THEME.load().user_bg).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(THEME.load().user_color)
+                            .bg(THEME.load().user_bg)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(ts_str, Style::default().fg(THEME.load().muted).bg(THEME.load().user_bg)),
+                    Span::styled(
+                        ts_str,
+                        Style::default()
+                            .fg(THEME.load().muted)
+                            .bg(THEME.load().user_bg),
+                    ),
                 ]));
                 // Content — just render the text (pasted messages already contain "[Pasted N lines]")
-                let style = Style::default().fg(THEME.load().user_color).bg(THEME.load().user_bg);
+                let style = Style::default()
+                    .fg(THEME.load().user_color)
+                    .bg(THEME.load().user_bg);
                 for (src_line, line_off, line) in source_lines(text) {
                     let composed = format!("{}  {}", m, line);
                     let prefix_len = m.len() + 2;
                     for row in wrap_text_spans(&composed, width) {
                         let rendered = format!("{:<width$}", row.text, width = width);
-                        let meta = classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
+                        let meta =
+                            classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
                         lines.push_meta(Line::from(Span::styled(rendered, style)), meta);
                     }
                 }
                 // Bottom padding
-                lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                lines.push(Line::from(Span::styled(
+                    format!("{:<width$}", "", width = width),
+                    bg,
+                )));
                 // Bottom margin
                 lines.push(Line::from(""));
             }
@@ -263,7 +301,8 @@ impl TranscriptStore {
             ChatMessage::Thinking(text) => {
                 // Only add spacing if previous message wasn't a User block
                 // (User blocks already have bottom margin)
-                let prev_was_user = i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::User(_));
+                let prev_was_user =
+                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::User(_));
                 if !prev_was_user {
                     lines.push(Line::from(""));
                 }
@@ -271,7 +310,10 @@ impl TranscriptStore {
                 let dim_italic = dim.add_modifier(Modifier::ITALIC);
                 // Header
                 let thinking_label = if text == THINKING_PLACEHOLDER {
-                    let braille = ['\u{28fe}','\u{28f7}','\u{28ef}','\u{28df}','\u{287f}','\u{28bf}','\u{28fb}','\u{28fd}'];
+                    let braille = [
+                        '\u{28fe}', '\u{28f7}', '\u{28ef}', '\u{28df}', '\u{287f}', '\u{28bf}',
+                        '\u{28fb}', '\u{28fd}',
+                    ];
                     let idx = (ctx.spinner_frame / 4) % braille.len();
                     let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
                     format!("{} thinking", wave)
@@ -304,7 +346,10 @@ impl TranscriptStore {
                     let meta = if is_placeholder {
                         LineMeta::Chrome
                     } else {
-                        LineMeta::ContentLine { msg_idx: i, src_line: *src_line }
+                        LineMeta::ContentLine {
+                            msg_idx: i,
+                            src_line: *src_line,
+                        }
                     };
                     let trimmed = line.trim();
                     let is_last = k == show - 1 && non_empty.len() <= 8;
@@ -312,19 +357,21 @@ impl TranscriptStore {
                     let continuation = "│";
 
                     // Detect structure in thinking
-                    let (prefix_char, line_style) = if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                        ("· ", dim_italic)
-                    } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
-                        ("", dim.add_modifier(Modifier::BOLD))
-                    } else if trimmed.starts_with("```") {
-                        ("", dim.add_modifier(Modifier::DIM))
-                    } else {
-                        ("", dim_italic)
-                    };
+                    let (prefix_char, line_style) =
+                        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                            ("· ", dim_italic)
+                        } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
+                            ("", dim.add_modifier(Modifier::BOLD))
+                        } else if trimmed.starts_with("```") {
+                            ("", dim.add_modifier(Modifier::DIM))
+                        } else {
+                            ("", dim_italic)
+                        };
 
                     // Wrap manually to preserve connector on each line
                     let first_prefix = format!("{}{} {}", m, connector, prefix_char);
-                    let cont_prefix = format!("{}{} {}", m, continuation, " ".repeat(prefix_char.len()));
+                    let cont_prefix =
+                        format!("{}{} {}", m, continuation, " ".repeat(prefix_char.len()));
 
                     if content_width > 10 {
                         let chars: Vec<char> = trimmed.chars().collect();
@@ -333,24 +380,35 @@ impl TranscriptStore {
                         while pos < chars.len() {
                             let chunk_len = content_width.min(chars.len() - pos);
                             let chunk: String = chars[pos..pos + chunk_len].iter().collect();
-                            let prefix = if is_first { &first_prefix } else { &cont_prefix };
-                            lines.push_meta(Line::from(Span::styled(
-                                format!("{}{}", prefix, chunk),
-                                line_style,
-                            )), meta.clone());
+                            let prefix = if is_first {
+                                &first_prefix
+                            } else {
+                                &cont_prefix
+                            };
+                            lines.push_meta(
+                                Line::from(Span::styled(
+                                    format!("{}{}", prefix, chunk),
+                                    line_style,
+                                )),
+                                meta.clone(),
+                            );
                             pos += chunk_len;
                             is_first = false;
                         }
                     } else {
-                        lines.push_meta(Line::from(Span::styled(
-                            format!("{}{}", first_prefix, trimmed),
-                            line_style,
-                        )), meta);
+                        lines.push_meta(
+                            Line::from(Span::styled(
+                                format!("{}{}", first_prefix, trimmed),
+                                line_style,
+                            )),
+                            meta,
+                        );
                     }
                 }
                 if non_empty.len() > 8 {
                     lines.push(Line::from(Span::styled(
-                        format!("{}╰ +{} lines", m, non_empty.len() - 8), dim,
+                        format!("{}╰ +{} lines", m, non_empty.len() - 8),
+                        dim,
                     )));
                 }
             }
@@ -358,7 +416,8 @@ impl TranscriptStore {
             ChatMessage::Text(text) => {
                 // Separator between user block and agent response
                 // After thinking: just a single blank line (no separator)
-                let prev_was_thinking = i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
+                let prev_was_thinking =
+                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
                 if prev_was_thinking {
                     lines.push(Line::from(""));
                 } else if i > 0 {
@@ -367,7 +426,8 @@ impl TranscriptStore {
                     let sep_half = sep_total / 2;
                     let sep_left: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
                     let sep_right: String = "\u{2500}".repeat(sep_half.saturating_sub(2));
-                    let sep_content_width = sep_left.chars().count() + 3 + sep_right.chars().count();
+                    let sep_content_width =
+                        sep_left.chars().count() + 3 + sep_right.chars().count();
                     let pad_left = width.saturating_sub(sep_content_width) / 2;
                     lines.push(Line::from(vec![
                         Span::styled(" ".repeat(pad_left), Style::default()),
@@ -399,14 +459,17 @@ impl TranscriptStore {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{}{}", label, " ".repeat(gap)),
-                        Style::default().fg(label_color).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(label_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(ts_str, Style::default().fg(THEME.load().muted)),
                 ]));
                 // Body
                 if text.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        format!("{}   \u{2026}", m), Style::default().fg(THEME.load().muted),
+                        format!("{}   \u{2026}", m),
+                        Style::default().fg(THEME.load().muted),
                     )));
                 } else {
                     // Slice (c): render_markdown_spans classifies per lock L1 —
@@ -420,7 +483,11 @@ impl TranscriptStore {
                 }
             }
 
-            ChatMessage::ToolUseStart { tool_name, partial_input, .. } => {
+            ChatMessage::ToolUseStart {
+                tool_name,
+                partial_input,
+                ..
+            } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
                 // Breathing room before tool block
@@ -431,10 +498,16 @@ impl TranscriptStore {
                 let mut header = vec![
                     Span::styled(m.to_string(), Style::default().fg(accent)),
                     Span::styled(format!("{} ", icon), Style::default().fg(accent)),
-                    Span::styled(display_name, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        display_name,
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    ),
                 ];
                 if let Some(tag) = server_tag {
-                    header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
+                    header.push(Span::styled(
+                        format!(" [{}]", tag),
+                        Style::default().fg(THEME.load().muted),
+                    ));
                 }
                 // Show elapsed time while tool is running
                 let elapsed_str = if let Some(start) = self.tool_start_time() {
@@ -458,7 +531,9 @@ impl TranscriptStore {
                 } else {
                     header.push(Span::styled(
                         format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
-                        Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(THEME.load().status_streaming)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
                 lines.push(Line::from(header));
@@ -473,7 +548,10 @@ impl TranscriptStore {
                 // message"). The D4 tail rule extends a selection over the
                 // card's last row to the fragment's end.
                 if !partial_input.is_empty() {
-                    let preview_meta = LineMeta::ContentLine { msg_idx: i, src_line: 0 };
+                    let preview_meta = LineMeta::ContentLine {
+                        msg_idx: i,
+                        src_line: 0,
+                    };
                     let param_style = Style::default().fg(THEME.load().tool_param);
                     // Unescape \n in JSON string to real newlines for display
                     let unescaped = partial_input.replace("\\n", "\n").replace("\\t", "  ");
@@ -519,7 +597,9 @@ impl TranscriptStore {
                 );
             }
 
-            ChatMessage::ToolUse { tool_name, input, .. } => {
+            ChatMessage::ToolUse {
+                tool_name, input, ..
+            } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
                 // Breathing room before tool block
@@ -531,19 +611,30 @@ impl TranscriptStore {
                 let mut header = vec![
                     Span::styled(m.to_string(), Style::default().fg(accent)),
                     Span::styled(format!("{} ", icon), Style::default().fg(accent)),
-                    Span::styled(display_name, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        display_name,
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    ),
                 ];
                 if let Some(tag) = server_tag {
-                    header.push(Span::styled(format!(" [{}]", tag), Style::default().fg(THEME.load().muted)));
+                    header.push(Span::styled(
+                        format!(" [{}]", tag),
+                        Style::default().fg(THEME.load().muted),
+                    ));
                 }
                 // If this is the last message and a tool is executing, show animation
                 let is_last = i == self.messages().len() - 1;
                 if is_last && self.tool_start_time().is_some() {
                     let elapsed_str = if let Some(start) = self.tool_start_time() {
                         let secs = start.elapsed().as_secs_f64();
-                        if secs >= 1.0 { format!(" {:.1}s", secs) }
-                        else { format!(" {}ms", (secs * 1000.0) as u64) }
-                    } else { String::new() };
+                        if secs >= 1.0 {
+                            format!(" {:.1}s", secs)
+                        } else {
+                            format!(" {}ms", (secs * 1000.0) as u64)
+                        }
+                    } else {
+                        String::new()
+                    };
 
                     if tool_name == "bash" {
                         let (trace, color) = bash_trace(ctx.spinner_frame);
@@ -555,7 +646,9 @@ impl TranscriptStore {
                         let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
                         header.push(Span::styled(
                             format!(" {} running{}", SPINNER_FRAMES[spinner_idx], elapsed_str),
-                            Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
+                            Style::default()
+                                .fg(THEME.load().status_streaming)
+                                .add_modifier(Modifier::DIM),
                         ));
                     }
                 }
@@ -593,7 +686,8 @@ impl TranscriptStore {
                     };
                     if let Some(obj) = parsed.as_object() {
                         // Extract file extension from "path" param if present (for syntax highlighting)
-                        let file_ext = obj.get("path")
+                        let file_ext = obj
+                            .get("path")
                             .and_then(|v| v.as_str())
                             .and_then(|p| std::path::Path::new(p).extension())
                             .map(|e| e.to_string_lossy().to_string())
@@ -625,26 +719,65 @@ impl TranscriptStore {
                                         _ => k.as_str(),
                                     };
                                     let header = format!("{}     {}: ({} lines)", m, label, total);
-                                    lines.push_meta(Line::from(Span::styled(header, param_style)), km.clone());
+                                    lines.push_meta(
+                                        Line::from(Span::styled(header, param_style)),
+                                        km.clone(),
+                                    );
 
                                     // Syntax highlight the code
-                                    let is_code_param = k == "content" || k == "old_string" || k == "new_string";
+                                    let is_code_param =
+                                        k == "content" || k == "old_string" || k == "new_string";
                                     if is_code_param && !file_ext.is_empty() {
-                                        let hl_lines = highlight_tool_code(&content_lines[..show], &file_ext, m, marker, marker_color);
+                                        let hl_lines = highlight_tool_code(
+                                            &content_lines[..show],
+                                            &file_ext,
+                                            m,
+                                            marker,
+                                            marker_color,
+                                        );
                                         for hl_line in hl_lines {
                                             lines.push_meta(clamp_line(hl_line, width), km.clone());
                                         }
                                     } else {
-                                        for (ci, cline) in content_lines.iter().take(show).enumerate() {
-                                            lines.push_meta(clamp_line(Line::from(vec![
-                                                Span::styled(format!("{}    {:>3} {} ", m, ci + 1, marker), Style::default().fg(marker_color)),
-                                                Span::styled(cline.to_string(), param_style),
-                                            ]), width), km.clone());
+                                        for (ci, cline) in
+                                            content_lines.iter().take(show).enumerate()
+                                        {
+                                            lines.push_meta(
+                                                clamp_line(
+                                                    Line::from(vec![
+                                                        Span::styled(
+                                                            format!(
+                                                                "{}    {:>3} {} ",
+                                                                m,
+                                                                ci + 1,
+                                                                marker
+                                                            ),
+                                                            Style::default().fg(marker_color),
+                                                        ),
+                                                        Span::styled(
+                                                            cline.to_string(),
+                                                            param_style,
+                                                        ),
+                                                    ]),
+                                                    width,
+                                                ),
+                                                km.clone(),
+                                            );
                                         }
                                     }
                                     if total > max_preview {
-                                        let omit = format!("{}       … +{} more lines", m, total - max_preview);
-                                        lines.push_meta(Line::from(Span::styled(omit, Style::default().fg(THEME.load().muted))), km.clone());
+                                        let omit = format!(
+                                            "{}       … +{} more lines",
+                                            m,
+                                            total - max_preview
+                                        );
+                                        lines.push_meta(
+                                            Line::from(Span::styled(
+                                                omit,
+                                                Style::default().fg(THEME.load().muted),
+                                            )),
+                                            km.clone(),
+                                        );
                                     }
                                 } else {
                                     let val = if s.len() > 120 {
@@ -655,14 +788,20 @@ impl TranscriptStore {
                                     };
                                     let line_str = format!("{}     {}: {}", m, k, val);
                                     for wline in wrap_text(&line_str, width) {
-                                        lines.push_meta(Line::from(Span::styled(wline, param_style)), km.clone());
+                                        lines.push_meta(
+                                            Line::from(Span::styled(wline, param_style)),
+                                            km.clone(),
+                                        );
                                     }
                                 }
                             } else {
                                 let val = v.to_string();
                                 let line_str = format!("{}     {}: {}", m, k, val);
                                 for wline in wrap_text(&line_str, width) {
-                                    lines.push_meta(Line::from(Span::styled(wline, param_style)), km.clone());
+                                    lines.push_meta(
+                                        Line::from(Span::styled(wline, param_style)),
+                                        km.clone(),
+                                    );
                                 }
                             }
                         }
@@ -676,7 +815,11 @@ impl TranscriptStore {
                 );
             }
 
-            ChatMessage::ToolResult { ref content, elapsed_ms, .. } => {
+            ChatMessage::ToolResult {
+                ref content,
+                elapsed_ms,
+                ..
+            } => {
                 let margin = tool_panel_margin(width);
                 let width = tool_panel_width(width);
                 let result = content;
@@ -724,19 +867,32 @@ impl TranscriptStore {
                 if let Some(hl_lines) = highlighted_lines {
                     if !is_error && !is_timeout {
                         for (li, hl_line) in hl_lines.into_iter().enumerate() {
-                            let dimmed_spans: Vec<Span> = hl_line.spans.into_iter().map(|span| {
-                                Span::styled(span.content, span.style.add_modifier(Modifier::DIM))
-                            }).collect();
+                            let dimmed_spans: Vec<Span> = hl_line
+                                .spans
+                                .into_iter()
+                                .map(|span| {
+                                    Span::styled(
+                                        span.content,
+                                        span.style.add_modifier(Modifier::DIM),
+                                    )
+                                })
+                                .collect();
                             lines.push_meta(
                                 clamp_line(Line::from(dimmed_spans), width),
-                                LineMeta::ContentLine { msg_idx: i, src_line: li },
+                                LineMeta::ContentLine {
+                                    msg_idx: i,
+                                    src_line: li,
+                                },
                             );
                         }
                     } else {
                         for (li, hl_line) in hl_lines.into_iter().enumerate() {
                             lines.push_meta(
                                 clamp_line(hl_line, width),
-                                LineMeta::ContentLine { msg_idx: i, src_line: li },
+                                LineMeta::ContentLine {
+                                    msg_idx: i,
+                                    src_line: li,
+                                },
                             );
                         }
                     }
@@ -747,17 +903,27 @@ impl TranscriptStore {
                             if let Some(grep_spans) = try_highlight_grep_line(line, m) {
                                 lines.push_meta(
                                     clamp_line(Line::from(grep_spans), width),
-                                    LineMeta::ContentLine { msg_idx: i, src_line: li },
+                                    LineMeta::ContentLine {
+                                        msg_idx: i,
+                                        src_line: li,
+                                    },
                                 );
                                 continue;
                             }
                         }
                         let full = format!("{}       {}", m, line);
                         for wline in wrap_text(&full, width) {
-                            let body_style = if is_error || is_timeout { style } else { style.add_modifier(Modifier::DIM) };
+                            let body_style = if is_error || is_timeout {
+                                style
+                            } else {
+                                style.add_modifier(Modifier::DIM)
+                            };
                             lines.push_meta(
                                 Line::from(Span::styled(wline, body_style)),
-                                LineMeta::ContentLine { msg_idx: i, src_line: li },
+                                LineMeta::ContentLine {
+                                    msg_idx: i,
+                                    src_line: li,
+                                },
                             );
                         }
                     }
@@ -772,7 +938,10 @@ impl TranscriptStore {
                             format!("{}       +{} lines", m, result_lines.len() - show),
                             Style::default().fg(THEME.load().muted),
                         )),
-                        LineMeta::ContentLine { msg_idx: i, src_line: show },
+                        LineMeta::ContentLine {
+                            msg_idx: i,
+                            src_line: show,
+                        },
                     );
                 }
 
@@ -786,34 +955,48 @@ impl TranscriptStore {
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)", m, result_lines.len()),
+                            format!(
+                                "{}     \u{2514}\u{2500} \u{26a0} timed out ({} lines)",
+                                m,
+                                result_lines.len()
+                            ),
                             Style::default().fg(THEME.load().warning_color),
                         ),
-                        Span::styled(
-                            elapsed_str,
-                            Style::default().fg(THEME.load().subagent_time),
-                        ),
+                        Span::styled(elapsed_str, Style::default().fg(THEME.load().subagent_time)),
                     ]));
                 } else if !is_error && show > 0 {
                     if self.is_active_tool_result(i) {
                         // Tool still executing — show animation only for the active result.
                         let elapsed_str = if let Some(start) = self.tool_start_time() {
                             let secs = start.elapsed().as_secs_f64();
-                            if secs >= 1.0 { format!(" {:.1}s", secs) }
-                            else { format!(" {}ms", (secs * 1000.0) as u64) }
-                        } else { String::new() };
+                            if secs >= 1.0 {
+                                format!(" {:.1}s", secs)
+                            } else {
+                                format!(" {}ms", (secs * 1000.0) as u64)
+                            }
+                        } else {
+                            String::new()
+                        };
 
                         if preceding_tool.as_deref() == Some("bash") {
                             let (trace, color) = bash_trace(ctx.spinner_frame);
                             lines.push(Line::from(vec![
                                 Span::styled(format!("{}     ", m), Style::default()),
-                                Span::styled(format!("{}{}", trace, elapsed_str), Style::default().fg(color)),
+                                Span::styled(
+                                    format!("{}{}", trace, elapsed_str),
+                                    Style::default().fg(color),
+                                ),
                             ]));
                         } else {
                             let spinner_idx = (ctx.spinner_frame / 3) % SPINNER_FRAMES.len();
                             lines.push(Line::from(Span::styled(
-                                format!("{}     {} running{}", m, SPINNER_FRAMES[spinner_idx], elapsed_str),
-                                Style::default().fg(THEME.load().status_streaming).add_modifier(Modifier::DIM),
+                                format!(
+                                    "{}     {} running{}",
+                                    m, SPINNER_FRAMES[spinner_idx], elapsed_str
+                                ),
+                                Style::default()
+                                    .fg(THEME.load().status_streaming)
+                                    .add_modifier(Modifier::DIM),
                             )));
                         }
                     } else {
@@ -824,7 +1007,11 @@ impl TranscriptStore {
                         };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}     \u{2514}\u{2500} ok ({} lines)", m, result_lines.len()),
+                                format!(
+                                    "{}     \u{2514}\u{2500} ok ({} lines)",
+                                    m,
+                                    result_lines.len()
+                                ),
                                 Style::default().fg(THEME.load().tool_result_ok),
                             ),
                             Span::styled(
@@ -867,7 +1054,8 @@ impl TranscriptStore {
                         // wrap_text emits the prefix on every output row;
                         // strip ours so we can re-add the glyph or padding
                         // exactly once at the head.
-                        let body = row.text
+                        let body = row
+                            .text
                             .strip_prefix(&strip)
                             .unwrap_or(&row.text)
                             .to_string();
@@ -883,11 +1071,15 @@ impl TranscriptStore {
                         // (L1) verifies the source suffix survived the
                         // strip/re-prefix dance byte-for-byte.
                         let rendered = format!("{}{}", prefix, body);
-                        let meta = classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
-                        lines.push_meta(Line::from(vec![
-                            Span::styled(prefix, err_style),
-                            Span::styled(body, err_style),
-                        ]), meta);
+                        let meta =
+                            classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
+                        lines.push_meta(
+                            Line::from(vec![
+                                Span::styled(prefix, err_style),
+                                Span::styled(body, err_style),
+                            ]),
+                            meta,
+                        );
                     }
                 }
             }
@@ -904,39 +1096,58 @@ impl TranscriptStore {
                 // then wrap each line on word boundaries to fit `width`.
                 // Mirrors the User/Text pattern using wrap_text() so all
                 // chat content wraps consistently.
-                let style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
+                let style = Style::default()
+                    .fg(THEME.load().muted)
+                    .add_modifier(Modifier::DIM);
                 for (src_line, line_off, line) in source_lines(msg) {
                     let prefix_len = m.len() + 2;
                     for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
-                        let meta = classify_row(&row.text, &row, line, line_off, prefix_len, i, src_line);
+                        let meta =
+                            classify_row(&row.text, &row, line, line_off, prefix_len, i, src_line);
                         let text = row.text;
                         lines.push_meta(Line::from(Span::styled(text, style)), meta);
                     }
                 }
             }
 
-            ChatMessage::Event { source, severity, text } => {
+            ChatMessage::Event {
+                source,
+                severity,
+                text,
+            } => {
                 let theme = THEME.load();
                 let (icon, sev_color) = match severity.as_str() {
                     "critical" => ("🔴", theme.event_critical),
-                    "high"     => ("🟠", theme.event_icon),
-                    "medium"   => ("🟡", theme.event_icon),
-                    "low"      => ("🔵", theme.event_source),
-                    _          => ("📨", theme.event_icon),
+                    "high" => ("🟠", theme.event_icon),
+                    "medium" => ("🟡", theme.event_icon),
+                    "low" => ("🔵", theme.event_source),
+                    _ => ("📨", theme.event_icon),
                 };
                 let event_bg = Color::Rgb(30, 35, 45);
                 let bg = Style::default().bg(event_bg);
                 // Top spacing
                 lines.push(Line::from(""));
                 // Top padding
-                lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                lines.push(Line::from(Span::styled(
+                    format!("{:<width$}", "", width = width),
+                    bg,
+                )));
                 // Header: icon + source (severity is not rendered as a span)
                 let header = format!("{}  {} [{}]", m, icon, source);
                 let ts_str = format!("{} ", ts);
                 let gap = width.saturating_sub(header.chars().count() + ts_str.chars().count());
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{}  {} ", m, icon), Style::default().fg(sev_color).bg(event_bg)),
-                    Span::styled(format!("[{}]", source), Style::default().fg(theme.event_source).bg(event_bg).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{}  {} ", m, icon),
+                        Style::default().fg(sev_color).bg(event_bg),
+                    ),
+                    Span::styled(
+                        format!("[{}]", source),
+                        Style::default()
+                            .fg(theme.event_source)
+                            .bg(event_bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(" ".repeat(gap).to_string(), Style::default().bg(event_bg)),
                     Span::styled(ts_str, Style::default().fg(theme.muted).bg(event_bg)),
                 ]));
@@ -946,12 +1157,16 @@ impl TranscriptStore {
                     let prefix_len = m.len() + 2;
                     for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
                         let rendered = format!("{:<width$}", row.text, width = width);
-                        let meta = classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
+                        let meta =
+                            classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
                         lines.push_meta(Line::from(Span::styled(rendered, text_style)), meta);
                     }
                 }
                 // Bottom padding
-                lines.push(Line::from(Span::styled(format!("{:<width$}", "", width = width), bg)));
+                lines.push(Line::from(Span::styled(
+                    format!("{:<width$}", "", width = width),
+                    bg,
+                )));
                 lines.push(Line::from(""));
             }
         }
@@ -967,7 +1182,11 @@ impl TranscriptStore {
     pub(crate) fn render_lines(&self, width: usize, ctx: &RenderCtx<'_>) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for i in 0..self.messages().len() {
-            lines.extend(self.render_message_lines(i, width, ctx).lines.expect("freshly rendered slot has lines"));
+            lines.extend(
+                self.render_message_lines(i, width, ctx)
+                    .lines
+                    .expect("freshly rendered slot has lines"),
+            );
         }
         lines
     }
@@ -990,14 +1209,16 @@ fn is_grouped_system_continuation(prev: &str, current: &str) -> bool {
         || prev.trim_end().ends_with('…')
 }
 
-
-
 #[cfg(test)]
 mod meta_tests {
     use super::super::transcript::{ChatMessage, LineMeta, RenderCtx, TranscriptStore};
 
     fn ctx() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "agent" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "agent",
+        }
     }
 
     fn flatten(line: &ratatui::text::Line<'static>) -> String {
@@ -1015,9 +1236,12 @@ mod meta_tests {
     fn msg_entry_meta_parallel_and_content_ranges_sound() {
         let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
         store.push_msg(ChatMessage::User(
-            "hello there\nsecond user line that is long enough to wrap at forty columns easily".into(),
+            "hello there\nsecond user line that is long enough to wrap at forty columns easily"
+                .into(),
         ));
-        store.push_msg(ChatMessage::Thinking("pondering the request at hand".into()));
+        store.push_msg(ChatMessage::Thinking(
+            "pondering the request at hand".into(),
+        ));
         store.push_msg(ChatMessage::Text(
             "Some **markdown** text with `code`\n\n```rust\nlet x = 1;\n```".into(),
         ));
@@ -1031,7 +1255,9 @@ mod meta_tests {
             content: "a.txt\nb.txt\nline\twith\ttabs\nmore output text".into(),
             elapsed_ms: Some(5),
         });
-        store.push_msg(ChatMessage::Error("boom happened\nwith a second error line".into()));
+        store.push_msg(ChatMessage::Error(
+            "boom happened\nwith a second error line".into(),
+        ));
         store.push_msg(ChatMessage::System(
             "system notice spanning enough words to wrap at narrow widths for coverage".into(),
         ));
@@ -1058,11 +1284,11 @@ mod meta_tests {
                 let entry = store.render_message_lines(idx, width, &ctx());
                 assert_eq!(
                     entry.lines().len(),
-                    entry.meta.len(),
+                    entry.meta_slice().len(),
                     "meta must stay parallel to lines (msg {idx}, width {width})"
                 );
                 let mut prev_end = 0usize;
-                for (row, meta) in entry.meta.iter().enumerate() {
+                for (row, meta) in entry.meta_slice().iter().enumerate() {
                     match meta {
                         LineMeta::Chrome => {}
                         LineMeta::Content { range, content_col } => {
@@ -1075,7 +1301,8 @@ mod meta_tests {
                                 "Content range {range:?} out of bounds (msg {idx} row {row}, width {width})"
                             );
                             assert!(
-                                source.is_char_boundary(range.start) && source.is_char_boundary(range.end),
+                                source.is_char_boundary(range.start)
+                                    && source.is_char_boundary(range.end),
                                 "Content range {range:?} splits a char (msg {idx} row {row})"
                             );
                             assert!(
@@ -1113,7 +1340,10 @@ mod meta_tests {
         for (idx, wants_content) in [(0usize, true), (6, true), (5, true)] {
             let entry = store.render_message_lines(idx, 80, &ctx());
             assert_eq!(
-                entry.meta.iter().any(|m| matches!(m, LineMeta::Content { .. })),
+                entry
+                    .meta_slice()
+                    .iter()
+                    .any(|m| matches!(m, LineMeta::Content { .. })),
                 wants_content,
                 "msg {idx} should emit Content rows for its plain wrapped body"
             );
@@ -1121,7 +1351,10 @@ mod meta_tests {
         // ToolResult rows are line-mapped (L2).
         let entry = store.render_message_lines(4, 80, &ctx());
         assert!(
-            entry.meta.iter().any(|m| matches!(m, LineMeta::ContentLine { .. })),
+            entry
+                .meta_slice()
+                .iter()
+                .any(|m| matches!(m, LineMeta::ContentLine { .. })),
             "ToolResult content rows must be ContentLine-mapped"
         );
     }
