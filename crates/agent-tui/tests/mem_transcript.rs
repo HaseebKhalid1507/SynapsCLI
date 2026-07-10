@@ -193,21 +193,22 @@ fn mem_transcript_four_checkpoint_baseline() {
 
     // ── Baseline assertions (REWRITE IN SLICE 4) ─────────────────────────────
     //
-    // BASELINE — these assertions document today's pathology.
-    // Slice 4 inverts them to the I-RENDER / I-HILITE ratchets.
+    // POST-SLICE-3 RATCHETS — lazy measurement is active; first frame renders
+    // only viewport + halo, not all messages.
 
-    // First-frame renders == total messages (O(n) eager).
-    assert_eq!(
-        cp3_renders, TOTAL,
-        "BASELINE: cold Missing renders all {TOTAL} messages on first frame. \
-         Slice 4 rewrites this to renders ≤ 72."
+    // First-frame renders << total messages (viewport+halo only).
+    assert!(
+        cp3_renders <= 72,
+        "RATCHET: cold Missing first frame must render ≤72 (viewport+halo), got {cp3_renders}"
     );
 
-    // Off-screen code fences trigger syntect on first frame.
+    // Off-screen code fences must NOT trigger syntect; viewport fences may.
+    // With 1000 msgs where every 5th has a fence, eager rendered all 200;
+    // lazy renders only the ~21 viewport+halo msgs, of which ~4 have fences.
     assert!(
-        cp3_hl > 0,
-        "BASELINE: off-screen code fences trigger syntect (hl_calls={cp3_hl}). \
-         Slice 4 rewrites this to == 0."
+        cp3_hl <= 20,
+        "RATCHET: highlight calls must be ≤20 (viewport only), got {cp3_hl}. \
+         Eager baseline was ~200."
     );
     assert!(
         cp3_ss,
