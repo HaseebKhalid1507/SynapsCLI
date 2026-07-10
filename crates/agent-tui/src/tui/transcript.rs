@@ -76,7 +76,11 @@ pub(crate) enum ChatMessage {
     },
     Error(String),
     System(String),
-    Event { source: String, severity: String, text: String },
+    Event {
+        source: String,
+        severity: String,
+        text: String,
+    },
 }
 
 impl ChatMessage {
@@ -100,7 +104,9 @@ impl ChatMessage {
             ChatMessage::Thinking(t) => Cow::Borrowed(t.as_str()),
             // Transient accumulated fragment (design §2: not over-engineered;
             // finalize replaces the message).
-            ChatMessage::ToolUseStart { partial_input, .. } => Cow::Borrowed(partial_input.as_str()),
+            ChatMessage::ToolUseStart { partial_input, .. } => {
+                Cow::Borrowed(partial_input.as_str())
+            }
             // DECISION LOCK L5 — the flip point: ToolUse copies as the
             // PRETTY-PRINTED input JSON (line-mappable, valid JSON, readable
             // pasted). To flip to the raw compact form, replace this arm's
@@ -150,7 +156,10 @@ pub(crate) enum LineMeta {
     /// consecutive Content rows of one message:
     ///   gap bytes whitespace-only, no '\n'  ⇒ soft wrap
     ///   gap bytes contain '\n'              ⇒ hard break
-    Content { range: std::ops::Range<usize>, content_col: u16 },
+    Content {
+        range: std::ops::Range<usize>,
+        content_col: u16,
+    },
     /// This row presents a *transformed* view of source line `src_line`
     /// (clamped code, highlighted tool output, pretty-printed JSON row,
     /// thinking excerpt) — line-level mapping is sound but column-level is
@@ -239,7 +248,11 @@ impl LineCache {
     /// Build a cache from rendered slots, computing `cum_heights` from
     /// scratch.
     pub(crate) fn new(width: usize, per_msg: Vec<MsgSlot>) -> Self {
-        let mut cache = LineCache { width, per_msg, cum_heights: Vec::new() };
+        let mut cache = LineCache {
+            width,
+            per_msg,
+            cum_heights: Vec::new(),
+        };
         cache.rebuild_cum_from(0);
         cache
     }
@@ -248,7 +261,8 @@ impl LineCache {
     /// cache is invalidated with the same watermark as the slots it sums.
     /// Returns the number of entries written (perf probe, lock L4).
     pub(crate) fn rebuild_cum_from(&mut self, k: usize) -> usize {
-        let k = k.min(self.per_msg.len())
+        let k = k
+            .min(self.per_msg.len())
             .min(self.cum_heights.len().saturating_sub(1));
         self.cum_heights.truncate(k + 1);
         if self.cum_heights.is_empty() {
@@ -342,7 +356,7 @@ impl CacheState {
     /// Dirty → Clean keeping the cache; Missing/Clean unchanged. Mirrors the
     /// old `dirty_from = None` (watermark consumed) transition.
     #[cfg(test)]
-#[allow(dead_code)] // test helper, kept for future cache tests
+    #[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn mark_clean(&mut self) {
         if matches!(self, CacheState::Dirty(..)) {
             let CacheState::Dirty(c, _) = std::mem::replace(self, CacheState::Missing) else {
@@ -497,28 +511,38 @@ impl TranscriptStore {
     /// Message renders since the last [`Self::probe_reset`].
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn probe_render_count(&self) -> usize {
-        self.probe.renders.load(std::sync::atomic::Ordering::Relaxed)
+        self.probe
+            .renders
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cumulative-offset entry writes since the last [`Self::probe_reset`].
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn probe_cum_write_count(&self) -> usize {
-        self.probe.cum_writes.load(std::sync::atomic::Ordering::Relaxed)
+        self.probe
+            .cum_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Zero both perf counters — call after a warm-up frame, before the
     /// frame under measurement.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn probe_reset(&self) {
-        self.probe.renders.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.probe.cum_writes.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.probe
+            .renders
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.probe
+            .cum_writes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Internal bump seam for `render_message_lines` (render.rs — a sibling
     /// module; store fields are sealed, so the bump routes through a method).
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn probe_note_render(&self) {
-        self.probe.renders.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.probe
+            .renders
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ── Scroll API ────────────────────────────────────────────────────────────
@@ -571,36 +595,54 @@ impl TranscriptStore {
     /// calls render as **input → its output** pairs, instead of all inputs
     /// stacked then all outputs stacked. Falls back to appending at the end
     /// when no matching tool_use exists (legacy providers without tool_ids).
-    pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
+    pub(crate) fn push_tool_result(
+        &mut self,
+        tool_id: String,
+        content: String,
+        elapsed_ms: Option<u64>,
+    ) {
         let use_idx = if tool_id.is_empty() {
             None
         } else {
             // Invariant: each tool_id should appear at most once. Assert in
             // debug builds so duplicate IDs surface immediately.
             debug_assert!(
-                self.messages.iter().filter(|m| matches!(
+                self.messages
+                    .iter()
+                    .filter(|m| matches!(
+                        &m.msg,
+                        ChatMessage::ToolUse { tool_id: tid, .. }
+                        | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                            if tid == &tool_id
+                    ))
+                    .count()
+                    <= 1,
+                "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
+            );
+            self.messages.iter().position(|m| {
+                matches!(
                     &m.msg,
                     ChatMessage::ToolUse { tool_id: tid, .. }
                     | ChatMessage::ToolUseStart { tool_id: tid, .. }
                         if tid == &tool_id
-                )).count() <= 1,
-                "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
-            );
-            self.messages.iter().position(|m| matches!(
-                &m.msg,
-                ChatMessage::ToolUse { tool_id: tid, .. }
-                | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                    if tid == &tool_id
-            ))
+                )
+            })
         };
-        let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
+        let msg = ChatMessage::ToolResult {
+            tool_id,
+            content,
+            elapsed_ms,
+        };
         match use_idx {
             Some(i) => {
                 let at = (i + 1).min(self.messages.len());
-                self.messages.insert(at, TimestampedMsg {
-                    msg,
-                    time: chrono::Local::now().format("%H:%M").to_string(),
-                });
+                self.messages.insert(
+                    at,
+                    TimestampedMsg {
+                        msg,
+                        time: chrono::Local::now().format("%H:%M").to_string(),
+                    },
+                );
                 if self.scroll_pinned {
                     self.scroll_back = 0;
                 }
@@ -745,9 +787,7 @@ impl TranscriptStore {
     /// two-phase immutable-render-then-mutable-apply structure — borrow rules
     /// are identical inside the store (design §3.5).
     pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) {
-        let needs_full_rebuild = self
-            .line_cache()
-            .map_or(true, |c| c.width != content_width);
+        let needs_full_rebuild = self.line_cache().map_or(true, |c| c.width != content_width);
 
         // Width change ⇒ rewrap ⇒ every content coordinate is re-derived;
         // clear the selection explicitly — honest and cheap (design §3.3).
@@ -764,9 +804,10 @@ impl TranscriptStore {
                 .collect();
             let cache = LineCache::new(content_width, per_msg);
             #[cfg(any(test, feature = "testing"))]
-            self.probe
-                .cum_writes
-                .fetch_add(cache.cum_heights.len(), std::sync::atomic::Ordering::Relaxed);
+            self.probe.cum_writes.fetch_add(
+                cache.cum_heights.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             self.cache = CacheState::Clean(cache);
         } else if let CacheState::Dirty(cache, k) = &self.cache {
             // Incremental rebuild: only re-render messages[k..]
@@ -923,7 +964,9 @@ impl TranscriptStore {
             .line_cache()
             .and_then(|c| {
                 Self::window_msg_range(c, start, end).map(|(f, l)| {
-                    (f..=l).filter(|&mi| c.per_msg[mi].lines.is_none()).collect()
+                    (f..=l)
+                        .filter(|&mi| c.per_msg[mi].lines.is_none())
+                        .collect()
                 })
             })
             .unwrap_or_default();
@@ -984,8 +1027,14 @@ impl TranscriptStore {
         if start >= end || cache.per_msg.is_empty() {
             return None;
         }
-        let first = cache.cum_heights.partition_point(|&c| c <= start).saturating_sub(1);
-        let last = cache.cum_heights.partition_point(|&c| c < end).saturating_sub(1);
+        let first = cache
+            .cum_heights
+            .partition_point(|&c| c <= start)
+            .saturating_sub(1);
+        let last = cache
+            .cum_heights
+            .partition_point(|&c| c < end)
+            .saturating_sub(1);
         Some((first, last))
     }
 
@@ -994,7 +1043,9 @@ impl TranscriptStore {
     /// whole middles. A message straddling an edge is rendered fully and
     /// sliced — line-granular windows require it, bounded by one message.
     fn assemble_window(&self, start: usize, end: usize) -> Vec<ratatui::text::Line<'static>> {
-        let Some(cache) = self.line_cache() else { return Vec::new() };
+        let Some(cache) = self.line_cache() else {
+            return Vec::new();
+        };
         let Some((first, last)) = Self::window_msg_range(cache, start, end) else {
             return Vec::new();
         };
@@ -1088,7 +1139,12 @@ impl TranscriptStore {
         let (msg_idx, line_in_msg) = self.event_row_to_content(row)?;
         let col = col.saturating_sub(rect.x).min(rect.width - 1);
         let src_byte = self.resolve_src_byte(msg_idx, line_in_msg, col);
-        Some(SelPos { msg_idx, line_in_msg, col, src_byte })
+        Some(SelPos {
+            msg_idx,
+            line_in_msg,
+            col,
+            src_byte,
+        })
     }
 
     /// Terminal row → (msg_idx, line_in_msg) through the viewport + LIVE
@@ -1253,8 +1309,16 @@ impl TranscriptStore {
             return None;
         }
         let max_col = rect.width - 1;
-        let (sf, sc) = if sf < vis_start { (vis_start, 0) } else { (sf, s.col.min(max_col)) };
-        let (ef, ec) = if ef >= vis_end { (vis_end - 1, max_col) } else { (ef, e.col.min(max_col)) };
+        let (sf, sc) = if sf < vis_start {
+            (vis_start, 0)
+        } else {
+            (sf, s.col.min(max_col))
+        };
+        let (ef, ec) = if ef >= vis_end {
+            (vis_end - 1, max_col)
+        } else {
+            (ef, e.col.min(max_col))
+        };
         Some((
             rect.x + sc,
             rect.y + (sf - vis_start) as u16,
@@ -1270,8 +1334,10 @@ impl TranscriptStore {
     /// behavior — scenario 22's "Shady observation").
     pub(crate) fn hit_test(&self, col: u16, row: u16) -> bool {
         if let Some(rect) = self.viewport {
-            col >= rect.x && col < rect.x + rect.width
-                && row >= rect.y && row < rect.y + rect.height
+            col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
         } else {
             false
         }
@@ -1311,7 +1377,9 @@ impl TranscriptStore {
 
         let mut parts: Vec<String> = Vec::new();
         for mi in s.msg_idx..=e.msg_idx {
-            let Some(entry) = cache.per_msg.get(mi) else { continue };
+            let Some(entry) = cache.per_msg.get(mi) else {
+                continue;
+            };
             let source = self.source_text(mi);
             let src: &str = &source;
             if src.is_empty() || entry.meta.is_empty() {
@@ -1324,8 +1392,16 @@ impl TranscriptStore {
             }
 
             let last_row = entry.meta.len() - 1;
-            let row_lo = if mi == s.msg_idx { s.line_in_msg.min(last_row) } else { 0 };
-            let row_hi = if mi == e.msg_idx { e.line_in_msg.min(last_row) } else { last_row };
+            let row_lo = if mi == s.msg_idx {
+                s.line_in_msg.min(last_row)
+            } else {
+                0
+            };
+            let row_hi = if mi == e.msg_idx {
+                e.line_in_msg.min(last_row)
+            } else {
+                last_row
+            };
             if row_lo > row_hi {
                 continue;
             }
@@ -1334,9 +1410,15 @@ impl TranscriptStore {
             let Some(first) = (row_lo..=row_hi).find(|&r| is_content(r)) else {
                 continue; // chrome end-to-end within this message (D5)
             };
-            let last = (row_lo..=row_hi).rev().find(|&r| is_content(r)).unwrap_or(first);
+            let last = (row_lo..=row_hi)
+                .rev()
+                .find(|&r| is_content(r))
+                .unwrap_or(first);
             // The message's final content row — the D4 tail-rule trigger.
-            let last_content_in_msg = entry.meta.iter().rposition(|m| !matches!(m, LineMeta::Chrome));
+            let last_content_in_msg = entry
+                .meta
+                .iter()
+                .rposition(|m| !matches!(m, LineMeta::Chrome));
 
             let lo = if mi == s.msg_idx {
                 match &entry.meta[first] {
@@ -1362,9 +1444,7 @@ impl TranscriptStore {
                     // "I want this output" — copy through the end of source
                     // (recovers renderer-truncated tails).
                     LineMeta::ContentLine { .. } if Some(last) == last_content_in_msg => src.len(),
-                    LineMeta::ContentLine { src_line, .. } => {
-                        source_line_range(src, *src_line).end
-                    }
+                    LineMeta::ContentLine { src_line, .. } => source_line_range(src, *src_line).end,
                     LineMeta::Chrome => unreachable!("last is a content row"),
                 }
             } else {
@@ -1403,15 +1483,18 @@ impl TranscriptStore {
     /// the message cache on a spinner tick would change output. Was
     /// `App::render_lines_uses_spinner` (design §3.4).
     pub(crate) fn uses_spinner(&self) -> bool {
-        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
-            ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
-            ChatMessage::ToolUseStart { .. } => true,
-            ChatMessage::ToolUse { .. } => {
-                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
-            }
-            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
-            _ => false,
-        })
+        self.messages
+            .iter()
+            .enumerate()
+            .any(|(idx, msg)| match &msg.msg {
+                ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
+                ChatMessage::ToolUseStart { .. } => true,
+                ChatMessage::ToolUse { .. } => {
+                    idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
+                }
+                ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
+                _ => false,
+            })
     }
 
     // ── Tool state queries + find_* helpers (moved in slice b′) ──────────────
@@ -1424,9 +1507,11 @@ impl TranscriptStore {
             return false;
         }
         match self.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, elapsed_ms: None, .. }) => {
-                self.tool_start_times.contains_key(tool_id)
-            }
+            Some(ChatMessage::ToolResult {
+                tool_id,
+                elapsed_ms: None,
+                ..
+            }) => self.tool_start_times.contains_key(tool_id),
             _ => false,
         }
     }
@@ -1437,12 +1522,19 @@ impl TranscriptStore {
         // parallel tool calls a `ToolResult` may not be positionally
         // adjacent to its matching `ToolUse`.
         let target_id: Option<String> = match self.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => Some(tool_id.clone()),
+            Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => {
+                Some(tool_id.clone())
+            }
             _ => None,
         };
         if let Some(id) = target_id {
             for m in self.messages.iter() {
-                if let ChatMessage::ToolUse { tool_id, tool_name, input } = &m.msg {
+                if let ChatMessage::ToolUse {
+                    tool_id,
+                    tool_name,
+                    input,
+                } = &m.msg
+                {
                     if tool_id == &id && tool_name == "read" {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
                             if let Some(path) = parsed["path"].as_str() {
@@ -1457,9 +1549,16 @@ impl TranscriptStore {
             }
         }
         // Fallback: walk backwards from idx to find the preceding ToolUse
-        if idx == 0 { return String::new(); }
+        if idx == 0 {
+            return String::new();
+        }
         for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.messages[i].msg {
+            if let ChatMessage::ToolUse {
+                ref tool_name,
+                ref input,
+                ..
+            } = self.messages[i].msg
+            {
                 if tool_name == "read" {
                     // Extract path from the JSON input
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
@@ -1483,14 +1582,22 @@ impl TranscriptStore {
         // is the only way to render parallel-tool outputs correctly,
         // since results may not be positionally adjacent to their
         // matching tool_use.
-        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.messages.get(idx).map(|m| &m.msg) {
+        if let Some(ChatMessage::ToolResult { tool_id, .. }) =
+            self.messages.get(idx).map(|m| &m.msg)
+        {
             if !tool_id.is_empty() {
                 for m in self.messages.iter() {
                     match &m.msg {
-                        ChatMessage::ToolUse { tool_id: tid, tool_name, .. }
-                        | ChatMessage::ToolUseStart { tool_id: tid, tool_name, .. }
-                            if tid == tool_id =>
-                        {
+                        ChatMessage::ToolUse {
+                            tool_id: tid,
+                            tool_name,
+                            ..
+                        }
+                        | ChatMessage::ToolUseStart {
+                            tool_id: tid,
+                            tool_name,
+                            ..
+                        } if tid == tool_id => {
                             return Some(tool_name.clone());
                         }
                         _ => {}
@@ -1498,7 +1605,9 @@ impl TranscriptStore {
                 }
             }
         }
-        if idx == 0 { return None; }
+        if idx == 0 {
+            return None;
+        }
         for i in (0..idx).rev() {
             if let ChatMessage::ToolUse { ref tool_name, .. } = self.messages[i].msg {
                 return Some(tool_name.clone());
@@ -1524,18 +1633,22 @@ impl TranscriptStore {
 
     /// Locate the index of a `ToolUseStart` block with this `tool_id`.
     pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
-        ))
+        self.messages.iter().rposition(|m| {
+            matches!(
+                &m.msg,
+                ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
+            )
+        })
     }
 
     /// Locate the latest `ToolResult` block for this `tool_id`.
     pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
-        ))
+        self.messages.iter().rposition(|m| {
+            matches!(
+                &m.msg,
+                ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
+            )
+        })
     }
 
     /// Begin streaming a new tool call. Records start time per-tool so
@@ -1561,10 +1674,16 @@ impl TranscriptStore {
         let target_idx = if !tool_id.is_empty() {
             self.find_tool_use_start_idx(tool_id)
         } else {
-            self.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
+            self.messages
+                .iter()
+                .rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
         };
         if let Some(idx) = target_idx {
-            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolUseStart {
+                ref mut partial_input,
+                ..
+            } = self.messages[idx].msg
+            {
                 partial_input.push_str(delta);
                 // P11 narrowing (design §1.3 prerequisite): the delta only
                 // changes messages[idx..] (idx itself, plus any later message
@@ -1579,7 +1698,12 @@ impl TranscriptStore {
     /// Finalize a streaming tool call. Replaces the matching
     /// `ToolUseStart` in place — keeping its position so on-screen order
     /// matches the order the model emitted the calls.
-    pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
+    pub(crate) fn on_tool_use_finalized(
+        &mut self,
+        tool_id: String,
+        tool_name: String,
+        input_str: String,
+    ) {
         self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
@@ -1590,7 +1714,11 @@ impl TranscriptStore {
         self.tool_start_time = Some(now);
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
-            self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
+            self.messages[idx].msg = ChatMessage::ToolUse {
+                tool_id,
+                tool_name,
+                input: input_str,
+            };
             // P11 narrowing + lock L2: idx IS the matched use index, so
             // dirtying from idx covers the stale-header trap directly. The
             // in-place ToolUseStart→ToolUse swap can also change the render
@@ -1603,14 +1731,23 @@ impl TranscriptStore {
         }
         // No matching start (e.g. provider only emits finalized blocks) —
         // append a new finalized block at the end.
-        self.push_msg(ChatMessage::ToolUse { tool_id, tool_name, input: input_str });
+        self.push_msg(ChatMessage::ToolUse {
+            tool_id,
+            tool_name,
+            input: input_str,
+        });
     }
 
     /// Stream a chunk of tool output. Appends to the matching
     /// `ToolResult` if one exists, otherwise creates a new placeholder.
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolResult {
+                ref mut content,
+                elapsed_ms,
+                ..
+            } = self.messages[idx].msg
+            {
                 if elapsed_ms.is_none() {
                     content.push_str(&delta);
                     // P11 narrowing: output deltas change messages[idx..]
@@ -1647,16 +1784,23 @@ impl TranscriptStore {
         let use_idx = if tool_id.is_empty() {
             None
         } else {
-            self.messages.iter().position(|m| matches!(
-                &m.msg,
-                ChatMessage::ToolUse { tool_id: tid, .. }
-                | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                    if tid == &tool_id
-            ))
+            self.messages.iter().position(|m| {
+                matches!(
+                    &m.msg,
+                    ChatMessage::ToolUse { tool_id: tid, .. }
+                    | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                        if tid == &tool_id
+                )
+            })
         };
 
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
+            if let ChatMessage::ToolResult {
+                ref mut content,
+                elapsed_ms,
+                ..
+            } = self.messages[idx].msg
+            {
                 if elapsed_ms.is_none() {
                     *content = result;
                     self.messages[idx].msg = ChatMessage::ToolResult {
@@ -1678,7 +1822,11 @@ impl TranscriptStore {
         // Model produced real output — clear any empty thinking placeholder
         // so its spinner stops.
         self.drop_empty_thinking();
-        if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.messages.last_mut() {
+        if let Some(TimestampedMsg {
+            msg: ChatMessage::Text(ref mut existing),
+            ..
+        }) = self.messages.last_mut()
+        {
             existing.push_str(text);
         } else {
             self.push_msg(ChatMessage::Text(text.to_string()));
@@ -1687,7 +1835,11 @@ impl TranscriptStore {
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
-        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.messages.last_mut() {
+        if let Some(TimestampedMsg {
+            msg: ChatMessage::Thinking(ref mut existing),
+            ..
+        }) = self.messages.last_mut()
+        {
             // First real delta replaces the sentinel placeholder rather than
             // appending to it (otherwise content reads "…​<thinking>").
             if existing == THINKING_PLACEHOLDER {
@@ -1712,9 +1864,10 @@ impl TranscriptStore {
     pub(crate) fn drop_empty_thinking(&mut self) {
         // Walk from the tail, skipping System messages, to find the first
         // non-System message. If it's an empty/placeholder Thinking, drop it.
-        let candidate_idx = self.messages.iter().rposition(|m| {
-            !matches!(&m.msg, ChatMessage::System(_))
-        });
+        let candidate_idx = self
+            .messages
+            .iter()
+            .rposition(|m| !matches!(&m.msg, ChatMessage::System(_)));
         if let Some(idx) = candidate_idx {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
@@ -1820,7 +1973,7 @@ impl TranscriptStore {
     /// Set the cache to `Dirty(cache, watermark)`. Used by tests that simulate
     /// the `invalidate_from` path without calling `visible_window`.
     #[cfg(test)]
-#[allow(dead_code)] // test helper, kept for future cache tests
+    #[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn test_set_cache_dirty(&mut self, mut cache: LineCache, from: usize) {
         cache.rebuild_cum_from(0);
         self.cache = CacheState::Dirty(cache, from);
@@ -1835,7 +1988,7 @@ impl TranscriptStore {
 
     /// Put a `CacheState` back after a test manipulation.
     #[cfg(test)]
-#[allow(dead_code)] // test helper, kept for future cache tests
+    #[allow(dead_code)] // test helper, kept for future cache tests
     pub(crate) fn test_put_cache(&mut self, cs: CacheState) {
         self.cache = cs;
     }
@@ -1887,7 +2040,11 @@ mod visible_window_tests {
     use super::*;
 
     fn test_ctx() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
     }
 
     /// Ported from app.rs with slice (e). The app.rs original *mirrored* the
@@ -1912,8 +2069,8 @@ mod visible_window_tests {
 
         let content_width: usize = 80;
         let content_height: usize = 5; // viewport is 5 rows — much less than 20
-        // Outer body rect: inner content = outer − 2 in each dimension
-        // (visible_window derives content_width/height the same way draw.rs did).
+                                       // Outer body rect: inner content = outer − 2 in each dimension
+                                       // (visible_window derives content_width/height the same way draw.rs did).
         let msg_area = ratatui::layout::Rect {
             x: 0,
             y: 1,
@@ -1924,17 +2081,23 @@ mod visible_window_tests {
         // Pinned at bottom → scroll_back = 0.
         let vw = store.visible_window(msg_area, &test_ctx());
 
-        let total = store.line_cache().expect("line cache populated after layout").total_height();
+        let total = store
+            .line_cache()
+            .expect("line cache populated after layout")
+            .total_height();
         assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
         let end = total; // scroll_back = 0
         let start = end.saturating_sub(content_height);
 
         let to_str = |sl: &[ratatui::text::Line<'static>]| -> Vec<String> {
             sl.iter()
-              .map(|l| {
-                  l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-              })
-              .collect()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
         };
 
         // 1. Published len must equal the viewport, NOT the full buffer.
@@ -1945,14 +2108,24 @@ mod visible_window_tests {
              got {} (full buffer len = {total}) — full-buffer publish regression",
             vw.lines.len()
         );
-        assert_eq!(vw.lines_width, content_width, "lines_width must be the content width");
-        assert_eq!(vw.scroll_back, 0, "pinned → post-clamp scroll_back must be 0");
+        assert_eq!(
+            vw.lines_width, content_width,
+            "lines_width must be the content width"
+        );
+        assert_eq!(
+            vw.scroll_back, 0,
+            "pinned → post-clamp scroll_back must be 0"
+        );
         assert!(!vw.is_empty, "20 messages → is_empty must be false");
 
         // 2. Content must match the reference render's [start..end] window
         //    (post flat-kill: render_lines is the oracle, not a live buffer).
         let oracle = store.render_lines(content_width, &test_ctx());
-        assert_eq!(oracle.len(), total, "oracle render must reproduce total_height");
+        assert_eq!(
+            oracle.len(),
+            total,
+            "oracle render must reproduce total_height"
+        );
         assert_eq!(
             to_str(&vw.lines),
             to_str(&oracle[start..end]),
@@ -1970,8 +2143,11 @@ mod visible_window_tests {
         // 4. Sanity: scroll into the middle, check a different window.
         store.scroll_up(10); // unpins, scroll_back = 10
         let vw2 = store.visible_window(msg_area, &test_ctx());
-        assert_eq!(vw2.lines.len(), content_height,
-            "mid-scroll window must also have viewport length");
+        assert_eq!(
+            vw2.lines.len(),
+            content_height,
+            "mid-scroll window must also have viewport length"
+        );
         assert_eq!(vw2.scroll_back, 10, "scroll_back 10 is within clamp range");
         assert_ne!(
             to_str(&vw2.lines),
@@ -2042,8 +2218,7 @@ mod source_text_tests {
         let src = m.source_text();
         // Valid, pretty-printed, key/value line-mappable JSON.
         assert_eq!(
-            src,
-            "{\n  \"command\": \"ls -la\",\n  \"timeout\": 30\n}",
+            src, "{\n  \"command\": \"ls -la\",\n  \"timeout\": 30\n}",
             "L5: ToolUse source must be serde_json pretty form"
         );
         // Owned (computed at copy time) — the raw compact form is one flip away.
@@ -2075,7 +2250,10 @@ mod source_text_tests {
 
     #[test]
     fn error_system_are_verbatim() {
-        assert_eq!(ChatMessage::Error("boom\ntail".into()).source_text(), "boom\ntail");
+        assert_eq!(
+            ChatMessage::Error("boom\ntail".into()).source_text(),
+            "boom\ntail"
+        );
         assert_eq!(ChatMessage::System("notice".into()).source_text(), "notice");
     }
 
@@ -2120,8 +2298,8 @@ mod source_text_tests {
 //   syntax_set_was_touched() — whether SYNTAX_SET LazyLock init fired since reset
 #[cfg(test)]
 mod slice0_baseline_pathology {
-    use super::*;
     use super::super::highlight;
+    use super::*;
     use ratatui::layout::Rect;
 
     const VIEWPORT_ROWS: usize = 40;
@@ -2129,14 +2307,19 @@ mod slice0_baseline_pathology {
     // Outer rect adds 2 border rows/cols each side.
     fn msg_area(rows: usize, cols: usize) -> Rect {
         Rect {
-            x: 0, y: 0,
-            width:  (cols + 2) as u16,
+            x: 0,
+            y: 0,
+            width: (cols + 2) as u16,
             height: (rows + 2) as u16,
         }
     }
 
     fn test_ctx() -> RenderCtx<'static> {
-        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
     }
 
     /// Build 1,000 deterministic synthetic messages:
@@ -2186,8 +2369,8 @@ mod slice0_baseline_pathology {
         // BASELINE — rewrite in Slice 4:
         //   after lazy estimation lands, assert renders <= VIEWPORT_ROWS + 2*HALO (≤72)
         const N_PLAIN: usize = 800;
-        const N_CODE:  usize = 200;
-        const TOTAL:   usize = N_PLAIN + N_CODE + 5; // +5 tail messages
+        const N_CODE: usize = 200;
+        const TOTAL: usize = N_PLAIN + N_CODE + 5; // +5 tail messages
 
         let mut store = make_synthetic_store(N_PLAIN, N_CODE);
 
@@ -2231,7 +2414,7 @@ mod slice0_baseline_pathology {
         // BASELINE — rewrite in Slice 4:
         //   after lazy estimation, assert highlight_calls == 0 && !syntax_set_was_touched
         const N_PLAIN: usize = 800;
-        const N_CODE:  usize = 200; // off-screen code fences
+        const N_CODE: usize = 200; // off-screen code fences
 
         let mut store = make_synthetic_store(N_PLAIN, N_CODE);
 
@@ -2298,7 +2481,13 @@ mod slice0_baseline_pathology {
              highlight_calls={hl_calls}  (expected: 0)"
         );
 
-        assert_eq!(renders,  0, "second frame on a clean cache must trigger zero renders");
-        assert_eq!(hl_calls, 0, "second frame on a clean cache must trigger zero highlight calls");
+        assert_eq!(
+            renders, 0,
+            "second frame on a clean cache must trigger zero renders"
+        );
+        assert_eq!(
+            hl_calls, 0,
+            "second frame on a clean cache must trigger zero highlight calls"
+        );
     }
 }
