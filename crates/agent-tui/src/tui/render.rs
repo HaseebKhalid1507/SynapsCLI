@@ -150,7 +150,8 @@ impl LineSink {
         // separate second-half pass over slots leaving the viewport window.
         MsgSlot {
             lines: Some(self.lines),
-            meta: self.meta,
+            height: super::transcript::HeightState::Exact(self.meta.len()),
+            meta: Some(self.meta),
         }
     }
 }
@@ -1283,11 +1284,11 @@ mod meta_tests {
                 let entry = store.render_message_lines(idx, width, &ctx());
                 assert_eq!(
                     entry.lines().len(),
-                    entry.meta.len(),
+                    entry.meta_slice().len(),
                     "meta must stay parallel to lines (msg {idx}, width {width})"
                 );
                 let mut prev_end = 0usize;
-                for (row, meta) in entry.meta.iter().enumerate() {
+                for (row, meta) in entry.meta_slice().iter().enumerate() {
                     match meta {
                         LineMeta::Chrome => {}
                         LineMeta::Content { range, content_col } => {
@@ -1340,7 +1341,7 @@ mod meta_tests {
             let entry = store.render_message_lines(idx, 80, &ctx());
             assert_eq!(
                 entry
-                    .meta
+                    .meta_slice()
                     .iter()
                     .any(|m| matches!(m, LineMeta::Content { .. })),
                 wants_content,
@@ -1351,7 +1352,7 @@ mod meta_tests {
         let entry = store.render_message_lines(4, 80, &ctx());
         assert!(
             entry
-                .meta
+                .meta_slice()
                 .iter()
                 .any(|m| matches!(m, LineMeta::ContentLine { .. })),
             "ToolResult content rows must be ContentLine-mapped"

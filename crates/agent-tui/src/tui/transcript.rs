@@ -1,4 +1,3 @@
-//! # TranscriptStore — message pane ownership
 //!
 //! This module owns everything the message pane shows and nothing else:
 //! the message list, the per-message render cache, the viewport position, and
@@ -28,6 +27,8 @@
 //! changes remap or clear per lock L3: an insert/invalidate at index
 //! `k <= max(endpoint msg_idx)` shifts endpoints (pure insert below them) or
 //! clears the selection; width changes clear it explicitly in `sync_cache`.
+
+pub(crate) mod estimate;
 
 /// Read-only App state the transcript renderer needs. Constructed fresh at
 /// each cache-sync call site — cheap (a usize, a bool, a &str). This makes
@@ -183,36 +184,71 @@ fn source_line_range(source: &str, idx: usize) -> std::ops::Range<usize> {
     source.len()..source.len()
 }
 
-/// Per-message render cache slot (P11 design §1.2). This is the unit P11
-/// caches and (in the second-half slices) evicts.
+// T241 Slice 1: HeightState + meta: Option<Vec<LineMeta>>.
+// All Slice-1 slots are Exact with meta: Some(_). Estimated slots with
+// meta: None are introduced in Slice 3 (the Missing-arm rewrite).
+
+/// Per-slot height: exact (from a full render) or estimated (from the cheap
+/// source-byte estimator in `estimate.rs`). Use `.value()` for the coordinate.
 ///
-/// Two deliberate choices, per the decision lock:
-/// - **`meta.len()` IS the height** — no separate `height` field to desync
-///   (and no `u16` truncation concern). `meta` is always present after
-///   measurement and parallels the rendered rows.
-/// - **`meta` survives demotion; only `lines` dies.** `selected_text` reads
-///   `meta` + `source_text()` exclusively (P10 §7), so copy of off-screen —
-///   even evicted — selections works with zero re-render. `lines: None`
-///   means "measured but demoted": height/meta retained, pixels evicted.
-///   Demotion is live: `visible_window` evicts slots outside the viewport ±
-///   halo each frame and promotes (re-renders) on demand.
+/// Introduced in T241 Slice 1. All code paths still produce `Exact` here;
+/// `Estimated` slots are first created in Slice 3 (the Missing-arm rewrite).
+#[allow(dead_code)] // Estimated variant used from Slice 3 onward
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HeightState {
+    /// Height from a full `render_message_lines` call at `LineCache::width`.
+    /// The slot's `meta` is `Some(_)` and parallel to `lines`.
+    Exact(usize),
+    /// Cheap estimate from `estimate::estimate_message_height`. The slot's
+    /// `meta` is `None`; exact row provenance is not yet known.
+    Estimated(usize),
+}
+
+impl HeightState {
+    /// The numeric height value (rows), regardless of exactness.
+    #[inline]
+    pub(crate) fn value(&self) -> usize {
+        match self {
+            HeightState::Exact(n) | HeightState::Estimated(n) => *n,
+        }
+    }
+
+    /// `true` when the height came from a full render.
+    #[allow(dead_code)] // used in Slice 3+
+    #[inline]
+    pub(crate) fn is_exact(&self) -> bool {
+        matches!(self, HeightState::Exact(_))
+    }
+}
+
 pub(crate) struct MsgSlot {
-    /// Present only while the message intersects the viewport ± the
-    /// retention halo (design §3 step 7).
+    /// Present only while the message intersects the viewport +/-
+    /// the retention halo (design §3 step 7).
     pub(crate) lines: Option<Vec<ratatui::text::Line<'static>>>,
-    /// Parallel to the rendered rows. Invariant: when `lines` is `Some`,
-    /// `lines.len() == meta.len()`.
-    pub(crate) meta: Vec<LineMeta>,
+    /// Row provenance -- `Some` when this slot has been exactly rendered;
+    /// `None` for `Estimated` slots that have never been through
+    /// `render_message_lines`. When `lines` is `Some`, `meta` is `Some` and
+    /// `meta.as_ref().unwrap().len() == lines.as_ref().unwrap().len()`.
+    ///
+    /// **Slice 1:** all slots are produced by `render_message_lines` and
+    /// therefore always `Some`. Callers that access `meta` use
+    /// `.as_deref().unwrap_or(&[])` so that Slice 3 (Estimated slots) compiles
+    /// without further churn.
+    pub(crate) meta: Option<Vec<LineMeta>>,
+    /// The row height of this message -- exact or estimated. Use `.value()` to
+    /// get the usize coordinate; match the enum when correctness matters.
+    pub(crate) height: HeightState,
 }
 
 impl MsgSlot {
-    /// The message's exact height in display rows — valid whether or not
-    /// the pixels are currently materialized.
+    /// The message's height in display rows -- valid for both Exact and
+    /// Estimated slots. Replaces the old `self.meta.len()` derivation.
+    #[inline]
     pub(crate) fn height(&self) -> usize {
-        self.meta.len()
+        self.height.value()
     }
 
-    /// The rendered rows. Panics on a demoted slot — callers must hold the
+    /// The rendered rows. Panics on a demoted slot -- callers must hold the
     /// "promoted first" invariant (`visible_window` promotes window slots
     /// before assembly; the sync paths only touch freshly rendered slots).
     /// Callers that can legitimately see a demoted slot must match on the
@@ -221,7 +257,15 @@ impl MsgSlot {
     pub(crate) fn lines(&self) -> &[ratatui::text::Line<'static>] {
         self.lines
             .as_deref()
-            .expect("MsgSlot demoted — promote (re-render) before reading lines")
+            .expect("MsgSlot demoted -- promote (re-render) before reading lines")
+    }
+
+    /// Row provenance as a slice -- empty for Estimated slots (meta is None).
+    /// Used by callers that need `meta` but can tolerate an empty slice when
+    /// the slot is estimated. Meta survives demotion (lines=None) unchanged.
+    #[inline]
+    pub(crate) fn meta_slice(&self) -> &[LineMeta] {
+        self.meta.as_deref().unwrap_or(&[])
     }
 }
 
@@ -1076,8 +1120,8 @@ impl TranscriptStore {
         if let Some(cache) = self.cache.line_cache_mut() {
             if let Some(slot) = cache.per_msg.get_mut(msg_idx) {
                 debug_assert_eq!(
-                    fresh.meta.len(),
-                    slot.meta.len(),
+                    fresh.height(),
+                    slot.height(),
                     "promoted slot {msg_idx} must re-render to its measured height"
                 );
                 *slot = fresh;
@@ -1191,7 +1235,7 @@ impl TranscriptStore {
     fn resolve_src_byte(&self, msg_idx: usize, line_in_msg: usize, col: u16) -> Option<usize> {
         use super::text_metrics::char_width;
         let entry = self.line_cache()?.per_msg.get(msg_idx)?;
-        let LineMeta::Content { range, content_col } = entry.meta.get(line_in_msg)? else {
+        let LineMeta::Content { range, content_col } = entry.meta_slice().get(line_in_msg)? else {
             return None;
         };
         // Lock L3: a demoted slot (lines == None) resolves to no src_byte —
@@ -1382,7 +1426,7 @@ impl TranscriptStore {
             };
             let source = self.source_text(mi);
             let src: &str = &source;
-            if src.is_empty() || entry.meta.is_empty() {
+            if src.is_empty() || entry.meta_slice().is_empty() {
                 continue;
             }
             // Middle messages contribute their full source (§1.4 step 2).
@@ -1391,7 +1435,7 @@ impl TranscriptStore {
                 continue;
             }
 
-            let last_row = entry.meta.len() - 1;
+            let last_row = entry.meta_slice().len().saturating_sub(1);
             let row_lo = if mi == s.msg_idx {
                 s.line_in_msg.min(last_row)
             } else {
@@ -1406,7 +1450,7 @@ impl TranscriptStore {
                 continue;
             }
             // Endpoints on chrome snap inward to the nearest content row.
-            let is_content = |r: usize| !matches!(entry.meta[r], LineMeta::Chrome);
+            let is_content = |r: usize| !matches!(entry.meta_slice()[r], LineMeta::Chrome);
             let Some(first) = (row_lo..=row_hi).find(|&r| is_content(r)) else {
                 continue; // chrome end-to-end within this message (D5)
             };
@@ -1416,12 +1460,12 @@ impl TranscriptStore {
                 .unwrap_or(first);
             // The message's final content row — the D4 tail-rule trigger.
             let last_content_in_msg = entry
-                .meta
+                .meta_slice()
                 .iter()
                 .rposition(|m| !matches!(m, LineMeta::Chrome));
 
             let lo = if mi == s.msg_idx {
-                match &entry.meta[first] {
+                match &entry.meta_slice()[first] {
                     LineMeta::Content { range, .. } if first == s.line_in_msg => {
                         s.src_byte.unwrap_or(range.start)
                     }
@@ -1435,7 +1479,7 @@ impl TranscriptStore {
                 0
             };
             let hi = if mi == e.msg_idx {
-                match &entry.meta[last] {
+                match &entry.meta_slice()[last] {
                     LineMeta::Content { range, .. } if last == e.line_in_msg => {
                         e.src_byte.unwrap_or(range.end)
                     }
