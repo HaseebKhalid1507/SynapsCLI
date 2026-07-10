@@ -70,7 +70,10 @@ impl RpcState {
         if self.api_messages.is_empty() {
             return;
         }
-        self.session.api_messages = self.api_messages.clone();
+        // Swap the live vec into the session for serialization instead of
+        // cloning, so no full duplicate lives in `session.api_messages`
+        // between saves. Swap back once save() returns.
+        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
@@ -82,6 +85,7 @@ impl RpcState {
         if let Err(e) = self.session.save().await {
             tracing::error!(error = %e, "failed to save session");
         }
+        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
     }
 
     /// Returns `true` if a streaming task is currently running.
@@ -163,14 +167,15 @@ async fn spawn_prompt(
         };
 
         while let Some(ev) = stream.next().await {
+            // Peel off MessageHistory first so we can MOVE the payload into
+            // state instead of cloning it (the vec can be several MB).
+            if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
+                let mut st = state.lock().await;
+                st.api_messages = msgs;
+                st.save_session().await;
+                continue;
+            }
             match &ev {
-                // ── Session bookkeeping ─────────────────────────────────────
-                StreamEvent::Session(SessionEvent::MessageHistory(msgs)) => {
-                    let mut st = state.lock().await;
-                    st.api_messages = msgs.clone();
-                    st.save_session().await;
-                    continue;
-                }
                 StreamEvent::Session(se @ SessionEvent::Usage {
                     input_tokens,
                     output_tokens,
