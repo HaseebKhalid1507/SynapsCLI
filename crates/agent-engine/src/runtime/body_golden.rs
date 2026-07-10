@@ -230,12 +230,50 @@ fn scenarios() -> Vec<Scenario> {
             stream: true,
             identity_sensitive: false,
         },
+        // S241 gate-review Finding-3 armor: the four adaptive scenarios above
+        // are all 5m/stream/no-system. TTL and adaptive-mode were argued
+        // independent (shared cache_control_value helper) — these two combos
+        // turn that argument into gated fact.
+        Scenario {
+            name: "adaptive_tools_1h",
+            model: adaptive,
+            thinking_budget: 16384,
+            ttl: CacheTtl::OneHour,
+            tools: two_tools(),
+            system_prompt: None,
+            auth_type: "api_key",
+            messages: plain_history(),
+            stream: true,
+            identity_sensitive: false,
+        },
+        Scenario {
+            name: "adaptive_sync_system_5m",
+            model: adaptive,
+            thinking_budget: 16384,
+            ttl: CacheTtl::FiveMinutes,
+            tools: vec![],
+            system_prompt: Some("You review Rust code.".to_string()),
+            auth_type: "api_key",
+            messages: plain_history(),
+            stream: false,
+            identity_sensitive: false,
+        },
     ]
 }
 
-/// VERBATIM replica of the pre-slice-4 body assembly (api.rs:707-781 /
-/// api_sync.rs:80-118 at the time fixtures were generated). Frozen on purpose
-/// — this is the legacy truth the new serializer must reproduce byte-for-byte.
+/// Replica of the pre-slice-4 body assembly (api.rs:707-781 / api_sync.rs:80-118
+/// at the time fixtures were generated). The *assembly* (json! shape, marker
+/// probes, key layout) is verbatim and frozen on purpose — it is the legacy
+/// truth the new serializer must reproduce byte-for-byte.
+///
+/// SCOPE HONESTY (S241 gate review): the sanitize/annotate pipeline below is
+/// the CURRENT (slice-3, Arc-based) helper code, not the pre-slice-3 Vec code —
+/// both sides of the old-vs-new comparison share it. This gate therefore guards
+/// the slice-4 ASSEMBLY only; semantic drift inside the helpers themselves is
+/// invisible here and is owned by the helpers.rs unit suite (see
+/// `sanitize_leaves_missing_content_key_absent` for one such frozen divergence:
+/// the old Vec-era code accidentally inserted `"content": null` on assistant
+/// messages lacking a content key via IndexMut; the Arc port does not).
 fn old_body_bytes(s: &Scenario) -> Vec<u8> {
     let mut cleaned_messages = s.messages.to_vec();
     HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
@@ -321,6 +359,23 @@ fn fixture_dir() -> std::path::PathBuf {
 
 fn identity_is_default() -> bool {
     crate::core::config::get_identity() == EXPECTED_DEFAULT_IDENTITY
+}
+
+/// Finding-2 armor (S241 gate review): if the runtime's DEFAULT_IDENTITY ever
+/// drifts from the constant the oauth fixtures were generated with, this test
+/// FAILS LOUDLY instead of letting `identity_is_default()` silently skip the
+/// `system_oauth_hybrid` fixture comparison forever. Const-to-const compare —
+/// no global state, immune to test-order config pollution. On failure: decide
+/// consciously, regenerate fixtures (GOLDEN_WRITE=1), update both constants.
+#[test]
+fn default_identity_constant_has_not_drifted() {
+    assert_eq!(
+        crate::core::config::DEFAULT_IDENTITY,
+        EXPECTED_DEFAULT_IDENTITY,
+        "DEFAULT_IDENTITY drifted from the golden-fixture constant. The \
+         system_oauth_hybrid fixture would silently stop being compared. \
+         Regenerate fixtures (GOLDEN_WRITE=1) and update EXPECTED_DEFAULT_IDENTITY."
+    );
 }
 
 /// Fixture generator — replica (legacy) code only. Run explicitly:

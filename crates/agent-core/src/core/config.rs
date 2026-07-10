@@ -7,7 +7,7 @@ static PROFILE_NAME: OnceLock<Option<String>> = OnceLock::new();
 static PROVIDER_KEYS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 static IDENTITY: OnceLock<String> = OnceLock::new();
 
-const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
+pub const DEFAULT_IDENTITY: &str = "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
 /// Returns the configured identity string for the system prompt preamble.
 /// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set

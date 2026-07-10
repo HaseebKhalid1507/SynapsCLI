@@ -430,6 +430,22 @@ mod tests {
         assert_eq!(cleaned[4]["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
+    /// Finding-1 freeze (S241 gate review): the OLD Vec-era sanitize used
+    /// `msg["content"].as_array_mut()`, whose IndexMut *inserted* a
+    /// `"content": null` key into assistant messages that lacked one (bytes
+    /// the API rejected anyway). The Arc port reads immutably and leaves the
+    /// message untouched. This test freezes the NEW behavior so nobody
+    /// "fixes" it back to the accidental insertion.
+    #[test]
+    fn sanitize_leaves_missing_content_key_absent() {
+        let mut msgs = vec![json!({"role": "assistant"})];
+        let before = serde_json::to_string(&msgs[0]).unwrap();
+        sanitize_vals(&mut msgs);
+        let after = serde_json::to_string(&msgs[0]).unwrap();
+        assert_eq!(before, after, "message without content key must pass through byte-identical");
+        assert!(msgs[0].get("content").is_none(), "content key must NOT be inserted");
+    }
+
     #[test]
     fn sanitize_drops_empty_thinking_blocks() {
         let mut msgs = vec![json!({
