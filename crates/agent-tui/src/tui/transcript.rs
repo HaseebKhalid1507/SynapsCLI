@@ -1110,9 +1110,24 @@ impl TranscriptStore {
         }
 
         if needs_full_rebuild {
-            // Width changed or no cache: full rebuild
-            let per_msg: Vec<MsgSlot> = (0..self.messages.len())
-                .map(|i| self.render_message_lines(i, content_width, ctx))
+            // T241 Slice 3 (the core flip): width changed or no cache.
+            // Do NOT render anything — build ESTIMATED slots for every
+            // message (O(total source bytes), zero markdown/syntect) and let
+            // `promote_window` exact-render only the viewport + halo
+            // afterwards (§4.2/§4.4). Estimates are coordinates, not truth:
+            // `cum_heights` over estimates is a valid coordinate system
+            // (I-COORD); corrections splice in via `rebuild_cum_from`.
+            let per_msg: Vec<MsgSlot> = self
+                .messages
+                .iter()
+                .map(|m| MsgSlot {
+                    lines: None,
+                    meta: None,
+                    height: HeightState::Estimated(estimate::estimate_message_height(
+                        &m.msg,
+                        content_width,
+                    )),
+                })
                 .collect();
             let cache = LineCache::new(content_width, per_msg);
             #[cfg(any(test, feature = "testing"))]
@@ -1259,6 +1274,16 @@ impl TranscriptStore {
         } else if let Some(cache) = self.cache.line_cache() {
             self.scroll_anchor = Self::capture_anchor(cache, self.scroll_back as usize, content_height);
         }
+        // ── T241 Slice 3: promote the viewport + halo to exact ──
+        // Every frame, idempotent (§4.4): exact-render any Estimated slot
+        // intersecting the window ± PROMOTE_HALO_MSGS, splice corrections
+        // into cum_heights, and re-derive scroll_back from the anchor so the
+        // correction never moves the anchor row on screen (§4.3 theorem).
+        // On a fully-Exact window this is a no-op scan (zero renders).
+        self.promote_window(content_height, ctx);
+        // Re-source totals after corrections — the window below must be cut
+        // from the CORRECTED coordinate system, not the estimated one.
+        let total = self.line_cache().map_or(0, |c| c.total_height());
         let scroll_back = self.scroll_back;
 
         // ── Visible range + viewport geometry (old draw.rs §5 write-backs) ──
@@ -1337,6 +1362,137 @@ impl TranscriptStore {
         }
     }
 
+    /// T241 Slice 3 — promotion halo in MESSAGES each side of the visible
+    /// message range (§4.4). Fixed constant (not viewport-derived): the I-RENDER
+    /// ratchet is `V_msgs + 2·HALO` exact renders on a cold frame — for a
+    /// 40-row viewport that is ≤ 40 + 32 = 72 (scope §2, T1). A fixed 16 keeps
+    /// the bound independent of estimate quality and gives a wheel-scroll
+    /// runway of ≥16 messages before the next promotion is needed.
+    const PROMOTE_HALO_MSGS: usize = 16;
+
+    /// T241 Slice 3 — §4.4 `promote_window`: exact-render every Estimated
+    /// slot in the visible message range ± [`Self::PROMOTE_HALO_MSGS`],
+    /// splice height corrections into `cum_heights`, and re-derive
+    /// `scroll_back` from the [`ScrollAnchor`] so corrections never move the
+    /// anchor row on screen (§4.3 no-jump theorem).
+    ///
+    /// Runs every frame after `sync_cache`; idempotent — a window that is
+    /// already fully Exact performs zero renders and zero cum writes.
+    ///
+    /// The loop is bounded: each pass converts ≥1 Estimated slot to Exact
+    /// (or exits), and promotion is monotone (Exact never reverts to
+    /// Estimated mid-frame), so it terminates in ≤ n passes — in practice
+    /// ≤ 2 (§4.4): a second pass only runs when corrections shifted the
+    /// window enough to expose new Estimated slots at its edges.
+    ///
+    /// Sound to render slots in isolation (scope R1, verified):
+    /// `render_message_lines` reads neighbours' SOURCE (`messages[i-1].msg`)
+    /// and the list length, never neighbours' rendered state.
+    fn promote_window(&mut self, content_height: usize, ctx: &RenderCtx<'_>) {
+        loop {
+            // ── Determine the window in the CURRENT coordinate system ──
+            let Some(cache) = self.cache.line_cache() else {
+                return;
+            };
+            let n = cache.per_msg.len();
+            let total = cache.total_height();
+            if n == 0 || total == 0 || content_height == 0 {
+                return;
+            }
+            let width = cache.width;
+            // S_top per §4.3: pinned mode recomputes from total; anchored
+            // mode derives from (msg_idx, row_in_msg); a scroll offset
+            // without a captured anchor falls back to the raw conversion.
+            let max_top = total.saturating_sub(content_height);
+            let s_top = if self.scroll_back == 0 {
+                max_top
+            } else if let Some(anchor) = &self.scroll_anchor {
+                let mi = anchor.msg_idx.min(n - 1);
+                let h = cache.per_msg[mi].height().max(1);
+                (cache.cum_heights[mi] + anchor.row_in_msg.min(h - 1)).min(max_top)
+            } else {
+                Self::scroll_back_to_stop(self.scroll_back as usize, total, content_height)
+            };
+            let Some((first, last)) =
+                Self::window_msg_range(cache, s_top, s_top + content_height)
+            else {
+                return;
+            };
+            let lo = first.saturating_sub(Self::PROMOTE_HALO_MSGS);
+            let hi = (last + Self::PROMOTE_HALO_MSGS).min(n - 1);
+            let to_promote: Vec<usize> = (lo..=hi)
+                .filter(|&mi| !cache.per_msg[mi].height.is_exact())
+                .collect();
+            if to_promote.is_empty() {
+                return; // window fully Exact — fixed point reached
+            }
+
+            // ── Render phase (immutable borrow of self) ──
+            // These are the ONLY exact renders on the cold path (§4.4).
+            let fresh: Vec<(usize, MsgSlot)> = to_promote
+                .iter()
+                .map(|&mi| (mi, self.render_message_lines(mi, width, ctx)))
+                .collect();
+
+            // ── Apply phase (mutable borrow) ──
+            let mut min_corrected: Option<usize> = None;
+            {
+                let cache = self
+                    .cache
+                    .line_cache_mut()
+                    .expect("cache existed at loop head");
+                for (mi, slot) in fresh {
+                    if slot.height() != cache.per_msg[mi].height() {
+                        min_corrected = Some(min_corrected.map_or(mi, |m: usize| m.min(mi)));
+                    }
+                    cache.per_msg[mi] = slot;
+                }
+            }
+
+            // ── Correction splice + anchor-stable scroll recompute ──
+            if let Some(k) = min_corrected {
+                let _cum_written = self
+                    .cache
+                    .line_cache_mut()
+                    .expect("cache existed at loop head")
+                    .rebuild_cum_from(k);
+                #[cfg(any(test, feature = "testing"))]
+                self.probe
+                    .cum_writes
+                    .fetch_add(_cum_written, std::sync::atomic::Ordering::Relaxed);
+
+                let cache = self.cache.line_cache().expect("cache existed at loop head");
+                let new_total = cache.total_height();
+                if self.scroll_back != 0 {
+                    // Anchored: recompute scroll_back so the anchor message
+                    // stays at the same screen row (§4.3). Without an anchor
+                    // (defensive), just clamp (I-CLAMP).
+                    let sb = match &self.scroll_anchor {
+                        Some(anchor) => {
+                            Self::anchor_to_scroll_back(anchor, cache, content_height)
+                        }
+                        None => Self::clamp_scroll_back(
+                            self.scroll_back as usize,
+                            new_total,
+                            content_height,
+                        ),
+                    };
+                    self.scroll_back = sb.min(u16::MAX as usize) as u16;
+                    if self.scroll_back == 0 {
+                        self.scroll_anchor = None;
+                    }
+                }
+                // The growth-adjust in `visible_window` compares next frame's
+                // total against `last_line_count`; fold the correction in NOW
+                // so it is not double-applied as phantom "growth".
+                self.last_line_count = new_total;
+            }
+            // Loop: corrections may have shifted the window over new
+            // Estimated slots at the edges; the next pass promotes them or
+            // exits at the fixed point.
+        }
+    }
+
     /// Resolve height-space rows `[start..end)` to a message range via
     /// binary search over `cum_heights` (design §3 step 4):
     /// `cum[first] <= start < cum[first+1]` and `cum[last] < end <= cum[last+1]`.
@@ -1379,10 +1535,15 @@ impl TranscriptStore {
         out
     }
 
-    /// Re-materialize a demoted slot's pixels (design §3 step 5). The height
-    /// is already known — the render is debug-asserted to reproduce it (the
-    /// measure-IS-render guarantee; a mismatch means a height-affecting
-    /// render input changed without an invalidate — the §1.4 rule violation).
+    /// Re-materialize a demoted slot's pixels (design §3 step 5). For an
+    /// Exact slot the height is already known — the render is debug-asserted
+    /// to reproduce it (the measure-IS-render guarantee; a mismatch means a
+    /// height-affecting render input changed without an invalidate — the
+    /// §1.4 rule violation). T241 Slice 3: an ESTIMATED slot may also land
+    /// here via the frame-lagged event path (`promote_for_event` — a wheel +
+    /// click in one input batch can map into rows `promote_window` has not
+    /// covered yet); its first exact render is a height CORRECTION, spliced
+    /// into `cum_heights` like any §4.4 correction.
     fn promote_slot(&mut self, msg_idx: usize, width: usize, ctx: &RenderCtx<'_>) {
         let needs = self
             .line_cache()
@@ -1394,12 +1555,23 @@ impl TranscriptStore {
         let fresh = self.render_message_lines(msg_idx, width, ctx);
         if let Some(cache) = self.cache.line_cache_mut() {
             if let Some(slot) = cache.per_msg.get_mut(msg_idx) {
-                debug_assert_eq!(
-                    fresh.height(),
-                    slot.height(),
-                    "promoted slot {msg_idx} must re-render to its measured height"
-                );
+                let was_exact = slot.height.is_exact();
+                if was_exact {
+                    debug_assert_eq!(
+                        fresh.height(),
+                        slot.height(),
+                        "promoted slot {msg_idx} must re-render to its measured height"
+                    );
+                }
+                let corrected = fresh.height() != slot.height();
                 *slot = fresh;
+                if !was_exact && corrected {
+                    let _cum_written = cache.rebuild_cum_from(msg_idx);
+                    #[cfg(any(test, feature = "testing"))]
+                    self.probe
+                        .cum_writes
+                        .fetch_add(_cum_written, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -2426,8 +2598,6 @@ mod visible_window_tests {
             .expect("line cache populated after layout")
             .total_height();
         assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
-        let end = total; // scroll_back = 0
-        let start = end.saturating_sub(content_height);
 
         let to_str = |sl: &[ratatui::text::Line<'static>]| -> Vec<String> {
             sl.iter()
@@ -2458,25 +2628,26 @@ mod visible_window_tests {
         );
         assert!(!vw.is_empty, "20 messages → is_empty must be false");
 
-        // 2. Content must match the reference render's [start..end] window
-        //    (post flat-kill: render_lines is the oracle, not a live buffer).
+        // 2. Content must match the reference render's window, compared
+        //    BOTTOM-RELATIVE (T241 Slice 3: `total_height` now includes
+        //    ESTIMATED heights for slots outside the viewport + promote
+        //    halo, so cache coordinates and eager-oracle coordinates only
+        //    coincide measured from the bottom, where the tail window is
+        //    always Exact — I-STREAM). Bottom-pinned viewport == the
+        //    oracle's last `content_height` rows, byte-identical.
         let oracle = store.render_lines(content_width, &test_ctx());
-        assert_eq!(
-            oracle.len(),
-            total,
-            "oracle render must reproduce total_height"
-        );
+        let o_len = oracle.len();
         assert_eq!(
             to_str(&vw.lines),
-            to_str(&oracle[start..end]),
-            "published window content must equal the reference render's [start..end]"
+            to_str(&oracle[o_len - content_height..]),
+            "published window content must equal the reference render's bottom window"
         );
 
         // 3. Render-thread side: visible = model.lines.to_vec() (no re-slice).
         let visible_render: Vec<ratatui::text::Line> = vw.lines.to_vec();
         assert_eq!(
             to_str(&visible_render),
-            to_str(&oracle[start..end]),
+            to_str(&oracle[o_len - content_height..]),
             "render-thread .to_vec() on vw.lines must equal the visible window"
         );
 
@@ -2493,6 +2664,14 @@ mod visible_window_tests {
             to_str(&vw2.lines),
             to_str(&vw.lines),
             "different scroll positions must yield different window content"
+        );
+        // Bottom-relative oracle equivalence holds mid-scroll too: rows
+        // [o_len-15, o_len-10) — 10 rows up from the bottom, all within the
+        // exact-promoted tail.
+        assert_eq!(
+            to_str(&vw2.lines),
+            to_str(&oracle[o_len - 15..o_len - 10]),
+            "mid-scroll window must equal the oracle's bottom-relative slice"
         );
     }
 }
@@ -2618,32 +2797,39 @@ mod source_text_tests {
     }
 }
 
-// ── Slice 0: Baseline pathology tests (T241 §5 / §8) ─────────────────────────
+// ── Slice 3: I-RENDER / I-HILITE ratchets (T241 §5, T1–T3) ───────────────────
 //
-// These tests document the CURRENT eager behaviour as a measured baseline.
-// They are `#[ignore]` so CI doesn't pay the syntect init cost on every run;
-// invoke them explicitly:
+// Slice 0 landed these as INVERTED baselines documenting the eager pathology
+// (renders == total, off-screen fences → syntect). Slice 3 (the lazy flip)
+// rewrote them into the hard ratchets:
 //
-//   cargo test -p synaps-tui --test '*' -- --ignored baseline_slice0
-//   cargo test -p synaps-tui -- --ignored baseline_slice0
+//   T1  cold Missing first frame:  exact_renders ≤ V_msgs + 2·HALO  (≤ 72)
+//   T2  second frame, no input:    exact_renders delta == 0
+//   T3  off-screen code fences outside window+halo: highlight calls == 0
 //
-// INTENTIONAL REWRITE TARGET: Slice 4 of T241 (lazy-estimator landing) will
-// flip the assertions in these tests.  The test names and the comment
-// "BASELINE — rewrite in Slice 4" serve as grep-able markers so the
-// implementer knows exactly which assertions invert.
+// T1/T2 use the per-store render probe — parallel-safe, ACTIVE in CI (they
+// never touch syntect: the promoted window is plain text).
+// The mixed-store cold test and T3 read the PROCESS-GLOBAL highlight
+// counters, so they stay `#[ignore]` and must run isolated:
+//
+//   cargo test -p synaps-tui --lib -- --ignored slice3 --test-threads=1
 //
 // Counter semantics (recap):
 //   probe_render_count()  — render_message_lines calls since last probe_reset()
 //   highlight_call_count() — syntect highlight_line sessions since last reset
 //   syntax_set_was_touched() — whether SYNTAX_SET LazyLock init fired since reset
 #[cfg(test)]
-mod slice0_baseline_pathology {
+mod slice3_lazy_ratchets {
     use super::super::highlight;
     use super::*;
     use ratatui::layout::Rect;
 
     const VIEWPORT_ROWS: usize = 40;
     const VIEWPORT_COLS: usize = 120;
+
+    /// I-RENDER bound (scope §2): `V_msgs + 2·HALO` where `V_msgs` ≤ viewport
+    /// rows (MIN_MSG_HEIGHT = 1) and HALO = `PROMOTE_HALO_MSGS` = 16.
+    const RENDER_BOUND: usize = VIEWPORT_ROWS + 2 * TranscriptStore::PROMOTE_HALO_MSGS; // 72
     // Outer rect adds 2 border rows/cols each side.
     fn msg_area(rows: usize, cols: usize) -> Rect {
         Rect {
@@ -2697,17 +2883,19 @@ mod slice0_baseline_pathology {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // BASELINE — rewrite in Slice 4
+    // T1 ratchet (mixed-content variant) — flipped from the Slice-0 baseline.
     //
-    // T241 §5 T1 (inverted): current eager path renders ALL N messages on the
-    // first Missing→sync_cache.  After Slice 3 the ratchet flips to ≤ 72 for
-    // a 40-row viewport.
+    // T241 §5 T1: cold Missing first frame promotes only viewport + halo.
+    // Hard bound: exact_renders ≤ V_msgs + 2·HALO = 72 (was == 1005 eager).
+    // Still `#[ignore]`: the promote halo legitimately reaches the fenced
+    // tail messages, so this variant loads syntect (slow) — the ACTIVE plain
+    // variant below covers CI.
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
-    #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
+    #[ignore = "slow: halo reaches fenced tail msgs → loads syntect; run with --ignored"]
     fn baseline_slice0_cold_missing_renders_all_messages() {
-        // BASELINE — rewrite in Slice 4:
-        //   after lazy estimation lands, assert renders <= VIEWPORT_ROWS + 2*HALO (≤72)
+        // Name kept from Slice 0 for history/grep; the assertion is now the
+        // Slice-3 I-RENDER ratchet (renders ≤ RENDER_BOUND, not == TOTAL).
         const N_PLAIN: usize = 800;
         const N_CODE: usize = 200;
         const TOTAL: usize = N_PLAIN + N_CODE + 5; // +5 tail messages
@@ -2727,36 +2915,130 @@ mod slice0_baseline_pathology {
 
         eprintln!(
             "[baseline_slice0_cold_missing_renders_all_messages]\n  \
-             renders={renders}  (expected today: == {TOTAL}; target after Slice3: ≤72)\n  \
+             renders={renders}  (I-RENDER ratchet: ≤ {RENDER_BOUND}; eager baseline was == {TOTAL})\n  \
              highlight_calls={hl_calls}\n  \
              syntax_set_touched={ss_touched}"
         );
 
-        // BASELINE assertion: today every message is rendered on the first frame.
-        // This will be INVERTED in Slice 4.
-        assert_eq!(
-            renders, TOTAL,
-            "BASELINE: cold Missing sync renders all {TOTAL} messages. \
-             Slice 4 rewrites this assertion to renders ≤ 72."
+        // I-RENDER (T1): the cold frame renders only the viewport + halo.
+        assert!(
+            renders <= RENDER_BOUND,
+            "I-RENDER: cold Missing frame must render ≤ {RENDER_BOUND} messages \
+             (viewport + 2·halo), rendered {renders} of {TOTAL}"
+        );
+        assert!(
+            renders > 0,
+            "sanity: the cold frame must render SOMETHING (the visible tail)"
         );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // BASELINE — rewrite in Slice 4
-    //
-    // T241 §5 T3 (inverted): an off-screen fenced code block currently forces
-    // SYNTAX_SET init (highlight_call_count > 0, syntax_set_was_touched == true)
-    // on the first frame.  After Slice 3 the ratchet flips to == 0 / false.
+    // T1 — ACTIVE hard ratchet (scope §5): 1,000 messages, viewport 40,
+    // first frame from Missing → exact_renders ≤ 72. All-plain store so the
+    // test never touches syntect (fast + parallel-safe: reads only the
+    // per-store render probe).
     // ─────────────────────────────────────────────────────────────────────────
     #[test]
-    #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
-    fn baseline_slice0_offscreen_code_fence_triggers_syntect_init() {
-        // BASELINE — rewrite in Slice 4:
-        //   after lazy estimation, assert highlight_calls == 0 && !syntax_set_was_touched
-        const N_PLAIN: usize = 800;
-        const N_CODE: usize = 200; // off-screen code fences
+    fn slice3_t1_cold_first_frame_renders_at_most_viewport_plus_halo() {
+        const TOTAL: usize = 1_000;
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..TOTAL {
+            store.push_msg(ChatMessage::Text(format!(
+                "Plain ratchet message {i}.\n\
+                 Second line of message {i}.\n\
+                 Third line: the quick brown fox jumps over the lazy dog."
+            )));
+        }
 
-        let mut store = make_synthetic_store(N_PLAIN, N_CODE);
+        store.probe_reset();
+        let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
+        let _vw = store.visible_window(area, &test_ctx());
+
+        let renders = store.probe_render_count();
+        eprintln!(
+            "[slice3_t1] cold first frame renders={renders} (bound {RENDER_BOUND}, n={TOTAL})"
+        );
+        assert!(
+            renders <= RENDER_BOUND,
+            "I-RENDER (T1): first frame from Missing at n={TOTAL} must perform \
+             ≤ {RENDER_BOUND} exact renders, performed {renders}"
+        );
+        assert!(renders > 0, "sanity: cold frame must render the visible tail");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // T2 — ACTIVE hard ratchet (scope §5): same store, second frame with no
+    // input → exact_renders delta == 0 (the promoted window is a fixed point).
+    // ─────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn slice3_t2_second_frame_renders_delta_zero() {
+        const TOTAL: usize = 1_000;
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..TOTAL {
+            store.push_msg(ChatMessage::Text(format!(
+                "Plain ratchet message {i}.\n\
+                 Second line of message {i}.\n\
+                 Third line: the quick brown fox jumps over the lazy dog."
+            )));
+        }
+
+        let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
+        let ctx = test_ctx();
+        let _vw = store.visible_window(area, &ctx); // cold frame
+
+        store.probe_reset();
+        let _vw2 = store.visible_window(area, &ctx); // second frame, no input
+
+        let renders = store.probe_render_count();
+        let cum_writes = store.probe_cum_write_count();
+        eprintln!("[slice3_t2] second frame renders={renders} cum_writes={cum_writes}");
+        assert_eq!(
+            renders, 0,
+            "T2: second frame with no input must render 0 messages, rendered {renders}"
+        );
+        assert_eq!(
+            cum_writes, 0,
+            "T2: second frame must write 0 cumulative-offset entries (lock L4)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // T3 ratchet — flipped from the Slice-0 baseline (was: off-screen fences
+    // trigger syntect; now: fences strictly OUTSIDE viewport+halo trigger
+    // ZERO highlight calls — I-HILITE). The fences sit at the FRONT of the
+    // transcript (indices 0..N_CODE) so the tail window + halo never reaches
+    // them. Reads the process-global highlight counters → stays `#[ignore]`;
+    // run isolated:  cargo test -p synaps-tui --lib -- --ignored slice3 --test-threads=1
+    // ─────────────────────────────────────────────────────────────────────────
+    #[test]
+    #[ignore = "reads process-global highlight counters; run isolated with --ignored --test-threads=1"]
+    fn slice3_t3_offscreen_code_fence_zero_highlight_calls() {
+        const N_CODE: usize = 200; // fences at the FRONT — far outside the halo
+        const N_PLAIN: usize = 800;
+
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..N_CODE {
+            store.push_msg(ChatMessage::Text(format!(
+                "Message with off-screen fenced code block {i}.\n\
+                 ```rust\n\
+                 fn synthetic_{i}() -> usize {{\n\
+                     let x = {i};\n\
+                     x * x\n\
+                 }}\n\
+                 ```\n\
+                 After the code block."
+            )));
+        }
+        for i in 0..N_PLAIN {
+            store.push_msg(ChatMessage::Text(format!(
+                "Synthetic assistant message {i}.\n\
+                 This is a second line of text to give the message some height.\n\
+                 Third line: the quick brown fox jumps over the lazy dog."
+            )));
+        }
+        for i in 0..5 {
+            store.push_msg(ChatMessage::User(format!("User tail message {i}")));
+        }
 
         store.probe_reset();
         highlight::highlight_reset_counters();
@@ -2764,30 +3046,33 @@ mod slice0_baseline_pathology {
         let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
         let _vw = store.visible_window(area, &test_ctx());
 
+        let renders = store.probe_render_count();
         let hl_calls = highlight::highlight_call_count();
         let ss_touched = highlight::syntax_set_was_touched();
 
         eprintln!(
-            "[baseline_slice0_offscreen_code_fence_triggers_syntect_init]\n  \
-             highlight_calls={hl_calls}  (expected today: >0; target after Slice3: ==0)\n  \
-             syntax_set_touched={ss_touched}  \
-             (note: may be false if SYNTAX_SET pre-warmed by another test in this process)"
+            "[slice3_t3] renders={renders} highlight_calls={hl_calls} \
+             syntax_set_touched={ss_touched} (I-HILITE targets: 0 / false)"
         );
 
-        // BASELINE assertion: today off-screen fences trigger syntect on first frame.
-        // This is INVERTED in Slice 4 (hl_calls == 0).
-        assert!(
-            hl_calls > 0,
-            "BASELINE: off-screen code fences trigger syntect (got {hl_calls} calls). \
-             Slice 4 rewrites this to == 0."
+        // I-HILITE (T3): fences outside viewport + halo must never highlight.
+        assert_eq!(
+            hl_calls, 0,
+            "I-HILITE: off-screen (outside halo) code fences must trigger \
+             ZERO syntect highlight calls on the first frame, got {hl_calls}"
         );
-        // Note: SYNTAX_SET_TOUCHED is a process-global latch that fires at
-        // most once per process lifetime. It is only reliable in isolated runs
-        // (the integration test tests/mem_transcript.rs).  In shared-process
-        // runs another test may pre-warm SYNTAX_SET, leaving ss_touched=false
-        // here even though hl_calls > 0 (syntect IS executing, just not
-        // initializing again).  We assert hl_calls only; the integration test
-        // asserts ss_touched independently.
+        assert!(
+            renders <= RENDER_BOUND,
+            "I-RENDER holds here too: rendered {renders} > {RENDER_BOUND}"
+        );
+        // SYNTAX_SET_TOUCHED is a process-global latch reset by
+        // highlight_reset_counters(); reliable only when this test runs
+        // isolated (--test-threads=1), which the #[ignore] note mandates.
+        assert!(
+            !ss_touched,
+            "I-HILITE: SYNTAX_SET must not initialize when no fence is in \
+             the viewport + halo (run isolated — see #[ignore] note)"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
