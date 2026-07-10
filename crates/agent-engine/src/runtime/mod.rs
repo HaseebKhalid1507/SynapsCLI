@@ -621,15 +621,10 @@ impl Runtime {
     /// Uses a dedicated summarization system prompt (not the user's), omits
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
-    pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
+    pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
         self.refresh_if_needed().await?;
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
-
-        // Boundary adapter (#128 slice 3): Arc::new(value) moves each Value —
-        // zero deep copies. Outer callers convert to SharedMessage in slice 5.
-        let messages: Vec<crate::SharedMessage> =
-            messages.into_iter().map(std::sync::Arc::new).collect();
 
         ApiMethods::call_api_simple(
             &self.auth,

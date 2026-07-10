@@ -1,4 +1,3 @@
-use serde_json::Value;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 
@@ -29,7 +28,7 @@ pub(crate) struct App {
     /// Cursor position as a **char index** (not byte index).
     /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
     pub(crate) cursor_pos: usize,
-    pub(crate) api_messages: Vec<Value>,
+    pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
@@ -325,9 +324,7 @@ impl App {
         if self.api_messages.is_empty() {
             return;
         }
-        // Swap live vec into session for serialization; swap back after save
-        // so no full duplicate lives in `session.api_messages` between saves.
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
+        self.session.api_messages = self.api_messages.clone();
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
@@ -337,7 +334,6 @@ impl App {
         if let Err(e) = self.session.save().await {
             eprintln!("\x1b[31m[ERROR] Failed to save session: {}\x1b[0m", e);
         }
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -56,7 +56,7 @@ struct InFlight {
 struct RpcState {
     runtime: Runtime,
     session: Session,
-    api_messages: Vec<serde_json::Value>,
+    api_messages: Vec<synaps_cli::SharedMessage>,
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,
@@ -70,10 +70,7 @@ impl RpcState {
         if self.api_messages.is_empty() {
             return;
         }
-        // Swap the live vec into the session for serialization instead of
-        // cloning, so no full duplicate lives in `session.api_messages`
-        // between saves. Swap back once save() returns.
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
+        self.session.api_messages = self.api_messages.clone();
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
@@ -85,7 +82,6 @@ impl RpcState {
         if let Err(e) = self.session.save().await {
             tracing::error!(error = %e, "failed to save session");
         }
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
     }
 
     /// Returns `true` if a streaming task is currently running.
@@ -143,15 +139,9 @@ async fn spawn_prompt(
 
     let handle = tokio::spawn(async move {
         // Snapshot message history; release lock before blocking on the stream.
-        // Slice 2 shim: outer state is `Vec<Value>` — wrap each in Arc for the
-        // inner stream loop. Cost identical to today's clone (no regression).
-        let messages: Vec<synaps_cli::SharedMessage> = {
-            let st = state.lock().await;
-            st.api_messages
-                .iter()
-                .map(|v| std::sync::Arc::new(v.clone()))
-                .collect()
-        };
+        // Vec<SharedMessage> clone = pointer bumps only.
+        let messages: Vec<synaps_cli::SharedMessage> =
+            state.lock().await.api_messages.clone();
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
@@ -176,12 +166,7 @@ async fn spawn_prompt(
             // state instead of cloning it (the vec can be several MB).
             if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
                 let mut st = state.lock().await;
-                // Slice 2 shim: unwrap Arc when unique (no copy in the common
-                // path — we are the sole consumer).
-                st.api_messages = msgs
-                    .into_iter()
-                    .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
-                    .collect();
+                st.api_messages = msgs;
                 st.save_session().await;
                 continue;
             }
@@ -317,7 +302,7 @@ async fn handle_prompt(
     {
         let mut st = state.lock().await;
         st.api_messages
-            .push(serde_json::json!({"role": "user", "content": content}));
+            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
     }
 
     let in_flight = spawn_prompt(id, state.clone(), writer_tx).await;
@@ -348,8 +333,9 @@ async fn handle_compact(
         Ok(summary) => {
             {
                 let mut st = state.lock().await;
-                st.api_messages =
-                    vec![serde_json::json!({"role": "user", "content": summary.clone()})];
+                st.api_messages = vec![std::sync::Arc::new(
+                    serde_json::json!({"role": "user", "content": summary.clone()}),
+                )];
                 st.save_session().await;
             }
             let _ = writer_tx

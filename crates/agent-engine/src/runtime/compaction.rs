@@ -1,6 +1,6 @@
 //! Conversation compaction — turn a long message history into a structured summary.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// System prompt used for the compaction API call.
 /// Instructs the model to summarize, not continue the conversation.
@@ -101,7 +101,7 @@ impl FileOps {
 /// Serialize the in-memory API message history into a readable transcript and
 /// ask the LLM to produce a structured summary. Called by `/compact`.
 pub async fn compact_conversation(
-    api_messages: &[Value],
+    api_messages: &[crate::SharedMessage],
     runtime: &Runtime,
     custom_instructions: Option<&str>,
 ) -> Result<String> {
@@ -222,6 +222,6 @@ pub async fn compact_conversation(
         file_section
     ));
 
-    let user_msg = json!({"role": "user", "content": prompt_text});
+    let user_msg = std::sync::Arc::new(json!({"role": "user", "content": prompt_text}));
     runtime.compact_call(vec![user_msg]).await
 }

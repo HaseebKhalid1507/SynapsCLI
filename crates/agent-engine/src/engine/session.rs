@@ -5,12 +5,12 @@
 
 use crate::{Session, Runtime};
 use crate::pricing::calculate_cost_optional_split;
-use serde_json::Value;
+use crate::SharedMessage;
 
 /// Conversation state tracked by the engine.
 pub struct ConversationState {
     pub session: Session,
-    pub api_messages: Vec<Value>,
+    pub api_messages: Vec<SharedMessage>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
@@ -61,9 +61,7 @@ impl ConversationState {
         if self.api_messages.is_empty() {
             return;
         }
-        // Swap live vec into session for serialization; swap back after save
-        // so no full duplicate lives in `session.api_messages` between saves.
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
+        self.session.api_messages = self.api_messages.clone();
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
         self.session.session_cost = self.session_cost;
@@ -73,7 +71,6 @@ impl ConversationState {
         if let Err(e) = self.session.save().await {
             tracing::error!("Failed to save session: {}", e);
         }
-        std::mem::swap(&mut self.session.api_messages, &mut self.api_messages);
     }
 
     /// Clear the current session and start fresh.

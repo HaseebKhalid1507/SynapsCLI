@@ -7,7 +7,7 @@
 
 use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentConfig, HandoffState, watcher_types::{AgentStats, DailyStats}};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -291,7 +291,9 @@ pub async fn run(config_path: String, trigger_context: String) {
     let session_start = Instant::now();
     let max_duration = std::time::Duration::from_secs(config.limits.max_session_duration_mins * 60);
     let mut watcher_exit_called = false;
-    let mut messages: Vec<Value> = vec![json!({"role": "user", "content": boot_message})];
+    let mut messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
+        json!({"role": "user", "content": boot_message}),
+    )];
 
     log(agent_name, "session started — entering agentic loop");
 
@@ -335,11 +337,8 @@ pub async fn run(config_path: String, trigger_context: String) {
             }
         });
 
-        // Slice 2 shim: Vec<Value> → Vec<SharedMessage>.
-        let msgs_in: Vec<synaps_cli::SharedMessage> = messages
-            .iter()
-            .map(|v| std::sync::Arc::new(v.clone()))
-            .collect();
+        // Vec<SharedMessage> clone = pointer bumps only.
+        let msgs_in: Vec<synaps_cli::SharedMessage> = messages.clone();
         let mut stream = runtime.run_stream_with_messages(
             msgs_in,
             cancel,
@@ -414,11 +413,7 @@ pub async fn run(config_path: String, trigger_context: String) {
                     }
                 }
                 StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-                    // Slice 2 shim back to Vec<Value>.
-                    messages = history
-                        .into_iter()
-                        .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
-                        .collect();
+                    messages = history;
                     turn_done = true;
                 }
                 StreamEvent::Session(SessionEvent::Done) => {
@@ -450,10 +445,10 @@ pub async fn run(config_path: String, trigger_context: String) {
                 // Give it one more chance to write handoff
                 if !watcher_exit_called {
                     log(agent_name, "agent ended turn without tool calls — prompting for handoff");
-                    messages.push(json!({
+                    messages.push(std::sync::Arc::new(json!({
                         "role": "user",
                         "content": "You stopped without calling watcher_exit. If you're done, call watcher_exit now with your handoff state. If you have more work, continue."
-                    }));
+                    })));
                     // Let it have one more turn
                     continue;
                 }
@@ -464,16 +459,13 @@ pub async fn run(config_path: String, trigger_context: String) {
     // Exit phase — if we didn't get a clean watcher_exit, ask for handoff
     if !watcher_exit_called && !interrupted.load(Ordering::Acquire) {
         log(agent_name, "requesting handoff before shutdown...");
-        messages.push(json!({
+        messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": "You're being shut down (resource limit reached). Call watcher_exit NOW with your handoff state — summarize what you did, what's pending, and any context your next session needs."
-        }));
+        })));
 
         let cancel = CancellationToken::new();
-        let msgs_in: Vec<synaps_cli::SharedMessage> = messages
-            .iter()
-            .map(|v| std::sync::Arc::new(v.clone()))
-            .collect();
+        let msgs_in: Vec<synaps_cli::SharedMessage> = messages.clone();
         let mut stream = runtime.run_stream_with_messages(msgs_in, cancel, None, None, false).await;
         
         // Give it 60 seconds to write handoff

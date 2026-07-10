@@ -598,7 +598,7 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     {
         let mut conv = state.conv.write().await;
         conv.api_messages
-            .push(serde_json::json!({"role": "user", "content": content}));
+            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
     }
 
     // Server-local subagent tracker — chat.rs has the same. queued_message
@@ -623,15 +623,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     // history to the API.
     'turn: loop {
         // Snapshot messages and set up a fresh cancel token for this turn.
-        // Slice 2 shim: Vec<Value> → Vec<SharedMessage> for the inner loop.
-        let messages: Vec<synaps_cli::SharedMessage> = state
-            .conv
-            .read()
-            .await
-            .api_messages
-            .iter()
-            .map(|v| std::sync::Arc::new(v.clone()))
-            .collect();
+        // Vec<SharedMessage> clone = pointer bumps only.
+        let messages: Vec<synaps_cli::SharedMessage> =
+            state.conv.read().await.api_messages.clone();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 
@@ -688,8 +682,9 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     // next user turn. Then save and continue the outer loop.
                     {
                         let mut conv = state.conv.write().await;
-                        conv.api_messages
-                            .push(serde_json::json!({"role": "user", "content": queued}));
+                        conv.api_messages.push(std::sync::Arc::new(
+                            serde_json::json!({"role": "user", "content": queued}),
+                        ));
                     }
                     state.save_session().await;
                     continue 'turn;
@@ -1012,7 +1007,7 @@ async fn handle_command(name: &str, args: &str, state: &Arc<ServerState>) {
 /// fidelity in the replay buffer for resumed sessions. Tracked as
 /// follow-up — engine should expose a `Session::display_history()`
 /// helper.
-fn rebuild_history(api_messages: &[serde_json::Value]) -> Vec<HistoryEntry> {
+fn rebuild_history(api_messages: &[synaps_cli::SharedMessage]) -> Vec<HistoryEntry> {
     let mut history = Vec::new();
     for msg in api_messages {
         match msg["role"].as_str() {

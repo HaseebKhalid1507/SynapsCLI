@@ -18,7 +18,7 @@ pub use agent_core::{epoch_millis, truncate_str};
 pub use agent_engine::{runtime, tools, mcp, skills, events, extensions, sidecar, engine, help};
 
 // ── item re-exports (tui uses these at crate root) ────────────────────────────
-pub use agent_engine::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
+pub use agent_engine::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent, SharedMessage};
 pub use agent_engine::{Tool, ToolContext, ToolRegistry};
 pub use agent_engine::{Session, SessionInfo, find_session, latest_session, list_sessions, list_recent_sessions, resolve_session, find_session_by_name, validate_name};
 pub use agent_engine::{RuntimeError, Result};
