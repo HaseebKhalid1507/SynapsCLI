@@ -143,9 +143,14 @@ async fn spawn_prompt(
 
     let handle = tokio::spawn(async move {
         // Snapshot message history; release lock before blocking on the stream.
-        let messages = {
+        // Slice 2 shim: outer state is `Vec<Value>` — wrap each in Arc for the
+        // inner stream loop. Cost identical to today's clone (no regression).
+        let messages: Vec<synaps_cli::SharedMessage> = {
             let st = state.lock().await;
-            st.api_messages.clone()
+            st.api_messages
+                .iter()
+                .map(|v| std::sync::Arc::new(v.clone()))
+                .collect()
         };
 
         // Acquire lock only long enough to start the stream future.
@@ -171,7 +176,12 @@ async fn spawn_prompt(
             // state instead of cloning it (the vec can be several MB).
             if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
                 let mut st = state.lock().await;
-                st.api_messages = msgs;
+                // Slice 2 shim: unwrap Arc when unique (no copy in the common
+                // path — we are the sole consumer).
+                st.api_messages = msgs
+                    .into_iter()
+                    .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
+                    .collect();
                 st.save_session().await;
                 continue;
             }

@@ -66,7 +66,12 @@ pub(super) async fn handle_stream_event(
             return StreamAction::Continue;
         }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-            app.api_messages = history;
+            // Slice 2 shim: outer state is Vec<Value>. Unwrap Arc when unique
+            // (common — TUI is the sole consumer of the stream's history).
+            app.api_messages = history
+                .into_iter()
+                .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
+                .collect();
             app.save_session().await;
         }
         StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {
@@ -261,7 +266,7 @@ pub(super) async fn handle_event_queue_arm(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.iter().map(|v| std::sync::Arc::new(v.clone())).collect(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             *cancel_token = Some(ct);
                             *steer_tx = Some(s_tx);
@@ -340,7 +345,7 @@ pub(super) async fn handle_stream_arm(
                                 patch.apply(app);
                                 render_handle.publish(model);
                             }
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.iter().map(|v| std::sync::Arc::new(v.clone())).collect(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.status_text = None;
                             app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             *cancel_token = Some(ct);
@@ -354,7 +359,7 @@ pub(super) async fn handle_stream_arm(
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.streaming = true;
                             app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.iter().map(|v| std::sync::Arc::new(v.clone())).collect(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                             app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                             *cancel_token = Some(ct);
                             *steer_tx = Some(s_tx);

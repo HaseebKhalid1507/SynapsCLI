@@ -21,7 +21,7 @@ futures      = "0.3"
 async-trait  = "0.1.89"
 
 # Serialisation
-serde        = { version = "1.0", features = ["derive"] }
+serde        = { version = "1.0", features = ["derive", "rc"] }
 serde_json   = "1.0"
 
 # Tracing

@@ -274,7 +274,7 @@ pub(crate) async fn handle_input_action(
                                             patch.apply(app);
                                             render_handle.publish(model);
                                         }
-                                        *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                                        *stream = Some(runtime.run_stream_with_messages(app.api_messages.iter().map(|v| std::sync::Arc::new(v.clone())).collect(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                         app.status_text = None;
                                         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                                         *cancel_token = Some(ct);
@@ -993,7 +993,7 @@ pub(crate) async fn handle_input_action(
                                     patch.apply(app);
                                     render_handle.publish(model);
                                 }
-                                *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                                *stream = Some(runtime.run_stream_with_messages(app.api_messages.iter().map(|v| std::sync::Arc::new(v.clone())).collect(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
                                 app.status_text = None;
                                 app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
                                 *cancel_token = Some(ct);

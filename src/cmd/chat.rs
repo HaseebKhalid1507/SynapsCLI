@@ -186,8 +186,15 @@ pub async fn run(
         conv.api_messages.push(json!({"role": "user", "content": message}));
 
         let cancel = CancellationToken::new();
+        // Slice 2 shim: convert outer Vec<Value> → Vec<SharedMessage> for the
+        // inner stream loop; MessageHistory unwraps back inside process_stream_event.
+        let msgs_in: Vec<synaps_cli::SharedMessage> = conv
+            .api_messages
+            .iter()
+            .map(|v| std::sync::Arc::new(v.clone()))
+            .collect();
         let mut stream = runtime.run_stream_with_messages(
-            conv.api_messages.clone(), cancel, None, None, false
+            msgs_in, cancel, None, None, false
         ).await;
 
         let mut in_thinking = false;

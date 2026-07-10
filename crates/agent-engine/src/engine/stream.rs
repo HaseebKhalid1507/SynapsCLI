@@ -120,7 +120,12 @@ pub fn process_stream_event(
             (EngineStreamEvent::ToolResult { tool_id, result }, StreamCompletion::Continue)
         }
         StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-            *messages = history;
+            // Slice 2 shim: outer state is still `Vec<Value>`. Move-not-clone
+            // when the Arc is unique (common — we're the sole consumer).
+            *messages = history
+                .into_iter()
+                .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
+                .collect();
             (EngineStreamEvent::Noop, StreamCompletion::Continue)
         }
         StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id, agent_name, task_preview }) => {

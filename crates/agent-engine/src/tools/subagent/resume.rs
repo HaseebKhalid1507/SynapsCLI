@@ -179,7 +179,7 @@ impl Tool for SubagentResumeTool {
                     });
 
                     let mut stream = runtime.run_stream_with_messages(
-                        vec![serde_json::json!({"role": "user", "content": task_for_stream})],
+                        vec![std::sync::Arc::new(serde_json::json!({"role": "user", "content": task_for_stream}))],
                         cancel,
                         Some(steer_rx),
                         None,

@@ -1,7 +1,9 @@
 use super::types::{AgentEvent, StreamEvent};
 use crate::core::config::CacheTtl;
 use crate::truncate_str;
+use crate::SharedMessage;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Where a cache_control marker sits in the request body.
@@ -48,7 +50,7 @@ impl HelperMethods {
     /// into the conversation as user messages. Returns true if any were injected.
     pub(super) fn drain_steering(
         steering_rx: &mut Option<mpsc::UnboundedReceiver<String>>,
-        messages: &mut Vec<Value>,
+        messages: &mut Vec<SharedMessage>,
         tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> bool {
         let rx = match steering_rx.as_mut() {
@@ -62,7 +64,7 @@ impl HelperMethods {
             let _ = tx.send(StreamEvent::Agent(AgentEvent::SteeringDelivered {
                 message: msg.clone(),
             }));
-            messages.push(json!({"role": "user", "content": msg}));
+            messages.push(Arc::new(json!({"role": "user", "content": msg})));
             injected = true;
         }
         injected

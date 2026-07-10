@@ -335,8 +335,13 @@ pub async fn run(config_path: String, trigger_context: String) {
             }
         });
 
+        // Slice 2 shim: Vec<Value> → Vec<SharedMessage>.
+        let msgs_in: Vec<synaps_cli::SharedMessage> = messages
+            .iter()
+            .map(|v| std::sync::Arc::new(v.clone()))
+            .collect();
         let mut stream = runtime.run_stream_with_messages(
-            messages.clone(),
+            msgs_in,
             cancel,
             None, // no steering for autonomous agents
             None,
@@ -409,7 +414,11 @@ pub async fn run(config_path: String, trigger_context: String) {
                     }
                 }
                 StreamEvent::Session(SessionEvent::MessageHistory(history)) => {
-                    messages = history;
+                    // Slice 2 shim back to Vec<Value>.
+                    messages = history
+                        .into_iter()
+                        .map(|a| std::sync::Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
+                        .collect();
                     turn_done = true;
                 }
                 StreamEvent::Session(SessionEvent::Done) => {
@@ -461,7 +470,11 @@ pub async fn run(config_path: String, trigger_context: String) {
         }));
 
         let cancel = CancellationToken::new();
-        let mut stream = runtime.run_stream_with_messages(messages.clone(), cancel, None, None, false).await;
+        let msgs_in: Vec<synaps_cli::SharedMessage> = messages
+            .iter()
+            .map(|v| std::sync::Arc::new(v.clone()))
+            .collect();
+        let mut stream = runtime.run_stream_with_messages(msgs_in, cancel, None, None, false).await;
         
         // Give it 60 seconds to write handoff
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);

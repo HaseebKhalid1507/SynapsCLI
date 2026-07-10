@@ -623,7 +623,15 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
     // history to the API.
     'turn: loop {
         // Snapshot messages and set up a fresh cancel token for this turn.
-        let messages = state.conv.read().await.api_messages.clone();
+        // Slice 2 shim: Vec<Value> → Vec<SharedMessage> for the inner loop.
+        let messages: Vec<synaps_cli::SharedMessage> = state
+            .conv
+            .read()
+            .await
+            .api_messages
+            .iter()
+            .map(|v| std::sync::Arc::new(v.clone()))
+            .collect();
         let cancel = CancellationToken::new();
         *state.cancel_token.write().await = Some(cancel.clone());
 

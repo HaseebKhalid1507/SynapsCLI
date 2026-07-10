@@ -945,7 +945,7 @@ impl Runtime {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(
-            vec![json!({"role": "user", "content": prompt})],
+            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))],
             cancel,
             None,
             None,
@@ -959,7 +959,7 @@ impl Runtime {
     /// API retries, and dynamic tool registration (MCP) internally.
     pub async fn run_stream_with_messages(
         &self,
-        messages: Vec<Value>,
+        messages: Vec<crate::SharedMessage>,
         cancel: CancellationToken,
         steering_rx: Option<mpsc::UnboundedReceiver<String>>,
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
