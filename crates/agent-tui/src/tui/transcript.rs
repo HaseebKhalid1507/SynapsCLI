@@ -411,6 +411,72 @@ impl CacheState {
     }
 }
 
+// ── T241 Slice 2: ScrollAnchor data model ────────────────────────────────────
+//
+// **Scroll representation audit (Slice 2 — was ⚠️UNVERIFIED in scope §1.8):**
+//
+// `TranscriptStore` stores scroll position as `scroll_back: u16` —
+// **offset-from-bottom**, counting rows from the last content row upward.
+//   - `scroll_back == 0` means pinned to the bottom (latest content visible).
+//   - The visible window in height-space is:
+//       end   = total_height − scroll_back
+//       start = end − content_height          (clamped to 0)
+//       S_top = start                          (top visible content row)
+//   - Therefore: `S_top = total_height − scroll_back − content_height` (clamped).
+//   - And inversely: `scroll_back = total_height − content_height − S_top` (clamped).
+//
+// This is the representation used throughout `visible_window` (transcript.rs
+// lines 990–991 before this edit). `ScrollAnchor` is representation-independent:
+// conversions go through `S_top` as an intermediate, then convert back to
+// `scroll_back` for the live field.
+//
+// **Pinned mode vs. anchored mode:**
+// `None` (absent) = pinned to bottom — `S_top` is recomputed each frame from
+// `total_height` and `content_height`. This is the default state and is NOT
+// stored as a coordinate, because any height correction above the fold that
+// changed `total_height` would require no update to a pinned view.
+//
+// `Some(ScrollAnchor { msg_idx, row_in_msg })` = anchored away from bottom —
+// the user has scrolled up. `msg_idx` is the message whose first content row
+// is closest to the top of the viewport, and `row_in_msg` is how many rows
+// into that message the top of the viewport is (0 = the very first row of
+// the message).
+//
+// **The no-jump theorem (§4.3):** a height correction Δ to message j:
+//   j > anchor.msg_idx  → cum[anchor.msg_idx] unchanged → S_top unchanged → no visual motion
+//   j < anchor.msg_idx  → cum[anchor.msg_idx] += Δ      → S_top += Δ → anchor msg stays
+//                          at same screen row; content coordinate shifted, not visual
+//   j == anchor.msg_idx → clamp row_in_msg to min(row_in_msg, new_height − 1) → bounded motion
+//
+// **Slice 2 shadow-only policy:**
+// The `scroll_anchor` field is kept in sync with every `scroll_back` mutation
+// but does NOT drive rendering yet. All rendering still uses the raw
+// `scroll_back` field (eager behavior preserved, screens byte-identical).
+// Slice 3 rewrites the Missing-arm and `promote_window`, at which point the
+// anchor will be used as the coordinate source for S_top recomputation.
+
+/// A viewport anchor away from the bottom of the transcript.
+///
+/// When the user scrolls up, we capture the message + intra-message row that
+/// is at the top of the visible window. Future height corrections (Slice 3)
+/// use this to recompute `S_top` without visual jumps (§4.3 correction
+/// theorem).
+///
+/// Absent (`None` on `TranscriptStore.scroll_anchor`) means the view is
+/// **pinned to the bottom** — `S_top` is recomputed from `total_height` each
+/// frame and the anchor is not a coordinate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollAnchor {
+    /// Index into `TranscriptStore.messages` of the message whose rows
+    /// contain the topmost visible content row.
+    pub(crate) msg_idx: usize,
+    /// Row offset **from the top of the anchor message** to the topmost
+    /// visible content row. `0` means the very first row of the message
+    /// is at the top of the viewport. Always `< h_i` where `h_i` is the
+    /// height of the anchor message.
+    pub(crate) row_in_msg: usize,
+}
+
 /// Shell for the transcript store.
 ///
 /// Slice (a): `messages`.
@@ -424,6 +490,8 @@ impl CacheState {
 /// (`render_message_lines`, render.rs) moved into this impl with
 /// [`RenderCtx`] threading; `sync_cache` folds in the draw.rs cache-sync
 /// block; `show_full_output` is store-owned (locked decision #1).
+/// Slice 2 (T241): `scroll_anchor` shadow field (§4.3); kept in sync with
+/// `scroll_back` mutations but not yet used for rendering (Slice 3 activates).
 ///
 /// # Inline-mode accommodation (design §3.6)
 ///
@@ -447,6 +515,18 @@ pub(crate) struct TranscriptStore {
     /// Previous flat-line total — used to stabilise `scroll_back` when
     /// unpinned during streaming growth. See draw.rs §4 (growth-adjust block).
     last_line_count: usize,
+    /// T241 Slice 2: anchor in message-space for use by Slice 3 height-
+    /// correction (§4.3 no-jump theorem).
+    ///
+    /// `None`  = pinned to bottom (default). S_top is recomputed from
+    ///           `total_height` and `content_height` each frame.
+    /// `Some`  = anchored away from bottom. The anchor msg/row identifies
+    ///           the content coordinate of the top-of-viewport. Slice 3
+    ///           uses it as the coordinate source after height corrections.
+    ///
+    /// **Shadow-only in Slice 2**: kept in sync with every `scroll_back`
+    /// mutation but does NOT yet drive rendering. Slice 3 activates it.
+    scroll_anchor: Option<ScrollAnchor>,
 
     // ── Render cache (moved in slice b′; enum shape since slice d) ───────────
     /// Cached wrapped+highlighted message lines + incremental watermark.
@@ -537,6 +617,7 @@ impl TranscriptStore {
             scroll_back: 0,
             scroll_pinned: true,
             last_line_count: 0,
+            scroll_anchor: None,
             cache: CacheState::Missing,
             show_full_output: false,
             tool_start_time: None,
@@ -595,10 +676,193 @@ impl TranscriptStore {
     // scroll/selection note (lock L4): wheel scroll preserves selection,
     // keypresses clear it in input.rs::handle_key.
 
+    // ── T241 Slice 2: anchor conversion / capture / restore / clamp ──────────
+    //
+    // These are PURE functions of their arguments — no side effects, no
+    // `self` mutation. They are the mathematical kernel for §4.3; Slice 3
+    // will call them from `promote_window` and the Missing-arm rewrite.
+    //
+    // All functions use `S_top` (top visible content row, 0-based in
+    // cumulative-height space) as the intermediate representation.
+    //
+    // Relation to `scroll_back` (offset-from-bottom):
+    //   scroll_back = (total_height - content_height - S_top).clamp(0, max_back)
+    //   S_top       = (total_height - scroll_back - content_height).max(0)
+    //   where max_back = total_height.saturating_sub(content_height)
+
+    /// Convert a cumulative `scroll_back` offset + known totals to `S_top`.
+    ///
+    /// `total_height`: `cum_heights[n]` — current total rows in the cache.
+    /// `content_height`: viewport rows (inner, sans borders).
+    /// Returns 0 if the view is over-scrolled or the transcript is empty.
+    #[inline]
+    pub(crate) fn scroll_back_to_stop(
+        scroll_back: usize,
+        total_height: usize,
+        content_height: usize,
+    ) -> usize {
+        total_height
+            .saturating_sub(scroll_back)
+            .saturating_sub(content_height)
+    }
+
+    /// Convert `S_top` to a `scroll_back` offset, clamped to valid range.
+    ///
+    /// `total_height`: `cum_heights[n]`.
+    /// `content_height`: viewport rows (inner, sans borders).
+    /// The result is always `≤ total_height.saturating_sub(content_height)`.
+    #[allow(dead_code)] // Slice 3 uses this; tests use it via cfg(test)
+    #[inline]
+    pub(crate) fn stop_to_scroll_back(
+        s_top: usize,
+        total_height: usize,
+        content_height: usize,
+    ) -> usize {
+        let max_back = total_height.saturating_sub(content_height);
+        total_height
+            .saturating_sub(content_height)
+            .saturating_sub(s_top)
+            .min(max_back)
+    }
+
+    /// Capture a [`ScrollAnchor`] from the current scroll position and cache.
+    ///
+    /// Returns `None` when:
+    /// - the cache is absent (no heights yet),
+    /// - the transcript is empty,
+    /// - `scroll_back == 0` (view is pinned to bottom — caller uses pinned mode,
+    ///   not an anchor coordinate),
+    /// - or the cache is empty after drain.
+    ///
+    /// The anchor identifies the message whose range in height-space straddles
+    /// `s_top`, and the intra-message row offset.
+    pub(crate) fn capture_anchor(
+        cache: &LineCache,
+        scroll_back: usize,
+        content_height: usize,
+    ) -> Option<ScrollAnchor> {
+        if cache.per_msg.is_empty() || scroll_back == 0 {
+            return None;
+        }
+        let total = cache.total_height();
+        let s_top = Self::scroll_back_to_stop(scroll_back, total, content_height);
+
+        // Binary search: find the message `i` such that
+        //   cum_heights[i] <= s_top < cum_heights[i+1]
+        // `partition_point(|c| c <= s_top)` gives the first index k where
+        // cum_heights[k] > s_top, so our message is at k-1 (clamped to 0).
+        let k = cache
+            .cum_heights
+            .partition_point(|&c| c <= s_top)
+            .saturating_sub(1)
+            .min(cache.per_msg.len() - 1);
+
+        let row_in_msg = s_top.saturating_sub(cache.cum_heights[k]);
+        // Clamp against the slot's actual height (safety for zero-height slots).
+        let h = cache.per_msg[k].height().max(1);
+        let row_in_msg = row_in_msg.min(h - 1);
+
+        Some(ScrollAnchor {
+            msg_idx: k,
+            row_in_msg,
+        })
+    }
+
+    /// Restore `scroll_back` from a [`ScrollAnchor`] and the current cache.
+    ///
+    /// Applies the no-jump theorem (§4.3): the anchor is used to recompute
+    /// `S_top` even after height corrections to messages other than the
+    /// anchor, producing a corrected `scroll_back` that keeps the anchor
+    /// message at the same screen row.
+    ///
+    /// Edge cases handled:
+    /// - Empty cache / zero viewport: returns 0.
+    /// - Stale `msg_idx` (past end of messages after cap/drain): clamps to
+    ///   the last message.
+    /// - Anchor message height shrank below `row_in_msg`: clamps `row_in_msg`.
+    /// - Pinned bottom (`anchor == None`): recomputes `scroll_back = 0`
+    ///   (caller's responsibility; this function handles `Some` only).
+    #[allow(dead_code)] // Slice 3 activates; tests use via cfg(test)
+    pub(crate) fn anchor_to_scroll_back(
+        anchor: &ScrollAnchor,
+        cache: &LineCache,
+        content_height: usize,
+    ) -> usize {
+        if cache.per_msg.is_empty() || content_height == 0 {
+            return 0;
+        }
+        let total = cache.total_height();
+        if total == 0 {
+            return 0;
+        }
+
+        // Clamp stale msg_idx (e.g. after cap/drain).
+        let msg_idx = anchor.msg_idx.min(cache.per_msg.len() - 1);
+
+        // Clamp row_in_msg to the anchor message's current height.
+        let h = cache.per_msg[msg_idx].height().max(1);
+        let row_in_msg = anchor.row_in_msg.min(h - 1);
+
+        // S_top = cum_heights[msg_idx] + row_in_msg, clamped.
+        let s_top = cache.cum_heights[msg_idx].saturating_add(row_in_msg);
+
+        // Convert back to scroll_back (clamped via stop_to_scroll_back).
+        Self::stop_to_scroll_back(s_top, total, content_height)
+    }
+
+    /// Clamp `scroll_back` to the valid range `[0, max_back]` given the
+    /// current total height and content height. Also updates `scroll_pinned`.
+    ///
+    /// Called after any correction that may shift `total_height` (Slice 3).
+    /// Idempotent: safe to call even when already clamped.
+    #[allow(dead_code)] // Slice 3 activates; tests use via cfg(test)
+    #[inline]
+    pub(crate) fn clamp_scroll_back(scroll_back: usize, total_height: usize, content_height: usize) -> usize {
+        total_height.saturating_sub(content_height).min(scroll_back)
+    }
+
+    /// Sync the shadow anchor to match the current `scroll_back` + cache.
+    ///
+    /// Called at the end of every scroll mutation that changes `scroll_back`.
+    /// In Slice 2 this is a shadow-only operation: it keeps `scroll_anchor`
+    /// consistent with `scroll_back` so Slice 3 can rely on it being correct.
+    ///
+    /// When `scroll_back == 0` the anchor is cleared (`None` = pinned bottom).
+    fn sync_anchor_from_scroll_back(&mut self) {
+        if self.scroll_back == 0 {
+            self.scroll_anchor = None;
+            return;
+        }
+        // Only capture if we have a live cache with heights.
+        let Some(cache) = self.cache.line_cache() else {
+            // No cache yet — can't capture a meaningful anchor.
+            // The anchor will be captured on the next `visible_window` call
+            // that populates the cache.
+            self.scroll_anchor = None;
+            return;
+        };
+        // Use a placeholder content_height for the shadow capture.
+        // This is fine because the anchor's (msg_idx, row_in_msg) is
+        // content-height-independent; only the scroll_back↔S_top conversion
+        // needs a content_height, and Slice 3 will always supply the live one.
+        //
+        // We use the viewport stored from the last visible_window call.
+        // If no viewport yet, use 40 as a safe placeholder (the anchor will
+        // be re-captured on the next frame with the real height).
+        let content_height = self
+            .viewport
+            .map(|r| r.height as usize)
+            .unwrap_or(40);
+        self.scroll_anchor =
+            Self::capture_anchor(cache, self.scroll_back as usize, content_height);
+    }
+
     /// Scroll up (away from bottom) by `lines`. Unpins the viewport.
     pub(crate) fn scroll_up(&mut self, lines: u16) {
         self.scroll_back = self.scroll_back.saturating_add(lines);
         self.scroll_pinned = false;
+        // Slice 2: keep shadow anchor in sync.
+        self.sync_anchor_from_scroll_back();
     }
 
     /// Scroll down (toward bottom) by `lines`. Re-pins at 0.
@@ -607,12 +871,16 @@ impl TranscriptStore {
         if self.scroll_back == 0 {
             self.scroll_pinned = true;
         }
+        // Slice 2: keep shadow anchor in sync.
+        self.sync_anchor_from_scroll_back();
     }
 
     /// Reset scroll to bottom and pin.
     pub(crate) fn scroll_to_bottom(&mut self) {
         self.scroll_back = 0;
         self.scroll_pinned = true;
+        // Slice 2: pinned bottom → clear anchor.
+        self.scroll_anchor = None;
     }
 
     // ── Content mutations (moved in slice b′) ────────────────────────────────
@@ -984,6 +1252,13 @@ impl TranscriptStore {
             }
         }
         self.last_line_count = total;
+        // Slice 2: re-sync shadow anchor after the growth-adjust/clamp pass.
+        // viewport field not yet set at this point, so supply content_height directly.
+        if self.scroll_back == 0 {
+            self.scroll_anchor = None;
+        } else if let Some(cache) = self.cache.line_cache() {
+            self.scroll_anchor = Self::capture_anchor(cache, self.scroll_back as usize, content_height);
+        }
         let scroll_back = self.scroll_back;
 
         // ── Visible range + viewport geometry (old draw.rs §5 write-backs) ──
@@ -2071,6 +2346,27 @@ impl TranscriptStore {
         self.scroll_back = v;
         self.scroll_pinned = v == 0;
     }
+
+    // ── Scroll anchor query / mutation (test + Slice 3) ──────────────────────
+
+    /// Read the current shadow scroll anchor.
+    ///
+    /// `None` = pinned to bottom. `Some(a)` = anchored at message `a.msg_idx`,
+    /// row `a.row_in_msg` from the top of that message.
+    ///
+    /// Public for Slice 3's `promote_window` and for tests.
+    #[allow(dead_code)] // Slice 3 activates production use
+    pub(crate) fn scroll_anchor(&self) -> Option<&ScrollAnchor> {
+        self.scroll_anchor.as_ref()
+    }
+
+    /// Directly set the shadow anchor — for tests that need to place the
+    /// anchor at a known position before calling conversion functions.
+    #[cfg(test)]
+    #[allow(dead_code)] // test helper; used when anchor-mutation tests land
+    pub(crate) fn test_set_scroll_anchor(&mut self, anchor: Option<ScrollAnchor>) {
+        self.scroll_anchor = anchor;
+    }
 }
 
 impl Default for TranscriptStore {
@@ -2532,6 +2828,375 @@ mod slice0_baseline_pathology {
         assert_eq!(
             hl_calls, 0,
             "second frame on a clean cache must trigger zero highlight calls"
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T241 Slice 2 — ScrollAnchor unit tests
+//
+// Mathematical theorem tests (§4.3 correction theorem):
+//   TA-1  correction below anchor: S_top unchanged
+//   TA-2  correction above anchor: coordinate shifts, anchor msg at same screen row
+//   TA-3  anchor-message shrink: row_in_msg clamps; motion bounded to msg
+//   TA-4  empty / stale index: no panic, valid result
+//   TA-5  pinned bottom: anchor is None; recomputes from total
+//   TA-6  round-trip capture → restore is idempotent with exact cache
+//   TA-7  clamp_scroll_back covers empty transcript and zero viewport
+//   TA-8  scroll mutations keep anchor in sync
+// ═════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod scroll_anchor_tests {
+    use super::*;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a `LineCache` with `n` slots of height `h` each.
+    fn uniform_cache(n: usize, h: usize) -> LineCache {
+        let per_msg: Vec<MsgSlot> = (0..n)
+            .map(|_| MsgSlot {
+                lines: None,
+                meta: None,
+                height: HeightState::Exact(h),
+            })
+            .collect();
+        LineCache::new(80, per_msg)
+    }
+
+    /// Build a `LineCache` with per-message heights from a slice.
+    fn cache_from_heights(heights: &[usize]) -> LineCache {
+        let per_msg: Vec<MsgSlot> = heights
+            .iter()
+            .map(|&h| MsgSlot {
+                lines: None,
+                meta: None,
+                height: HeightState::Exact(h),
+            })
+            .collect();
+        LineCache::new(80, per_msg)
+    }
+
+    fn test_ctx() -> RenderCtx<'static> {
+        RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        }
+    }
+
+    // ── TA-1: correction BELOW anchor leaves S_top unchanged ─────────────────
+    //
+    // Layout: 10 messages × 5 rows each = total 50. Viewport = 10.
+    // Anchor at msg 3, row_in_msg 2  →  S_top = 3*5 + 2 = 17.
+    // scroll_back = 50 - 10 - 17 = 23.
+    //
+    // Apply correction +10 to message 7 (below anchor 3).
+    // New total = 60. Anchor cum[3] = 15 (unchanged), so S_top = 17 still.
+    // New scroll_back = 60 - 10 - 17 = 33.
+    //
+    // Test: restore from anchor with new cache → scroll_back == 33.
+    #[test]
+    fn ta1_correction_below_anchor_s_top_unchanged() {
+        let cache_before = uniform_cache(10, 5); // total=50
+        let content_height = 10usize;
+        let scroll_back_before = 23usize; // S_top = 50-10-23 = 17
+        let s_top_before = TranscriptStore::scroll_back_to_stop(
+            scroll_back_before,
+            cache_before.total_height(),
+            content_height,
+        );
+        assert_eq!(s_top_before, 17);
+
+        let anchor = TranscriptStore::capture_anchor(
+            &cache_before,
+            scroll_back_before,
+            content_height,
+        )
+        .expect("capture must succeed");
+        assert_eq!(anchor.msg_idx, 3);   // cum[3]=15, 17-15=2
+        assert_eq!(anchor.row_in_msg, 2);
+
+        // Apply +10 to message 7 (index 7 > anchor.msg_idx=3 → below anchor).
+        let mut heights: Vec<usize> = vec![5; 10];
+        heights[7] = 15; // was 5, now 15: delta +10
+        let cache_after = cache_from_heights(&heights); // total=60
+
+        let sb_after = TranscriptStore::anchor_to_scroll_back(
+            &anchor,
+            &cache_after,
+            content_height,
+        );
+
+        // S_top must still be 17: scroll_back = 60 - 10 - 17 = 33
+        let s_top_after = TranscriptStore::scroll_back_to_stop(
+            sb_after,
+            cache_after.total_height(),
+            content_height,
+        );
+        assert_eq!(
+            s_top_after, s_top_before,
+            "correction below anchor must not change S_top (was {s_top_before}, got {s_top_after})"
+        );
+        assert_eq!(sb_after, 33);
+    }
+
+    // ── TA-2: correction ABOVE anchor shifts coordinate, anchor row on screen unchanged ──
+    //
+    // Same layout. Apply +10 to message 1 (above anchor 3).
+    // New cum[3] = 5+5+15+5 = 30 (was 15). New S_top = 30 + 2 = 32.
+    // New total = 60. New scroll_back = 60 - 10 - 32 = 18.
+    //
+    // Key: anchor.row_in_msg == 2 is unchanged; the anchor MESSAGE is still
+    // at the same screen row (the screen row of msg 3's row 2 hasn't moved).
+    // The COORDINATE shifted, but the visual row is the same.
+    #[test]
+    fn ta2_correction_above_anchor_shifts_coordinate_anchor_screen_row_fixed() {
+        let cache_before = uniform_cache(10, 5);
+        let content_height = 10usize;
+        let scroll_back_before = 23usize;
+
+        let anchor = TranscriptStore::capture_anchor(
+            &cache_before,
+            scroll_back_before,
+            content_height,
+        )
+        .expect("capture must succeed");
+
+        // Apply +10 to message 1 (index 1 < anchor.msg_idx=3 → above anchor).
+        let mut heights: Vec<usize> = vec![5; 10];
+        heights[1] = 15; // delta +10
+        let cache_after = cache_from_heights(&heights); // total=60
+
+        let sb_after = TranscriptStore::anchor_to_scroll_back(
+            &anchor,
+            &cache_after,
+            content_height,
+        );
+
+        // anchor msg still at same distance from top of viewport.
+        // new cum[3] = 5+15+5+5 = 25 (accumulated: cum[0]=0,cum[1]=5,cum[2]=20,cum[3]=25).
+        // S_top = cum[3] + row_in_msg = 25 + 2 = 27.
+        // scroll_back = 60 - 10 - 27 = 23.
+        let s_top_after = TranscriptStore::scroll_back_to_stop(
+            sb_after,
+            cache_after.total_height(),
+            content_height,
+        );
+        assert_eq!(
+            s_top_after, 27,
+            "correction above anchor: S_top must shift by delta (expected 27 = cum[3]+row_in_msg, got {s_top_after})"
+        );
+        // The anchor message's SCREEN ROW is 0 (it's at the top): that hasn't changed.
+        // What changed is the content coordinate S_top, not the screen position.
+        // We verify: (S_top - cum[anchor.msg_idx]) == row_in_msg.
+        let cum_anchor = cache_after.cum_heights[anchor.msg_idx];
+        assert_eq!(
+            s_top_after.saturating_sub(cum_anchor),
+            anchor.row_in_msg,
+            "anchor msg row_in_msg must still point to the top-of-viewport row"
+        );
+    }
+
+    // ── TA-3: anchor-message shrinks → row_in_msg clamps, motion bounded ─────
+    //
+    // Anchor at msg 3, row_in_msg 2 (height was 5). Shrink msg 3 to height 2.
+    // row_in_msg must clamp to 1 (h-1). S_top = cum[3] + 1 = 15+1 = 16.
+    // scroll_back = 50 - 10 - 16 = 24.
+    //
+    // Motion: S_top changed from 17 to 16 — bounded to within the anchor message.
+    #[test]
+    fn ta3_anchor_message_shrink_clamps_row_in_msg() {
+        let cache_before = uniform_cache(10, 5);
+        let content_height = 10usize;
+        let scroll_back_before = 23usize; // S_top = 17
+
+        let anchor = TranscriptStore::capture_anchor(
+            &cache_before,
+            scroll_back_before,
+            content_height,
+        )
+        .expect("capture must succeed");
+        assert_eq!(anchor.msg_idx, 3);
+        assert_eq!(anchor.row_in_msg, 2);
+
+        // Shrink message 3 from 5 to 2 rows.
+        let mut heights: Vec<usize> = vec![5; 10];
+        heights[3] = 2; // shrink: total becomes 47
+        let cache_after = cache_from_heights(&heights);
+
+        let sb_after = TranscriptStore::anchor_to_scroll_back(
+            &anchor,
+            &cache_after,
+            content_height,
+        );
+        let s_top_after = TranscriptStore::scroll_back_to_stop(
+            sb_after,
+            cache_after.total_height(),
+            content_height,
+        );
+        // row_in_msg clamped to min(2, 2-1) = 1. S_top = 15+1 = 16.
+        assert_eq!(s_top_after, 16, "shrunk anchor msg: S_top must clamp to 16 (got {s_top_after})");
+        // Motion is exactly 1 row — bounded to within the anchor message.
+        assert!(
+            (17i64 - s_top_after as i64).abs() <= 5,
+            "shrink motion must be bounded to one anchor-message height"
+        );
+    }
+
+    // ── TA-4: empty transcript + stale msg_idx → no panic, valid result ───────
+    #[test]
+    fn ta4_empty_and_stale_no_panic() {
+        // Empty cache.
+        let empty = cache_from_heights(&[]);
+        let anchor_result = TranscriptStore::capture_anchor(&empty, 0, 40);
+        assert!(anchor_result.is_none(), "empty cache capture must return None");
+
+        // Stale anchor (msg_idx past the end after drain).
+        let small = cache_from_heights(&[5, 5]); // only 2 msgs
+        let stale = ScrollAnchor { msg_idx: 99, row_in_msg: 3 };
+        // Must not panic; clamps to last msg.
+        let _ = TranscriptStore::anchor_to_scroll_back(&stale, &small, 10);
+
+        // Zero viewport.
+        let cache = uniform_cache(5, 5);
+        let anchor = ScrollAnchor { msg_idx: 2, row_in_msg: 0 };
+        let sb = TranscriptStore::anchor_to_scroll_back(&anchor, &cache, 0);
+        assert_eq!(sb, 0, "zero viewport → scroll_back 0");
+
+        // Zero-height slot in cache.
+        let cache_zero = cache_from_heights(&[0, 5, 5]);
+        let _ = TranscriptStore::capture_anchor(&cache_zero, 5, 5); // must not panic
+    }
+
+    // ── TA-5: pinned bottom — anchor is None, recomputes from total ───────────
+    #[test]
+    fn ta5_pinned_bottom_anchor_none_recomputes() {
+        let cache = uniform_cache(10, 5); // total=50
+        let content_height = 10usize;
+        // scroll_back == 0 → capture returns None (pinned mode, not a coordinate).
+        let anchor = TranscriptStore::capture_anchor(&cache, 0, content_height);
+        assert!(
+            anchor.is_none(),
+            "scroll_back==0 must return None (pinned mode, not a coordinate)"
+        );
+        // scroll_back > 0 (actually scrolled up) returns Some even if s_top==0.
+        // total=50, content=10, scroll_back=40 → s_top=0.
+        let anchor_sb40 = TranscriptStore::capture_anchor(&cache, 40, content_height);
+        assert!(
+            anchor_sb40.is_some(),
+            "scroll_back>0 with s_top==0 must still return Some (anchored, not pinned)"
+        );
+        // scroll_back > max_back (over-scrolled) still returns Some.
+        let anchor_over = TranscriptStore::capture_anchor(&cache, 99, content_height);
+        assert!(
+            anchor_over.is_some(),
+            "over-scrolled (sb>max_back) must still return Some"
+        );
+    }
+
+    // ── TA-6: round-trip capture → restore is idempotent with exact cache ─────
+    #[test]
+    fn ta6_round_trip_capture_restore_idempotent() {
+        let cache = uniform_cache(20, 5); // total=100
+        let content_height = 10usize;
+
+        // Test several scroll positions.
+        for sb in [10usize, 25, 50, 70, 85] {
+            let anchor = TranscriptStore::capture_anchor(
+                &cache,
+                sb,
+                content_height,
+            );
+            match anchor {
+                None => {
+                    // Only valid when sb == 0.
+                    assert_eq!(sb, 0, "capture returns None only for sb==0");
+                }
+                Some(ref a) => {
+                    let sb_restored = TranscriptStore::anchor_to_scroll_back(
+                        a,
+                        &cache,
+                        content_height,
+                    );
+                    // The restored scroll_back must equal the original when
+                    // the cache is unchanged (no height corrections).
+                    assert_eq!(
+                        sb_restored, sb,
+                        "round-trip must be idempotent: sb={sb} → anchor={a:?} → {sb_restored}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── TA-7: clamp_scroll_back covers edge cases ─────────────────────────────
+    #[test]
+    fn ta7_clamp_scroll_back_edge_cases() {
+        // Empty transcript: max_back = 0.
+        assert_eq!(TranscriptStore::clamp_scroll_back(99, 0, 10), 0);
+        // total < viewport: no scrollable space.
+        assert_eq!(TranscriptStore::clamp_scroll_back(50, 5, 10), 0);
+        // scroll_back within range: unchanged.
+        assert_eq!(TranscriptStore::clamp_scroll_back(10, 50, 10), 10);
+        // scroll_back exceeds max: clamped.
+        assert_eq!(TranscriptStore::clamp_scroll_back(100, 50, 10), 40);
+        // Zero viewport: total - 0 - scroll_back.
+        assert_eq!(TranscriptStore::clamp_scroll_back(30, 50, 0), 30);
+    }
+
+    // ── TA-8: scroll mutations keep anchor in sync ────────────────────────────
+    //
+    // Build a store with a live cache, perform scroll mutations via the
+    // public scroll_up/scroll_down/scroll_to_bottom API, and assert that
+    // the shadow anchor is consistent with scroll_back after each.
+    #[test]
+    fn ta8_scroll_mutations_keep_anchor_in_sync() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        // Push 30 text messages — each renders to a few rows.
+        for i in 0..30 {
+            store.push_msg(ChatMessage::Text(format!("Message {i}: some content here.")));
+        }
+
+        // Warm the cache via visible_window so heights are available.
+        let msg_area = ratatui::layout::Rect {
+            x: 0, y: 0, width: 82, height: 12, // content: 80 wide, 10 high
+        };
+        let _ = store.visible_window(msg_area, &test_ctx());
+
+        // Initially pinned → anchor is None.
+        assert!(
+            store.scroll_anchor().is_none(),
+            "initially pinned: scroll_anchor must be None"
+        );
+
+        // Scroll up → anchor must be Some.
+        store.scroll_up(5);
+        assert!(
+            store.scroll_anchor().is_some(),
+            "after scroll_up: anchor must be Some"
+        );
+
+        // The anchor's msg_idx must be within range.
+        let n_msgs = store.message_count();
+        if let Some(a) = store.scroll_anchor() {
+            assert!(a.msg_idx < n_msgs, "anchor.msg_idx must be in range");
+        }
+
+        // Scroll down to 0 → re-pin → anchor is None.
+        store.scroll_down(9999); // saturates to 0
+        assert!(
+            store.scroll_anchor().is_none(),
+            "after scroll_down to 0: anchor must be None"
+        );
+        assert!(store.is_pinned(), "scroll_back 0 → must be pinned");
+
+        // scroll_to_bottom → anchor is None.
+        store.scroll_up(3);
+        assert!(store.scroll_anchor().is_some(), "after scroll_up: anchor Some");
+        store.scroll_to_bottom();
+        assert!(
+            store.scroll_anchor().is_none(),
+            "scroll_to_bottom must clear anchor"
         );
     }
 }
