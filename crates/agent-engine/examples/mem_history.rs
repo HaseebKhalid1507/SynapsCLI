@@ -275,7 +275,67 @@ fn main() {
     drop(black_box(stage2));
     drop(black_box(stage3));
     drop(black_box(stage4));
-    drop(black_box(history));
+
+    // ── SHARED pipeline (post-#128 world) ───────────────────────────────────
+    // Same four stages, but the history is Vec<Arc<Value>> and every "copy"
+    // is what the Arc-share migration actually does: refcount bumps for
+    // stages 1/2/4, and NO body tree rebuild for stage 3 (RequestBody borrows
+    // the slice; the wire-byte buffer exists in both worlds and is counted in
+    // neither).
+    println!("\n── SHARED pipeline (Arc<Value>, slices 2-5) ──\n");
+    let shared: Vec<std::sync::Arc<Value>> =
+        history.into_iter().map(std::sync::Arc::new).collect();
+    let _ = black_box(shared.len());
+    let s_base = rss_anon_kb();
+
+    let sb1 = rss_anon_kb();
+    let s1: Vec<std::sync::Arc<Value>> = black_box(shared.clone());
+    let sa1 = rss_anon_kb();
+
+    let sb2 = rss_anon_kb();
+    let s2: Vec<std::sync::Arc<Value>> = black_box(s1.to_vec());
+    let sa2 = rss_anon_kb();
+
+    // Stage 3 equivalent: borrowing serializer — no Value tree is rebuilt.
+    let sb3 = rss_anon_kb();
+    let s3: &[std::sync::Arc<Value>] = black_box(&s2[..]);
+    let sa3 = rss_anon_kb();
+
+    let sb4 = rss_anon_kb();
+    let s4: Vec<std::sync::Arc<Value>> = black_box(s3.to_vec());
+    let sa4 = rss_anon_kb();
+
+    let s_rows = [
+        ("1'", "shared.clone() → stream task", sa1 - sb1, sa1 - s_base),
+        ("2'", "to_vec() → cleaned_msgs (ptr bumps)", sa2 - sb2, sa2 - s_base),
+        ("3'", "RequestBody borrow (no tree rebuild)", sa3 - sb3, sa3 - s_base),
+        ("4'", "to_vec() OAI path (ptr bumps)", sa4 - sb4, sa4 - s_base),
+    ];
+    println!(
+        "{:<6}  {:<42}  {:>12}  {:>14}",
+        "Stage", "What it mirrors", "Delta KB", "Cumulative KB"
+    );
+    println!("{}", "─".repeat(80));
+    for (stage, label, delta, cum) in &s_rows {
+        println!("{:<6}  {:<42}  {:>12}  {:>14}", stage, label, delta, cum);
+    }
+    println!("{}", "─".repeat(80));
+    let shared_cum = sa4 - s_base;
+    println!("\n══ BEFORE/AFTER (this machine, same fixture) ══");
+    println!("legacy pipeline, 4 live copies:  {} KB", cum4);
+    println!("shared pipeline, 4 live handles: {} KB", shared_cum);
+    if cum4 > 0 {
+        println!(
+            "reduction: {} KB ({:.1}% of the copy overhead eliminated)",
+            cum4 - shared_cum,
+            100.0 * (cum4 - shared_cum) as f64 / cum4 as f64
+        );
+    }
+
+    drop(black_box(s4));
+    drop(black_box(s2));
+    drop(black_box(s1));
+    drop(black_box(shared));
 
     println!("\nDone.");
 }
