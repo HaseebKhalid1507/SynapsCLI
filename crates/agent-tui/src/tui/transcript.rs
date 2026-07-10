@@ -2099,3 +2099,206 @@ mod source_text_tests {
         assert_eq!(store.source_text(1), "t");
     }
 }
+
+// ── Slice 0: Baseline pathology tests (T241 §5 / §8) ─────────────────────────
+//
+// These tests document the CURRENT eager behaviour as a measured baseline.
+// They are `#[ignore]` so CI doesn't pay the syntect init cost on every run;
+// invoke them explicitly:
+//
+//   cargo test -p synaps-tui --test '*' -- --ignored baseline_slice0
+//   cargo test -p synaps-tui -- --ignored baseline_slice0
+//
+// INTENTIONAL REWRITE TARGET: Slice 4 of T241 (lazy-estimator landing) will
+// flip the assertions in these tests.  The test names and the comment
+// "BASELINE — rewrite in Slice 4" serve as grep-able markers so the
+// implementer knows exactly which assertions invert.
+//
+// Counter semantics (recap):
+//   probe_render_count()  — render_message_lines calls since last probe_reset()
+//   highlight_call_count() — syntect highlight_line sessions since last reset
+//   syntax_set_was_touched() — whether SYNTAX_SET LazyLock init fired since reset
+#[cfg(test)]
+mod slice0_baseline_pathology {
+    use super::*;
+    use super::super::highlight;
+    use ratatui::layout::Rect;
+
+    const VIEWPORT_ROWS: usize = 40;
+    const VIEWPORT_COLS: usize = 120;
+    // Outer rect adds 2 border rows/cols each side.
+    fn msg_area(rows: usize, cols: usize) -> Rect {
+        Rect {
+            x: 0, y: 0,
+            width:  (cols + 2) as u16,
+            height: (rows + 2) as u16,
+        }
+    }
+
+    fn test_ctx() -> RenderCtx<'static> {
+        RenderCtx { spinner_frame: 0, streaming: false, agent_name: "synaps" }
+    }
+
+    /// Build 1,000 deterministic synthetic messages:
+    ///   - 800 plain-text assistant messages (off-screen in a 40-row viewport)
+    ///   - 200 messages containing a fenced Rust code block (off-screen)
+    ///
+    /// No real session data; purely synthetic and public-safe.
+    fn make_synthetic_store(n_plain: usize, n_code: usize) -> TranscriptStore {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        for i in 0..n_plain {
+            store.push_msg(ChatMessage::Text(format!(
+                "Synthetic assistant message {i}.\n\
+                 This is a second line of text to give the message some height.\n\
+                 Third line: the quick brown fox jumps over the lazy dog."
+            )));
+        }
+        for i in 0..n_code {
+            store.push_msg(ChatMessage::Text(format!(
+                "Message with off-screen fenced code block {i}.\n\
+                 ```rust\n\
+                 fn synthetic_{i}() -> usize {{\n\
+                     let x = {i};\n\
+                     x * x\n\
+                 }}\n\
+                 ```\n\
+                 After the code block."
+            )));
+        }
+        // Push a few visible messages at the tail so the viewport has something
+        // to show (these are the ones that will be on-screen).
+        for i in 0..5 {
+            store.push_msg(ChatMessage::User(format!("User tail message {i}")));
+        }
+        store
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BASELINE — rewrite in Slice 4
+    //
+    // T241 §5 T1 (inverted): current eager path renders ALL N messages on the
+    // first Missing→sync_cache.  After Slice 3 the ratchet flips to ≤ 72 for
+    // a 40-row viewport.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[test]
+    #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
+    fn baseline_slice0_cold_missing_renders_all_messages() {
+        // BASELINE — rewrite in Slice 4:
+        //   after lazy estimation lands, assert renders <= VIEWPORT_ROWS + 2*HALO (≤72)
+        const N_PLAIN: usize = 800;
+        const N_CODE:  usize = 200;
+        const TOTAL:   usize = N_PLAIN + N_CODE + 5; // +5 tail messages
+
+        let mut store = make_synthetic_store(N_PLAIN, N_CODE);
+
+        // Reset counters right before the cold frame.
+        store.probe_reset();
+        highlight::highlight_reset_counters();
+
+        let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
+        let _vw = store.visible_window(area, &test_ctx());
+
+        let renders = store.probe_render_count();
+        let hl_calls = highlight::highlight_call_count();
+        let ss_touched = highlight::syntax_set_was_touched();
+
+        eprintln!(
+            "[baseline_slice0_cold_missing_renders_all_messages]\n  \
+             renders={renders}  (expected today: == {TOTAL}; target after Slice3: ≤72)\n  \
+             highlight_calls={hl_calls}\n  \
+             syntax_set_touched={ss_touched}"
+        );
+
+        // BASELINE assertion: today every message is rendered on the first frame.
+        // This will be INVERTED in Slice 4.
+        assert_eq!(
+            renders, TOTAL,
+            "BASELINE: cold Missing sync renders all {TOTAL} messages. \
+             Slice 4 rewrites this assertion to renders ≤ 72."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BASELINE — rewrite in Slice 4
+    //
+    // T241 §5 T3 (inverted): an off-screen fenced code block currently forces
+    // SYNTAX_SET init (highlight_call_count > 0, syntax_set_was_touched == true)
+    // on the first frame.  After Slice 3 the ratchet flips to == 0 / false.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[test]
+    #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
+    fn baseline_slice0_offscreen_code_fence_triggers_syntect_init() {
+        // BASELINE — rewrite in Slice 4:
+        //   after lazy estimation, assert highlight_calls == 0 && !syntax_set_was_touched
+        const N_PLAIN: usize = 800;
+        const N_CODE:  usize = 200; // off-screen code fences
+
+        let mut store = make_synthetic_store(N_PLAIN, N_CODE);
+
+        store.probe_reset();
+        highlight::highlight_reset_counters();
+
+        let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
+        let _vw = store.visible_window(area, &test_ctx());
+
+        let hl_calls = highlight::highlight_call_count();
+        let ss_touched = highlight::syntax_set_was_touched();
+
+        eprintln!(
+            "[baseline_slice0_offscreen_code_fence_triggers_syntect_init]\n  \
+             highlight_calls={hl_calls}  (expected today: >0; target after Slice3: ==0)\n  \
+             syntax_set_touched={ss_touched}  \
+             (note: may be false if SYNTAX_SET pre-warmed by another test in this process)"
+        );
+
+        // BASELINE assertion: today off-screen fences trigger syntect on first frame.
+        // This is INVERTED in Slice 4 (hl_calls == 0).
+        assert!(
+            hl_calls > 0,
+            "BASELINE: off-screen code fences trigger syntect (got {hl_calls} calls). \
+             Slice 4 rewrites this to == 0."
+        );
+        // Note: SYNTAX_SET_TOUCHED is a process-global latch that fires at
+        // most once per process lifetime. It is only reliable in isolated runs
+        // (the integration test tests/mem_transcript.rs).  In shared-process
+        // runs another test may pre-warm SYNTAX_SET, leaving ss_touched=false
+        // here even though hl_calls > 0 (syntect IS executing, just not
+        // initializing again).  We assert hl_calls only; the integration test
+        // asserts ss_touched independently.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Non-pathological steady-state: warm cache, no renders, counter deltas zero.
+    // This test does NOT get rewritten in Slice 4 — it should pass before and
+    // after the lazy refactor.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[test]
+    #[ignore = "slow: loads syntect defaults; run explicitly with --ignored"]
+    fn baseline_slice0_warm_cache_second_frame_zero_renders() {
+        let mut store = make_synthetic_store(100, 20);
+
+        let area = msg_area(VIEWPORT_ROWS, VIEWPORT_COLS);
+        let ctx = test_ctx();
+
+        // First (cold) frame — burns the cache.
+        let _vw = store.visible_window(area, &ctx);
+
+        // Reset after cold frame, measure the second.
+        store.probe_reset();
+        highlight::highlight_reset_counters();
+
+        let _vw2 = store.visible_window(area, &ctx);
+
+        let renders = store.probe_render_count();
+        let hl_calls = highlight::highlight_call_count();
+
+        eprintln!(
+            "[baseline_slice0_warm_cache_second_frame_zero_renders]\n  \
+             renders={renders}  (expected: 0)\n  \
+             highlight_calls={hl_calls}  (expected: 0)"
+        );
+
+        assert_eq!(renders,  0, "second frame on a clean cache must trigger zero renders");
+        assert_eq!(hl_calls, 0, "second frame on a clean cache must trigger zero highlight calls");
+    }
+}

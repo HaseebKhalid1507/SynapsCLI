@@ -49,11 +49,69 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(clamped)
 }
 
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    #[cfg(any(test, feature = "testing"))]
+    SYNTAX_SET_TOUCHED.store(true, std::sync::atomic::Ordering::Relaxed);
+    SyntaxSet::load_defaults_newlines()
+});
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+// ── Test-only highlight instrumentation (Slice 0 / T241) ─────────────────────
+//
+// Two counters:
+//   HIGHLIGHT_CALLS   — bumped once per syntect highlight_line() call-site entry
+//                       (each of highlight_code_block / highlight_tool_code /
+//                        highlight_read_output touching SYNTAX_SET increments this)
+//   SYNTAX_SET_TOUCHED — latched true the first time SYNTAX_SET is force-initialized
+//                        (i.e. the LazyLock closure runs). Loading syntect defaults
+//                        is the single largest first-touch memory cost (~10–20 MB);
+//                        off-screen code fences must NOT trigger it on the first frame
+//                        after Slice 3 lands.
+//
+// All three items compile to zero bytes and zero cycles in production.
+// Reset via `highlight_reset_counters()`; read via the `highlight_*` accessors.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) static HIGHLIGHT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) static SYNTAX_SET_TOUCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reset both counters to zero — call before a measurement frame.
+/// Also clears `SYNTAX_SET_TOUCHED` (which is a latch, not a rate counter,
+/// so it only makes sense to clear between isolated test runs).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn highlight_reset_counters() {
+    HIGHLIGHT_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SYNTAX_SET_TOUCHED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read `HIGHLIGHT_CALLS`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn highlight_call_count() -> usize {
+    HIGHLIGHT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read `SYNTAX_SET_TOUCHED`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn syntax_set_was_touched() -> bool {
+    SYNTAX_SET_TOUCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Internal helper: bump HIGHLIGHT_CALLS once per syntect highlight session entry.
+#[cfg(any(test, feature = "testing"))]
+#[inline(always)]
+fn note_highlight_call() {
+    HIGHLIGHT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(any(test, feature = "testing")))]
+#[inline(always)]
+fn note_highlight_call() {}
 
 /// Highlight a code block using syntect
 pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<Line<'static>> {
+    note_highlight_call();
     let ss = &*SYNTAX_SET;
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
@@ -86,6 +144,7 @@ pub(crate) fn highlight_code_block(code: &str, lang: &str, prefix: &str) -> Vec<
 /// Try to syntax-highlight a single tool output line.
 /// Highlight code lines for tool params (write content, edit old/new) — clean style matching read output
 pub(crate) fn highlight_tool_code(lines: &[&str], ext: &str, margin: &str, marker: &str, marker_color: Color) -> Vec<Line<'static>> {
+    note_highlight_call();
     let ss = &*SYNTAX_SET;
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];
@@ -295,6 +354,7 @@ pub(crate) fn is_read_tool_output(lines: &[&str]) -> bool {
 
 /// Highlight read tool output as a code block using syntect
 pub(crate) fn highlight_read_output(lines: &[&str], ext: &str, margin: &str) -> Option<Vec<Line<'static>>> {
+    note_highlight_call();
     let ss = &*SYNTAX_SET;
     let ts = &*THEME_SET;
     let theme = &ts.themes["base16-ocean.dark"];

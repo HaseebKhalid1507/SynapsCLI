@@ -541,6 +541,24 @@ impl TestHarness {
         self.app.transcript.probe_reset()
     }
 
+    /// Zero the highlight counters (`HIGHLIGHT_CALLS` + `SYNTAX_SET_TOUCHED`).
+    /// Call before the frame under measurement to get a clean read.
+    pub fn reset_highlight_probe(&self) {
+        super::highlight::highlight_reset_counters();
+    }
+
+    /// Read `HIGHLIGHT_CALLS` — syntect highlight sessions triggered since last
+    /// `reset_highlight_probe`.
+    pub fn highlight_call_count(&self) -> usize {
+        super::highlight::highlight_call_count()
+    }
+
+    /// Read `SYNTAX_SET_TOUCHED` — whether the `SYNTAX_SET` LazyLock has been
+    /// initialized (forced-touch) since the last `reset_highlight_probe`.
+    pub fn syntax_set_was_touched(&self) -> bool {
+        super::highlight::syntax_set_was_touched()
+    }
+
     /// Begin a streaming tool call — drives the store's real
     /// `on_tool_use_start` routing, exactly as the stream handler does.
     pub fn tool_use_start(&mut self, tool_id: &str, tool_name: &str) -> &mut Self {
@@ -781,4 +799,31 @@ pub mod termcaps {
     pub use super::super::termcaps::{
         parse_burst_replies, write_query_burst, BurstReplies, TermCaps, BURST_TIMEOUT, QUERY_BURST,
     };
+}
+
+/// Slice 0 / T241 measurement probe facade — re-exports the highlight counter
+/// surfaces so `tests/mem_transcript.rs` and future Slice-N harnesses can
+/// read highlight-call counts without reaching into `pub(crate)` internals.
+///
+/// Store probe access (render_count, cum_height_writes, reset_perf_probe) is
+/// available directly on [`TestHarness`].
+///
+/// Only available under `feature = "testing"`.
+pub mod probe {
+    /// Reset both highlight counters (`HIGHLIGHT_CALLS`, `SYNTAX_SET_TOUCHED`).
+    /// Call before the frame under measurement.
+    pub fn highlight_reset() {
+        super::super::highlight::highlight_reset_counters();
+    }
+
+    /// Read `HIGHLIGHT_CALLS` — syntect highlight sessions since last reset.
+    pub fn highlight_call_count() -> usize {
+        super::super::highlight::highlight_call_count()
+    }
+
+    /// Read `SYNTAX_SET_TOUCHED` — whether `SYNTAX_SET` LazyLock has fired
+    /// since the last reset.
+    pub fn syntax_set_was_touched() -> bool {
+        super::super::highlight::syntax_set_was_touched()
+    }
 }
