@@ -96,10 +96,10 @@ pub(crate) async fn handle_input_action(
                                 }
                                 // Flush any events that arrived during streaming
                                 for formatted in app.pending_events.drain(..) {
-                                    app.api_messages.push(serde_json::json!({
+                                    app.api_messages.push(std::sync::Arc::new(serde_json::json!({
                                         "role": "user",
                                         "content": formatted
-                                    }));
+                                    })));
                                 }
                                 *stream = None;
                                 *cancel_token = None;
@@ -235,7 +235,7 @@ pub(crate) async fn handle_input_action(
                                         let tool_use_id = format!("toolu_skill_{}", uuid::Uuid::new_v4().simple());
                                         let body = LoadSkillTool::format_body(&skill);
 
-                                        app.api_messages.push(json!({
+                                        app.api_messages.push(std::sync::Arc::new(json!({
                                             "role": "assistant",
                                             "content": [{
                                                 "type": "tool_use",
@@ -243,15 +243,15 @@ pub(crate) async fn handle_input_action(
                                                 "name": "load_skill",
                                                 "input": {"skill": skill.name.clone()}
                                             }]
-                                        }));
-                                        app.api_messages.push(json!({
+                                        })));
+                                        app.api_messages.push(std::sync::Arc::new(json!({
                                             "role": "user",
                                             "content": [{
                                                 "type": "tool_result",
                                                 "tool_use_id": tool_use_id,
                                                 "content": body
                                             }]
-                                        }));
+                                        })));
                                         let display_name = match &skill.plugin {
                                             Some(p) => format!("{}:{}", p, skill.name),
                                             None => skill.name.clone(),
@@ -259,7 +259,7 @@ pub(crate) async fn handle_input_action(
                                         app.push_msg(ChatMessage::System(format!("loaded skill: {}", display_name)));
 
                                         if !arg.is_empty() {
-                                            app.api_messages.push(json!({"role": "user", "content": arg.clone()}));
+                                            app.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": arg.clone()})));
                                             app.push_msg(ChatMessage::User(arg));
                                         }
                                         // Start stream — mirror InputAction::Submit stream-start pattern.
@@ -981,7 +981,7 @@ pub(crate) async fn handle_input_action(
                                 } else {
                                     input
                                 };
-                                app.api_messages.push(json!({"role": "user", "content": api_content}));
+                                app.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": api_content})));
                                 let ct = CancellationToken::new();
                                 let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 app.status_text = Some("connecting…".to_string());

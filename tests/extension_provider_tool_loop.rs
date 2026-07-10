@@ -93,7 +93,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         provider_id: "p".to_string(),
         model_id: "m".to_string(),
         model: "plugin:p:m".to_string(),
-        messages: vec![json!({"role": "user", "content": "use a tool"})],
+        messages: vec![std::sync::Arc::new(json!({"role": "user", "content": "use a tool"}))],
         system_prompt: None,
         tools: registry.tools_schema().as_ref().clone(),
         temperature: None,

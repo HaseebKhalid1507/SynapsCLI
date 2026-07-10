@@ -72,7 +72,7 @@ pub struct ProviderCompleteParams {
     pub provider_id: String,
     pub model_id: String,
     pub model: String,
-    pub messages: Vec<Value>,
+    pub messages: Vec<crate::SharedMessage>,
     pub system_prompt: Option<String>,
     pub tools: Vec<Value>,
     pub temperature: Option<f32>,
@@ -315,10 +315,10 @@ where
         }
 
         let assistant_content = result.content.clone();
-        params.messages.push(serde_json::json!({
+        params.messages.push(std::sync::Arc::new(serde_json::json!({
             "role": "assistant",
             "content": assistant_content,
-        }));
+        })));
 
         let mut tool_results = Vec::with_capacity(tool_uses.len());
         for tool_use in tool_uses {
@@ -333,10 +333,10 @@ where
                 .await,
             );
         }
-        params.messages.push(serde_json::json!({
+        params.messages.push(std::sync::Arc::new(serde_json::json!({
             "role": "user",
             "content": tool_results,
-        }));
+        })));
     }
     Err(format!(
         "extension provider '{}' exceeded provider tool-use iteration limit ({})",

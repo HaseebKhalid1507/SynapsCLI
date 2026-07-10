@@ -46,7 +46,7 @@ async fn try_route_streams_text_deltas_when_provider_supports_streaming() {
         &reqwest::Client::new(),
         &tools,
         &None,
-        &[serde_json::json!({"role":"user","content":[{"type":"text","text":"hi"}]})],
+        &[std::sync::Arc::new(serde_json::json!({"role":"user","content":[{"type":"text","text":"hi"}]}))],
         &tx,
         None,
         None,

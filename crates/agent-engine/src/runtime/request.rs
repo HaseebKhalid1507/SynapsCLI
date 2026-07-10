@@ -1,14 +1,153 @@
 //! Request-construction helpers for Anthropic API calls.
 //!
 //! Extracted from `api.rs`. Holds auth/beta header builders shared by the
-//! streaming and non-streaming code paths. All methods are added to
-//! `ApiMethods` via an additional `impl` block.
+//! streaming and non-streaming code paths (`ApiMethods` impl block), plus the
+//! borrowing `RequestBody` serializer (#128 Slice 4) that replaced the
+//! `json!`-assembled `Value` body.
 
+use serde::ser::{Serialize, SerializeSeq, Serializer};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::api::{ApiMethods, ApiOptions};
+use super::helpers::{cache_control_value, HelperMethods, MarkerSite};
 use super::types::AuthState;
+use crate::core::config::CacheTtl;
+use crate::SharedMessage;
+
+/// Anthropic `/v1/messages` request body that BORROWS the message history
+/// instead of deep-rebuilding it into a `serde_json::Value` tree (kills copy
+/// C8 — one full history tree per API round).
+///
+/// BYTE-IDENTITY CONTRACT (prompt-cache keys depend on it): the legacy body
+/// was a `json!` map — serde_json without `preserve_order` backs `Value`
+/// objects with a BTreeMap, so keys serialized ALPHABETICALLY. Field
+/// declaration order below reproduces exactly that order:
+///   max_tokens, messages, model, [output_config], [stream], [system], thinking, tools
+/// Optional-field PRESENCE must also match: `output_config` only for adaptive
+/// models with a mapped effort, `stream` only on the streaming transport,
+/// `system` only when `build_system_blocks` returns Some. Guarded by
+/// `runtime::body_golden` — do not reorder fields or change skip conditions
+/// without regenerating fixtures (and accepting fleet-wide cache invalidation).
+#[derive(serde::Serialize)]
+pub(super) struct RequestBody<'a> {
+    max_tokens: u64,
+    messages: &'a [SharedMessage],
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<Value>,
+    thinking: Value,
+    tools: MarkedTools<'a>,
+}
+
+impl<'a> RequestBody<'a> {
+    /// Assemble the request body. `messages` must already be sanitized +
+    /// cache-annotated (`sanitize_thinking_blocks` / `annotate_cache_breakpoint`).
+    /// `stream: true` → streaming transport (`"stream":true`); `false` → sync
+    /// transport (key absent, matching the legacy api_sync body).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        model: &'a str,
+        messages: &'a [SharedMessage],
+        tools_schema: &'a [Value],
+        system_prompt: &Option<String>,
+        auth_type: &str,
+        thinking_budget: u32,
+        ttl: CacheTtl,
+        stream: bool,
+    ) -> Self {
+        let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
+        let thinking = if adaptive {
+            json!({ "type": "adaptive", "display": "summarized" })
+        } else {
+            // Legacy path requires budget_tokens >= 1024 (Anthropic enforced).
+            // "adaptive" sentinel (0) on a legacy model falls back to "high".
+            let budget = if thinking_budget == 0 {
+                crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+            } else {
+                thinking_budget
+            };
+            json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" })
+        };
+        // Adaptive models: control thinking depth via effort (GA, no beta).
+        // "adaptive" level = omit output_config entirely (model decides).
+        let output_config = if adaptive {
+            let level = crate::core::models::thinking_level_for_budget(thinking_budget);
+            crate::core::models::effort_for_thinking_level(level)
+                .map(|effort| json!({ "effort": effort }))
+        } else {
+            None
+        };
+        Self {
+            max_tokens: HelperMethods::max_tokens_for_model(model),
+            messages,
+            model,
+            output_config,
+            stream: if stream { Some(true) } else { None },
+            system: HelperMethods::build_system_blocks(auth_type, system_prompt, ttl),
+            thinking,
+            tools: MarkedTools::new(tools_schema, ttl),
+        }
+    }
+
+    /// Pre-assembly equivalent of the legacy `body["tools"]` non-empty probe.
+    pub(super) fn has_tool_marker(&self) -> bool {
+        !self.tools.tools.is_empty()
+    }
+
+    /// Pre-assembly equivalent of the legacy `body.get("system").is_some()`.
+    pub(super) fn has_system_marker(&self) -> bool {
+        self.system.is_some()
+    }
+}
+
+/// Tool schemas with the prompt-cache marker on the LAST tool (so all tool
+/// schemas land in the cached prefix). Pre-assembly replacement for the legacy
+/// `HelperMethods::mark_last_tool` that mutated the assembled body: borrows
+/// all tools except the last, which is cloned once and stamped with
+/// `cache_control` (stable-prefix site — carries `"ttl":"1h"` under OneHour
+/// and Hybrid). Serializes byte-identically to the legacy in-place mutation
+/// (the clone's map is BTreeMap-backed, so the inserted key sorts the same).
+pub(super) struct MarkedTools<'a> {
+    tools: &'a [Value],
+    marked_last: Option<Value>,
+}
+
+impl<'a> MarkedTools<'a> {
+    pub(super) fn new(tools: &'a [Value], ttl: CacheTtl) -> Self {
+        let marked_last = tools.last().map(|t| {
+            let mut t = t.clone();
+            t["cache_control"] = cache_control_value(ttl, MarkerSite::StablePrefix);
+            t
+        });
+        Self { tools, marked_last }
+    }
+}
+
+impl Serialize for MarkedTools<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.tools.len()))?;
+        match &self.marked_last {
+            Some(last) => {
+                for tool in &self.tools[..self.tools.len() - 1] {
+                    seq.serialize_element(tool)?;
+                }
+                seq.serialize_element(last)?;
+            }
+            None => {
+                for tool in self.tools {
+                    seq.serialize_element(tool)?;
+                }
+            }
+        }
+        seq.end()
+    }
+}
 
 impl ApiMethods {
     /// Build the auth header for Anthropic requests.

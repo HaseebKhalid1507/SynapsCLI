@@ -167,7 +167,7 @@ pub struct HookEvent {
     /// Contains the conversation transcript so extensions (like Stelline)
     /// can extract memories without reaching into runtime internals.
     #[serde(default)]
-    pub transcript: Option<Vec<Value>>,
+    pub transcript: Option<Vec<crate::SharedMessage>>,
     /// Arbitrary extension-defined data, passed through without inspection.
     pub data: Value,
 }
@@ -308,7 +308,7 @@ impl HookEvent {
     }
 
     /// Construct an `on_session_end` event.
-    pub fn on_session_end(session_id: &str, transcript: Option<Vec<Value>>) -> Self {
+    pub fn on_session_end(session_id: &str, transcript: Option<Vec<crate::SharedMessage>>) -> Self {
         Self {
             kind: HookKind::OnSessionEnd,
             tool_name: None,

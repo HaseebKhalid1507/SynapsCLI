@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
 
 use super::app::{App, ChatMessage};
 use super::theme;
@@ -121,7 +120,7 @@ pub(super) async fn fetch_usage() -> std::result::Result<Vec<String>, String> {
     Ok(lines)
 }
 
-pub(super) fn rebuild_display_messages(api_messages: &[Value], app: &mut App) {
+pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage], app: &mut App) {
     app.transcript.clear();
     for msg in api_messages {
         // Skip compaction summary messages — internal context, not user-visible
@@ -260,14 +259,14 @@ mod tests {
 
         // Every entry is filtered out by rebuild_display_messages.
         let api_messages = vec![
-            serde_json::json!({
+            std::sync::Arc::new(serde_json::json!({
                 "role": "user",
                 "content": "<context-summary>compacted context</context-summary>"
-            }),
-            serde_json::json!({
+            })),
+            std::sync::Arc::new(serde_json::json!({
                 "role": "user",
                 "content": "<event tool_use_id=\"x\">data</event>"
-            }),
+            })),
         ];
 
         rebuild_display_messages(&api_messages, &mut app);

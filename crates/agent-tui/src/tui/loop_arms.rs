@@ -732,13 +732,13 @@ pub(crate) async fn handle_animation_tick(
                             }
                             // Flush any events that arrived during compaction
                             for formatted in app.pending_events.drain(..) {
-                                app.api_messages.push(serde_json::json!({
+                                app.api_messages.push(std::sync::Arc::new(serde_json::json!({
                                     "role": "user",
                                     "content": formatted
-                                }));
+                                })));
                             }
                             if let Some(queued) = app.queued_message.take() {
-                                app.api_messages.push(serde_json::json!({"role": "user", "content": queued}));
+                                app.api_messages.push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": queued})));
                                 app.push_msg(ChatMessage::System(format!("queued message restored: {}", queued)));
                             }
                             app.push_msg(ChatMessage::System(format!(

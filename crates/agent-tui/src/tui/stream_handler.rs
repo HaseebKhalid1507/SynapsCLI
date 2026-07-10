@@ -148,10 +148,10 @@ pub(super) async fn handle_stream_event(
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();
             for formatted in app.pending_events.drain(..) {
-                app.api_messages.push(serde_json::json!({
+                app.api_messages.push(std::sync::Arc::new(serde_json::json!({
                     "role": "user",
                     "content": formatted
-                }));
+                })));
             }
 
             // Check for queued message to auto-send
@@ -245,10 +245,10 @@ pub(super) async fn handle_event_queue_arm(
                             app.pending_events.push(formatted);
                         }
                     } else {
-                        app.api_messages.push(serde_json::json!({
+                        app.api_messages.push(std::sync::Arc::new(serde_json::json!({
                             "role": "user",
                             "content": formatted
-                        }));
+                        })));
                     }
                     app.invalidate();
                 }
@@ -328,7 +328,7 @@ pub(super) async fn handle_stream_arm(
                             } else {
                                 queued
                             };
-                            app.api_messages.push(json!({"role": "user", "content": api_content}));
+                            app.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": api_content})));
                             let ct = CancellationToken::new();
                             let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                             app.status_text = Some("connecting…".to_string());

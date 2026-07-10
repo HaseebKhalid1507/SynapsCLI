@@ -124,10 +124,10 @@ pub async fn run(
                         if let Ok(summary) = compact_conversation(
                             &conv.api_messages, &runtime, custom_instructions.as_deref()
                         ).await {
-                            conv.api_messages = vec![json!({
+                            conv.api_messages = vec![std::sync::Arc::new(json!({
                                 "role": "user",
                                 "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                            })];
+                            }))];
                             last_compacted_tokens = conv.estimate_tokens();
                             eprintln!("compacted → ~{} tokens", last_compacted_tokens);
                         }
@@ -183,11 +183,14 @@ pub async fn run(
             input.to_string()
         };
 
-        conv.api_messages.push(json!({"role": "user", "content": message}));
+        conv.api_messages
+            .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
 
         let cancel = CancellationToken::new();
+        // Vec<SharedMessage> clone = pointer bumps only.
+        let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
         let mut stream = runtime.run_stream_with_messages(
-            conv.api_messages.clone(), cancel, None, None, false
+            msgs_in, cancel, None, None, false
         ).await;
 
         let mut in_thinking = false;
@@ -263,7 +266,8 @@ pub async fn run(
                 }
                 StreamCompletion::AutoSendQueued(queued) => {
                     // Re-inject and loop
-                    conv.api_messages.push(json!({"role": "user", "content": queued}));
+                    conv.api_messages
+                        .push(std::sync::Arc::new(json!({"role": "user", "content": queued})));
                     // Stream will continue from the outer loop
                     break;
                 }
@@ -285,10 +289,10 @@ pub async fn run(
         if est > threshold && conv.api_messages.len() >= 4 {
             eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
             if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
-                conv.api_messages = vec![json!({
+                conv.api_messages = vec![std::sync::Arc::new(json!({
                     "role": "user",
                     "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                })];
+                }))];
                 last_compacted_tokens = conv.estimate_tokens();
                 eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
             }

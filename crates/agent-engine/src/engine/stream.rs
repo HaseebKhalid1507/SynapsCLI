@@ -4,7 +4,6 @@
 //! and returns renderer-agnostic actions.
 
 use crate::{StreamEvent, LlmEvent, SessionEvent, AgentEvent};
-use serde_json::Value;
 
 /// What happened during a stream event — renderer decides how to display.
 #[derive(Debug)]
@@ -92,7 +91,7 @@ pub enum StreamCompletion {
 /// `pending_events` — events buffered during streaming (drained on completion)
 pub fn process_stream_event(
     event: StreamEvent,
-    messages: &mut Vec<Value>,
+    messages: &mut Vec<crate::SharedMessage>,
     subagents: &mut Vec<SubagentTracker>,
     queued_message: &mut Option<String>,
     pending_events: &mut Vec<String>,
@@ -188,10 +187,10 @@ pub fn process_stream_event(
             // Drain pending events into messages
             let had_pending = !pending_events.is_empty();
             for formatted in pending_events.drain(..) {
-                messages.push(serde_json::json!({
+                messages.push(std::sync::Arc::new(serde_json::json!({
                     "role": "user",
                     "content": formatted
-                }));
+                })));
             }
 
             // Check for queued message

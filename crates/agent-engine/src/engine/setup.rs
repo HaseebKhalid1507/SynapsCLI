@@ -61,7 +61,7 @@ pub struct EngineBoot {
     /// on this so the flag has one source of truth.
     pub no_extensions: bool,
     pub session: Session,
-    pub api_messages: Vec<serde_json::Value>,
+    pub api_messages: Vec<crate::SharedMessage>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
@@ -235,7 +235,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 /// Result of session resolution.
 struct SessionBootResult {
     session: Session,
-    api_messages: Vec<serde_json::Value>,
+    api_messages: Vec<crate::SharedMessage>,
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,

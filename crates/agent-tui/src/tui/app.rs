@@ -1,4 +1,3 @@
-use serde_json::Value;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 
@@ -29,7 +28,7 @@ pub(crate) struct App {
     /// Cursor position as a **char index** (not byte index).
     /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
     pub(crate) cursor_pos: usize,
-    pub(crate) api_messages: Vec<Value>,
+    pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,

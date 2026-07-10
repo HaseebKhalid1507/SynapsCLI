@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use serde_json::Value;
+use crate::core::stream_types::SharedMessage;
 use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
@@ -19,7 +19,7 @@ pub struct Session {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub session_cost: f64,
-    pub api_messages: Vec<Value>,
+    pub api_messages: Vec<SharedMessage>,
     /// Saved abort context — injected into the next user message on /continue
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_context: Option<String>,
@@ -97,8 +97,8 @@ impl Session {
             total_output_tokens: 0,
             session_cost: 0.0,
             api_messages: vec![
-                serde_json::json!({"role": "user", "content": summary_parts}),
-                serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."}),
+                SharedMessage::new(serde_json::json!({"role": "user", "content": summary_parts})),
+                SharedMessage::new(serde_json::json!({"role": "assistant", "content": "I've loaded the conversation summary and system prompt. Ready to continue."})),
             ],
             abort_context: None,
             parent_session: Some(parent.id.clone()),
@@ -496,10 +496,10 @@ mod tests {
         let mut session = Session::new("gpt-4", "brief", None);
         
         // Add a user message
-        session.api_messages.push(json!({
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": "hello world"
-        }));
+        })));
         
         // Call auto_title
         session.auto_title();
@@ -519,20 +519,20 @@ mod tests {
         
         // Test with non-user message
         let mut session_no_user = Session::new("gpt-4", "brief", None);
-        session_no_user.api_messages.push(json!({
+        session_no_user.api_messages.push(std::sync::Arc::new(json!({
             "role": "assistant",
             "content": "response"
-        }));
+        })));
         session_no_user.auto_title();
         assert_eq!(session_no_user.title, "");
         
         // Test with long content (should truncate to 80 chars)
         let mut session_long = Session::new("gpt-4", "brief", None);
         let long_content = "a".repeat(100);
-        session_long.api_messages.push(json!({
+        session_long.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": long_content
-        }));
+        })));
         session_long.auto_title();
         assert_eq!(session_long.title.len(), 80);
         assert_eq!(session_long.title, "a".repeat(80));
@@ -543,14 +543,14 @@ mod tests {
         let mut session = Session::new("gpt-4", "brief", Some("system prompt"));
         
         // Add some messages to test message count
-        session.api_messages.push(json!({
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": "test message"
-        }));
-        session.api_messages.push(json!({
+        })));
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "assistant",
             "content": "test response"
-        }));
+        })));
         
         session.title = "Test Title".to_string();
         session.session_cost = 0.05;
@@ -595,7 +595,7 @@ mod tests {
     fn test_session_serialization_round_trip() {
         let mut session = Session::new("gpt-4-turbo", "detailed", Some("You are a helpful assistant"));
         session.title = "Test Session".to_string();
-        session.api_messages.push(json!({"role": "user", "content": "test"}));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "test"})));
         session.total_input_tokens = 100;
         session.total_output_tokens = 200;
         session.session_cost = 0.15;
@@ -627,9 +627,9 @@ mod tests {
         session.title = "Complex Session".to_string();
         
         // Add multiple messages
-        session.api_messages.push(json!({"role": "user", "content": "First message"}));
-        session.api_messages.push(json!({"role": "assistant", "content": "First response"}));
-        session.api_messages.push(json!({"role": "user", "content": "Second message"}));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "First message"})));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "assistant", "content": "First response"})));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "Second message"})));
         
         // Set token counts and cost
         session.total_input_tokens = 1500;
@@ -663,9 +663,9 @@ mod tests {
         let mut session = Session::new("gpt-3.5-turbo", "normal", None);
         
         // Add exactly 3 messages
-        session.api_messages.push(json!({"role": "user", "content": "message 1"}));
-        session.api_messages.push(json!({"role": "assistant", "content": "response 1"}));
-        session.api_messages.push(json!({"role": "user", "content": "message 2"}));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "message 1"})));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "assistant", "content": "response 1"})));
+        session.api_messages.push(std::sync::Arc::new(json!({"role": "user", "content": "message 2"})));
         
         let info = session.info();
         
@@ -681,10 +681,10 @@ mod tests {
         
         // Create a user message with exactly 200 characters
         let long_content = "a".repeat(200);
-        session.api_messages.push(json!({
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "user",
             "content": long_content
-        }));
+        })));
         
         session.auto_title();
         
@@ -698,10 +698,10 @@ mod tests {
         let mut session = Session::new("gpt-4", "brief", None);
         
         // Push only an assistant message (no user messages)
-        session.api_messages.push(json!({
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "assistant", 
             "content": "This should be ignored for auto title"
-        }));
+        })));
         
         session.auto_title();
         
@@ -709,10 +709,10 @@ mod tests {
         assert_eq!(session.title, "");
         
         // Test with system message too
-        session.api_messages.push(json!({
+        session.api_messages.push(std::sync::Arc::new(json!({
             "role": "system",
             "content": "System message should also be ignored"
-        }));
+        })));
         
         session.auto_title();
         assert_eq!(session.title, "");
