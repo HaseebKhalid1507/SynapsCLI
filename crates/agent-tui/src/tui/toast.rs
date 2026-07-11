@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use super::clock::TuiClock;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
@@ -24,7 +25,11 @@ pub(crate) struct Toast {
     /// colors for pixel art, status indicators, and themed widgets.
     pub(crate) rich_lines: Option<Vec<Line<'static>>>,
     pub(crate) position: ToastPosition,
-    created_at: Instant,
+    /// Optional border accent (P19.2). Extension widgets resolve this
+    /// through the namespaced theme token `ext.<id>.accent`; `None` keeps
+    /// the default `border_active` border, byte-identical to before.
+    pub(crate) accent: Option<ratatui::style::Color>,
+    created_at: Option<Instant>,
     ttl: Option<Duration>,
 }
 
@@ -36,7 +41,8 @@ impl Toast {
             lines: vec![line.into()],
             rich_lines: None,
             position: ToastPosition::default(),
-            created_at: Instant::now(),
+            accent: None,
+            created_at: None,
             ttl: Some(Duration::from_secs(4)),
         }
     }
@@ -63,6 +69,12 @@ impl Toast {
         self.rich_lines.is_some()
     }
 
+    /// Set the border accent color (P19.2, resolved ext theme token).
+    pub(crate) fn accent(mut self, color: Option<ratatui::style::Color>) -> Self {
+        self.accent = color;
+        self
+    }
+
     pub(crate) fn at(mut self, position: ToastPosition) -> Self {
         self.position = position;
         self
@@ -74,7 +86,10 @@ impl Toast {
     }
 
     fn is_expired(&self, now: Instant) -> bool {
-        self.ttl.is_some_and(|ttl| now.duration_since(self.created_at) >= ttl)
+        self.ttl.is_some_and(|ttl| {
+            self.created_at
+                .is_some_and(|created| now.duration_since(created) >= ttl)
+        })
     }
 
     #[allow(dead_code)]
@@ -85,15 +100,18 @@ impl Toast {
 
 /// In-memory toast provider. Upserting by id lets async loaders update a single
 /// on-screen notification instead of flooding the transcript.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ToastProvider {
     toasts: VecDeque<Toast>,
     max_visible: usize,
+    /// Injectable clock (P6.2). Stamps `created_at` on upsert and drives
+    /// expiry in `tick`, so toast lifetimes are deterministic under test.
+    clock: TuiClock,
 }
 
 impl ToastProvider {
-    pub(crate) fn new() -> Self {
-        Self { toasts: VecDeque::new(), max_visible: 5 }
+    pub(crate) fn new(clock: TuiClock) -> Self {
+        Self { toasts: VecDeque::new(), max_visible: 5, clock }
     }
 
     /// Insert or update a toast by id. Returns `true` if the VISIBLE content
@@ -103,7 +121,11 @@ impl ToastProvider {
     /// stays alive, but returns `false` so it does NOT trigger a wasteful redraw.
     /// (This is the #119 idle-burn fix: plugins re-sending unchanged widgets no
     /// longer pin the render loop at ~30% CPU.)
-    pub(crate) fn upsert(&mut self, toast: Toast) -> bool {
+    pub(crate) fn upsert(&mut self, mut toast: Toast) -> bool {
+        // Stamp the birth time from the injectable clock (P6.2). Both the
+        // insert and the replace path below adopt this fresh `created_at`,
+        // preserving the prior "replace refreshes created_at/ttl" behavior.
+        toast.created_at = Some(self.clock.now());
         if let Some(existing) = self.toasts.iter_mut().find(|t| t.id == toast.id) {
             let changed = existing.title != toast.title
                 || existing.lines != toast.lines
@@ -129,7 +151,7 @@ impl ToastProvider {
 
     pub(crate) fn tick(&mut self) -> bool {
         let before = self.toasts.len();
-        let now = Instant::now();
+        let now = self.clock.now();
         self.toasts.retain(|toast| !toast.is_expired(now));
         before != self.toasts.len()
     }
@@ -220,7 +242,7 @@ mod tests {
 
     #[test]
     fn provider_upsert_replaces_existing_toast() {
-        let mut provider = ToastProvider::new();
+        let mut provider = ToastProvider::new(TuiClock::real());
         provider.upsert(Toast::new("loader", "1/3 loading"));
         provider.upsert(Toast::new("loader", "2/3 loading"));
         let visible: Vec<_> = provider.visible().collect();
@@ -230,7 +252,7 @@ mod tests {
 
     #[test]
     fn persistent_toast_survives_tick() {
-        let mut provider = ToastProvider::new();
+        let mut provider = ToastProvider::new(TuiClock::real());
         provider.upsert(Toast::new("buddy", "(•ᴗ•)").ttl(None));
         assert!(!provider.tick());
         assert_eq!(provider.visible().count(), 1);

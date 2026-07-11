@@ -1,71 +1,34 @@
-use serde_json::Value;
-use chrono::Local;
 use synaps_cli::Session;
 use synaps_cli::pricing::calculate_cost_optional_split;
 
-/// Sentinel placeholder pushed into a `Thinking` block while the model is
-/// deciding whether to think. Using ellipsis + zero-width space makes it
-/// visually identical to "…" but never equal to real model output.
-pub(crate) const THINKING_PLACEHOLDER: &str = "\u{2026}\u{200B}";
+// Type re-export shims from slice (a). Kept this release — deleting is churn
+// for no gain. One-release grace per design §5(f).
+// TODO(P9-followup): drop re-exports; callers should import from transcript directly.
+pub(crate) use super::transcript::{ChatMessage, TranscriptStore, THINKING_PLACEHOLDER};
+// Test-only re-exports: production code reaches the cache via store methods;
+// only ported cache tests name these types directly.
+#[allow(unused_imports)]
+pub(crate) use super::transcript::{CacheState, LineCache, MsgSlot, RenderCtx};
+#[allow(unused_imports)]
+pub(crate) use super::transcript::TimestampedMsg;
 
-#[derive(Clone)]
-pub(crate) enum ChatMessage {
-    User(String),
-    Thinking(String),
-    Text(String),
-    /// Streaming tool-use placeholder. `tool_id` lets the chat UI route
-    /// subsequent input deltas and the final finalize event to *this*
-    /// block when multiple tools run in parallel — without it, the
-    /// "always update last message" hack misroutes deltas/results to
-    /// whichever tool block happens to be most recent.
-    ToolUseStart {
-        tool_id: String,
-        tool_name: String,
-        partial_input: String,
-    },
-    ToolUse {
-        tool_id: String,
-        tool_name: String,
-        input: String,
-    },
-    ToolResult {
-        tool_id: String,
-        content: String,
-        elapsed_ms: Option<u64>,
-    },
-    Error(String),
-    System(String),
-    Event { source: String, severity: String, text: String },
-}
-
-pub(crate) struct TimestampedMsg {
-    pub(crate) msg: ChatMessage,
-    pub(crate) time: String,
-}
-
-/// Per-message render cache. Parallel to `App.messages`: each slot holds the
-/// rendered `Vec<Line>` for that message. `flat` is their concatenation, which
-/// is what downstream (draw/selection) consumes. The `width` at which these
-/// were rendered is stored so stale entries can be detected on terminal resize.
-pub(crate) struct LineCache {
-    pub(crate) width: usize,
-    /// Rendered lines per message — index parallel to App.messages.
-    pub(crate) per_msg: Vec<Vec<ratatui::text::Line<'static>>>,
-    /// Concatenation of per_msg; what downstream code consumes.
-    pub(crate) flat: Vec<ratatui::text::Line<'static>>,
-}
-
+/// Central TUI state.
+///
+/// T199.2 boundary: `App` is **loop state**, not render input. The render
+/// builder ([`super::draw::build_render_model`]) never takes `App`; it takes
+/// [`super::view_model::ViewInputs`], which names the exact render-input
+/// subset of these fields (input/chrome, session totals, panes, modal
+/// projections). Fields NOT in `ViewInputs` — per-turn accounting, history/
+/// paste/tab bookkeeping, channel endpoints, async task handles — are
+/// invisible to the renderer by construction. Builder-requested mutations
+/// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
-    pub(crate) messages: Vec<TimestampedMsg>,
+    pub(crate) transcript: TranscriptStore,
     pub(crate) input: String,
     /// Cursor position as a **char index** (not byte index).
     /// Use `cursor_byte_pos()` to convert to byte offset for String operations.
     pub(crate) cursor_pos: usize,
-    pub(crate) scroll_back: u16,
-    /// When true, viewport stays pinned to the bottom (auto-scroll).
-    /// Set to false when user scrolls up, true when they scroll back to bottom.
-    pub(crate) scroll_pinned: bool,
-    pub(crate) api_messages: Vec<Value>,
+    pub(crate) api_messages: Vec<synaps_cli::SharedMessage>,
     pub(crate) streaming: bool,
     pub(crate) input_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
@@ -97,37 +60,20 @@ pub(crate) struct App {
     /// denominator adapts when users switch models mid-session. See
     /// `synaps_cli::models::context_window_for_model`.
     pub(crate) last_turn_context_window: u64,
-    pub(crate) api_call_count: u32,
+    api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
-    /// Cached wrapped+highlighted message lines.
-    /// `None` means "stale — rebuild on next draw". `Some(cache)` means
-    /// "valid at cache.width". Replaced the old `(usize, Vec<Line>)` tuple
-    /// with a structured type that supports per-message incremental updates.
-    pub(crate) line_cache: Option<LineCache>,
-    /// Lowest message index whose rendered lines are stale. `None` = fully clean.
-    /// Set to `Some(k)` to trigger partial re-render from message k on next draw.
-    pub(crate) dirty_from: Option<usize>,
     pub(crate) needs_redraw: bool,
     /// When set, the next repaint bypasses the streaming redraw throttle.
     /// Set by user input (scroll/typing/cursor) so interaction stays instant
     /// even while the model is streaming; cleared after the paint.
     pub(crate) force_redraw: bool,
-    pub(crate) show_full_output: bool,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
-    /// Previous rendered line count — used to stabilize scroll when not pinned
-    pub(crate) last_line_count: usize,
     /// Active subagent status for the live panel
     pub(crate) subagents: Vec<SubagentState>,
     /// Counter for unique subagent IDs within a session
-    /// Tracks when the current tool started executing (for elapsed time display)
-    pub(crate) tool_start_time: Option<std::time::Instant>,
-    /// Per-tool start times keyed by `tool_id`. Lets parallel tool calls
-    /// each show their own elapsed-time on the result block, instead of
-    /// sharing a single timer that the last-started tool clobbers.
-    pub(crate) tool_start_times: std::collections::HashMap<String, std::time::Instant>,
     /// Saved context from an aborted response — injected into the next user message
     pub(crate) abort_context: Option<String>,
     /// Message queued while streaming — auto-sent when current response finishes
@@ -149,6 +95,19 @@ pub(crate) struct App {
     pub(crate) models: Option<super::models::ModelsModalState>,
     /// Active /help find lightbox state.
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
+    /// P7 modal-routing stack (finished, P7.8). The single source of input
+    /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
+    /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
+    /// (+ the `secret_prompts` queue), never a new owner (§6). Every open/close
+    /// site pushes/pops in lock-step; membership is cross-checked against the
+    /// backing fields by `debug_assert_stack_sync`. Empty ⇒ `top()` is
+    /// `PaneId::Chat` ⇒ input goes to the base chat pane.
+    pub(crate) modal_stack: super::focus::ModalStack,
+    /// P7.8 secret-prompt queue — folded onto App from the `run()` local
+    /// (§5). Drained from the mpsc channel via `poll_requests` in the tick
+    /// arm; `is_active()` is mirrored by `modal_stack.contains(SecretPrompt)`
+    /// via `reconcile_secret_prompt` (asserted by `debug_assert_stack_sync`).
+    pub(crate) secret_prompts: synaps_cli::tools::SecretPromptQueue,
     /// Background compaction task — polled in the event loop so /compact doesn't block.
     pub(crate) compact_task: Option<tokio::task::JoinHandle<Result<String, synaps_cli::error::RuntimeError>>>,
     /// Events buffered during streaming — injected into api_messages after stream completes
@@ -164,17 +123,6 @@ pub(crate) struct App {
     /// Channel for receiving expanded model-list API results.
     pub(crate) model_list_tx: tokio::sync::mpsc::UnboundedSender<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
     pub(crate) model_list_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Result<Vec<super::models::ExpandedModelEntry>, String>)>,
-    /// Text selection state for the message area.
-    /// Anchor is where the mouse was first pressed (col, row in terminal coords).
-    /// End is the current drag position. Both are absolute terminal coordinates.
-    pub(crate) selection_anchor: Option<(u16, u16)>,
-    pub(crate) selection_end: Option<(u16, u16)>,
-    /// The message area rect from the last draw, used by input.rs to map mouse
-    /// coordinates to message content.
-    pub(crate) msg_area_rect: Option<ratatui::layout::Rect>,
-    /// The visible line range from the last draw: (start_line_index, end_line_index)
-    /// into the line_cache, so we can extract text from screen coordinates.
-    pub(crate) visible_line_range: Option<(usize, usize)>,
     /// Suppress paste events arriving shortly after a right-click copy/paste.
     /// Terminals that auto-paste on right-click generate a spurious Event::Paste
     /// immediately after MouseDown(Right). We suppress only within a short TTL
@@ -199,6 +147,9 @@ pub(crate) struct App {
     pub(crate) widget_tx: tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::widgets::ExtensionWidgetEvent>,
     /// Live keybind registry — held so /settings can hot-swap plugin toggle keys.
     pub(crate) keybinds: Option<std::sync::Arc<std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>>>,
+    /// Injectable clock (P6.2). Real in production, Test in the harness so
+    /// time-dependent state (toast expiry, tool timers) stays deterministic.
+    pub(crate) clock: super::clock::TuiClock,
 }
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -215,17 +166,24 @@ pub(crate) struct SubagentState {
 }
 
 impl App {
+    /// Test-only convenience constructor: production-equivalent App backed by
+    /// the real system clock. Production code uses `new_with_clock` directly.
+    #[cfg(test)]
     pub(crate) fn new(session: Session) -> Self {
+        Self::new_with_clock(session, super::clock::TuiClock::real())
+    }
+
+    /// Construct an App with an explicit clock (P6.2). `run()` passes
+    /// `TuiClock::real()`; the harness passes `TuiClock::test()`.
+    pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            messages: Vec::new(),
+            transcript: TranscriptStore::new(clock.clone()),
             input: String::new(),
             cursor_pos: 0,
-            scroll_back: 0,
-            scroll_pinned: true,
             api_messages: Vec::new(),
             streaming: false,
             input_history: Vec::new(),
@@ -250,17 +208,11 @@ impl App {
             agent_name: synaps_cli::config::load_config()
                 .agent_name
                 .unwrap_or_else(|| "agent".to_string()),
-            line_cache: None,
-            dirty_from: None,
             needs_redraw: true,
             force_redraw: false,
-            show_full_output: false,
             logo_dismiss_t: None,
             logo_build_t: Some(0.0),
-            last_line_count: 0,
             subagents: Vec::new(),
-            tool_start_time: None,
-            tool_start_times: std::collections::HashMap::new(),
             abort_context: None,
             queued_message: None,
             input_before_paste: None,
@@ -272,6 +224,11 @@ impl App {
             plugins: None,
             models: None,
             help_find: None,
+            // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
+            modal_stack: super::focus::ModalStack::new(),
+            // P7.8: folded off the `run()` local; production wires the mpsc
+            // channel separately (mod.rs). Starts empty (no active prompt).
+            secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compact_task: None,
             pending_events: Vec::new(),
             model_health: std::collections::HashMap::new(),
@@ -281,20 +238,17 @@ impl App {
             ping_rx: ping_rx_init,
             model_list_tx: model_list_tx_init,
             model_list_rx: model_list_rx_init,
-            selection_anchor: None,
-            selection_end: None,
-            msg_area_rect: None,
-            visible_line_range: None,
             suppress_paste_until: None,
             sidecars: std::collections::HashMap::new(),
             active_tasks: std::sync::Arc::new(synaps_cli::extensions::active_tasks::ActiveTasks::new()),
-            toasts: super::toast::ToastProvider::new(),
+            toasts: super::toast::ToastProvider::new(clock.clone()),
             extension_loader_rx: extension_loader_rx_init,
             extension_loader_tx: extension_loader_tx_init,
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,
             keybinds: None,
+            clock,
         }
     }
     /// Build the text shown in the chat transcript for a submitted user message.
@@ -365,49 +319,7 @@ impl App {
 
     /// Calculate the number of visual lines the input needs, given an inner width.
     /// Returns (total_lines, cursor_row, cursor_col) for layout and cursor placement.
-    pub(crate) fn input_wrap_info(&self, inner_width: u16) -> (u16, u16, u16) {
-        use unicode_width::UnicodeWidthChar;
-        let w = inner_width.max(1) as usize;
-        // prefix "❯ " is 2 display columns (only on first line)
-        let prefix_width: usize = 2;
-
-        let mut row: u16 = 0;
-        let mut col: usize = prefix_width;
-        let mut cursor_row: u16 = 0;
-        let mut cursor_col: u16 = prefix_width as u16;
-
-        for (i, ch) in self.input.chars().enumerate() {
-            if i == self.cursor_pos {
-                cursor_row = row;
-                cursor_col = col as u16;
-            }
-            if ch == '\n' {
-                row += 1;
-                col = prefix_width; // continuation lines also have 2-char indent
-                continue;
-            }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if col + cw > w {
-                row += 1;
-                col = 0;
-            }
-            col += cw;
-        }
-        // If cursor is at the end
-        if self.cursor_pos == self.input_char_count() {
-            cursor_row = row;
-            cursor_col = col as u16;
-            // If cursor is exactly at the wrap boundary
-            if col >= w {
-                cursor_row += 1;
-                cursor_col = 0;
-            }
-        }
-
-        let total_lines = row + 1;
-        (total_lines, cursor_row, cursor_col)
-    }
-
+    ///
     pub(crate) async fn save_session(&mut self) {
         if self.api_messages.is_empty() {
             return;
@@ -464,85 +376,23 @@ impl App {
         );
     }
 
+    // ── Slice (b′) delegating wrappers ──────────────────────────────────
+    //
+    // Content mutations, tool routing, and the invalidate family moved to
+    // TranscriptStore (transcript.rs). These wrappers keep identical
+    // signatures so call sites don't churn (locked decision #3); redraw
+    // signaling (`needs_redraw`) stays here on App.
+
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
-        self.messages.push(TimestampedMsg {
-            msg,
-            time: Local::now().format("%H:%M").to_string(),
-        });
-        // Auto-scroll only when pinned to bottom
-        if self.scroll_pinned {
-            self.scroll_back = 0;
-        }
-        // New tail message — mark last slot dirty (append to per_msg on next rebuild).
-        self.invalidate_last();
+        self.transcript.push_msg(msg);
+        self.needs_redraw = true;
     }
 
-    /// Insert a freshly created `ToolResult` directly beneath its matching
-    /// `ToolUse` / `ToolUseStart` block (matched by `tool_id`) so parallel tool
-    /// calls render as **input → its output** pairs, instead of all inputs
-    /// stacked then all outputs stacked. Falls back to appending at the end
-    /// when no matching tool_use exists (legacy providers without tool_ids).
-    pub(crate) fn push_tool_result(&mut self, tool_id: String, content: String, elapsed_ms: Option<u64>) {
-        let use_idx = if tool_id.is_empty() {
-            None
-        } else {
-            // Invariant: each tool_id should appear at most once. Assert in
-            // debug builds so duplicate IDs surface immediately.
-            debug_assert!(
-                self.messages.iter().filter(|m| matches!(
-                    &m.msg,
-                    ChatMessage::ToolUse { tool_id: tid, .. }
-                    | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                        if tid == &tool_id
-                )).count() <= 1,
-                "push_tool_result: duplicate ToolUse/ToolUseStart for tool_id={tool_id:?}"
-            );
-            self.messages.iter().position(|m| matches!(
-                &m.msg,
-                ChatMessage::ToolUse { tool_id: tid, .. }
-                | ChatMessage::ToolUseStart { tool_id: tid, .. }
-                    if tid == &tool_id
-            ))
-        };
-        let msg = ChatMessage::ToolResult { tool_id, content, elapsed_ms };
-        match use_idx {
-            Some(i) => {
-                let at = (i + 1).min(self.messages.len());
-                self.messages.insert(at, TimestampedMsg {
-                    msg,
-                    time: Local::now().format("%H:%M").to_string(),
-                });
-                if self.scroll_pinned {
-                    self.scroll_back = 0;
-                }
-                // Insert mid-list — invalidate_from(at) so draw re-renders from insert point.
-                self.invalidate_from(at);
-            }
-            None => self.push_msg(msg),
-        }
-    }
-    ///
-    /// `render_lines` markdown-renders + syntax-highlights EVERY display message
-    /// on the first frame. On `--continue` of a long session (hundreds of
-    /// messages) that made boot crawl. This keeps only the most recent `cap`
-    /// display messages and prepends a notice — the FULL history is untouched in
-    /// `api_messages`, so the model still sees everything; only the visible
-    /// scrollback is trimmed. (Proper fix is viewport virtualization — #98.)
+    /// Delegates to [`TranscriptStore::cap_resumed_display`]. Note: does not
+    /// signal a redraw — verbatim-preserves the pre-move behavior (the method
+    /// never invalidated; it runs at resume before any cache exists).
     pub(crate) fn cap_resumed_display(&mut self, cap: usize) {
-        if self.messages.len() <= cap {
-            return;
-        }
-        let omitted = self.messages.len() - cap;
-        self.messages.drain(0..omitted);
-        self.messages.insert(
-            0,
-            TimestampedMsg {
-                msg: ChatMessage::System(format!(
-                    "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
-                )),
-                time: Local::now().format("%H:%M").to_string(),
-            },
-        );
+        self.transcript.cap_resumed_display(cap);
     }
 
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
@@ -550,25 +400,16 @@ impl App {
     /// Use for structural changes (theme, width, message list reshuffle). For
     /// streaming deltas prefer `invalidate_last()` which is O(1).
     pub(crate) fn invalidate(&mut self) {
-        self.line_cache = None;
-        self.dirty_from = None;
-        self.needs_redraw = true;
-    }
-
-    /// Mark messages from index `idx` onwards as dirty (cheapest granularity).
-    /// Coalesces with any existing dirty_from by taking the minimum.
-    pub(crate) fn invalidate_from(&mut self, idx: usize) {
-        self.dirty_from = Some(match self.dirty_from {
-            Some(k) => k.min(idx),
-            None => idx,
-        });
+        self.transcript.invalidate();
         self.needs_redraw = true;
     }
 
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
-        self.invalidate_from(self.messages.len().saturating_sub(1));
+        self.transcript.invalidate_last();
+        self.needs_redraw = true;
     }
+
 
     /// Request a redraw without invalidating the line cache (e.g. for
     /// panel-only changes like spinner/timer updates, scroll, cursor blink).
@@ -597,19 +438,7 @@ impl App {
             return false;
         }
 
-        self.render_lines_uses_spinner()
-    }
-
-    fn render_lines_uses_spinner(&self) -> bool {
-        self.messages.iter().enumerate().any(|(idx, msg)| match &msg.msg {
-            ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
-            ChatMessage::ToolUseStart { .. } => true,
-            ChatMessage::ToolUse { .. } => {
-                idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
-            }
-            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
-            _ => false,
-        })
+        self.transcript.uses_spinner()
     }
 
     /// True when a full terminal clear is needed before an animated redraw.
@@ -623,227 +452,39 @@ impl App {
         false
     }
 
-    /// Returns true when the chat message at `idx` is the tool result currently
-    /// being streamed/executed. Completed historical tool results must render as
-    /// done even while a later tool call is active.
-    pub(crate) fn is_active_tool_result(&self, idx: usize) -> bool {
-        if self.tool_start_time.is_none() {
-            return false;
-        }
-        match self.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, elapsed_ms: None, .. }) => {
-                self.tool_start_times.contains_key(tool_id)
-            }
-            _ => false,
-        }
-    }
-
-    /// Find the file extension from the ToolUse message preceding a ToolResult at index `idx`.
-    pub(crate) fn find_preceding_read_extension(&self, idx: usize) -> String {
-        // Prefer matching by tool_id when the result carries one — under
-        // parallel tool calls a `ToolResult` may not be positionally
-        // adjacent to its matching `ToolUse`.
-        let target_id: Option<String> = match self.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::ToolResult { tool_id, .. }) if !tool_id.is_empty() => Some(tool_id.clone()),
-            _ => None,
-        };
-        if let Some(id) = target_id {
-            for m in self.messages.iter() {
-                if let ChatMessage::ToolUse { tool_id, tool_name, input } = &m.msg {
-                    if tool_id == &id && tool_name == "read" {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
-                            if let Some(path) = parsed["path"].as_str() {
-                                if let Some(ext) = std::path::Path::new(path).extension() {
-                                    return ext.to_string_lossy().to_string();
-                                }
-                            }
-                        }
-                        return String::new();
-                    }
-                }
-            }
-        }
-        // Fallback: walk backwards from idx to find the preceding ToolUse
-        if idx == 0 { return String::new(); }
-        for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, ref input, .. } = self.messages[i].msg {
-                if tool_name == "read" {
-                    // Extract path from the JSON input
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) {
-                        if let Some(path) = parsed["path"].as_str() {
-                            // Get the extension
-                            if let Some(ext) = std::path::Path::new(path).extension() {
-                                return ext.to_string_lossy().to_string();
-                            }
-                        }
-                    }
-                }
-                break; // Stop at first ToolUse regardless
-            }
-        }
-        String::new()
-    }
-
-    /// Find the tool name from the ToolUse message preceding a ToolResult at index `idx`.
-    pub(crate) fn find_preceding_tool_name(&self, idx: usize) -> Option<String> {
-        // Prefer matching by tool_id when the result carries one — this
-        // is the only way to render parallel-tool outputs correctly,
-        // since results may not be positionally adjacent to their
-        // matching tool_use.
-        if let Some(ChatMessage::ToolResult { tool_id, .. }) = self.messages.get(idx).map(|m| &m.msg) {
-            if !tool_id.is_empty() {
-                for m in self.messages.iter() {
-                    match &m.msg {
-                        ChatMessage::ToolUse { tool_id: tid, tool_name, .. }
-                        | ChatMessage::ToolUseStart { tool_id: tid, tool_name, .. }
-                            if tid == tool_id =>
-                        {
-                            return Some(tool_name.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if idx == 0 { return None; }
-        for i in (0..idx).rev() {
-            if let ChatMessage::ToolUse { ref tool_name, .. } = self.messages[i].msg {
-                return Some(tool_name.clone());
-            }
-            if let ChatMessage::ToolUseStart { ref tool_name, .. } = self.messages[i].msg {
-                return Some(tool_name.clone());
-            }
-        }
-        None
-    }
-
     // ── Tool-event routing ──────────────────────────────────────────────
     //
-    // Stream events arrive interleaved when the model fans out parallel
-    // tool calls. The chat UI keeps a flat `Vec<ChatMessage>`, so to keep
-    // each on-screen tool block correct we must route every delta /
-    // finalize / result event back to the block whose `tool_id` matches.
-    //
-    // The earlier "always update last message" approach worked for
-    // sequential tool calls but corrupts state under parallelism — input
-    // deltas from tool A would land on tool B's `ToolUseStart`, and the
-    // first arriving result would be silently overwritten by the second.
+    // Routing logic lives in TranscriptStore (transcript.rs) since slice (b′);
+    // these are signature-identical delegates.
 
-    /// Locate the index of a `ToolUseStart` block with this `tool_id`.
-    pub(crate) fn find_tool_use_start_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolUseStart { tool_id: tid, .. } if tid == tool_id
-        ))
-    }
-
-    /// Locate the latest `ToolResult` block for this `tool_id`.
-    pub(crate) fn find_tool_result_idx(&self, tool_id: &str) -> Option<usize> {
-        self.messages.iter().rposition(|m| matches!(
-            &m.msg,
-            ChatMessage::ToolResult { tool_id: tid, .. } if tid == tool_id
-        ))
-    }
-
-    /// Begin streaming a new tool call. Records start time per-tool so
-    /// elapsed-ms is correct under parallel execution.
+    /// Delegates to [`TranscriptStore::on_tool_use_start`].
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
-        self.drop_empty_thinking();
-        let now = std::time::Instant::now();
-        self.tool_start_time = Some(now);
-        if !tool_id.is_empty() {
-            self.tool_start_times.insert(tool_id.clone(), now);
-        }
-        self.push_msg(ChatMessage::ToolUseStart {
-            tool_id,
-            tool_name,
-            partial_input: String::new(),
-        });
+        self.transcript.on_tool_use_start(tool_id, tool_name);
+        self.needs_redraw = true;
     }
 
-    /// Append a chunk of the tool's input JSON to the matching
-    /// `ToolUseStart` block. Falls back to "last ToolUseStart" only when
-    /// the event lacks a tool_id (legacy paths).
+    /// Delegates to [`TranscriptStore::on_tool_use_delta`].
     pub(crate) fn on_tool_use_delta(&mut self, tool_id: &str, delta: &str) {
-        let target_idx = if !tool_id.is_empty() {
-            self.find_tool_use_start_idx(tool_id)
-        } else {
-            self.messages.iter().rposition(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
-        };
-        if let Some(idx) = target_idx {
-            if let ChatMessage::ToolUseStart { ref mut partial_input, .. } = self.messages[idx].msg {
-                partial_input.push_str(delta);
-                self.invalidate();
-            }
-        }
+        self.transcript.on_tool_use_delta(tool_id, delta);
+        self.needs_redraw = true;
     }
 
-    /// Finalize a streaming tool call. Replaces the matching
-    /// `ToolUseStart` in place — keeping its position so on-screen order
-    /// matches the order the model emitted the calls.
+    /// Delegates to [`TranscriptStore::on_tool_use_finalized`].
     pub(crate) fn on_tool_use_finalized(&mut self, tool_id: String, tool_name: String, input_str: String) {
-        self.drop_empty_thinking();
-        // Track start time even if we never saw a ToolUseStart (some
-        // providers go straight to a finalized tool_use).
-        if !tool_id.is_empty() {
-            self.tool_start_times.entry(tool_id.clone()).or_insert_with(std::time::Instant::now);
-        }
-        self.tool_start_time = Some(std::time::Instant::now());
-
-        if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
-            self.messages[idx].msg = ChatMessage::ToolUse { tool_id, tool_name, input: input_str };
-            self.invalidate();
-            return;
-        }
-        // No matching start (e.g. provider only emits finalized blocks) —
-        // append a new finalized block at the end.
-        self.push_msg(ChatMessage::ToolUse { tool_id, tool_name, input: input_str });
+        self.transcript.on_tool_use_finalized(tool_id, tool_name, input_str);
+        self.needs_redraw = true;
     }
 
-    /// Stream a chunk of tool output. Appends to the matching
-    /// `ToolResult` if one exists, otherwise creates a new placeholder.
+    /// Delegates to [`TranscriptStore::on_tool_result_delta`].
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
-        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
-                if elapsed_ms.is_none() {
-                    content.push_str(&delta);
-                    self.invalidate();
-                    return;
-                }
-            }
-        }
-        self.push_tool_result(tool_id, delta, None);
+        self.transcript.on_tool_result_delta(tool_id, delta);
+        self.needs_redraw = true;
     }
 
-    /// Finalize a tool result. Replaces any in-flight `ToolResult` for
-    /// this `tool_id` (including a delta-buffered one) and stamps the
-    /// elapsed time using the per-tool start time.
+    /// Delegates to [`TranscriptStore::on_tool_result`].
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
-        let elapsed = self
-            .tool_start_times
-            .remove(&tool_id)
-            .map(|t| t.elapsed().as_millis() as u64);
-        // Clear the shared "active tool" timer once the *latest* tool
-        // finishes — otherwise the bash trace animation lingers.
-        if self.tool_start_times.is_empty() {
-            self.tool_start_time = None;
-        }
-
-        if let Some(idx) = self.find_tool_result_idx(&tool_id) {
-            if let ChatMessage::ToolResult { ref mut content, elapsed_ms, .. } = self.messages[idx].msg {
-                if elapsed_ms.is_none() {
-                    *content = result;
-                    self.messages[idx].msg = ChatMessage::ToolResult {
-                        tool_id,
-                        content: std::mem::take(content),
-                        elapsed_ms: elapsed,
-                    };
-                    self.invalidate();
-                    return;
-                }
-            }
-        }
-        self.push_tool_result(tool_id, result, elapsed);
+        self.transcript.on_tool_result(tool_id, result);
+        self.needs_redraw = true;
     }
 
     /// Capture all assistant output since the last user message as abort context.
@@ -853,7 +494,7 @@ impl App {
         let mut parts: Vec<String> = Vec::new();
 
         // Walk backwards from the end to find content since last user message
-        for tmsg in self.messages.iter().rev() {
+        for tmsg in self.transcript.messages().iter().rev() {
             match &tmsg.msg {
                 ChatMessage::User(_) => break, // stop at the last user message
                 ChatMessage::Thinking(t)
@@ -924,148 +565,20 @@ impl App {
         }
     }
 
-    /// Returns true if there is an active text selection in the message area.
-    pub(crate) fn has_selection(&self) -> bool {
-        self.selection_anchor.is_some() && self.selection_end.is_some()
-    }
-
-    /// Clear the current text selection.
-    pub(crate) fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-        self.selection_end = None;
-    }
-
-    /// Get the normalized selection range: (start_col, start_row, end_col, end_row)
-    /// where start <= end in reading order. Returns None if no selection.
-    pub(crate) fn selection_range(&self) -> Option<(u16, u16, u16, u16)> {
-        let (ac, ar) = self.selection_anchor?;
-        let (ec, er) = self.selection_end?;
-        // Normalize: start is the earlier position in reading order
-        if ar < er || (ar == er && ac <= ec) {
-            Some((ac, ar, ec, er))
-        } else {
-            Some((ec, er, ac, ar))
-        }
-    }
-
-    /// Rendering margin used in render.rs for message continuation lines.
-    /// 3-char margin + 2-char content indent = 5 chars total.
-    const MSG_LINE_INDENT: &'static str = "     ";
-
-    /// Extract the selected text from the visible line cache.
-    /// Uses msg_area_rect and visible_line_range to map terminal coordinates
-    /// back to line content. msg_area_rect stores the inner content rect
-    /// (after borders/padding), so no offset arithmetic is needed here.
-    pub(crate) fn selected_text(&self) -> Option<String> {
-        let (sc, sr, ec, er) = self.selection_range()?;
-        let rect = self.msg_area_rect?;
-        let (vis_start, vis_end) = self.visible_line_range?;
-        let all_lines = &self.line_cache.as_ref()?.flat;
-
-        let content_x = rect.x;
-        let content_y = rect.y;
-        let content_h = rect.height;
-
-        // Convert terminal y-coordinates to line indices
-        let mut result = String::new();
-        for term_y in sr..=er {
-            if term_y < content_y || term_y >= content_y + content_h {
-                continue;
-            }
-            let line_offset = (term_y - content_y) as usize;
-            let line_idx = vis_start + line_offset;
-            if line_idx >= vis_end || line_idx >= all_lines.len() {
-                continue;
-            }
-            let line = &all_lines[line_idx];
-            // Extract text from the line spans
-            let full_text: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-
-            // Determine character range on this line
-            let line_start_col = if term_y == sr {
-                (sc.saturating_sub(content_x)) as usize
-            } else {
-                0
-            };
-            let line_end_col = if term_y == er {
-                (ec.saturating_sub(content_x)) as usize
-            } else {
-                full_text.len()
-            };
-
-            let chars: Vec<char> = full_text.chars().collect();
-            let start = line_start_col.min(chars.len());
-            let end = line_end_col.min(chars.len());
-            if start < end {
-                let selected: String = chars[start..end].iter().collect();
-                let trimmed = selected.trim_end();
-                let trimmed = if result.is_empty() {
-                    trimmed.trim_start()
-                } else {
-                    trimmed.strip_prefix(Self::MSG_LINE_INDENT).unwrap_or(trimmed)
-                };
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(trimmed);
-            }
-        }
-
-        if result.is_empty() { None } else { Some(result) }
-    }
-
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
-        // Model produced real output — clear any empty thinking placeholder
-        // so its spinner stops.
-        self.drop_empty_thinking();
-        if let Some(TimestampedMsg { msg: ChatMessage::Text(ref mut existing), .. }) = self.messages.last_mut() {
-            existing.push_str(text);
-        } else {
-            self.push_msg(ChatMessage::Text(text.to_string()));
-        }
-        self.invalidate_last();
+        self.transcript.append_or_update_text(text);
+        self.needs_redraw = true;
     }
 
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
-        if let Some(TimestampedMsg { msg: ChatMessage::Thinking(ref mut existing), .. }) = self.messages.last_mut() {
-            // First real delta replaces the sentinel placeholder rather than
-            // appending to it (otherwise content reads "…​<thinking>").
-            if existing == THINKING_PLACEHOLDER {
-                *existing = text.to_string();
-            } else {
-                existing.push_str(text);
-            }
-        } else {
-            self.push_msg(ChatMessage::Thinking(text.to_string()));
-        }
-        self.invalidate_last();
+        self.transcript.append_or_update_thinking(text);
+        self.needs_redraw = true;
     }
 
-    /// Remove a trailing thinking block that never received content — the
-    /// sentinel placeholder, or one left empty. Called when the model starts
-    /// producing real output or the turn ends, so the thinking spinner can't
-    /// run forever on an empty thinking step.
-    ///
-    /// Scans backward past trailing System/Notice messages so a placeholder
-    /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
-    /// found and removed (FIX 4).
+    /// Delegates to [`TranscriptStore::drop_empty_thinking`].
     pub(crate) fn drop_empty_thinking(&mut self) {
-        // Walk from the tail, skipping System messages, to find the first
-        // non-System message. If it's an empty/placeholder Thinking, drop it.
-        let candidate_idx = self.messages.iter().rposition(|m| {
-            !matches!(&m.msg, ChatMessage::System(_))
-        });
-        if let Some(idx) = candidate_idx {
-            if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
-                if t == THINKING_PLACEHOLDER || t.is_empty() {
-                    self.messages.remove(idx);
-                    // Structural change (remove) — full invalidate to resync per_msg lengths.
-                    self.invalidate();
-                }
-            }
-        }
+        self.transcript.drop_empty_thinking();
+        self.needs_redraw = true;
     }
 
     pub(crate) fn handle_theme_command(&mut self, arg: &str) {
@@ -1142,6 +655,28 @@ impl App {
 
 }
 
+/// Test-only render delegates. Production rendering goes through
+/// `TranscriptStore::sync_cache` (draw.rs); tests keep calling through App so
+/// the incremental-cache regression suite ports with the move (slice d).
+#[cfg(test)]
+impl App {
+    pub(crate) fn render_ctx(&self) -> RenderCtx<'_> {
+        RenderCtx {
+            spinner_frame: self.spinner_frame,
+            streaming: self.streaming,
+            agent_name: &self.agent_name,
+        }
+    }
+
+    pub(crate) fn render_message_lines(&self, idx: usize, width: usize) -> MsgSlot {
+        self.transcript.render_message_lines(idx, width, &self.render_ctx())
+    }
+
+    pub(crate) fn render_lines(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
+        self.transcript.render_lines(width, &self.render_ctx())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,20 +693,20 @@ mod tests {
 
         // Case 1: text follows empty thinking.
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-        assert!(app.render_lines_uses_spinner(), "placeholder should animate while present");
+        assert!(app.transcript.uses_spinner(), "placeholder should animate while present");
         app.append_or_update_text("here is the answer");
         assert!(
-            !matches!(app.messages.last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
+            !matches!(app.transcript.messages().last().map(|m| &m.msg), Some(ChatMessage::Thinking(_))),
             "empty thinking must be gone once text arrives"
         );
-        assert!(!app.render_lines_uses_spinner(), "spinner must stop after agent moves on");
+        assert!(!app.transcript.uses_spinner(), "spinner must stop after agent moves on");
 
         // Case 2: a tool follows empty thinking.
         let mut app = test_app();
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
         app.on_tool_use_start("t1".to_string(), "bash".to_string());
         let thinking_count = app
-            .messages
+            .transcript.messages()
             .iter()
             .filter(|m| matches!(m.msg, ChatMessage::Thinking(_)))
             .count();
@@ -1184,7 +719,7 @@ mod tests {
         app.append_or_update_thinking("actually reasoning");
         app.append_or_update_text("done");
         assert!(
-            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "actually reasoning")),
             "non-empty thinking must survive and not keep the … prefix"
         );
     }
@@ -1201,7 +736,7 @@ mod tests {
             app.on_tool_result(id.to_string(), format!("out-{id}"));
         }
         let seq: Vec<(String, bool)> = app
-            .messages
+            .transcript.messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some((tool_id.clone(), false)),
@@ -1275,11 +810,11 @@ mod tests {
             elapsed_ms: None,
         });
         // Only call_2 is still in tool_start_times (call_1 is done)
-        app.tool_start_time = Some(std::time::Instant::now());
-        app.tool_start_times.insert("call_2".to_string(), std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_2".to_string(), app.clock.now());
 
-        assert!(!app.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
-        assert!(app.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
+        assert!(!app.transcript.is_active_tool_result(1), "completed historical result (call_1, not in tool_start_times) must render done");
+        assert!(app.transcript.is_active_tool_result(3), "latest in-flight result (call_2, in tool_start_times) must be active");
 
         // Bonus: with BOTH in-flight (parallel), BOTH must be active
         let mut app2 = test_app();
@@ -1303,11 +838,11 @@ mod tests {
             content: "".to_string(),
             elapsed_ms: None,
         });
-        app2.tool_start_time = Some(std::time::Instant::now());
-        app2.tool_start_times.insert("p1".to_string(), std::time::Instant::now());
-        app2.tool_start_times.insert("p2".to_string(), std::time::Instant::now());
-        assert!(app2.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
-        assert!(app2.is_active_tool_result(3), "parallel in-flight p2 last must be active");
+        app2.transcript.test_set_tool_start_time(Some(app2.clock.now()));
+        app2.transcript.test_insert_tool_start_time("p1".to_string(), app2.clock.now());
+        app2.transcript.test_insert_tool_start_time("p2".to_string(), app2.clock.now());
+        assert!(app2.transcript.is_active_tool_result(1), "parallel in-flight p1 mid-vec must be active");
+        assert!(app2.transcript.is_active_tool_result(3), "parallel in-flight p2 last must be active");
     }
 
     #[test]
@@ -1323,26 +858,25 @@ mod tests {
             content: "done".to_string(),
             elapsed_ms: Some(25),
         });
-        app.tool_start_time = Some(std::time::Instant::now());
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
 
-        assert!(!app.is_active_tool_result(1));
+        assert!(!app.transcript.is_active_tool_result(1));
     }
 
     #[test]
     fn animation_tick_for_subagent_panel_does_not_invalidate_message_cache() {
         let mut app = test_app();
         app.push_msg(ChatMessage::System("stable transcript".to_string()));
-        app.line_cache = Some({
+        {
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+        }
         app.subagents.push(SubagentState {
             id: 1,
             name: "tester".to_string(),
             status: "running".to_string(),
-            start_time: std::time::Instant::now(),
+            start_time: app.clock.now(),
             done: false,
             duration_secs: None,
         });
@@ -1352,7 +886,7 @@ mod tests {
 
         assert!(!invalidate_messages, "subagent panel spinner redraw must not rebuild message cache");
         assert!(!app.needs_clear_for_animation_redraw(), "subagent-only animation must not force terminal.clear flicker");
-        assert!(app.line_cache.is_some(), "message cache should remain valid for panel-only animation");
+        assert!(app.transcript.line_cache().is_some(), "message cache should remain valid for panel-only animation");
     }
 
     #[test]
@@ -1368,14 +902,13 @@ mod tests {
             content: String::new(),
             elapsed_ms: None,
         });
-        app.tool_start_time = Some(std::time::Instant::now());
-        app.tool_start_times.insert("call_1".to_string(), std::time::Instant::now());
-        app.line_cache = Some({
+        app.transcript.test_set_tool_start_time(Some(app.clock.now()));
+        app.transcript.test_insert_tool_start_time("call_1".to_string(), app.clock.now());
+        {
             let w = 80;
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+        }
         app.spinner_frame = 2;
 
         let invalidate_messages = app.advance_animations();
@@ -1395,22 +928,20 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial response".to_string()));
         app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
 
-        // Build full cache first
-        app.line_cache = Some({
-            let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len()).map(|i| app.render_message_lines(i, w)).collect();
-            let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-            LineCache { width: w, per_msg, flat }
-        });
-        app.dirty_from = None;
-        let last = app.messages.len() - 1;
+        // Build full cache first (Clean = old Some + dirty_from None)
+        {
+            let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count()).map(|i| app.render_message_lines(i, w)).collect();
+            app.transcript.test_set_cache_clean(LineCache::new(w, per_msg));
+        }
+        let last = app.transcript.message_count() - 1;
 
         // Snapshot per_msg[0..last]
-        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
 
-        // Advance spinner (spinner_frame % 3 == 0 triggers render_lines_uses_spinner)
+        // Advance spinner (spinner_frame % 3 == 0 triggers uses_spinner)
         app.spinner_frame = 2; // next wrapping_add gives 3, which % 3 == 0
         let needs_redraw = app.advance_animations();
         assert!(needs_redraw, "spinner must signal redraw while THINKING_PLACEHOLDER present");
@@ -1420,29 +951,29 @@ mod tests {
         // But first assert dirty_from is still None (advance_animations doesn't set it).
         // Then we call invalidate_last() as the updated caller will.
         app.invalidate_last();
-        assert_eq!(app.dirty_from, Some(last), "dirty_from must point to tail message only");
+        assert_eq!(app.transcript.cache_dirty_from(), Some(last), "dirty watermark must point to tail message only");
 
         // Simulate draw.rs incremental rebuild
         {
-            let fresh: Vec<Vec<ratatui::text::Line<'static>>> = (last..app.messages.len())
+            let fresh: Vec<MsgSlot> = (last..app.transcript.message_count())
                 .map(|i| app.render_message_lines(i, w))
                 .collect();
-            let cache = app.line_cache.as_mut().unwrap();
-            for (offset, rendered) in fresh.into_iter().enumerate() {
-                cache.per_msg[last + offset] = rendered;
+            let mut cs = app.transcript.test_take_cache();
+            if let CacheState::Dirty(ref mut cache, _) = cs {
+                for (offset, rendered) in fresh.into_iter().enumerate() {
+                    cache.per_msg[last + offset] = rendered;
+                }
             }
-            let prefix_len: usize = cache.per_msg[..last].iter().map(|v| v.len()).sum();
-            cache.flat.truncate(prefix_len);
-            for slot in &cache.per_msg[last..] {
-                cache.flat.extend(slot.iter().cloned());
+            // mark clean
+            if let CacheState::Dirty(cache, _) = cs {
+                app.transcript.test_set_cache_clean(cache);
             }
         }
-        app.dirty_from = None;
 
         // per_msg[0..last] must be unchanged
-        let after: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let after: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
         assert_eq!(snapshot, after, "earlier per_msg slots must not change on spinner tick");
     }
@@ -1518,7 +1049,7 @@ mod tests {
     // ── Parallel tool-event routing (Bug 2 regression coverage) ─────────
 
     fn last_tool_use(app: &App, tool_id: &str) -> Option<(String, String)> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUse { tool_id: tid, tool_name, input } if tid == tool_id => {
                 Some((tool_name.clone(), input.clone()))
             }
@@ -1527,7 +1058,7 @@ mod tests {
     }
 
     fn tool_use_start_partial(app: &App, tool_id: &str) -> Option<String> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolUseStart { tool_id: tid, partial_input, .. } if tid == tool_id => {
                 Some(partial_input.clone())
             }
@@ -1536,7 +1067,7 @@ mod tests {
     }
 
     fn tool_result_content(app: &App, tool_id: &str) -> Option<String> {
-        app.messages.iter().find_map(|m| match &m.msg {
+        app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id: tid, content, .. } if tid == tool_id => {
                 Some(content.clone())
             }
@@ -1594,7 +1125,7 @@ mod tests {
 
         // Both are now ToolUse, no lingering ToolUseStart.
         let lingering_starts = app
-            .messages
+            .transcript.messages()
             .iter()
             .filter(|m| matches!(&m.msg, ChatMessage::ToolUseStart { .. }))
             .count();
@@ -1613,7 +1144,7 @@ mod tests {
 
         // On-screen order matches call order (call_a appears before call_b).
         let positions: Vec<&str> = app
-            .messages
+            .transcript.messages()
             .iter()
             .filter_map(|m| match &m.msg {
                 ChatMessage::ToolUse { tool_id, .. } => Some(tool_id.as_str()),
@@ -1705,11 +1236,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         app.on_tool_result("call_b".to_string(), "b".to_string());
 
-        let a_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+        let a_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_a" => *elapsed_ms,
             _ => None,
         });
-        let b_elapsed = app.messages.iter().find_map(|m| match &m.msg {
+        let b_elapsed = app.transcript.messages().iter().find_map(|m| match &m.msg {
             ChatMessage::ToolResult { tool_id, elapsed_ms, .. } if tool_id == "call_b" => *elapsed_ms,
             _ => None,
         });
@@ -1732,7 +1263,7 @@ mod tests {
         app.append_or_update_text("answer");
         // The Thinking block must survive with "…" content, not be dropped
         assert!(
-            app.messages.iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::Thinking(t) if t == "…")),
             "real ellipsis thinking content must survive — sentinel and real output are distinct"
         );
     }
@@ -1747,7 +1278,7 @@ mod tests {
         app.push_msg(ChatMessage::System("retrying…".to_string()));
         // Now trigger the drop (e.g. text arrives / turn ends)
         app.drop_empty_thinking();
-        let has_placeholder = app.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "placeholder stranded under a System message must be removed by drop_empty_thinking");
@@ -1761,7 +1292,7 @@ mod tests {
         // Simulate what the abort handler does: drop + push error
         app.drop_empty_thinking();
         app.push_msg(ChatMessage::Error("aborted".to_string()));
-        let has_placeholder = app.messages.iter().any(|m| matches!(
+        let has_placeholder = app.transcript.messages().iter().any(|m| matches!(
             &m.msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER
         ));
         assert!(!has_placeholder, "abort must remove thinking placeholder so spinner doesn't freeze");
@@ -1786,8 +1317,8 @@ mod tests {
 
         let w = 80;
         let flat = app.render_lines(w);
-        let concat: Vec<ratatui::text::Line<'static>> = (0..app.messages.len())
-            .flat_map(|i| app.render_message_lines(i, w))
+        let concat: Vec<ratatui::text::Line<'static>> = (0..app.transcript.message_count())
+            .flat_map(|i| app.render_message_lines(i, w).lines.expect("freshly rendered slot has lines"))
             .collect();
 
         // Compare by rendered string content (Line doesn't impl PartialEq for spans reliably)
@@ -1799,9 +1330,13 @@ mod tests {
     }
 
     #[test]
-    fn line_cache_build_produces_flat_equal_to_render_lines() {
-        // This test verifies that the LineCache struct's build path (per_msg concat -> flat)
-        // produces the same flat output as render_lines(width).
+    fn line_cache_build_produces_heights_equal_to_render_lines_prefix_sums() {
+        // P11 flat-kill port of the flat oracle: the LineCache build path
+        // must produce cum_heights equal to the prefix sums of the reference
+        // render (render_lines, the surviving §4 oracle), and the per_msg
+        // concatenation must equal the reference render line-for-line.
+        // PERMANENT test (red-team angle 5): this is the standing height
+        // oracle now that the flat buffer is gone.
         let mut app = test_app();
         app.push_msg(ChatMessage::User("hi".to_string()));
         app.push_msg(ChatMessage::Text("hello back".to_string()));
@@ -1820,58 +1355,65 @@ mod tests {
         let expected_flat = app.render_lines(w);
 
         // Build a LineCache manually using the new struct
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, w))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-        let cache = LineCache { width: w, per_msg, flat };
+        let cache = LineCache::new(w, per_msg);
 
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "LineCache.flat must equal render_lines output");
+        // Height oracle: cum_heights ≡ prefix sums of the reference render.
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "total_height must equal the reference render's line count");
+        let mut acc = 0usize;
+        for (i, slot) in cache.per_msg.iter().enumerate() {
+            assert_eq!(cache.cum_heights[i], acc, "cum_heights[{i}] must be the prefix sum");
+            acc += slot.height();
+        }
+        // Content oracle: per_msg concatenation ≡ the reference render.
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal render_lines output");
         assert!(cache.width == w);
     }
 
     /// Helper: builds a LineCache for an app at a given width, simulating what draw.rs does.
     fn build_cache(app: &App, width: usize) -> LineCache {
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
+        let per_msg: Vec<MsgSlot> = (0..app.transcript.message_count())
             .map(|i| app.render_message_lines(i, width))
             .collect();
-        let flat: Vec<ratatui::text::Line<'static>> = per_msg.iter().flatten().cloned().collect();
-        LineCache { width, per_msg, flat }
+        LineCache::new(width, per_msg)
     }
 
-    /// Helper: simulate the incremental rebuild from draw.rs (slice 3 logic).
+    /// Helper: simulate the incremental rebuild from sync_cache (slice 3 logic,
+    /// ported to CacheState in slice d).
     fn rebuild_incremental(app: &mut App, width: usize) {
-        match app.line_cache.take() {
-            Some(mut cache) if cache.width == width => {
-                if let Some(k) = app.dirty_from.take() {
-                    // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
-                    if cache.per_msg.len() != app.messages.len() {
-                        cache.per_msg.truncate(k);
-                        for i in k..app.messages.len() {
-                            cache.per_msg.push(app.render_message_lines(i, width));
-                        }
-                    } else {
-                        // In-place partial re-render: only messages[k..]
-                        for i in k..app.messages.len() {
-                            cache.per_msg[i] = app.render_message_lines(i, width);
-                        }
+        match app.transcript.test_take_cache() {
+            CacheState::Dirty(mut cache, k) if cache.width == width => {
+                // If per_msg length is out of sync with messages (insert/remove), re-render all from k.
+                if cache.per_msg.len() != app.transcript.message_count() {
+                    cache.per_msg.truncate(k);
+                    for i in k..app.transcript.message_count() {
+                        cache.per_msg.push(app.render_message_lines(i, width));
                     }
-                    // Rebuild flat from k: keep lines from per_msg[..k], append from per_msg[k..]
-                    let prefix_len: usize = cache.per_msg[..k].iter().map(|v| v.len()).sum();
-                    cache.flat.truncate(prefix_len);
-                    for slot in &cache.per_msg[k..] {
-                        cache.flat.extend(slot.iter().cloned());
+                } else {
+                    // In-place partial re-render: only messages[k..]
+                    for i in k..app.transcript.message_count() {
+                        cache.per_msg[i] = app.render_message_lines(i, width);
                     }
                 }
-                app.line_cache = Some(cache);
+                // cum_heights is recomputed by test_set_cache_clean below.
+                app.transcript.test_set_cache_clean(cache);
+            }
+            CacheState::Clean(cache) if cache.width == width => {
+                // Clean at the right width — nothing to do (old dirty_from == None path).
+                app.transcript.test_set_cache_clean(cache);
             }
             _ => {
-                app.dirty_from = None;
-                app.line_cache = Some(build_cache(app, width));
+                let c = build_cache(app, width);
+                app.transcript.test_set_cache_clean(c);
             }
         }
     }
@@ -1886,49 +1428,53 @@ mod tests {
         app.push_msg(ChatMessage::Text("partial answer".to_string()));
 
         // Full build
-        app.line_cache = Some(build_cache(&app, w));
-        app.dirty_from = None;
+        app.transcript.test_set_cache_clean(build_cache(&app, w));
 
-        let last = app.messages.len() - 1; // index of Text message
+        let last = app.transcript.message_count() - 1; // index of Text message
 
         // Snapshot per_msg[0..last] content strings (before update)
-        let snapshot: Vec<Vec<String>> = app.line_cache.as_ref().unwrap().per_msg[..last]
+        let snapshot: Vec<Vec<String>> = app.transcript.line_cache().unwrap().per_msg[..last]
             .iter()
-            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
 
         // Simulate append_or_update_text delta (modifies last message, marks tail dirty)
-        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.messages.last_mut() {
+        if let Some(crate::tui::app::TimestampedMsg { msg: ChatMessage::Text(ref mut t), .. }) = app.transcript.test_last_msg_mut() {
             t.push_str(" — more content appended");
         }
-        app.dirty_from = Some(last); // invalidate_last equivalent
+        app.transcript.invalidate_from(last); // invalidate_last equivalent (direct store call)
 
         // Incremental rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.line_cache.as_ref().unwrap();
+        let cache = app.transcript.line_cache().unwrap();
 
         // per_msg[0..last] must be unchanged (content-equal to snapshot)
         let after: Vec<Vec<String>> = cache.per_msg[..last]
             .iter()
-            .map(|slot| slot.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
+            .map(|slot| slot.lines().iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect())
             .collect();
         assert_eq!(snapshot, after, "per_msg[0..last] must not change on tail-only invalidation");
 
         // per_msg[last] must have changed (the text grew)
-        let last_strs: Vec<String> = cache.per_msg[last].iter()
+        let last_strs: Vec<String> = cache.per_msg[last].lines().iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect();
         let contains_new = last_strs.iter().any(|s| s.contains("more content appended"));
         assert!(contains_new, "per_msg[last] must reflect the updated text");
 
-        // flat must equal full render_lines (correctness)
+        // Concatenated slots + cum_heights must equal the reference render
+        // (the surviving §4 oracle — flat is gone).
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "flat must equal full render_lines after incremental rebuild");
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal full render_lines after incremental rebuild");
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "cum_heights total must track the reference render after incremental rebuild");
     }
 
     #[test]
@@ -1942,12 +1488,11 @@ mod tests {
             input: r#"{"command":"ls"}"#.to_string(),
         });
 
-        app.line_cache = Some(build_cache(&app, w));
-        app.dirty_from = None;
+        app.transcript.test_set_cache_clean(build_cache(&app, w));
 
         // Insert a ToolResult after ToolUse (as push_tool_result does)
         let at = 2;
-        app.messages.insert(at, crate::tui::app::TimestampedMsg {
+        app.transcript.test_insert_at(at, crate::tui::app::TimestampedMsg {
             msg: ChatMessage::ToolResult {
                 tool_id: "t1".to_string(),
                 content: "file.txt".to_string(),
@@ -1955,123 +1500,23 @@ mod tests {
             },
             time: "00:00".to_string(),
         });
-        app.dirty_from = Some(at); // invalidate_from(at)
+        app.transcript.invalidate_from(at);
 
         // Rebuild: since per_msg.len() (2) != messages.len() (3), should do full-from-k rebuild
         rebuild_incremental(&mut app, w);
 
-        let cache = app.line_cache.as_ref().unwrap();
-        assert_eq!(cache.per_msg.len(), app.messages.len(), "per_msg must track messages after insert");
+        let cache = app.transcript.line_cache().unwrap();
+        assert_eq!(cache.per_msg.len(), app.transcript.message_count(), "per_msg must track messages after insert");
 
         let expected_flat = app.render_lines(w);
         let to_str = |lines: &[ratatui::text::Line<'static>]| -> Vec<String> {
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
         };
-        assert_eq!(to_str(&expected_flat), to_str(&cache.flat),
-            "flat must equal render_lines after insert + incremental rebuild");
-    }
-}
-
-#[cfg(test)]
-mod visible_window_tests {
-    use super::*;
-
-    /// Unit-tests the windowing arithmetic that the "publish visible window
-    /// only" perf fix relies on (draw.rs §3-5 + the deferred Arc clone).
-    ///
-    /// `build_render_model` itself needs a live `Runtime` + `CommandRegistry`
-    /// so it can't be called in isolation — instead this mirrors its publish
-    /// path exactly and pins the invariants the production code must satisfy:
-    ///   1. `lines.len()` == content_height (the viewport), NOT `total`.
-    ///      This is what makes the publish O(viewport) instead of O(n).
-    ///   2. `lines` content == `cache.flat[start..end]` for the scroll position.
-    ///   3. the render thread's `model.lines.to_vec()` (no re-slice) equals
-    ///      that same window — proving the [start..end] re-slice is redundant.
-    ///   4. a different scroll_back yields a different window of the same len.
-    ///
-    /// If the production slice arithmetic drifts (wrong start/end, off-by-one,
-    /// or reverting to a full-buffer clone), the mirrored logic here breaks too.
-    #[test]
-    fn visible_window_publish_clones_only_viewport_not_full_buffer() {
-        let mut app = App::new(Session::new("test-model", "low", None));
-
-        // 20 Text messages → each renders as 1 flat line at w=80, so total >= 20.
-        for i in 0..20 {
-            app.push_msg(ChatMessage::Text(format!("line {i}")));
-        }
-
-        let content_width: usize = 80;
-        let content_height: usize = 5; // viewport is 5 rows — much less than 20
-
-        // Mirror draw.rs §3: build cache.
-        let per_msg: Vec<Vec<ratatui::text::Line<'static>>> = (0..app.messages.len())
-            .map(|i| app.render_message_lines(i, content_width))
-            .collect();
-        let flat: Vec<ratatui::text::Line<'static>> =
-            per_msg.iter().flatten().cloned().collect();
-        let cache = LineCache { width: content_width, per_msg, flat };
-
-        let total = cache.flat.len();
-        assert!(total >= 20, "sanity: need >= 20 flat lines, got {total}");
-
-        // Mirror draw.rs §4-5: scroll pinned to bottom, scroll_back = 0.
-        let scroll_back: usize = 0;
-        let end = total.saturating_sub(scroll_back);
-        let start = end.saturating_sub(content_height);
-
-        // ── NEW path (the fix): slice BEFORE Arc wrap ─────────────────────────
-        let all_lines_vec: &[ratatui::text::Line<'static>] = cache.flat.as_slice();
-        let visible_slice = all_lines_vec.get(start..end).unwrap_or(&[]);
-        let lines: std::sync::Arc<[ratatui::text::Line<'static>]> =
-            visible_slice.to_vec().into();
-
-        let to_str = |sl: &[ratatui::text::Line<'static>]| -> Vec<String> {
-            sl.iter()
-              .map(|l| {
-                  l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-              })
-              .collect()
-        };
-
-        // 1. Published len must equal the viewport, NOT the full buffer.
-        //    With OLD code: `lines` = full clone → len == total (e.g. 20+), fails here.
-        assert_eq!(
-            lines.len(),
-            content_height,
-            "model.lines.len() must equal content_height ({content_height}), \
-             got {} (full buffer len = {total}) — old code publishes the whole buffer",
-            lines.len()
-        );
-
-        // 2. Content must match cache.flat[start..end].
-        assert_eq!(
-            to_str(&lines),
-            to_str(&cache.flat[start..end]),
-            "published window content must equal cache.flat[start..end]"
-        );
-
-        // 3. Render-thread side: after fix, visible = model.lines.to_vec() (no re-slice).
-        //    The full `lines` arc IS the window — no [start..end] indexing needed.
-        let visible_render: Vec<ratatui::text::Line> = lines.to_vec();
-        assert_eq!(
-            to_str(&visible_render),
-            to_str(&cache.flat[start..end]),
-            "render-thread .to_vec() on model.lines must equal the visible window"
-        );
-
-        // 4. Sanity: scroll into the middle, check a different window.
-        let scroll_mid: usize = 10; // scroll back 10 lines
-        let end2 = total.saturating_sub(scroll_mid);
-        let start2 = end2.saturating_sub(content_height);
-        let visible2 = all_lines_vec.get(start2..end2).unwrap_or(&[]);
-        let lines2: std::sync::Arc<[ratatui::text::Line<'static>]> =
-            visible2.to_vec().into();
-        assert_eq!(lines2.len(), content_height,
-            "mid-scroll window must also have viewport length");
-        assert_ne!(
-            to_str(&lines2),
-            to_str(&lines),
-            "different scroll positions must yield different window content"
-        );
+        let concat: Vec<ratatui::text::Line<'static>> =
+            cache.per_msg.iter().flat_map(|e| e.lines().iter().cloned()).collect();
+        assert_eq!(to_str(&expected_flat), to_str(&concat),
+            "per_msg concatenation must equal render_lines after insert + incremental rebuild");
+        assert_eq!(cache.total_height(), expected_flat.len(),
+            "cum_heights total must track the reference render after insert + incremental rebuild");
     }
 }

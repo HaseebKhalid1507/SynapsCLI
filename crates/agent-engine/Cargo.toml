@@ -1,6 +1,6 @@
 [package]
 name = "synaps-engine"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
@@ -11,7 +11,7 @@ name = "agent_engine"
 path = "src/lib.rs"
 
 [dependencies]
-agent-core = { path = "../agent-core", version = "0.5.1", package = "synaps-core" }
+agent-core = { path = "../agent-core", version = "0.6.0", package = "synaps-core" }
 
 # Async runtime + utilities
 tokio              = { version = "1.0", features = ["full"] }
@@ -26,7 +26,7 @@ bytes              = "1"
 memchr             = "2"
 
 # Serialisation
-serde              = { version = "1.0", features = ["derive"] }
+serde              = { version = "1.0", features = ["derive", "rc"] }
 serde_json         = "1.0"
 toml               = "0.8"
 
@@ -81,6 +81,11 @@ tokio-tungstenite  = "0.21"
 
 # Misc
 arc-swap           = "1"
+
+[features]
+# Test-support surface: offline Runtime construction for headless harnesses.
+# Never enabled in production builds; enabled by synaps-tui's `testing` feature.
+testing = []
 
 [dev-dependencies]
 serial_test = "3.4.0"

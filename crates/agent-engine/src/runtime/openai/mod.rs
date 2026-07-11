@@ -100,7 +100,7 @@ pub async fn try_route(
     client: &reqwest::Client,
     tools_schema: &std::sync::Arc<Vec<serde_json::Value>>,
     system_prompt: &Option<String>,
-    messages: &[serde_json::Value],
+    messages: &[crate::SharedMessage],
     tx: &tokio::sync::mpsc::UnboundedSender<crate::runtime::types::StreamEvent>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
@@ -201,6 +201,9 @@ pub async fn try_route(
                 provider_id: provider_id.to_string(),
                 model_id: model_id.to_string(),
                 model: model.to_string(),
+                // Arc-shared (#128): refcount bumps, not a deep copy. Serde's
+                // `rc` feature serializes Arc<Value> transparently, so the
+                // wire shape crossing the extension boundary is unchanged.
                 messages: messages.to_vec(),
                 system_prompt: system_prompt.clone(),
                 tools: tools_schema.as_ref().clone(),

@@ -138,6 +138,11 @@ pub struct ExtensionManager {
     capabilities: HashMap<String, Vec<crate::extensions::runtime::process::CapabilityDeclaration>>,
     /// Optional plugin-reported info from the `info.get` RPC.
     plugin_info: HashMap<String, PluginInfo>,
+    /// Theme tokens declared in each loaded extension's manifest (P19.2),
+    /// kept so the TUI can merge them into the theme under
+    /// `ext.<plugin-id>.<token>` without re-reading manifests. Extensions
+    /// that declare none simply have no entry.
+    manifest_theme_tokens: HashMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 impl ExtensionManager {
@@ -151,6 +156,7 @@ impl ExtensionManager {
             manifest_configs: HashMap::new(),
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
+            manifest_theme_tokens: HashMap::new(),
         }
     }
 
@@ -167,6 +173,7 @@ impl ExtensionManager {
             manifest_configs: HashMap::new(),
             capabilities: HashMap::new(),
             plugin_info: HashMap::new(),
+            manifest_theme_tokens: HashMap::new(),
         }
     }
 
@@ -341,6 +348,10 @@ impl ExtensionManager {
         self.extensions.insert(id.to_string(), handler);
         self.manifest_configs
             .insert(id.to_string(), manifest.config.clone());
+        if !manifest.theme_tokens.is_empty() {
+            self.manifest_theme_tokens
+                .insert(id.to_string(), manifest.theme_tokens.clone());
+        }
         if !capability_declarations.is_empty() {
             self.capabilities
                 .insert(id.to_string(), capability_declarations);
@@ -457,6 +468,7 @@ impl ExtensionManager {
         self.manifest_configs.remove(id);
         self.capabilities.remove(id);
         self.plugin_info.remove(id);
+        self.manifest_theme_tokens.remove(id);
         handler.shutdown().await;
 
         tracing::info!(extension = %id, "Extension unloaded");
@@ -553,6 +565,20 @@ impl ExtensionManager {
     /// Return optional cached plugin info reported by `info.get`.
     pub fn plugin_info(&self, id: &str) -> Option<&PluginInfo> {
         self.plugin_info.get(id)
+    }
+
+    /// Manifest-declared theme tokens for every loaded extension, sorted by
+    /// extension ID (P19.2). Each entry is `(plugin-id, token -> hex color)`;
+    /// the TUI namespaces these as `ext.<plugin-id>.<token>` when merging
+    /// into the active theme. Extensions without `theme_tokens` don't appear.
+    pub fn theme_tokens(&self) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
+        let mut out: Vec<_> = self
+            .manifest_theme_tokens
+            .iter()
+            .map(|(id, tokens)| (id.clone(), tokens.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Ask a plugin for its sidecar spawn arguments. Best-effort —
@@ -1006,6 +1032,7 @@ impl ExtensionManager {
             }).collect();
 
             let resolved = ExtensionManifest {
+                theme_tokens: Default::default(),
                 command,
                 args,
                 ..ext_manifest
@@ -1064,6 +1091,7 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1104,6 +1132,7 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1187,6 +1216,7 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1217,6 +1247,7 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus.clone());
         let good = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),
@@ -1232,6 +1263,7 @@ mod tests {
             config: vec![],
         };
         let bad = ExtensionManifest {
+            theme_tokens: Default::default(),
             command: "/definitely/not/a/real/extension-binary".to_string(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
@@ -1333,6 +1365,7 @@ mod tests {
         let bus = Arc::new(HookBus::new());
         let mut mgr = ExtensionManager::new(bus);
         let manifest = ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: crate::extensions::manifest::ExtensionRuntime::Process,
             command: "python3".to_string(),

@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 mod api;
 mod api_sync;
 mod auth;
+#[cfg(test)]
+mod body_golden;
 pub mod compaction;
 pub(crate) mod helpers;
 pub mod openai;
@@ -321,6 +323,71 @@ impl Runtime {
         })
     }
 
+    /// Offline construction seam for headless test harnesses (P4).
+    ///
+    /// Identical to [`Runtime::new`] except:
+    /// - auth is a stub token — no `auth.json` read, no keychain, no network
+    /// - the idle shell-session reaper is not spawned — no tokio runtime
+    ///   required at construction time
+    ///
+    /// Every accessor (`model()`, `thinking_level()`, tool registry, …) works
+    /// normally; anything that would hit the Anthropic API fails at call time,
+    /// which is the correct behavior for a harness that only drives the UI.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_headless() -> Self {
+        let client = Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()
+            .expect("reqwest client construction is infallible with built-in roots");
+
+        let session_manager = {
+            let config = crate::tools::shell::ShellConfig::default();
+            crate::tools::shell::SessionManager::new(config)
+        };
+
+        Runtime {
+            client,
+            auth: Arc::new(RwLock::new(AuthState {
+                auth_token: "test-token".to_string(),
+                auth_type: "api_key".to_string(),
+                refresh_token: None,
+                token_expires: None,
+            })),
+            model: crate::models::default_model().to_string(),
+            tools: Arc::new(RwLock::new(ToolRegistry::new())),
+            system_prompt: None,
+            thinking_budget: 4096,
+            context_window_override: None,
+            compaction_model: None,
+            subagent_registry: Arc::new(Mutex::new(
+                crate::runtime::subagent::SubagentRegistry::new(),
+            )),
+            event_queue: Arc::new(crate::events::EventQueue::new(1000)),
+            watcher_exit_path: None,
+            max_tool_output: 30000,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+            api_retries: 3,
+            refusal_retries: 2,
+            telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            cache_diagnostics: false,
+            cache_ttl: crate::core::config::CacheTtl::default(),
+            ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_msg_id: Arc::new(Mutex::new(None)),
+            session_manager,
+            hook_bus: Arc::new(crate::extensions::hooks::HookBus::new()),
+            reaper_handle: None,
+            reaper_cancel: None,
+            credential_source: crate::auth::CredentialSource::Local,
+            token_cache: crate::auth::TokenCache::new(),
+        }
+    }
+
     pub fn set_system_prompt(&mut self, prompt: String) {
         self.system_prompt = Some(prompt);
     }
@@ -554,7 +621,7 @@ impl Runtime {
     /// Uses a dedicated summarization system prompt (not the user's), omits
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
-    pub async fn compact_call(&self, messages: Vec<Value>) -> Result<String> {
+    pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
         self.refresh_if_needed().await?;
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
@@ -577,7 +644,8 @@ impl Runtime {
         // Refresh OAuth token if expired
         self.refresh_if_needed().await?;
 
-        let mut messages = vec![json!({"role": "user", "content": prompt})];
+        let mut messages: Vec<crate::SharedMessage> =
+            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))];
 
         loop {
             let response = ApiMethods::call_api(
@@ -627,10 +695,10 @@ impl Runtime {
                 }
 
                 // Add assistant's response to conversation (only content, role)
-                messages.push(json!({
+                messages.push(std::sync::Arc::new(json!({
                     "role": "assistant",
                     "content": content
-                }));
+                })));
 
                 // Execute tools — parallel when multiple are requested
                 let mut tool_results = Vec::new();
@@ -860,10 +928,10 @@ impl Runtime {
                 }
 
                 // Add tool results to conversation
-                messages.push(json!({
+                messages.push(std::sync::Arc::new(json!({
                     "role": "user",
                     "content": tool_results
-                }));
+                })));
 
                 // Continue the loop to get Claude's response with tool results
             } else {
@@ -880,7 +948,7 @@ impl Runtime {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         self.run_stream_with_messages(
-            vec![json!({"role": "user", "content": prompt})],
+            vec![std::sync::Arc::new(json!({"role": "user", "content": prompt}))],
             cancel,
             None,
             None,
@@ -894,7 +962,7 @@ impl Runtime {
     /// API retries, and dynamic tool registration (MCP) internally.
     pub async fn run_stream_with_messages(
         &self,
-        messages: Vec<Value>,
+        messages: Vec<crate::SharedMessage>,
         cancel: CancellationToken,
         steering_rx: Option<mpsc::UnboundedReceiver<String>>,
         secret_prompt: Option<crate::tools::SecretPromptHandle>,

@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-11
+
+The TUI modernization release. 112 commits, 6 waves of architectural work, two
+major performance rewrites, and a complete modal/focus system overhaul.
+
+### Added
+
+- **ModalStack + FocusManager** — proper modal/pane lifecycle with stack-based
+  routing, eliminating ad-hoc boolean flags (P7, 8 slices).
+- **TuiClock** — deterministic time source for testable animations (P6.2).
+- **Interaction tapes** — JSON record/replay for deterministic UI test
+  scenarios (P6.4).
+- **Headless test harness** — drives the real TUI dispatch surface without a
+  terminal; bounded async executor for streaming scenarios (P6.1–P6.5).
+- **TermCaps** — terminal capability detection via DA1 queries; gates
+  edge-scrub, sync-output, and Kitty graphics on actual terminal facts (P16).
+- **Namespaced extension theme tokens** — `ext.<id>.<token>` for per-plugin
+  theming with per-part chrome overrides (P19).
+- Discord invite link in README.
+
+### Performance
+
+- **Arc-share conversation messages (#128)** — per-turn history copy overhead
+  reduced from 4,536 KB to 0 KB (−100%). Every history clone is now a pointer
+  bump. 13 golden byte-gate fixtures protect prompt-cache prefixes.
+- **Lazy transcript virtualization (#241)** — cold-resume renders reduced from
+  1,000 to 21 (−97.9%), syntax highlights from 200 to 4 (−98.0%), first-frame
+  RSS from 14.2 to 10.6 MB (−25.4%). ScrollAnchor + promote-on-touch model.
+- **Combined real-world result:** 70.8 → 30.7 MB PSS (−57%) on a 1,189-message
+  session.
+
+### Changed
+
+- **run() split (P12)** — `tui/mod.rs` reduced from 2,597 to 443 lines.
+  Boot prologue → `run_setup.rs`, input dispatch → `dispatch.rs`, stream
+  handlers → `stream_handler.rs`.
+- **ViewInputs seam (T199.2)** — render-input boundary extracted, reconciling
+  the view-model split after P7/P12.
+- Secret-prompt handling folded into ModalStack (P7.8).
+
+### Fixed
+
+- Plugin-category settings panic + category-to-index mis-map (PR#60 review).
+- Abort-path mutex ordering fix (PR#60 review).
+- 18 pre-existing clippy lints resolved (#240).
+
 ## [0.5.1] — 2026-07-03
 
 ### Added

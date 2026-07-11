@@ -5,12 +5,12 @@
 
 use crate::{Session, Runtime};
 use crate::pricing::calculate_cost_optional_split;
-use serde_json::Value;
+use crate::SharedMessage;
 
 /// Conversation state tracked by the engine.
 pub struct ConversationState {
     pub session: Session,
-    pub api_messages: Vec<Value>,
+    pub api_messages: Vec<SharedMessage>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,

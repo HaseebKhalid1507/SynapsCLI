@@ -8,7 +8,7 @@ pub mod pricing;
 // Re-export stream event types at crate root so engine/tui can import them
 // cleanly as `agent_core::{StreamEvent, LlmEvent, ...}` without digging
 // into the internal module path.
-pub use core::stream_types::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+pub use core::stream_types::{AgentEvent, LlmEvent, SessionEvent, SharedMessage, StreamEvent};
 
 // Replicate the root lib.rs aliases so internal `crate::config`,
 // `crate::models`, `crate::session`, etc. resolve INSIDE agent-core.

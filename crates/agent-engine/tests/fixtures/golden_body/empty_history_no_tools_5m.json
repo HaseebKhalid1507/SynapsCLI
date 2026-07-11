@@ -1,0 +1,1 @@
+{"max_tokens":64000,"messages":[],"model":"claude-sonnet-4-5-20250929","stream":true,"thinking":{"budget_tokens":16384,"display":"summarized","type":"enabled"},"tools":[]}

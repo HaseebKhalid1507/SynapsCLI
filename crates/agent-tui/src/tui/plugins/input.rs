@@ -38,7 +38,9 @@ pub(crate) fn handle_event(state: &mut PluginsModalState, key: KeyEvent) -> Inpu
     match key.code {
         KeyCode::Esc => InputOutcome::Close,
         KeyCode::Tab => {
-            state.focus = match state.focus { Focus::Left => Focus::Right, Focus::Right => Focus::Left };
+            // P7.6: focus toggle now goes through the FocusManager ring
+            // (two-slot next()); `state.focus` is re-derived from it.
+            state.toggle_focus();
             state.row_error = None;
             InputOutcome::None
         }
@@ -73,7 +75,7 @@ fn list_enter(state: &mut PluginsModalState) -> InputOutcome {
     match rows.get(state.selected_left) {
         Some(LeftRow::AddMarketplace) if matches!(state.focus, Focus::Right | Focus::Left) => {
             state.mode = RightMode::AddMarketplaceEditor { buffer: String::new(), error: None };
-            state.focus = Focus::Right;
+            state.set_focus(Focus::Right);
             InputOutcome::None
         }
         Some(_) if matches!(state.focus, Focus::Right) => {
@@ -314,7 +316,7 @@ mod tests {
     fn enter_on_add_marketplace_opens_editor() {
         let mut s = crate::tui::plugins::PluginsModalState::new(PluginsState::default());
         s.selected_left = s.left_rows().len() - 1; // AddMarketplace
-        s.focus = crate::tui::plugins::state::Focus::Right;
+        s.set_focus(crate::tui::plugins::state::Focus::Right);
         handle_event(&mut s, key(KeyCode::Enter));
         assert!(matches!(s.mode, crate::tui::plugins::state::RightMode::AddMarketplaceEditor { .. }));
     }
@@ -458,7 +460,7 @@ mod tests {
         let mut s = crate::tui::plugins::PluginsModalState::new(file);
         s.selected_left = 1; // marketplace row
         s.selected_right = 0; // "web" plugin (Browseable { installed: true })
-        s.focus = crate::tui::plugins::state::Focus::Right;
+        s.set_focus(crate::tui::plugins::state::Focus::Right);
 
         // Press U to ask uninstall
         handle_event(&mut s, KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
@@ -495,7 +497,7 @@ mod tests {
         let mut s = crate::tui::plugins::PluginsModalState::new(file);
         s.selected_left = 0; // Installed
         s.selected_right = 0;
-        s.focus = crate::tui::plugins::state::Focus::Right;
+        s.set_focus(crate::tui::plugins::state::Focus::Right);
         // Enter detail view
         s.mode = RightMode::Detail { row_idx: 0 };
 
@@ -525,7 +527,7 @@ mod tests {
         });
         let mut s = crate::tui::plugins::PluginsModalState::new(file);
         s.selected_left = 1; // marketplace row
-        s.focus = crate::tui::plugins::state::Focus::Right;
+        s.set_focus(crate::tui::plugins::state::Focus::Right);
 
         // Press R from right pane — should still open remove confirm
         handle_event(&mut s, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));

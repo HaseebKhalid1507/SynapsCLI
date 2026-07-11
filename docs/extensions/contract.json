@@ -85,6 +85,22 @@
       "secret_env must be an environment variable name when present"
     ]
   },
+  "theme_tokens": {
+    "manifest_key": "extension.theme_tokens",
+    "status": "optional",
+    "compatibility": "additive optional field within extension_protocol_version 1 (no version bump; per docs/STABILITY.md §1, extensions and hosts must tolerate its absence — manifests without it behave exactly as before)",
+    "shape": "object mapping <token> -> hex color (\"#rgb\" or \"#rrggbb\")",
+    "theme_namespace": "ext.<plugin-id>.<token>",
+    "override_order": [
+      "user theme TOML key ext.<plugin-id>.<token> (wins)",
+      "manifest theme_tokens value",
+      "unset (host renders with its base tokens)"
+    ],
+    "validation": [
+      "token must be non-empty and must not contain dots, slashes, or spaces",
+      "value must be a hex color: \"#rgb\" or \"#rrggbb\""
+    ]
+  },
   "registered_capabilities": {
     "tools": {
       "permission": "tools.register",

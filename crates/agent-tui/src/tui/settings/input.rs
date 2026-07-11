@@ -221,10 +221,9 @@ pub(crate) fn handle_event(
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => InputOutcome::Close,
         (KeyCode::Tab, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            state.focus = match state.focus {
-                Focus::Left => Focus::Right,
-                Focus::Right => Focus::Left,
-            };
+            // P7.7: focus toggle now goes through the FocusManager ring
+            // (two-slot next()); `state.focus` is re-derived from it.
+            state.toggle_focus();
             state.row_error = None;
             InputOutcome::None
         }
@@ -261,7 +260,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Left, _) | (KeyCode::Right, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting() {
+            if let Some(def) = state.current_setting(snap) {
                 if let EditorKind::Cycler(options) = def.editor {
                     let current = cycler_current_value(def.key, snap);
                     let idx = options.iter().position(|o| *o == current).unwrap_or(0);
@@ -282,7 +281,7 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         (KeyCode::Enter, _) if state.focus == Focus::Right => {
-            if let Some(def) = state.current_setting() {
+            if let Some(def) = state.current_setting(snap) {
                 match def.editor {
                     EditorKind::Text { numeric } => {
                         state.row_error = None;
@@ -529,13 +528,17 @@ fn row_count(state: &SettingsState, snap: &RuntimeSnapshot) -> usize {
             .unwrap_or(0);
     }
     let visible = visible_categories(&snap.lifecycle_claims);
-    let cat = visible[state.category_idx];
+    // Guard against a stale `category_idx` parked past the list (e.g. a plugin
+    // category hot-reloaded away while the modal is open): no category => no rows.
+    let Some(&cat) = visible.get(state.category_idx) else {
+        return 0;
+    };
     if cat == super::schema::Category::Plugins {
         snap.plugins.len() + 1
     } else if cat == super::schema::Category::Providers {
         synaps_cli::runtime::openai::registry::providers().len() + 1 // +1 for Local row
     } else {
-        state.current_settings().len()
+        state.current_settings(snap).len()
     }
 }
 
@@ -583,7 +586,7 @@ mod tests {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES
             .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
-        state.focus = Focus::Right;
+        state.set_focus(Focus::Right);
         state.setting_idx = idx;
         state
     }
@@ -664,7 +667,7 @@ mod tests {
     fn at_first_plugin_cat(s: &RuntimeSnapshot) -> SettingsState {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES.len();
-        state.focus = Focus::Right;
+        state.set_focus(Focus::Right);
         state.setting_idx = 0;
         // sanity
         assert!(state.is_plugin_category(s));

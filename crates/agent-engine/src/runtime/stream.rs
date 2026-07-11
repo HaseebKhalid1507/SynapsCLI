@@ -6,7 +6,7 @@ use super::{
     BeforeToolCallDecision,
 };
 use crate::extensions::hooks::events::HookEvent;
-use crate::{Result, RuntimeError, ToolRegistry};
+use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -74,7 +74,7 @@ fn assistant_text_from_content(content: &[Value]) -> String {
 impl StreamMethods {
     pub(super) async fn run_stream_internal(
         session: StreamSession,
-        initial_messages: Vec<Value>,
+        initial_messages: Vec<SharedMessage>,
     ) -> Result<()> {
         let StreamSession {
             auth,
@@ -240,10 +240,10 @@ impl StreamMethods {
                 }
 
                 // Add assistant's response to conversation
-                messages.push(json!({
+                messages.push(Arc::new(json!({
                     "role": "assistant",
                     "content": content
-                }));
+                })));
 
                 let assistant_text = assistant_text_from_content(content);
                 let hook_event = HookEvent::on_message_complete(
@@ -563,10 +563,10 @@ impl StreamMethods {
 
                 // Add tool results to conversation — always, so the assistant's tool_use
                 // blocks have matching tool_result blocks even on cancellation.
-                messages.push(json!({
+                messages.push(Arc::new(json!({
                     "role": "user",
                     "content": tool_results
-                }));
+                })));
 
                 if canceled {
                     // Send final history on cancellation so session can be saved

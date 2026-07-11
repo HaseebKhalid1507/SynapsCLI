@@ -3,6 +3,14 @@
 //! clean leaf with no upward dependencies into the engine layer.
 
 use serde_json::Value;
+use std::sync::Arc;
+
+/// Reference-counted shared message payload. Introduced at the runtime's
+/// inner boundary (T128 Slice 2) to enable clone-free fan-out of message
+/// history through the stream loop and `SessionEvent::MessageHistory`.
+/// Outer state (App/Session/ConversationState) remains `Vec<Value>` and
+/// shims at the boundary — see Slice 5 for full conversion.
+pub type SharedMessage = Arc<Value>;
 
 /// Top-level stream event — grouped into concern-specific sub-enums.
 #[derive(Debug, Clone)]
@@ -44,7 +52,7 @@ pub enum LlmEvent {
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    MessageHistory(Vec<Value>),
+    MessageHistory(Vec<SharedMessage>),
     Usage {
         input_tokens: u64,
         output_tokens: u64,

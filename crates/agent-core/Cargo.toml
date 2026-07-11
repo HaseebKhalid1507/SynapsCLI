@@ -1,6 +1,6 @@
 [package]
 name = "synaps-core"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Foundation types, config, session, auth, protocol — leaf crate for agent-runtime"
@@ -11,7 +11,7 @@ name = "agent_core"
 path = "src/lib.rs"
 
 [dependencies]
-serde              = { version = "1.0", features = ["derive"] }
+serde              = { version = "1.0", features = ["derive", "rc"] }
 serde_json         = "1.0"
 tokio              = { version = "1.0", features = ["full"] }
 toml               = "0.8"

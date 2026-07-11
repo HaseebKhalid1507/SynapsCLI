@@ -133,6 +133,7 @@ mod tests {
     #[test]
     fn summary_lists_permissions_hooks_and_required_config() {
         let summary = summarize_plugin_permissions(&plugin(Some(ExtensionManifest {
+            theme_tokens: Default::default(),
             protocol_version: 1,
             runtime: ExtensionRuntime::Process,
             command: "python3".to_string(),

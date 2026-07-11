@@ -111,7 +111,7 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
 /// Convert Anthropic-shaped message list + optional system prompt into
 /// an OpenAI ChatMessage stream.
 pub fn messages_to_oai(
-    anthropic_messages: &[Value],
+    anthropic_messages: &[crate::SharedMessage],
     system_prompt: &Option<String>,
     name_map: &ToolNameMap,
 ) -> Vec<ChatMessage> {

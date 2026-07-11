@@ -56,7 +56,7 @@ struct InFlight {
 struct RpcState {
     runtime: Runtime,
     session: Session,
-    api_messages: Vec<serde_json::Value>,
+    api_messages: Vec<synaps_cli::SharedMessage>,
     total_input_tokens: u64,
     total_output_tokens: u64,
     session_cost: f64,
@@ -139,10 +139,9 @@ async fn spawn_prompt(
 
     let handle = tokio::spawn(async move {
         // Snapshot message history; release lock before blocking on the stream.
-        let messages = {
-            let st = state.lock().await;
-            st.api_messages.clone()
-        };
+        // Vec<SharedMessage> clone = pointer bumps only.
+        let messages: Vec<synaps_cli::SharedMessage> =
+            state.lock().await.api_messages.clone();
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
@@ -163,14 +162,15 @@ async fn spawn_prompt(
         };
 
         while let Some(ev) = stream.next().await {
+            // Peel off MessageHistory first so we can MOVE the payload into
+            // state instead of cloning it (the vec can be several MB).
+            if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
+                let mut st = state.lock().await;
+                st.api_messages = msgs;
+                st.save_session().await;
+                continue;
+            }
             match &ev {
-                // ── Session bookkeeping ─────────────────────────────────────
-                StreamEvent::Session(SessionEvent::MessageHistory(msgs)) => {
-                    let mut st = state.lock().await;
-                    st.api_messages = msgs.clone();
-                    st.save_session().await;
-                    continue;
-                }
                 StreamEvent::Session(se @ SessionEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -302,7 +302,7 @@ async fn handle_prompt(
     {
         let mut st = state.lock().await;
         st.api_messages
-            .push(serde_json::json!({"role": "user", "content": content}));
+            .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
     }
 
     let in_flight = spawn_prompt(id, state.clone(), writer_tx).await;
@@ -333,8 +333,9 @@ async fn handle_compact(
         Ok(summary) => {
             {
                 let mut st = state.lock().await;
-                st.api_messages =
-                    vec![serde_json::json!({"role": "user", "content": summary.clone()})];
+                st.api_messages = vec![std::sync::Arc::new(
+                    serde_json::json!({"role": "user", "content": summary.clone()}),
+                )];
                 st.save_session().await;
             }
             let _ = writer_tx

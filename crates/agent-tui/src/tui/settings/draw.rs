@@ -4,7 +4,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
 use super::schema::{SettingDef, EditorKind, visible_categories};
-use super::super::theme::THEME;
+use super::super::theme::{ModalKind, THEME};
 
 pub(crate) fn render(
     frame: &mut Frame,
@@ -19,12 +19,20 @@ pub(crate) fn render(
     let modal = Rect { x, y, width: w, height: h };
 
     frame.render_widget(Clear, modal);
-    let block = Block::default()
+    // P19.1: per-part chrome. Border resolves to the `settings.border`
+    // override if set, else the shared `border_active` base token (identical
+    // to pre-P19.1). Title style is applied ONLY when `settings.title` is set,
+    // so the unset path leaves the title exactly as before.
+    let theme = THEME.load();
+    let mut block = Block::default()
         .title(" Settings ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(THEME.load().border_active))
-        .style(Style::default().bg(THEME.load().bg));
+        .border_style(Style::default().fg(theme.modal_border(ModalKind::Settings)))
+        .style(Style::default().bg(theme.bg));
+    if let Some(tc) = theme.modal_title(ModalKind::Settings) {
+        block = block.title_style(Style::default().fg(tc));
+    }
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
@@ -85,7 +93,10 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_plugin_category(frame, area, state, snap);
         return;
     }
-    let current_cat = visible_categories(&snap.lifecycle_claims)[state.category_idx];
+    let current_cat = visible_categories(&snap.lifecycle_claims)
+        .get(state.category_idx)
+        .copied()
+        .unwrap_or(super::schema::Category::Plugins);
     if current_cat == super::schema::Category::Plugins {
         render_plugins_list(frame, area, state, snap);
         return;
@@ -94,7 +105,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         render_providers_list(frame, area, state, snap);
         return;
     }
-    let settings = state.current_settings();
+    let settings = state.current_settings(snap);
     let selected_key = settings.get(state.setting_idx).map(|d| d.key);
     let mut lines = Vec::new();
     for (i, def) in settings.iter().enumerate() {

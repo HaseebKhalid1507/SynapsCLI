@@ -24,6 +24,7 @@ fn manifest_with_args(extra_args: Vec<&str>) -> ExtensionManifest {
     let mut args = vec![fixture_path()];
     args.extend(extra_args.into_iter().map(String::from));
     ExtensionManifest {
+        theme_tokens: Default::default(),
         protocol_version: CURRENT_EXTENSION_PROTOCOL_VERSION,
         runtime: ExtensionRuntime::Process,
         command: "python3".to_string(),
