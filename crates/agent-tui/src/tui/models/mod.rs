@@ -13,6 +13,7 @@ struct DevProviderSelection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DevProviderAuth {
     OAuth(&'static str),
+    Cloud,
     ApiKey,
     LocalModels,
 }
@@ -43,6 +44,21 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             key: "google-gemini",
             name: "Google Gemini (Code Assist)",
             auth_kind: DevProviderAuth::OAuth("google-gemini"),
+        },
+        DevProviderSelection {
+            key: "azure-openai",
+            name: "Azure OpenAI",
+            auth_kind: DevProviderAuth::Cloud,
+        },
+        DevProviderSelection {
+            key: "aws-bedrock",
+            name: "AWS Bedrock",
+            auth_kind: DevProviderAuth::Cloud,
+        },
+        DevProviderSelection {
+            key: "google-vertex",
+            name: "Google Vertex",
+            auth_kind: DevProviderAuth::Cloud,
         },
     ];
 
@@ -376,7 +392,7 @@ fn build_sections_from_parts(
             .filter(|m| model_matches(m, &query, favorites_only))
             .collect();
         pin_favorites_first(&mut entries);
-        if !entries.is_empty() {
+        if !entries.is_empty() || provider.auth_kind == DevProviderAuth::Cloud {
             sections.push(ModelSection {
                 provider_key: provider.key.to_string(),
                 provider_name: provider.name.to_string(),
@@ -389,40 +405,65 @@ fn build_sections_from_parts(
     if let Some(manager) = synaps_cli::runtime::openai::extension_manager_for_routing() {
         if let Ok(manager) = manager.try_read() {
             for provider in manager.providers() {
-                let mut entries: Vec<ModelEntry> = provider.spec.models.iter().enumerate().map(|(order, model)| {
-                    let runtime_id = synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
-                        &provider.plugin_id,
-                        &provider.provider_id,
-                        &model.id,
-                    );
-                    let mut badges: Vec<&str> = Vec::new();
-                    if model.capabilities.get("tool_use").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        badges.push("tool-use");
-                    }
-                    if model.capabilities.get("streaming").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        badges.push("streaming");
-                    }
-                    let base = model.display_name.clone().unwrap_or_else(|| model.id.clone());
-                    let label = if badges.is_empty() {
-                        base
-                    } else {
-                        let suffix = badges.iter().map(|b| format!("[{}]", b)).collect::<Vec<_>>().join(" ");
-                        format!("{} {}", base, suffix)
-                    };
-                    ModelEntry {
-                        id: runtime_id.clone(),
-                        display_id: model.id.clone(),
-                        label,
-                        tier: "extension".to_string(),
-                        provider_key: provider.runtime_id.clone(),
-                        provider_name: provider.spec.display_name.clone(),
-                        configured: true,
-                        is_current: current_model == runtime_id,
-                        is_favorite: state.favorites.contains(&runtime_id),
-                        favorite_id: runtime_id,
-                        order,
-                    }
-                }).filter(|m| model_matches(m, &query, favorites_only)).collect();
+                let mut entries: Vec<ModelEntry> = provider
+                    .spec
+                    .models
+                    .iter()
+                    .enumerate()
+                    .map(|(order, model)| {
+                        let runtime_id =
+                            synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
+                                &provider.plugin_id,
+                                &provider.provider_id,
+                                &model.id,
+                            );
+                        let mut badges: Vec<&str> = Vec::new();
+                        if model
+                            .capabilities
+                            .get("tool_use")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            badges.push("tool-use");
+                        }
+                        if model
+                            .capabilities
+                            .get("streaming")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            badges.push("streaming");
+                        }
+                        let base = model
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| model.id.clone());
+                        let label = if badges.is_empty() {
+                            base
+                        } else {
+                            let suffix = badges
+                                .iter()
+                                .map(|b| format!("[{}]", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            format!("{} {}", base, suffix)
+                        };
+                        ModelEntry {
+                            id: runtime_id.clone(),
+                            display_id: model.id.clone(),
+                            label,
+                            tier: "extension".to_string(),
+                            provider_key: provider.runtime_id.clone(),
+                            provider_name: provider.spec.display_name.clone(),
+                            configured: true,
+                            is_current: current_model == runtime_id,
+                            is_favorite: state.favorites.contains(&runtime_id),
+                            favorite_id: runtime_id,
+                            order,
+                        }
+                    })
+                    .filter(|m| model_matches(m, &query, favorites_only))
+                    .collect();
                 pin_favorites_first(&mut entries);
                 if !entries.is_empty() {
                     sections.push(ModelSection {
@@ -521,24 +562,28 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
             .collect(),
-        "google-gemini" => synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
-            .into_iter()
-            .map(|model| {
-                let tier = match model.id.as_str() {
-                    "gemini-2.5-pro" => "S",
-                    "gemini-2.5-flash" => "A",
-                    _ => "",
-                };
-                (model.id, model.label.unwrap_or_default(), tier.to_string())
-            })
-            .collect(),
+        "google-gemini" => {
+            synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
+                .into_iter()
+                .map(|model| {
+                    let tier = match model.id.as_str() {
+                        "gemini-2.5-pro" => "S",
+                        "gemini-2.5-flash" => "A",
+                        _ => "",
+                    };
+                    (model.id, model.label.unwrap_or_default(), tier.to_string())
+                })
+                .collect()
+        }
         key => synaps_cli::runtime::openai::registry::providers()
             .iter()
             .find(|spec| spec.key == key)
             .map(|spec| {
                 spec.models
                     .iter()
-                    .map(|(id, label, tier)| ((*id).to_string(), (*label).to_string(), (*tier).to_string()))
+                    .map(|(id, label, tier)| {
+                        ((*id).to_string(), (*label).to_string(), (*tier).to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -569,6 +614,7 @@ fn dev_provider_is_logged_in(
 ) -> bool {
     match provider.auth_kind {
         DevProviderAuth::LocalModels => !availability.local_models.is_empty(),
+        DevProviderAuth::Cloud => true,
         DevProviderAuth::ApiKey => availability.configured_static.contains(provider.key),
         DevProviderAuth::OAuth(storage_key) => logged_in_oauth.contains(storage_key),
     }
@@ -866,16 +912,21 @@ impl Widget for ModelsModalWidget<'_> {
             "No configured models match the current search."
         };
         let list = if lines.is_empty() {
-            vec![Line::from(Span::styled(empty_line, Style::default().fg(theme.muted)))]
+            vec![Line::from(Span::styled(
+                empty_line,
+                Style::default().fg(theme.muted),
+            ))]
         } else {
             lines
         };
         Paragraph::new(list).render(list_area, buf);
 
-        Paragraph::new("↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close")
-            .style(Style::default().fg(theme.muted))
-            .alignment(Alignment::Center)
-            .render(footer, buf);
+        Paragraph::new(
+            "↑/↓ select • Enter use • f favorite • e expand • Tab view • c collapse • Esc close",
+        )
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center)
+        .render(footer, buf);
 
         if let Some(expanded) = self.state.expanded.as_ref() {
             render_expanded_lightbox(area, buf, self.state, expanded);
@@ -1390,15 +1441,18 @@ mod tests {
             .iter()
             .map(|entry| entry.display_id.as_str())
             .collect();
-        assert_eq!(ids, vec![
-            "gemini-3.1-pro-preview",
-            "gemini-3-pro-preview",
-            "gemini-3.5-flash",
-            "gemini-3-flash-preview",
-            "gemini-3.1-flash-lite",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-        ]);
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-3.1-pro-preview",
+                "gemini-3-pro-preview",
+                "gemini-3.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+            ]
+        );
         assert!(gemini
             .entries
             .iter()

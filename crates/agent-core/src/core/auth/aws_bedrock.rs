@@ -423,7 +423,12 @@ pub fn sign_bedrock_request(
     let dt = chrono::DateTime::from_timestamp(epoch as i64, 0).ok_or(AwsError::Upstream)?;
     let date = dt.format("%Y%m%d").to_string();
     let amz = dt.format("%Y%m%dT%H%M%SZ").to_string();
-    let host = format!("bedrock-runtime.{region}.amazonaws.com");
+    let runtime = path.starts_with("/model/");
+    let host = if runtime {
+        format!("bedrock-runtime.{region}.amazonaws.com")
+    } else {
+        format!("bedrock.{region}.amazonaws.com")
+    };
     let payload = hex(Sha256::digest(body));
     let canonical=format!("{method}\n{path}\n\nhost:{host}\nx-amz-date:{amz}\nx-amz-security-token:{}\n\nhost;x-amz-date;x-amz-security-token\n{payload}",c.session_token);
     let scope = format!("{date}/{region}/bedrock/aws4_request");

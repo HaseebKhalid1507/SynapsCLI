@@ -246,3 +246,61 @@ pub struct InvokeOptions {
     pub max_output_tokens: Option<u32>,
     pub temperature_milli: Option<u16>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudProviderDescriptor {
+    pub id: CloudProviderId,
+    pub display_name: &'static str,
+    /// Cloud operations always execute behind the typed broker boundary.
+    pub typed_broker_only: bool,
+    /// Production login needs a Synaps-owned/configured public OAuth app.
+    pub registration_required: bool,
+}
+
+pub const CLOUD_PROVIDER_DESCRIPTORS: [CloudProviderDescriptor; 3] = [
+    CloudProviderDescriptor {
+        id: CloudProviderId::AzureOpenAi,
+        display_name: "Azure OpenAI",
+        typed_broker_only: true,
+        registration_required: true,
+    },
+    CloudProviderDescriptor {
+        id: CloudProviderId::AwsBedrock,
+        display_name: "AWS Bedrock",
+        typed_broker_only: true,
+        registration_required: false,
+    },
+    CloudProviderDescriptor {
+        id: CloudProviderId::GoogleVertex,
+        display_name: "Google Vertex",
+        typed_broker_only: true,
+        registration_required: true,
+    },
+];
+
+pub fn cloud_provider_descriptors() -> &'static [CloudProviderDescriptor] {
+    &CLOUD_PROVIDER_DESCRIPTORS
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_descriptors_are_complete_and_never_vend_credentials() {
+        let descriptors = cloud_provider_descriptors();
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].id.as_str(), "azure-openai");
+        assert_eq!(descriptors[1].id.as_str(), "aws-bedrock");
+        assert_eq!(descriptors[2].id.as_str(), "google-vertex");
+        assert!(descriptors.iter().all(|d| d.typed_broker_only));
+        assert_eq!(
+            descriptors
+                .iter()
+                .filter(|d| d.registration_required)
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![CloudProviderId::AzureOpenAi, CloudProviderId::GoogleVertex]
+        );
+    }
+}

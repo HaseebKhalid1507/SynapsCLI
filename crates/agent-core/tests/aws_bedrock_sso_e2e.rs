@@ -236,6 +236,17 @@ fn sigv4_is_deterministic_and_secret_safe() {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-west-2/bedrock/aws4_request"
     ));
     assert_eq!(r.header("x-amz-security-token"), Some("token"));
+    assert_eq!(r.host, "bedrock-runtime.us-west-2.amazonaws.com");
+    let control = sign_bedrock_request(
+        "us-west-2",
+        "GET",
+        "/foundation-models",
+        b"",
+        &creds,
+        1_700_000_000,
+    )
+    .unwrap();
+    assert_eq!(control.host, "bedrock.us-west-2.amazonaws.com");
     let debug = format!("{creds:?}");
     assert!(!debug.contains("secret") && !debug.contains("token"));
 }

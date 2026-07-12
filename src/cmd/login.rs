@@ -8,6 +8,7 @@ use synaps_cli::{auth, config};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthKind {
     OAuth,
+    Cloud,
     ApiKey,
 }
 
@@ -61,6 +62,7 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) {
 
     match selected.auth_kind {
         AuthKind::OAuth => run_oauth_login(selected, profile).await,
+        AuthKind::Cloud => run_cloud_login(selected),
         AuthKind::ApiKey => run_api_key_login(selected, profile),
     }
 }
@@ -108,6 +110,16 @@ fn oauth_storage_key(provider: LoginProvider) -> &'static str {
     auth::provider::parse_cli_provider(provider.key)
         .map(|id| id.as_str())
         .unwrap_or(provider.key)
+}
+
+fn run_cloud_login(provider: LoginProvider) {
+    let message = match provider.key {
+        "azure-openai" => "registration_required: configure a Synaps-owned Microsoft Entra public-client ID plus tenant/subscription/resource context in the credential broker",
+        "google-vertex" => "registration_required: configure a Synaps-owned Google Desktop OAuth client ID plus project/location context in the credential broker",
+        "aws-bedrock" => "AWS Bedrock setup requires SSO start URL, SSO region, explicit account/role, and Bedrock region; credentials and SigV4 remain broker-owned",
+        _ => "cloud provider setup is unavailable",
+    };
+    eprintln!("{}: {}", provider.name, message);
 }
 
 fn run_api_key_login(provider: LoginProvider, profile: Option<String>) {
@@ -310,6 +322,22 @@ fn login_providers() -> Vec<LoginProvider> {
         .collect();
 
     providers.extend(
+        synaps_cli::auth::cloud::cloud_provider_descriptors()
+            .iter()
+            .map(|provider| LoginProvider {
+                key: provider.id.as_str(),
+                name: provider.display_name,
+                description: if provider.registration_required {
+                    "typed broker OAuth (registration required)"
+                } else {
+                    "IAM Identity Center + broker-side SigV4"
+                },
+                auth_kind: AuthKind::Cloud,
+                recommended: false,
+            }),
+    );
+
+    providers.extend(
         synaps_cli::runtime::openai::registry::providers()
             .iter()
             .map(|provider| LoginProvider {
@@ -432,6 +460,7 @@ fn render_provider_picker(
         };
         let auth = match provider.auth_kind {
             AuthKind::OAuth => "oauth",
+            AuthKind::Cloud => "cloud broker",
             AuthKind::ApiKey => "api key",
         };
         eprint!(
@@ -489,6 +518,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_providers_include_all_typed_cloud_descriptors() {
+        let providers = login_providers();
+        for key in ["azure-openai", "aws-bedrock", "google-vertex"] {
+            let provider = find_provider(&providers, key).expect("cloud descriptor missing");
+            assert_eq!(provider.auth_kind, AuthKind::Cloud);
+        }
+    }
+
+    #[test]
     fn relaunch_args_preserve_profile() {
         assert_eq!(
             main_app_args(Some("work".to_string())),
@@ -531,11 +569,15 @@ mod tests {
         assert!(providers[0].recommended);
         // Non-recommended OAuth providers follow; HashMap registry order is not stable.
         assert!(
-            providers.iter().any(|p| p.key == "openai-codex" && p.auth_kind == AuthKind::OAuth),
+            providers
+                .iter()
+                .any(|p| p.key == "openai-codex" && p.auth_kind == AuthKind::OAuth),
             "openai-codex must remain in the OAuth login list"
         );
         assert!(
-            providers.iter().any(|p| p.key == "xai-auth" && p.auth_kind == AuthKind::OAuth),
+            providers
+                .iter()
+                .any(|p| p.key == "xai-auth" && p.auth_kind == AuthKind::OAuth),
             "xai-auth must remain in the OAuth login list"
         );
     }
@@ -585,7 +627,9 @@ mod tests {
         // CLI aliases resolve through parse_cli_provider; picker key stays canonical.
         assert!(find_provider(&providers, "copilot").is_none());
         assert_eq!(
-            auth::provider::parse_cli_provider("copilot").unwrap().as_str(),
+            auth::provider::parse_cli_provider("copilot")
+                .unwrap()
+                .as_str(),
             "github-copilot"
         );
     }
@@ -607,7 +651,9 @@ mod tests {
         assert_eq!(ai_studio.auth_kind, AuthKind::ApiKey);
         // CLI aliases route to google-gemini except the reserved "google".
         assert_eq!(
-            auth::provider::parse_cli_provider("gemini").unwrap().as_str(),
+            auth::provider::parse_cli_provider("gemini")
+                .unwrap()
+                .as_str(),
             "google-gemini"
         );
         assert!(auth::provider::parse_cli_provider("google").is_err());
