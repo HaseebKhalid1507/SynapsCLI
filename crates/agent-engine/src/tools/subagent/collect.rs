@@ -47,17 +47,27 @@ impl Tool for SubagentCollectTool {
                 "SubagentRegistry not available on this ToolContext".to_string()
             ))?;
 
-        let reg = registry.lock().unwrap();
-        let handle = reg.get(&handle_id)
+        let mut reg = registry.lock().unwrap();
+        let handle = reg.get_mut(&handle_id)
             .ok_or_else(|| RuntimeError::Tool(
-                format!("No subagent found with handle_id '{}'", handle_id)
+                format!(
+                    "No subagent found with handle_id '{}'. \
+                     Finished handles are retained for {} minutes after completion \
+                     and then garbage-collected.",
+                    handle_id,
+                    crate::runtime::subagent::FINISHED_HANDLE_TTL.as_secs() / 60
+                )
             ))?;
 
-        // Clone all needed data under the lock, then drop before char traversal
         let status = handle.status();
         let output: String = handle.partial_output();
         let elapsed = handle.elapsed_secs();
-        let _ = handle;
+
+        // Mark collected on any terminal read so the reaper knows it's safe to GC.
+        let already_collected = handle.is_collected();
+        if status != SubagentStatus::Running {
+            handle.mark_collected();
+        }
         drop(reg);
 
         if status == SubagentStatus::Running {
@@ -76,11 +86,90 @@ impl Tool for SubagentCollectTool {
             }).to_string());
         }
 
-        // Done — return full result
+        // Done — return full result including collected flag for idempotency signaling
         Ok(json!({
             "handle_id": handle_id,
             "status":    status.as_str(),
-            "output":    output
+            "output":    output,
+            "collected": already_collected,
         }).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use crate::runtime::subagent::{SubagentRegistry, SubagentHandle, SubagentState, SubagentStatus};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::sync::{mpsc, oneshot};
+
+    fn make_finished_handle(id: &str, output: &str) -> SubagentHandle {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        {
+            let mut s = state.write().unwrap();
+            s.status = SubagentStatus::Completed;
+            s.partial_text = output.to_string();
+            s.finished_at = Some(std::time::Instant::now());
+        }
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let (_result_tx, result_rx) = oneshot::channel();
+        SubagentHandle::new(
+            id.to_string(),
+            "test-agent".to_string(),
+            "test task".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "system prompt".to_string(),
+            300,
+            state,
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        )
+    }
+
+    fn make_ctx_with_registry(
+        registry: Arc<Mutex<SubagentRegistry>>,
+    ) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry);
+        ctx
+    }
+
+    // U5: collect marks collected on first read; second read shows collected=true
+    #[tokio::test]
+    async fn collect_marks_collected_and_is_idempotent() {
+        let tool = SubagentCollectTool;
+
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let handle = make_finished_handle("sa_42", "result text");
+        registry.lock().unwrap().register(handle);
+
+        // First collect — should return collected=false (not yet collected before this call)
+        let result1 = tool.execute(
+            json!({"handle_id": "sa_42"}),
+            make_ctx_with_registry(registry.clone()),
+        ).await.unwrap();
+        let body1: serde_json::Value = serde_json::from_str(&result1).unwrap();
+        assert_eq!(body1["status"], "completed");
+        assert_eq!(body1["output"], "result text");
+        assert_eq!(body1["collected"], false, "first collect should report collected=false");
+
+        // Second collect — same handle still in registry (not yet reaped), collected=true
+        let result2 = tool.execute(
+            json!({"handle_id": "sa_42"}),
+            make_ctx_with_registry(registry.clone()),
+        ).await.unwrap();
+        let body2: serde_json::Value = serde_json::from_str(&result2).unwrap();
+        assert_eq!(body2["status"], "completed");
+        assert_eq!(body2["collected"], true, "second collect should report collected=true");
+
+        // After collect, the registry should have the handle marked collected
+        let reg = registry.lock().unwrap();
+        let h = reg.get("sa_42").unwrap();
+        assert!(h.is_collected(), "handle must be marked collected in registry");
     }
 }
