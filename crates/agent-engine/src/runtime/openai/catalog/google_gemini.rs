@@ -15,7 +15,9 @@
 //! Media / embedding / video / voice models are NOT surfaced either: this
 //! runtime is text + tool-call only.
 
-use super::{CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport};
+use super::{
+    CatalogModel, CatalogProviderKind, CatalogSource, Modality, PricingSummary, ReasoningSupport,
+};
 
 pub const PROVIDER_KEY: &str = "google-gemini";
 pub const PROVIDER_NAME: &str = "Google Gemini (Code Assist)";
@@ -31,8 +33,40 @@ pub struct GoogleGeminiModelDescriptor {
     pub thinking: bool,
 }
 
-/// Conservative allowlist. Kept short on purpose (spec §Catalog).
+/// Text/tool-capable wire IDs exposed by the official Gemini CLI. Preview and
+/// rollout models are intentionally visible; upstream account policy remains
+/// authoritative and may reject models not enabled for a particular user.
 pub const GOOGLE_GEMINI_TEXT_MODELS: &[GoogleGeminiModelDescriptor] = &[
+    GoogleGeminiModelDescriptor {
+        id: "gemini-3.1-pro-preview",
+        label: "Gemini 3.1 Pro (Preview)",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
+    GoogleGeminiModelDescriptor {
+        id: "gemini-3-pro-preview",
+        label: "Gemini 3 Pro (Preview)",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
+    GoogleGeminiModelDescriptor {
+        id: "gemini-3.5-flash",
+        label: "Gemini 3.5 Flash",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
+    GoogleGeminiModelDescriptor {
+        id: "gemini-3-flash-preview",
+        label: "Gemini 3 Flash (Preview)",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
+    GoogleGeminiModelDescriptor {
+        id: "gemini-3.1-flash-lite",
+        label: "Gemini 3.1 Flash Lite",
+        context_tokens: Some(1_048_576),
+        thinking: true,
+    },
     GoogleGeminiModelDescriptor {
         id: "gemini-2.5-pro",
         label: "Gemini 2.5 Pro",
@@ -81,27 +115,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_exposes_only_reference_verified_stable_text_ids() {
+    fn catalog_exposes_all_official_reference_text_ids() {
         assert_eq!(
             GOOGLE_GEMINI_TEXT_MODELS
                 .iter()
                 .map(|m| m.id)
                 .collect::<Vec<_>>(),
-            vec!["gemini-2.5-pro", "gemini-2.5-flash"],
-            "conservative catalog must not drift; add wire IDs only with reference evidence"
+            vec![
+                "gemini-3.1-pro-preview",
+                "gemini-3-pro-preview",
+                "gemini-3.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+            ]
         );
     }
 
     #[test]
-    fn catalog_is_text_only_and_excludes_preview_media_embedding_ids() {
+    fn catalog_is_text_only_and_excludes_non_chat_models() {
         let models = google_gemini_static_catalog_models();
-        assert!(models.iter().all(|m| m.input_modalities == vec![Modality::Text]));
+        assert!(models
+            .iter()
+            .all(|m| m.input_modalities == vec![Modality::Text]));
         for banned in [
-            "gemini-3-pro-preview",
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-3.5-flash",
-            "gemini-3-flash",
             "auto-gemini-2.5",
             "auto-gemini-3",
             "text-embedding-004",
@@ -112,7 +150,7 @@ mod tests {
         ] {
             assert!(
                 !models.iter().any(|m| m.id == banned),
-                "{banned} must not be in the conservative catalog"
+                "{banned} must not be in the text/tool catalog"
             );
         }
     }

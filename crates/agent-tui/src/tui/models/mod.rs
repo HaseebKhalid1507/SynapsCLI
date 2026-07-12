@@ -1101,19 +1101,21 @@ mod tests {
             .iter()
             .map(|entry| entry.display_id.as_str())
             .collect();
-        assert_eq!(ids, vec!["gemini-2.5-pro", "gemini-2.5-flash"]);
+        assert_eq!(ids, vec![
+            "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ]);
         assert!(gemini
             .entries
             .iter()
             .all(|entry| entry.id.starts_with("google-gemini/")));
-        // Preview / experiment / embedding ids never leak into the TUI.
-        for banned in [
-            "gemini-3-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-3.5-flash",
-            "auto-gemini-2.5",
-            "text-embedding-004",
-        ] {
+        // Routing aliases and non-chat models never leak into the TUI.
+        for banned in ["auto-gemini-2.5", "auto-gemini-3", "text-embedding-004"] {
             assert!(!ids.contains(&banned));
         }
     }
