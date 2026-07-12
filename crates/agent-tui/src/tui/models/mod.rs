@@ -39,6 +39,11 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             name: "GitHub Copilot",
             auth_kind: DevProviderAuth::OAuth("github-copilot"),
         },
+        DevProviderSelection {
+            key: "google-gemini",
+            name: "Google Gemini (Code Assist)",
+            auth_kind: DevProviderAuth::OAuth("google-gemini"),
+        },
     ];
 
     providers.extend(
@@ -270,6 +275,7 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
         synaps_cli::auth::OAuthProviderId::OpenAiCodex,
         synaps_cli::auth::OAuthProviderId::Xai,
         synaps_cli::auth::OAuthProviderId::GitHubCopilot,
+        synaps_cli::auth::OAuthProviderId::GoogleGemini,
     ]
     .into_iter()
     .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
@@ -455,6 +461,17 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 let tier = match model.id.as_str() {
                     "gpt-5.3-codex" | "gpt-5.5" | "claude-opus-4.8" | "claude-fable-5" => "S+",
                     "gpt-5.4" | "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.7" => "S",
+                    _ => "",
+                };
+                (model.id, model.label.unwrap_or_default(), tier.to_string())
+            })
+            .collect(),
+        "google-gemini" => synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
+            .into_iter()
+            .map(|model| {
+                let tier = match model.id.as_str() {
+                    "gemini-2.5-pro" => "S",
+                    "gemini-2.5-flash" => "A",
                     _ => "",
                 };
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
@@ -1057,6 +1074,70 @@ mod tests {
         // No guessed sol / auto ids.
         assert!(!ids.contains(&"gpt-5.6-sol"));
         assert!(!ids.contains(&"auto"));
+    }
+
+    #[test]
+    fn google_gemini_section_lists_conservative_catalog_when_logged_in() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+        };
+        let sections = build_sections_from_parts(
+            "google-gemini/gemini-2.5-pro",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["google-gemini"]),
+        );
+        let gemini = sections
+            .iter()
+            .find(|section| section.provider_key == "google-gemini")
+            .expect("logged-in Google Gemini section");
+        let ids: Vec<_> = gemini
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["gemini-2.5-pro", "gemini-2.5-flash"]);
+        assert!(gemini
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("google-gemini/")));
+        // Preview / experiment / embedding ids never leak into the TUI.
+        for banned in [
+            "gemini-3-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+            "auto-gemini-2.5",
+            "text-embedding-004",
+        ] {
+            assert!(!ids.contains(&banned));
+        }
+    }
+
+    #[test]
+    fn google_gemini_section_hidden_when_not_logged_in() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+        };
+        // No login for google-gemini in the logged_in set.
+        let sections = build_sections_from_parts(
+            "claude/sonnet-4.5",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["claude"]),
+        );
+        assert!(sections
+            .iter()
+            .all(|section| section.provider_key != "google-gemini"));
     }
 
     #[test]
