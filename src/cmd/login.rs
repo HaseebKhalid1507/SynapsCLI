@@ -589,4 +589,27 @@ mod tests {
             "github-copilot"
         );
     }
+
+    #[test]
+    fn login_providers_include_google_gemini_from_descriptor() {
+        let providers = login_providers();
+        let found = find_provider(&providers, "google-gemini")
+            .expect("descriptor-driven login must surface google-gemini");
+        assert_eq!(found.key, "google-gemini");
+        assert_eq!(found.auth_kind, AuthKind::OAuth);
+        assert_eq!(found.name, "Google Gemini (Code Assist)");
+        assert!(!found.recommended);
+        // Storage key is canonical.
+        assert_eq!(oauth_storage_key(found), "google-gemini");
+        // The static Google AI Studio API-key entry stays reachable at "google".
+        let ai_studio = find_provider(&providers, "google")
+            .expect("Google AI Studio API-key entry must remain reachable");
+        assert_eq!(ai_studio.auth_kind, AuthKind::ApiKey);
+        // CLI aliases route to google-gemini except the reserved "google".
+        assert_eq!(
+            auth::provider::parse_cli_provider("gemini").unwrap().as_str(),
+            "google-gemini"
+        );
+        assert!(auth::provider::parse_cli_provider("google").is_err());
+    }
 }

@@ -215,7 +215,10 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
         // Aliases normalize only at CLI parsing; storage key remains github-copilot.
         "github-copilot" | "copilot" | "gh-copilot" => Ok(OAuthProviderId::GitHubCopilot),
         // CLI aliases only; canonical storage key is "google-gemini".
-        "google-gemini" | "google" | "gemini" | "gemini-cli" => {
+        // `google` is NOT accepted here: the static provider key "google"
+        // (Google AI Studio, API-key) already claims that CLI token and we
+        // must not silently redirect it to the Code Assist OAuth flow.
+        "google-gemini" | "gemini" | "gemini-cli" | "gemini-code-assist" => {
             Ok(OAuthProviderId::GoogleGemini)
         }
         _ => Err(format!("unknown OAuth provider: {value}")),
@@ -310,12 +313,14 @@ mod tests {
             OAuthProviderId::GoogleGemini
         );
         // CLI aliases are CLI-only; canonical FromStr must reject them.
-        assert!(OAuthProviderId::from_str("google").is_err());
         assert!(OAuthProviderId::from_str("gemini").is_err());
         assert!(OAuthProviderId::from_str("gemini-cli").is_err());
-        assert_eq!(
-            parse_cli_provider("google").unwrap(),
-            OAuthProviderId::GoogleGemini
+        // `google` MUST remain reserved for the static AI-Studio API-key
+        // provider; treating it as a Gemini OAuth alias would silently
+        // redirect existing users' `synaps login --provider google` flow.
+        assert!(
+            parse_cli_provider("google").is_err(),
+            "'google' must not resolve to google-gemini OAuth"
         );
         assert_eq!(
             parse_cli_provider("Gemini").unwrap(),
@@ -323,6 +328,10 @@ mod tests {
         );
         assert_eq!(
             parse_cli_provider("GEMINI-CLI").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+        assert_eq!(
+            parse_cli_provider("gemini-code-assist").unwrap(),
             OAuthProviderId::GoogleGemini
         );
         assert_eq!(
