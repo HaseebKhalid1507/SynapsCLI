@@ -35,6 +35,7 @@ mod generic;
 mod groq;
 mod nvidia;
 mod openrouter;
+mod xai;
 
 pub use anthropic::{
     anthropic_models_url, merge_catalog_pages, parse_anthropic_catalog_models,
@@ -45,6 +46,7 @@ pub use generic::parse_generic_catalog_models;
 pub use groq::{infer_groq_reasoning, parse_groq_catalog_models};
 pub use nvidia::{infer_nvidia_reasoning, parse_nvidia_catalog_models};
 pub use openrouter::parse_openrouter_catalog_models;
+pub use xai::{xai_model, xai_static_catalog_models, XaiModelDescriptor, XAI_TEXT_MODELS};
 
 // ─── Modality ────────────────────────────────────────────────────────────────
 
@@ -63,12 +65,12 @@ impl Modality {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
-            "text"  => Modality::Text,
+            "text" => Modality::Text,
             "image" => Modality::Image,
             "audio" => Modality::Audio,
             "video" => Modality::Video,
-            "file"  => Modality::File,
-            other   => Modality::Other(other.to_string()),
+            "file" => Modality::File,
+            other => Modality::Other(other.to_string()),
         }
     }
 }
@@ -229,21 +231,21 @@ pub fn from_static_seed(
     label: &str,
 ) -> Option<CatalogModel> {
     let mut m = CatalogModel::new(provider_key, provider_name, id)?;
-    m.label = if label.trim().is_empty() { None } else { Some(label.to_string()) };
+    m.label = if label.trim().is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    };
     m.source = CatalogSource::StaticFallback;
     m.reasoning = ReasoningSupport::Unknown;
     Some(m)
 }
 
 /// Convert all static seeds in a ProviderSpec to CatalogModel entries.
-pub fn static_seeds_from_spec(
-    spec: &super::registry::ProviderSpec,
-) -> Vec<CatalogModel> {
+pub fn static_seeds_from_spec(spec: &super::registry::ProviderSpec) -> Vec<CatalogModel> {
     spec.models
         .iter()
-        .filter_map(|(id, label, _tier)| {
-            from_static_seed(spec.key, spec.name, id, label)
-        })
+        .filter_map(|(id, label, _tier)| from_static_seed(spec.key, spec.name, id, label))
         .collect()
 }
 
@@ -330,7 +332,9 @@ async fn fetch_anthropic_catalog_models(
 }
 
 impl ModelCatalogProvider for OpenRouterCatalogProvider {
-    fn provider_key(&self) -> &'static str { "openrouter" }
+    fn provider_key(&self) -> &'static str {
+        "openrouter"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -341,7 +345,9 @@ impl ModelCatalogProvider for OpenRouterCatalogProvider {
 }
 
 impl ModelCatalogProvider for GroqCatalogProvider {
-    fn provider_key(&self) -> &'static str { "groq" }
+    fn provider_key(&self) -> &'static str {
+        "groq"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -355,7 +361,9 @@ impl ModelCatalogProvider for GroqCatalogProvider {
 }
 
 impl ModelCatalogProvider for NvidiaCatalogProvider {
-    fn provider_key(&self) -> &'static str { "nvidia" }
+    fn provider_key(&self) -> &'static str {
+        "nvidia"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -373,7 +381,9 @@ impl ModelCatalogProvider for NvidiaCatalogProvider {
 }
 
 impl ModelCatalogProvider for AnthropicCatalogProvider {
-    fn provider_key(&self) -> &'static str { "claude" }
+    fn provider_key(&self) -> &'static str {
+        "claude"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -384,7 +394,9 @@ impl ModelCatalogProvider for AnthropicCatalogProvider {
 }
 
 impl ModelCatalogProvider for CodexCatalogProvider {
-    fn provider_key(&self) -> &'static str { "openai-codex" }
+    fn provider_key(&self) -> &'static str {
+        "openai-codex"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -395,7 +407,9 @@ impl ModelCatalogProvider for CodexCatalogProvider {
 }
 
 impl ModelCatalogProvider for GenericCatalogProvider {
-    fn provider_key(&self) -> &'static str { "generic" }
+    fn provider_key(&self) -> &'static str {
+        "generic"
+    }
 
     fn fetch<'a>(
         &'a self,
@@ -512,7 +526,9 @@ mod tests {
             .expect("groq spec");
         let seeds = static_seeds_from_spec(spec);
         assert_eq!(seeds.len(), spec.models.len());
-        assert!(seeds.iter().all(|m| m.source == CatalogSource::StaticFallback));
+        assert!(seeds
+            .iter()
+            .all(|m| m.source == CatalogSource::StaticFallback));
         assert!(seeds.iter().all(|m| !m.id.is_empty()));
         assert!(seeds.iter().all(|m| m.runtime_id().starts_with("groq/")));
     }
@@ -527,7 +543,8 @@ mod tests {
     #[test]
     fn pricing_summary_has_internal_reasoning_cost_zero_is_false() {
         let p = PricingSummary {
-            prompt: None, completion: None,
+            prompt: None,
+            completion: None,
             internal_reasoning: Some("0".to_string()),
         };
         assert!(!p.has_internal_reasoning_cost());
@@ -536,7 +553,8 @@ mod tests {
     #[test]
     fn pricing_summary_has_internal_reasoning_cost_nonzero_is_true() {
         let p = PricingSummary {
-            prompt: None, completion: None,
+            prompt: None,
+            completion: None,
             internal_reasoning: Some("0.0000035".to_string()),
         };
         assert!(p.has_internal_reasoning_cost());
@@ -544,11 +562,17 @@ mod tests {
 
     #[test]
     fn catalog_provider_trait_dispatch_selects_specialized_handlers() {
-        assert_eq!(catalog_provider_for("openrouter").provider_key(), "openrouter");
+        assert_eq!(
+            catalog_provider_for("openrouter").provider_key(),
+            "openrouter"
+        );
         assert_eq!(catalog_provider_for("groq").provider_key(), "groq");
         assert_eq!(catalog_provider_for("nvidia").provider_key(), "nvidia");
         assert_eq!(catalog_provider_for("claude").provider_key(), "claude");
-        assert_eq!(catalog_provider_for("openai-codex").provider_key(), "openai-codex");
+        assert_eq!(
+            catalog_provider_for("openai-codex").provider_key(),
+            "openai-codex"
+        );
         assert_eq!(catalog_provider_for("cerebras").provider_key(), "generic");
     }
 
@@ -559,11 +583,14 @@ mod tests {
 
     #[test]
     fn anthropic_page_metadata_is_exposed_for_pagination() {
-        let page = parse_anthropic_catalog_page(r#"{
+        let page = parse_anthropic_catalog_page(
+            r#"{
             "data":[{"id":"claude-opus-4-7"}],
             "has_more": true,
             "last_id": "claude-opus-4-7"
-        }"#).expect("parse page");
+        }"#,
+        )
+        .expect("parse page");
         assert!(page.has_more);
         assert_eq!(page.last_id.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(page.models.len(), 1);
@@ -583,8 +610,12 @@ mod tests {
 
     #[test]
     fn merge_catalog_pages_dedupes_by_id() {
-        let first = parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"}]}"#).unwrap();
-        let second = parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"}]}"#).unwrap();
+        let first =
+            parse_anthropic_catalog_models(r#"{"data":[{"id":"claude-opus-4-7"}]}"#).unwrap();
+        let second = parse_anthropic_catalog_models(
+            r#"{"data":[{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"}]}"#,
+        )
+        .unwrap();
         let merged = merge_catalog_pages(vec![first, second]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "claude-opus-4-7");
@@ -675,7 +706,10 @@ mod tests {
         #[test]
         fn parses_internal_reasoning_cost_flag() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
             assert!(gemini.pricing.has_internal_reasoning_cost());
         }
 
@@ -689,38 +723,56 @@ mod tests {
         #[test]
         fn verbosity_param_maps_to_anthropic_adaptive() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let claude = models.iter().find(|m| m.id == "anthropic/claude-opus-4-7").unwrap();
-            assert_eq!(claude.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            let claude = models
+                .iter()
+                .find(|m| m.id == "anthropic/claude-opus-4-7")
+                .unwrap();
+            assert_eq!(
+                claude.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
         fn reasoning_effort_maps_to_openrouter_reasoning() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
             let o4 = models.iter().find(|m| m.id == "openai/o4-mini").unwrap();
-            assert_eq!(o4.reasoning, ReasoningSupport::OpenRouter {
-                include_reasoning: false,
-                effort: true,
-                verbosity: false,
-                internal_reasoning_priced: false,
-            });
+            assert_eq!(
+                o4.reasoning,
+                ReasoningSupport::OpenRouter {
+                    include_reasoning: false,
+                    effort: true,
+                    verbosity: false,
+                    internal_reasoning_priced: false,
+                }
+            );
         }
 
         #[test]
         fn reasoning_include_reasoning_maps_correctly() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
-            assert_eq!(gemini.reasoning, ReasoningSupport::OpenRouter {
-                include_reasoning: true,
-                effort: false,
-                verbosity: false,
-                internal_reasoning_priced: true,
-            });
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
+            assert_eq!(
+                gemini.reasoning,
+                ReasoningSupport::OpenRouter {
+                    include_reasoning: true,
+                    effort: false,
+                    verbosity: false,
+                    internal_reasoning_priced: true,
+                }
+            );
         }
 
         #[test]
         fn parses_multimodal_input() {
             let models = parse_openrouter_catalog_models(RICH_FIXTURE).expect("parse ok");
-            let gemini = models.iter().find(|m| m.id == "google/gemini-2.5-flash").unwrap();
+            let gemini = models
+                .iter()
+                .find(|m| m.id == "google/gemini-2.5-flash")
+                .unwrap();
             assert!(gemini.input_modalities.contains(&Modality::Text));
             assert!(gemini.input_modalities.contains(&Modality::Image));
             assert!(gemini.input_modalities.contains(&Modality::Audio));
@@ -756,7 +808,10 @@ mod tests {
             assert_eq!(m.max_output_tokens, Some(128_000));
             assert!(m.input_modalities.contains(&Modality::Image));
             // verbosity wins → AnthropicAdaptive
-            assert_eq!(m.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            assert_eq!(
+                m.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
@@ -785,9 +840,6 @@ mod tests {
 
     // ── Task 3: Generic handler / compat with registry ────────────────────────
 
-
-
-
     // ── Task 5: Anthropic parser and Codex static catalog ───────────────────
 
     mod anthropic {
@@ -815,12 +867,16 @@ mod tests {
             assert_eq!(model.label.as_deref(), Some("Claude Opus 4.7"));
             assert_eq!(model.context_tokens, Some(200_000));
             assert_eq!(model.max_output_tokens, Some(32_000));
-            assert_eq!(model.reasoning, ReasoningSupport::AnthropicAdaptive { adaptive: true });
+            assert_eq!(
+                model.reasoning,
+                ReasoningSupport::AnthropicAdaptive { adaptive: true }
+            );
         }
 
         #[test]
         fn parser_tolerates_missing_capabilities_as_unknown() {
-            let json = r#"{"data":[{"id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku"}]}"#;
+            let json =
+                r#"{"data":[{"id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku"}]}"#;
             let models = parse_anthropic_catalog_models(json).expect("parse anthropic");
             assert_eq!(models[0].reasoning, ReasoningSupport::Unknown);
         }
@@ -846,8 +902,12 @@ mod tests {
             assert!(!models.iter().any(|m| m.id == "gpt-5.5-pro"));
             assert!(!models.iter().any(|m| m.id == "gpt-5.4-nano"));
             assert!(!models.iter().any(|m| m.id == "gpt-5.1-codex-mini"));
-            assert!(models.iter().all(|m| m.source == CatalogSource::StaticFallback));
-            assert!(models.iter().all(|m| m.runtime_id().starts_with("openai-codex/")));
+            assert!(models
+                .iter()
+                .all(|m| m.source == CatalogSource::StaticFallback));
+            assert!(models
+                .iter()
+                .all(|m| m.runtime_id().starts_with("openai-codex/")));
         }
     }
 
@@ -871,10 +931,22 @@ mod tests {
 
         #[test]
         fn inference_maps_reasoning_families() {
-            assert_eq!(infer_groq_reasoning("openai/gpt-oss-120b"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("qwen/qwen3-32b"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("groq/compound-mini"), ReasoningSupport::GroqReasoning);
-            assert_eq!(infer_groq_reasoning("llama-3.3-70b-versatile"), ReasoningSupport::None);
+            assert_eq!(
+                infer_groq_reasoning("openai/gpt-oss-120b"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("qwen/qwen3-32b"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("groq/compound-mini"),
+                ReasoningSupport::GroqReasoning
+            );
+            assert_eq!(
+                infer_groq_reasoning("llama-3.3-70b-versatile"),
+                ReasoningSupport::None
+            );
         }
 
         #[test]
@@ -907,9 +979,18 @@ mod tests {
 
         #[test]
         fn inference_detects_thinking_and_standard_models() {
-            assert_eq!(infer_nvidia_reasoning("qwen/qwen3-next-80b-a3b-thinking"), ReasoningSupport::NvidiaInlineThinking);
-            assert_eq!(infer_nvidia_reasoning("nvidia/cosmos-reason2-8b"), ReasoningSupport::NvidiaInlineThinking);
-            assert_eq!(infer_nvidia_reasoning("meta/llama-3.3-70b-instruct"), ReasoningSupport::None);
+            assert_eq!(
+                infer_nvidia_reasoning("qwen/qwen3-next-80b-a3b-thinking"),
+                ReasoningSupport::NvidiaInlineThinking
+            );
+            assert_eq!(
+                infer_nvidia_reasoning("nvidia/cosmos-reason2-8b"),
+                ReasoningSupport::NvidiaInlineThinking
+            );
+            assert_eq!(
+                infer_nvidia_reasoning("meta/llama-3.3-70b-instruct"),
+                ReasoningSupport::None
+            );
         }
 
         #[test]
@@ -920,7 +1001,6 @@ mod tests {
             assert_eq!(models[0].id, "meta/llama-3.3-70b-instruct");
         }
     }
-
 
     mod generic_compat {
         use super::super::*;
@@ -934,8 +1014,8 @@ mod tests {
                     { "id": "openai/gpt-oss-120b" }
                 ]
             }"#;
-            let models = parse_generic_catalog_models(json, "openrouter", "OpenRouter")
-                .expect("parse ok");
+            let models =
+                parse_generic_catalog_models(json, "openrouter", "OpenRouter").expect("parse ok");
             assert_eq!(models.len(), 2);
             assert_eq!(models[0].runtime_id(), "openrouter/qwen/qwen3-coder");
             assert_eq!(models[0].display_label(), "Qwen: Qwen3 Coder");
@@ -960,8 +1040,8 @@ mod tests {
         #[test]
         fn generic_catalog_source_is_live() {
             let json = r#"{"data":[{"id":"m1","name":"Model One"}]}"#;
-            let models = parse_generic_catalog_models(json, "testprovider", "Test")
-                .expect("parse ok");
+            let models =
+                parse_generic_catalog_models(json, "testprovider", "Test").expect("parse ok");
             assert_eq!(models[0].source, CatalogSource::Live);
         }
 
@@ -997,11 +1077,15 @@ mod tests {
         fn static_seeds_from_spec_all_providers() {
             // Every registered provider should produce at least one seed
             for spec in super::super::super::registry::providers() {
-                if spec.models.is_empty() { continue; }
+                if spec.models.is_empty() {
+                    continue;
+                }
                 let seeds = super::super::static_seeds_from_spec(spec);
                 assert!(!seeds.is_empty(), "no seeds for {}", spec.key);
                 assert!(
-                    seeds.iter().all(|m| m.runtime_id().starts_with(&format!("{}/", spec.key))),
+                    seeds
+                        .iter()
+                        .all(|m| m.runtime_id().starts_with(&format!("{}/", spec.key))),
                     "runtime_id prefix wrong for {}",
                     spec.key
                 );

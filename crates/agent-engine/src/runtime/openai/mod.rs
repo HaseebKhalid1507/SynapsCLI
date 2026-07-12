@@ -71,7 +71,7 @@ pub struct ResolvedRoute {
 /// Resolve typed credential and wire dimensions. Unknown explicit prefixes fail closed.
 pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
     if let Some((prefix, rest)) = model.split_once('/') {
-        if prefix == "xai-auth" && rest == "grok-4.5" {
+        if prefix == "xai-auth" && catalog::xai_model(rest).is_some() {
             return Some(ResolvedRoute {
                 endpoint: "https://api.x.ai/v1".into(),
                 model: rest.into(),
@@ -447,17 +447,25 @@ mod tests {
 
     #[test]
     fn brokered_provider_routing_is_typed_and_fail_closed() {
-        let xai = resolve_route("xai-auth/grok-4.5").unwrap();
-        assert_eq!(
-            xai.auth,
-            AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Xai)
-        );
-        assert_eq!(xai.wire, WireProtocol::OpenAiResponses);
+        for descriptor in catalog::XAI_TEXT_MODELS {
+            let runtime_id = format!("xai-auth/{}", descriptor.id);
+            let xai = resolve_route(&runtime_id).unwrap();
+            assert_eq!(xai.model, descriptor.id);
+            assert_eq!(xai.provider, "xai-auth");
+            assert_eq!(xai.endpoint, "https://api.x.ai/v1");
+            assert_eq!(
+                xai.auth,
+                AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Xai)
+            );
+            assert_eq!(xai.wire, WireProtocol::OpenAiResponses);
+        }
         let static_route = resolve_route("groq/llama-3.3-70b-versatile").unwrap();
         assert_eq!(static_route.auth, AuthPolicy::BrokerProxy);
         assert_eq!(static_route.wire, WireProtocol::OpenAiChatCompletions);
         assert!(resolve_route("unknown-provider/model").is_none());
         assert!(resolve_route("xai-auth/not-a-real-model").is_none());
+        assert!(resolve_route("xai-auth/grok-build-0.1").is_none());
+        assert!(resolve_route("xai-auth/grok-imagine-image").is_none());
     }
 
     #[test]
