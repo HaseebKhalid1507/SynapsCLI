@@ -402,26 +402,27 @@ impl Runtime {
     }
 
     pub fn set_model(&mut self, model: String) {
-        // Strip any health/status prefix (e.g. "✅  339ms  groq/..." → "groq/...")
-        let cleaned = if let Some(pos) = model.find("claude-") {
-            model[pos..].to_string()
-        } else if let Some(pos) = model.find('/') {
-            let before = &model[..pos];
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                .map(|i| {
-                    i + before[i..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(1)
-                })
-                .unwrap_or(0);
-            model[key_start..].to_string()
-        } else {
-            model
-        };
-        self.model = cleaned;
+        // Older model pickers passed the rendered health row back here, e.g.
+        // `✅  339ms  groq/llama-3.3-70b`. Remove that exact decoration shape,
+        // rather than searching inside the ID: provider-qualified IDs may
+        // legitimately contain `claude-` after their slash.
+        let trimmed = model.trim();
+        let cleaned = trimmed
+            .split_once(char::is_whitespace)
+            .and_then(|(_, rest)| {
+                let rest = rest.trim_start();
+                let (latency, candidate) = rest.split_once(char::is_whitespace)?;
+                let millis = latency.strip_suffix("ms")?;
+                if !millis.is_empty() && millis.chars().all(|c| c.is_ascii_digit()) {
+                    let candidate = candidate.trim();
+                    if !candidate.is_empty() && !candidate.chars().any(char::is_whitespace) {
+                        return Some(candidate);
+                    }
+                }
+                None
+            })
+            .unwrap_or(trimmed);
+        self.model = cleaned.to_owned();
     }
 
     pub fn set_tools(&mut self, tools: ToolRegistry) {
@@ -1118,6 +1119,38 @@ impl Clone for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_model_preserves_qualified_provider_ids_and_bare_claude() {
+        let cases = [
+            ("github-copilot/claude-opus-4.8", "github-copilot/claude-opus-4.8"),
+            ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+            ("google/gemini-2.5-pro", "google/gemini-2.5-pro"),
+            ("openai/gpt-5", "openai/gpt-5"),
+            ("claude-opus-4-8", "claude-opus-4-8"),
+        ];
+
+        for (input, expected) in cases {
+            let mut runtime = Runtime::new_headless();
+            runtime.set_model(input.to_owned());
+            assert_eq!(runtime.model(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn set_model_strips_only_legacy_health_status_decoration() {
+        let cases = [
+            ("✅  339ms  groq/llama-3.3-70b", "groq/llama-3.3-70b"),
+            ("✅  339ms  github-copilot/claude-opus-4.8", "github-copilot/claude-opus-4.8"),
+            ("⚠️  1200ms  anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+        ];
+
+        for (input, expected) in cases {
+            let mut runtime = Runtime::new_headless();
+            runtime.set_model(input.to_owned());
+            assert_eq!(runtime.model(), expected, "input: {input}");
+        }
+    }
 
     #[tokio::test]
     async fn confirm_without_prompt_fails_closed() {
