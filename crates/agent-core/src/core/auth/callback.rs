@@ -82,7 +82,7 @@ pub async fn start_callback_server_at(
                         CallbackOutcome::Invalid
                     }
                 } else if let (Some(code), Some(state)) = (query.get("code"), query.get("state")) {
-                    if state == &expected {
+                    if state == &expected && !code.trim().is_empty() {
                         CallbackOutcome::Authorized(CallbackResult {
                             code: code.clone(),
                             state: state.clone(),
@@ -137,6 +137,27 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn empty_http_code_is_invalid_and_listener_is_released() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (rx, handle) = start_callback_server("expected".into(), port)
+            .await
+            .unwrap();
+        let response = reqwest::get(format!(
+            "http://127.0.0.1:{port}/callback?code=&state=expected"
+        ))
+        .await
+        .unwrap();
+        assert!(!response.text().await.unwrap().contains("successful</h1>"));
+        assert_eq!(rx.await.unwrap(), CallbackOutcome::Invalid);
+        handle.shutdown().await;
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .is_ok());
+    }
+
     #[test]
     fn sanitizes_provider_errors() {
         assert_eq!(sanitize("denied\nsecret=?"), "deniedsecret");

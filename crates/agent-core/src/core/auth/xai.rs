@@ -4,6 +4,7 @@ use super::{
 };
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use url::Url;
 
 pub const ISSUER: &str = "https://auth.x.ai";
@@ -183,6 +184,37 @@ fn parse_pasted_callback(input: &str, expected_state: &str) -> Option<super::Cal
     Some(super::CallbackResult { code, state })
 }
 
+async fn wait_for_callback<R>(
+    mut callback: tokio::sync::oneshot::Receiver<CallbackOutcome>,
+    input: R,
+    expected_state: &str,
+) -> Result<CallbackOutcome, String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut lines = input.lines();
+    loop {
+        tokio::select! {
+            result = &mut callback => {
+                return result.map_err(|_| "xAI callback canceled".to_string());
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if let Some(callback) = parse_pasted_callback(&line, expected_state) {
+                            return Ok(CallbackOutcome::Authorized(callback));
+                        }
+                        eprintln!("Ignoring invalid callback URL; waiting for browser callback.");
+                    }
+                    // EOF or an unavailable stdin disables only the manual fallback. The
+                    // browser listener remains authoritative and must keep running.
+                    Ok(None) | Err(_) => return callback.await.map_err(|_| "xAI callback canceled".to_string()),
+                }
+            }
+        }
+    }
+}
+
 pub async fn login() -> Result<OAuthCredentials, String> {
     let client = Client::new();
     let d = discover(&client).await?;
@@ -199,20 +231,10 @@ pub async fn login() -> Result<OAuthCredentials, String> {
         start_callback_server_at(state.clone(), "127.0.0.1", CALLBACK_PORT, "/callback").await?;
     let _ = open_browser(&url);
     eprintln!("Complete xAI sign-in in your browser. If the callback cannot connect, paste the full callback URL here.");
-    let expected = state.clone();
-    let paste = tokio::task::spawn_blocking(move || {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok()?;
-        parse_pasted_callback(&line, &expected)
-    });
-    let outcome = tokio::select! {
-        result = rx => result.map_err(|_| "xAI callback canceled".to_string())?,
-        result = paste => match result.ok().flatten() {
-            Some(callback) => CallbackOutcome::Authorized(callback),
-            None => return Err("Paste the full matching xAI callback URL; bare codes are rejected".into()),
-        }
-    };
+    let outcome =
+        wait_for_callback(rx, tokio::io::BufReader::new(tokio::io::stdin()), &state).await;
     handle.shutdown().await;
+    let outcome = outcome?;
     let callback = match outcome {
         CallbackOutcome::Authorized(v) => v,
         CallbackOutcome::Denied { error, description } => {
@@ -290,6 +312,40 @@ mod tests {
                 .code,
             "c"
         );
+    }
+
+    #[tokio::test]
+    async fn eof_and_invalid_paste_do_not_cancel_browser_callback() {
+        for input in ["", "bare-code\n"] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let input = tokio::io::BufReader::new(std::io::Cursor::new(input.as_bytes()));
+            let waiter = tokio::spawn(async move { wait_for_callback(rx, input, "s").await });
+            tokio::task::yield_now().await;
+            tx.send(CallbackOutcome::Authorized(super::super::CallbackResult {
+                code: "browser".into(),
+                state: "s".into(),
+            }))
+            .unwrap();
+            assert!(matches!(
+                waiter.await.unwrap().unwrap(),
+                CallbackOutcome::Authorized(result) if result.code == "browser"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_pasted_url_still_completes_and_drops_callback_receiver() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pasted = "http://127.0.0.1:56121/callback?code=pasted&state=s\n";
+        let outcome = wait_for_callback(
+            rx,
+            tokio::io::BufReader::new(std::io::Cursor::new(pasted.as_bytes())),
+            "s",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, CallbackOutcome::Authorized(result) if result.code == "pasted"));
+        assert!(tx.send(CallbackOutcome::Invalid).is_err());
     }
 
     #[test]
