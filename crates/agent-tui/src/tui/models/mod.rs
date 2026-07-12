@@ -29,6 +29,11 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
             name: "OpenAI Codex",
             auth_kind: DevProviderAuth::OAuth("openai-codex"),
         },
+        DevProviderSelection {
+            key: "xai-auth",
+            name: "xAI (Grok)",
+            auth_kind: DevProviderAuth::OAuth("xai-auth"),
+        },
     ];
 
     providers.extend(
@@ -258,6 +263,7 @@ fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
     [
         synaps_cli::auth::OAuthProviderId::Anthropic,
         synaps_cli::auth::OAuthProviderId::OpenAiCodex,
+        synaps_cli::auth::OAuthProviderId::Xai,
     ]
     .into_iter()
     .filter(|id| synaps_cli::auth::broker::oauth_provider_logged_in(*id))
@@ -432,6 +438,10 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
                 };
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
             })
+            .collect(),
+        "xai-auth" => synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
+            .into_iter()
+            .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
             .collect(),
         key => synaps_cli::runtime::openai::registry::providers()
             .iter()
@@ -959,6 +969,36 @@ mod tests {
             .collect();
         assert!(all_ids.contains(&"openrouter/qwen/qwen3-coder"));
         assert!(all_ids.contains(&"openrouter/google/gemma-3-27b-it"));
+    }
+
+    #[test]
+    fn logged_in_xai_provider_shows_authoritative_static_catalog_immediately() {
+        let state = ModelsModalState {
+            cursor: 0,
+            search: String::new(),
+            view: ModelsView::All,
+            collapsed: HashSet::new(),
+            favorites: BTreeSet::new(),
+            expanded: None,
+        };
+        let sections = build_sections_from_parts(
+            "xai-auth/grok-4.3",
+            &state,
+            &ProviderAvailability::default(),
+            &BTreeSet::from(["xai-auth"]),
+        );
+
+        let xai = sections
+            .iter()
+            .find(|section| section.provider_key == "xai-auth")
+            .expect("logged-in xAI section");
+        let ids: Vec<_> = xai.entries.iter().map(|entry| entry.display_id.as_str()).collect();
+        let catalog_ids: Vec<_> = synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(ids, catalog_ids);
+        assert!(xai.entries.iter().all(|entry| entry.id.starts_with("xai-auth/")));
     }
 
     #[test]
