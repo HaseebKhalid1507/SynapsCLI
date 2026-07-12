@@ -330,7 +330,10 @@ pub trait CredentialBroker: Send + Sync {
         provider: CloudProviderId,
         context_ref: &str,
         allow_stale: bool,
-    ) -> Result<Vec<CloudCatalogEntry>, BrokerError>;
+    ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
+        let _ = (context_ref, allow_stale);
+        Err(BrokerError::NotConfigured(provider.to_string()))
+    }
 
     /// Typed cloud invocation. The canonical model and normalized request are the
     /// only caller-controlled inputs; hosts, auth and signing remain broker-owned.
@@ -340,7 +343,10 @@ pub trait CredentialBroker: Send + Sync {
         context_ref: &str,
         model_id: &str,
         request: InvokeRequest,
-    ) -> Result<CloudEventStream, BrokerError>;
+    ) -> Result<CloudEventStream, BrokerError> {
+        let _ = (context_ref, model_id, request);
+        Err(BrokerError::NotConfigured(provider.to_string()))
+    }
 
     /// Non-secret provider capability/status list.
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError>;
