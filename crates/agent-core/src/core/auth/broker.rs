@@ -386,7 +386,10 @@ impl ProductionCloudBackend {
             .timeout(Duration::from_secs(90))
             .build()
             .expect("cloud HTTPS client configuration is valid");
-        Self { http, refresh_lock: Arc::new(tokio::sync::Mutex::new(())) }
+        Self {
+            http,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     fn state(&self, provider: CloudProviderId) -> Result<serde_json::Value, BrokerError> {
@@ -395,7 +398,7 @@ impl ProductionCloudBackend {
             .ok_or_else(|| BrokerError::NotConfigured(provider.to_string()))
     }
 
-    fn aws(
+    async fn aws(
         &self,
     ) -> Result<super::aws_bedrock::AwsBedrockBroker<super::aws_bedrock::AwsHttpApi>, BrokerError>
     {
@@ -406,9 +409,92 @@ impl ProductionCloudBackend {
             secret_key: String,
             session_token: String,
             expires_at: u64,
+            registered_client: serde_json::Value,
+            sso_access_token: String,
+            sso_refresh_token: Option<String>,
+            sso_expires_at: u64,
         }
-        let s: State = serde_json::from_value(self.state(CloudProviderId::AwsBedrock)?)
-            .map_err(|_| BrokerError::Credential("invalid AWS broker state".into()))?;
+        let decode = |value| {
+            serde_json::from_value::<State>(value)
+                .map_err(|_| BrokerError::Credential("invalid AWS broker state".into()))
+        };
+        let mut raw = self.state(CloudProviderId::AwsBedrock)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut s = decode(raw.clone())?;
+        if s.expires_at <= now + 60_000 {
+            // Role credentials are shared mutable broker state. Serialize refresh,
+            // then reload so waiters consume the winner's atomic commit.
+            let _guard = self.refresh_lock.lock().await;
+            raw = self.state(CloudProviderId::AwsBedrock)?;
+            s = decode(raw.clone())?;
+            if s.expires_at <= now + 60_000 {
+                let api =
+                    super::aws_bedrock::AwsHttpApi::new(self.http.clone(), &s.config.sso_region);
+                if s.sso_expires_at <= now + 60_000 {
+                    let refresh = s
+                        .sso_refresh_token
+                        .as_deref()
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            BrokerError::Credential("AWS SSO session expired; login again".into())
+                        })?;
+                    let client = super::aws_bedrock::RegisteredClient::new(
+                        s.registered_client["id"].as_str().ok_or_else(|| {
+                            BrokerError::Credential("invalid AWS client registration".into())
+                        })?,
+                        s.registered_client["secret"].as_str().ok_or_else(|| {
+                            BrokerError::Credential("invalid AWS client registration".into())
+                        })?,
+                        s.registered_client["expires_at"].as_u64().ok_or_else(|| {
+                            BrokerError::Credential("invalid AWS client registration".into())
+                        })?,
+                    );
+                    if client.expires_at <= now / 1000 {
+                        return Err(BrokerError::Credential(
+                            "AWS client registration expired; login again".into(),
+                        ));
+                    }
+                    use super::aws_bedrock::AwsApi;
+                    let token = api
+                        .create_token(
+                            &client,
+                            &s.config.sso_region,
+                            super::aws_bedrock::TokenGrant::RefreshToken(refresh),
+                        )
+                        .await
+                        .map_err(|_| {
+                            BrokerError::Credential("AWS SSO refresh rejected; login again".into())
+                        })?;
+                    raw["sso_access_token"] = token.access().into();
+                    if let Some(rotated) = token.refresh() {
+                        raw["sso_refresh_token"] = rotated.into();
+                    }
+                    raw["sso_expires_at"] = (now + token.expires_in * 1000).into();
+                    s = decode(raw.clone())?;
+                }
+                use super::aws_bedrock::AwsApi;
+                let credentials = api
+                    .get_role_credentials(
+                        &s.config.sso_region,
+                        &s.sso_access_token,
+                        &s.config.account_id,
+                        &s.config.role_name,
+                    )
+                    .await
+                    .map_err(|_| {
+                        BrokerError::Credential("AWS role refresh rejected; login again".into())
+                    })?;
+                raw["access_key"] = credentials.access_key().into();
+                raw["secret_key"] = credentials.secret_key().into();
+                raw["session_token"] = credentials.session_token().into();
+                raw["expires_at"] = credentials.expires_at.into();
+                storage::save_cloud_state("aws-bedrock", &raw).map_err(BrokerError::Credential)?;
+                s = decode(raw)?;
+            }
+        }
         let api = super::aws_bedrock::AwsHttpApi::new(self.http.clone(), &s.config.sso_region);
         Ok(super::aws_bedrock::AwsBedrockBroker::from_credentials(
             api,
@@ -445,7 +531,9 @@ impl ProductionCloudBackend {
         let _refresh = self.refresh_lock.lock().await;
         *state = self.state(CloudProviderId::AzureOpenAi)?;
         if state[key]["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
-            return state[key]["access_token"].as_str().map(str::to_owned)
+            return state[key]["access_token"]
+                .as_str()
+                .map(str::to_owned)
                 .ok_or_else(|| BrokerError::Credential("invalid Azure token state".into()));
         }
         let config: super::cloud::AzureOpenAiConfig =
@@ -504,7 +592,9 @@ impl ProductionCloudBackend {
         let _refresh = self.refresh_lock.lock().await;
         *state = self.state(CloudProviderId::GoogleVertex)?;
         if state["expires_at"].as_u64().unwrap_or(0) > now + 60_000 {
-            return state["access_token"].as_str().map(str::to_owned)
+            return state["access_token"]
+                .as_str()
+                .map(str::to_owned)
                 .ok_or_else(|| BrokerError::Credential("invalid Vertex token state".into()));
         }
         let client_id = state["client_id"]
@@ -563,7 +653,7 @@ impl CloudBackend for ProductionCloudBackend {
         }
         match provider {
             CloudProviderId::AwsBedrock => {
-                let broker = self.aws()?;
+                let broker = self.aws().await?;
                 let label = broker.public_context().bedrock_region;
                 broker
                     .catalog()
@@ -607,10 +697,11 @@ impl CloudBackend for ProductionCloudBackend {
                     if !r.status().is_success() {
                         return Err(BrokerError::Transport("Azure catalog rejected".into()));
                     }
-                    let body = r
-                        .text()
+                    let body = read_body_capped(r, MAX_CLOUD_CATALOG_BODY_BYTES)
                         .await
-                        .map_err(|_| BrokerError::Transport("Azure catalog failed".into()))?;
+                        .map_err(|_| {
+                            BrokerError::Transport("Azure catalog exceeded body limit".into())
+                        })?;
                     url = discovery
                         .accept_page(&body)
                         .map_err(|_| BrokerError::Transport("invalid Azure catalog".into()))?;
@@ -647,8 +738,9 @@ impl CloudBackend for ProductionCloudBackend {
                 for _ in 0..20 {
                     let mut url=format!("https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models",config.location,config.project_id,config.location);
                     if let Some(p) = &page {
-                        let mut parsed = url::Url::parse(&url)
-                            .map_err(|_| BrokerError::Transport("invalid Vertex catalog URL".into()))?;
+                        let mut parsed = url::Url::parse(&url).map_err(|_| {
+                            BrokerError::Transport("invalid Vertex catalog URL".into())
+                        })?;
                         parsed.query_pairs_mut().append_pair("pageToken", p);
                         url = parsed.into();
                     }
@@ -662,23 +754,32 @@ impl CloudBackend for ProductionCloudBackend {
                     if !r.status().is_success() {
                         return Err(BrokerError::Transport("Vertex catalog rejected".into()));
                     }
-                    let v: serde_json::Value = r
-                        .json()
-                        .await
-                        .map_err(|_| BrokerError::Transport("invalid Vertex catalog".into()))?;
+                    let v = cloud_catalog_json(r).await?;
                     for m in v["publisherModels"].as_array().into_iter().flatten() {
                         if let Some(name) = m["name"]
                             .as_str()
                             .filter(|n| n.starts_with("publishers/google/models/"))
                         {
-                            out.push(CloudCatalogEntry {
-                                provider,
-                                id: format!("google-vertex/{name}"),
-                                display_name: m["displayName"].as_str().unwrap_or(name).into(),
-                                context_ref: provider.as_str().into(),
-                                context_label: format!("{}/{}", config.project_id, config.location),
-                                stale: false,
-                            });
+                            if out.len() >= MAX_CLOUD_CATALOG_ENTRIES {
+                                return Err(BrokerError::Transport(
+                                    "Vertex catalog exceeded entry limit".into(),
+                                ));
+                            }
+                            if !out.iter().any(|entry: &CloudCatalogEntry| {
+                                entry.id == format!("google-vertex/{name}")
+                            }) {
+                                out.push(CloudCatalogEntry {
+                                    provider,
+                                    id: format!("google-vertex/{name}"),
+                                    display_name: m["displayName"].as_str().unwrap_or(name).into(),
+                                    context_ref: provider.as_str().into(),
+                                    context_label: format!(
+                                        "{}/{}",
+                                        config.project_id, config.location
+                                    ),
+                                    stale: false,
+                                });
+                            }
                         }
                     }
                     page = v["nextPageToken"].as_str().map(str::to_owned);
@@ -723,7 +824,7 @@ impl CloudBackend for ProductionCloudBackend {
         }
         match provider {
             CloudProviderId::AwsBedrock => {
-                let broker = self.aws()?;
+                let broker = self.aws().await?;
                 let events = if request.stream {
                     broker
                         .converse_stream(model_id, request)
@@ -887,6 +988,16 @@ impl CloudBackend for ProductionCloudBackend {
             }
         }
     }
+}
+
+const MAX_CLOUD_CATALOG_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CLOUD_CATALOG_ENTRIES: usize = 10_000;
+
+/// Read one catalog page without allowing an upstream to allocate an unbounded body.
+async fn cloud_catalog_json(resp: reqwest::Response) -> Result<serde_json::Value, BrokerError> {
+    let body = read_body_capped(resp, MAX_CLOUD_CATALOG_BODY_BYTES).await?;
+    serde_json::from_str(&body)
+        .map_err(|_| BrokerError::Transport("invalid cloud catalog response".into()))
 }
 
 /// In-process credential broker. This module is the ONLY place runtime-serving
