@@ -953,8 +953,15 @@ impl CloudBackend for ProductionCloudBackend {
                 }
                 if request.stream {
                     use futures::StreamExt;
-                    let stream =
-                        sse_json_stream(r).filter_map(|item| async move {
+                    use std::sync::{
+                        atomic::{AtomicBool, Ordering},
+                        Arc,
+                    };
+                    let terminal = Arc::new(AtomicBool::new(false));
+                    let seen = terminal.clone();
+                    let events = sse_json_stream(r).filter_map(move |item| {
+                        let seen = seen.clone();
+                        async move {
                             match item {
                                 Ok(Some(v)) => v["delta"]
                                     .as_str()
@@ -964,10 +971,29 @@ impl CloudBackend for ProductionCloudBackend {
                                             delta: delta.into(),
                                         })
                                     }),
-                                Ok(None) => Some(Ok(CloudEvent::Done)),
+                                Ok(None) => {
+                                    seen.store(true, Ordering::SeqCst);
+                                    Some(Ok(CloudEvent::Done))
+                                }
                                 Err(error) => Some(Err(error)),
                             }
-                        });
+                        }
+                    });
+                    let stream = events.chain(futures::stream::unfold(
+                        (terminal, false),
+                        |(terminal, emitted)| async move {
+                            if terminal.load(Ordering::SeqCst) || emitted {
+                                None
+                            } else {
+                                Some((
+                                    Err(BrokerError::Transport(
+                                        "Azure stream ended without [DONE]".into(),
+                                    )),
+                                    (terminal, true),
+                                ))
+                            }
+                        },
+                    ));
                     Ok(Box::pin(stream))
                 } else {
                     let text = read_body_capped(r, MAX_CLOUD_STREAM_EVENT_BYTES).await?;
@@ -1098,18 +1124,21 @@ impl CloudBackend for ProductionCloudBackend {
                             }
                             futures::stream::iter(out)
                         })
-                        .chain(futures::stream::unfold(terminal, |terminal| async move {
-                            if terminal.load(Ordering::SeqCst) {
-                                None
-                            } else {
-                                Some((
-                                    Err(BrokerError::Transport(
-                                        "Vertex stream ended without finish metadata".into(),
-                                    )),
-                                    terminal,
-                                ))
-                            }
-                        }));
+                        .chain(futures::stream::unfold(
+                            (terminal, false),
+                            |(terminal, emitted)| async move {
+                                if terminal.load(Ordering::SeqCst) || emitted {
+                                    None
+                                } else {
+                                    Some((
+                                        Err(BrokerError::Transport(
+                                            "Vertex stream ended without finish metadata".into(),
+                                        )),
+                                        (terminal, true),
+                                    ))
+                                }
+                            },
+                        ));
                     Ok(Box::pin(stream))
                 } else {
                     let text = read_body_capped(r, MAX_CLOUD_STREAM_EVENT_BYTES).await?;
@@ -1950,14 +1979,29 @@ impl CredentialBroker for RemoteBroker {
         use futures::StreamExt;
         let chunks = Box::pin(resp.bytes_stream());
         let stream = futures::stream::unfold(
-            (chunks, Vec::<u8>::new()),
-            |(mut chunks, mut buffer)| async move {
+            (chunks, Vec::<u8>::new(), false, false),
+            |(mut chunks, mut buffer, done, failed)| async move {
+                if failed {
+                    return None;
+                }
                 loop {
                     if let Some(end) = buffer.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = buffer.drain(..=end).collect();
-                        let event = serde_json::from_slice::<CloudEvent>(&line[..end])
+                        let parsed = serde_json::from_slice::<CloudEvent>(&line[..end])
                             .map_err(|_| BrokerError::Transport("invalid cloud event".into()));
-                        return Some((event, (chunks, buffer)));
+                        let event = match parsed {
+                            Ok(CloudEvent::Done) if done => Err(BrokerError::Transport(
+                                "duplicate cloud terminal event".into(),
+                            )),
+                            Ok(CloudEvent::Done) => Ok(CloudEvent::Done),
+                            Ok(_) if done => Err(BrokerError::Transport(
+                                "cloud data followed terminal event".into(),
+                            )),
+                            other => other,
+                        };
+                        let next_done = done || matches!(event, Ok(CloudEvent::Done));
+                        let next_failed = event.is_err();
+                        return Some((event, (chunks, buffer, next_done, next_failed)));
                     }
                     match chunks.next().await {
                         Some(Ok(chunk))
@@ -1968,20 +2012,28 @@ impl CredentialBroker for RemoteBroker {
                         Some(Ok(_)) => {
                             return Some((
                                 Err(BrokerError::Transport("cloud event exceeded limit".into())),
-                                (chunks, Vec::new()),
+                                (chunks, Vec::new(), done, true),
                             ))
                         }
                         Some(Err(_)) => {
                             return Some((
                                 Err(BrokerError::Transport("broker stream failed".into())),
-                                (chunks, Vec::new()),
+                                (chunks, Vec::new(), done, true),
                             ))
                         }
-                        None if buffer.is_empty() => return None,
+                        None if buffer.is_empty() && done => return None,
+                        None if buffer.is_empty() => {
+                            return Some((
+                                Err(BrokerError::Transport(
+                                    "cloud stream ended without terminal event".into(),
+                                )),
+                                (chunks, Vec::new(), done, true),
+                            ))
+                        }
                         None => {
                             return Some((
                                 Err(BrokerError::Transport("truncated cloud event".into())),
-                                (chunks, Vec::new()),
+                                (chunks, Vec::new(), done, true),
                             ))
                         }
                     }
@@ -2096,6 +2148,73 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn spawn_ndjson(body: &'static str) -> String {
+        use axum::{body::Body, routing::post, Router};
+        use bytes::Bytes;
+        let app = Router::new().route(
+            "/cloud/invoke",
+            post(move || async move {
+                let chunks = body
+                    .as_bytes()
+                    .chunks(3)
+                    .map(|chunk| Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(chunk)));
+                axum::response::Response::builder()
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn remote_events(body: &'static str) -> Vec<Result<CloudEvent, BrokerError>> {
+        use futures::StreamExt;
+        let broker = RemoteBroker::new(
+            spawn_ndjson(body).await,
+            "opaque-machine-token",
+            reqwest::Client::new(),
+            super::super::TokenCache::new(),
+        );
+        broker
+            .cloud_invoke(
+                CloudProviderId::GoogleVertex,
+                "ctx-opaque",
+                "google-vertex/publishers/google/models/test",
+                InvokeRequest {
+                    messages: vec![],
+                    tools: vec![],
+                    stream: true,
+                    options: Default::default(),
+                },
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn remote_ndjson_requires_exactly_one_terminal_and_stops_after_error() {
+        let valid =
+            remote_events("{\"type\":\"text_delta\",\"delta\":\"hi\"}\n{\"type\":\"done\"}\n")
+                .await;
+        assert_eq!(valid.len(), 2);
+        assert!(matches!(valid[1], Ok(CloudEvent::Done)));
+
+        for body in [
+            "{\"type\":\"text_delta\",\"delta\":\"hi\"}\n",
+            "{\"type\":\"done\"}\n{\"type\":\"done\"}\n",
+            "{\"type\":\"done\"}\n{\"type\":\"text_delta\",\"delta\":\"late\"}\n",
+        ] {
+            let events = remote_events(body).await;
+            assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+            assert!(events.last().unwrap().is_err());
+        }
+    }
 
     /// The per-provider endpoint allowlist: a signed proxy request cannot be
     /// steered at other same-host endpoints (key management, billing, …).
