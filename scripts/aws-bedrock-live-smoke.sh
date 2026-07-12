@@ -8,4 +8,4 @@ for v in SYNAPS_AWS_SSO_START_URL SYNAPS_AWS_SSO_REGION SYNAPS_AWS_ACCOUNT_ID SY
 done
 # Never echo environment values: they include account context and may be sensitive.
 echo 'AWS Bedrock live smoke requested; secret-safe evidence only.'
-CARGO_BUILD_JOBS=8 cargo test -p synaps-core --test aws_bedrock_live --features aws-live -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=8 cargo test -p synaps-core --test aws_bedrock_live -- --ignored --test-threads=1

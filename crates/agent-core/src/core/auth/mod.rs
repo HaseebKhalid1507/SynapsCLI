@@ -60,8 +60,8 @@ pub use provider::{
 };
 pub use static_providers::{static_provider, StaticProviderSpec, LOCAL_PROVIDER_KEY};
 pub use storage::{
-    auth_file_path, load_auth, load_provider_auth, load_static_key, save_auth, save_provider_auth,
-    save_static_key,
+    auth_file_path, load_auth, load_cloud_state, load_provider_auth, load_static_key, save_auth,
+    save_cloud_state, save_provider_auth, save_static_key,
 };
 pub use token::{
     ensure_fresh_provider_token, ensure_fresh_token, exchange_code_for_tokens, refresh_token,
