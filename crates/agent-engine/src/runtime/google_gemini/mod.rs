@@ -3,6 +3,7 @@
 //! Experimental. See docs/google-gemini-oauth-spec.md.
 
 pub mod setup;
+pub mod stream;
 pub mod translate;
 
 pub use setup::{
@@ -11,7 +12,9 @@ pub use setup::{
     ONBOARDING_POLL_INTERVAL,
 };
 
+pub use stream::{stream_gemini, StreamError};
+
 pub use translate::{
-    from_stream_line, translate_generate_content_request, GeminiFunctionCall, GeminiPart,
-    GeminiStreamEvent, MAX_INBOUND_LINE_BYTES,
+    from_stream_line, translate_generate_content_request, ChatTurn, GeminiFunctionCall,
+    GeminiPart, GeminiStreamEvent, ToolSpec, MAX_INBOUND_LINE_BYTES,
 };

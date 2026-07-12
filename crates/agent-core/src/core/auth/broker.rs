@@ -297,6 +297,8 @@ pub struct LocalBroker {
     local_base_url: Option<String>,
     /// Test seam: overrides the pinned Anthropic usage URL.
     anthropic_usage_url: Option<String>,
+    /// Test seam: overrides the pinned cloudcode-pa base URL.
+    google_gemini_base_url: Option<String>,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
@@ -309,6 +311,7 @@ impl LocalBroker {
             http,
             local_base_url: None,
             anthropic_usage_url: None,
+            google_gemini_base_url: None,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
         }
@@ -318,6 +321,20 @@ impl LocalBroker {
     pub fn with_local_base_url(http: reqwest::Client, base_url: impl Into<String>) -> Self {
         Self {
             local_base_url: Some(base_url.into()),
+            ..Self::new(http)
+        }
+    }
+
+    /// Test seam: point the pinned Google Code Assist host at a loopback fake.
+    /// Production code must never call this — it only relaxes the base URL,
+    /// not any of the path allowlist / bearer / redirect-denial invariants.
+    #[doc(hidden)]
+    pub fn with_google_gemini_base_url_for_tests(
+        http: reqwest::Client,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            google_gemini_base_url: Some(base_url.into().trim_end_matches('/').to_string()),
             ..Self::new(http)
         }
     }
@@ -413,10 +430,11 @@ impl LocalBroker {
             // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
             // broker-owned; runtime never receives it.
             let token = self.access_token(OAuthProviderId::GoogleGemini).await?;
-            (
-                token.token,
-                GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string(),
-            )
+            let base = self
+                .google_gemini_base_url
+                .clone()
+                .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
+            (token.token, base)
         } else {
             (
                 self.resolve_static_key(&request.provider)?,
