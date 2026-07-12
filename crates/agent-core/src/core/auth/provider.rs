@@ -19,6 +19,7 @@ pub enum OAuthProviderId {
     OpenAiCodex,
     Xai,
     GitHubCopilot,
+    GoogleGemini,
 }
 
 impl OAuthProviderId {
@@ -28,6 +29,7 @@ impl OAuthProviderId {
             Self::OpenAiCodex => "openai-codex",
             Self::Xai => "xai-auth",
             Self::GitHubCopilot => "github-copilot",
+            Self::GoogleGemini => "google-gemini",
         }
     }
 }
@@ -46,6 +48,7 @@ impl FromStr for OAuthProviderId {
             "openai-codex" => Ok(Self::OpenAiCodex),
             "xai-auth" => Ok(Self::Xai),
             "github-copilot" => Ok(Self::GitHubCopilot),
+            "google-gemini" => Ok(Self::GoogleGemini),
             _ => Err(format!("unknown canonical OAuth provider id: {value}")),
         }
     }
@@ -91,6 +94,7 @@ pub enum ProviderBehavior {
     OpenAiCodex,
     Xai,
     GitHubCopilot,
+    GoogleGemini,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,7 +159,7 @@ pub fn registry() -> OAuthProviderRegistry {
     OAuthProviderRegistry::validate(DESCRIPTORS, []).expect("built-in OAuth registry must be valid")
 }
 
-pub const DESCRIPTORS: [OAuthProviderDescriptor; 4] = [
+pub const DESCRIPTORS: [OAuthProviderDescriptor; 5] = [
     OAuthProviderDescriptor {
         id: OAuthProviderId::Anthropic,
         display_name: "Claude",
@@ -190,6 +194,16 @@ pub const DESCRIPTORS: [OAuthProviderDescriptor; 4] = [
         broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
         behavior: ProviderBehavior::GitHubCopilot,
     },
+    OAuthProviderDescriptor {
+        id: OAuthProviderId::GoogleGemini,
+        display_name: "Google Gemini (Code Assist)",
+        description: "Google account OAuth for Gemini CLI / Code Assist (experimental)",
+        recommended: false,
+        // Broker keeps the Google refresh token; runtime only ever sees the
+        // short-lived access token via AccessToken.
+        broker_strategy: BrokerCredentialStrategy::OAuthAccessToken,
+        behavior: ProviderBehavior::GoogleGemini,
+    },
 ];
 
 /// CLI-only normalization. Internal callers must carry the canonical typed ID.
@@ -200,6 +214,10 @@ pub fn parse_cli_provider(value: &str) -> Result<OAuthProviderId, String> {
         "xai-auth" => Ok(OAuthProviderId::Xai),
         // Aliases normalize only at CLI parsing; storage key remains github-copilot.
         "github-copilot" | "copilot" | "gh-copilot" => Ok(OAuthProviderId::GitHubCopilot),
+        // CLI aliases only; canonical storage key is "google-gemini".
+        "google-gemini" | "google" | "gemini" | "gemini-cli" => {
+            Ok(OAuthProviderId::GoogleGemini)
+        }
         _ => Err(format!("unknown OAuth provider: {value}")),
     }
 }
@@ -214,6 +232,7 @@ pub async fn login(id: OAuthProviderId) -> Result<OAuthCredentials, String> {
         ProviderBehavior::OpenAiCodex => super::providers::openai_codex::login().await,
         ProviderBehavior::Xai => super::providers::xai::login().await,
         ProviderBehavior::GitHubCopilot => super::providers::github_copilot::login().await,
+        ProviderBehavior::GoogleGemini => super::providers::google_gemini::login().await,
     }
 }
 
@@ -234,6 +253,9 @@ pub async fn refresh(
         ProviderBehavior::Xai => super::providers::xai::refresh(client, refresh).await,
         ProviderBehavior::GitHubCopilot => {
             super::providers::github_copilot::refresh(client, refresh).await
+        }
+        ProviderBehavior::GoogleGemini => {
+            super::providers::google_gemini::refresh(client, refresh).await
         }
     }
 }
@@ -277,6 +299,49 @@ mod tests {
             OAuthProviderId::Anthropic
         );
         assert!(OAuthProviderId::from_str("claude").is_err());
+    }
+
+    #[test]
+    fn google_gemini_canonical_id_and_cli_aliases() {
+        // Canonical wire/storage id is exactly "google-gemini".
+        assert_eq!(OAuthProviderId::GoogleGemini.as_str(), "google-gemini");
+        assert_eq!(
+            OAuthProviderId::from_str("google-gemini").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+        // CLI aliases are CLI-only; canonical FromStr must reject them.
+        assert!(OAuthProviderId::from_str("google").is_err());
+        assert!(OAuthProviderId::from_str("gemini").is_err());
+        assert!(OAuthProviderId::from_str("gemini-cli").is_err());
+        assert_eq!(
+            parse_cli_provider("google").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+        assert_eq!(
+            parse_cli_provider("Gemini").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+        assert_eq!(
+            parse_cli_provider("GEMINI-CLI").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+        assert_eq!(
+            parse_cli_provider("google-gemini").unwrap(),
+            OAuthProviderId::GoogleGemini
+        );
+
+        let registry = registry();
+        let desc = registry
+            .get(OAuthProviderId::GoogleGemini)
+            .expect("google-gemini descriptor must be registered");
+        assert_eq!(desc.id, OAuthProviderId::GoogleGemini);
+        // Broker keeps refresh; only vends access token + expiry.
+        assert_eq!(
+            desc.broker_strategy,
+            BrokerCredentialStrategy::OAuthAccessToken
+        );
+        assert_eq!(desc.behavior, ProviderBehavior::GoogleGemini);
+        assert!(!desc.recommended, "gemini is experimental — not recommended");
     }
 
     #[test]

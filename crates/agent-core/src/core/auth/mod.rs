@@ -16,6 +16,7 @@ mod browser;
 mod callback;
 mod credential_source;
 pub mod github_copilot;
+pub mod google_gemini;
 mod openai_codex;
 mod pkce;
 pub mod provider;
