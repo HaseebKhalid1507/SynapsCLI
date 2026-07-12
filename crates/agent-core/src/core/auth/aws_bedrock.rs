@@ -318,7 +318,7 @@ impl<A: AwsApi> AwsBedrockBroker<A> {
             "/foundation-models",
             b"",
             &self.credentials,
-            1_700_000_000,
+            chrono::Utc::now().timestamp().max(0) as u64,
         )?;
         Ok(self
             .api
@@ -348,7 +348,7 @@ impl<A: AwsApi> AwsBedrockBroker<A> {
             &path,
             &body,
             &self.credentials,
-            1_700_000_000,
+            chrono::Utc::now().timestamp().max(0) as u64,
         )?;
         self.api.converse(r).await
     }
@@ -366,11 +366,245 @@ impl<A: AwsApi> AwsBedrockBroker<A> {
             &path,
             &body,
             &self.credentials,
-            1_700_000_000,
+            chrono::Utc::now().timestamp().max(0) as u64,
         )?;
         self.api.converse_stream(r).await
     }
 }
+
+#[derive(Clone)]
+pub struct AwsHttpApi {
+    http: reqwest::Client,
+    sso_region: String,
+}
+impl AwsHttpApi {
+    pub fn new(http: reqwest::Client, sso_region: impl Into<String>) -> Self {
+        Self {
+            http,
+            sso_region: sso_region.into(),
+        }
+    }
+}
+fn aws_json_error(status: reqwest::StatusCode) -> AwsError {
+    if status.is_success() {
+        AwsError::Upstream
+    } else {
+        AwsError::Upstream
+    }
+}
+#[async_trait]
+impl AwsApi for AwsHttpApi {
+    async fn register_client(&self, region: &str) -> Result<RegisteredClient, AwsError> {
+        let u = format!("https://oidc.{region}.amazonaws.com/client/register");
+        let v:serde_json::Value=self.http.post(u).json(&serde_json::json!({"clientName":"synaps-cli","clientType":"public","scopes":["sso:account:access"]})).send().await.map_err(|_|AwsError::Upstream)?.error_for_status().map_err(|e|aws_json_error(e.status().unwrap_or(reqwest::StatusCode::BAD_GATEWAY)))?.json().await.map_err(|_|AwsError::Upstream)?;
+        Ok(RegisteredClient::new(
+            v["clientId"].as_str().ok_or(AwsError::Upstream)?,
+            v["clientSecret"].as_str().ok_or(AwsError::Upstream)?,
+            v["clientSecretExpiresAt"]
+                .as_u64()
+                .ok_or(AwsError::Upstream)?,
+        ))
+    }
+    async fn start_device_authorization(
+        &self,
+        c: &RegisteredClient,
+        start: &str,
+    ) -> Result<DeviceAuthorization, AwsError> {
+        let u = format!(
+            "https://oidc.{}.amazonaws.com/device_authorization",
+            self.sso_region
+        );
+        let v: serde_json::Value = self
+            .http
+            .post(u)
+            .json(&serde_json::json!({"clientId":c.id,"clientSecret":c.secret,"startUrl":start}))
+            .send()
+            .await
+            .map_err(|_| AwsError::Upstream)?
+            .error_for_status()
+            .map_err(|_| AwsError::Upstream)?
+            .json()
+            .await
+            .map_err(|_| AwsError::Upstream)?;
+        Ok(DeviceAuthorization::new(
+            v["deviceCode"].as_str().ok_or(AwsError::Upstream)?,
+            v["userCode"].as_str().ok_or(AwsError::Upstream)?,
+            v.get("verificationUriComplete")
+                .or_else(|| v.get("verificationUri"))
+                .and_then(|x| x.as_str())
+                .ok_or(AwsError::Upstream)?,
+            v["interval"].as_u64().unwrap_or(5),
+            v["expiresIn"].as_u64().ok_or(AwsError::Upstream)?,
+        ))
+    }
+    async fn create_token(
+        &self,
+        c: &RegisteredClient,
+        region: &str,
+        g: TokenGrant<'_>,
+    ) -> Result<SsoToken, AwsError> {
+        let (grant, key) = match g {
+            TokenGrant::DeviceCode(x) => (
+                "urn:ietf:params:oauth:grant-type:device_code",
+                ("deviceCode", x),
+            ),
+            TokenGrant::RefreshToken(x) => ("refresh_token", ("refreshToken", x)),
+        };
+        let mut body =
+            serde_json::json!({"clientId":c.id,"clientSecret":c.secret,"grantType":grant});
+        body[key.0] = key.1.into();
+        let r = self
+            .http
+            .post(format!("https://oidc.{region}.amazonaws.com/token"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| AwsError::Upstream)?;
+        if !r.status().is_success() {
+            let t = r.text().await.unwrap_or_default();
+            return Err(if t.contains("AuthorizationPending") {
+                AwsError::AuthorizationPending
+            } else if t.contains("SlowDown") {
+                AwsError::SlowDown
+            } else {
+                AwsError::AuthorizationFailed
+            });
+        }
+        let v: serde_json::Value = r.json().await.map_err(|_| AwsError::Upstream)?;
+        Ok(SsoToken::new(
+            v["accessToken"].as_str().ok_or(AwsError::Upstream)?,
+            v["refreshToken"].as_str(),
+            v["expiresIn"].as_u64().ok_or(AwsError::Upstream)?,
+        ))
+    }
+    async fn list_accounts(&self, r: &str, t: &str) -> Result<Vec<Account>, AwsError> {
+        let v: serde_json::Value = self
+            .http
+            .get(format!(
+                "https://portal.sso.{r}.amazonaws.com/assignment/accounts"
+            ))
+            .header("x-amz-sso_bearer_token", t)
+            .send()
+            .await
+            .map_err(|_| AwsError::Upstream)?
+            .error_for_status()
+            .map_err(|_| AwsError::Upstream)?
+            .json()
+            .await
+            .map_err(|_| AwsError::Upstream)?;
+        Ok(v["accountList"]
+            .as_array()
+            .ok_or(AwsError::Upstream)?
+            .iter()
+            .filter_map(|x| {
+                Some(Account {
+                    id: x["accountId"].as_str()?.into(),
+                    name: x["accountName"].as_str().unwrap_or("").into(),
+                })
+            })
+            .collect())
+    }
+    async fn list_account_roles(&self, r: &str, t: &str, a: &str) -> Result<Vec<Role>, AwsError> {
+        let v: serde_json::Value = self
+            .http
+            .get(format!(
+                "https://portal.sso.{r}.amazonaws.com/assignment/roles?account_id={a}"
+            ))
+            .header("x-amz-sso_bearer_token", t)
+            .send()
+            .await
+            .map_err(|_| AwsError::Upstream)?
+            .error_for_status()
+            .map_err(|_| AwsError::Upstream)?
+            .json()
+            .await
+            .map_err(|_| AwsError::Upstream)?;
+        Ok(v["roleList"]
+            .as_array()
+            .ok_or(AwsError::Upstream)?
+            .iter()
+            .filter_map(|x| {
+                Some(Role {
+                    name: x["roleName"].as_str()?.into(),
+                })
+            })
+            .collect())
+    }
+    async fn get_role_credentials(
+        &self,
+        r: &str,
+        t: &str,
+        a: &str,
+        role: &str,
+    ) -> Result<RoleCredentials, AwsError> {
+        let v:serde_json::Value=self.http.get(format!("https://portal.sso.{r}.amazonaws.com/federation/credentials?account_id={a}&role_name={role}")).header("x-amz-sso_bearer_token",t).send().await.map_err(|_|AwsError::Upstream)?.error_for_status().map_err(|_|AwsError::Upstream)?.json().await.map_err(|_|AwsError::Upstream)?;
+        let c = &v["roleCredentials"];
+        Ok(RoleCredentials::new(
+            c["accessKeyId"].as_str().ok_or(AwsError::Upstream)?,
+            c["secretAccessKey"].as_str().ok_or(AwsError::Upstream)?,
+            c["sessionToken"].as_str().ok_or(AwsError::Upstream)?,
+            c["expiration"].as_u64().ok_or(AwsError::Upstream)?,
+        ))
+    }
+    async fn list_foundation_models(
+        &self,
+        q: SignedRequest,
+    ) -> Result<Vec<FoundationModel>, AwsError> {
+        let v = self.send_signed(q).await?;
+        Ok(v["modelSummaries"]
+            .as_array()
+            .ok_or(AwsError::Upstream)?
+            .iter()
+            .filter_map(|x| {
+                Some(FoundationModel::new(
+                    x["modelId"].as_str()?,
+                    x["modelName"].as_str().unwrap_or(""),
+                    x["inputModalities"].as_array()?.iter().any(|v| v == "TEXT"),
+                    x["inferenceTypesSupported"].as_array().is_some(),
+                ))
+            })
+            .collect())
+    }
+    async fn converse(&self, q: SignedRequest) -> Result<ConverseOutput, AwsError> {
+        let v = self.send_signed(q).await?;
+        Ok(ConverseOutput {
+            text: v
+                .pointer("/output/message/content/0/text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .into(),
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: v["usage"]["inputTokens"].as_u64().unwrap_or(0),
+                output_tokens: v["usage"]["outputTokens"].as_u64().unwrap_or(0),
+            },
+        })
+    }
+    async fn converse_stream(&self, _: SignedRequest) -> Result<Vec<ConverseEvent>, AwsError> {
+        Err(AwsError::Upstream)
+    }
+}
+impl AwsHttpApi {
+    async fn send_signed(&self, q: SignedRequest) -> Result<serde_json::Value, AwsError> {
+        let url = format!("https://{}{}", q.host, q.path);
+        let mut b = match q.method {
+            "GET" => self.http.get(url),
+            _ => self.http.post(url).body(q.body),
+        };
+        for (k, v) in q.headers {
+            b = b.header(k, v)
+        }
+        b.send()
+            .await
+            .map_err(|_| AwsError::Upstream)?
+            .error_for_status()
+            .map_err(|_| AwsError::Upstream)?
+            .json()
+            .await
+            .map_err(|_| AwsError::Upstream)
+    }
+}
+
 fn valid_model(v: &str) -> Result<&str, AwsError> {
     let v = v
         .strip_prefix("aws-bedrock/")
