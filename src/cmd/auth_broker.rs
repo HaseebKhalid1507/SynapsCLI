@@ -384,6 +384,8 @@ fn build_router(state: BrokerState) -> Router {
         .route("/token", get(token))
         .route("/proxy", post(proxy))
         .route("/usage", get(usage))
+        .route("/cloud/catalog", post(cloud_catalog))
+        .route("/cloud/invoke", post(cloud_invoke))
         .route("/capabilities", get(capabilities))
         // Bound inbound request bodies to the broker's typed proxy limit.
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -570,6 +572,93 @@ async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::respo
     match st.local.anthropic_usage().await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(e) => broker_error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudCatalogRequest {
+    provider: auth::CloudProviderId,
+    context_ref: String,
+    #[serde(default)]
+    allow_stale: bool,
+}
+
+async fn cloud_catalog(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<CloudCatalogRequest>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"bad machine auth"})),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st
+        .local
+        .cloud_catalog(request.provider, &request.context_ref, request.allow_stale)
+        .await
+    {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(error) => broker_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudInvokeRequest {
+    provider: auth::CloudProviderId,
+    context_ref: String,
+    model_id: String,
+    request: auth::InvokeRequest,
+}
+
+async fn cloud_invoke(
+    State(st): State<BrokerState>,
+    headers: HeaderMap,
+    Json(request): Json<CloudInvokeRequest>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"bad machine auth"})),
+        )
+            .into_response();
+    }
+    use synaps_cli::auth::CredentialBroker;
+    match st
+        .local
+        .cloud_invoke(
+            request.provider,
+            &request.context_ref,
+            &request.model_id,
+            request.request,
+        )
+        .await
+    {
+        Ok(stream) => {
+            // NDJSON framing survives arbitrary HTTP chunk boundaries.
+            let body = axum::body::Body::from_stream(stream.map(|event| {
+                event
+                    .and_then(|event| {
+                        serde_json::to_vec(&event)
+                            .map(|mut bytes| {
+                                bytes.push(b'\n');
+                                bytes::Bytes::from(bytes)
+                            })
+                            .map_err(|e| auth::BrokerError::Transport(e.to_string()))
+                    })
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }));
+            (
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson")],
+                body,
+            )
+                .into_response()
+        }
+        Err(error) => broker_error_response(error),
     }
 }
 
