@@ -16,9 +16,10 @@ impl Tool for SubagentStatusTool {
 
     fn description(&self) -> &str {
         "Poll the current state of a reactive subagent. Returns status \
-         (running/finished/timed_out/failed), the last 500 characters of output \
+         (running/completed/cancelled/timed_out/failed), the last 500 characters of output \
          produced so far, elapsed time in seconds, and the number of tool calls \
-         made. Non-blocking — returns immediately."
+         made. If the status is 'failed', an 'error' field contains the failure reason. \
+         Non-blocking — returns immediately."
     }
 
     fn parameters(&self) -> Value {
@@ -57,7 +58,8 @@ impl Tool for SubagentStatusTool {
         // Clone all needed data under the lock, then drop lock before char traversal
         let full: String = handle.partial_output();
         let agent_name = handle.agent_name.clone();
-        let status_str = handle.status().as_str().to_string();
+        let status = handle.status();
+        let status_str = status.as_str().to_string();
         let elapsed = handle.elapsed_secs();
         let tool_count = handle.tool_log().len();
         let _ = handle;
@@ -70,13 +72,17 @@ impl Tool for SubagentStatusTool {
             full
         };
 
-        Ok(json!({
+        let mut resp = json!({
             "handle_id":      handle_id,
             "agent_name":     agent_name,
             "status":         status_str,
             "partial_output": partial_output,
             "elapsed_secs":   (elapsed * 10.0).round() / 10.0,
             "tool_count":     tool_count
-        }).to_string())
+        });
+        if let Some(reason) = status.failure_reason() {
+            resp["error"] = json!(reason);
+        }
+        Ok(resp.to_string())
     }
 }

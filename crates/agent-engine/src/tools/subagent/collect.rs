@@ -87,12 +87,16 @@ impl Tool for SubagentCollectTool {
         }
 
         // Done — return full result including collected flag for idempotency signaling
-        Ok(json!({
+        let mut body = json!({
             "handle_id": handle_id,
             "status":    status.as_str(),
             "output":    output,
             "collected": already_collected,
-        }).to_string())
+        });
+        if let Some(reason) = status.failure_reason() {
+            body["error"] = json!(reason);
+        }
+        Ok(body.to_string())
     }
 }
 

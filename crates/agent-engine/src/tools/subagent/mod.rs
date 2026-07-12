@@ -46,10 +46,8 @@ pub(crate) fn apply_subagent_runtime_policy(
 /// Build the subagent tool registry: extension tools if the routing manager
 /// has a shared registry, otherwise the bare without_subagent set.
 ///
-/// Single source of truth for both start.rs and resume.rs — divergence is
-/// structurally impossible when both call this.
-///
-/// Mirrors start.rs:174-185 exactly.
+/// Single source of truth for all three spawn paths (oneshot, start, resume).
+/// Divergence is structurally impossible when all three call this function.
 pub(crate) async fn subagent_tools() -> crate::ToolRegistry {
     if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
         let mgr = ext_mgr.read().await;

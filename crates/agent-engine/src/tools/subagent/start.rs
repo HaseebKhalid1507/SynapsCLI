@@ -323,6 +323,7 @@ impl Tool for SubagentStartTool {
                                     text.push_str("\n[partial response]:\n");
                                     text.push_str(&partial);
                                 }
+                                state_a.write().unwrap_or_else(|p| p.into_inner()).partial_text = text.clone();
                                 return Ok(SubagentResult {
                                     text,
                                     model: model_a.clone(),
@@ -401,7 +402,7 @@ impl Tool for SubagentStartTool {
                     "unknown panic".to_string()
                 };
                 tracing::error!("Subagent thread panicked: {}", msg);
-                state_t.write().unwrap().status = SubagentStatus::Failed(format!("panic: {}", msg));
+                state_t.write().unwrap_or_else(|p| p.into_inner()).status = SubagentStatus::Failed(format!("panic: {}", msg));
             }
 
             // ── Terminal finalizer — exactly once, outside catch_unwind ────────

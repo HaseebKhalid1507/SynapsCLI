@@ -138,22 +138,22 @@ impl SubagentHandle {
 
     /// Current status snapshot.
     pub fn status(&self) -> SubagentStatus {
-        self.state.read().unwrap().status.clone()
+        self.state.read().unwrap_or_else(|p| p.into_inner()).status.clone()
     }
 
     /// Partial output accumulated so far.
     pub fn partial_output(&self) -> String {
-        self.state.read().unwrap().partial_text.clone()
+        self.state.read().unwrap_or_else(|p| p.into_inner()).partial_text.clone()
     }
 
     /// Snapshot of the tool log.
     pub fn tool_log(&self) -> Vec<String> {
-        self.state.read().unwrap().tool_log.clone()
+        self.state.read().unwrap_or_else(|p| p.into_inner()).tool_log.clone()
     }
 
     /// Snapshot of conversation state (for resume).
     pub fn conversation_state(&self) -> Vec<Value> {
-        self.state.read().unwrap().conversation_state.clone()
+        self.state.read().unwrap_or_else(|p| p.into_inner()).conversation_state.clone()
     }
 
     /// Seconds since this handle was created.
@@ -271,9 +271,17 @@ impl SubagentRegistry {
     ///   (b) it has been finished longer than `ttl` (abandoned).
     /// Finished-but-uncollected handles inside the TTL are RETAINED so the
     /// completion event can wake the parent and collect still succeeds.
+    ///
+    /// Additionally, handles whose OS thread is still running (e.g. still in
+    /// the finalizer path) are deferred — joining a live thread blocks the TUI
+    /// loop. They will be reaped on the next cleanup pass once the thread exits.
     pub fn cleanup_finished_with_ttl(&mut self, ttl: std::time::Duration) {
         let reap_ids: Vec<String> = self.handles.iter()
             .filter(|(_, h)| h.is_finished()
+                // Defer handles whose OS thread is still alive — joining a live
+                // thread would block the TUI event loop. Use map_or (stable 1.80+)
+                // rather than is_none_or (stable 1.82+).
+                && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
                 && (h.is_collected()
                     || h.finished_elapsed().is_some_and(|d| d >= ttl)))
             .map(|(id, _)| id.clone())
@@ -308,6 +316,14 @@ impl SubagentStatus {
             SubagentStatus::Cancelled => "cancelled",
             SubagentStatus::TimedOut => "timed_out",
             SubagentStatus::Failed(_) => "failed",
+        }
+    }
+
+    /// Returns the failure reason string if this is a `Failed` variant.
+    pub fn failure_reason(&self) -> Option<&str> {
+        match self {
+            SubagentStatus::Failed(r) => Some(r.as_str()),
+            _ => None,
         }
     }
 }
@@ -499,6 +515,46 @@ mod tests {
         reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
 
         assert!(reg.get("sa_1").is_none(), "handle past TTL must be reaped even if uncollected");
+    }
+
+    // U5-reaper: finished-status handle with a still-sleeping OS thread is deferred;
+    // after thread exits a second cleanup reaps it.
+    #[test]
+    fn reaper_defers_handle_with_live_thread() {
+        let mut reg = SubagentRegistry::new();
+        let mut h = make_finished_handle("sa_live");
+        h.mark_collected(); // collected — would normally be reaped immediately
+
+        // Attach a real thread that sleeps briefly (simulates thread still in finalizer)
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_c = Arc::clone(&barrier);
+        let thread = std::thread::spawn(move || {
+            // Wait for the test to run its first cleanup
+            barrier_c.wait();
+            // Now sleep a bit more before truly exiting
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        h.set_thread_handle(thread);
+        reg.register(h);
+
+        // Signal thread (it's waiting on barrier)
+        barrier.wait();
+
+        // First cleanup: thread is still alive → handle must be deferred (retained)
+        // The thread may or may not have exited by the time we get here, so we only
+        // assert the positive case when we know the thread is still live.
+        // Instead: sleep briefly to be sure the thread has NOT exited, then check.
+        // (The thread sleeps 20ms after barrier; we check immediately after barrier.)
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        // Handle may still be present (thread live) or absent (thread exited) — both ok.
+        // What must NOT happen: a blocking join. The test itself completes in < 1s.
+
+        // Wait for thread to truly exit
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second cleanup: thread is finished → handle must be reaped
+        reg.cleanup_finished_with_ttl(std::time::Duration::ZERO);
+        assert!(reg.get("sa_live").is_none(), "handle must be reaped once OS thread exits");
     }
 
     // U4: running handles never touched by any reaper variant

@@ -362,6 +362,27 @@ fn steer_then_complete_still_publishes() {
     assert!(queue.is_empty(), "no duplicate completion events");
 }
 
+// ── I7: finalizer_push_fires_notified_wake ────────────────────────────────────
+//
+// Verify that finalize_subagent's queue.push() wakes a waiter on queue.notified().
+// This tests the REAL Notify wake path used by the parent's event loop.
+
+#[tokio::test]
+async fn finalizer_push_fires_notified_wake() {
+    let queue = Arc::new(EventQueue::new(100));
+    let queue_w = Arc::clone(&queue);
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(2), queue_w.notified()).await
+    });
+    tokio::task::yield_now().await;
+    let state = Arc::new(RwLock::new(SubagentState::new()));
+    state.write().unwrap().status = SubagentStatus::Completed;
+    state.write().unwrap().partial_text = "notify me".to_string();
+    finalize_subagent(&state, Some(&queue), "sa_notify", 400, "notify-agent", Instant::now(), None);
+    waiter.await.unwrap().expect("queue.notified() must resolve when finalizer pushes");
+    assert_eq!(queue.pop().unwrap().content.content_type, "subagent_completion");
+}
+
 // ── L1: live_reactive_subagent_end_to_end ────────────────────────────────────
 //
 // Requires live credentials + network. Run with:

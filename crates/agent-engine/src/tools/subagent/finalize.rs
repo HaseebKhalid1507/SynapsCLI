@@ -10,10 +10,14 @@ use crate::events::{Event, EventQueue};
 use crate::events::types::{EventContent, EventSource, Severity};
 use crate::runtime::subagent::{SubagentState, SubagentStatus};
 
-/// Kill-switch for rollback: set SYNAPS_DISABLE_SUBAGENT_WAKE=1 to suppress
+/// Kill-switch for rollback: set SYNAPS_DISABLE_SUBAGENT_WAKE=1|true|yes to suppress
 /// completion-event publication (state/reaper changes remain active).
+fn wake_disabled_value(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
 fn wake_disabled() -> bool {
-    std::env::var("SYNAPS_DISABLE_SUBAGENT_WAKE").is_ok_and(|v| v == "1")
+    std::env::var("SYNAPS_DISABLE_SUBAGENT_WAKE").is_ok_and(|v| wake_disabled_value(&v))
 }
 
 /// Build the completion event. Pure — unit-testable without threads.
@@ -33,9 +37,16 @@ pub fn build_completion_event(
     use uuid::Uuid;
 
     let status_str = status.as_str();
+    let reason_suffix = match status.failure_reason() {
+        Some(r) => {
+            let truncated: String = r.chars().take(300).collect();
+            format!(" Reason: {}", truncated)
+        }
+        None => String::new(),
+    };
     let text = format!(
         "Subagent '{agent_name}' ({handle_id}) finished with status '{status_str}' \
-         after {duration_secs:.1}s. \
+         after {duration_secs:.1}s.{reason_suffix} \
          Call subagent_collect with handle_id \"{handle_id}\" to retrieve the full result. \
          Preview: {result_preview}"
     );
@@ -47,6 +58,9 @@ pub fn build_completion_event(
         "status":        status_str,
         "duration_secs": (duration_secs * 10.0).round() / 10.0,
     });
+    if let Some(reason) = status.failure_reason() {
+        data_map["error"] = json!(reason);
+    }
     if let Some(rf) = resumed_from {
         data_map["resumed_from"] = json!(rf);
     }
@@ -241,19 +255,30 @@ mod tests {
             "completion event must be at front after priority push");
     }
 
-    // U9: kill-switch suppresses publication but still finalizes state
-    // NOTE: uses serial execution via environment variable — must not run in parallel
-    // with other finalize tests. We test the kill-switch guard via direct env inspection
-    // rather than process-global env mutation to avoid flaky parallel interference.
+    // kill_switch_value_parsing: exhaustive unit test for wake_disabled_value()
+    // on: 1, true, TRUE, yes, Yes, " 1 "; off: "", 0, false, no, 2, on
     #[test]
-    fn kill_switch_suppresses_publication() {
-        // Verify the guard function itself returns true when var is set.
-        // We do NOT actually mutate the process env here to avoid flaking parallel tests.
-        // The env::var path is trivially correct; the behavioral test is in subagent_wake.rs
-        // where we can use serial test ordering.
+    fn kill_switch_value_parsing() {
+        // ON values
+        assert!(wake_disabled_value("1"),      "\"1\" must be recognized");
+        assert!(wake_disabled_value("true"),   "\"true\" must be recognized");
+        assert!(wake_disabled_value("TRUE"),   "\"TRUE\" must be recognized (case-insensitive)");
+        assert!(wake_disabled_value("yes"),    "\"yes\" must be recognized");
+        assert!(wake_disabled_value("Yes"),    "\"Yes\" must be recognized (case-insensitive)");
+        assert!(wake_disabled_value(" 1 "),    "\" 1 \" must be recognized (trimmed)");
+        // OFF values
+        assert!(!wake_disabled_value(""),      "empty string must be OFF");
+        assert!(!wake_disabled_value("0"),     "\"0\" must be OFF");
+        assert!(!wake_disabled_value("false"), "\"false\" must be OFF");
+        assert!(!wake_disabled_value("no"),    "\"no\" must be OFF");
+        assert!(!wake_disabled_value("2"),     "\"2\" must be OFF");
+        assert!(!wake_disabled_value("on"),    "\"on\" must be OFF");
+    }
 
-        // Instead: verify that with a real queue + no kill-switch, the event IS published
-        // (positive path for U9's intended coverage area).
+    // Positive-path: kill-switch OFF → event is published when finalize runs
+    #[test]
+    fn kill_switch_off_event_published() {
+        // Verify that with a real queue + no kill-switch, the event IS published.
         let state = make_state(SubagentStatus::Completed, "done");
         let queue = Arc::new(EventQueue::new(100));
 
@@ -284,5 +309,26 @@ mod tests {
             None,
         );
         assert!(ev.content.text.contains("clean preview text"));
+    }
+
+    // #3 finalize unit test: Failed("boom") must populate data["error"] and text must contain reason
+    #[test]
+    fn failed_reason_in_event_data_and_text() {
+        let ev = build_completion_event(
+            "sa_fail", 11, "bomber",
+            &SubagentStatus::Failed("boom".to_string()),
+            "partial output",
+            2.0,
+            None,
+        );
+
+        let data = ev.content.data.as_ref().unwrap();
+        assert_eq!(data["error"], "boom", "data[\"error\"] must contain the failure reason");
+        assert_eq!(data["status"], "failed");
+        assert!(
+            ev.content.text.contains("boom"),
+            "event text must contain failure reason: {}",
+            ev.content.text
+        );
     }
 }
