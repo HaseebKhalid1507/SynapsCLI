@@ -44,7 +44,7 @@ fn event_payload_serde_roundtrip() {
 #[test]
 fn rpc_event_event_round_trip() {
     let ev = RpcEvent::Event {
-        payload: synaps_cli::core::rpc_protocol::EventPayload {
+        payload: Box::new(synaps_cli::core::rpc_protocol::EventPayload {
             id: "e-1".into(),
             source: "uptime-kuma".into(),
             severity: "critical".into(),
@@ -52,7 +52,7 @@ fn rpc_event_event_round_trip() {
             text: "Jellyfin DOWN".into(),
             timestamp: "2025-01-01T00:00:00Z".into(),
             formatted: "<event>Jellyfin DOWN</event>".into(),
-        },
+        }),
     };
     let json = serde_json::to_string(&ev).expect("serialize");
     let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -73,7 +73,7 @@ fn rpc_event_event_round_trip() {
 #[test]
 fn rpc_event_event_golden_json_shape() {
     let ev = RpcEvent::Event {
-        payload: synaps_cli::core::rpc_protocol::EventPayload {
+        payload: Box::new(synaps_cli::core::rpc_protocol::EventPayload {
             id: "x".into(),
             source: "s".into(),
             severity: "low".into(),
@@ -81,7 +81,7 @@ fn rpc_event_event_golden_json_shape() {
             text: "t".into(),
             timestamp: "ts".into(),
             formatted: "f".into(),
-        },
+        }),
     };
     let json = serde_json::to_string(&ev).unwrap();
     // Must have type="event" at top level

@@ -256,7 +256,7 @@ pub enum RpcEvent {
     #[serde(rename = "event")]
     Event {
         /// Canonical structured payload from the runtime event queue.
-        payload: EventPayload,
+        payload: Box<EventPayload>,
     },
 
     /// A streaming update from the assistant (text delta, thinking, tool

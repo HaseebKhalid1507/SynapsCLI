@@ -41,7 +41,7 @@ fn drain_idle_queue_produces_rpc_event_frames() {
     // Build RpcEvent::Event frames from the drained batch.
     let frames: Vec<RpcEvent> = drained
         .iter()
-        .map(|d| RpcEvent::Event { payload: event_payload_from_drained(d) })
+        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
         .collect();
 
     assert_eq!(frames.len(), 2);
@@ -74,7 +74,7 @@ fn rpc_event_event_frames_serialise_to_wire_json() {
     let mut pending = Vec::new();
 
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
-    let frame = RpcEvent::Event { payload: event_payload_from_drained(&drained[0]) };
+    let frame = RpcEvent::Event { payload: Box::new(event_payload_from_drained(&drained[0])) };
 
     let json = serde_json::to_string(&frame).expect("serialize");
     let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -83,7 +83,7 @@ fn rpc_event_event_frames_serialise_to_wire_json() {
     assert_eq!(val["payload"]["source"], "test-src");
     assert_eq!(val["payload"]["severity"], "medium");
     assert_eq!(val["payload"]["text"], "ping");
-    assert!(val["payload"]["timestamp"].as_str().unwrap().len() > 0);
+    assert!(!val["payload"]["timestamp"].as_str().unwrap().is_empty());
     assert!(val["payload"]["formatted"].as_str().unwrap().starts_with("<event "));
 }
 

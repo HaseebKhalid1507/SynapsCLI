@@ -217,7 +217,7 @@ impl CacheTtl {
 ///
 /// Controls how runtime events (from the `EventQueue`) are delivered in
 /// server and RPC modes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EventsConfig {
     /// When `true`, the server will automatically trigger a model turn when
     /// runtime events arrive while idle. Default `false` — clients must send
@@ -226,20 +226,11 @@ pub struct EventsConfig {
     pub auto_turn: bool,
 }
 
-impl Default for EventsConfig {
-    fn default() -> Self {
-        Self { auto_turn: false }
-    }
-}
-
 /// Parse `events.*` configuration keys.
 fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) {
-    match key {
-        "events.auto_turn" => {
-            cfg.auto_turn = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
-        }
-        _ => {} // unknown events.* keys ignored
-    }
+    if key == "events.auto_turn" {
+        cfg.auto_turn = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
+    } // unknown events.* keys ignored
 }
 
 /// Parsed configuration from the config file.

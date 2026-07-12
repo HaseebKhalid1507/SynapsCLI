@@ -213,7 +213,7 @@ async fn spawn_prompt(
                         // Re-build a minimal EventPayload from the formatted string.
                         // (Full DrainedEvent is not available here — just the string.)
                         let ev_frame = RpcEvent::Event {
-                            payload: synaps_cli::core::rpc_protocol::EventPayload {
+                            payload: Box::new(synaps_cli::core::rpc_protocol::EventPayload {
                                 id: uuid_v4_simple(),
                                 source: "buffered".into(),
                                 severity: "medium".into(),
@@ -221,7 +221,7 @@ async fn spawn_prompt(
                                 text: formatted.clone(),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                 formatted,
-                            },
+                            }),
                         };
                         let _ = wtx.send(ev_frame).await;
                     }
@@ -746,7 +746,7 @@ pub async fn run(
                     );
                     drained
                         .iter()
-                        .map(|d| RpcEvent::Event { payload: event_payload_from_drained(d) })
+                        .map(|d| RpcEvent::Event { payload: Box::new(event_payload_from_drained(d)) })
                         .collect()
                 }; // mutex released here
 
