@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use synaps_cli::{CancellationToken, Runtime, StreamEvent, LlmEvent, SessionEvent, AgentEvent};
-use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, EventDisposition};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, EventDisposition, AUTO_TURN_CAP};
 
 use super::app::{App, ChatMessage, SubagentState, THINKING_PLACEHOLDER};
 use super::draw::build_render_model;
@@ -312,21 +312,27 @@ pub(super) async fn handle_event_queue_arm(
         WakeAction::RunTurn => {
             // Cap check: if we ARE at cap this would have returned Forward.
             // Increment before spawning so cap is visible for the next wake.
-            app.consecutive_auto_turns += 1;
-            let ct = CancellationToken::new();
-            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            app.streaming = true;
-            app.spinner_frame = 0;
-            *stream = Some(runtime.run_stream_with_messages(
-                app.api_messages.clone(),
-                ct.clone(),
-                Some(s_rx),
-                Some(secret_prompt_handle.clone()),
-                false,
-            ).await);
-            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-            *cancel_token = Some(ct);
-            *steer_tx = Some(s_tx);
+            // Optional guard: skip if a stream is already active (shouldn't
+            // happen if wake_action saw busy=false, but defend against it).
+            if stream.is_some() {
+                tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
+            } else {
+                app.consecutive_auto_turns += 1;
+                let ct = CancellationToken::new();
+                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                app.streaming = true;
+                app.spinner_frame = 0;
+                *stream = Some(runtime.run_stream_with_messages(
+                    app.api_messages.clone(),
+                    ct.clone(),
+                    Some(s_rx),
+                    Some(secret_prompt_handle.clone()),
+                    false,
+                ).await);
+                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                *cancel_token = Some(ct);
+                *steer_tx = Some(s_tx);
+            }
         }
         WakeAction::Forward => {
             // Check if we hit the cap (some Injected events but cap blocked RunTurn).
@@ -429,14 +435,31 @@ pub(super) async fn handle_stream_arm(
                             drop(stream.take());
                             drop(cancel_token.take());
                             drop(steer_tx.take());
-                            let ct = CancellationToken::new();
-                            let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            app.streaming = true;
-                            app.spinner_frame = 0;
-                            *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
-                            app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
-                            *cancel_token = Some(ct);
-                            *steer_tx = Some(s_tx);
+
+                            // Issue 5 fix: enforce counter/cap identical to the
+                            // EventWake → RunTurn path in handle_event_arm.
+                            // wake_action already checked the cap before emitting
+                            // AutoTriggerEvents, but we increment here to track
+                            // this continuation turn so subsequent events see the
+                            // correct counter.
+                            app.consecutive_auto_turns += 1;
+                            if app.consecutive_auto_turns >= AUTO_TURN_CAP {
+                                app.push_msg(ChatMessage::System(format!(
+                                    "auto-turn cap reached ({} consecutive) — waiting for your input",
+                                    AUTO_TURN_CAP
+                                )));
+                                app.invalidate();
+                                // Do NOT spawn a new stream — park at prompt.
+                            } else {
+                                let ct = CancellationToken::new();
+                                let (s_tx, s_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                app.streaming = true;
+                                app.spinner_frame = 0;
+                                *stream = Some(runtime.run_stream_with_messages(app.api_messages.clone(), ct.clone(), Some(s_rx), Some(secret_prompt_handle.clone()), false).await);
+                                app.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.to_string()));
+                                *cancel_token = Some(ct);
+                                *steer_tx = Some(s_tx);
+                            }
                         }
                     }
 

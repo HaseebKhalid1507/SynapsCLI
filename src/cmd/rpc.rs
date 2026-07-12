@@ -124,7 +124,37 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 
 // ─── Streaming task ───────────────────────────────────────────────────────────
 
+// ─── Terminal-path helper ─────────────────────────────────────────────────────
+
+/// Atomically close out a terminal path: clear `in_flight` and flush any
+/// buffered `pending_events` into `api_messages` — all under **one** mutex
+/// acquisition.
+///
+/// Called on Done, Error, cancel/abort-as-error, and stream-drop paths so every
+/// terminal branch leaves the state consistent without holding the lock across
+/// multiple awaits.  The drainer task already emitted wire-format `Event` frames
+/// for each buffered event when it first ran; we only inject the formatted
+/// strings into `api_messages` here (no duplicate wire frames).
+async fn terminal_flush(state: &Mutex<RpcState>) {
+    let mut st = state.lock().await;
+    st.in_flight = None;
+    let to_inject = std::mem::take(&mut st.pending_events);
+    for formatted in to_inject {
+        st.api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": formatted})
+        ));
+    }
+}
+
+// ─── Streaming task ───────────────────────────────────────────────────────────
+
 /// Spawn a streaming task for a `Prompt` or `FollowUp` command.
+///
+/// **Race fix (issue 1):** `in_flight` is set on the shared state **before** the
+/// function returns so the drainer always sees `is_streaming() == true` for the
+/// entirety of the active prompt.  The previous pattern set it _after_ returning,
+/// which left a window where a concurrently-woken drainer could see `busy = false`
+/// and inject events as idle instead of buffering them.
 ///
 /// The task takes a snapshot of `api_messages` while briefly holding the mutex,
 /// then releases it before the long-running LLM stream begins so that `Abort`
@@ -134,18 +164,21 @@ async fn spawn_prompt(
     prompt_id: String,
     state: Arc<Mutex<RpcState>>,
     writer_tx: mpsc::Sender<RpcEvent>,
-) -> InFlight {
+) {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let cancel_check = cancel.clone();
     let pid = prompt_id.clone();
     let wtx = writer_tx.clone();
 
+    // Snapshot messages while holding the lock.
+    // Vec<SharedMessage> clone = pointer bumps only.
+    let messages: Vec<synaps_cli::SharedMessage> =
+        state.lock().await.api_messages.clone();
+
+    let state_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
-        // Snapshot message history; release lock before blocking on the stream.
-        // Vec<SharedMessage> clone = pointer bumps only.
-        let messages: Vec<synaps_cli::SharedMessage> =
-            state.lock().await.api_messages.clone();
+        let state = state_task;
 
         // Acquire lock only long enough to start the stream future.
         let mut stream = {
@@ -189,21 +222,10 @@ async fn spawn_prompt(
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
-                    // Flush events buffered while streaming was active.
-                    // B1 FIX: inject buffered formatted strings into api_messages ONLY.
-                    // The drainer already emitted one RpcEvent::Event frame per event
-                    // when it ran (busy drain → pending_events). Re-emitting another
-                    // frame here would cause wire duplication with fake metadata
-                    // (synthetic UUID, source="buffered"). Do NOT emit Event frames.
-                    {
-                        let mut st = state.lock().await;
-                        let to_inject = std::mem::take(&mut st.pending_events);
-                        for formatted in to_inject {
-                            st.api_messages.push(std::sync::Arc::new(
-                                serde_json::json!({"role": "user", "content": formatted})
-                            ));
-                        }
-                    }
+                    // terminal_flush: under ONE lock set in_flight=None and flush
+                    // pending_events → api_messages. No duplicate wire Event frames —
+                    // the drainer already emitted them when it ran.
+                    terminal_flush(&state).await;
                     let _ = wtx
                         .send(RpcEvent::Response {
                             id: pid.clone(),
@@ -211,7 +233,6 @@ async fn spawn_prompt(
                             body: serde_json::json!({ "ok": true }),
                         })
                         .await;
-                    state.lock().await.in_flight = None;
                     return;
                 }
                 // ── Turn error (always returns early) ───────────────────────
@@ -233,7 +254,7 @@ async fn spawn_prompt(
                                 body: serde_json::json!({ "ok": true, "cancelled": true }),
                             })
                             .await;
-                        state.lock().await.in_flight = None;
+                        terminal_flush(&state).await;
                         return;
                     }
                     let _ = wtx
@@ -250,7 +271,7 @@ async fn spawn_prompt(
                             body: serde_json::json!({ "ok": false, "error": msg }),
                         })
                         .await;
-                    state.lock().await.in_flight = None;
+                    terminal_flush(&state).await;
                     return;
                 }
                 _ => {}
@@ -285,10 +306,12 @@ async fn spawn_prompt(
                 body,
             })
             .await;
-        state.lock().await.in_flight = None;
+        terminal_flush(&state).await;
     });
 
-    InFlight { prompt_id, cancel, handle }
+    // Issue 1 fix: set in_flight BEFORE returning so the drainer always sees
+    // is_streaming() == true from the moment the prompt is accepted.
+    state.lock().await.in_flight = Some(InFlight { prompt_id, cancel, handle });
 }
 
 // ─── Per-command handlers ─────────────────────────────────────────────────────
@@ -324,8 +347,9 @@ async fn handle_prompt(
             .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": content})));
     }
 
-    let in_flight = spawn_prompt(id, state.clone(), writer_tx).await;
-    state.lock().await.in_flight = Some(in_flight);
+    // spawn_prompt snapshots messages, sets in_flight atomically (issue 1 fix),
+    // and spawns the streaming task.  No separate write-back needed here.
+    spawn_prompt(id, state.clone(), writer_tx).await;
 }
 
 /// Handle the `Compact` command.

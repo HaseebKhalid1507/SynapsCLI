@@ -14,7 +14,7 @@ use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::engine::reactor::{drain_event_queue, event_payload_from_drained, wake_action, WakeAction};
+use synaps_cli::engine::reactor::{drain_event_queue, event_payload_from_drained, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
 use axum::extract::Query;
@@ -800,6 +800,23 @@ async fn handle_user_message(content: String, state: &Arc<ServerState>) {
                     continue 'turn;
                 }
                 StreamCompletion::AutoTriggerEvents => {
+                    // Issue 3 fix: gate on events_auto_turn config; enforce counter+cap.
+                    // handle_user_message already reset the counter to 0 at entry, but
+                    // subsequent auto-trigger iterations within this same user message
+                    // handling must still be bounded.
+                    if !state.events_auto_turn {
+                        state.save_session().await;
+                        break 'turn;
+                    }
+                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if cur >= AUTO_TURN_CAP {
+                        tracing::info!(
+                            cap = AUTO_TURN_CAP,
+                            "server: auto-turn cap reached (handle_user_message AutoTriggerEvents) — parking"
+                        );
+                        state.save_session().await;
+                        break 'turn;
+                    }
                     // pending_events were already drained into conv.api_messages
                     // by process_stream_event. Save and trigger a follow-up turn.
                     state.save_session().await;
@@ -1006,8 +1023,6 @@ fn engine_event_to_server_message(event: EngineStreamEvent) -> Option<ServerMess
 /// The event content remains in api_messages and will be processed with the
 /// client-driven turn.
 async fn run_injected_event_turn(state: &Arc<ServerState>) {
-    use synaps_cli::engine::reactor::AUTO_TURN_CAP;
-
     // Guard: if already streaming, event stays in api_messages for the active turn.
     if state
         .streaming
@@ -1021,11 +1036,14 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
         state: Arc::clone(state),
     };
 
-    // Increment counter; bail if cap exceeded.
+    // Increment counter; bail (saturate, do NOT reset) if cap reached.
+    // Only handle_user_message resets the counter so the cap stays latched
+    // until real user input arrives — preventing a looping event source from
+    // immediately re-saturating after a reset.
     let prev = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if prev >= AUTO_TURN_CAP {
-        // Exceeded cap — reset and park until real user input.
-        state.consecutive_auto_turns.store(0, std::sync::atomic::Ordering::Release);
+        // Saturate at cap — leave counter elevated so further signals are
+        // also discarded. handle_user_message is the only reset path.
         tracing::info!(
             cap = AUTO_TURN_CAP,
             "server: auto-turn cap reached — parking until real user input"
@@ -1097,6 +1115,23 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
                     continue 'turn;
                 }
                 StreamCompletion::AutoTriggerEvents => {
+                    // Issue 3 fix: gate on events_auto_turn and enforce cap.
+                    // Counter was already incremented at function entry. Check again
+                    // before spinning another turn — if cap is reached, park.
+                    if !state.events_auto_turn {
+                        state.save_session().await;
+                        break 'turn;
+                    }
+                    let cur = state.consecutive_auto_turns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if cur >= AUTO_TURN_CAP {
+                        // Saturate — leave counter elevated until real user input.
+                        tracing::info!(
+                            cap = AUTO_TURN_CAP,
+                            "server: auto-turn cap reached (AutoTriggerEvents) — parking"
+                        );
+                        state.save_session().await;
+                        break 'turn;
+                    }
                     state.save_session().await;
                     continue 'turn;
                 }

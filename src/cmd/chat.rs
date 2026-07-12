@@ -183,8 +183,9 @@ pub async fn run(
             PromptRead::EventWake { run_turn: true } => {
                 // A runtime event was injected; policy says RunTurn.
                 // Events were already drained + injected by drain_event_queue above.
-                // Fall through to 'turn_loop without modifying consecutive_auto_turns
-                // (wake_action already checked the cap; we increment inside the loop).
+                // Issue 6 fix: increment consecutive_auto_turns BEFORE the turn so
+                // the cap counter is correct if further events arrive mid-stream.
+                consecutive_auto_turns += 1;
             }
 
             PromptRead::Line(raw_line) => {

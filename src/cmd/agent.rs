@@ -463,8 +463,12 @@ pub async fn run(config_path: String, trigger_context: String) {
                 // Agent stopped on its own without calling watcher_exit.
                 // Determine whether to wait on reactive events or nag immediately.
                 let (children_running, queue_len) = {
-                    // Drop registry lock before any await.
-                    let reg = runtime.subagent_registry().lock().unwrap();
+                    // Drop registry lock before any await. Poison-safe: a panicked
+                    // subagent thread should not brick the agent idle loop.
+                    let reg = match runtime.subagent_registry().lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     let running = reg.list_active().len();
                     drop(reg);
                     (running > 0, runtime.event_queue().len())
