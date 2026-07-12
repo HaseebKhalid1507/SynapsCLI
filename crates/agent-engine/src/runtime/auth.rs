@@ -3,7 +3,7 @@ use tokio::sync::RwLock;
 use crate::{Result, RuntimeError};
 use reqwest::Client;
 use crate::auth::{BrokerClient, CredentialSource, TokenCache, resolve_remote, is_expired_with_margin, DEFAULT_MARGIN_MS};
-use super::types::{AuthState, PiAuth};
+use super::types::AuthState;
 
 pub(super) struct AuthMethods;
 
@@ -134,48 +134,7 @@ impl AuthMethods {
         Ok(())
     }
     
-    pub(super) fn get_auth_token() -> Result<(String, String, Option<String>, Option<u64>)> {
-        // Try auth.json via the auth module
-        if let Ok(Some(auth_file)) = crate::auth::load_auth() {
-            let creds = &auth_file.anthropic;
-            if creds.auth_type == "oauth" && !creds.access.is_empty() {
-                return Ok((
-                    creds.access.clone(),
-                    "oauth".to_string(),
-                    Some(creds.refresh.clone()),
-                    Some(creds.expires),
-                ));
-            }
-        }
 
-        // Legacy: try the old PiAuth struct format (in case auth.json has optional fields)
-        let auth_path = crate::config::resolve_read_path("auth.json");
-
-        if auth_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&auth_path) {
-                if let Ok(auth) = serde_json::from_str::<PiAuth>(&content) {
-                    let creds = &auth.anthropic;
-                    if let (true, Some(access)) = (creds.auth_type == "oauth", creds.access.as_ref()) {
-                        return Ok((
-                            access.clone(),
-                            "oauth".to_string(),
-                            creds.refresh.clone(),
-                            creds.expires,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Fall back to env var
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            return Ok((api_key, "api_key".to_string(), None, None));
-        }
-        
-        // No Anthropic credentials — allow startup anyway for non-Anthropic providers.
-        // Auth will fail lazily on the first actual Anthropic API call.
-        Ok(("".to_string(), "none".to_string(), None, None))
-    }
 }
 #[cfg(test)]
 mod tests {

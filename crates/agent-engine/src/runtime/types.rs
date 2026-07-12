@@ -14,10 +14,6 @@ pub(super) struct AuthState {
     pub(super) token_expires: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct PiAuth {
-    pub(super) anthropic: AnthropicAuth,
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]

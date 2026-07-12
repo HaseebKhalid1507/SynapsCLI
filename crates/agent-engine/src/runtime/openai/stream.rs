@@ -160,26 +160,14 @@ pub(crate) async fn call_codex_stream_inner(
     source: &crate::auth::CredentialSource,
     cache: &crate::auth::TokenCache,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    // Resolve the codex access token honoring the credential source: Remote
-    // fetches from the broker, Local refreshes the openai-codex auth.json. (#158 C4)
-    let (access, account_id) = if !cfg.api_key.is_empty() {
-        (cfg.api_key.clone(), crate::auth::extract_codex_account_id(&cfg.api_key))
-    } else {
-        match source {
-            crate::auth::CredentialSource::Remote { .. } => {
-                let access = crate::auth::resolve_access_token("openai-codex", source, cache, client).await?;
-                let acct = crate::auth::extract_codex_account_id(&access);
-                (access, acct)
-            }
-            crate::auth::CredentialSource::Local => {
-                let creds = crate::auth::ensure_fresh_provider_token(client, "openai-codex").await?;
-                let acct = creds
-                    .account_id
-                    .clone()
-                    .or_else(|| crate::auth::extract_codex_account_id(&creds.access));
-                (creds.access, acct)
-            }
-        }
+    // Every Codex credential, local or remote, crosses the broker abstraction.
+    // Provider routing metadata is deliberately credential-free.
+    let access = crate::auth::resolve_access_token("openai-codex", source, cache, client).await?;
+    let account_id = match source {
+        crate::auth::CredentialSource::Local => crate::auth::load_provider_auth("openai-codex")?
+            .and_then(|creds| creds.account_id)
+            .or_else(|| crate::auth::extract_codex_account_id(&access)),
+        crate::auth::CredentialSource::Remote { .. } => crate::auth::extract_codex_account_id(&access),
     };
     let account_id = account_id.ok_or("Failed to extract ChatGPT account id from Codex token")?;
 

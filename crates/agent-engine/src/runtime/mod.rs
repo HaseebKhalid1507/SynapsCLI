@@ -263,7 +263,11 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
-        let (auth_token, auth_type, refresh_token, token_expires) = AuthMethods::get_auth_token()?;
+        // Runtime construction is credential-blind. Credentials are acquired
+        // lazily through the broker abstraction after configuration is applied;
+        // this layer never opens auth.json or consults a secret environment var.
+        let (auth_token, auth_type, refresh_token, token_expires) =
+            (String::new(), "oauth".to_string(), None, Some(0));
 
         let client = Client::builder()
             .tls_built_in_webpki_certs(true)

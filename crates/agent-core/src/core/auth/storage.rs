@@ -122,10 +122,21 @@ fn save_provider_auth_at(
         serde_json::Map::new()
     };
 
-    root.insert(
-        provider.to_string(),
-        serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?,
-    );
+    let encoded = serde_json::to_value(creds)
+        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    // Merge known credential fields into an existing provider object rather
+    // than replacing it. Providers may add metadata (including nested objects)
+    // that must survive refresh/login writes.
+    let mut provider_value = root
+        .remove(provider)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let (Some(target), Some(fields)) = (provider_value.as_object_mut(), encoded.as_object()) {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    root.insert(provider.to_string(), provider_value);
 
     let json = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("Failed to serialize auth: {}", e))?;
@@ -188,6 +199,18 @@ mod tests {
             expires: 1,
             account_id: None,
         }
+    }
+
+    #[test]
+    fn save_preserves_unknown_nested_provider_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"openai-codex":{"type":"oauth","refresh":"old","access":"old","expires":1,"metadata":{"tenant":"t1","flags":{"beta":true}}}}"#).unwrap();
+        save_provider_auth_at(&path, "openai-codex", &fresh_creds()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["openai-codex"]["metadata"]["tenant"], "t1");
+        assert_eq!(value["openai-codex"]["metadata"]["flags"]["beta"], true);
+        assert_eq!(value["openai-codex"]["access"], "a");
     }
 
     #[test]

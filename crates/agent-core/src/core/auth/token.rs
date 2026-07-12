@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex;
+
 use reqwest::Client;
 
 use super::storage::{auth_file_path, load_provider_auth, save_provider_auth};
@@ -198,6 +202,21 @@ pub async fn ensure_fresh_token(client: &Client) -> std::result::Result<OAuthCre
     Ok(new_creds)
 }
 
+/// Process-wide, per-provider refresh gates. The file lock protects persistence;
+/// these gates additionally keep concurrent async callers in this process from
+/// rotating the same refresh token while the network request is in flight.
+fn refresh_gate(provider: &str) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("refresh gate registry poisoned");
+    gates
+        .entry(provider.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// Ensure a non-Anthropic OAuth provider has a fresh token.
 pub async fn ensure_fresh_provider_token<P>(
     client: &Client,
@@ -208,6 +227,9 @@ where
     P::Error: std::fmt::Display,
 {
     let provider = provider.try_into().map_err(|e| e.to_string())?;
+    let _gate = refresh_gate(provider.as_str()).lock_owned().await;
+    // Re-read after entering the gate: a preceding waiter may have refreshed
+    // and atomically persisted a rotated refresh token.
     let Some(creds) = load_provider_auth(provider.as_str())? else {
         return Err(format!(
             "No credentials for {}. Run `synaps login`.",

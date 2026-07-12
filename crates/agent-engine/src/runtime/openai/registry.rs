@@ -310,12 +310,11 @@ pub fn resolve_codex_shorthand(s: &str) -> Option<ProviderConfig> {
     if provider_key != "openai-codex" {
         return None;
     }
-    let token = std::env::var("OPENAI_CODEX_ACCESS_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty());
     Some(ProviderConfig {
         base_url: "https://chatgpt.com/backend-api".to_string(),
-        api_key: token.unwrap_or_default(),
+        // Credentials are resolved immediately before the request through the
+        // credential broker. Routing metadata must never capture env secrets.
+        api_key: String::new(),
         model: model.to_string(),
         provider: "openai-codex".to_string(),
     })
