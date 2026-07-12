@@ -1,22 +1,17 @@
-//! C5c RED → GREEN: server broadcasts runtime events, policy-gated auto-turn.
+//! C5c: server internalizes runtime events and policy-gates owning-session auto-turn.
 //!
 //! Tests:
 //!  1. events_auto_turn_default_true — EventsConfig default
-//!  2. events_auto_turn_parses_true — config key parsing
-//!  3. server_message_event_broadcast_shape — ServerMessage::Event serialises
-//!  4. drain_for_server_builds_server_message_event — integration of drain +
-//!     event_payload_from_drained → ServerMessage::Event
-//!  5. server_event_broadcast_always_no_auto_turn — WakeAction::Forward when
-//!     auto_turn disabled (default)
-//!  6. server_event_broadcast_wakeaction_run_turn_when_enabled — WakeAction::RunTurn
-//!     when auto_turn = true, idle, last message is user
+//!  2. explicit false/0/no opt out
+//!  3. server drain injects canonical content without a raw event frame
+//!  4. wake policy respects enabled/disabled configuration
+
 
 use agent_engine::engine::reactor::{
-    drain_event_queue, event_payload_from_drained, wake_action, WakeAction,
+    drain_event_queue, wake_action, WakeAction,
 };
 use agent_engine::events::{types::{Event, Severity}, EventQueue};
 use synaps_cli::core::config::{EventsConfig, load_config_from_str};
-use synaps_cli::protocol::ServerMessage;
 
 fn make_queue(items: &[(&str, &str, Option<Severity>)]) -> EventQueue {
     let q = EventQueue::new(64);
@@ -66,52 +61,17 @@ fn events_auto_turn_opt_out_no_parses() {
     assert!(!cfg.events.auto_turn);
 }
 
-// ─── 3. ServerMessage::Event serialises correctly ────────────────────────────
+// ─── 3. Server internalizes canonical formatted content ─────────────────────
 
 #[test]
-fn server_message_event_broadcast_shape() {
-    let msg = ServerMessage::Event {
-        payload: synaps_cli::core::rpc_protocol::EventPayload {
-            id: "sv-1".into(),
-            source: "monitor".into(),
-            severity: "high".into(),
-            content_type: "alert".into(),
-            text: "disk 90% full".into(),
-            timestamp: "2025-01-01T00:00:00Z".into(),
-            formatted: "<event>disk 90% full</event>".into(),
-        },
-    };
-    let json = serde_json::to_string(&msg).expect("serialize");
-    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(val["type"], "event");
-    assert_eq!(val["payload"]["source"], "monitor");
-    assert_eq!(val["payload"]["severity"], "high");
-    assert_eq!(val["payload"]["text"], "disk 90% full");
-}
-
-// ─── 4. Drain → ServerMessage::Event ─────────────────────────────────────────
-
-#[test]
-fn drain_for_server_builds_server_message_event() {
+fn drain_for_server_injects_canonical_event_without_raw_frame() {
     let q = make_queue(&[("grafana", "CPU spike", Some(Severity::High))]);
     let mut messages = Vec::new();
     let mut pending = Vec::new();
-    // Server: idle, no streaming
     let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
     assert_eq!(drained.len(), 1);
-
-    let server_msg = ServerMessage::Event {
-        payload: event_payload_from_drained(&drained[0]),
-    };
-
-    match &server_msg {
-        ServerMessage::Event { payload } => {
-            assert_eq!(payload.source, "grafana");
-            assert_eq!(payload.text, "CPU spike");
-            assert_eq!(payload.severity, "high");
-        }
-        _ => panic!("expected Event variant"),
-    }
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"].as_str(), Some(drained[0].formatted.as_str()));
 }
 
 // ─── 5. No auto-turn when events.auto_turn = false (default) ─────────────────

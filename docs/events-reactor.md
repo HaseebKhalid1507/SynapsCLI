@@ -30,8 +30,8 @@ regardless of which mode (chat, RPC, server) drains it.
 | Mode | Idle (not streaming) | Busy (streaming active) | Auto-turn | Wire frame emitted? |
 |------|---------------------|------------------------|-----------|---------------------|
 | **chat** | Inject into `api_messages` + continue turn | Steer via `steer_tx`; buffer if channel dead | N/A (turn-based) | No |
-| **RPC** | Inject into `api_messages` + emit `RpcEvent::Event` frame | Buffer in `pending_events` + emit `RpcEvent::Event` frame | **Never** (client decides) | Yes — drainer only, exactly once |
-| **server** | Inject into `api_messages` + broadcast `ServerMessage::Event` | Buffer in `pending_events` + broadcast `ServerMessage::Event` | Gated on `events.auto_turn` (default **false**) | Yes — drainer only |
+| **RPC** | Inject + emit one `RpcEvent::Event` observability frame | Buffer + emit one frame; terminal flush injects | Owning session auto-turns (default on, opt-out) | Yes — drainer only, exactly once |
+| **server** | Inject into the one shared owning conversation; no raw event frame | Buffer for the shared conversation; no raw event frame | Owning conversation auto-turns (default on, opt-out) | Yes — drainer only |
 
 ---
 
@@ -75,7 +75,7 @@ is non-empty:
 
 ```toml
 # ~/.config/synaps/config.toml
-events.auto_turn = false   # default — clients must send a follow-up
+events.auto_turn = true    # default — owning session continues automatically
 # events.auto_turn = true  # server triggers model turns on idle events
 ```
 

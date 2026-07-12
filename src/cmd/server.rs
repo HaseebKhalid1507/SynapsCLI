@@ -14,7 +14,7 @@ use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-use synaps_cli::engine::reactor::{drain_event_queue, event_payload_from_drained, wake_action, WakeAction, AUTO_TURN_CAP};
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
 use axum::extract::Query;
@@ -285,9 +285,10 @@ pub async fn run(
 
     // ── Event drainer task (exactly one per Runtime) ──────────────────────
     //
-    // Policy (per RECON §Server):
-    //   * Broadcast ServerMessage::Event to ALL connected clients ALWAYS.
-    //   * Auto-turn is behind `events.auto_turn` (default false).
+    // Policy:
+    //   * Runtime events are internalized into the single shared conversation.
+    //   * No raw event frame is broadcast; clients see the ordinary model stream.
+    //   * Auto-turn follows `events.auto_turn` (default true, explicit opt-out).
     //   * Do NOT touch the `streaming` guard from this task — use the
     //     auto_turn_tx channel to hand off to the listener task below.
     //   * conv.pending_events tracks buffered strings while streaming; they
@@ -303,7 +304,7 @@ pub async fn run(
                 eq.notified().await;
 
                 // Drain + mutate conv fields — brief lock, released before sends.
-                let (frames, action) = {
+                let action = {
                     let mut conv = state_d.conv.write().await;
                     let busy = state_d.streaming.load(std::sync::atomic::Ordering::Acquire);
                     // Reborrow through &mut *conv so NLL field-split borrow analysis
@@ -318,26 +319,17 @@ pub async fn run(
                     );
                     let consecutive = state_d.consecutive_auto_turns
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let action = wake_action(
+                    wake_action(
                         &drained,
                         &conv_ref.api_messages,
                         busy,
                         state_d.events_auto_turn,
                         consecutive,
-                    );
-                    let frames: Vec<ServerMessage> = drained
-                        .iter()
-                        .map(|d| ServerMessage::Event {
-                            payload: event_payload_from_drained(d),
-                        })
-                        .collect();
-                    (frames, action)
+                    )
                 }; // conv write-lock released
 
-                // Broadcast Event frames to all connected clients.
-                for frame in frames {
-                    let _ = state_d.broadcast_tx.send(frame);
-                }
+                // Events are internalized into conv.api_messages by drain_event_queue.
+                // No raw event broadcast to clients — model turn is the delivery mechanism.
 
                 // If auto_turn enabled + conditions met, signal the listener.
                 // Unit signal — event content already in conv.api_messages.
@@ -1032,6 +1024,19 @@ async fn run_injected_event_turn(state: &Arc<ServerState>) {
     let _streaming_guard = StreamingGuard {
         state: Arc::clone(state),
     };
+
+    // Guard: last api_messages entry must be role=user (injected event content).
+    // Stale signals (e.g. fired after a user turn already consumed the message)
+    // are silently parked — no turn started.
+    {
+        let conv = state.conv.read().await;
+        let last_role = conv.api_messages.last()
+            .and_then(|m| m["role"].as_str());
+        if last_role != Some("user") {
+            tracing::debug!("server: auto-turn parked — last message is not role=user");
+            return;
+        }
+    }
 
     // Increment counter; bail (saturate, do NOT reset) if cap reached.
     // Only handle_user_message resets the counter so the cap stays latched

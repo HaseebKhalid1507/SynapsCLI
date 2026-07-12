@@ -4,14 +4,12 @@
 //!
 //!  1. `EventPayload` serde roundtrip (reactor.rs `event_payload_from_drained`)
 //!  2. `RpcEvent::Event` round-trip (additive wire frame)
-//!  3. `ServerMessage::Event` round-trip (additive wire frame)
-//!  4. `EventsConfig` default (auto_turn = false)
-//!  5. `EventsConfig` parse from config key `events.auto_turn = true`
+//!  3. `EventsConfig` default (auto_turn = true)
+//!  4. `EventsConfig` parse from config key `events.auto_turn = true`
 //!
 //! RPC_PROTOCOL_VERSION must stay 1 (additive variant, no break).
 
 use synaps_cli::core::rpc_protocol::{RpcEvent, RPC_PROTOCOL_VERSION};
-use synaps_cli::protocol::ServerMessage;
 use synaps_cli::engine::reactor::EventPayload;
 use synaps_cli::core::config::{EventsConfig, load_config_from_str};
 
@@ -97,41 +95,12 @@ fn rpc_protocol_version_still_one_after_event_frame() {
     assert_eq!(RPC_PROTOCOL_VERSION, 1);
 }
 
-// ─── 3. ServerMessage::Event round-trip ──────────────────────────────────────
-
-#[test]
-fn server_message_event_round_trip() {
-    let msg = ServerMessage::Event {
-        payload: synaps_cli::core::rpc_protocol::EventPayload {
-            id: "se-1".into(),
-            source: "test".into(),
-            severity: "medium".into(),
-            content_type: "message".into(),
-            text: "boom".into(),
-            timestamp: "2025-01-01T00:00:00Z".into(),
-            formatted: "<event>boom</event>".into(),
-        },
-    };
-    let json = serde_json::to_string(&msg).expect("serialize");
-    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(val["type"], "event");
-    assert_eq!(val["payload"]["text"], "boom");
-
-    let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
-    match back {
-        ServerMessage::Event { payload } => {
-            assert_eq!(payload.id, "se-1");
-        }
-        _ => panic!("wrong variant"),
-    }
-}
-
 // ─── 4. EventsConfig default ─────────────────────────────────────────────────
 
 #[test]
-fn events_config_default_auto_turn_false() {
+fn events_config_default_auto_turn_true() {
     let cfg = EventsConfig::default();
-    assert!(!cfg.auto_turn, "events.auto_turn must default to false");
+    assert!(cfg.auto_turn, "events.auto_turn must default to true; opt-out via events.auto_turn = false");
 }
 
 // ─── 5. EventsConfig parses from config key ──────────────────────────────────

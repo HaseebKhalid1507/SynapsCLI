@@ -72,9 +72,9 @@ pub struct RpcAttachment {
     pub mime: Option<String>,
 }
 
-/// Canonical runtime event payload — shared by `RpcEvent::Event` (RPC wire
-/// format) and `ServerMessage::Event` (WebSocket wire format) so both modes
-/// emit identical structured data from a single source of truth.
+/// Canonical runtime event payload carried by `RpcEvent::Event`.
+/// Server mode internalizes the same formatted event into its owning conversation
+/// rather than exposing a raw transport frame.
 ///
 /// All string fields are UTF-8; `formatted` is the full XML-tagged payload
 /// already safe for injection into the agent context (prompt-injection
