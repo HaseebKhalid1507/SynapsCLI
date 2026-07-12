@@ -6,6 +6,7 @@
 //! Usage: synaps-agent --config <path/to/config.toml>
 
 use synaps_cli::{Runtime, StreamEvent, LlmEvent, SessionEvent, AgentConfig, HandoffState, watcher_types::{AgentStats, DailyStats}};
+use synaps_cli::engine::reactor::{drain_event_queue, idle_should_wait};
 use futures::StreamExt;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -294,6 +295,9 @@ pub async fn run(config_path: String, trigger_context: String) {
     let mut messages: Vec<synaps_cli::SharedMessage> = vec![std::sync::Arc::new(
         json!({"role": "user", "content": boot_message}),
     )];
+    // Pending formatted events buffered while a turn was streaming.
+    // Invariant: exactly one waiter on event_queue.notified() exists in agent mode.
+    let mut pending_events: Vec<String> = Vec::new();
 
     log(agent_name, "session started — entering agentic loop");
 
@@ -319,6 +323,21 @@ pub async fn run(config_path: String, trigger_context: String) {
         if interrupted.load(Ordering::Acquire) {
             log(agent_name, "interrupted by signal");
             break;
+        }
+
+        // Drain the event queue (idle, no active stream, no steer channel).
+        // Each popped event is injected as a role=user message and logged.
+        {
+            let drained = drain_event_queue(
+                runtime.event_queue(),
+                &mut messages,
+                &mut pending_events,
+                false, // idle
+                None,  // no steer channel
+            );
+            for d in &drained {
+                log(agent_name, &format!("event [{}]: {}", d.event.content.content_type, d.event.content.text));
+            }
         }
 
         // Run one streaming turn
@@ -441,8 +460,33 @@ pub async fn run(config_path: String, trigger_context: String) {
         // the last message was from the assistant with no tool use
         if let Some(last) = messages.last() {
             if last["role"].as_str() == Some("assistant") && last["stop_reason"].as_str() == Some("end_turn") {
-                // Agent stopped on its own without calling watcher_exit
-                // Give it one more chance to write handoff
+                // Agent stopped on its own without calling watcher_exit.
+                // Determine whether to wait on reactive events or nag immediately.
+                let (children_running, queue_len) = {
+                    // Drop registry lock before any await.
+                    let reg = runtime.subagent_registry().lock().unwrap();
+                    let running = reg.list_active().len();
+                    drop(reg);
+                    (running > 0, runtime.event_queue().len())
+                };
+
+                if idle_should_wait(children_running, queue_len) {
+                    // Park on the queue notifier (bounded 30s) then loop back to
+                    // drain at the top.  Exactly one waiter exists in agent mode.
+                    log(agent_name, &format!(
+                        "idle — waiting for events (children={}, queue={})",
+                        children_running as u8, queue_len
+                    ));
+                    let _ = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(30),
+                        runtime.event_queue().notified(),
+                    ).await;
+                    // Loop back — drain fires at the top.
+                    continue;
+                }
+
+                // No children and no queued events — give the agent one more chance
+                // to write handoff (original nag behaviour).
                 if !watcher_exit_called {
                     log(agent_name, "agent ended turn without tool calls — prompting for handoff");
                     messages.push(std::sync::Arc::new(json!({

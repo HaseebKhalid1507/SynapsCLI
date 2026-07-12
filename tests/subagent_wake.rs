@@ -548,3 +548,78 @@ fn c2_reap_finished_poison_safe() {
     // Must not panic
     reap_finished(&registry);
 }
+
+// ── C3: agent idle_should_wait reactive wait ──────────────────────────────────
+//
+// Verify that `idle_should_wait` integrates correctly with the real EventQueue
+// notified() path: when a subagent completion event arrives, a waiter wakes
+// and sees the event via drain.
+
+/// C3-S1: idle_should_wait returns false when registry empty + queue empty.
+#[test]
+fn c3_idle_should_wait_no_children_no_events() {
+    use agent_engine::engine::reactor::idle_should_wait;
+    use agent_engine::events::EventQueue;
+    let q = Arc::new(EventQueue::new(16));
+    assert!(!idle_should_wait(false, q.len()));
+}
+
+/// C3-S2: idle_should_wait true when queue has items.
+#[test]
+fn c3_idle_should_wait_queue_has_items() {
+    use agent_engine::engine::reactor::idle_should_wait;
+    use agent_engine::events::EventQueue;
+    use agent_engine::events::types::Event;
+    let q = Arc::new(EventQueue::new(16));
+    q.push(Event::simple("test", "ping", None)).unwrap();
+    assert!(idle_should_wait(false, q.len()));
+}
+
+/// C3-S3: idle_should_wait true when children running.
+#[test]
+fn c3_idle_should_wait_children_running() {
+    use agent_engine::engine::reactor::idle_should_wait;
+    use agent_engine::events::EventQueue;
+    let q = Arc::new(EventQueue::new(16));
+    assert!(idle_should_wait(true, q.len())); // queue empty, but children running
+}
+
+/// C3-S4: notified() wakes within timeout when event pushed (drain + inject path).
+#[tokio::test]
+async fn c3_notified_wakes_when_event_arrives() {
+    use agent_engine::engine::reactor::{drain_event_queue, idle_should_wait};
+    use agent_engine::events::EventQueue;
+    use agent_engine::events::types::Event;
+    use agent_core::SharedMessage;
+    use std::sync::Arc;
+
+    let q = Arc::new(EventQueue::new(16));
+    let q2 = Arc::clone(&q);
+
+    // Simulate: no children, no events → would not wait (idle_should_wait=false)
+    // But if we pretend children_running=true, we wait. Then the "finalizer" pushes.
+    assert!(!idle_should_wait(false, q.len()));
+
+    // Spawn a task that pushes an event after 50ms (simulating finalizer)
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        q2.push(Event::simple("subagent_completion", "done", None)).unwrap();
+    });
+
+    // Wait with 2s timeout
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        q.notified(),
+    ).await;
+    assert!(result.is_ok(), "notified() must wake within timeout");
+
+    // Now drain — event must be injected into messages
+    let mut messages: Vec<SharedMessage> = vec![Arc::new(serde_json::json!({"role":"user","content":"boot"}))];
+    let mut pending: Vec<String> = vec![];
+    let drained = drain_event_queue(&q, &mut messages, &mut pending, false, None);
+    assert_eq!(drained.len(), 1, "one event must be drained");
+    assert!(q.is_empty(), "queue must be empty after drain");
+    // Message injected as role=user
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1]["role"].as_str().unwrap(), "user");
+}
