@@ -143,6 +143,25 @@ impl auth::cloud_login::CloudLoginUi for TerminalCloudLoginUi {
         }
     }
 
+    fn prompt_config(
+        &mut self,
+        variable: &'static str,
+        label: &'static str,
+    ) -> Result<String, String> {
+        if !io::stdin().is_terminal() {
+            return Err(format!(
+                "non-interactive AWS login requires {variable} or saved broker cloud config"
+            ));
+        }
+        eprint!("{label} ({variable}): ");
+        io::stderr().flush().map_err(|e| e.to_string())?;
+        let mut value = String::new();
+        io::stdin()
+            .read_line(&mut value)
+            .map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
     fn select(
         &mut self,
         kind: auth::cloud_login::CloudSelectionKind,

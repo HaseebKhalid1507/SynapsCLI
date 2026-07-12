@@ -37,6 +37,13 @@ impl CloudLoginChoice {
 /// Presentation boundary for interactive cloud login. Core never accesses a terminal.
 pub trait CloudLoginUi {
     fn present_challenge(&mut self, challenge: CloudLoginChallenge);
+    /// Request non-secret provider configuration. Implementations must return a
+    /// clear error instead of blocking when no interactive input is available.
+    fn prompt_config(
+        &mut self,
+        variable: &'static str,
+        label: &'static str,
+    ) -> Result<String, String>;
     fn select(
         &mut self,
         kind: CloudSelectionKind,
@@ -341,11 +348,60 @@ async fn login_google_vertex(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     )
 }
 
+fn resolve_config(
+    configured: Option<String>,
+    variable: &'static str,
+    label: &'static str,
+    ui: &mut dyn CloudLoginUi,
+) -> Result<String, String> {
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .map(Ok)
+        .unwrap_or_else(|| ui.prompt_config(variable, label))
+        .and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                Err(format!("{variable} cannot be empty"))
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn saved_aws_config() -> Option<super::AwsBedrockConfig> {
+    super::load_cloud_state("aws-bedrock")
+        .ok()
+        .flatten()
+        .and_then(|state| serde_json::from_value(state["config"].clone()).ok())
+}
+
 async fn login_aws_bedrock(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
     use super::aws_bedrock::{AwsApi, AwsHttpApi, TokenGrant};
-    let start = required_env("SYNAPS_AWS_SSO_START_URL")?;
-    let sso_region = required_env("SYNAPS_AWS_SSO_REGION")?;
-    let bedrock_region = required_env("SYNAPS_AWS_BEDROCK_REGION")?;
+    let saved = saved_aws_config();
+    let start = resolve_config(
+        std::env::var("SYNAPS_AWS_SSO_START_URL")
+            .ok()
+            .or_else(|| saved.as_ref().map(|v| v.sso_start_url.clone())),
+        "SYNAPS_AWS_SSO_START_URL",
+        "IAM Identity Center start URL",
+        ui,
+    )?;
+    let sso_region = resolve_config(
+        std::env::var("SYNAPS_AWS_SSO_REGION")
+            .ok()
+            .or_else(|| saved.as_ref().map(|v| v.sso_region.clone())),
+        "SYNAPS_AWS_SSO_REGION",
+        "IAM Identity Center region",
+        ui,
+    )?;
+    let bedrock_region = resolve_config(
+        std::env::var("SYNAPS_AWS_BEDROCK_REGION")
+            .ok()
+            .or_else(|| saved.map(|v| v.bedrock_region)),
+        "SYNAPS_AWS_BEDROCK_REGION",
+        "Bedrock region",
+        ui,
+    )?;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -485,6 +541,14 @@ mod ui_tests {
             self.challenges.push(challenge);
         }
 
+        fn prompt_config(
+            &mut self,
+            _variable: &'static str,
+            _label: &'static str,
+        ) -> Result<String, String> {
+            Err("unexpected prompt".into())
+        }
+
         fn select(
             &mut self,
             kind: CloudSelectionKind,
@@ -493,6 +557,73 @@ mod ui_tests {
             self.selections.push((kind, choices.to_vec()));
             Ok(choices[1].id.clone())
         }
+    }
+
+    #[test]
+    fn aws_context_uses_configured_values_without_prompting() {
+        let mut ui = RecordingUi::default();
+        assert_eq!(
+            resolve_config(
+                Some("us-east-1".into()),
+                "SYNAPS_AWS_SSO_REGION",
+                "SSO region",
+                &mut ui
+            )
+            .unwrap(),
+            "us-east-1"
+        );
+    }
+
+    struct ConfigUi {
+        prompts: Vec<(&'static str, &'static str)>,
+        answer: Result<String, String>,
+    }
+    impl CloudLoginUi for ConfigUi {
+        fn present_challenge(&mut self, _: CloudLoginChallenge) {}
+        fn prompt_config(
+            &mut self,
+            variable: &'static str,
+            label: &'static str,
+        ) -> Result<String, String> {
+            self.prompts.push((variable, label));
+            self.answer.clone()
+        }
+        fn select(
+            &mut self,
+            _: CloudSelectionKind,
+            _: &[CloudLoginChoice],
+        ) -> Result<String, String> {
+            Err("unexpected selection".into())
+        }
+    }
+
+    #[test]
+    fn aws_context_prompts_for_missing_value_through_ui() {
+        let mut ui = ConfigUi {
+            prompts: vec![],
+            answer: Ok("us-west-2".into()),
+        };
+        assert_eq!(
+            resolve_config(None, "SYNAPS_AWS_BEDROCK_REGION", "Bedrock region", &mut ui).unwrap(),
+            "us-west-2"
+        );
+        assert_eq!(
+            ui.prompts,
+            vec![("SYNAPS_AWS_BEDROCK_REGION", "Bedrock region")]
+        );
+    }
+
+    #[test]
+    fn aws_context_reports_noninteractive_missing_variable() {
+        let mut ui = ConfigUi {
+            prompts: vec![],
+            answer: Err(
+                "non-interactive login requires SYNAPS_AWS_SSO_START_URL or saved config".into(),
+            ),
+        };
+        let error =
+            resolve_config(None, "SYNAPS_AWS_SSO_START_URL", "SSO start URL", &mut ui).unwrap_err();
+        assert!(error.contains("SYNAPS_AWS_SSO_START_URL"));
     }
 
     #[test]
