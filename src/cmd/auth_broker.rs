@@ -377,6 +377,22 @@ pub async fn run(
     Ok(())
 }
 
+/// Build the production auth-broker router with an injected typed cloud backend.
+/// This is the supported construction seam for unattended production-router tests;
+/// credentials and signing remain behind `CloudBackend`.
+pub fn build_router_with_cloud_backend(
+    machine_token: Option<String>,
+    backend: Arc<dyn auth::broker::CloudBackend>,
+) -> Router {
+    let client = reqwest::Client::new();
+    let local = auth::LocalBroker::new(client.clone()).with_cloud_backend(backend);
+    build_router(BrokerState {
+        machine_token,
+        client,
+        local: Arc::new(local),
+    })
+}
+
 /// Build the shared axum Router. Extracted so tests can reuse it.
 fn build_router(state: BrokerState) -> Router {
     Router::new()
@@ -699,6 +715,9 @@ fn broker_error_response(e: auth::BrokerError) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── ct_eq (preserved) ────────────────────────────────────────────────────
@@ -1037,6 +1056,126 @@ mod tests {
     }
 
     // ── Broker service: /proxy, /capabilities, /token isolation ─────────────
+
+    // ── Genuine authenticated cloud production-router E2E ────────────────────
+
+    struct TypedCloudFixture {
+        invokes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl auth::broker::CloudBackend for TypedCloudFixture {
+        async fn catalog(
+            &self,
+            provider: auth::CloudProviderId,
+            context: &str,
+            _: bool,
+        ) -> Result<Vec<auth::broker::CloudCatalogEntry>, auth::BrokerError> {
+            assert_eq!(context, "ctx-opaque-route");
+            Ok(vec![auth::broker::CloudCatalogEntry {
+                provider,
+                id: "model-x".into(),
+                display_name: "Model X".into(),
+                context_ref: context.into(),
+                context_label: "sandbox".into(),
+                stale: false,
+                fetched_at: 7,
+            }])
+        }
+        async fn invoke(
+            &self,
+            _: auth::CloudProviderId,
+            context: &str,
+            model: &str,
+            _: auth::InvokeRequest,
+        ) -> Result<auth::broker::CloudEventStream, auth::BrokerError> {
+            assert_eq!((context, model), ("ctx-opaque-route", "model-x"));
+            self.invokes.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(auth::broker::CloudEvent::TextDelta {
+                    delta: "frag".into(),
+                }),
+                Ok(auth::broker::CloudEvent::TextDelta {
+                    delta: "mented".into(),
+                }),
+                Ok(auth::broker::CloudEvent::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_broker_catalog_then_fragmented_invoke_uses_real_auth_router() {
+        use auth::CredentialBroker;
+        let backend = Arc::new(TypedCloudFixture {
+            invokes: AtomicUsize::new(0),
+        });
+        let app = build_router_with_cloud_backend(Some("machine-only".into()), backend.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        let endpoint = format!("http://{addr}");
+        let remote = auth::RemoteBroker::new(
+            &endpoint,
+            "machine-only",
+            reqwest::Client::new(),
+            auth::TokenCache::new(),
+        );
+        let provider = auth::CloudProviderId::AwsBedrock;
+        let catalog = remote
+            .cloud_catalog(provider, "ctx-opaque-route", false)
+            .await
+            .unwrap();
+        assert_eq!(catalog[0].context_ref, "ctx-opaque-route");
+        let request: auth::InvokeRequest =
+            serde_json::from_value(json!({"messages":[],"tools":[],"stream":true,"options":{}}))
+                .unwrap();
+        let mut events = remote
+            .cloud_invoke(
+                provider,
+                &catalog[0].context_ref,
+                &catalog[0].id,
+                request.clone(),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(event) = events.next().await {
+            seen.push(event.unwrap());
+        }
+        assert_eq!(
+            seen,
+            vec![
+                auth::broker::CloudEvent::TextDelta {
+                    delta: "frag".into()
+                },
+                auth::broker::CloudEvent::TextDelta {
+                    delta: "mented".into()
+                },
+                auth::broker::CloudEvent::Done
+            ]
+        );
+        assert_eq!(backend.invokes.load(Ordering::SeqCst), 1);
+
+        for token in [None, Some("invalid")] {
+            let client = reqwest::Client::new();
+            let mut call = client.post(format!("{endpoint}/cloud/invoke")).json(&json!({"provider":"aws-bedrock","context_ref":"ctx-opaque-route","model_id":"model-x","request":request}));
+            if let Some(token) = token {
+                call = call.bearer_auth(token);
+            }
+            let response = call.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let wire = response.text().await.unwrap();
+            assert!(!wire.contains("machine-only") && !wire.contains("ctx-opaque-route"));
+        }
+        assert_eq!(backend.invokes.load(Ordering::SeqCst), 1);
+    }
 
     /// Spawn the REAL router (real handlers/state) on an ephemeral loopback
     /// port. `local_upstream` pins the `local` provider at a fake endpoint so
