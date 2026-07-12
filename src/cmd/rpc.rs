@@ -107,12 +107,6 @@ fn encode_event(ev: &RpcEvent) -> String {
     })
 }
 
-/// Generate a UUID v4 string — used for synthesised EventPayload ids when the
-/// original DrainedEvent metadata is not available (buffered-event flush path).
-fn uuid_v4_simple() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 // ─── Writer task ──────────────────────────────────────────────────────────────
 
 /// Spawn a dedicated task that owns stdout and serialises frames from a channel.
@@ -196,34 +190,19 @@ async fn spawn_prompt(
                 StreamEvent::Session(SessionEvent::Done) => {
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
                     // Flush events buffered while streaming was active.
-                    // Lock briefly to drain pending_events; release before sends.
-                    let buffered: Vec<String> = {
+                    // B1 FIX: inject buffered formatted strings into api_messages ONLY.
+                    // The drainer already emitted one RpcEvent::Event frame per event
+                    // when it ran (busy drain → pending_events). Re-emitting another
+                    // frame here would cause wire duplication with fake metadata
+                    // (synthetic UUID, source="buffered"). Do NOT emit Event frames.
+                    {
                         let mut st = state.lock().await;
                         let to_inject = std::mem::take(&mut st.pending_events);
-                        // Inject buffered events into messages for the next turn.
-                        for formatted in &to_inject {
+                        for formatted in to_inject {
                             st.api_messages.push(std::sync::Arc::new(
                                 serde_json::json!({"role": "user", "content": formatted})
                             ));
                         }
-                        to_inject
-                    };
-                    // Forward buffered events as Event frames (client can follow up).
-                    for formatted in buffered {
-                        // Re-build a minimal EventPayload from the formatted string.
-                        // (Full DrainedEvent is not available here — just the string.)
-                        let ev_frame = RpcEvent::Event {
-                            payload: Box::new(synaps_cli::core::rpc_protocol::EventPayload {
-                                id: uuid_v4_simple(),
-                                source: "buffered".into(),
-                                severity: "medium".into(),
-                                content_type: "message".into(),
-                                text: formatted.clone(),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                formatted,
-                            }),
-                        };
-                        let _ = wtx.send(ev_frame).await;
                     }
                     let _ = wtx
                         .send(RpcEvent::Response {
