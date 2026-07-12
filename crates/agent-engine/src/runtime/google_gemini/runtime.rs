@@ -16,6 +16,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use super::setup::setup_user;
 use super::stream::{stream_gemini, StreamError};
 use super::translate::{ChatTurn, GeminiStreamEvent, ToolSpec};
 use crate::auth::CredentialBroker;
@@ -203,16 +204,28 @@ pub(crate) async fn call_google_gemini_stream_inner(
     let turns = messages_to_gemini_turns(messages);
     let tools = tools_to_gemini(tools_schema);
 
+    // Resolve the Code Assist project id through the broker before streaming.
+    // Code Assist rejects `streamGenerateContent` without a project on the
+    // envelope; the broker owns the OAuth token so `setup_user` never touches
+    // secrets directly. We honor GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID
+    // as an override, matching the reference client.
+    let env_project = gemini_project_env();
+    let user = setup_user(broker.as_ref(), env_project)
+        .await
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("{e}")))?;
+    let project_id = user.project_id;
+
     tracing::debug!(
         provider = %cfg.provider,
         model = %cfg.model,
+        project = %project_id,
         "google-gemini stream request via broker proxy"
     );
 
     let mut stream = stream_gemini(
         broker.as_ref(),
         cfg.model.clone(),
-        None, // project id is broker-owned; runtime does not surface it here
+        Some(project_id),
         system_prompt.clone(),
         &turns,
         &tools,
@@ -290,6 +303,21 @@ pub(crate) async fn call_google_gemini_stream_inner(
     }))
 }
 
+/// Read `GOOGLE_CLOUD_PROJECT` (or the `_ID` alias) if set, matching the
+/// reference client. Empty values are treated as unset. The runtime forwards
+/// this to `setup_user`, which keeps the setup module env-free.
+fn gemini_project_env() -> Option<String> {
+    for key in ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"] {
+        if let Ok(v) = std::env::var(key) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Map Gemini's `finishReason` values onto Anthropic-style stop reasons the
 /// outer agent loop already knows how to interpret.
 fn map_finish_reason(reason: &str) -> String {
@@ -335,7 +363,15 @@ mod tests {
         ) -> Result<AccessToken, BrokerError> {
             Err(BrokerError::NotConfigured("stub".into()))
         }
-        async fn proxy(&self, _r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+        async fn proxy(&self, r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            // Serve a minimal Code Assist `loadCodeAssist` response so
+            // `setup_user` can resolve a project id without secrets.
+            if r.path == "/v1internal:loadCodeAssist" {
+                return Ok(ProxyResponse {
+                    status: 200,
+                    body: r#"{"cloudaicompanionProject":"test-proj","currentTier":{"id":"STANDARD","name":"Std","hasOnboardedPreviously":true}}"#.to_string(),
+                });
+            }
             Err(BrokerError::Denied("not implemented".into()))
         }
         async fn proxy_stream(
@@ -495,5 +531,47 @@ mod tests {
         assert_eq!(out[0].name, "search");
         assert_eq!(out[0].description.as_deref(), Some("d"));
         assert!(out[0].parameters_json_schema.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolves_project_via_broker_and_includes_it_in_stream_request() {
+        // Regression: previously the runtime called stream_gemini with
+        // project=None, causing Code Assist to reject the request. The runtime
+        // must resolve the user's project through the broker (setup_user) and
+        // put it on the envelope so /v1internal:streamGenerateContent succeeds.
+        let stub = Arc::new(StubBroker::new(vec![chunk(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n",
+        )]));
+        let seen = stub.seen.clone();
+        let broker: Arc<dyn CredentialBroker> = stub;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let msgs: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role":"user","content":"hi"}))];
+
+        call_google_gemini_stream_inner(
+            &cfg(),
+            &broker,
+            &[],
+            &None,
+            &msgs,
+            &tx,
+            &cancel,
+        )
+        .await
+        .expect("stream should succeed once project is resolved");
+
+        let request = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stream request should be recorded");
+        assert_eq!(request.path, "/v1internal:streamGenerateContent");
+        let body = request.body.as_ref().expect("stream request has body");
+        assert_eq!(
+            body["project"].as_str(),
+            Some("test-proj"),
+            "runtime must forward the setup-resolved project id on the envelope: {body}",
+        );
     }
 }
