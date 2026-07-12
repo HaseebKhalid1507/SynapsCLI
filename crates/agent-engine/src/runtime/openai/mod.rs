@@ -464,11 +464,18 @@ pub async fn try_route(
             .await,
         ),
         WireProtocol::AnthropicMessages => None,
-        // The Gemini Code Assist wire is dispatched by the broker-proxied
-        // stream builder below, not the OpenAI-style branches. `None` here
-        // is the correct signal for callers that only speak OpenAI-shaped
-        // stream translation.
-        WireProtocol::GoogleGeminiCodeAssist => None,
+        WireProtocol::GoogleGeminiCodeAssist => Some(
+            crate::runtime::google_gemini::runtime::call_google_gemini_stream_inner(
+                &cfg,
+                &broker,
+                tools_schema,
+                system_prompt,
+                messages,
+                tx,
+                cancel,
+            )
+            .await,
+        ),
     }
 }
 
@@ -538,6 +545,65 @@ mod tests {
         let route = resolve_route("openai-codex/gpt-5.1-codex-mini").unwrap();
         assert_eq!(route.provider, "openai-codex");
         assert_eq!(route.wire, WireProtocol::CodexResponses);
+    }
+
+    /// Regression: models under the `google-gemini/*` prefix must route through
+    /// `try_route` (i.e. the OpenAI-runtime dispatcher must return `Some(_)` so
+    /// the caller invokes the Gemini stream rather than falling through to the
+    /// Anthropic path and reporting a misleading 401. Before this fix,
+    /// `WireProtocol::GoogleGeminiCodeAssist => None` made `try_route` return
+    /// `None`.
+    ///
+    /// We drive `try_route` through the `Remote` credential source pointed at a
+    /// closed loopback port so the broker request errors out fast without
+    /// touching the developer's real auth.json or the network. The outcome we
+    /// assert is only that the routing dispatcher returned `Some(_)` — the
+    /// specific broker error is irrelevant.
+    #[tokio::test]
+    async fn try_route_google_gemini_is_not_none_and_does_not_fall_through_to_anthropic() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client");
+        // 127.0.0.1:1 is a reserved port; on Linux connect(2) returns
+        // ECONNREFUSED immediately so the broker call fails fast.
+        let source = crate::auth::CredentialSource::Remote {
+            endpoint: "http://127.0.0.1:1".into(),
+            machine_token: "not-a-real-token".into(),
+        };
+        let cache = crate::auth::TokenCache::new();
+        let tools_schema: std::sync::Arc<Vec<serde_json::Value>> =
+            std::sync::Arc::new(Vec::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let messages: Vec<crate::SharedMessage> = vec![std::sync::Arc::new(serde_json::json!({
+            "role": "user",
+            "content": "hi"
+        }))];
+
+        let fut = try_route(
+            "google-gemini/gemini-2.5-pro",
+            &client,
+            &tools_schema,
+            &None,
+            &messages,
+            &tx,
+            None,
+            None,
+            0,
+            &cancel,
+            &source,
+            &cache,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("try_route completed within budget");
+
+        assert!(
+            result.is_some(),
+            "google-gemini must route through try_route (was None → fell through to Anthropic)"
+        );
     }
 
     #[test]
