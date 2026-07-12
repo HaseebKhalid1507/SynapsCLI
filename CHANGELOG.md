@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reactive subagent wake (Phase 1)** — subagents no longer silently vanish
+  when the parent turn ends before they complete. `cleanup_finished()` now
+  retains uncollected finished handles for 15 minutes (TTL reaper); a
+  `finalize_subagent` hook fires exactly once at each subagent thread exit
+  (outside `catch_unwind`), stamps `finished_at`, and pushes a
+  `subagent_completion` event to the parent's `EventQueue` so the idle parent
+  wakes and can call `subagent_collect`. Kill-switch:
+  `SYNAPS_DISABLE_SUBAGENT_WAKE=1`. Covers start, resume, panic, timeout, and
+  tokio-build-failure exit paths. Encodes the live regression as integration
+  test I1 (`parent_wakes_after_turn_end_multi_subagent`). See
+  `IMPLEMENTATION-PLAN.md` in the workspace for full design rationale.
+
 ## [0.6.0] — 2026-07-11
 
 The TUI modernization release. 112 commits, 6 waves of architectural work, two
