@@ -1,15 +1,15 @@
+use super::helpers::HelperMethods;
+use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
+use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
+use crate::runtime::telemetry::{self, TelemetryLevel};
+use crate::{Result, RuntimeError, ToolRegistry};
+use futures::StreamExt;
+use reqwest::Client;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use serde_json::{json, Value};
-use reqwest::Client;
-use futures::StreamExt;
-use crate::{Result, RuntimeError, ToolRegistry};
-use crate::runtime::telemetry::{self, TelemetryLevel};
-use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
-use super::types::{AuthState, StreamEvent, LlmEvent, SessionEvent};
-use super::helpers::HelperMethods;
 
 /// Truncate to at most `max` bytes without slicing mid-UTF-8-codepoint.
 /// Used for forensic logging of unknown event lines.
@@ -278,12 +278,16 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
         AnthropicEvent::ContentBlockDelta { delta } => match delta {
             Delta::TextDelta { text } => {
                 state.current_text.push_str(&text);
-                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
+                let _ = ctx
+                    .tx
+                    .send(StreamEvent::Llm(LlmEvent::Text(text.into_owned())));
             }
             Delta::ThinkingDelta { thinking } => {
                 // Anthropic sends thinking text in delta.thinking
                 state.current_thinking.push_str(&thinking);
-                let _ = ctx.tx.send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
+                let _ = ctx
+                    .tx
+                    .send(StreamEvent::Llm(LlmEvent::Thinking(thinking.into_owned())));
             }
             Delta::SignatureDelta { signature } => {
                 state.current_thinking_signature = signature.into_owned();
@@ -364,18 +368,38 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 // repeat all aggregates (and carry the final output count),
                 // but be defensive — a sparse delta must not zero out what
                 // the start already reported.
-                let input_t = if usage.input_tokens > 0 { usage.input_tokens } else { state.msg_start_input.unwrap_or(0) };
-                let output_t = if usage.output_tokens > 0 { usage.output_tokens } else { state.msg_start_output.unwrap_or(0) };
-                let cache_read = if usage.cache_read_input_tokens > 0 { usage.cache_read_input_tokens } else { state.msg_start_cache_read.unwrap_or(0) };
-                let cache_create = if usage.cache_creation_input_tokens > 0 { usage.cache_creation_input_tokens } else { state.msg_start_cache_create.unwrap_or(0) };
+                let input_t = if usage.input_tokens > 0 {
+                    usage.input_tokens
+                } else {
+                    state.msg_start_input.unwrap_or(0)
+                };
+                let output_t = if usage.output_tokens > 0 {
+                    usage.output_tokens
+                } else {
+                    state.msg_start_output.unwrap_or(0)
+                };
+                let cache_read = if usage.cache_read_input_tokens > 0 {
+                    usage.cache_read_input_tokens
+                } else {
+                    state.msg_start_cache_read.unwrap_or(0)
+                };
+                let cache_create = if usage.cache_creation_input_tokens > 0 {
+                    usage.cache_creation_input_tokens
+                } else {
+                    state.msg_start_cache_create.unwrap_or(0)
+                };
                 // TTL breakdown: prefer the delta's own cache_creation
                 // sub-object (future-proof), but in live traffic message_delta
                 // carries ONLY the aggregate — the split arrives on
                 // message_start. Fall back to the values captured there.
-                let cache_create_5m = usage.cache_creation.as_ref()
+                let cache_create_5m = usage
+                    .cache_creation
+                    .as_ref()
                     .and_then(|cc| cc.ephemeral_5m_input_tokens)
                     .or(state.msg_start_cache_5m);
-                let cache_create_1h = usage.cache_creation.as_ref()
+                let cache_create_1h = usage
+                    .cache_creation
+                    .as_ref()
                     .and_then(|cc| cc.ephemeral_1h_input_tokens)
                     .or(state.msg_start_cache_1h);
 
@@ -403,17 +427,24 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 // request_has_1h_marker: if this request carried no 1h marker
                 // at all, a zero 1h bucket proves nothing — stay silent.
                 if cache_create_1h.unwrap_or(0) > 0 {
-                    ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ctx.saw_1h_honored
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 if ctx.cache_ttl != crate::core::config::CacheTtl::FiveMinutes
                     && ctx.request_has_1h_marker
                     && cache_create_1h.unwrap_or(0) == 0
                     && cache_create_5m.unwrap_or(0) > 0
                     && cache_read == 0
-                    && !ctx.saw_1h_honored.load(std::sync::atomic::Ordering::Relaxed)
-                    && !ctx.ttl_downgrade_notified.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && !ctx
+                        .saw_1h_honored
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && !ctx
+                        .ttl_downgrade_notified
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
-                    tracing::warn!("1h cache TTL not honored — check account/beta support (cache_ttl config)");
+                    tracing::warn!(
+                        "1h cache TTL not honored — check account/beta support (cache_ttl config)"
+                    );
                     let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Notice(
                         "⚠ 1h cache TTL not honored — check account/beta support (cache_ttl config)".to_string(),
                     )));
@@ -421,7 +452,13 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
 
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
                     HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                    tracing::debug!("Token Usage: {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+                    tracing::debug!(
+                        "Token Usage: {} input | {} output | {} cache_read | {} cache_create",
+                        input_t,
+                        output_t,
+                        cache_read,
+                        cache_create
+                    );
                     // ═══ TELEMETRY: accumulate usage (message_delta carries final counts) ═══
                     if ctx.telemetry_level.enabled() {
                         state.telem_usage.input = input_t;
@@ -468,14 +505,21 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 state.msg_start_output = Some(usage.output_tokens);
                 state.msg_start_cache_read = Some(usage.cache_read_input_tokens);
                 state.msg_start_cache_create = Some(usage.cache_creation_input_tokens);
-                state.msg_start_cache_5m = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_5m_input_tokens);
-                state.msg_start_cache_1h = usage.cache_creation.as_ref().and_then(|cc| cc.ephemeral_1h_input_tokens);
+                state.msg_start_cache_5m = usage
+                    .cache_creation
+                    .as_ref()
+                    .and_then(|cc| cc.ephemeral_5m_input_tokens);
+                state.msg_start_cache_1h = usage
+                    .cache_creation
+                    .as_ref()
+                    .and_then(|cc| cc.ephemeral_1h_input_tokens);
                 // Latch 1h-honored HERE, not only in the delta arm: a stream
                 // that dies between start and delta on turn 1 must not lose
                 // the latch — that would arm a false downgrade notice on a
                 // later healthy turn (1h == 0 because the prefix is cached).
                 if state.msg_start_cache_1h.unwrap_or(0) > 0 {
-                    ctx.saw_1h_honored.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ctx.saw_1h_honored
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -658,7 +702,22 @@ impl ApiMethods {
         options: &ApiOptions,
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
-        Self::call_api_stream_inner(auth, client, model, tools, system_prompt, thinking_budget, messages, tx, &CancellationToken::new(), max_retries, refusal_retries, options, telemetry_level).await
+        Self::call_api_stream_inner(
+            auth,
+            client,
+            model,
+            tools,
+            system_prompt,
+            thinking_budget,
+            messages,
+            tx,
+            &CancellationToken::new(),
+            max_retries,
+            refusal_retries,
+            options,
+            telemetry_level,
+        )
+        .await
     }
 
     /// Static inner version — used by both `call_api_stream` (instance) and
@@ -683,15 +742,30 @@ impl ApiMethods {
         // Route to OpenAI-compat provider if the model id resolves to one.
         let tools_schema = tools.tools_schema();
         if let Some(result) = crate::runtime::openai::try_route(
-            model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, thinking_budget, cancel,
-            &options.credential_source, &options.token_cache,
-        ).await {
+            model,
+            client,
+            &tools_schema,
+            system_prompt,
+            messages,
+            &tx,
+            None,
+            None,
+            thinking_budget,
+            cancel,
+            &options.credential_source,
+            &options.token_cache,
+        )
+        .await
+        {
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
+        // Provider qualification is application identity; Anthropic's wire API
+        // still receives its native bare model id.
+        let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         // Read auth state for this API call
-        let (mut auth_header_name, mut auth_header_value, auth_type) = Self::build_auth_header(auth).await;
+        let (mut auth_header_name, mut auth_header_value, auth_type) =
+            Self::build_auth_header(auth).await;
         // C1: allow a single on-401 token refetch+retry for Remote clients.
         let mut auth_retried = false;
 
@@ -746,7 +820,10 @@ impl ApiMethods {
             crate::core::config::CacheTtl::Hybrid => has_tool_marker || has_system_marker,
         };
 
-        tracing::trace!("Outgoing API Request Payload:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        tracing::trace!(
+            "Outgoing API Request Payload:\n{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
 
         // Serialize the body once up-front; each retry attempt reuses the same
         // bytes via a cheap `Bytes::clone()` (refcount bump, no copy). Previously
@@ -754,7 +831,9 @@ impl ApiMethods {
         // `serde_json::to_vec(&body)` over the entire conversation on every
         // 429 retry — wasted work since the payload is identical.
         let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
-            .map_err(|e| RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e)))?
+            .map_err(|e| {
+                RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
+            })?
             .into();
 
         // ═══ UNIFIED RETRY (task #130) ════════════════════════════════════════
@@ -1236,7 +1315,10 @@ mod tests {
             &ctx,
         );
         assert_eq!(state.accumulated_content.len(), 1);
-        assert_eq!(state.accumulated_content[0], json!({"type":"text","text":"Hello, world"}));
+        assert_eq!(
+            state.accumulated_content[0],
+            json!({"type":"text","text":"Hello, world"})
+        );
         assert!(state.current_text.is_empty());
         let events = drain(&mut rx);
         let texts: Vec<&str> = events
@@ -1266,8 +1348,14 @@ mod tests {
             &ctx,
         );
         assert_eq!(state.accumulated_content.len(), 2);
-        assert_eq!(state.accumulated_content[0], json!({"type":"text","text":"first"}));
-        assert_eq!(state.accumulated_content[1], json!({"type":"text","text":"second"}));
+        assert_eq!(
+            state.accumulated_content[0],
+            json!({"type":"text","text":"first"})
+        );
+        assert_eq!(
+            state.accumulated_content[1],
+            json!({"type":"text","text":"second"})
+        );
     }
 
     #[test]
@@ -1321,7 +1409,9 @@ mod tests {
             &ctx,
         );
         let input = &state.accumulated_content[0]["input"];
-        let err = input["__parse_error"].as_str().expect("__parse_error key present");
+        let err = input["__parse_error"]
+            .as_str()
+            .expect("__parse_error key present");
         assert!(err.starts_with("invalid tool input JSON:"));
     }
 
@@ -1411,7 +1501,15 @@ mod tests {
         let events = drain(&mut rx);
         assert!(matches!(
             &events[0],
-            StreamEvent::Session(SessionEvent::Usage { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 300, cache_creation_input_tokens: 100, cache_creation_5m: Some(60), cache_creation_1h: Some(40), model: None })
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_input_tokens: 300,
+                cache_creation_input_tokens: 100,
+                cache_creation_5m: Some(60),
+                cache_creation_1h: Some(40),
+                model: None
+            })
         ));
     }
 
@@ -1476,7 +1574,9 @@ mod tests {
         assert!(!state.usage_emitted);
         let events = drain(&mut rx);
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
             "message_start must capture only — emitting here double-counts"
         );
     }
@@ -1531,7 +1631,9 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(&[PROBED_LIVE_START], &mut state, &ctx);
-        assert!(drain(&mut rx).iter().all(|e| !matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))));
+        assert!(drain(&mut rx)
+            .iter()
+            .all(|e| !matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))));
         emit_residual_usage(&mut state, &ctx);
         let events = drain(&mut rx);
         let usages: Vec<_> = events
@@ -1564,7 +1666,12 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        let ctx = make_ctx_ttl(
+            &tx,
+            crate::core::config::CacheTtl::Hybrid,
+            &notified,
+            &honored,
+        );
         feed(&[HONORED_START], &mut state, &ctx); // no delta — stream died
         assert!(
             honored.load(std::sync::atomic::Ordering::Relaxed),
@@ -1586,7 +1693,9 @@ mod tests {
         );
         let events = drain(&mut rx);
         assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
             "all-zero usage must not emit a Usage event"
         );
         // stop_reason still captured — the gate only guards the Usage emit.
@@ -1608,11 +1717,16 @@ mod tests {
         assert!(state.first_event_seen);
         std::thread::sleep(std::time::Duration::from_millis(5));
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+            ],
             &mut state,
             &ctx,
         );
-        assert_eq!(state.telem_ttft, first, "TTFT must not be overwritten by later events");
+        assert_eq!(
+            state.telem_ttft, first,
+            "TTFT must not be overwritten by later events"
+        );
     }
 
     /// Regression test for the double-emit bug fixed in the slice-2 pre-work
@@ -1633,7 +1747,11 @@ mod tests {
         );
         // Tail path: final content_block_stop arrives as a partial last line
         // (no trailing newline) — same seam, same call.
-        process_data_line(r#"data: {"type":"content_block_stop","index":0}"#, &mut state, &ctx);
+        process_data_line(
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            &mut state,
+            &ctx,
+        );
         // End-of-stream flush.
         state.finalize();
 
@@ -1642,7 +1760,11 @@ mod tests {
             .iter()
             .filter(|b| b["type"] == "tool_use")
             .collect();
-        assert_eq!(tool_blocks.len(), 1, "tool_use block must be emitted exactly once");
+        assert_eq!(
+            tool_blocks.len(),
+            1,
+            "tool_use block must be emitted exactly once"
+        );
         let tool_events = drain(&mut rx)
             .into_iter()
             .filter(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUse { .. })))
@@ -1655,12 +1777,17 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"dangling"}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"dangling"}}"#,
+            ],
             &mut state,
             &ctx,
         );
         state.finalize();
-        assert_eq!(state.accumulated_content, vec![json!({"type":"text","text":"dangling"})]);
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"text","text":"dangling"})]
+        );
     }
 
     #[test]
@@ -1685,12 +1812,17 @@ mod tests {
         let (mut state2, tx2, _rx2) = harness();
         let ctx2 = make_ctx(&tx2);
         feed(
-            &[r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#],
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ],
             &mut state2,
             &ctx2,
         );
         state2.finalize();
-        assert!(state2.accumulated_content.is_empty(), "empty thinking must be suppressed");
+        assert!(
+            state2.accumulated_content.is_empty(),
+            "empty thinking must be suppressed"
+        );
     }
 
     #[test]
@@ -1727,13 +1859,18 @@ mod tests {
         state.finalize();
         let after_first = state.accumulated_content.clone();
         state.finalize();
-        assert_eq!(state.accumulated_content, after_first, "second finalize must be a no-op");
+        assert_eq!(
+            state.accumulated_content, after_first,
+            "second finalize must be a no-op"
+        );
 
         // Same for partial text.
         let (mut state2, tx2, _rx2) = harness();
         let ctx2 = make_ctx(&tx2);
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"t"}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"t"}}"#,
+            ],
             &mut state2,
             &ctx2,
         );
@@ -1760,7 +1897,11 @@ mod tests {
         );
         assert_eq!(state.current_text, "ok");
         let events = drain(&mut rx);
-        assert_eq!(events.len(), 1, "only the valid data line may produce events");
+        assert_eq!(
+            events.len(),
+            1,
+            "only the valid data line may produce events"
+        );
     }
 
     // ───────────────────── slice 3: typed-path additions ─────────────────────
@@ -1807,7 +1948,9 @@ mod tests {
         let ctx = make_ctx(&tx);
         // Establish some non-trivial state first.
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre"}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pre"}}"#,
+            ],
             &mut state,
             &ctx,
         );
@@ -1821,9 +1964,19 @@ mod tests {
             &mut state,
             &ctx,
         );
-        assert_eq!(snapshot(&state), before, "Unknown events must not mutate state");
-        assert!(drain(&mut rx).is_empty(), "Unknown events must emit zero events");
-        assert!(state.stream_error.is_none(), "ping/unknown must not set a stream error");
+        assert_eq!(
+            snapshot(&state),
+            before,
+            "Unknown events must not mutate state"
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "Unknown events must emit zero events"
+        );
+        assert!(
+            state.stream_error.is_none(),
+            "ping/unknown must not set a stream error"
+        );
     }
 
     #[test]
@@ -1837,14 +1990,29 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#],
+            &[
+                r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            ],
             &mut state,
             &ctx,
         );
-        let err = state.stream_error.expect("error event must set stream_error");
-        assert!(err.message.contains("overloaded_error"), "must carry the error type: {}", err.message);
-        assert!(err.message.contains("Overloaded"), "must carry the error message: {}", err.message);
-        assert!(err.retryable, "overloaded_error is a transient/retryable class");
+        let err = state
+            .stream_error
+            .expect("error event must set stream_error");
+        assert!(
+            err.message.contains("overloaded_error"),
+            "must carry the error type: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Overloaded"),
+            "must carry the error message: {}",
+            err.message
+        );
+        assert!(
+            err.retryable,
+            "overloaded_error is a transient/retryable class"
+        );
     }
 
     #[test]
@@ -1870,11 +2038,16 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx_telemetry_off(&tx);
         feed(
-            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#],
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ],
             &mut state,
             &ctx,
         );
-        assert!(state.stop_reason_seen, "stop_reason must be captured with telemetry OFF");
+        assert!(
+            state.stop_reason_seen,
+            "stop_reason must be captured with telemetry OFF"
+        );
         assert!(
             state.telem_stop_reason.is_none(),
             "telem_stop_reason stays None when telemetry off — only the unconditional flag is set"
@@ -1885,12 +2058,15 @@ mod tests {
     fn context_overflow_error_is_terminal_not_retryable() {
         // `request_too_large` / `invalid_request_error` is the context-overflow
         // (#130) class — retrying never helps, so it must classify terminal.
-        for kind in ["request_too_large", "invalid_request_error", "authentication_error"] {
+        for kind in [
+            "request_too_large",
+            "invalid_request_error",
+            "authentication_error",
+        ] {
             let (mut state, tx, _rx) = harness();
             let ctx = make_ctx(&tx);
-            let line = format!(
-                r#"data: {{"type":"error","error":{{"type":"{kind}","message":"nope"}}}}"#
-            );
+            let line =
+                format!(r#"data: {{"type":"error","error":{{"type":"{kind}","message":"nope"}}}}"#);
             feed(&[line.as_str()], &mut state, &ctx);
             let err = state.stream_error.expect("error captured");
             assert!(!err.retryable, "{kind} must be terminal, not retryable");
@@ -1902,19 +2078,28 @@ mod tests {
     #[test]
     fn outcome_retries_on_transient_error_event() {
         let r = classify_stream_outcome(
-            Some(StreamError { message: "overloaded".to_string(), retryable: true }),
+            Some(StreamError {
+                message: "overloaded".to_string(),
+                retryable: true,
+            }),
             vec![],
             false,
             false,
             false,
         );
-        assert!(matches!(r, StreamOutcome::Retry(_)), "transient error must retry, got {r:?}");
+        assert!(
+            matches!(r, StreamOutcome::Retry(_)),
+            "transient error must retry, got {r:?}"
+        );
     }
 
     #[test]
     fn outcome_fails_on_terminal_error_event() {
         let r = classify_stream_outcome(
-            Some(StreamError { message: "request_too_large".to_string(), retryable: false }),
+            Some(StreamError {
+                message: "request_too_large".to_string(),
+                retryable: false,
+            }),
             vec![],
             false,
             false,
@@ -1944,17 +2129,26 @@ mod tests {
         // User cancellation legitimately yields empty content — not an error,
         // and never a retry (don't fight the user's cancel).
         let r = classify_stream_outcome(None, vec![], false, false, true);
-        assert!(matches!(r, StreamOutcome::Done(_)), "cancellation is a clean Done");
+        assert!(
+            matches!(r, StreamOutcome::Done(_)),
+            "cancellation is a clean Done"
+        );
 
         // A cancel during a retryable error must ALSO downgrade to Done.
         let r2 = classify_stream_outcome(
-            Some(StreamError { message: "overloaded".to_string(), retryable: true }),
+            Some(StreamError {
+                message: "overloaded".to_string(),
+                retryable: true,
+            }),
             vec![],
             false,
             false,
             true,
         );
-        assert!(matches!(r2, StreamOutcome::Done(_)), "cancel beats a retryable error");
+        assert!(
+            matches!(r2, StreamOutcome::Done(_)),
+            "cancel beats a retryable error"
+        );
     }
 
     #[test]
@@ -1962,7 +2156,10 @@ mod tests {
         // A real end_turn with no content (rare but valid — e.g. a pause turn)
         // carries a stop_reason and must pass through.
         let r = classify_stream_outcome(None, vec![], true, false, false);
-        assert!(matches!(r, StreamOutcome::Done(_)), "empty-but-stop_reason is valid");
+        assert!(
+            matches!(r, StreamOutcome::Done(_)),
+            "empty-but-stop_reason is valid"
+        );
     }
 
     #[test]
@@ -1981,13 +2178,19 @@ mod tests {
         // accumulated — a partial answer after an error frame is not a turn.
         let content = vec![json!({"type":"text","text":"partial"})];
         let r = classify_stream_outcome(
-            Some(StreamError { message: "boom".to_string(), retryable: false }),
+            Some(StreamError {
+                message: "boom".to_string(),
+                retryable: false,
+            }),
             content,
             true,
             false,
             false,
         );
-        assert!(matches!(r, StreamOutcome::Fail(_)), "error event wins over partial content");
+        assert!(
+            matches!(r, StreamOutcome::Fail(_)),
+            "error event wins over partial content"
+        );
     }
 
     #[test]
@@ -2005,7 +2208,11 @@ mod tests {
             &mut state,
             &ctx,
         );
-        assert_eq!(snapshot(&state), before, "malformed lines must be skipped without state change");
+        assert_eq!(
+            snapshot(&state),
+            before,
+            "malformed lines must be skipped without state change"
+        );
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -2047,18 +2254,26 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"keep"}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"keep"}}"#,
+            ],
             &mut state,
             &ctx,
         );
         drain(&mut rx);
         let before = snapshot(&state);
         feed(
-            &[r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"x":1}}}"#],
+            &[
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"x":1}}}"#,
+            ],
             &mut state,
             &ctx,
         );
-        assert_eq!(snapshot(&state), before, "unknown delta subtype must not mutate state");
+        assert_eq!(
+            snapshot(&state),
+            before,
+            "unknown delta subtype must not mutate state"
+        );
         assert!(drain(&mut rx).is_empty());
     }
 
@@ -2069,7 +2284,9 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#],
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ],
             &mut state,
             &ctx,
         );
@@ -2079,7 +2296,10 @@ mod tests {
         process_data_line(&remaining, &mut state, &ctx);
         drop(remaining); // event Cow must not outlive this — compile-time proof it didn't
         state.finalize();
-        assert_eq!(state.accumulated_content, vec![json!({"type":"text","text":"tail ✨"})]);
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"text","text":"tail ✨"})]
+        );
         let events = drain(&mut rx);
         assert!(matches!(
             events.last().unwrap(),
@@ -2120,45 +2340,86 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        let ctx = make_ctx_ttl(
+            &tx,
+            crate::core::config::CacheTtl::Hybrid,
+            &notified,
+            &honored,
+        );
         // Turn 1: 1h prefix written (split on message_start) → latch set, no notice.
         feed(&[HONORED_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0, "turn 1 (1h honored)");
-        assert!(honored.load(std::sync::atomic::Ordering::Relaxed), "latch set on 1h write");
+        assert!(
+            honored.load(std::sync::atomic::Ordering::Relaxed),
+            "latch set on 1h write"
+        );
         // Turn 2: prefix cached → 1h == 0, 5m > 0. Healthy. SILENCE.
         let (mut state_t2, tx_t2, mut rx_t2) = harness();
-        let ctx_t2 = make_ctx_ttl(&tx_t2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        let ctx_t2 = make_ctx_ttl(
+            &tx_t2,
+            crate::core::config::CacheTtl::Hybrid,
+            &notified,
+            &honored,
+        );
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state_t2, &ctx_t2);
-        assert_eq!(count_downgrade_notices(&mut rx_t2), 0, "turn 2 (healthy hybrid signature)");
+        assert_eq!(
+            count_downgrade_notices(&mut rx_t2),
+            0,
+            "turn 2 (healthy hybrid signature)"
+        );
         // Later request in the same session (new ctx, same latches): still silent.
         let (mut state2, tx2, mut rx2) = harness();
-        let ctx2 = make_ctx_ttl(&tx2, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        let ctx2 = make_ctx_ttl(
+            &tx2,
+            crate::core::config::CacheTtl::Hybrid,
+            &notified,
+            &honored,
+        );
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state2, &ctx2);
-        assert_eq!(count_downgrade_notices(&mut rx2), 0, "later request, same session");
+        assert_eq!(
+            count_downgrade_notices(&mut rx2),
+            0,
+            "later request, same session"
+        );
     }
 
     #[test]
     fn downgrade_detector_fires_once_when_1h_never_honored() {
         // Genuinely downgraded account: the 1h bucket never goes nonzero —
         // the notice fires on turn 1, exactly once per session, in both modes.
-        for ttl in [crate::core::config::CacheTtl::OneHour, crate::core::config::CacheTtl::Hybrid] {
+        for ttl in [
+            crate::core::config::CacheTtl::OneHour,
+            crate::core::config::CacheTtl::Hybrid,
+        ] {
             let (mut state, tx, mut rx) = harness();
             let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let ctx = make_ctx_ttl(&tx, ttl, &notified, &honored);
             // First occurrence: 1h bucket = 0, 5m bucket > 0 → exactly one Notice.
             feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
-            assert_eq!(count_downgrade_notices(&mut rx), 1, "first occurrence under {ttl:?}");
+            assert_eq!(
+                count_downgrade_notices(&mut rx),
+                1,
+                "first occurrence under {ttl:?}"
+            );
             // Second occurrence (same session/latch): nothing.
             let (mut state_b, tx_b, mut rx_b) = harness();
             let ctx_b = make_ctx_ttl(&tx_b, ttl, &notified, &honored);
             feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state_b, &ctx_b);
-            assert_eq!(count_downgrade_notices(&mut rx_b), 0, "second occurrence under {ttl:?}");
+            assert_eq!(
+                count_downgrade_notices(&mut rx_b),
+                0,
+                "second occurrence under {ttl:?}"
+            );
             // Latch persists across requests in the session (new ctx, same latches).
             let (mut state2, tx2, mut rx2) = harness();
             let ctx2 = make_ctx_ttl(&tx2, ttl, &notified, &honored);
             feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state2, &ctx2);
-            assert_eq!(count_downgrade_notices(&mut rx2), 0, "next request, same session");
+            assert_eq!(
+                count_downgrade_notices(&mut rx2),
+                0,
+                "next request, same session"
+            );
             // Mode is never auto-flipped — ctx still carries the configured TTL.
             assert_eq!(ctx2.cache_ttl, ttl);
         }
@@ -2177,10 +2438,18 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
+        let ctx = make_ctx_ttl(
+            &tx,
+            crate::core::config::CacheTtl::OneHour,
+            &latch,
+            &honored,
+        );
         feed(&[HONORED_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(count_downgrade_notices(&mut rx), 0);
-        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed), "latch untouched when honored");
+        assert!(
+            !latch.load(std::sync::atomic::Ordering::Relaxed),
+            "latch untouched when honored"
+        );
     }
 
     #[test]
@@ -2189,9 +2458,16 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::OneHour, &latch, &honored);
+        let ctx = make_ctx_ttl(
+            &tx,
+            crate::core::config::CacheTtl::OneHour,
+            &latch,
+            &honored,
+        );
         feed(
-            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100}}"#],
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":100}}"#,
+            ],
             &mut state,
             &ctx,
         );
@@ -2209,7 +2485,12 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let honored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ctx = make_ctx_ttl(&tx, crate::core::config::CacheTtl::Hybrid, &notified, &honored);
+        let ctx = make_ctx_ttl(
+            &tx,
+            crate::core::config::CacheTtl::Hybrid,
+            &notified,
+            &honored,
+        );
         feed(
             &[
                 r#"data: {"type":"message_start","message":{"id":"msg_warm","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":5000,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0}}}}"#,
@@ -2218,8 +2499,15 @@ mod tests {
             &mut state,
             &ctx,
         );
-        assert_eq!(count_downgrade_notices(&mut rx), 0, "warm restart is healthy — no notice");
-        assert!(!notified.load(std::sync::atomic::Ordering::Relaxed), "notice latch untouched");
+        assert_eq!(
+            count_downgrade_notices(&mut rx),
+            0,
+            "warm restart is healthy — no notice"
+        );
+        assert!(
+            !notified.load(std::sync::atomic::Ordering::Relaxed),
+            "notice latch untouched"
+        );
     }
 
     #[test]
@@ -2241,7 +2529,11 @@ mod tests {
             request_has_1h_marker: false,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
-        assert_eq!(count_downgrade_notices(&mut rx), 0, "no 1h marker in request → silent");
+        assert_eq!(
+            count_downgrade_notices(&mut rx),
+            0,
+            "no 1h marker in request → silent"
+        );
         assert!(!notified.load(std::sync::atomic::Ordering::Relaxed));
     }
 
@@ -2254,12 +2546,20 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}"#],
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}"#,
+            ],
             &mut state,
             &ctx,
         );
-        assert!(state.stop_reason_seen, "stop_reason_seen must be true on refusal");
-        assert!(state.stop_reason_is_refusal, "stop_reason_is_refusal must be true when stop_reason=refusal");
+        assert!(
+            state.stop_reason_seen,
+            "stop_reason_seen must be true on refusal"
+        );
+        assert!(
+            state.stop_reason_is_refusal,
+            "stop_reason_is_refusal must be true when stop_reason=refusal"
+        );
     }
 
     #[test]
@@ -2269,12 +2569,17 @@ mod tests {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(
-            &[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#],
+            &[
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ],
             &mut state,
             &ctx,
         );
         assert!(state.stop_reason_seen, "stop_reason_seen must be true");
-        assert!(!state.stop_reason_is_refusal, "stop_reason_is_refusal must be false for end_turn");
+        assert!(
+            !state.stop_reason_is_refusal,
+            "stop_reason_is_refusal must be false for end_turn"
+        );
     }
 
     #[test]
@@ -2316,7 +2621,10 @@ mod tests {
         // Test 6: SynapsConfig default must set refusal_retries = 2.
         use crate::core::config::SynapsConfig;
         let config = SynapsConfig::default();
-        assert_eq!(config.refusal_retries, 2, "default refusal_retries must be 2");
+        assert_eq!(
+            config.refusal_retries, 2,
+            "default refusal_retries must be 2"
+        );
     }
 
     #[test]
@@ -2334,7 +2642,10 @@ mod tests {
             Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
             None => std::env::remove_var("SYNAPS_BASE_DIR"),
         }
-        assert_eq!(config.refusal_retries, 5, "refusal_retries must parse from config file");
+        assert_eq!(
+            config.refusal_retries, 5,
+            "refusal_retries must parse from config file"
+        );
     }
 
     #[test]
@@ -2355,7 +2666,10 @@ mod tests {
             &mut state,
             &ctx,
         );
-        assert!(state.stop_reason_is_refusal, "end-to-end: refusal flag must survive full event sequence");
+        assert!(
+            state.stop_reason_is_refusal,
+            "end-to-end: refusal flag must survive full event sequence"
+        );
         let content = std::mem::take(&mut state.accumulated_content);
         let r = classify_stream_outcome(None, content, true, true, false);
         assert!(
@@ -2363,7 +2677,6 @@ mod tests {
             "end-to-end: classify must return Refusal after realistic fixture, got {r:?}"
         );
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2378,23 +2691,26 @@ mod tests {
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod on401_tests {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-    use tokio::sync::{mpsc, RwLock};
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::get as axum_get,
+        routing::post as axum_post,
+        Router,
+    };
     use reqwest::Client;
     use serde_json::json;
-    use axum::{
-        Router,
-        routing::post as axum_post,
-        routing::get as axum_get,
-        http::{StatusCode, HeaderMap},
-        response::IntoResponse,
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
     };
+    use tokio::sync::{mpsc, RwLock};
 
     use super::{ApiMethods, ApiOptions};
-    use crate::{ToolRegistry, StreamEvent};
-    use crate::runtime::types::AuthState;
     use crate::auth::{CredentialSource, TokenCache};
     use crate::runtime::telemetry::TelemetryLevel;
+    use crate::runtime::types::AuthState;
+    use crate::{StreamEvent, ToolRegistry};
 
     // ── minimal SSE body Anthropic would return for a "hello" text turn ──────
     const SSE_SUCCESS: &str = concat!(
@@ -2444,12 +2760,16 @@ mod on401_tests {
 
     /// Spawn a mock broker that always vends a fresh token.
     async fn spawn_mock_broker(token: &'static str) -> String {
-        let app = Router::new()
-            .route("/token", axum_get(move |_headers: HeaderMap| async move {
+        let app = Router::new().route(
+            "/token",
+            axum_get(move |_headers: HeaderMap| async move {
                 // Accept any machine-token for test simplicity
-                (StatusCode::OK,
-                 format!("{{\"access_token\":\"{token}\",\"expires\":9999999999999}}"))
-            }));
+                (
+                    StatusCode::OK,
+                    format!("{{\"access_token\":\"{token}\",\"expires\":9999999999999}}"),
+                )
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2482,7 +2802,9 @@ mod on401_tests {
     ) -> crate::error::Result<serde_json::Value> {
         let client = Client::new();
         let tools = ToolRegistry::new();
-        let messages = vec![std::sync::Arc::new(json!({"role": "user", "content": "hi"}))];
+        let messages = vec![std::sync::Arc::new(
+            json!({"role": "user", "content": "hi"}),
+        )];
         let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
         ApiMethods::call_api_stream(
             &auth,
@@ -2526,10 +2848,17 @@ mod on401_tests {
         let result = drive_call(auth, options).await;
 
         // Call must succeed
-        assert!(result.is_ok(), "expected success after retry, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected success after retry, got: {:?}",
+            result.err()
+        );
         // Anthropic endpoint was hit exactly twice: once 401, once 200
-        assert_eq!(counter.load(Ordering::SeqCst), 2,
-            "expected exactly 2 calls to Anthropic (1×401 + 1×200)");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "expected exactly 2 calls to Anthropic (1×401 + 1×200)"
+        );
     }
 
     // ─── T2: Persistent 401 — no infinite loop ────────────────────────────────
@@ -2560,9 +2889,12 @@ mod on401_tests {
         // Must be an error (not a success or an infinite retry)
         assert!(result.is_err(), "expected terminal error on persistent 401");
         // Exactly 2 upstream calls: original + single retry
-        assert_eq!(counter.load(Ordering::SeqCst), 2,
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
             "persistent 401 must cause exactly 2 upstream calls, got {}",
-            counter.load(Ordering::SeqCst));
+            counter.load(Ordering::SeqCst)
+        );
     }
 
     // ─── T3: Local source — 401 is NOT retried (regression guard) ────────────
@@ -2581,8 +2913,11 @@ mod on401_tests {
         let result = drive_call(auth, options).await;
 
         assert!(result.is_err(), "401 with Local source must be an error");
-        assert_eq!(counter.load(Ordering::SeqCst), 1,
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
             "Local source must never retry on 401, got {} calls",
-            counter.load(Ordering::SeqCst));
+            counter.load(Ordering::SeqCst)
+        );
     }
 }

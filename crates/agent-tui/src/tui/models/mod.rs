@@ -20,7 +20,7 @@ enum DevProviderAuth {
 fn dev_model_providers() -> Vec<DevProviderSelection> {
     let mut providers = vec![
         DevProviderSelection {
-            key: "claude",
+            key: "anthropic",
             name: "Anthropic",
             auth_kind: DevProviderAuth::OAuth("anthropic"),
         },
@@ -53,7 +53,7 @@ fn dev_model_providers() -> Vec<DevProviderSelection> {
                 key: spec.key,
                 name: spec.name,
                 auth_kind: DevProviderAuth::ApiKey,
-            })
+            }),
     );
 
     providers.push(DevProviderSelection {
@@ -107,11 +107,26 @@ pub(crate) struct ExpandedModelEntry {
 impl ExpandedModelEntry {
     #[allow(dead_code)]
     pub(crate) fn new(id: String, label: String, is_favorite: bool) -> Self {
-        Self { id, label, is_favorite, metadata: Vec::new() }
+        Self {
+            id,
+            label,
+            is_favorite,
+            metadata: Vec::new(),
+        }
     }
 
-    pub(crate) fn with_metadata(id: String, label: String, is_favorite: bool, metadata: Vec<String>) -> Self {
-        Self { id, label, is_favorite, metadata }
+    pub(crate) fn with_metadata(
+        id: String,
+        label: String,
+        is_favorite: bool,
+        metadata: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            is_favorite,
+            metadata,
+        }
     }
 
     pub(crate) fn metadata_label(&self) -> String {
@@ -129,7 +144,11 @@ pub(crate) struct FuzzyScore {
 pub(crate) fn fuzzy_model_score(query: &str, haystack: &str) -> Option<FuzzyScore> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return Some(FuzzyScore { gaps: 0, first_match: 0, haystack_len: haystack.chars().count() });
+        return Some(FuzzyScore {
+            gaps: 0,
+            first_match: 0,
+            haystack_len: haystack.chars().count(),
+        });
     }
 
     let haystack_lower = haystack.to_lowercase();
@@ -137,15 +156,26 @@ pub(crate) fn fuzzy_model_score(query: &str, haystack: &str) -> Option<FuzzyScor
     let mut positions = Vec::new();
     for ch in query.chars() {
         let tail = &haystack_lower[search_start..];
-        let found = tail.char_indices().find(|(_, candidate)| *candidate == ch)?;
+        let found = tail
+            .char_indices()
+            .find(|(_, candidate)| *candidate == ch)?;
         let pos = search_start + found.0;
         positions.push(pos);
         search_start = pos + found.1.len_utf8();
     }
     let first_match = positions.first().copied().unwrap_or(0);
-    let span = positions.last().copied().unwrap_or(first_match).saturating_sub(first_match) + 1;
+    let span = positions
+        .last()
+        .copied()
+        .unwrap_or(first_match)
+        .saturating_sub(first_match)
+        + 1;
     let gaps = span.saturating_sub(query.chars().count());
-    Some(FuzzyScore { gaps, first_match, haystack_len: haystack_lower.len() })
+    Some(FuzzyScore {
+        gaps,
+        first_match,
+        haystack_len: haystack_lower.len(),
+    })
 }
 
 pub(crate) fn sort_expanded_models(models: &mut [ExpandedModelEntry], query: &str) {
@@ -211,8 +241,13 @@ impl ModelsModalState {
         let favorites: BTreeSet<String> = synaps_cli::config::load_config()
             .favorite_models
             .into_iter()
+            .map(|id| normalize_favorite_id(&id))
             .collect();
-        let view = if favorites.is_empty() { ModelsView::All } else { ModelsView::Favorites };
+        let view = if favorites.is_empty() {
+            ModelsView::All
+        } else {
+            ModelsView::Favorites
+        };
         Self {
             cursor: 0,
             search: String::new(),
@@ -227,6 +262,7 @@ impl ModelsModalState {
         self.favorites = synaps_cli::config::load_config()
             .favorite_models
             .into_iter()
+            .map(|id| normalize_favorite_id(&id))
             .collect();
         if self.favorites.is_empty() && self.view == ModelsView::Favorites {
             self.view = ModelsView::All;
@@ -235,18 +271,29 @@ impl ModelsModalState {
 }
 
 pub(crate) fn normalize_favorite_id(model: &str) -> String {
-    if model.contains('/') {
+    if let Some(id) = model.strip_prefix("claude/") {
+        format!("anthropic/{id}")
+    } else if model.contains('/') {
         model.to_string()
+    } else if model.starts_with("claude-") {
+        format!("anthropic/{model}")
     } else {
-        format!("claude/{model}")
+        model.to_string()
     }
 }
 
 pub(crate) fn model_id_for_runtime(favorite_id: &str) -> String {
-    favorite_id
-        .strip_prefix("claude/")
-        .unwrap_or(favorite_id)
-        .to_string()
+    normalize_favorite_id(favorite_id)
+}
+
+fn remove_favorite_compat(id: &str) {
+    let canonical = normalize_favorite_id(id);
+    let _ = synaps_cli::config::remove_favorite_model(&canonical);
+    if let Some(wire_id) = canonical.strip_prefix("anthropic/") {
+        // Old configurations used both bare and claude/-qualified forms.
+        let _ = synaps_cli::config::remove_favorite_model(wire_id);
+        let _ = synaps_cli::config::remove_favorite_model(&format!("claude/{wire_id}"));
+    }
 }
 
 pub(crate) fn build_sections(current_model: &str, state: &ModelsModalState) -> Vec<ModelSection> {
@@ -317,7 +364,10 @@ fn build_sections_from_parts(
                     provider_name: provider.name.to_string(),
                     configured: true,
                     is_current: current_model == runtime_id || current_fav == favorite_id,
-                    is_favorite: state.favorites.contains(&favorite_id),
+                    is_favorite: state
+                        .favorites
+                        .iter()
+                        .any(|id| normalize_favorite_id(id) == favorite_id),
                     favorite_id,
                     order: model.order,
                 }
@@ -429,7 +479,7 @@ fn provider_model_selections(
 
 fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, String, String)> {
     match provider.key {
-        "claude" => synaps_cli::models::KNOWN_MODELS
+        "anthropic" => synaps_cli::models::KNOWN_MODELS
             .iter()
             .enumerate()
             .map(|(idx, (id, label))| {
@@ -553,14 +603,20 @@ pub(crate) fn visible_rows(sections: &[ModelSection], state: &ModelsModalState) 
         rows.push(VisibleRow::Section { idx: section_idx });
         if !state.collapsed.contains(&section.provider_key) {
             for (idx, _) in section.entries.iter().enumerate() {
-                rows.push(VisibleRow::Model { section: section_idx, idx });
+                rows.push(VisibleRow::Model {
+                    section: section_idx,
+                    idx,
+                });
             }
         }
     }
     rows
 }
 
-pub(crate) fn selected_provider<'a>(sections: &'a [ModelSection], state: &ModelsModalState) -> Option<&'a ModelSection> {
+pub(crate) fn selected_provider<'a>(
+    sections: &'a [ModelSection],
+    state: &ModelsModalState,
+) -> Option<&'a ModelSection> {
     let rows = visible_rows(sections, state);
     match rows.get(state.cursor)? {
         VisibleRow::Section { idx } => sections.get(*idx),
@@ -569,11 +625,17 @@ pub(crate) fn selected_provider<'a>(sections: &'a [ModelSection], state: &Models
 }
 
 pub(crate) fn expanded_visible_models(state: &ModelsModalState) -> Vec<ExpandedModelEntry> {
-    let Some(expanded) = state.expanded.as_ref() else { return Vec::new(); };
-    let ExpandedLoadState::Ready(models) = &expanded.load_state else { return Vec::new(); };
+    let Some(expanded) = state.expanded.as_ref() else {
+        return Vec::new();
+    };
+    let ExpandedLoadState::Ready(models) = &expanded.load_state else {
+        return Vec::new();
+    };
     let mut visible: Vec<_> = models
         .iter()
-        .filter(|model| fuzzy_model_score(&expanded.search, &format!("{} {}", model.id, model.label)).is_some())
+        .filter(|model| {
+            fuzzy_model_score(&expanded.search, &format!("{} {}", model.id, model.label)).is_some()
+        })
         .cloned()
         .collect();
     sort_expanded_models(&mut visible, &expanded.search);
@@ -590,7 +652,9 @@ pub(crate) fn set_expanded_models(
     provider_key: &str,
     result: Result<Vec<ExpandedModelEntry>, String>,
 ) {
-    let Some(expanded) = state.expanded.as_mut() else { return; };
+    let Some(expanded) = state.expanded.as_mut() else {
+        return;
+    };
     if expanded.provider_key != provider_key {
         return;
     }
@@ -606,7 +670,10 @@ pub(crate) fn set_expanded_models(
     };
 }
 
-pub(crate) fn selected_model<'a>(sections: &'a [ModelSection], state: &ModelsModalState) -> Option<&'a ModelEntry> {
+pub(crate) fn selected_model<'a>(
+    sections: &'a [ModelSection],
+    state: &ModelsModalState,
+) -> Option<&'a ModelEntry> {
     let rows = visible_rows(sections, state);
     match rows.get(state.cursor)? {
         VisibleRow::Model { section, idx } => sections.get(*section)?.entries.get(*idx),
@@ -614,10 +681,22 @@ pub(crate) fn selected_model<'a>(sections: &'a [ModelSection], state: &ModelsMod
     }
 }
 
-pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ModelsModalState, current_model: &str) {
+pub(crate) fn render(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &ModelsModalState,
+    current_model: &str,
+) {
     let sections = build_sections(current_model, state);
     frame.render_widget(Clear, area);
-    frame.render_widget(ModelsModalWidget { state, sections, current_model }, area);
+    frame.render_widget(
+        ModelsModalWidget {
+            state,
+            sections,
+            current_model,
+        },
+        area,
+    );
 }
 
 struct ModelsModalWidget<'a> {
@@ -635,7 +714,12 @@ impl Widget for ModelsModalWidget<'_> {
             .title(" Models ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.modal_border(ModalKind::Models)))
-            .padding(Padding { left: 2, right: 2, top: 1, bottom: 1 });
+            .padding(Padding {
+                left: 2,
+                right: 2,
+                top: 1,
+                bottom: 1,
+            });
         if let Some(tc) = theme.modal_title(ModalKind::Models) {
             block = block.title_style(Style::default().fg(tc));
         }
@@ -660,26 +744,47 @@ impl Widget for ModelsModalWidget<'_> {
         .areas(inner);
 
         Paragraph::new(Line::from(vec![
-            Span::styled("◇ Switch model", Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" · {model_count} available · {favorite_count} ★ favorites"), Style::default().fg(theme.muted)),
+            Span::styled(
+                "◇ Switch model",
+                Style::default()
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {model_count} available · {favorite_count} ★ favorites"),
+                Style::default().fg(theme.muted),
+            ),
         ]))
         .render(title, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("Search: ", Style::default().fg(theme.muted)),
-            Span::styled(if self.state.search.is_empty() { "▎".to_string() } else { format!("{}▎", self.state.search) }, Style::default().fg(theme.header_fg)),
+            Span::styled(
+                if self.state.search.is_empty() {
+                    "▎".to_string()
+                } else {
+                    format!("{}▎", self.state.search)
+                },
+                Style::default().fg(theme.header_fg),
+            ),
         ]))
         .render(search_bar, buf);
 
         Paragraph::new(Line::from(vec![
             Span::styled("View:   ", Style::default().fg(theme.muted)),
             Span::styled(view, Style::default().fg(theme.help_fg)),
-            Span::styled(format!("   current: {}", self.current_model), Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("   current: {}", self.current_model),
+                Style::default().fg(theme.muted),
+            ),
         ]))
         .render(view_bar, buf);
 
         let list_height = list_area.height as usize;
-        let offset = self.state.cursor.saturating_sub(list_height.saturating_sub(1));
+        let offset = self
+            .state
+            .cursor
+            .saturating_sub(list_height.saturating_sub(1));
         let lines: Vec<Line> = rows
             .iter()
             .enumerate()
@@ -689,16 +794,28 @@ impl Widget for ModelsModalWidget<'_> {
                 VisibleRow::Section { idx } => {
                     let section = &self.sections[*idx];
                     let selected = row_idx == self.state.cursor;
-                    let glyph = if self.state.collapsed.contains(&section.provider_key) { "▸" } else { "▾" };
+                    let glyph = if self.state.collapsed.contains(&section.provider_key) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
                     let style = if selected {
-                        Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme.header_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme.help_fg)
                     };
                     Line::from(vec![
-                        Span::styled(if selected { "● " } else { "  " }, Style::default().fg(theme.border_active)),
+                        Span::styled(
+                            if selected { "● " } else { "  " },
+                            Style::default().fg(theme.border_active),
+                        ),
                         Span::styled(format!("{glyph} {}", section.provider_name), style),
-                        Span::styled(format!(" ({})", section.entries.len()), Style::default().fg(theme.muted)),
+                        Span::styled(
+                            format!(" ({})", section.entries.len()),
+                            Style::default().fg(theme.muted),
+                        ),
                     ])
                 }
                 VisibleRow::Model { section, idx } => {
@@ -707,19 +824,34 @@ impl Widget for ModelsModalWidget<'_> {
                     let marker = if selected { "●" } else { "○" };
                     let fav = if entry.is_favorite { "★" } else { " " };
                     let current = if entry.is_current { " default" } else { "" };
-                    let tier = if entry.tier.is_empty() { String::new() } else { format!(" {}", entry.tier) };
+                    let tier = if entry.tier.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", entry.tier)
+                    };
                     let style = if selected {
-                        Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme.header_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else if entry.is_current {
                         Style::default().fg(theme.status_ready)
                     } else {
                         Style::default().fg(theme.input_fg)
                     };
                     Line::from(vec![
-                        Span::styled(format!("  {marker} "), Style::default().fg(theme.border_active)),
+                        Span::styled(
+                            format!("  {marker} "),
+                            Style::default().fg(theme.border_active),
+                        ),
                         Span::styled(format!("{:<38}", entry.id), style),
-                        Span::styled(format!(" — {}", entry.label), Style::default().fg(theme.muted)),
-                        Span::styled(format!(" {fav}"), Style::default().fg(theme.status_streaming)),
+                        Span::styled(
+                            format!(" — {}", entry.label),
+                            Style::default().fg(theme.muted),
+                        ),
+                        Span::styled(
+                            format!(" {fav}"),
+                            Style::default().fg(theme.status_streaming),
+                        ),
                         Span::styled(tier, Style::default().fg(theme.muted)),
                         Span::styled(current, Style::default().fg(theme.status_ready)),
                     ])
@@ -750,7 +882,12 @@ impl Widget for ModelsModalWidget<'_> {
     }
 }
 
-fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalState, expanded: &ExpandedModelsState) {
+fn render_expanded_lightbox(
+    area: Rect,
+    buf: &mut Buffer,
+    state: &ModelsModalState,
+    expanded: &ExpandedModelsState,
+) {
     let theme = THEME.load();
     let width = area.width.saturating_sub(10).min(110);
     let height = area.height.saturating_sub(6).min(28);
@@ -761,7 +898,12 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
     }
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     Clear.render(popup, buf);
     let status = match &expanded.load_state {
@@ -773,7 +915,12 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
         .title(format!(" {} models · {} ", expanded.provider_name, status))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_active))
-        .padding(Padding { left: 2, right: 2, top: 1, bottom: 1 });
+        .padding(Padding {
+            left: 2,
+            right: 2,
+            top: 1,
+            bottom: 1,
+        });
     let inner = block.inner(popup);
     block.render(popup, buf);
 
@@ -786,17 +933,35 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
 
     Paragraph::new(Line::from(vec![
         Span::styled("Search: ", Style::default().fg(theme.muted)),
-        Span::styled(if expanded.search.is_empty() { "▎".to_string() } else { format!("{}▎", expanded.search) }, Style::default().fg(theme.header_fg)),
+        Span::styled(
+            if expanded.search.is_empty() {
+                "▎".to_string()
+            } else {
+                format!("{}▎", expanded.search)
+            },
+            Style::default().fg(theme.header_fg),
+        ),
     ]))
     .render(search_bar, buf);
 
     let list_height = list.height as usize;
     let visible = expanded_visible_models(state);
-    let offset = expanded.cursor.saturating_sub(list_height.saturating_sub(1));
+    let offset = expanded
+        .cursor
+        .saturating_sub(list_height.saturating_sub(1));
     let lines = match &expanded.load_state {
-        ExpandedLoadState::Loading => vec![Line::from(Span::styled("Loading provider models…", Style::default().fg(theme.muted)))],
-        ExpandedLoadState::Error(err) => vec![Line::from(Span::styled(format!("Failed to load models: {err}"), Style::default().fg(theme.error_color)))],
-        ExpandedLoadState::Ready(_) if visible.is_empty() => vec![Line::from(Span::styled("No models match the current search.", Style::default().fg(theme.muted)))],
+        ExpandedLoadState::Loading => vec![Line::from(Span::styled(
+            "Loading provider models…",
+            Style::default().fg(theme.muted),
+        ))],
+        ExpandedLoadState::Error(err) => vec![Line::from(Span::styled(
+            format!("Failed to load models: {err}"),
+            Style::default().fg(theme.error_color),
+        ))],
+        ExpandedLoadState::Ready(_) if visible.is_empty() => vec![Line::from(Span::styled(
+            "No models match the current search.",
+            Style::default().fg(theme.muted),
+        ))],
         ExpandedLoadState::Ready(_) => visible
             .iter()
             .enumerate()
@@ -807,17 +972,32 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
                 let marker = if selected { "●" } else { "○" };
                 let fav = if model.is_favorite { "★" } else { " " };
                 let style = if selected {
-                    Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme.header_fg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.input_fg)
                 };
                 let meta = model.metadata_label();
-                let meta_text = if meta.is_empty() { String::new() } else { format!(" · {meta}") };
+                let meta_text = if meta.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {meta}")
+                };
                 Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(theme.border_active)),
+                    Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(theme.border_active),
+                    ),
                     Span::styled(format!("{:<48}", model.id), style),
-                    Span::styled(format!(" — {}{}", model.label, meta_text), Style::default().fg(theme.muted)),
-                    Span::styled(format!(" {fav}"), Style::default().fg(theme.status_streaming)),
+                    Span::styled(
+                        format!(" — {}{}", model.label, meta_text),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        format!(" {fav}"),
+                        Style::default().fg(theme.status_streaming),
+                    ),
                 ])
             })
             .collect(),
@@ -833,7 +1013,6 @@ fn render_expanded_lightbox(area: Rect, buf: &mut Buffer, state: &ModelsModalSta
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn expanded_entry_metadata_label_joins_badges() {
@@ -854,10 +1033,78 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_favorites_normalize_to_canonical_provider_identity() {
+        assert_eq!(
+            normalize_favorite_id("claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_favorite_id("claude/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_favorite_id("anthropic/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("anthropic/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("github-copilot/claude-opus-4-7"),
+            "github-copilot/claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn legacy_and_canonical_anthropic_favorites_and_current_model_match() {
+        for favorite in [
+            "claude-opus-4-7",
+            "claude/claude-opus-4-7",
+            "anthropic/claude-opus-4-7",
+        ] {
+            let state = ModelsModalState {
+                cursor: 0,
+                search: String::new(),
+                view: ModelsView::Favorites,
+                collapsed: HashSet::new(),
+                favorites: BTreeSet::from([favorite.to_string()]),
+                expanded: None,
+            };
+            for current in ["claude-opus-4-7", "anthropic/claude-opus-4-7"] {
+                let sections = build_sections_from_parts(
+                    current,
+                    &state,
+                    &ProviderAvailability::default(),
+                    &BTreeSet::from(["anthropic"]),
+                );
+                let entry = sections
+                    .iter()
+                    .flat_map(|s| &s.entries)
+                    .find(|m| m.display_id == "claude-opus-4-7")
+                    .expect("legacy favorite remains visible");
+                assert_eq!(entry.id, "anthropic/claude-opus-4-7");
+                assert_eq!(entry.favorite_id, "anthropic/claude-opus-4-7");
+                assert!(entry.is_favorite);
+                assert!(entry.is_current);
+            }
+        }
+    }
+
+    #[test]
     fn claude_favorite_ids_round_trip_to_runtime_ids() {
-        assert_eq!(normalize_favorite_id("claude-opus-4-7"), "claude/claude-opus-4-7");
-        assert_eq!(model_id_for_runtime("claude/claude-opus-4-7"), "claude-opus-4-7");
-        assert_eq!(model_id_for_runtime("groq/llama-3.3-70b-versatile"), "groq/llama-3.3-70b-versatile");
+        assert_eq!(
+            normalize_favorite_id("claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("claude/claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(
+            model_id_for_runtime("groq/llama-3.3-70b-versatile"),
+            "groq/llama-3.3-70b-versatile"
+        );
     }
 
     #[test]
@@ -878,7 +1125,10 @@ mod tests {
         );
         let total: usize = sections.iter().map(|s| s.entries.len()).sum();
         assert_eq!(total, 1);
-        assert_eq!(sections[0].entries[0].favorite_id, "claude/claude-opus-4-7");
+        assert_eq!(
+            sections[0].entries[0].favorite_id,
+            "anthropic/claude-opus-4-7"
+        );
 
         state.view = ModelsView::All;
         let sections = build_sections_from_parts(
@@ -906,7 +1156,7 @@ mod tests {
             &ProviderAvailability::default(),
             &BTreeSet::from(["anthropic"]),
         );
-        assert!(sections.iter().any(|s| s.provider_key == "claude"));
+        assert!(sections.iter().any(|s| s.provider_key == "anthropic"));
         assert!(!sections.iter().any(|s| s.provider_key == "groq"));
         assert!(!sections.iter().any(|s| s.provider_key == "openrouter"));
     }
@@ -920,9 +1170,21 @@ mod tests {
     #[test]
     fn fuzzy_model_matches_rank_contiguous_and_early_matches_first() {
         let mut models = vec![
-            ExpandedModelEntry::new("provider/alpha-qwen-coder".to_string(), "alpha qwen coder".to_string(), false),
-            ExpandedModelEntry::new("provider/qwen3-coder".to_string(), "qwen3 coder".to_string(), false),
-            ExpandedModelEntry::new("provider/my-q-w-e-n".to_string(), "my q w e n".to_string(), false),
+            ExpandedModelEntry::new(
+                "provider/alpha-qwen-coder".to_string(),
+                "alpha qwen coder".to_string(),
+                false,
+            ),
+            ExpandedModelEntry::new(
+                "provider/qwen3-coder".to_string(),
+                "qwen3 coder".to_string(),
+                false,
+            ),
+            ExpandedModelEntry::new(
+                "provider/my-q-w-e-n".to_string(),
+                "my q w e n".to_string(),
+                false,
+            ),
         ];
         sort_expanded_models(&mut models, "qwen");
         assert_eq!(models[0].id, "provider/qwen3-coder");
@@ -961,7 +1223,10 @@ mod tests {
         };
         let availability = ProviderAvailability {
             configured_static: BTreeSet::new(),
-            local_models: vec!["qwen3-coder:latest".to_string(), "devstral:latest".to_string()],
+            local_models: vec![
+                "qwen3-coder:latest".to_string(),
+                "devstral:latest".to_string(),
+            ],
         };
         let sections = build_sections_from_parts(
             "local/qwen3-coder:latest",
@@ -970,9 +1235,19 @@ mod tests {
             &BTreeSet::new(),
         );
 
-        let local = sections.iter().find(|s| s.provider_key == "local").expect("local section");
-        let ids: Vec<_> = local.entries.iter().map(|entry| entry.id.as_str()).collect();
-        assert_eq!(ids, vec!["local/qwen3-coder:latest", "local/devstral:latest"]);
+        let local = sections
+            .iter()
+            .find(|s| s.provider_key == "local")
+            .expect("local section");
+        let ids: Vec<_> = local
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["local/qwen3-coder:latest", "local/devstral:latest"]
+        );
     }
 
     #[test]
@@ -996,7 +1271,7 @@ mod tests {
             &BTreeSet::from(["anthropic", "openai-codex"]),
         );
 
-        assert!(sections.iter().any(|s| s.provider_key == "claude"));
+        assert!(sections.iter().any(|s| s.provider_key == "anthropic"));
         assert!(sections.iter().any(|s| s.provider_key == "openai-codex"));
         assert!(sections.iter().any(|s| s.provider_key == "openrouter"));
         assert!(!sections.iter().any(|s| s.provider_key == "groq"));
@@ -1030,13 +1305,20 @@ mod tests {
             .iter()
             .find(|section| section.provider_key == "xai-auth")
             .expect("logged-in xAI section");
-        let ids: Vec<_> = xai.entries.iter().map(|entry| entry.display_id.as_str()).collect();
+        let ids: Vec<_> = xai
+            .entries
+            .iter()
+            .map(|entry| entry.display_id.as_str())
+            .collect();
         let catalog_ids: Vec<_> = synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
             .into_iter()
             .map(|model| model.id)
             .collect();
         assert_eq!(ids, catalog_ids);
-        assert!(xai.entries.iter().all(|entry| entry.id.starts_with("xai-auth/")));
+        assert!(xai
+            .entries
+            .iter()
+            .all(|entry| entry.id.starts_with("xai-auth/")));
     }
 
     #[test]
@@ -1168,7 +1450,10 @@ mod tests {
             &availability,
             &BTreeSet::new(),
         );
-        let nvidia = sections.iter().find(|s| s.provider_key == "nvidia").expect("nvidia section");
+        let nvidia = sections
+            .iter()
+            .find(|s| s.provider_key == "nvidia")
+            .expect("nvidia section");
         let registry_count = synaps_cli::runtime::openai::registry::providers()
             .iter()
             .find(|provider| provider.key == "nvidia")
@@ -1176,6 +1461,9 @@ mod tests {
             .models
             .len();
         assert_eq!(nvidia.entries.len(), registry_count);
-        assert!(nvidia.entries.iter().any(|entry| entry.id == "nvidia/stepfun-ai/step-3.5-flash"));
+        assert!(nvidia
+            .entries
+            .iter()
+            .any(|entry| entry.id == "nvidia/stepfun-ai/step-3.5-flash"));
     }
 }

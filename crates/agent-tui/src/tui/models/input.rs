@@ -1,6 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{ExpandedLoadState, ExpandedModelsState, ModelsModalState, ModelsView, build_sections, expanded_visible_models, selected_expanded_model, selected_model, selected_provider, visible_rows, model_id_for_runtime};
+use super::{
+    build_sections, expanded_visible_models, model_id_for_runtime, normalize_favorite_id,
+    remove_favorite_compat, selected_expanded_model, selected_model, selected_provider,
+    visible_rows, ExpandedLoadState, ExpandedModelsState, ModelsModalState, ModelsView,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputOutcome {
@@ -68,9 +72,11 @@ pub(crate) fn handle_event(
         KeyCode::Char('f') => {
             if let Some(model) = selected_model(&sections, state) {
                 if model.is_favorite {
-                    let _ = synaps_cli::config::remove_favorite_model(&model.favorite_id);
+                    remove_favorite_compat(&model.favorite_id);
                 } else {
-                    let _ = synaps_cli::config::add_favorite_model(&model.favorite_id);
+                    let _ = synaps_cli::config::add_favorite_model(&normalize_favorite_id(
+                        &model.favorite_id,
+                    ));
                 }
                 state.refresh_favorites();
                 let new_len = visible_rows(&build_sections(current_model, state), state).len();
@@ -95,7 +101,10 @@ pub(crate) fn handle_event(
             InputOutcome::None
         }
         KeyCode::Char(ch) => {
-            if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
                 state.search.push(ch);
                 state.cursor = 0;
             }
@@ -136,9 +145,10 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
         KeyCode::Char('f') => {
             if let Some(model) = selected_expanded_model(state) {
                 if model.is_favorite {
-                    let _ = synaps_cli::config::remove_favorite_model(&model.id);
+                    remove_favorite_compat(&model.id);
                 } else {
-                    let _ = synaps_cli::config::add_favorite_model(&model.id);
+                    let _ =
+                        synaps_cli::config::add_favorite_model(&normalize_favorite_id(&model.id));
                 }
                 state.refresh_favorites();
             }
@@ -152,7 +162,10 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
             InputOutcome::None
         }
         KeyCode::Char(ch) => {
-            if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
                 if let Some(expanded) = state.expanded.as_mut() {
                     expanded.search.push(ch);
                     expanded.cursor = 0;
@@ -220,9 +233,12 @@ mod tests {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
         let outcome = handle_event(&mut state, key(KeyCode::Char('e')), "claude-opus-4-7");
-        assert_eq!(outcome, InputOutcome::ExpandProvider("claude".to_string()));
+        assert_eq!(
+            outcome,
+            InputOutcome::ExpandProvider("anthropic".to_string())
+        );
         let expanded = state.expanded.expect("expanded state");
-        assert_eq!(expanded.provider_key, "claude");
+        assert_eq!(expanded.provider_key, "anthropic");
         assert_eq!(expanded.search, "");
         assert_eq!(expanded.load_state, ExpandedLoadState::Loading);
     }
@@ -236,13 +252,27 @@ mod tests {
             cursor: 0,
             search: String::new(),
             load_state: ExpandedLoadState::Ready(vec![
-                ExpandedModelEntry::new("openrouter/deepseek/deepseek-chat".to_string(), "DeepSeek".to_string(), false),
-                ExpandedModelEntry::new("openrouter/qwen/qwen3-coder".to_string(), "Qwen3 Coder".to_string(), false),
+                ExpandedModelEntry::new(
+                    "openrouter/deepseek/deepseek-chat".to_string(),
+                    "DeepSeek".to_string(),
+                    false,
+                ),
+                ExpandedModelEntry::new(
+                    "openrouter/qwen/qwen3-coder".to_string(),
+                    "Qwen3 Coder".to_string(),
+                    false,
+                ),
             ]),
         });
 
-        assert_eq!(handle_event(&mut state, key(KeyCode::Char('q')), "claude-opus-4-7"), InputOutcome::None);
-        assert_eq!(handle_event(&mut state, key(KeyCode::Enter), "claude-opus-4-7"), InputOutcome::Apply("openrouter/qwen/qwen3-coder".to_string()));
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Char('q')), "claude-opus-4-7"),
+            InputOutcome::None
+        );
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Enter), "claude-opus-4-7"),
+            InputOutcome::Apply("openrouter/qwen/qwen3-coder".to_string())
+        );
     }
 
     #[test]
@@ -256,7 +286,10 @@ mod tests {
             load_state: ExpandedLoadState::Loading,
         });
 
-        assert_eq!(handle_event(&mut state, key(KeyCode::Esc), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Esc), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert!(state.expanded.is_none());
     }
 
@@ -264,9 +297,15 @@ mod tests {
     fn tab_toggles_all_and_favorites_view() {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
-        assert_eq!(handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert_eq!(state.view, ModelsView::Favorites);
-        assert_eq!(handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"), InputOutcome::None);
+        assert_eq!(
+            handle_event(&mut state, key(KeyCode::Tab), "claude-opus-4-7"),
+            InputOutcome::None
+        );
         assert_eq!(state.view, ModelsView::All);
     }
 

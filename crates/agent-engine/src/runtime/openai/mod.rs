@@ -74,6 +74,15 @@ pub struct ResolvedRoute {
 /// Resolve typed credential and wire dimensions. Unknown explicit prefixes fail closed.
 pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
     if let Some((prefix, rest)) = model.split_once('/') {
+        if prefix == "anthropic" && rest.starts_with("claude-") {
+            return Some(ResolvedRoute {
+                endpoint: "https://api.anthropic.com".into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Anthropic),
+                wire: WireProtocol::AnthropicMessages,
+            });
+        }
         if prefix == "xai-auth" && catalog::xai_model(rest).is_some() {
             return Some(ResolvedRoute {
                 endpoint: "https://api.x.ai/v1".into(),
@@ -484,6 +493,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn anthropic_identity_is_explicit_while_legacy_bare_ids_still_route() {
+        for id in ["claude-sonnet-4-6", "claude-opus-4-7"] {
+            let qualified = resolve_route(&format!("anthropic/{id}"))
+                .expect("qualified Anthropic model must route");
+            assert_eq!(qualified.provider, "anthropic");
+            assert_eq!(qualified.model, id);
+            assert_eq!(qualified.wire, WireProtocol::AnthropicMessages);
+
+            let legacy = resolve_route(id).expect("legacy bare Claude model must route");
+            assert_eq!(legacy.provider, "anthropic");
+            assert_eq!(legacy.model, id);
+        }
+        assert_eq!(
+            resolve_route("github-copilot/claude-sonnet-4.6")
+                .unwrap()
+                .provider,
+            "github-copilot"
+        );
+    }
+
+    #[test]
     fn brokered_provider_routing_is_typed_and_fail_closed() {
         for descriptor in catalog::XAI_TEXT_MODELS {
             let runtime_id = format!("xai-auth/{}", descriptor.id);
@@ -571,8 +601,7 @@ mod tests {
             machine_token: "not-a-real-token".into(),
         };
         let cache = crate::auth::TokenCache::new();
-        let tools_schema: std::sync::Arc<Vec<serde_json::Value>> =
-            std::sync::Arc::new(Vec::new());
+        let tools_schema: std::sync::Arc<Vec<serde_json::Value>> = std::sync::Arc::new(Vec::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
 

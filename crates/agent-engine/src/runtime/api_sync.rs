@@ -5,15 +5,15 @@
 //! `Runtime::compact_call`. All methods are additional `impl ApiMethods`
 //! blocks — the struct itself is defined in `api.rs`.
 
+use super::api::{ApiMethods, ApiOptions};
+use super::helpers::HelperMethods;
+use super::types::AuthState;
+use crate::{Result, RuntimeError, ToolRegistry};
+use reqwest::Client;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use serde_json::{json, Value};
-use reqwest::Client;
-use crate::{Result, RuntimeError, ToolRegistry};
-use super::api::{ApiMethods, ApiOptions};
-use super::types::AuthState;
-use super::helpers::HelperMethods;
 
 impl ApiMethods {
     /// Concatenate the `text` fields of every block in an Anthropic-shaped
@@ -48,14 +48,26 @@ impl ApiMethods {
         let tools_schema = tools.tools_schema();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(result) = crate::runtime::openai::try_route(
-            model, client, &tools_schema, system_prompt, messages, &tx,
-            None, None, thinking_budget, &tokio_util::sync::CancellationToken::new(),
-            &options.credential_source, &options.token_cache,
-        ).await {
+            model,
+            client,
+            &tools_schema,
+            system_prompt,
+            messages,
+            &tx,
+            None,
+            None,
+            thinking_budget,
+            &tokio_util::sync::CancellationToken::new(),
+            &options.credential_source,
+            &options.token_cache,
+        )
+        .await
+        {
             drop(tx);
             while rx.recv().await.is_some() {}
             return result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")));
         }
+        let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         // Read auth state
         let (auth_token, auth_type) = {
@@ -70,7 +82,10 @@ impl ApiMethods {
         }
 
         let auth_header = if auth_type == "oauth" {
-            ("authorization".to_string(), format!("Bearer {}", auth_token))
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", auth_token),
+            )
         } else {
             ("x-api-key".to_string(), auth_token.clone())
         };
@@ -102,7 +117,9 @@ impl ApiMethods {
         // Serialize once up-front; each retry attempt reuses the same bytes
         // via a cheap `Bytes::clone()` (refcount bump, no copy).
         let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
-            .map_err(|e| RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e)))?
+            .map_err(|e| {
+                RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
+            })?
             .into();
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
@@ -137,9 +154,15 @@ impl ApiMethods {
                             match resp.json::<Value>().await {
                                 Ok(j) => {
                                     if j["error"].is_object() {
-                                        eprintln!("API Error Response: {}", serde_json::to_string_pretty(&j).unwrap_or_default());
+                                        eprintln!(
+                                            "API Error Response: {}",
+                                            serde_json::to_string_pretty(&j).unwrap_or_default()
+                                        );
                                         if let Some(error_type) = j["error"]["type"].as_str() {
-                                            return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+                                            return Err(RuntimeError::Tool(format!(
+                                                "API Error: {}",
+                                                error_type
+                                            )));
                                         }
                                     }
                                     result_json = Some(j);
@@ -151,16 +174,32 @@ impl ApiMethods {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
-                                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
-                                    tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                                    let delay = Duration::from_millis(
+                                        1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                                    );
+                                    tracing::warn!(
+                                        "API retry {}/{} after {:?}: {}",
+                                        non_429_attempts,
+                                        max_retries,
+                                        delay,
+                                        last_err
+                                    );
                                     tokio::time::sleep(delay).await;
                                 }
                             }
                         } else {
                             let is_429 = status.as_u16() == 429;
-                            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
-                            let reset_hint = if from_hdr { Some(format!("{}s", delay.as_secs())) } else { None };
+                            let is_retryable =
+                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(
+                                resp.headers(),
+                                attempt + 1,
+                            );
+                            let reset_hint = if from_hdr {
+                                Some(format!("{}s", delay.as_secs()))
+                            } else {
+                                None
+                            };
                             let error_text = resp.text().await.unwrap_or_default();
 
                             let retry_exhausted = if is_429 {
@@ -172,19 +211,32 @@ impl ApiMethods {
                             if !is_retryable || retry_exhausted {
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(status.as_u16(), &error_text, hint)
+                                    crate::core::error::humanize_api_error_with_reset(
+                                        status.as_u16(),
+                                        &error_text,
+                                        hint,
+                                    ),
                                 ));
                             }
 
                             last_reset_hint = reset_hint.clone();
                             last_err = format!("{}: {}", status, error_text);
-                            if !is_429 { non_429_attempts += 1; }
+                            if !is_429 {
+                                non_429_attempts += 1;
+                            }
 
                             let budget = if is_429 { MAX_429_RETRIES } else { max_retries };
-                            let retry_num = if is_429 { attempt + 1 } else { non_429_attempts };
+                            let retry_num = if is_429 {
+                                attempt + 1
+                            } else {
+                                non_429_attempts
+                            };
                             let notice = if is_429 {
                                 if let Some(ref hint) = reset_hint {
-                                    format!("⚠ Rate limited — resuming in {} ({}/{})", hint, retry_num, budget)
+                                    format!(
+                                        "⚠ Rate limited — resuming in {} ({}/{})",
+                                        hint, retry_num, budget
+                                    )
                                 } else {
                                     format!("⚠ Rate limited — retrying ({}/{})", retry_num, budget)
                                 }
@@ -201,8 +253,16 @@ impl ApiMethods {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
-                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
-                        tracing::warn!("API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                        let delay = Duration::from_millis(
+                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                        );
+                        tracing::warn!(
+                            "API retry {}/{} after {:?}: {}",
+                            non_429_attempts,
+                            max_retries,
+                            delay,
+                            last_err
+                        );
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -210,7 +270,9 @@ impl ApiMethods {
                 attempt += 1;
             }
 
-            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after retries: {}", last_err)))?
+            result_json.ok_or_else(|| {
+                RuntimeError::Tool(format!("API failed after retries: {}", last_err))
+            })?
         };
 
         // Log usage for cache analysis.
@@ -270,13 +332,14 @@ impl ApiMethods {
                 result.map_err(|e| RuntimeError::Config(format!("openai provider: {e}")))?;
             return Ok(Self::concat_response_text(&response));
         }
+        let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
 
         // Fail early with a clear message if no Anthropic credentials
         if auth_type == "none" {
             return Err(RuntimeError::Auth(
-                "No API key or OAuth token found. Run `synaps login` to authenticate.".to_string()
+                "No API key or OAuth token found. Run `synaps login` to authenticate.".to_string(),
             ));
         }
 
@@ -336,7 +399,9 @@ impl ApiMethods {
                     .header(auth_header_name.clone(), auth_header_value.clone())
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json");
-                if let Some(beta) = Self::build_beta_header(&auth_type, &ApiOptions::default(), model) {
+                if let Some(beta) =
+                    Self::build_beta_header(&auth_type, &ApiOptions::default(), model)
+                {
                     req = req.header("anthropic-beta", beta);
                 }
 
@@ -348,7 +413,10 @@ impl ApiMethods {
                                 Ok(j) => {
                                     if j["error"].is_object() {
                                         if let Some(error_type) = j["error"]["type"].as_str() {
-                                            return Err(RuntimeError::Tool(format!("API Error: {}", error_type)));
+                                            return Err(RuntimeError::Tool(format!(
+                                                "API Error: {}",
+                                                error_type
+                                            )));
                                         }
                                     }
                                     result_json = Some(j);
@@ -360,16 +428,32 @@ impl ApiMethods {
                                         return Err(RuntimeError::Api(e));
                                     }
                                     last_err = e.to_string();
-                                    let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
-                                    tracing::warn!("Compaction retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                                    let delay = Duration::from_millis(
+                                        1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                                    );
+                                    tracing::warn!(
+                                        "Compaction retry {}/{} after {:?}: {}",
+                                        non_429_attempts,
+                                        max_retries,
+                                        delay,
+                                        last_err
+                                    );
                                     tokio::time::sleep(delay).await;
                                 }
                             }
                         } else {
                             let is_429 = status.as_u16() == 429;
-                            let is_retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
-                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(resp.headers(), attempt + 1);
-                            let reset_hint = if from_hdr { Some(format!("{}s", delay.as_secs())) } else { None };
+                            let is_retryable =
+                                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529);
+                            let (delay, from_hdr) = super::telemetry::retry_delay_from_headers(
+                                resp.headers(),
+                                attempt + 1,
+                            );
+                            let reset_hint = if from_hdr {
+                                Some(format!("{}s", delay.as_secs()))
+                            } else {
+                                None
+                            };
                             let error_text = resp.text().await.unwrap_or_default();
 
                             let retry_exhausted = if is_429 {
@@ -381,15 +465,26 @@ impl ApiMethods {
                             if !is_retryable || retry_exhausted {
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::Tool(
-                                    crate::core::error::humanize_api_error_with_reset(status.as_u16(), &error_text, hint)
+                                    crate::core::error::humanize_api_error_with_reset(
+                                        status.as_u16(),
+                                        &error_text,
+                                        hint,
+                                    ),
                                 ));
                             }
 
                             last_reset_hint = reset_hint;
                             last_err = format!("{}: {}", status, error_text);
-                            if !is_429 { non_429_attempts += 1; }
+                            if !is_429 {
+                                non_429_attempts += 1;
+                            }
 
-                            tracing::warn!("Compaction API retry after {:?}: {}: {}", delay, status, last_err);
+                            tracing::warn!(
+                                "Compaction API retry after {:?}: {}: {}",
+                                delay,
+                                status,
+                                last_err
+                            );
                             tokio::time::sleep(delay).await;
                         }
                     }
@@ -399,8 +494,16 @@ impl ApiMethods {
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
-                        let delay = Duration::from_millis(1000 * 2u64.pow(non_429_attempts.saturating_sub(1)));
-                        tracing::warn!("Compaction API retry {}/{} after {:?}: {}", non_429_attempts, max_retries, delay, last_err);
+                        let delay = Duration::from_millis(
+                            1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
+                        );
+                        tracing::warn!(
+                            "Compaction API retry {}/{} after {:?}: {}",
+                            non_429_attempts,
+                            max_retries,
+                            delay,
+                            last_err
+                        );
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -408,7 +511,9 @@ impl ApiMethods {
                 attempt += 1;
             }
 
-            result_json.ok_or_else(|| RuntimeError::Tool(format!("API failed after retries: {}", last_err)))?
+            result_json.ok_or_else(|| {
+                RuntimeError::Tool(format!("API failed after retries: {}", last_err))
+            })?
         };
 
         // Log usage
@@ -433,7 +538,9 @@ impl ApiMethods {
         }
 
         if out.is_empty() {
-            return Err(RuntimeError::Tool("Compaction returned empty response".to_string()));
+            return Err(RuntimeError::Tool(
+                "Compaction returned empty response".to_string(),
+            ));
         }
 
         Ok(out)

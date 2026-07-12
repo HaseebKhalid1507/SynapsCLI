@@ -1,22 +1,41 @@
-use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
-use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{EditorKind, visible_categories};
 use super::draw::current_value_for;
+use super::schema::{visible_categories, EditorKind};
+use super::{ActiveEditor, Focus, RuntimeSnapshot, SettingsState};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(crate) enum InputOutcome {
     None,
     Close,
-    Apply { key: &'static str, value: String },
+    Apply {
+        key: &'static str,
+        value: String,
+    },
     /// Apply a plugin-declared settings field. Written to the plugin's
     /// own namespaced config (`~/.synaps-cli/plugins/<id>/config`).
-    PluginApply { plugin_id: String, key: String, value: String },
+    PluginApply {
+        plugin_id: String,
+        key: String,
+        value: String,
+    },
     /// User requested to open a plugin-declared custom editor.
     /// The async upper layer calls `settings.editor.open` and installs
     /// `ActiveEditor::PluginCustom` with the returned render payload.
-    PluginCustomOpen { plugin_id: String, category: String, key: String },
-    SetProviderKey { provider_id: String, value: String },
-    TogglePlugin { name: String, enabled: bool },
-    PreviewTheme { name: String },
+    PluginCustomOpen {
+        plugin_id: String,
+        category: String,
+        key: String,
+    },
+    SetProviderKey {
+        provider_id: String,
+        value: String,
+    },
+    TogglePlugin {
+        name: String,
+        enabled: bool,
+    },
+    PreviewTheme {
+        name: String,
+    },
     RevertTheme,
     OpenPluginsMarketplace,
     PingModels,
@@ -32,7 +51,10 @@ pub(crate) fn handle_event(
         if key.code == KeyCode::Esc {
             let revert = matches!(
                 &state.edit_mode,
-                Some(ActiveEditor::Picker { setting_key: "theme", .. })
+                Some(ActiveEditor::Picker {
+                    setting_key: "theme",
+                    ..
+                })
             ) && state.original_theme_name.is_some();
             state.edit_mode = None;
             if revert {
@@ -156,8 +178,20 @@ pub(crate) fn handle_event(
                     let current = plugin_field_current_value(&plugin_id, &field);
                     let idx = options.iter().position(|o| *o == current).unwrap_or(0);
                     let new_idx = match key.code {
-                        KeyCode::Left => if idx > 0 { idx - 1 } else { idx },
-                        KeyCode::Right => if idx + 1 < options.len() { idx + 1 } else { idx },
+                        KeyCode::Left => {
+                            if idx > 0 {
+                                idx - 1
+                            } else {
+                                idx
+                            }
+                        }
+                        KeyCode::Right => {
+                            if idx + 1 < options.len() {
+                                idx + 1
+                            } else {
+                                idx
+                            }
+                        }
                         _ => idx,
                     };
                     if new_idx != idx {
@@ -186,10 +220,8 @@ pub(crate) fn handle_event(
                     // Picker options are not declarable in the manifest
                     // today (only Cycler carries inline options); show a
                     // note rather than opening an empty picker.
-                    state.row_error = Some((
-                        field.key.clone(),
-                        "picker editor not yet wired".to_string(),
-                    ));
+                    state.row_error =
+                        Some((field.key.clone(), "picker editor not yet wired".to_string()));
                     return InputOutcome::None;
                 }
                 (KeyCode::Enter, PE::Cycler { options }) if !options.is_empty() => {
@@ -237,7 +269,9 @@ pub(crate) fn handle_event(
                     }
                 }
                 Focus::Right => {
-                    if state.setting_idx > 0 { state.setting_idx -= 1; }
+                    if state.setting_idx > 0 {
+                        state.setting_idx -= 1;
+                    }
                 }
             }
             state.row_error = None;
@@ -246,7 +280,8 @@ pub(crate) fn handle_event(
         (KeyCode::Down, _) => {
             match state.focus {
                 Focus::Left => {
-                    let total_categories = visible_categories(&snap.lifecycle_claims).len() + snap.plugin_categories.len();
+                    let total_categories = visible_categories(&snap.lifecycle_claims).len()
+                        + snap.plugin_categories.len();
                     if state.category_idx + 1 < total_categories {
                         state.category_idx += 1;
                         state.setting_idx = 0;
@@ -254,7 +289,9 @@ pub(crate) fn handle_event(
                 }
                 Focus::Right => {
                     let n = row_count(state, snap);
-                    if state.setting_idx + 1 < n { state.setting_idx += 1; }
+                    if state.setting_idx + 1 < n {
+                        state.setting_idx += 1;
+                    }
                 }
             }
             state.row_error = None;
@@ -266,8 +303,20 @@ pub(crate) fn handle_event(
                     let current = cycler_current_value(def.key, snap);
                     let idx = options.iter().position(|o| *o == current).unwrap_or(0);
                     let new_idx = match key.code {
-                        KeyCode::Left => if idx > 0 { idx - 1 } else { idx },
-                        KeyCode::Right => if idx + 1 < options.len() { idx + 1 } else { idx },
+                        KeyCode::Left => {
+                            if idx > 0 {
+                                idx - 1
+                            } else {
+                                idx
+                            }
+                        }
+                        KeyCode::Right => {
+                            if idx + 1 < options.len() {
+                                idx + 1
+                            } else {
+                                idx
+                            }
+                        }
                         _ => idx,
                     };
                     if new_idx != idx {
@@ -297,8 +346,11 @@ pub(crate) fn handle_event(
                         state.row_error = None;
                         // Anthropic models
                         let mut opts: Vec<String> = vec!["── Anthropic ──".to_string()];
-                        opts.extend(synaps_cli::models::KNOWN_MODELS
-                            .iter().map(|(id, desc)| format!("  {}  — {}", id, desc)));
+                        opts.extend(
+                            synaps_cli::models::KNOWN_MODELS
+                                .iter()
+                                .map(|(id, desc)| format!("  anthropic/{}  — {}", id, desc)),
+                        );
 
                         // Provider models (only for configured providers)
                         let registry = synaps_cli::runtime::openai::registry::providers();
@@ -307,12 +359,18 @@ pub(crate) fn handle_event(
                                 .provider_key_status
                                 .get(spec.key)
                                 .is_some_and(|status| status.is_configured());
-                            if !configured { continue; }
+                            if !configured {
+                                continue;
+                            }
                             opts.push(format!("── {} ──", spec.name));
                             for (id, label, tier) in spec.models {
                                 let full = format!("{}/{}", spec.key, id);
-                                let health = snap.model_health.get(&full)
-                                    .map(|(s, ms)| format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms)))
+                                let health = snap
+                                    .model_health
+                                    .get(&full)
+                                    .map(|(s, ms)| {
+                                        format!("{} {:>6}  ", s.icon(), fmt_latency(*s, *ms))
+                                    })
                                     .unwrap_or_default();
                                 opts.push(format!("  {}{}  — {} [{}]", health, full, label, tier));
                             }
@@ -320,7 +378,8 @@ pub(crate) fn handle_event(
                         opts.push("Custom…".to_string());
 
                         let current = current_value_for(def, snap);
-                        let cursor = opts.iter()
+                        let cursor = opts
+                            .iter()
                             .position(|o| o.trim_start().starts_with(&current))
                             .unwrap_or(0);
                         state.edit_mode = Some(ActiveEditor::Picker {
@@ -398,7 +457,9 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         }
                     }
                     if *setting_key == "theme" {
-                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                        return InputOutcome::PreviewTheme {
+                            name: options[*cursor].clone(),
+                        };
                     }
                     InputOutcome::None
                 }
@@ -408,8 +469,13 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     if selection.starts_with("──") {
                         return InputOutcome::None;
                     }
-                    if (*setting_key == "model" || *setting_key == "compaction_model") && selection == "Custom…" {
-                        state.edit_mode = Some(ActiveEditor::CustomModel { buffer: String::new(), setting_key });
+                    if (*setting_key == "model" || *setting_key == "compaction_model")
+                        && selection == "Custom…"
+                    {
+                        state.edit_mode = Some(ActiveEditor::CustomModel {
+                            buffer: String::new(),
+                            setting_key,
+                        });
                         return InputOutcome::None;
                     }
                     let raw = selection.split("  —").next().unwrap_or(&selection).trim();
@@ -419,8 +485,15 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         // A provider-qualified ID takes precedence over model-family
                         // substrings (e.g. github-copilot/claude-fable-5).
                         let before = &raw[..pos];
-                        let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
-                            .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
+                        let key_start = before
+                            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                            .map(|i| {
+                                i + before[i..]
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.len_utf8())
+                                    .unwrap_or(1)
+                            })
                             .unwrap_or(0);
                         raw[key_start..].to_string()
                     } else if let Some(pos) = raw.find("claude-") {
@@ -511,7 +584,8 @@ pub(crate) fn plugin_field_current_value(
     plugin_id: &str,
     field: &synaps_cli::skills::registry::PluginSettingsField,
 ) -> String {
-    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(plugin_id, &field.key) {
+    if let Some(v) = synaps_cli::extensions::config_store::read_plugin_config(plugin_id, &field.key)
+    {
         return v;
     }
     match &field.default {
@@ -549,8 +623,11 @@ fn fmt_latency(status: synaps_cli::runtime::openai::ping::PingStatus, ms: u64) -
     use synaps_cli::runtime::openai::ping::PingStatus;
     match status {
         PingStatus::Online => {
-            if ms >= 1000 { format!("{:.1}s", ms as f64 / 1000.0) }
-            else { format!("{}ms", ms) }
+            if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{}ms", ms)
+            }
         }
         other => other.label().to_string(),
     }
@@ -574,8 +651,14 @@ mod tests {
             api_retries: 0,
             theme_name: "t".into(),
             plugins: vec![
-                super::super::PluginRow { name: "p1".into(), skill_count: 1 },
-                super::super::PluginRow { name: "p2".into(), skill_count: 2 },
+                super::super::PluginRow {
+                    name: "p1".into(),
+                    skill_count: 1,
+                },
+                super::super::PluginRow {
+                    name: "p2".into(),
+                    skill_count: 2,
+                },
             ],
             disabled_plugins: vec!["p2".into()],
             provider_key_status: std::collections::BTreeMap::new(),
@@ -589,7 +672,9 @@ mod tests {
     fn plugins_state_at(idx: usize) -> SettingsState {
         let mut state = SettingsState::new();
         state.category_idx = super::super::schema::CATEGORIES
-            .iter().position(|c| *c == super::super::schema::Category::Plugins).unwrap();
+            .iter()
+            .position(|c| *c == super::super::schema::Category::Plugins)
+            .unwrap();
         state.set_focus(Focus::Right);
         state.setting_idx = idx;
         state
@@ -598,7 +683,11 @@ mod tests {
     #[test]
     fn enter_on_marketplace_row_opens_plugins_marketplace() {
         let mut state = plugins_state_at(0);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::OpenPluginsMarketplace));
     }
 
@@ -606,7 +695,11 @@ mod tests {
     fn enter_on_plugin_row_is_noop() {
         // Enter on a plugin row should NOT toggle — only Space does.
         let mut state = plugins_state_at(1);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::None));
     }
 
@@ -614,7 +707,11 @@ mod tests {
     fn space_on_plugin_row_toggles_off() {
         // Row 1 is the first plugin (p1).
         let mut state = plugins_state_at(1);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &snap(),
+        );
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p1");
@@ -628,7 +725,11 @@ mod tests {
     fn enter_on_disabled_plugin_is_noop() {
         // Enter on a disabled plugin row should NOT toggle.
         let mut state = plugins_state_at(2);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snap(),
+        );
         assert!(matches!(out, InputOutcome::None));
     }
 
@@ -636,7 +737,11 @@ mod tests {
     fn space_on_disabled_plugin_toggles_on() {
         // Row 2 is the second plugin (p2, disabled).
         let mut state = plugins_state_at(2);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &snap());
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &snap(),
+        );
         match out {
             InputOutcome::TogglePlugin { name, enabled } => {
                 assert_eq!(name, "p2");
@@ -644,6 +749,34 @@ mod tests {
             }
             _ => panic!("expected TogglePlugin"),
         }
+    }
+
+    #[test]
+    fn settings_anthropic_picker_emits_provider_qualified_id() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  anthropic/claude-sonnet-4-6  — Claude Sonnet".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "anthropic/claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    fn settings_copilot_claude_picker_keeps_copilot_provider() {
+        let mut state = SettingsState::new();
+        state.edit_mode = Some(ActiveEditor::Picker {
+            setting_key: "model",
+            options: vec!["  github-copilot/claude-sonnet-4.6  — Claude Sonnet".to_string()],
+            cursor: 0,
+        });
+        assert!(matches!(
+            handle_editor_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Apply { key: "model", value } if value == "github-copilot/claude-sonnet-4.6"
+        ));
     }
 
     // ---- Path B Phase 4 — plugin-declared category wiring ----------------
@@ -687,17 +820,27 @@ mod tests {
             fields: vec![plugin_field(
                 "speed",
                 "Speed",
-                PluginSettingsEditor::Cycler { options: vec!["slow".into(), "fast".into()] },
+                PluginSettingsEditor::Cycler {
+                    options: vec!["slow".into(), "fast".into()],
+                },
             )],
         }]);
         let mut state = SettingsState::new();
         // Down across all built-ins, then once into plugin category.
         for _ in 0..super::super::schema::CATEGORIES.len() {
-            handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+            handle_event(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &s,
+            );
         }
         assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
         // One more Down should NOT advance past the last plugin category.
-        handle_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &s);
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &s,
+        );
         assert_eq!(state.category_idx, super::super::schema::CATEGORIES.len());
     }
 
@@ -716,9 +859,17 @@ mod tests {
             )],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginApply { plugin_id, key, value } => {
+            InputOutcome::PluginApply {
+                plugin_id,
+                key,
+                value,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(key, "speed");
                 assert_eq!(value, "fast");
@@ -740,15 +891,38 @@ mod tests {
             )],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         assert!(matches!(out, InputOutcome::None));
-        assert!(matches!(state.edit_mode, Some(ActiveEditor::PluginText { .. })));
+        assert!(matches!(
+            state.edit_mode,
+            Some(ActiveEditor::PluginText { .. })
+        ));
         // Type "hi" then Enter.
-        handle_event(&mut state, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &s);
-        handle_event(&mut state, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            &s,
+        );
+        handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &s,
+        );
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginApply { plugin_id, key, value } => {
+            InputOutcome::PluginApply {
+                plugin_id,
+                key,
+                value,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(key, "label");
                 assert_eq!(value, "hi");
@@ -766,17 +940,30 @@ mod tests {
             fields: vec![plugin_field("body", "Body", PluginSettingsEditor::Custom)],
         }]);
         let mut state = at_first_plugin_cat(&s);
-        let out = handle_event(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &s);
+        let out = handle_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &s,
+        );
         match out {
-            InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+            InputOutcome::PluginCustomOpen {
+                plugin_id,
+                category,
+                key,
+            } => {
                 assert_eq!(plugin_id, "demo");
                 assert_eq!(category, "capture");
                 assert_eq!(key, "body");
             }
-            other => panic!("expected PluginCustomOpen, got {:?}",
-                std::mem::discriminant(&other)),
+            other => panic!(
+                "expected PluginCustomOpen, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
-        assert!(state.edit_mode.is_none(), "async upper layer opens the editor after RPC returns");
+        assert!(
+            state.edit_mode.is_none(),
+            "async upper layer opens the editor after RPC returns"
+        );
     }
 
     #[test]

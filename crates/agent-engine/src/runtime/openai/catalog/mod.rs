@@ -223,12 +223,9 @@ impl CatalogModel {
         })
     }
 
-    /// Synaps runtime id: bare for Anthropic/Claude, "provider/id" otherwise.
+    /// Synaps runtime id. Provider identity is always explicit, including Anthropic.
     pub fn runtime_id(&self) -> String {
-        match &self.provider_kind {
-            CatalogProviderKind::Anthropic => self.id.clone(),
-            _ => format!("{}/{}", self.provider_key, self.id),
-        }
+        format!("{}/{}", self.provider_key, self.id)
     }
 
     /// Label if present, id otherwise.
@@ -622,10 +619,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_runtime_id_is_bare() {
+    fn anthropic_runtime_id_is_provider_qualified() {
         let mut m = CatalogModel::new("anthropic", "Anthropic", "claude-opus-4-7").unwrap();
         m.provider_kind = CatalogProviderKind::Anthropic;
-        assert_eq!(m.runtime_id(), "claude-opus-4-7");
+        assert_eq!(m.runtime_id(), "anthropic/claude-opus-4-7");
     }
 
     #[test]
@@ -997,7 +994,7 @@ mod tests {
             let models = parse_anthropic_catalog_models(json).expect("parse anthropic");
             assert_eq!(models.len(), 1);
             let model = &models[0];
-            assert_eq!(model.runtime_id(), "claude-opus-4-7");
+            assert_eq!(model.runtime_id(), "anthropic/claude-opus-4-7");
             assert_eq!(model.label.as_deref(), Some("Claude Opus 4.7"));
             assert_eq!(model.context_tokens, Some(200_000));
             assert_eq!(model.max_output_tokens, Some(32_000));
