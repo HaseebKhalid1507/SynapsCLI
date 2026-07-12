@@ -415,15 +415,16 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     let raw = selection.split("  —").next().unwrap_or(&selection).trim();
                     // Strip health prefix (e.g. "✅  79ms  groq/..." or "✅  1304ms  nvidia/...")
                     // Find the model ID by looking for known provider prefixes or "claude-"
-                    let value = if let Some(pos) = raw.find("claude-") {
-                        raw[pos..].to_string()
-                    } else if let Some(pos) = raw.find('/') {
-                        // Find start of provider key before the slash (e.g. "groq/", "nvidia/")
+                    let value = if let Some(pos) = raw.find('/') {
+                        // A provider-qualified ID takes precedence over model-family
+                        // substrings (e.g. github-copilot/claude-fable-5).
                         let before = &raw[..pos];
                         let key_start = before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
                             .map(|i| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
                             .unwrap_or(0);
                         raw[key_start..].to_string()
+                    } else if let Some(pos) = raw.find("claude-") {
+                        raw[pos..].to_string()
                     } else {
                         raw.to_string()
                     };

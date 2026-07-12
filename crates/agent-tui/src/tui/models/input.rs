@@ -175,6 +175,47 @@ mod tests {
     }
 
     #[test]
+    fn every_copilot_curated_selection_emits_provider_qualified_routable_id() {
+        for model in synaps_cli::runtime::openai::catalog::copilot_static_catalog_models() {
+            let favorite_id = format!("github-copilot/{}", model.id);
+            let emitted = model_id_for_runtime(&favorite_id);
+            assert_eq!(emitted, favorite_id);
+            let route = synaps_cli::runtime::openai::resolve_route(&emitted)
+                .unwrap_or_else(|| panic!("Copilot model did not route: {emitted}"));
+            assert_eq!(route.provider, "github-copilot");
+        }
+    }
+
+    #[test]
+    fn expanded_copilot_enter_emits_provider_qualified_claude_ids() {
+        for wire_id in ["claude-fable-5", "claude-opus-4.8"] {
+            let expected = format!("github-copilot/{wire_id}");
+            let mut state = ModelsModalState::new();
+            state.expanded = Some(ExpandedModelsState {
+                provider_key: "github-copilot".to_string(),
+                provider_name: "GitHub Copilot".to_string(),
+                cursor: 0,
+                search: String::new(),
+                load_state: ExpandedLoadState::Ready(vec![ExpandedModelEntry::new(
+                    expected.clone(),
+                    wire_id.to_string(),
+                    false,
+                )]),
+            });
+            assert_eq!(
+                handle_event(&mut state, key(KeyCode::Enter), "other"),
+                InputOutcome::Apply(expected.clone())
+            );
+            assert_eq!(
+                synaps_cli::runtime::openai::resolve_route(&expected)
+                    .unwrap()
+                    .provider,
+                "github-copilot"
+            );
+        }
+    }
+
+    #[test]
     fn e_opens_expanded_provider_browser() {
         let mut state = ModelsModalState::new();
         state.view = ModelsView::All;
