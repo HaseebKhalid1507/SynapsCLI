@@ -4,14 +4,15 @@
 //! compaction) but renders to stdin/stdout. Built for scripting,
 //! piping, SSH, CI, and agent benchmark frameworks like Harbor.
 //!
-//! Note: the inbox watcher and session socket are started by `engine::setup::boot()`
-//! but inbound events are not actively drained in this mode. Events will accumulate
-//! until the session ends. Full event-queue handling is a TUI-only feature for now.
+//! C4a: chat now correctly continues turns when pending runtime events are
+//! injected at turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
+//! Uses central drain_event_queue + wake_action — no bespoke event formatting.
 
 use synaps_cli::engine::setup::{self, EngineOpts};
 use synaps_cli::engine::commands::{self, CommandResult};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
 use synaps_cli::engine::session::ConversationState;
+use synaps_cli::engine::reactor::{drain_event_queue, wake_action, WakeAction, AUTO_TURN_CAP};
 use synaps_cli::{CancellationToken, flush_stdout};
 use synaps_cli::runtime::compaction::compact_conversation;
 use futures::StreamExt;
@@ -59,9 +60,8 @@ pub async fn run(
     // In pipe/headless mode (echo "..." | synaps chat ...) stdin is immediately
     // ready, so the old fire-and-forget approach caused a race: the first API
     // call fired before extension processes finished spawning, and the model
-    // never saw extension-registered tools (e.g. get_weather). Awaiting here
-    // ensures all extensions are loaded and their tools are registered in the
-    // ToolRegistry before we read stdin and send the first message to the API.
+    // never saw extension-registered tools. Awaiting here ensures all extensions
+    // are loaded before we read stdin.
     //
     // The TUI is unaffected — it has its own extension loader path that runs
     // concurrently with the event loop (human typing provides natural latency).
@@ -89,6 +89,12 @@ pub async fn run(
     let compact_threshold: usize = 80_000;
     let mut last_compacted_tokens: usize = 0;
 
+    // C4a: consecutive auto-turn counter; reset to 0 on real user input.
+    // Initial value doesn't matter — always reset before first turn.
+    #[allow(unused_assignments)]
+    let mut consecutive_auto_turns: u32 = 0;
+
+
     loop {
         if is_tty {
             eprint!("❯ ");
@@ -104,8 +110,11 @@ pub async fn run(
             }
             Ok(_) => {}
         }
-        let input = input.trim();
+        let input = input.trim_end_matches('\r').trim();
         if input.is_empty() { continue; }
+
+        // Real user input — reset auto-turn counter.
+        consecutive_auto_turns = 0;
 
         // ── Slash commands ──
         if let Some((cmd, arg)) = commands::parse_command(input) {
@@ -175,128 +184,183 @@ pub async fn run(
             continue;
         }
 
-        // ── Send message ──
-        // Inject abort context if present
+        // ── Regular user message ──
         let message = if let Some(ctx) = conv.abort_context.take() {
             format!("{}\n\n[ABORT CONTEXT — your previous response was interrupted. Here's what you completed before the abort:]\n\n{}\n\n[END ABORT CONTEXT — continue from where you left off or adjust based on the user's new message]", input, ctx)
         } else {
             input.to_string()
         };
-
         conv.api_messages
             .push(std::sync::Arc::new(json!({"role": "user", "content": message})));
 
-        let cancel = CancellationToken::new();
-        // Vec<SharedMessage> clone = pointer bumps only.
-        let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
-        let mut stream = runtime.run_stream_with_messages(
-            msgs_in, cancel, None, None, false
-        ).await;
+        // ── C4a: turn loop — run until no pending events or cap reached ──
+        'turn_loop: loop {
+            let cancel = CancellationToken::new();
+            // Vec<SharedMessage> clone = pointer bumps only.
+            let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
+            let mut stream = runtime.run_stream_with_messages(
+                msgs_in, cancel, None, None, false
+            ).await;
 
-        let mut in_thinking = false;
+            let mut in_thinking = false;
 
-        while let Some(event) = stream.next().await {
-            let (engine_event, completion) = stream::process_stream_event(
-                event,
-                &mut conv.api_messages,
-                &mut subagents,
-                &mut conv.queued_message,
-                &mut conv.pending_events,
-            );
+            let turn_completion = loop {
+                let Some(event) = stream.next().await else {
+                    break StreamCompletion::Done;
+                };
+                let (engine_event, completion) = stream::process_stream_event(
+                    event,
+                    &mut conv.api_messages,
+                    &mut subagents,
+                    &mut conv.queued_message,
+                    &mut conv.pending_events,
+                );
 
-            match engine_event {
-                EngineStreamEvent::Thinking(text) => {
-                    if !in_thinking {
-                        eprint!("\x1b[2m"); // dim
-                        in_thinking = true;
+                match engine_event {
+                    EngineStreamEvent::Thinking(text) => {
+                        if !in_thinking {
+                            eprint!("\x1b[2m"); // dim
+                            in_thinking = true;
+                        }
+                        eprint!("{}", text);
+                        io::stderr().flush().ok();
                     }
-                    eprint!("{}", text);
-                    io::stderr().flush().ok();
-                }
-                EngineStreamEvent::Text(text) => {
-                    if in_thinking {
-                        eprintln!("\x1b[0m"); // reset
-                        in_thinking = false;
+                    EngineStreamEvent::Text(text) => {
+                        if in_thinking {
+                            eprintln!("\x1b[0m"); // reset
+                            in_thinking = false;
+                        }
+                        print!("{}", text);
+                        flush_stdout();
                     }
-                    print!("{}", text);
-                    flush_stdout();
+                    EngineStreamEvent::ToolStart { tool_name, .. } => {
+                        if in_thinking { eprintln!("\x1b[0m"); in_thinking = false; }
+                        eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
+                        io::stderr().flush().ok();
+                    }
+                    EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
+                        let input_preview = serde_json::to_string(&input).unwrap_or_default();
+                        let preview: String = input_preview.chars().take(60).collect();
+                        eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+                    }
+                    EngineStreamEvent::ToolResult { result, .. } => {
+                        let preview: String = result.chars().take(80).collect();
+                        eprintln!("\x1b[32m  → {}\x1b[0m", preview);
+                    }
+                    EngineStreamEvent::SubagentStart { name, task, .. } => {
+                        eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
+                    }
+                    EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
+                        eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
+                    }
+                    EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
+                        let model_name = model.as_deref().unwrap_or(runtime.model());
+                        conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
+                    }
+                    EngineStreamEvent::SteeringDelivered { message } => {
+                        eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                    }
+                    EngineStreamEvent::Notice(text) => {
+                        eprintln!("\x1b[2m{}\x1b[0m", text);
+                    }
+                    EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
+                    EngineStreamEvent::Error(e) => {
+                        eprintln!("\x1b[31m❌ {}\x1b[0m", e);
+                    }
+                    _ => {}
                 }
-                EngineStreamEvent::ToolStart { tool_name, .. } => {
-                    if in_thinking { eprintln!("\x1b[0m"); in_thinking = false; }
-                    eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
-                    io::stderr().flush().ok();
+
+                match completion {
+                    StreamCompletion::Done | StreamCompletion::Error(_) => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        println!();
+                        break StreamCompletion::Done;
+                    }
+                    StreamCompletion::AutoSendQueued(queued) => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        conv.api_messages.push(std::sync::Arc::new(
+                            json!({"role": "user", "content": queued})
+                        ));
+                        break StreamCompletion::AutoSendQueued(String::new());
+                    }
+                    StreamCompletion::AutoTriggerEvents => {
+                        if in_thinking { eprintln!("\x1b[0m"); }
+                        break StreamCompletion::AutoTriggerEvents;
+                    }
+                    StreamCompletion::Continue => {}
                 }
-                EngineStreamEvent::ToolFinalized { tool_name, input, .. } => {
-                    let input_preview = serde_json::to_string(&input).unwrap_or_default();
-                    let preview: String = input_preview.chars().take(60).collect();
-                    eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+            };
+
+            // Post-turn: save + auto-compact.
+            conv.save().await;
+            let est = conv.estimate_tokens();
+            let threshold = if last_compacted_tokens > 0 {
+                last_compacted_tokens + compact_threshold
+            } else {
+                compact_threshold
+            };
+            if est > threshold && conv.api_messages.len() >= 4 {
+                eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
+                if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
+                    conv.api_messages = vec![std::sync::Arc::new(json!({
+                        "role": "user",
+                        "content": format!("<context-summary>\n{}\n</context-summary>", summary)
+                    }))];
+                    last_compacted_tokens = conv.estimate_tokens();
+                    eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
                 }
-                EngineStreamEvent::ToolResult { result, .. } => {
-                    let preview: String = result.chars().take(80).collect();
-                    eprintln!("\x1b[32m  → {}\x1b[0m", preview);
-                }
-                EngineStreamEvent::SubagentStart { name, task, .. } => {
-                    eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
-                }
-                EngineStreamEvent::SubagentDone { status, duration_secs, .. } => {
-                    eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
-                }
-                EngineStreamEvent::Usage { input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model } => {
-                    let model_name = model.as_deref().unwrap_or(runtime.model());
-                    conv.add_usage(input_tokens, output_tokens, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, model_name);
-                }
-                EngineStreamEvent::SteeringDelivered { message } => {
-                    eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
-                }
-                EngineStreamEvent::Notice(text) => {
-                    eprintln!("\x1b[2m{}\x1b[0m", text);
-                }
-                EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
-                EngineStreamEvent::Error(e) => {
-                    eprintln!("\x1b[31m❌ {}\x1b[0m", e);
-                }
-                _ => {} // deltas handled above
             }
 
-            match completion {
-                StreamCompletion::Done | StreamCompletion::Error(_) => {
-                    if in_thinking { eprintln!("\x1b[0m"); }
-                    println!();
-                    break;
+            // C4a: decide whether to continue for another auto-turn.
+            match turn_completion {
+                StreamCompletion::AutoSendQueued(_) => {
+                    // User-driven queued message — reset cap and loop.
+                    consecutive_auto_turns = 0;
+                    continue 'turn_loop;
                 }
-                StreamCompletion::AutoSendQueued(queued) => {
-                    // Re-inject and loop
-                    conv.api_messages
-                        .push(std::sync::Arc::new(json!({"role": "user", "content": queued})));
-                    // Stream will continue from the outer loop
-                    break;
+                StreamCompletion::AutoTriggerEvents => {
+                    // Pending events were injected by process_stream_event; drain any
+                    // remaining queue items and decide via central wake_action.
+                    let drained = drain_event_queue(
+                        runtime.event_queue(),
+                        &mut conv.api_messages,
+                        &mut conv.pending_events,
+                        false, // idle after turn
+                        None,
+                    );
+                    for d in &drained {
+                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
+                    }
+                    let action = wake_action(
+                        &drained,
+                        &conv.api_messages,
+                        false,
+                        true, // auto_turn_enabled
+                        consecutive_auto_turns,
+                    );
+                    match action {
+                        WakeAction::RunTurn => {
+                            consecutive_auto_turns += 1;
+                            if consecutive_auto_turns >= AUTO_TURN_CAP {
+                                eprintln!(
+                                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
+                                    AUTO_TURN_CAP
+                                );
+                            }
+                            continue 'turn_loop;
+                        }
+                        WakeAction::Forward | WakeAction::Nothing => {
+                            // Cap reached or nothing more — park at prompt.
+                            break 'turn_loop;
+                        }
+                    }
                 }
-                StreamCompletion::AutoTriggerEvents => break,
-                StreamCompletion::Continue => {}
+                _ => {
+                    // Done or Error — exit turn loop normally.
+                    break 'turn_loop;
+                }
             }
-        }
-
-        // Save after each turn
-        conv.save().await;
-
-        // Auto-compact
-        let est = conv.estimate_tokens();
-        let threshold = if last_compacted_tokens > 0 {
-            last_compacted_tokens + compact_threshold
-        } else {
-            compact_threshold
-        };
-        if est > threshold && conv.api_messages.len() >= 4 {
-            eprintln!("\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m", est);
-            if let Ok(summary) = compact_conversation(&conv.api_messages, &runtime, None).await {
-                conv.api_messages = vec![std::sync::Arc::new(json!({
-                    "role": "user",
-                    "content": format!("<context-summary>\n{}\n</context-summary>", summary)
-                }))];
-                last_compacted_tokens = conv.estimate_tokens();
-                eprintln!("\x1b[2m[compacted → ~{} tokens]\x1b[0m", last_compacted_tokens);
-            }
-        }
+        } // end 'turn_loop
     }
 
     // ── Shutdown ──
@@ -305,7 +369,7 @@ pub async fn run(
     // Fire on_session_end hook
     let hook_event = synaps_cli::extensions::hooks::events::HookEvent::on_session_end(
         &conv.session.id,
-        None, // no transcript in headless
+        None,
     );
     let _ = runtime.hook_bus().emit(&hook_event).await;
 
