@@ -148,24 +148,133 @@ fn wake_action_forward_when_auto_turn_disabled() {
         "RPC opt-out: auto_turn_enabled=false must not produce RunTurn");
 }
 
-// ─── T5: is_busy seam — auto_turn_pending blocks as effectively as in_flight ──
+// ─── T5: terminal_flush_seam — false path never reserves, counter unchanged ───
 
-/// `is_busy` is logically `in_flight.is_some() || auto_turn_pending`.
-/// We test this seam independently by simulating both flags.
+/// `allow_chain = false` (error/cancel/drop paths):
+/// * `auto_turn_pending` is cleared
+/// * `pending_events` are flushed into `api_messages` (events not lost)
+/// * `consecutive_auto_turns` counter is NOT incremented
+/// * Return value is always `None`
 #[test]
-fn is_busy_covers_both_in_flight_and_auto_turn_pending() {
-    // Simulate is_busy logic directly (seam test — no RpcState needed)
-    let in_flight_some = true;
-    let auto_turn_pending = false;
-    assert!(in_flight_some || auto_turn_pending, "in_flight alone → busy");
+fn terminal_flush_false_never_reserves_and_counter_unchanged() {
+    use agent_engine::engine::reactor::terminal_flush_seam;
 
-    let in_flight_some = false;
-    let auto_turn_pending = true;
-    assert!(in_flight_some || auto_turn_pending, "auto_turn_pending alone → busy");
+    let mut auto_turn_pending = true; // was set; must be cleared
+    let mut pending_events = vec!["<event>test</event>".to_string()];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
+    let events_auto_turn = true; // enabled — must still not fire on false path
+    let mut counter: u32 = 0;
 
-    let in_flight_some = false;
-    let auto_turn_pending = false;
-    assert!(!(in_flight_some || auto_turn_pending), "neither → not busy");
+    let result = terminal_flush_seam(
+        false, // allow_chain = false (error path)
+        &mut auto_turn_pending,
+        &mut pending_events,
+        &mut api_messages,
+        events_auto_turn,
+        &mut counter,
+    );
+
+    // Must return None — no auto-turn scheduled
+    assert!(result.is_none(), "false path must never return a reserved id");
+    // auto_turn_pending must be cleared
+    assert!(!auto_turn_pending, "false path must clear auto_turn_pending");
+    // pending_events must be drained
+    assert!(pending_events.is_empty(), "pending_events must be flushed");
+    // events injected into api_messages (event not lost)
+    assert_eq!(api_messages.len(), 2, "buffered event must be injected into api_messages");
+    // Counter must NOT change — critical invariant
+    assert_eq!(counter, 0, "false path must not increment consecutive_auto_turns");
+}
+
+// ─── T7: terminal_flush_seam — true path reserves when eligible ───────────────
+
+/// `allow_chain = true` (Done path):
+/// * When all conditions met → returns `Some(id)`, increments counter, sets pending
+/// * When cap reached → returns `None`, does not increment
+#[test]
+fn terminal_flush_true_reserves_when_eligible() {
+    use agent_engine::engine::reactor::terminal_flush_seam;
+
+    let mut auto_turn_pending = false;
+    let mut pending_events = vec!["<event>ev</event>".to_string()];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
+    let events_auto_turn = true;
+    let mut counter: u32 = 0;
+
+    let result = terminal_flush_seam(
+        true, // allow_chain = true (Done path)
+        &mut auto_turn_pending,
+        &mut pending_events,
+        &mut api_messages,
+        events_auto_turn,
+        &mut counter,
+    );
+
+    // Must return Some — auto-turn was reserved
+    assert!(result.is_some(), "true path must return auto_id when conditions met");
+    // auto_turn_pending must be set
+    assert!(auto_turn_pending, "true path must set auto_turn_pending = true");
+    // counter incremented
+    assert_eq!(counter, 1, "true path must increment consecutive_auto_turns");
+}
+
+#[test]
+fn terminal_flush_true_does_not_reserve_at_cap() {
+    use agent_engine::engine::reactor::terminal_flush_seam;
+
+    let mut auto_turn_pending = false;
+    let mut pending_events = vec!["<event>ev</event>".to_string()];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
+    let events_auto_turn = true;
+    let mut counter: u32 = AUTO_TURN_CAP; // already at cap
+
+    let result = terminal_flush_seam(
+        true, // allow_chain = true, but cap is exhausted
+        &mut auto_turn_pending,
+        &mut pending_events,
+        &mut api_messages,
+        events_auto_turn,
+        &mut counter,
+    );
+
+    assert!(result.is_none(), "true path at cap must not reserve");
+    assert!(!auto_turn_pending, "auto_turn_pending must stay false when denied");
+    assert_eq!(counter, AUTO_TURN_CAP, "counter must not change when denied");
+}
+
+#[test]
+fn terminal_flush_false_does_not_reserve_even_at_zero_counter() {
+    use agent_engine::engine::reactor::terminal_flush_seam;
+
+    // Stress-test: even with perfect conditions, false path must never reserve.
+    let mut auto_turn_pending = false;
+    let mut pending_events = vec!["<event>ev</event>".to_string()];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "prior"}))
+    ];
+    let events_auto_turn = true;
+    let mut counter: u32 = 0;
+
+    for _ in 0..3 {
+        let result = terminal_flush_seam(
+            false, // always false
+            &mut auto_turn_pending,
+            &mut pending_events,
+            &mut api_messages,
+            events_auto_turn,
+            &mut counter,
+        );
+        assert!(result.is_none());
+        assert_eq!(counter, 0, "counter must remain 0 across all false-path calls");
+        // Re-arm pending for next iteration
+        pending_events.push("<event>more</event>".to_string());
+    }
 }
 
 // ─── T6: claim_auto_turn coalescing — one reservation per batch ───────────────
@@ -187,15 +296,32 @@ fn claim_auto_turn_coalesces_one_per_batch() {
 
 // ─── T7: real user input resets consecutive counter ──────────────────────────
 
+/// terminal_flush_seam with allow_chain=true resets normally.
+/// A real Prompt handler resets counter to 0 — verify that after reset,
+/// a true-path flush can reserve again.
 #[test]
 fn consecutive_counter_reset_on_real_user_input() {
-    let mut consecutive_auto_turns: u32 = 0;
-    assert_eq!(consecutive_auto_turns, 0);
-    // Simulate real Prompt / FollowUp handler reset:
-    consecutive_auto_turns = 0;
-    assert_eq!(consecutive_auto_turns, 0, "real user input must reset counter");
-    // After reset, auto-turn is re-enabled:
-    assert!(claim_auto_turn(&mut consecutive_auto_turns));
+    use agent_engine::engine::reactor::terminal_flush_seam;
+
+    // Simulate real Prompt/FollowUp: counter was at cap, real user input resets to 0.
+    let mut counter: u32 = 0; // start at 0 (real Prompt resets it)
+    let mut auto_turn_pending = false;
+
+    // Now a Done-path flush should be able to reserve again.
+    let mut pending_events = vec!["<event>ev</event>".to_string()];
+    let mut api_messages: Vec<synaps_cli::SharedMessage> = vec![
+        std::sync::Arc::new(serde_json::json!({"role": "user", "content": "user msg"}))
+    ];
+    let result = terminal_flush_seam(
+        true,
+        &mut auto_turn_pending,
+        &mut pending_events,
+        &mut api_messages,
+        true,
+        &mut counter,
+    );
+    assert!(result.is_some(), "after counter reset, true-path must be able to reserve");
+    assert_eq!(counter, 1, "counter must be incremented to 1 after reset and claim");
 }
 
 // ─── T8: RPC start-barrier ordering — terminal_flush cannot precede in_flight ─

@@ -151,16 +151,27 @@ fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
 /// `auto_turn_pending`, and flush any buffered `pending_events` into
 /// `api_messages` — all under **one** mutex acquisition.
 ///
-/// Returns `Some(auto_id)` when the caller should schedule an additional
-/// auto-turn immediately after releasing the lock. Conditions:
-///   * `events_auto_turn` is enabled
-///   * there were buffered events to inject (non-empty pending_events)
-///   * `consecutive_auto_turns < AUTO_TURN_CAP`
-///   * last message after injection is `role=user`
+/// # `allow_chain` flag
 ///
-/// The caller **must** call `spawn_prompt(auto_id, …)` without holding the
-/// lock, avoiding recursive task races.
-async fn terminal_flush(state: &Mutex<RpcState>) -> Option<String> {
+/// Controls whether a post-flush auto-turn may be reserved:
+///
+/// * **`true`** (Done path): if all conditions are met (`events_auto_turn` enabled,
+///   buffered events present, `consecutive_auto_turns < AUTO_TURN_CAP`, last
+///   message is `role=user`), atomically claim the cap slot, set
+///   `auto_turn_pending = true`, and return `Some(auto_id)`.  The caller
+///   **must** forward the id to the scheduler without holding the lock.
+///
+/// * **`false`** (error / cancel / silent-drop paths): atomically clear
+///   `in_flight` and `auto_turn_pending`, flush `pending_events` into
+///   `api_messages` (so buffered events are not lost from history), but
+///   **never** claim a cap slot or set `auto_turn_pending`.  Returns `None`.
+///   The cap counter (`consecutive_auto_turns`) is left unchanged.
+///
+/// This eliminates the critical bug where error/cancel/drop paths previously
+/// allowed `terminal_flush` to increment `consecutive_auto_turns` and set
+/// `auto_turn_pending = true` while returning `Some(auto_id)` that was then
+/// silently discarded — leaving the session permanently stuck in busy state.
+async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<String> {
     let mut st = state.lock().await;
     st.in_flight = None;
     st.auto_turn_pending = false;
@@ -172,8 +183,9 @@ async fn terminal_flush(state: &Mutex<RpcState>) -> Option<String> {
         ));
     }
 
-    // Decide whether to schedule a post-flush auto-turn.
-    if had_buffered
+    // Only attempt to reserve a post-flush auto-turn on the Done path.
+    if allow_chain
+        && had_buffered
         && st.events_auto_turn
         && st.consecutive_auto_turns < AUTO_TURN_CAP
         && st.api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
@@ -284,10 +296,9 @@ async fn spawn_prompt(
                 // ── Turn complete ───────────────────────────────────────────
                 StreamEvent::Session(SessionEvent::Done) => {
                     let _ = wtx.send(RpcEvent::AgentEnd { usage: usage_acc.clone() }).await;
-                    // terminal_flush: under ONE lock clear in_flight + auto_turn_pending,
-                    // flush pending_events → api_messages.
-                    // Returns Some(auto_id) if a post-flush auto-turn should be scheduled.
-                    let post_flush_id = terminal_flush(&state).await;
+                    // terminal_flush(allow_chain=true): Done path — eligible to
+                    // reserve a post-flush auto-turn if conditions are met.
+                    let post_flush_id = terminal_flush(&state, true).await;
                     let resp_command = if pid.starts_with("auto:") { "auto_turn" } else { "prompt" };
                     let _ = wtx
                         .send(RpcEvent::Response {
@@ -325,8 +336,8 @@ async fn spawn_prompt(
                                 body: serde_json::json!({ "ok": true, "cancelled": true }),
                             })
                             .await;
-                        // Cancel path: discard post-flush auto-turn.
-                        let _ = terminal_flush(&state).await;
+                        // Cancel path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+                        let _ = terminal_flush(&state, false).await;
                         return;
                     }
                     let _ = wtx
@@ -344,8 +355,8 @@ async fn spawn_prompt(
                             body: serde_json::json!({ "ok": false, "error": msg }),
                         })
                         .await;
-                    // Error path: discard post-flush auto-turn (don't chain on error).
-                    let _ = terminal_flush(&state).await;
+                    // Error path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+                    let _ = terminal_flush(&state, false).await;
                     return;
                 }
                 _ => {}
@@ -381,8 +392,8 @@ async fn spawn_prompt(
                 body,
             })
             .await;
-        // Silent-drop / abort path: discard post-flush auto-turn.
-        let _ = terminal_flush(&state).await;
+        // Silent-drop / abort path: terminal_flush(allow_chain=false) — never reserve auto-turn.
+        let _ = terminal_flush(&state, false).await;
     });
 
     // Register in_flight BEFORE releasing the start barrier.

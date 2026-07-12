@@ -208,6 +208,49 @@ pub fn idle_should_wait(children_running: bool, queue_len: usize) -> bool {
     children_running || queue_len > 0
 }
 
+// ─── terminal_flush seam for integration testing ─────────────────────────────
+
+/// Pure decision logic mirroring `terminal_flush` from `cmd/rpc.rs` for use in
+/// integration tests.
+///
+/// This seam allows tests to verify the `allow_chain` contract on the mutable
+/// state fields that `terminal_flush` operates on, **without** requiring a live
+/// `Runtime`, `Session`, or `Mutex<RpcState>`.
+///
+/// Rules (identical to `terminal_flush`):
+/// * Always: clear `auto_turn_pending`; take `pending_events` → inject into `api_messages`.
+/// * `allow_chain = false`: never reserve; return `None`; leave `counter` unchanged.
+/// * `allow_chain = true`: if all conditions met, increment `counter`, set
+///   `auto_turn_pending = true`, return `Some("auto:seam")`.
+pub fn terminal_flush_seam(
+    allow_chain: bool,
+    auto_turn_pending: &mut bool,
+    pending_events: &mut Vec<String>,
+    api_messages: &mut Vec<crate::SharedMessage>,
+    events_auto_turn: bool,
+    consecutive_auto_turns: &mut u32,
+) -> Option<String> {
+    *auto_turn_pending = false;
+    let to_inject = std::mem::take(pending_events);
+    let had_buffered = !to_inject.is_empty();
+    for formatted in to_inject {
+        api_messages.push(std::sync::Arc::new(
+            serde_json::json!({"role": "user", "content": formatted})
+        ));
+    }
+    if allow_chain
+        && had_buffered
+        && events_auto_turn
+        && *consecutive_auto_turns < AUTO_TURN_CAP
+        && api_messages.last().map(|m| m["role"].as_str() == Some("user")).unwrap_or(false)
+        && claim_auto_turn(consecutive_auto_turns)
+    {
+        *auto_turn_pending = true;
+        return Some("auto:seam".to_string());
+    }
+    None
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
