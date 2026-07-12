@@ -47,9 +47,11 @@ pub use codex::codex_static_catalog_models;
 pub use generic::parse_generic_catalog_models;
 pub use github_copilot::{
     copilot_model, copilot_static_catalog_models, models_request_headers,
-    parse_copilot_catalog_models, runtime_wire_protocol as github_copilot_runtime_model,
-    validate_models_endpoint, CopilotModelDescriptor, COPILOT_API_VERSION, COPILOT_FALLBACK_MODELS,
-    MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL,
+    parse_copilot_catalog_entries, parse_copilot_catalog_models,
+    preferred_wire_protocol_from_endpoints, runtime_wire_protocol as github_copilot_runtime_model,
+    selectable_copilot_entries, validate_models_endpoint, CopilotCatalogEntry, CopilotEndpoint,
+    CopilotModelDescriptor, CopilotPolicyState, CopilotWire, COPILOT_API_VERSION,
+    COPILOT_FALLBACK_MODELS, MAX_MODELS_BODY_BYTES, MODELS_BASE_URL, MODELS_PATH, MODELS_URL,
     PROVIDER_KEY as COPILOT_PROVIDER_KEY, PROVIDER_NAME as COPILOT_PROVIDER_NAME,
 };
 pub use google_gemini::{
