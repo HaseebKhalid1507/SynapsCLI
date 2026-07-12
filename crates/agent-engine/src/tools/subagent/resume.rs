@@ -134,7 +134,26 @@ impl Tool for SubagentResumeTool {
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
 
+        // ── Build and register handle BEFORE spawning ─────────────────────────
         let system_prompt_for_handle = system_prompt.clone();
+        let handle = SubagentHandle::new(
+            handle_id.clone(),
+            label.clone(),
+            task_preview,
+            model.clone(),
+            system_prompt_for_handle,
+            timeout_secs,
+            Arc::clone(&state),
+            Some(steer_tx),
+            Some(shutdown_tx),
+            Some(result_rx),
+        );
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(handle);
+        }
+
+        // ── Spawn subagent thread ──────────────────────────────────────────────
         let thread_handle = std::thread::spawn(move || {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
             let state_for_finalizer = Arc::clone(&state_t);
@@ -176,7 +195,7 @@ impl Tool for SubagentResumeTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config());
                     runtime.set_system_prompt(system_prompt);
                     runtime.set_model(model_a.clone());
-                    runtime.set_tools(crate::ToolRegistry::without_subagent());
+                    runtime.set_tools(super::subagent_tools().await);
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -339,7 +358,7 @@ impl Tool for SubagentResumeTool {
                     Ok(sa_result) => {
                         {
                             let mut s = state_t.write().unwrap();
-                            if matches!(s.status, SubagentStatus::Running) {
+                            if matches!(s.status, SubagentStatus::Running) && !s.cancel_requested {
                                 s.status = SubagentStatus::Completed;
                                 s.conversation_state = vec![
                                     serde_json::json!({"role": "user", "content": task_for_complete.clone()}),
@@ -400,22 +419,9 @@ impl Tool for SubagentResumeTool {
             );
         });
 
-        let handle = SubagentHandle::new(
-            handle_id.clone(),
-            label.clone(),
-            task_preview,
-            model,
-            system_prompt_for_handle,
-            timeout_secs,
-            state,
-            Some(steer_tx),
-            Some(shutdown_tx),
-            Some(result_rx),
-        );
-
+        // ── Wire thread handle into the already-registered entry ─────────────
         {
             let mut reg = registry.lock().unwrap();
-            reg.register(handle);
             if let Some(h) = reg.get_mut(&handle_id) {
                 h.set_thread_handle(thread_handle);
             }

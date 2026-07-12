@@ -57,6 +57,11 @@ pub use write::WriteTool;
 // Re-export util items used by sibling tool modules via `super::`
 pub(crate) use util::{expand_path, strip_ansi, NEXT_SUBAGENT_ID};
 
+// Facade: expose finalize internals for integration tests without making the
+// subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
+#[doc(hidden)]
+pub use subagent::finalize::{build_completion_event, finalize_subagent};
+
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 
 /// Streaming channels — carry partial tool output and stream events.

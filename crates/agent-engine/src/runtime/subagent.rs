@@ -26,6 +26,8 @@ pub struct SubagentResult {
 pub enum SubagentStatus {
     Running,
     Completed,
+    /// User-aborted via TUI cancel. Never publishes a wake event.
+    Cancelled,
     TimedOut,
     Failed(String),
 }
@@ -42,6 +44,9 @@ pub struct SubagentState {
     pub conversation_state: Vec<Value>,
     /// Stamped once by finalize_subagent at thread exit.
     pub finished_at: Option<std::time::Instant>,
+    /// Set by cancel() before the shutdown signal is sent.
+    /// Read by finalize_subagent to label the terminal status correctly.
+    pub cancel_requested: bool,
 }
 
 impl SubagentState {
@@ -52,6 +57,7 @@ impl SubagentState {
             tool_log: Vec::new(),
             conversation_state: Vec::new(),
             finished_at: None,
+            cancel_requested: false,
         }
     }
 }
@@ -172,6 +178,9 @@ impl SubagentHandle {
     }
 
     pub fn cancel(&mut self) {
+        // Flag FIRST so finalize_subagent can read it before the thread exits.
+        // Use poison-safe write in case the thread panicked holding the lock.
+        self.state.write().unwrap_or_else(|p| p.into_inner()).cancel_requested = true;
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -296,6 +305,7 @@ impl SubagentStatus {
         match self {
             SubagentStatus::Running => "running",
             SubagentStatus::Completed => "completed",
+            SubagentStatus::Cancelled => "cancelled",
             SubagentStatus::TimedOut => "timed_out",
             SubagentStatus::Failed(_) => "failed",
         }
@@ -515,13 +525,85 @@ mod tests {
         assert!(s.tool_log.is_empty());
         assert!(s.conversation_state.is_empty());
         assert!(s.finished_at.is_none());
+        assert!(!s.cancel_requested, "cancel_requested must default to false");
     }
 
     #[test]
     fn subagent_status_as_str() {
         assert_eq!(SubagentStatus::Running.as_str(), "running");
         assert_eq!(SubagentStatus::Completed.as_str(), "completed");
+        assert_eq!(SubagentStatus::Cancelled.as_str(), "cancelled");
         assert_eq!(SubagentStatus::TimedOut.as_str(), "timed_out");
         assert_eq!(SubagentStatus::Failed("oops".into()).as_str(), "failed");
+    }
+
+    // V1: cancel() sets cancel_requested on shared state before sending signal.
+    #[test]
+    fn cancel_sets_cancel_requested_flag() {
+        let mut h = make_handle("sa_cancel");
+        {
+            let s = h.state.read().unwrap();
+            assert!(!s.cancel_requested, "cancel_requested must start false");
+        }
+        h.cancel();
+        {
+            let s = h.state.read().unwrap();
+            assert!(s.cancel_requested, "cancel_requested must be true after cancel()");
+        }
+        // Second call is a no-op (shutdown_tx already taken)
+        h.cancel();
+    }
+
+    // V2: cancelled status counts as finished, is_finished() returns true.
+    #[test]
+    fn cancelled_status_is_finished() {
+        let h = make_handle("sa_c1");
+        {
+            let mut s = h.state.write().unwrap();
+            s.status = SubagentStatus::Cancelled;
+        }
+        assert!(h.is_finished(), "Cancelled must count as finished");
+    }
+}
+
+// Separate module so finalize_subagent is accessible via its pub(crate) path.
+#[cfg(test)]
+mod cancelled_wake_tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    // V3: finalize_subagent with cancel_requested=true → status Cancelled,
+    // no event published, finished_at stamped.
+    // Test name matches spec: cancelled_suppresses_wake.
+    #[test]
+    fn cancelled_suppresses_wake() {
+        use crate::events::EventQueue;
+        use crate::tools::finalize_subagent;
+
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        {
+            let mut s = state.write().unwrap();
+            s.status = SubagentStatus::Completed; // thread set Completed before cancel flag noticed
+            s.cancel_requested = true;            // cancel() was called
+        }
+        let queue = Arc::new(EventQueue::new(100));
+
+        finalize_subagent(
+            &state,
+            Some(&queue),
+            "sa_v3", 42, "test-agent",
+            std::time::Instant::now(),
+            None,
+        );
+
+        // Queue must be empty — no wake event for cancelled subagents.
+        assert!(queue.is_empty(), "cancelled subagent must not publish a wake event");
+
+        // Status must have been re-labelled to Cancelled.
+        let s = state.read().unwrap();
+        assert_eq!(s.status, SubagentStatus::Cancelled, "status must be Cancelled when cancel_requested");
+
+        // finished_at must be stamped.
+        assert!(s.finished_at.is_some(), "finished_at must be stamped by finalizer");
     }
 }

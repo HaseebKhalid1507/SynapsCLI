@@ -43,6 +43,24 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime.set_cache_ttl(crate::core::config::CacheTtl::FiveMinutes);
 }
 
+/// Build the subagent tool registry: extension tools if the routing manager
+/// has a shared registry, otherwise the bare without_subagent set.
+///
+/// Single source of truth for both start.rs and resume.rs — divergence is
+/// structurally impossible when both call this.
+///
+/// Mirrors start.rs:174-185 exactly.
+pub(crate) async fn subagent_tools() -> crate::ToolRegistry {
+    if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
+        let mgr = ext_mgr.read().await;
+        if let Some(shared) = mgr.tools_shared() {
+            let extension_tools = shared.read().await;
+            return crate::ToolRegistry::without_subagent_with_extensions(&extension_tools);
+        }
+    }
+    crate::ToolRegistry::without_subagent()
+}
+
 #[cfg(test)]
 mod cache_ttl_policy_tests {
     use super::apply_subagent_runtime_policy;

@@ -2,8 +2,8 @@
 //!
 //! These tests exercise the finalizer + registry + EventQueue end-to-end
 //! **without a live model**. Each test spawns real OS threads that write
-//! terminal state and push a `subagent_completion` event, exactly mirroring
-//! what `finalize_subagent` does inside start.rs / resume.rs.
+//! terminal state and push a `subagent_completion` event, exercising the REAL
+//! `finalize_subagent` from finalize.rs (no mock replica).
 //!
 //! KEY TEST: I1 `parent_wakes_after_turn_end_multi_subagent` — encodes the
 //! live failure where `cleanup_finished()` at turn-end reaped handles before
@@ -13,13 +13,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use agent_engine::events::{Event, EventContent, EventQueue, EventSource, Severity};
+use agent_engine::events::EventQueue;
 use agent_engine::runtime::subagent::{
     SubagentHandle, SubagentRegistry, SubagentState, SubagentStatus,
 };
-use chrono::Utc;
-use serde_json::json;
-use uuid::Uuid;
+use agent_engine::tools::finalize_subagent;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -37,80 +35,6 @@ fn make_handle(id: &str, state: Arc<RwLock<SubagentState>>) -> SubagentHandle {
         None, // no shutdown_tx
         None, // no result_rx
     )
-}
-
-/// Simulate what finalize_subagent does: stamp finished_at, push completion event.
-/// This is the observable contract — tests validate this end-to-end behaviour
-/// without needing access to the pub(crate) finalize_subagent function.
-fn mock_finalize(
-    state: &Arc<RwLock<SubagentState>>,
-    queue: &Arc<EventQueue>,
-    handle_id: &str,
-    subagent_id: u64,
-    agent_name: &str,
-    started_at: Instant,
-    resumed_from: Option<&str>,
-) {
-    let (status_str, preview) = {
-        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
-        if matches!(s.status, SubagentStatus::Running) {
-            s.status = SubagentStatus::Failed("thread exited without terminal status".into());
-        }
-        if s.finished_at.is_none() {
-            s.finished_at = Some(Instant::now());
-        }
-        let st = match &s.status {
-            SubagentStatus::Completed => "completed",
-            SubagentStatus::TimedOut => "timed_out",
-            SubagentStatus::Failed(_) => "failed",
-            SubagentStatus::Running => "failed", // coerced above
-        };
-        let preview: String = s.partial_text.chars().take(300).collect();
-        (st, preview)
-    };
-
-    let duration = started_at.elapsed().as_secs_f64();
-    let text = format!(
-        "Subagent '{agent_name}' ({handle_id}) finished with status '{status_str}' \
-         after {duration:.1}s. \
-         Call subagent_collect with handle_id \"{handle_id}\" to retrieve the full result. \
-         Preview: {preview}"
-    );
-
-    let mut data = json!({
-        "handle_id":     handle_id,
-        "subagent_id":   subagent_id,
-        "agent_name":    agent_name,
-        "status":        status_str,
-        "duration_secs": (duration * 10.0).round() / 10.0,
-    });
-    if let Some(rf) = resumed_from {
-        data["resumed_from"] = json!(rf);
-    }
-
-    let ev = Event {
-        id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
-        source: EventSource {
-            source_type: "subagent".to_string(),
-            name: agent_name.to_string(),
-            callback: None,
-        },
-        channel: None,
-        sender: None,
-        content: EventContent {
-            text,
-            content_type: "subagent_completion".to_string(),
-            severity: Some(Severity::High),
-            data: Some(data),
-        },
-        expects_response: false,
-        reply_to: None,
-    };
-
-    if queue.push(ev.clone()).is_err() {
-        queue.push_priority(ev);
-    }
 }
 
 // ── I1: parent_wakes_after_turn_end_multi_subagent ───────────────────────────
@@ -150,7 +74,7 @@ fn parent_wakes_after_turn_end_multi_subagent() {
             state_c.write().unwrap().status = SubagentStatus::Completed;
             state_c.write().unwrap().partial_text = format!("result from {id}");
             let started = Instant::now() - Duration::from_millis(delay_ms);
-            mock_finalize(&state_c, &queue_c, &id, subagent_id, "mock-agent", started, None);
+            finalize_subagent(&state_c, Some(&queue_c), &id, subagent_id, "mock-agent", started, None);
         });
 
         // Register the thread handle so cleanup_finished can join it
@@ -241,9 +165,9 @@ fn panic_publishes_failed_completion() {
                 SubagentStatus::Failed(format!("panic: {}", msg));
         }
 
-        mock_finalize(
+        finalize_subagent(
             &state_for_finalizer,
-            &queue_c,
+            Some(&queue_c),
             "sa_panic",
             99,
             "panic-agent",
@@ -276,7 +200,7 @@ fn timeout_publishes_timed_out_completion() {
     let jh = std::thread::spawn(move || {
         // Simulate timeout: thread sets TimedOut then exits
         state_c.write().unwrap().status = SubagentStatus::TimedOut;
-        mock_finalize(&state_c, &queue_c, "sa_timeout", 50, "timeout-agent", Instant::now(), None);
+        finalize_subagent(&state_c, Some(&queue_c), "sa_timeout", 50, "timeout-agent", Instant::now(), None);
     });
     jh.join().unwrap();
 
@@ -298,7 +222,7 @@ fn exactly_once_per_subagent() {
         let jh = std::thread::spawn(move || {
             let state = Arc::new(RwLock::new(SubagentState::new()));
             state.write().unwrap().status = SubagentStatus::Completed;
-            mock_finalize(&state, &queue_c, &handle_id, i, "once-agent", Instant::now(), None);
+            finalize_subagent(&state, Some(&queue_c), &handle_id, i, "once-agent", Instant::now(), None);
         });
         join_handles.push(jh);
     }
@@ -356,7 +280,7 @@ fn reaper_race_finish_during_done_handling() {
         // Now complete (races with cleanup_finished in main)
         state_c.write().unwrap().status = SubagentStatus::Completed;
         state_c.write().unwrap().partial_text = "race result".to_string();
-        mock_finalize(&state_c, &queue_c, "sa_race", 200, "race-agent", Instant::now(), None);
+        finalize_subagent(&state_c, Some(&queue_c), "sa_race", 200, "race-agent", Instant::now(), None);
     });
 
     // Main: run cleanup_finished first (thread still Running at this point)
@@ -420,7 +344,7 @@ fn steer_then_complete_still_publishes() {
         // Then complete normally
         state_c.write().unwrap().status = SubagentStatus::Completed;
         state_c.write().unwrap().partial_text = "steered then completed".to_string();
-        mock_finalize(&state_c, &queue_c, "sa_steer", 300, "steer-agent", Instant::now(), None);
+        finalize_subagent(&state_c, Some(&queue_c), "sa_steer", 300, "steer-agent", Instant::now(), None);
     });
 
     // Send a steer message
@@ -446,14 +370,94 @@ fn steer_then_complete_still_publishes() {
 #[test]
 #[ignore = "requires live API credentials and network access"]
 fn live_reactive_subagent_end_to_end() {
-    // This test validates the full end-to-end path with a real model:
-    //   1. SubagentStartTool::execute with event_queue wired in ToolCapabilities
-    //   2. Simulate end-of-parent-turn: cleanup_finished()
-    //   3. await queue.notified() — parent wakes
-    //   4. SubagentCollectTool::execute succeeds
-    //
-    // Implementation deferred: requires ToolCapabilities::event_queue to be
-    // set (currently None in test_helpers.rs) and a valid API key in env.
-    // See IMPLEMENTATION-PLAN.md §5 L1 for full spec.
-    todo!("L1: wire ToolCapabilities::event_queue in test_helpers.rs, then implement")
+    use agent_engine::tools::{SubagentCollectTool, SubagentStartTool, SubagentRegistry, Tool};
+    use agent_engine::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
+    use std::sync::{Arc, Mutex};
+    use serde_json::json;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async move {
+        let queue = Arc::new(EventQueue::new(1000));
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+
+        let ctx = ToolContext {
+            channels: ToolChannels {
+                tx_delta: None,
+                tx_events: None,
+            },
+            capabilities: ToolCapabilities {
+                watcher_exit_path: None,
+                tool_register_tx: None,
+                session_manager: None,
+                subagent_registry: Some(Arc::clone(&registry)),
+                event_queue: Some(Arc::clone(&queue)),
+                secret_prompt: None,
+            },
+            limits: ToolLimits {
+                max_tool_output: 30000,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: 30,
+                bash_max_timeout: 300,
+                subagent_timeout: 120,
+            },
+        };
+
+        let result = SubagentStartTool.execute(json!({
+            "system_prompt": "You are a test subagent. Reply with exactly: done",
+            "task": "Say done",
+            "timeout": 120
+        }), ctx).await.expect("subagent_start must succeed with live credentials");
+
+        let body: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let handle_id = body["handle_id"].as_str().unwrap().to_string();
+        assert!(handle_id.starts_with("sa_"), "handle_id must be sa_N: {handle_id}");
+
+        // Simulate end-of-parent-turn cleanup — must retain uncollected handle.
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.cleanup_finished();
+        }
+
+        // Wait for the completion event (up to 120s).
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if !queue.is_empty() { break; }
+            assert!(Instant::now() < deadline, "timed out waiting for completion event");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Pop and validate the event.
+        let ev = queue.pop().expect("completion event must be present");
+        assert_eq!(ev.content.content_type, "subagent_completion");
+        let data = ev.content.data.as_ref().unwrap();
+        assert_eq!(data["handle_id"].as_str().unwrap(), handle_id,
+            "event handle_id must match the spawned subagent");
+
+        // subagent_collect must succeed.
+        let collect_ctx = ToolContext {
+            channels: ToolChannels { tx_delta: None, tx_events: None },
+            capabilities: ToolCapabilities {
+                watcher_exit_path: None,
+                tool_register_tx: None,
+                session_manager: None,
+                subagent_registry: Some(Arc::clone(&registry)),
+                event_queue: Some(Arc::clone(&queue)),
+                secret_prompt: None,
+            },
+            limits: ToolLimits {
+                max_tool_output: 30000,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: 30,
+                bash_max_timeout: 300,
+                subagent_timeout: 120,
+            },
+        };
+
+        let collect_result = SubagentCollectTool.execute(json!({ "handle_id": handle_id }), collect_ctx).await;
+        assert!(collect_result.is_ok(), "subagent_collect must succeed: {collect_result:?}");
+    });
 }

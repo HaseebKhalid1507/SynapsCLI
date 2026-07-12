@@ -18,7 +18,8 @@ fn wake_disabled() -> bool {
 
 /// Build the completion event. Pure — unit-testable without threads.
 /// `resumed_from`: set by resume.rs only (the prior handle_id this run continues from).
-pub(crate) fn build_completion_event(
+#[doc(hidden)]
+pub fn build_completion_event(
     handle_id: &str,
     subagent_id: u64,
     agent_name: &str,
@@ -77,7 +78,8 @@ pub(crate) fn build_completion_event(
 /// never-drop guarantee (push → push_priority fallback).
 ///
 /// `resumed_from`: `Some(prior_handle_id)` when called from resume.rs, `None` from start.rs.
-pub(crate) fn finalize_subagent(
+#[doc(hidden)]
+pub fn finalize_subagent(
     state: &Arc<RwLock<SubagentState>>,
     parent_queue: Option<&Arc<EventQueue>>,
     handle_id: &str,
@@ -86,23 +88,31 @@ pub(crate) fn finalize_subagent(
     started_at: std::time::Instant,
     resumed_from: Option<&str>,
 ) {
-    let (status, preview) = {
+    let (status, preview, cancelled) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
         // recover the inner value rather than re-panicking outside catch_unwind.
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
 
-        // Defensive: a thread exiting while still "Running" is itself a bug
-        // (e.g. tokio-runtime build failure path exits early) — coerce to Failed
-        // so the parent is never told a lie.
-        if matches!(s.status, SubagentStatus::Running) {
+        if s.cancel_requested {
+            // Honest label: user abort ≠ error, ≠ completion.
+            s.status = SubagentStatus::Cancelled;
+        } else if matches!(s.status, SubagentStatus::Running) {
+            // Defensive: a thread exiting while still "Running" is itself a bug
+            // (e.g. tokio-runtime build failure path exits early) — coerce to Failed
+            // so the parent is never told a lie.
             s.status = SubagentStatus::Failed("thread exited without terminal status".into());
         }
         if s.finished_at.is_none() {
             s.finished_at = Some(std::time::Instant::now());
         }
         let preview: String = s.partial_text.chars().take(300).collect();
-        (s.status.clone(), preview)
+        (s.status.clone(), preview, s.cancel_requested)
     };
+
+    if cancelled {
+        tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");
+        return;
+    }
 
     if wake_disabled() {
         return;
