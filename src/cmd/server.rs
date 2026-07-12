@@ -14,6 +14,7 @@ use synaps_cli::engine::commands::{self as engine_commands, CommandResult};
 use synaps_cli::engine::session::ConversationState;
 use synaps_cli::engine::setup::{self, BackgroundTasks, EngineOpts};
 use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
+use synaps_cli::engine::reactor::{drain_event_queue, event_payload_from_drained, wake_action, WakeAction};
 use synaps_cli::protocol::{ClientMessage, HistoryEntry, ServerMessage};
 use synaps_cli::{truncate_str, CancellationToken, Runtime};
 use axum::extract::Query;
@@ -49,6 +50,19 @@ struct ServerState {
     max_message_size: Option<usize>,
     /// Auto-approve confirm hooks (headless/agent mode).
     auto_approve_confirms: bool,
+    /// When true, the server will trigger a new model turn when runtime events
+    /// arrive while idle. Default false — clients must send a follow-up.
+    /// Controlled by `events.auto_turn` config key.
+    ///
+    /// POLICY: broadcasts ALWAYS happen. The auto-turn is gated on this flag.
+    /// Do not enable in production without rate-limiting — busy event sources
+    /// can drain the API budget rapidly.
+    events_auto_turn: bool,
+    /// Internal channel: event drainer sends a trigger message when auto_turn
+    /// is enabled and conditions are met. A dedicated listener task calls
+    /// `handle_user_message` with the injected content. This avoids touching
+    /// the streaming guard from the drainer task.
+    auto_turn_tx: tokio::sync::mpsc::Sender<String>,
 }
 
 /// RAII guard that clears the streaming flag on drop.
@@ -247,6 +261,10 @@ pub async fn run(
         }
     };
 
+    let (auto_turn_tx, auto_turn_rx) = tokio::sync::mpsc::channel::<String>(32);
+
+    let events_auto_turn = config.events.auto_turn;
+
     let state = Arc::new(ServerState {
         runtime: Mutex::new(runtime),
         conv: RwLock::new(conv),
@@ -260,7 +278,91 @@ pub async fn run(
         allowed_origins,
         max_message_size,
         auto_approve_confirms,
+        events_auto_turn,
+        auto_turn_tx,
     });
+
+    // ── Event drainer task (exactly one per Runtime) ──────────────────────
+    //
+    // Policy (per RECON §Server):
+    //   * Broadcast ServerMessage::Event to ALL connected clients ALWAYS.
+    //   * Auto-turn is behind `events.auto_turn` (default false).
+    //   * Do NOT touch the `streaming` guard from this task — use the
+    //     auto_turn_tx channel to hand off to the listener task below.
+    //   * conv.pending_events tracks buffered strings while streaming; they
+    //     are flushed by the turn loop's AutoTriggerEvents path.
+    {
+        let state_d = Arc::clone(&state);
+        tokio::spawn(async move {
+            let eq = {
+                let rt = state_d.runtime.lock().await;
+                rt.event_queue().clone()
+            };
+            loop {
+                eq.notified().await;
+
+                // Drain + mutate conv fields — brief lock, released before sends.
+                let (frames, action) = {
+                    let mut conv = state_d.conv.write().await;
+                    let busy = state_d.streaming.load(std::sync::atomic::Ordering::Acquire);
+                    // Reborrow through &mut *conv so NLL field-split borrow analysis
+                    // can see two disjoint fields (api_messages, pending_events).
+                    // Without this, the compiler sees two &mut borrows through the
+                    // same RwLockWriteGuard<T> DerefMut coercion and rejects with E0499.
+                    let conv_ref: &mut ConversationState = &mut *conv;
+                    let drained = drain_event_queue(
+                        &eq,
+                        &mut conv_ref.api_messages,
+                        &mut conv_ref.pending_events,
+                        busy,
+                        None,
+                    );
+                    let action = wake_action(
+                        &drained,
+                        &conv_ref.api_messages,
+                        busy,
+                        state_d.events_auto_turn,
+                        0, // consecutive_auto_turns: server doesn't track this yet
+                    );
+                    let frames: Vec<ServerMessage> = drained
+                        .iter()
+                        .map(|d| ServerMessage::Event {
+                            payload: event_payload_from_drained(d),
+                        })
+                        .collect();
+                    (frames, action)
+                }; // conv write-lock released
+
+                // Broadcast Event frames to all connected clients.
+                for frame in frames {
+                    let _ = state_d.broadcast_tx.send(frame);
+                }
+
+                // If auto_turn enabled + conditions met, signal the listener.
+                if action == WakeAction::RunTurn {
+                    let trigger = "[event-reactor auto-turn]".to_string();
+                    let _ = state_d.auto_turn_tx.send(trigger).await;
+                }
+            }
+        });
+    }
+
+    // ── Auto-turn listener task ───────────────────────────────────────────
+    //
+    // Reads from `auto_turn_rx`. For each trigger, calls `handle_user_message`
+    // with the injected content (already in conv.api_messages from the drainer).
+    // This avoids racing the `streaming` guard because `handle_user_message`
+    // performs its own atomic check-then-set.
+    {
+        let state_l = Arc::clone(&state);
+        let mut auto_turn_rx = auto_turn_rx;
+        tokio::spawn(async move {
+            while let Some(trigger) = auto_turn_rx.recv().await {
+                tracing::debug!("server: event auto-turn triggered: {trigger}");
+                handle_user_message(trigger, &state_l).await;
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
