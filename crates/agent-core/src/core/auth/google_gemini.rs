@@ -19,9 +19,13 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::sync::oneshot;
 use url::Url;
 
-use super::{now_millis, OAuthCredentials};
+use super::{
+    generate_code_challenge, generate_code_verifier, generate_state, now_millis,
+    save_provider_auth, start_callback_server_at, CallbackOutcome, OAuthCredentials,
+};
 
 // ── Pinned endpoints ─────────────────────────────────────────────────────────
 
@@ -79,13 +83,138 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum response body bytes we will accept from Google OAuth endpoints.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
-// ── Login / refresh stubs — implemented in later slices ──────────────────────
+// ── Login / refresh — production entrypoints ─────────────────────────────────
 
+/// Interactive login against the production Google OAuth endpoints.
 pub async fn login() -> Result<OAuthCredentials, String> {
-    Err("google-gemini interactive login is not yet implemented".to_string())
+    login_with(
+        CALLBACK_PORT,
+        TOKEN_URL,
+        /* allow_http_token_endpoint = */ false,
+        |auth_url| {
+            eprintln!(
+                "\n\x1b[1mOpening browser for Google Gemini (Code Assist) sign-in...\x1b[0m\n"
+            );
+            if let Err(e) = super::open_browser(auth_url) {
+                eprintln!("Could not open browser automatically: {e}");
+            }
+            eprintln!("\x1b[2mIf the browser didn't open, visit:\x1b[0m");
+            eprintln!("\x1b[36m{auth_url}\x1b[0m\n");
+            Ok(())
+        },
+    )
+    .await
 }
 
+/// Interactive login with injectable seams — pinned to production URLs by
+/// default; a test harness may override the token endpoint (and set
+/// `allow_http_token_endpoint = true`) to talk to a loopback OAuth fake.
+///
+/// The `browser` closure is invoked with the full authorization URL. In
+/// production it opens the user's browser; in tests it drives the loopback
+/// callback directly. Returning `Err` cancels the flow immediately.
+pub async fn login_with<F>(
+    port: u16,
+    token_endpoint: &str,
+    allow_http_token_endpoint: bool,
+    browser: F,
+) -> Result<OAuthCredentials, String>
+where
+    F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+{
+    // Endpoint policy: production callers pass TOKEN_URL and must satisfy the
+    // Google-host allowlist. Tests set `allow_http_token_endpoint` to permit a
+    // loopback http endpoint; that path is never reachable through login().
+    if allow_http_token_endpoint {
+        let url = Url::parse(token_endpoint)
+            .map_err(|_| GeminiAuthError::UntrustedEndpoint.into_secret_safe())?;
+        let host = url.host_str().unwrap_or("");
+        if !(url.scheme() == "http" && (host == "127.0.0.1" || host == "localhost")) {
+            return Err(GeminiAuthError::UntrustedEndpoint.into_secret_safe());
+        }
+    } else {
+        validate_google_https_endpoint(token_endpoint)
+            .map_err(GeminiAuthError::into_secret_safe)?;
+    }
+
+    let verifier = generate_code_verifier();
+    let challenge = generate_code_challenge(&verifier);
+    let state = generate_state();
+
+    let (rx, handle) = start_callback_server_at(state.clone(), CALLBACK_HOST, port, CALLBACK_PATH)
+        .await
+        .map_err(|e| format!("google-gemini: callback server failed: {e}"))?;
+
+    let auth_url = build_authorize_url(&challenge, &state, port);
+    if let Err(e) = browser(&auth_url) {
+        handle.shutdown().await;
+        return Err(format!("google-gemini: browser step failed: {e}"));
+    }
+
+    let outcome = wait_for_callback(rx, &state).await;
+    handle.shutdown().await;
+    let callback = match outcome? {
+        CallbackOutcome::Authorized(c) => c,
+        CallbackOutcome::Denied { error, description: _ } => {
+            // Never surface `description` — it's attacker-controlled content.
+            return Err(format!("google-gemini: OAuth denied ({error})"));
+        }
+        CallbackOutcome::Invalid => {
+            return Err("google-gemini: invalid OAuth callback state".into());
+        }
+    };
+
+    // Defensive: the callback server itself enforces state equality, but a
+    // regression there must still be caught here (mirrors the Anthropic and
+    // xAI patterns).
+    if callback.state != state {
+        return Err("google-gemini: OAuth state mismatch — possible CSRF".into());
+    }
+
+    let redirect = redirect_uri(port);
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", callback.code.as_str()),
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("code_verifier", verifier.as_str()),
+        ("redirect_uri", redirect.as_str()),
+    ];
+    let creds = token_post(
+        &Client::new(),
+        token_endpoint,
+        allow_http_token_endpoint,
+        &form,
+        None,
+        /* require_refresh = */ true,
+    )
+    .await?;
+
+    save_provider_auth(PROVIDER, &creds)
+        .map_err(|e| format!("google-gemini: failed to persist credentials: {e}"))?;
+    Ok(creds)
+}
+
+async fn wait_for_callback(
+    rx: oneshot::Receiver<CallbackOutcome>,
+    _expected_state: &str,
+) -> Result<CallbackOutcome, String> {
+    rx.await.map_err(|_| "google-gemini: callback channel closed".into())
+}
+
+/// Refresh grant against the production Google token endpoint.
 pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
+    refresh_with_endpoint(client, TOKEN_URL, /* allow_http = */ false, refresh).await
+}
+
+/// Refresh grant with an overridable token endpoint. Public for zero-network
+/// harness use only — production callers must go through `refresh_token`.
+pub async fn refresh_with_endpoint(
+    client: &Client,
+    token_endpoint: &str,
+    allow_http_token_endpoint: bool,
+    refresh: &str,
+) -> Result<OAuthCredentials, String> {
     if refresh.trim().is_empty() {
         return Err(GeminiAuthError::EmptyRefreshToken.into_secret_safe());
     }
@@ -95,7 +224,15 @@ pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCreden
         ("refresh_token", refresh),
         ("grant_type", "refresh_token"),
     ];
-    token_post(client, &form, Some(refresh), false).await
+    token_post(
+        client,
+        token_endpoint,
+        allow_http_token_endpoint,
+        &form,
+        Some(refresh),
+        /* require_refresh = */ false,
+    )
+    .await
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -215,7 +352,7 @@ struct TokenResponse {
     token_type: Option<String>,
 }
 
-pub(crate) fn credentials_from_token_response(
+pub fn credentials_from_token_response(
     body: &str,
     previous_refresh: Option<&str>,
     require_refresh: bool,
@@ -252,11 +389,23 @@ pub(crate) fn credentials_from_token_response(
 
 async fn token_post(
     _client: &Client,
+    token_endpoint: &str,
+    allow_http_token_endpoint: bool,
     form: &[(&str, &str)],
     previous_refresh: Option<&str>,
     require_refresh: bool,
 ) -> Result<OAuthCredentials, String> {
-    validate_google_https_endpoint(TOKEN_URL).map_err(GeminiAuthError::into_secret_safe)?;
+    if allow_http_token_endpoint {
+        let url = Url::parse(token_endpoint)
+            .map_err(|_| GeminiAuthError::UntrustedEndpoint.into_secret_safe())?;
+        let host = url.host_str().unwrap_or("");
+        if !(url.scheme() == "http" && (host == "127.0.0.1" || host == "localhost")) {
+            return Err(GeminiAuthError::UntrustedEndpoint.into_secret_safe());
+        }
+    } else {
+        validate_google_https_endpoint(token_endpoint)
+            .map_err(GeminiAuthError::into_secret_safe)?;
+    }
     // OAuth secrets (refresh tokens, code_verifier, client_secret) must never
     // be replayed to a redirect target. Use a dedicated no-redirect client.
     let no_redirect_client = Client::builder()
@@ -266,7 +415,7 @@ async fn token_post(
         .build()
         .map_err(|_| GeminiAuthError::Transport.into_secret_safe())?;
     let response = no_redirect_client
-        .post(TOKEN_URL)
+        .post(token_endpoint)
         .form(form)
         .send()
         .await
@@ -328,13 +477,6 @@ mod tests {
     #[test]
     fn provider_id_matches_typed_registry_key() {
         assert_eq!(PROVIDER, super::super::provider::OAuthProviderId::GoogleGemini.as_str());
-    }
-
-    #[tokio::test]
-    async fn login_stub_still_returns_secret_free_error_until_slice_3() {
-        let err = login().await.unwrap_err();
-        assert!(!err.is_empty());
-        assert!(!err.contains(CLIENT_SECRET));
     }
 
     #[tokio::test]
