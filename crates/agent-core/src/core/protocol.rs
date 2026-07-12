@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
+use crate::core::rpc_protocol::EventPayload;
 
 /// Messages sent from client → server
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +84,16 @@ pub enum ServerMessage {
     /// Streaming complete for this turn
     #[serde(rename = "done")]
     Done,
+
+    /// A runtime event broadcast to all connected clients.
+    /// **Additive** — old clients that don't recognise `"event"` will ignore it.
+    /// Whether to trigger a follow-up model turn is controlled by the server's
+    /// `events.auto_turn` config flag (default `false`).
+    #[serde(rename = "event")]
+    Event {
+        /// Canonical structured payload from the runtime event queue.
+        payload: EventPayload,
+    },
 
     /// Out-of-band advisory notice (e.g. cache-TTL downgrade warning).
     /// Additive variant — old clients ignore unknown message types.

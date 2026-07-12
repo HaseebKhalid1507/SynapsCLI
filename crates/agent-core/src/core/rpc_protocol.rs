@@ -72,6 +72,31 @@ pub struct RpcAttachment {
     pub mime: Option<String>,
 }
 
+/// Canonical runtime event payload — shared by `RpcEvent::Event` (RPC wire
+/// format) and `ServerMessage::Event` (WebSocket wire format) so both modes
+/// emit identical structured data from a single source of truth.
+///
+/// All string fields are UTF-8; `formatted` is the full XML-tagged payload
+/// already safe for injection into the agent context (prompt-injection
+/// stripped by `format_event_for_agent`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventPayload {
+    /// UUID of the originating event.
+    pub id: String,
+    /// Source type string (e.g. `"discord"`, `"uptime-kuma"`, `"cli"`).
+    pub source: String,
+    /// Severity label: `"low"` | `"medium"` | `"high"` | `"critical"`.
+    pub severity: String,
+    /// Content type label (e.g. `"message"`, `"alert"`, `"subagent_completion"`).
+    pub content_type: String,
+    /// Raw event text (before XML wrapping).
+    pub text: String,
+    /// ISO-8601 UTC timestamp string.
+    pub timestamp: String,
+    /// Full `format_event_for_agent` output — XML-wrapped, injection-safe.
+    pub formatted: String,
+}
+
 /// Token-usage summary for a completed agent turn.
 ///
 /// Mirrors the shape of `runtime::types::SessionEvent::Usage` so that
@@ -223,6 +248,17 @@ pub enum RpcCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum RpcEvent {
+    /// A runtime event forwarded to the parent without triggering a new model
+    /// turn.  The parent may inject this into the next authorised
+    /// [`RpcCommand::FollowUp`] / [`RpcCommand::Prompt`].  This variant is
+    /// **additive** — old protocol consumers that don't recognise `"event"`
+    /// will deserialise it as an unknown type and can ignore it safely.
+    #[serde(rename = "event")]
+    Event {
+        /// Canonical structured payload from the runtime event queue.
+        payload: EventPayload,
+    },
+
     /// A streaming update from the assistant (text delta, thinking, tool
     /// call lifecycle, …).  One or more of these frames precede each
     /// [`RpcEvent::AgentEnd`].

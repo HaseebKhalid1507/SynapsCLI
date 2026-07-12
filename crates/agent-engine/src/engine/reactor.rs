@@ -3,11 +3,17 @@
 //! `drain_event_queue` pops every pending event from the queue in priority
 //! order, formats it, and classifies it as Steered / Buffered / Injected.
 //! `wake_action` decides what the caller should do next.
+//!
+//! `event_payload_from_drained` builds the canonical wire-format payload
+//! (shared by RPC and server) from a `DrainedEvent`.
 
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::events::{EventQueue, format_event_for_agent};
 use crate::SharedMessage;
+
+// Re-export the shared wire payload so callers can use `engine::reactor::EventPayload`.
+pub use agent_core::core::rpc_protocol::EventPayload;
 
 /// Hard cap: how many consecutive auto-triggered model turns can fire before
 /// the engine parks and waits for real user input.
@@ -127,6 +133,34 @@ pub fn wake_action(
     }
 
     WakeAction::Forward
+}
+
+// ── Wire-payload constructor ──────────────────────────────────────────────────
+
+/// Build the canonical `EventPayload` from a `DrainedEvent`.
+///
+/// This is the **single canonical constructor** shared by RPC and server
+/// modes — both produce identical structured payloads from the same source.
+/// The `formatted` field carries the full XML-tagged, injection-safe string
+/// produced by `format_event_for_agent`.
+pub fn event_payload_from_drained(drained: &DrainedEvent) -> EventPayload {
+    let ev = &drained.event;
+    let severity = ev
+        .content
+        .severity
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("medium")
+        .to_string();
+    EventPayload {
+        id: ev.id.clone(),
+        source: ev.source.source_type.clone(),
+        severity,
+        content_type: ev.content.content_type.clone(),
+        text: ev.content.text.clone(),
+        timestamp: ev.timestamp.to_rfc3339(),
+        formatted: drained.formatted.clone(),
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
