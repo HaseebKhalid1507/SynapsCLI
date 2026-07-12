@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -14,7 +14,10 @@ pub(crate) enum HelpFindAction {
     Close,
 }
 
-pub(crate) fn handle_event(state: &mut synaps_cli::help::HelpFindState, key: KeyEvent) -> HelpFindAction {
+pub(crate) fn handle_event(
+    state: &mut synaps_cli::help::HelpFindState,
+    key: KeyEvent,
+) -> HelpFindAction {
     if state.detail_entry().is_some() {
         match key.code {
             KeyCode::Esc => {
@@ -56,8 +59,12 @@ pub(crate) fn handle_event(state: &mut synaps_cli::help::HelpFindState, key: Key
 }
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help::HelpFindState) {
-    let width = ((area.width as u32 * 8 / 10) as u16).max(50).min(area.width);
-    let height = ((area.height as u32 * 8 / 10) as u16).max(14).min(area.height);
+    let width = ((area.width as u32 * 8 / 10) as u16)
+        .max(50)
+        .min(area.width);
+    let height = ((area.height as u32 * 8 / 10) as u16)
+        .max(14)
+        .min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let modal = Rect::new(x, y, width, height);
@@ -85,7 +92,10 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
 
     let search = Paragraph::new(Line::from(vec![
         Span::styled("Search: ", Style::default().fg(THEME.load().muted)),
-        Span::styled(state.filter().to_string(), Style::default().fg(THEME.load().input_fg)),
+        Span::styled(
+            state.filter().to_string(),
+            Style::default().fg(THEME.load().input_fg),
+        ),
     ]));
     frame.render_widget(search, search_bar);
 
@@ -97,7 +107,12 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
         state
             .no_results_message()
             .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(THEME.load().muted))))
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(THEME.load().muted),
+                ))
+            })
             .collect()
     } else {
         let rendered_rows = render_help_find_rows(&rows, state, results.width as usize);
@@ -126,9 +141,16 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut synaps_cli::help
     };
     frame.render_widget(Paragraph::new(lines), results);
 
-    let footer = format!("{} result{}  ↑↓ move  Enter details  type filter  Esc close", result_count, if result_count == 1 { "" } else { "s" });
+    let footer = format!(
+        "{} result{}  ↑↓ move  Enter details  type filter  Esc close",
+        result_count,
+        if result_count == 1 { "" } else { "s" }
+    );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(THEME.load().muted)))),
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(THEME.load().muted),
+        ))),
         status_bar,
     );
 }
@@ -149,12 +171,18 @@ fn render_help_find_rows(
         .enumerate()
         .map(|(idx, row)| match row {
             synaps_cli::help::HelpFindRow::Category(category) => {
-                let spacer = if idx == 0 { Vec::new() } else { vec![Line::from("")] };
+                let spacer = if idx == 0 {
+                    Vec::new()
+                } else {
+                    vec![Line::from("")]
+                };
                 spacer
                     .into_iter()
                     .chain(std::iter::once(Line::from(Span::styled(
                         category.to_string(),
-                        Style::default().fg(THEME.load().muted).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(THEME.load().muted)
+                            .add_modifier(Modifier::BOLD),
                     ))))
                     .collect()
             }
@@ -162,13 +190,25 @@ fn render_help_find_rows(
                 let selected = idx == state.cursor();
                 let marker = if selected { "›" } else { " " };
                 let command_style = if selected {
-                    Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(THEME.load().claude_label)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(THEME.load().input_fg)
                 };
                 let summary_style = Style::default().fg(THEME.load().muted);
-                let match_style = Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD);
-                wrapped_entry_lines(marker, entry, state.filter(), width, command_style, summary_style, match_style)
+                let match_style = Style::default()
+                    .fg(THEME.load().claude_label)
+                    .add_modifier(Modifier::BOLD);
+                wrapped_entry_lines(
+                    marker,
+                    entry,
+                    state.filter(),
+                    width,
+                    command_style,
+                    summary_style,
+                    match_style,
+                )
             }
         })
         .collect()
@@ -192,7 +232,12 @@ fn wrapped_entry_lines(
                 if !command_part.trim().is_empty() {
                     spans.push(Span::raw("  "));
                 }
-                spans.extend(highlighted_spans(&summary, query, summary_style, match_style));
+                spans.extend(highlighted_spans(
+                    &summary,
+                    query,
+                    summary_style,
+                    match_style,
+                ));
             }
             Line::from(spans)
         })
@@ -233,10 +278,19 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
     frame.render_widget(block, modal);
 
     let mut lines = vec![
-        Line::from(Span::styled(entry.title.clone(), Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            entry.title.clone(),
+            Style::default()
+                .fg(THEME.load().claude_label)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
     ];
-    lines.extend(wrapped_styled_lines(&entry.summary, inner.width as usize, Style::default().fg(THEME.load().input_fg)));
+    lines.extend(wrapped_styled_lines(
+        &entry.summary,
+        inner.width as usize,
+        Style::default().fg(THEME.load().input_fg),
+    ));
     if let Some(source) = synaps_cli::help::source_display(entry) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -245,17 +299,37 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
         )));
     }
     lines.push(Line::from(""));
-    lines.extend(entry.lines.iter().flat_map(|line| {
-        wrapped_raw_lines(line, inner.width as usize)
-    }));
-    if let Some(usage) = entry.usage.as_ref().filter(|usage| !usage.trim().is_empty()) {
+    lines.extend(
+        entry
+            .lines
+            .iter()
+            .flat_map(|line| wrapped_raw_lines(line, inner.width as usize)),
+    );
+    if let Some(usage) = entry
+        .usage
+        .as_ref()
+        .filter(|usage| !usage.trim().is_empty())
+    {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Usage", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
-        lines.extend(wrapped_raw_lines(&format!("  {}", usage), inner.width as usize));
+        lines.push(Line::from(Span::styled(
+            "Usage",
+            Style::default()
+                .fg(THEME.load().claude_label)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(wrapped_raw_lines(
+            &format!("  {}", usage),
+            inner.width as usize,
+        ));
     }
     if !entry.examples.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Examples", Style::default().fg(THEME.load().claude_label).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            "Examples",
+            Style::default()
+                .fg(THEME.load().claude_label)
+                .add_modifier(Modifier::BOLD),
+        )));
         for example in &entry.examples {
             let rendered = if example.description.trim().is_empty() {
                 format!("  {}", example.command)
@@ -273,6 +347,9 @@ fn render_detail(frame: &mut Frame, modal: Rect, entry: &synaps_cli::help::HelpE
             Style::default().fg(THEME.load().muted),
         ));
     }
-    lines.push(Line::from(Span::styled("Esc back", Style::default().fg(THEME.load().muted))));
+    lines.push(Line::from(Span::styled(
+        "Esc back",
+        Style::default().fg(THEME.load().muted),
+    )));
     frame.render_widget(Paragraph::new(lines), inner);
 }

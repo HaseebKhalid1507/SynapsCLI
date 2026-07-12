@@ -70,7 +70,10 @@ fn scenario_01_empty_boot_chrome_present() {
     assert_eq!(h.input_contents(), "", "input should be empty on boot");
 
     // No actions dispatched just from booting.
-    assert!(h.take_actions().is_empty(), "boot should produce no actions");
+    assert!(
+        h.take_actions().is_empty(),
+        "boot should produce no actions"
+    );
 }
 
 /// Scenario 2 — Type + backspace: buffer state consistent after backspacing to empty.
@@ -98,7 +101,10 @@ fn scenario_02_type_then_backspace_to_empty() {
 
     // Render must still succeed.
     let frame = h.snapshot();
-    assert!(!frame.trim().is_empty(), "frame blank after backspace-to-empty");
+    assert!(
+        !frame.trim().is_empty(),
+        "frame blank after backspace-to-empty"
+    );
 }
 
 /// Scenario 3 — Type + submit: dispatch recorded via take_actions().
@@ -119,7 +125,11 @@ fn scenario_03_type_then_submit_records_action() {
     );
 
     // After submit the input buffer must be cleared.
-    assert_eq!(h.input_contents(), "", "input should be cleared after submit");
+    assert_eq!(
+        h.input_contents(),
+        "",
+        "input should be cleared after submit"
+    );
 }
 
 /// Scenario 4 — Esc in main view does NOT clear the input buffer.
@@ -145,7 +155,10 @@ fn scenario_04_esc_does_not_clear_input_main_view() {
     );
 
     // No action recorded.
-    assert!(h.take_actions().is_empty(), "Esc main-view should produce no action");
+    assert!(
+        h.take_actions().is_empty(),
+        "Esc main-view should produce no action"
+    );
 }
 
 // ── 2. Modals ─────────────────────────────────────────────────────────────────
@@ -371,7 +384,10 @@ fn scenario_10_scroll_lines_step_directly_inspectable() {
         3,
         "one mouse ScrollUp should increment scroll_back by 3 (hardcoded in input.rs)"
     );
-    assert!(!h.scroll_pinned(), "scroll_pinned should be false after scrolling up");
+    assert!(
+        !h.scroll_pinned(),
+        "scroll_pinned should be false after scrolling up"
+    );
 
     // One Shift+Up → 1 more line back.
     h.key(KeyCode::Up, KeyModifiers::SHIFT);
@@ -391,8 +407,15 @@ fn scenario_10_scroll_lines_step_directly_inspectable() {
 
     // One Shift+Down → back to 0 and re-pinned.
     h.key(KeyCode::Down, KeyModifiers::SHIFT);
-    assert_eq!(h.scroll_back(), 0, "Shift+Down should bring scroll_back back to 0");
-    assert!(h.scroll_pinned(), "scroll_pinned should be true again at scroll_back == 0");
+    assert_eq!(
+        h.scroll_back(),
+        0,
+        "Shift+Down should bring scroll_back back to 0"
+    );
+    assert!(
+        h.scroll_pinned(),
+        "scroll_pinned should be true again at scroll_back == 0"
+    );
 }
 
 // ── 4. Resize ─────────────────────────────────────────────────────────────────
@@ -412,7 +435,10 @@ fn scenario_11_wide_to_narrow_resize_reflows() {
     h.resize(40, 20);
 
     let narrow_frame = h.snapshot();
-    assert!(!narrow_frame.trim().is_empty(), "frame blank after narrow resize");
+    assert!(
+        !narrow_frame.trim().is_empty(),
+        "frame blank after narrow resize"
+    );
     assert_eq!(h.render().area().width, 40);
     assert_eq!(h.render().area().height, 20);
 }
@@ -616,7 +642,10 @@ fn scenario_19_mouse_scroll_up_changes_frame() {
 fn scenario_20_ctrl_c_dispatches_quit() {
     let mut h = TestHarness::boot();
 
-    assert!(!h.quit_requested(), "quit_requested should be false on boot");
+    assert!(
+        !h.quit_requested(),
+        "quit_requested should be false on boot"
+    );
 
     h.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
@@ -682,8 +711,15 @@ fn scenario_21_unpinned_growth_scroll_tracks_stable_window() {
 
     // First render: establishes baseline (last_line_count = 20, pinned → scroll_back = 0).
     h.render();
-    assert_eq!(h.scroll_back(), 0, "phase1: pinned on first render, scroll_back must be 0");
-    assert!(h.scroll_pinned(), "phase1: must be pinned after overflow-seeding render");
+    assert_eq!(
+        h.scroll_back(),
+        0,
+        "phase1: pinned on first render, scroll_back must be 0"
+    );
+    assert!(
+        h.scroll_pinned(),
+        "phase1: must be pinned after overflow-seeding render"
+    );
 
     // ── Phase 2: scroll up N lines (unpin) ──
     // 1 mouse ScrollUp = 3 lines. Fire once → scroll_back = 3, unpinned.
@@ -693,12 +729,23 @@ fn scenario_21_unpinned_growth_scroll_tracks_stable_window() {
         row: 10,
         modifiers: KeyModifiers::empty(),
     });
-    assert_eq!(h.scroll_back(), 3, "phase2: one mouse ScrollUp must set scroll_back=3");
-    assert!(!h.scroll_pinned(), "phase2: must be unpinned after scroll-up");
+    assert_eq!(
+        h.scroll_back(),
+        3,
+        "phase2: one mouse ScrollUp must set scroll_back=3"
+    );
+    assert!(
+        !h.scroll_pinned(),
+        "phase2: must be unpinned after scroll-up"
+    );
 
     // Render to bake the scroll state into last_line_count.
     h.render();
-    assert_eq!(h.scroll_back(), 3, "phase2: scroll_back must survive a render");
+    assert_eq!(
+        h.scroll_back(),
+        3,
+        "phase2: scroll_back must survive a render"
+    );
 
     // Capture the pre-growth window top: with ~40 seed lines (20 msgs × 2 flat
     // lines each), a ~17-row viewport, and scroll_back=3, the top visible
@@ -764,7 +811,11 @@ fn scenario_21_unpinned_growth_scroll_tracks_stable_window() {
         });
     }
     h.render();
-    assert_eq!(h.scroll_back(), 0, "phase5: scroll back to bottom must give scroll_back=0");
+    assert_eq!(
+        h.scroll_back(),
+        0,
+        "phase5: scroll back to bottom must give scroll_back=0"
+    );
     assert!(h.scroll_pinned(), "phase5: must re-pin on reaching bottom");
     let frame_bottom = h.snapshot();
     assert!(
@@ -926,8 +977,8 @@ fn scenario_22_selection_drag_and_copy_path() {
     });
     h.mouse(MouseEvent {
         kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        column: 10,  // same col as down
-        row: 4,      // same row as down → anchor==end → clear
+        column: 10, // same col as down
+        row: 4,     // same row as down → anchor==end → clear
         modifiers: KeyModifiers::empty(),
     });
     // After a bare click, selection must be cleared (draw.rs model.selection == None).
@@ -1109,8 +1160,10 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
     // At 80: content_width ~= 76. At 60: content_width ~= 56.
     // A 70-char message wraps at 60 but not at 80.
     let long_msg = "the quick brown fox jumps over the lazy dog — wrap test content here!!";
-    assert!(long_msg.len() > 56 && long_msg.len() < 76,
-        "test invariant: message must wrap at 60-col but not at 80-col");
+    assert!(
+        long_msg.len() > 56 && long_msg.len() < 76,
+        "test invariant: message must wrap at 60-col but not at 80-col"
+    );
     h.push_system_message(long_msg);
     h.push_system_message("short line");
     h.push_system_message("another somewhat longer line for coverage purpose only");
@@ -1136,7 +1189,11 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
         snap_60.contains("quick brown fox"),
         "phase2: message content must survive reflow to 60-col\n{snap_60}"
     );
-    assert_eq!(h.render().area().width, 60, "phase2: terminal width must be 60");
+    assert_eq!(
+        h.render().area().width,
+        60,
+        "phase2: terminal width must be 60"
+    );
 
     // ── Phase 3: resize back to 80×24 ──
     h.resize(80, 24);
@@ -1148,7 +1205,11 @@ fn scenario_23_resize_rebuild_cache_idempotent() {
         "phase3: frame at 80-col after resize-back must be byte-identical to \
          the original 80-col snapshot (width-keyed cache full-rebuild idempotence)"
     );
-    assert_eq!(h.render().area().width, 80, "phase3: terminal width must be 80 after resize-back");
+    assert_eq!(
+        h.render().area().width,
+        80,
+        "phase3: terminal width must be 80 after resize-back"
+    );
 }
 
 // ── P11 perf pins (design §5.2, DECISION LOCK L4) ────────────────────────────
@@ -1267,23 +1328,37 @@ fn scenario_p6_2_toast_expiry_only_advances_via_clock() {
 
     // A 4-second toast enters the provider.
     h.push_toast_with_ttl_secs("determinism", "still here", 4);
-    assert_eq!(h.toast_count(), 1, "toast should be live immediately after push");
+    assert_eq!(
+        h.toast_count(),
+        1,
+        "toast should be live immediately after push"
+    );
 
     // The frozen clock never ticks on its own: sweep many times, no wall time.
     for _ in 0..1000 {
         let reaped = h.tick_toasts();
         assert!(!reaped, "toast must NOT expire while the clock is frozen");
     }
-    assert_eq!(h.toast_count(), 1, "toast must survive ticks without clock advance");
+    assert_eq!(
+        h.toast_count(),
+        1,
+        "toast must survive ticks without clock advance"
+    );
 
     // Advance to just under the TTL — still alive.
     h.advance_clock_ms(3_999);
-    assert!(!h.tick_toasts(), "toast must survive at t=3.999s (< 4s TTL)");
+    assert!(
+        !h.tick_toasts(),
+        "toast must survive at t=3.999s (< 4s TTL)"
+    );
     assert_eq!(h.toast_count(), 1, "toast still live just under its TTL");
 
     // Cross the TTL boundary — now, and only now, it expires.
     h.advance_clock_ms(1);
-    assert!(h.tick_toasts(), "toast must expire exactly when the clock reaches its TTL");
+    assert!(
+        h.tick_toasts(),
+        "toast must expire exactly when the clock reaches its TTL"
+    );
     assert_eq!(h.toast_count(), 0, "toast reaped after clock crosses TTL");
 }
 
@@ -1301,8 +1376,15 @@ fn scenario_p7_8_secret_prompt_activates_and_renders() {
     let mut h = TestHarness::boot();
     h.activate_secret_prompt("Sudo", "enter your password");
 
-    assert!(h.secret_prompt_active(), "queue must be active after injection");
-    assert_eq!(h.modal_stack_depth(), 1, "SecretPrompt must be pushed onto the stack");
+    assert!(
+        h.secret_prompt_active(),
+        "queue must be active after injection"
+    );
+    assert_eq!(
+        h.modal_stack_depth(),
+        1,
+        "SecretPrompt must be pushed onto the stack"
+    );
 
     let frame = h.snapshot();
     assert!(frame.contains("Sudo"), "prompt title must render:\n{frame}");
@@ -1310,7 +1392,10 @@ fn scenario_p7_8_secret_prompt_activates_and_renders() {
         frame.contains("enter your password"),
         "prompt body must render:\n{frame}"
     );
-    assert!(frame.contains("password:"), "masked field label must render:\n{frame}");
+    assert!(
+        frame.contains("password:"),
+        "masked field label must render:\n{frame}"
+    );
 }
 
 /// Scenario P7.8-b — Typing masks input; Backspace deletes one bullet.
@@ -1322,15 +1407,27 @@ fn scenario_p7_8_secret_prompt_type_and_backspace_mask() {
     // Four chars → four bullets, and the plaintext must NEVER appear.
     h.type_str("h4x0");
     let frame = h.snapshot();
-    assert!(frame.contains("••••"), "four masked bullets expected:\n{frame}");
-    assert!(!frame.contains("h4x0"), "plaintext secret must never render:\n{frame}");
+    assert!(
+        frame.contains("••••"),
+        "four masked bullets expected:\n{frame}"
+    );
+    assert!(
+        !frame.contains("h4x0"),
+        "plaintext secret must never render:\n{frame}"
+    );
     assert!(h.secret_prompt_active(), "prompt stays open while typing");
 
     // Backspace removes exactly one bullet (four → three).
     h.key(KeyCode::Backspace, KeyModifiers::empty());
     let frame = h.snapshot();
-    assert!(frame.contains("•••"), "three bullets after one backspace:\n{frame}");
-    assert!(!frame.contains("••••"), "must no longer show four bullets:\n{frame}");
+    assert!(
+        frame.contains("•••"),
+        "three bullets after one backspace:\n{frame}"
+    );
+    assert!(
+        !frame.contains("••••"),
+        "must no longer show four bullets:\n{frame}"
+    );
 }
 
 /// Scenario P7.8-c — Paste appends per-character (still masked).
@@ -1341,8 +1438,14 @@ fn scenario_p7_8_secret_prompt_paste_masks_per_char() {
 
     h.paste("abc");
     let frame = h.snapshot();
-    assert!(frame.contains("•••"), "pasted 3 chars → 3 bullets:\n{frame}");
-    assert!(!frame.contains("abc"), "pasted secret must never render:\n{frame}");
+    assert!(
+        frame.contains("•••"),
+        "pasted 3 chars → 3 bullets:\n{frame}"
+    );
+    assert!(
+        !frame.contains("abc"),
+        "pasted secret must never render:\n{frame}"
+    );
     assert!(h.secret_prompt_active(), "prompt stays open after paste");
 }
 
@@ -1355,11 +1458,21 @@ fn scenario_p7_8_secret_prompt_enter_submits_and_pops() {
 
     h.key(KeyCode::Enter, KeyModifiers::empty());
 
-    assert!(!h.secret_prompt_active(), "queue drained after Enter submit");
-    assert_eq!(h.modal_stack_depth(), 0, "SecretPrompt popped off the stack");
+    assert!(
+        !h.secret_prompt_active(),
+        "queue drained after Enter submit"
+    );
+    assert_eq!(
+        h.modal_stack_depth(),
+        0,
+        "SecretPrompt popped off the stack"
+    );
 
     let frame = h.snapshot();
-    assert!(!frame.contains(" Sudo "), "prompt title gone after submit:\n{frame}");
+    assert!(
+        !frame.contains(" Sudo "),
+        "prompt title gone after submit:\n{frame}"
+    );
     assert!(
         frame.contains("Synaps") || frame.contains("ready"),
         "base chat view restored after submit:\n{frame}"
@@ -1376,10 +1489,17 @@ fn scenario_p7_8_secret_prompt_esc_cancels_and_pops() {
     h.key(KeyCode::Esc, KeyModifiers::empty());
 
     assert!(!h.secret_prompt_active(), "queue drained after Esc cancel");
-    assert_eq!(h.modal_stack_depth(), 0, "SecretPrompt popped off the stack");
+    assert_eq!(
+        h.modal_stack_depth(),
+        0,
+        "SecretPrompt popped off the stack"
+    );
 
     let frame = h.snapshot();
-    assert!(!frame.contains(" Sudo "), "prompt title gone after cancel:\n{frame}");
+    assert!(
+        !frame.contains(" Sudo "),
+        "prompt title gone after cancel:\n{frame}"
+    );
 }
 
 /// Scenario P7.8-f — Consecutive queued prompts: submit chains to the next one
@@ -1393,14 +1513,27 @@ fn scenario_p7_8_secret_prompt_chains_to_next_queued() {
     assert_eq!(h.modal_stack_depth(), 1, "still a single SecretPrompt pane");
 
     let frame = h.snapshot();
-    assert!(frame.contains("First"), "first prompt active first:\n{frame}");
+    assert!(
+        frame.contains("First"),
+        "first prompt active first:\n{frame}"
+    );
 
     // Submit the first → the queue auto-activates the second; the pane STAYS.
     h.key(KeyCode::Enter, KeyModifiers::empty());
-    assert!(h.secret_prompt_active(), "second prompt keeps the queue active");
-    assert_eq!(h.modal_stack_depth(), 1, "pane stays on the stack across chaining");
+    assert!(
+        h.secret_prompt_active(),
+        "second prompt keeps the queue active"
+    );
+    assert_eq!(
+        h.modal_stack_depth(),
+        1,
+        "pane stays on the stack across chaining"
+    );
     let frame = h.snapshot();
-    assert!(frame.contains("Second"), "second prompt now active:\n{frame}");
+    assert!(
+        frame.contains("Second"),
+        "second prompt now active:\n{frame}"
+    );
 
     // Submit the second → queue drains, pane pops.
     h.key(KeyCode::Enter, KeyModifiers::empty());
@@ -1440,7 +1573,10 @@ fn scenario_tape_round_trip_replays_byte_identical() {
     //    helpers, so the integration test never names serde_json directly.
     let json = tape.to_json();
     let tape2: Tape = Tape::from_json(&json).expect("tape deserializes");
-    assert_eq!(tape, tape2, "tape must survive the JSON round-trip structurally");
+    assert_eq!(
+        tape, tape2,
+        "tape must survive the JSON round-trip structurally"
+    );
 
     // 3. Replay the deserialized tape into a fresh harness.
     let replayed_frame = TestHarness::replay(&tape2);
@@ -1567,8 +1703,16 @@ fn drive_compound_stream_resize_modal() {
     // Real geometry change through the harness resize path (updates size +
     // backend + dispatches the event). The in-flight tool card must survive.
     h.resize(120, 40);
-    assert_eq!(h.render().area().width, 120, "PHASE 2: width must be 120 after resize");
-    assert_eq!(h.render().area().height, 40, "PHASE 2: height must be 40 after resize");
+    assert_eq!(
+        h.render().area().width,
+        120,
+        "PHASE 2: width must be 120 after resize"
+    );
+    assert_eq!(
+        h.render().area().height,
+        40,
+        "PHASE 2: height must be 40 after resize"
+    );
     let f2 = h.snapshot();
     assert!(
         f2.contains("read_file"),
@@ -1583,13 +1727,21 @@ fn drive_compound_stream_resize_modal() {
         f3.contains("Settings"),
         "PHASE 3 (modal overlay): settings modal must be drawn over the stream\n{f3}"
     );
-    assert_eq!(h.modal_stack_depth(), 1, "PHASE 3: modal stack depth must be 1");
+    assert_eq!(
+        h.modal_stack_depth(),
+        1,
+        "PHASE 3: modal stack depth must be 1"
+    );
 
     // ── PHASE 4 — modal CLOSE via Esc (with clock advance) ───────────────────
     h.advance_clock_ms(500);
     h.key(KeyCode::Esc, KeyModifiers::empty());
     let f4 = h.snapshot();
-    assert_eq!(h.modal_stack_depth(), 0, "PHASE 4 (modal gone): stack must pop to 0");
+    assert_eq!(
+        h.modal_stack_depth(),
+        0,
+        "PHASE 4 (modal gone): stack must pop to 0"
+    );
     assert!(
         !f4.contains(" Settings "),
         "PHASE 4 (modal gone): settings title must not bleed through after Esc\n{f4}"
@@ -1655,7 +1807,10 @@ fn compound_stream_resize_modal() {
 
     // (c) JSON round-trip stability (mirrors the P6.4 template).
     let round_tripped = Tape::from_json(&fixture.to_json()).expect("tape re-parses");
-    assert_eq!(fixture, round_tripped, "fixture must survive a JSON round-trip");
+    assert_eq!(
+        fixture, round_tripped,
+        "fixture must survive a JSON round-trip"
+    );
 
     // (d) DETERMINISM PROOF — replay 50× at the default geometry, byte-identical.
     let frame0 = TestHarness::replay(&fixture);

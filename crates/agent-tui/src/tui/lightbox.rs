@@ -44,7 +44,10 @@ mod tests {
     #[test]
     fn centered_lightbox_never_uses_unreliable_edge_columns_when_full_width() {
         let area = Rect::new(0, 0, 100, 40);
-        assert_eq!(centered_lightbox_rect(area, 100, 20), Rect::new(2, 10, 96, 20));
+        assert_eq!(
+            centered_lightbox_rect(area, 100, 20),
+            Rect::new(2, 10, 96, 20)
+        );
     }
 
     #[test]

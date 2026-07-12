@@ -411,29 +411,43 @@ pub(crate) fn handle_event(
 fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
     let editor = state.edit_mode.as_mut().expect("caller checks");
     match editor {
-        ActiveEditor::Text { buffer, setting_key, numeric, error } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if *numeric && buffer.parse::<u64>().is_err() {
-                        *error = Some("must be a number".to_string());
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::Apply { key: setting_key, value: buffer.clone() }
+        ActiveEditor::Text {
+            buffer,
+            setting_key,
+            numeric,
+            error,
+        } => match key.code {
+            KeyCode::Enter => {
+                if *numeric && buffer.parse::<u64>().is_err() {
+                    *error = Some("must be a number".to_string());
+                    return InputOutcome::None;
                 }
-                KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
-                KeyCode::Char(c) => {
-                    if *numeric && !c.is_ascii_digit() {
-                        *error = Some("digits only".to_string());
-                        return InputOutcome::None;
-                    }
-                    buffer.push(c);
-                    *error = None;
-                    InputOutcome::None
+                InputOutcome::Apply {
+                    key: setting_key,
+                    value: buffer.clone(),
                 }
-                _ => InputOutcome::None,
             }
-        }
-        ActiveEditor::Picker { setting_key, options, cursor } => {
+            KeyCode::Backspace => {
+                buffer.pop();
+                *error = None;
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                if *numeric && !c.is_ascii_digit() {
+                    *error = Some("digits only".to_string());
+                    return InputOutcome::None;
+                }
+                buffer.push(c);
+                *error = None;
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::Picker {
+            setting_key,
+            options,
+            cursor,
+        } => {
             match key.code {
                 KeyCode::Up => {
                     if *cursor > 0 {
@@ -444,7 +458,9 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                         }
                     }
                     if *setting_key == "theme" {
-                        return InputOutcome::PreviewTheme { name: options[*cursor].clone() };
+                        return InputOutcome::PreviewTheme {
+                            name: options[*cursor].clone(),
+                        };
                     }
                     InputOutcome::None
                 }
@@ -452,7 +468,8 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                     if *cursor + 1 < options.len() {
                         *cursor += 1;
                         // Skip header rows
-                        while *cursor + 1 < options.len() && options[*cursor].starts_with("──") {
+                        while *cursor + 1 < options.len() && options[*cursor].starts_with("──")
+                        {
                             *cursor += 1;
                         }
                     }
@@ -510,58 +527,81 @@ fn handle_editor_key(state: &mut SettingsState, key: KeyEvent) -> InputOutcome {
                 _ => InputOutcome::None,
             }
         }
-        ActiveEditor::CustomModel { buffer, setting_key } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if buffer.trim().is_empty() {
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::Apply { key: setting_key, value: buffer.trim().to_string() }
+        ActiveEditor::CustomModel {
+            buffer,
+            setting_key,
+        } => match key.code {
+            KeyCode::Enter => {
+                if buffer.trim().is_empty() {
+                    return InputOutcome::None;
                 }
-                KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
-                KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }
-                _ => InputOutcome::None,
+                InputOutcome::Apply {
+                    key: setting_key,
+                    value: buffer.trim().to_string(),
+                }
             }
-        }
-        ActiveEditor::ApiKey { provider_id, buffer } => {
-            match key.code {
-                KeyCode::Enter => {
-                    InputOutcome::SetProviderKey {
-                        provider_id: provider_id.clone(),
-                        value: buffer.trim().to_string(),
-                    }
-                }
-                KeyCode::Backspace => { buffer.pop(); InputOutcome::None }
-                KeyCode::Char(c) => { buffer.push(c); InputOutcome::None }
-                _ => InputOutcome::None,
+            KeyCode::Backspace => {
+                buffer.pop();
+                InputOutcome::None
             }
-        }
-        ActiveEditor::PluginText { plugin_id, key: field_key, buffer, numeric, error } => {
-            match key.code {
-                KeyCode::Enter => {
-                    if *numeric && buffer.parse::<i64>().is_err() {
-                        *error = Some("must be a number".to_string());
-                        return InputOutcome::None;
-                    }
-                    InputOutcome::PluginApply {
-                        plugin_id: plugin_id.clone(),
-                        key: field_key.clone(),
-                        value: buffer.clone(),
-                    }
-                }
-                KeyCode::Backspace => { buffer.pop(); *error = None; InputOutcome::None }
-                KeyCode::Char(c) => {
-                    if *numeric && !(c.is_ascii_digit() || c == '-') {
-                        *error = Some("digits only".to_string());
-                        return InputOutcome::None;
-                    }
-                    buffer.push(c);
-                    *error = None;
-                    InputOutcome::None
-                }
-                _ => InputOutcome::None,
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                InputOutcome::None
             }
-        }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::ApiKey {
+            provider_id,
+            buffer,
+        } => match key.code {
+            KeyCode::Enter => InputOutcome::SetProviderKey {
+                provider_id: provider_id.clone(),
+                value: buffer.trim().to_string(),
+            },
+            KeyCode::Backspace => {
+                buffer.pop();
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
+        ActiveEditor::PluginText {
+            plugin_id,
+            key: field_key,
+            buffer,
+            numeric,
+            error,
+        } => match key.code {
+            KeyCode::Enter => {
+                if *numeric && buffer.parse::<i64>().is_err() {
+                    *error = Some("must be a number".to_string());
+                    return InputOutcome::None;
+                }
+                InputOutcome::PluginApply {
+                    plugin_id: plugin_id.clone(),
+                    key: field_key.clone(),
+                    value: buffer.clone(),
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                *error = None;
+                InputOutcome::None
+            }
+            KeyCode::Char(c) => {
+                if *numeric && !(c.is_ascii_digit() || c == '-') {
+                    *error = Some("digits only".to_string());
+                    return InputOutcome::None;
+                }
+                buffer.push(c);
+                *error = None;
+                InputOutcome::None
+            }
+            _ => InputOutcome::None,
+        },
         ActiveEditor::PluginCustom { .. } => InputOutcome::None,
     }
 }

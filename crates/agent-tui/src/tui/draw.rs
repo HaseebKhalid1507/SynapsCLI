@@ -1,3 +1,7 @@
+use crossterm::{
+    execute,
+    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout},
@@ -6,11 +10,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
     Terminal,
 };
-use crossterm::{execute, terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate}};
 use std::io;
 use tachyonfx::{fx, Effect, Interpolation};
 
-use super::text_metrics::{width as display_width, char_width};
+use super::text_metrics::{char_width, width as display_width};
 
 /// The six named panes that make up the outer app layout.
 ///
@@ -43,7 +46,14 @@ impl AppAreas {
             Constraint::Length(1),
         ])
         .areas(area);
-        Self { header, body, subagent, download, input, footer }
+        Self {
+            header,
+            body,
+            subagent,
+            download,
+            input,
+            footer,
+        }
     }
 }
 
@@ -162,9 +172,9 @@ mod sidecar_pill_tests {
         let cases = [
             (50u16, 5usize, 11u16, 2u16), // the reported crash: 11 cols, 2 rows
             (0, 0, 1, 1),                 // 1x1 — absolute minimum
-            (200, 50, 0, 0),             // 0x0 — degenerate
-            (10, 1, 5, 1),               // narrow + single row
-            (100, 20, 200, 100),         // big — normal case
+            (200, 50, 0, 0),              // 0x0 — degenerate
+            (10, 1, 5, 1),                // narrow + single row
+            (100, 20, 200, 100),          // big — normal case
         ];
         for (cw, lc, aw, ah) in cases {
             let (w, h) = toast_dims(cw, lc, aw, ah); // must not panic
@@ -287,9 +297,9 @@ mod sidecar_pill_tests {
 }
 
 use super::app::SPINNER_FRAMES;
-use super::view_model::{RenderPatch, ViewInputs};
 use super::markdown::format_tokens;
 use super::theme::THEME;
+use super::view_model::{RenderPatch, ViewInputs};
 
 /// Generate a bash execution trace animation string and its pulsing color.
 /// Returns (trace_string, Color) for use in Span styling.
@@ -356,7 +366,11 @@ pub(crate) fn tool_accent(tool_name: &str) -> Color {
     /// Resolve a raw tool_* field: if Reset, fall back to `derived`.
     #[inline]
     fn resolve(raw: Color, derived: Color) -> Color {
-        if raw == Color::Reset { derived } else { raw }
+        if raw == Color::Reset {
+            derived
+        } else {
+            raw
+        }
     }
 
     if tool_name.starts_with("ext__") {
@@ -364,15 +378,15 @@ pub(crate) fn tool_accent(tool_name: &str) -> Color {
     }
 
     match tool_name {
-        "bash"     => resolve(t.tool_bash,     t.tool_result_ok),
-        "read"     => resolve(t.tool_read,     t.claude_label),
-        "write"    => resolve(t.tool_write,    t.warning_color),
-        "edit"     => resolve(t.tool_edit,     t.cost_color),
-        "grep"     => resolve(t.tool_grep,     t.table_header_color),
-        "find"     => resolve(t.tool_find,     t.subagent_name),
-        "ls"       => resolve(t.tool_ls,       t.table_cell_color),
+        "bash" => resolve(t.tool_bash, t.tool_result_ok),
+        "read" => resolve(t.tool_read, t.claude_label),
+        "write" => resolve(t.tool_write, t.warning_color),
+        "edit" => resolve(t.tool_edit, t.cost_color),
+        "grep" => resolve(t.tool_grep, t.table_header_color),
+        "find" => resolve(t.tool_find, t.subagent_name),
+        "ls" => resolve(t.tool_ls, t.table_cell_color),
         "subagent" => resolve(t.tool_subagent, t.subagent_name),
-        _          => resolve(t.tool_generic,  t.tool_label),
+        _ => resolve(t.tool_generic, t.tool_label),
     }
 }
 
@@ -507,7 +521,11 @@ pub(crate) fn build_render_model(
         super::view_model::input_wrap_info(inputs.input, inputs.cursor_pos, input_inner_width);
     let max_input_lines: u16 = 10;
     let input_height = input_lines.min(max_input_lines) + 2;
-    let download_height: u16 = if !inputs.active_tasks.is_empty() { 1 } else { 0 };
+    let download_height: u16 = if !inputs.active_tasks.is_empty() {
+        1
+    } else {
+        0
+    };
     let protected_bottom_rows = subagent_height
         .saturating_add(download_height)
         .saturating_add(input_height)
@@ -516,8 +534,14 @@ pub(crate) fn build_render_model(
     // Use AppAreas to derive msg_area — single source of truth for the outer layout.
     // body sits at y=1 (after the 1-line header) with Min(1) height matching the
     // old saturating_sub chain + .max(1), so the resulting Rect is identical.
-    let area = ratatui::layout::Rect { x: 0, y: 0, width: term_size.width, height: term_size.height };
-    let msg_area = AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: term_size.width,
+        height: term_size.height,
+    };
+    let msg_area =
+        AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
 
     // ── 3. Transcript visible window ──────────────────────────────────────────
     // One call folds the old §3–§6 block: cache sync → scroll growth/clamp
@@ -576,7 +600,10 @@ pub(crate) fn build_render_model(
 
     // ── 9. Ghost hint ─────────────────────────────────────────────────────────
     let ghost_hint: Option<GhostHint> = {
-        if inputs.input.starts_with('/') && inputs.input.len() > 1 && !inputs.input[1..].contains(' ') {
+        if inputs.input.starts_with('/')
+            && inputs.input.len() > 1
+            && !inputs.input[1..].contains(' ')
+        {
             let partial = &inputs.input[1..];
             let commands = super::commands::all_commands_with_skills(registry);
             let prefix_matches: Vec<&String> =
@@ -794,7 +821,6 @@ pub(crate) fn render_frame_into(
 
     // Recompute input_lines for layout using the snapshot input + cursor_pos.
     let (input_lines, _, _) = {
-        
         let w = input_inner_width.max(1) as usize;
         let prefix_width: usize = 2;
         let mut total_lines: u16 = 1;
@@ -915,8 +941,7 @@ pub(crate) fn render_frame_into(
                     }
                 }
                 super::sidecar::SidecarUiStatus::Active { .. } => {
-                    let pulse =
-                        ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
+                    let pulse = ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
                     let base = match THEME.load().status_streaming {
                         Color::Rgb(r, g, b) => (r, g, b),
                         _ => (220, 80, 80),
@@ -1013,11 +1038,8 @@ pub(crate) fn render_frame_into(
             r"      ██    ██    ██  ████ ██   ██ ██           ██",
             r" ███████    ██    ██   ███ ██   ██ ██      ███████",
         ];
-        
-        let art_display_widths: Vec<usize> = ascii_art
-            .iter()
-            .map(|l| display_width(l))
-            .collect();
+
+        let art_display_widths: Vec<usize> = ascii_art.iter().map(|l| display_width(l)).collect();
         let max_art_width = art_display_widths.iter().copied().max().unwrap_or(0);
         let avail_w = msg_area.width as usize;
         let avail_h = msg_area.height as usize;
@@ -1061,8 +1083,7 @@ pub(crate) fn render_frame_into(
                 ));
                 let build_t = model.logo_build_t.unwrap_or(1.0);
                 let start_y = center_y.saturating_sub((total_block as u16) / 2);
-                let art_x =
-                    msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
+                let art_x = msg_area.x + (avail_w as u16).saturating_sub(max_art_width as u16) / 2;
                 for (j, line) in ascii_art.iter().enumerate() {
                     let x = art_x;
                     let y = start_y + j as u16;
@@ -1092,8 +1113,7 @@ pub(crate) fn render_frame_into(
                                     let lp = ((build_t - diag) / 0.15).min(1.0);
                                     if lp < 1.0 && ch != ' ' {
                                         built.push(
-                                            build_chars
-                                                [(lp * build_chars.len() as f64) as usize],
+                                            build_chars[(lp * build_chars.len() as f64) as usize],
                                         );
                                     } else {
                                         built.push(ch);
@@ -1129,10 +1149,8 @@ pub(crate) fn render_frame_into(
                             width: sub_width as u16,
                             height: 1,
                         };
-                        frame.render_widget(
-                            Paragraph::new(Span::styled(sub_text, sub_style)),
-                            area,
-                        );
+                        frame
+                            .render_widget(Paragraph::new(Span::styled(sub_text, sub_style)), area);
                     }
                 }
             } else {
@@ -1289,7 +1307,10 @@ pub(crate) fn render_frame_into(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(THEME.load().subagent_border))
             .style(Style::default().bg(THEME.load().bg));
-        frame.render_widget(Paragraph::new(agent_lines).block(agent_block), subagent_area);
+        frame.render_widget(
+            Paragraph::new(agent_lines).block(agent_block),
+            subagent_area,
+        );
     }
 
     // ── Input ─────────────────────────────────────────────────────────────
@@ -1308,7 +1329,6 @@ pub(crate) fn render_frame_into(
     let prompt_style = Style::default().fg(THEME.load().prompt_fg);
     let input_style = Style::default().fg(THEME.load().input_fg);
     let input_lines_vec: Vec<ratatui::text::Line> = {
-        
         let mut rows: Vec<Vec<Span>> = Vec::new();
         let mut current_row: Vec<Span> = vec![Span::styled("\u{276f} ", prompt_style)];
         let mut col: usize = prefix_width;
@@ -1350,7 +1370,6 @@ pub(crate) fn render_frame_into(
 
     // Cursor position for scroll offset
     let (_, cursor_row, cursor_col) = {
-        
         let w2 = input_inner_width.max(1) as usize;
         let mut total_rows: u16 = 1;
         let mut cur_row: u16 = 0;
@@ -1462,8 +1481,7 @@ pub(crate) fn render_frame_into(
             + model.total_cache_read_tokens
             + model.total_cache_creation_tokens;
         if total_input > 0 && model.total_cache_read_tokens > 0 {
-            let rate =
-                (model.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
+            let rate = (model.total_cache_read_tokens as f64 / total_input as f64 * 100.0) as u32;
             let ttl_hint = if model.total_cache_write_1h > 0 {
                 "·1h"
             } else {
@@ -1649,9 +1667,13 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
 /// On a cramped terminal the toast simply renders smaller instead of crashing.
 fn toast_dims(content_width: u16, line_count: usize, area_w: u16, area_h: u16) -> (u16, u16) {
     let max_w = area_w.clamp(1, 64);
-    let width = content_width.saturating_add(4).clamp(18u16.min(max_w), max_w);
+    let width = content_width
+        .saturating_add(4)
+        .clamp(18u16.min(max_w), max_w);
     let max_h = area_h.max(1);
-    let height = (line_count as u16).saturating_add(2).clamp(3u16.min(max_h), max_h);
+    let height = (line_count as u16)
+        .saturating_add(2)
+        .clamp(3u16.min(max_h), max_h);
     (width, height)
 }
 
@@ -1675,9 +1697,7 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
             .border_type(BorderType::Rounded)
             // P19.2: extension widgets may carry an accent resolved from
             // `ext.<id>.accent`; None => border_active, identical to before.
-            .border_style(
-                Style::default().fg(toast.accent.unwrap_or(THEME.load().border_active)),
-            )
+            .border_style(Style::default().fg(toast.accent.unwrap_or(THEME.load().border_active)))
             .style(Style::default().bg(THEME.load().bg));
         frame.render_widget(Clear, rect);
         let paragraph = if toast.has_rich_lines() {

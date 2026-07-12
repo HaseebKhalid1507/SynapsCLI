@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind, MouseButton, Event};
-use synaps_cli::skills::registry::CommandRegistry;
 use super::app::{App, ChatMessage};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use synaps_cli::skills::registry::CommandRegistry;
 
 /// What the event loop should do after processing input.
 pub(super) enum InputAction {
@@ -35,9 +35,18 @@ pub(super) enum InputAction {
     OpenPluginsMarketplace,
     PingModels,
     /// Open a plugin-owned custom settings editor via `settings.editor.open`.
-    PluginEditorOpen { plugin_id: String, category: String, field: String },
+    PluginEditorOpen {
+        plugin_id: String,
+        category: String,
+        field: String,
+    },
     /// Forward a keypress to the active plugin-owned custom settings editor.
-    PluginEditorKey { plugin_id: String, category: String, field: String, key: crossterm::event::KeyEvent },
+    PluginEditorKey {
+        plugin_id: String,
+        category: String,
+        field: String,
+        key: crossterm::event::KeyEvent,
+    },
 }
 
 /// Process a crossterm Event and return what the main loop should do.
@@ -98,9 +107,7 @@ fn handle_event_inner(
 ) -> InputAction {
     match event {
         Event::Key(key) => handle_key(key.code, key.modifiers, app, streaming, registry, keybinds),
-        Event::Mouse(mouse) => {
-            handle_mouse(mouse, app, scroll_lines)
-        }
+        Event::Mouse(mouse) => handle_mouse(mouse, app, scroll_lines),
         Event::Paste(text) => {
             // Suppress paste events that fire immediately after a right-click copy.
             // Some terminals send both a Mouse(Down(Right)) AND an Event::Paste
@@ -119,9 +126,11 @@ fn handle_event_inner(
             // silently ate pastes into an empty input mid-stream.
             let text = if text.chars().count() > MAX_PASTE_CHARS {
                 let truncated: String = text.chars().take(MAX_PASTE_CHARS).collect();
-                app.push_msg(ChatMessage::System(
-                    format!("Paste truncated to {} chars (was {})", MAX_PASTE_CHARS, text.chars().count())
-                ));
+                app.push_msg(ChatMessage::System(format!(
+                    "Paste truncated to {} chars (was {})",
+                    MAX_PASTE_CHARS,
+                    text.chars().count()
+                )));
                 truncated
             } else {
                 text
@@ -140,7 +149,11 @@ fn handle_event_inner(
 }
 
 /// Handle mouse events: scroll, text selection (left drag), right-click copy/paste.
-fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines: u16) -> InputAction {
+fn handle_mouse(
+    mouse: crossterm::event::MouseEvent,
+    app: &mut App,
+    scroll_lines: u16,
+) -> InputAction {
     // Selection events may need to promote a demoted slot on demand (P11
     // lock L3: wheel + click in one input batch maps into rows demoted as of
     // the last frame). The re-render crosses the seam via RenderCtx, same as
@@ -166,7 +179,8 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
             if app.transcript.hit_test(mouse.column, mouse.row) {
-                app.transcript.selection_begin(mouse.column, mouse.row, &ctx);
+                app.transcript
+                    .selection_begin(mouse.column, mouse.row, &ctx);
             } else {
                 app.transcript.clear_selection();
             }
@@ -179,7 +193,8 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
 
         // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            app.transcript.selection_release(mouse.column, mouse.row, &ctx);
+            app.transcript
+                .selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not
@@ -188,10 +203,14 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                 // Copy selected text to clipboard — right-click with selection is COPY ONLY
                 if let Some(text) = app.transcript.selected_text() {
                     copy_to_clipboard(&text);
-                    app.push_msg(ChatMessage::System(format!("Copied {} chars", text.chars().count())));
+                    app.push_msg(ChatMessage::System(format!(
+                        "Copied {} chars",
+                        text.chars().count()
+                    )));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until =
+                    Some(app.clock.now() + std::time::Duration::from_millis(150));
                 // Clear selection after copy
                 app.transcript.clear_selection();
             } else {
@@ -208,7 +227,8 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
                     }
                 }
                 // Suppress the terminal-generated paste event that follows this right-click
-                app.suppress_paste_until = Some(app.clock.now() + std::time::Duration::from_millis(150));
+                app.suppress_paste_until =
+                    Some(app.clock.now() + std::time::Duration::from_millis(150));
             }
         }
 
@@ -221,12 +241,14 @@ fn handle_mouse(mouse: crossterm::event::MouseEvent, app: &mut App, scroll_lines
 /// holds one clipboard handle for the lifetime of the app. New copies replace
 /// the previous content atomically — no thread accumulation, no races.
 fn copy_to_clipboard(text: &str) {
-    use std::sync::{OnceLock, mpsc};
+    use std::sync::{mpsc, OnceLock};
     static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
     let sender = TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
-            let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+            let Ok(mut clipboard) = arboard::Clipboard::new() else {
+                return;
+            };
             while let Ok(text) = rx.recv() {
                 let _ = clipboard.set_text(&text);
             }
@@ -273,26 +295,23 @@ fn handle_key(
             || modifiers.contains(KeyModifiers::CONTROL)
             || modifiers.contains(KeyModifiers::ALT);
         if traceable {
-            tracing::info!(
-                ?code,
-                ?modifiers,
-                "key event received in chatui input"
-            );
+            tracing::info!(?code, ?modifiers, "key event received in chatui input");
         }
         if let Some(bind) = keybinds.match_key(code, modifiers) {
             use synaps_cli::skills::keybinds::KeybindAction;
             return match &bind.action {
                 KeybindAction::SlashCommand(cmd) => {
                     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-                    let resolved = super::commands::resolve_prefix(parts[0], &super::commands::all_commands_with_skills(registry));
+                    let resolved = super::commands::resolve_prefix(
+                        parts[0],
+                        &super::commands::all_commands_with_skills(registry),
+                    );
                     InputAction::SlashCommand(resolved, parts.get(1).unwrap_or(&"").to_string())
                 }
                 KeybindAction::LoadSkill(skill) => {
                     InputAction::SlashCommand("load".to_string(), skill.clone())
                 }
-                KeybindAction::InjectPrompt(text) => {
-                    InputAction::Submit(text.clone())
-                }
+                KeybindAction::InjectPrompt(text) => InputAction::Submit(text.clone()),
                 KeybindAction::Disabled => InputAction::None,
                 KeybindAction::RunScript { .. } => {
                     // TODO: execute script and inject output
@@ -356,7 +375,8 @@ fn handle_key(
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
             // App only signals the frame scheduler.
-            app.transcript.set_show_full_output(!app.transcript.show_full_output());
+            app.transcript
+                .set_show_full_output(!app.transcript.show_full_output());
             app.request_redraw();
         }
         (KeyCode::Char(c), _) => {
@@ -565,7 +585,13 @@ fn route_settings(
     // Invariant (checked by the tripwire): top() == Settings | PluginEditor ⇒
     // settings is Some.
     if let Some(state) = &mut app.settings {
-        if let Some(super::settings::ActiveEditor::PluginCustom { plugin_id, category, field, .. }) = &state.edit_mode {
+        if let Some(super::settings::ActiveEditor::PluginCustom {
+            plugin_id,
+            category,
+            field,
+            ..
+        }) = &state.edit_mode
+        {
             if let Event::Key(key) = event {
                 if key.code == KeyCode::Esc {
                     // P7.7: Esc on the nested PluginCustom editor POPS
@@ -601,14 +627,25 @@ fn route_settings(
             return InputAction::None;
         }
         if let Event::Key(key) = event {
-            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(runtime, registry, app.model_health.clone());
+            let snap = super::settings::RuntimeSnapshot::from_runtime_with_health(
+                runtime,
+                registry,
+                app.model_health.clone(),
+            );
             match super::settings::handle_event(state, key, &snap) {
-                super::settings::InputOutcome::Close => { app.settings = None; app.modal_stack.pop(); }
+                super::settings::InputOutcome::Close => {
+                    app.settings = None;
+                    app.modal_stack.pop();
+                }
                 super::settings::InputOutcome::None => {}
                 super::settings::InputOutcome::Apply { key, value } => {
                     return InputAction::SettingsApply(key, value);
                 }
-                super::settings::InputOutcome::PluginApply { plugin_id, key, value } => {
+                super::settings::InputOutcome::PluginApply {
+                    plugin_id,
+                    key,
+                    value,
+                } => {
                     let row_key = format!("plugin.{}.{}", plugin_id, key);
                     match synaps_cli::extensions::config_store::write_plugin_config(
                         &plugin_id, &key, &value,
@@ -622,7 +659,11 @@ fn route_settings(
                         }
                     }
                 }
-                super::settings::InputOutcome::PluginCustomOpen { plugin_id, category, key } => {
+                super::settings::InputOutcome::PluginCustomOpen {
+                    plugin_id,
+                    category,
+                    key,
+                } => {
                     return InputAction::PluginEditorOpen {
                         plugin_id,
                         category,
@@ -657,7 +698,10 @@ fn route_settings(
                 super::settings::InputOutcome::TogglePlugin { name, enabled } => {
                     let mut config = synaps_cli::config::load_config();
                     match super::plugins::actions::toggle_plugin_config(
-                        &name, enabled, &mut config, registry,
+                        &name,
+                        enabled,
+                        &mut config,
+                        registry,
                     ) {
                         Ok(()) => {
                             state.row_error = None;
@@ -789,7 +833,8 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
 
     // Fresh tab press — find matches for the current partial.
     let partial = app.input[1..].to_string();
-    let matches: Vec<String> = commands.iter()
+    let matches: Vec<String> = commands
+        .iter()
         .filter(|c| c.starts_with(partial.as_str()))
         .cloned()
         .collect();
@@ -805,7 +850,11 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
         // didn't add anything new, start cycling through matches.
         let first = &matches[0];
         let common_len = (0..first.len())
-            .take_while(|&i| matches.iter().all(|m| m.as_bytes().get(i) == first.as_bytes().get(i)))
+            .take_while(|&i| {
+                matches
+                    .iter()
+                    .all(|m| m.as_bytes().get(i) == first.as_bytes().get(i))
+            })
             .count();
 
         if common_len > partial.len() {
@@ -832,9 +881,18 @@ fn handle_tab_complete(app: &mut App, registry: &Arc<CommandRegistry>) {
 fn delete_word_backward(app: &mut App) {
     let chars: Vec<char> = app.input.chars().collect();
     let mut pos = app.cursor_pos;
-    while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
-    while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
-    let byte_start = app.input.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(app.input.len());
+    while pos > 0 && chars[pos - 1] == ' ' {
+        pos -= 1;
+    }
+    while pos > 0 && chars[pos - 1] != ' ' {
+        pos -= 1;
+    }
+    let byte_start = app
+        .input
+        .char_indices()
+        .nth(pos)
+        .map(|(i, _)| i)
+        .unwrap_or(app.input.len());
     let byte_end = app.cursor_byte_pos();
     app.input.drain(byte_start..byte_end);
     app.cursor_pos = pos;
@@ -844,8 +902,12 @@ fn delete_word_backward(app: &mut App) {
 fn jump_word_left(app: &mut App) {
     let chars: Vec<char> = app.input.chars().collect();
     let mut pos = app.cursor_pos;
-    while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
-    while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
+    while pos > 0 && chars[pos - 1] == ' ' {
+        pos -= 1;
+    }
+    while pos > 0 && chars[pos - 1] != ' ' {
+        pos -= 1;
+    }
     app.cursor_pos = pos;
 }
 
@@ -854,15 +916,19 @@ fn jump_word_right(app: &mut App) {
     let chars: Vec<char> = app.input.chars().collect();
     let len = chars.len();
     let mut pos = app.cursor_pos;
-    while pos < len && chars[pos] != ' ' { pos += 1; }
-    while pos < len && chars[pos] == ' ' { pos += 1; }
+    while pos < len && chars[pos] != ' ' {
+        pos += 1;
+    }
+    while pos < len && chars[pos] == ' ' {
+        pos += 1;
+    }
     app.cursor_pos = pos;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use synaps_cli::Session;
 
     fn models_key(code: KeyCode) -> Event {
@@ -872,24 +938,42 @@ mod tests {
     #[test]
     fn routed_models_search_navigation_applies_visible_provider_qualified_id() {
         use crate::tui::focus::PaneId;
-        use crate::tui::models::{ExpandedLoadState, ExpandedModelEntry, ExpandedModelsState, ModelsModalState};
+        use crate::tui::models::{
+            ExpandedLoadState, ExpandedModelEntry, ExpandedModelsState, ModelsModalState,
+        };
         let runtime = synaps_cli::Runtime::new_headless();
         let mut app = make_app();
         let mut models = ModelsModalState::new();
         models.expanded = Some(ExpandedModelsState {
-            provider_key: "github-copilot".into(), provider_name: "GitHub Copilot".into(),
-            cursor: 0, search: String::new(),
+            provider_key: "github-copilot".into(),
+            provider_name: "GitHub Copilot".into(),
+            cursor: 0,
+            search: String::new(),
             load_state: ExpandedLoadState::Ready(vec![
-                ExpandedModelEntry::new("github-copilot/claude-opus-4.7".into(), "Opus 4.7".into(), false),
-                ExpandedModelEntry::new("github-copilot/claude-opus-4.8".into(), "Opus 4.8".into(), false),
+                ExpandedModelEntry::new(
+                    "github-copilot/claude-opus-4.7".into(),
+                    "Opus 4.7".into(),
+                    false,
+                ),
+                ExpandedModelEntry::new(
+                    "github-copilot/claude-opus-4.8".into(),
+                    "Opus 4.8".into(),
+                    false,
+                ),
             ]),
         });
         app.models = Some(models);
         app.modal_stack.push(PaneId::Models);
         for ch in "opus 4".chars() {
-            assert!(matches!(route_models(models_key(KeyCode::Char(ch)), &mut app, &runtime), InputAction::None));
+            assert!(matches!(
+                route_models(models_key(KeyCode::Char(ch)), &mut app, &runtime),
+                InputAction::None
+            ));
         }
-        assert!(matches!(route_models(models_key(KeyCode::Down), &mut app, &runtime), InputAction::None));
+        assert!(matches!(
+            route_models(models_key(KeyCode::Down), &mut app, &runtime),
+            InputAction::None
+        ));
         match route_models(models_key(KeyCode::Enter), &mut app, &runtime) {
             InputAction::ModelsApply(id) => assert_eq!(id, "github-copilot/claude-opus-4.8"),
             _ => panic!("Enter did not apply selected visible model"),
@@ -903,7 +987,12 @@ mod tests {
     }
 
     fn scroll_event(kind: MouseEventKind) -> crossterm::event::MouseEvent {
-        MouseEvent { kind, column: 5, row: 5, modifiers: KeyModifiers::NONE }
+        MouseEvent {
+            kind,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     /// When scroll_lines=5 is configured, one ScrollUp event must add exactly 5
@@ -913,7 +1002,11 @@ mod tests {
         let mut app = make_app();
         app.transcript.test_set_scroll_back(0);
         handle_mouse(scroll_event(MouseEventKind::ScrollUp), &mut app, 5);
-        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should be 5 with scroll_lines=5");
+        assert_eq!(
+            app.transcript.scroll_back_pos(),
+            5,
+            "scroll_back should be 5 with scroll_lines=5"
+        );
     }
 
     /// When scroll_lines=5 is configured, one ScrollDown event must subtract 5
@@ -923,7 +1016,11 @@ mod tests {
         let mut app = make_app();
         app.transcript.test_set_scroll_back(10);
         handle_mouse(scroll_event(MouseEventKind::ScrollDown), &mut app, 5);
-        assert_eq!(app.transcript.scroll_back_pos(), 5, "scroll_back should decrease by 5");
+        assert_eq!(
+            app.transcript.scroll_back_pos(),
+            5,
+            "scroll_back should decrease by 5"
+        );
     }
 
     /// When scroll_lines is absent (None) the caller passes the default of 3.

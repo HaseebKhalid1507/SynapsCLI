@@ -114,7 +114,12 @@ mod tests {
         let sidecar_keys = ["sidecar_toggle_key"];
         for def in ALL_SETTINGS {
             if sidecar_keys.contains(&def.key) {
-                assert_eq!(def.category, Category::Sidecar, "setting '{}' should be in Sidecar", def.key);
+                assert_eq!(
+                    def.category,
+                    Category::Sidecar,
+                    "setting '{}' should be in Sidecar",
+                    def.key
+                );
             }
         }
         // sidecar_toggle_key must exist (it's the only generic sidecar setting kept in core).
@@ -126,7 +131,11 @@ mod tests {
 
     // ---- Phase 8 slice 8A.4: visible_categories ----
 
-    fn mk_claim(plugin: &str, command: &str, cat: Option<&str>) -> synaps_cli::skills::registry::LifecycleClaim {
+    fn mk_claim(
+        plugin: &str,
+        command: &str,
+        cat: Option<&str>,
+    ) -> synaps_cli::skills::registry::LifecycleClaim {
         synaps_cli::skills::registry::LifecycleClaim {
             plugin: plugin.to_string(),
             command: command.to_string(),

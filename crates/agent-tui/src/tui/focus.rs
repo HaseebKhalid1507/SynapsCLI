@@ -251,13 +251,7 @@ impl FocusRing {
                 matched = true;
             }
         }
-        if matched
-            && !visible
-            && self
-                .slots
-                .get(self.current)
-                .is_some_and(|s| s.id.0 == id)
-        {
+        if matched && !visible && self.slots.get(self.current).is_some_and(|s| s.id.0 == id) {
             self.step(true);
         }
         matched

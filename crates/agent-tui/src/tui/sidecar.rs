@@ -17,7 +17,7 @@
 //! the manifest's `provides.sidecar.model.default_path` if any.
 
 use synaps_cli::sidecar::discovery::{discover, DiscoveredSidecar};
-use synaps_cli::sidecar::manager::{SidecarManager, SidecarError, SidecarLifecycleEvent};
+use synaps_cli::sidecar::manager::{SidecarError, SidecarLifecycleEvent, SidecarManager};
 use synaps_cli::sidecar::protocol::{InsertTextMode, SIDECAR_PROTOCOL_VERSION};
 use synaps_cli::sidecar::spawn::SidecarSpawnArgs;
 
@@ -117,8 +117,8 @@ impl SidecarUiState {
         });
 
         let manager = SidecarManager::spawn(&sidecar.binary, &args, config)
-        .await
-        .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
+            .await
+            .map_err(|err: SidecarError| format!("failed to start sidecar: {}", err))?;
 
         // Read the sidecar's compiled backend straight from the cached
         // `info.get` response (Phase 5). Falls back to None when the plugin
@@ -224,10 +224,7 @@ pub(crate) fn handle_event(app: &mut App, plugin_id: &str, event: SidecarLifecyc
         },
         SidecarLifecycleEvent::Error(message) => {
             v.status = SidecarUiStatus::Error(message.clone());
-            app.push_msg(ChatMessage::Error(format!(
-                "sidecar error: {}",
-                message
-            )));
+            app.push_msg(ChatMessage::Error(format!("sidecar error: {}", message)));
         }
         SidecarLifecycleEvent::Exited => {
             let label = app
@@ -333,7 +330,10 @@ mod tests {
     fn build_spawn_args_skips_manifest_default_when_file_missing() {
         let sidecar = discovered(Some("/definitely/not/a/real/path/xyz.bin"));
         let out_args = build_spawn_args(&sidecar, None);
-        assert!(out_args.is_empty(), "missing default file must not produce args, got {out_args:?}");
+        assert!(
+            out_args.is_empty(),
+            "missing default file must not produce args, got {out_args:?}"
+        );
     }
 
     #[test]

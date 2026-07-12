@@ -1,22 +1,24 @@
-use ratatui::Frame;
+use super::super::theme::{ModalKind, THEME};
+use super::schema::{visible_categories, EditorKind, SettingDef};
+use super::{ActiveEditor, Focus, RuntimeSnapshot, SettingsState};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
-use super::{SettingsState, Focus, RuntimeSnapshot, ActiveEditor};
-use super::schema::{SettingDef, EditorKind, visible_categories};
-use super::super::theme::{ModalKind, THEME};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::Frame;
 
-pub(crate) fn render(
-    frame: &mut Frame,
-    area: Rect,
-    state: &SettingsState,
-    snap: &RuntimeSnapshot,
-) {
+pub(crate) fn render(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let w = (area.width.saturating_mul(8) / 10).max(60).min(area.width);
-    let h = (area.height.saturating_mul(7) / 10).max(20).min(area.height);
+    let h = (area.height.saturating_mul(7) / 10)
+        .max(20)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     // P19.1: per-part chrome. Border resolves to the `settings.border`
@@ -36,10 +38,10 @@ pub(crate) fn render(
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let [content, footer_bar] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-        .areas(inner);
-    let [sidebar, main] = Layout::horizontal([Constraint::Length(20), Constraint::Min(1)])
-        .areas(content);
+    let [content, footer_bar] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [sidebar, main] =
+        Layout::horizontal([Constraint::Length(20), Constraint::Min(1)]).areas(content);
 
     render_categories(frame, sidebar, state, snap);
     render_settings(frame, main, state, snap);
@@ -55,7 +57,11 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
     let cats = visible_categories(&snap.lifecycle_claims);
     let n_builtin = cats.len();
     for (i, cat) in cats.iter().enumerate() {
-        let marker = if i == state.category_idx { "▸ " } else { "  " };
+        let marker = if i == state.category_idx {
+            "▸ "
+        } else {
+            "  "
+        };
         let style = if i == state.category_idx && state.focus == Focus::Left {
             Style::default().fg(THEME.load().claude_label)
         } else if i == state.category_idx {
@@ -69,7 +75,11 @@ fn render_categories(frame: &mut Frame, area: Rect, state: &SettingsState, snap:
     }
     for (i, pcat) in snap.plugin_categories.iter().enumerate() {
         let abs = n_builtin + i;
-        let marker = if abs == state.category_idx { "▸ " } else { "  " };
+        let marker = if abs == state.category_idx {
+            "▸ "
+        } else {
+            "  "
+        };
         let style = if abs == state.category_idx && state.focus == Focus::Left {
             Style::default().fg(THEME.load().claude_label)
         } else if abs == state.category_idx {
@@ -118,16 +128,28 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         let current_value = current_value_for(def, snap);
         let value_display = if selected {
             match (&state.edit_mode, &def.editor) {
-                (Some(ActiveEditor::Text { buffer, setting_key, error, .. }), _)
-                    if *setting_key == def.key => {
+                (
+                    Some(ActiveEditor::Text {
+                        buffer,
+                        setting_key,
+                        error,
+                        ..
+                    }),
+                    _,
+                ) if *setting_key == def.key => {
                     let mut s = format!("[{}_]", buffer);
                     if let Some(err) = error {
                         s.push_str(&format!("  ! {}", err));
                     }
                     s
                 }
-                (Some(ActiveEditor::CustomModel { buffer, setting_key }), _)
-                    if *setting_key == def.key => {
+                (
+                    Some(ActiveEditor::CustomModel {
+                        buffer,
+                        setting_key,
+                    }),
+                    _,
+                ) if *setting_key == def.key => {
                     format!("[{}_]", buffer)
                 }
                 (None, EditorKind::Cycler(_)) => {
@@ -144,7 +166,11 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
         if let Some((key, msg)) = &state.row_error {
             if selected_key == Some(key.as_str()) && i == state.setting_idx {
                 let is_note = msg.starts_with("saved");
-                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                let color = if is_note {
+                    THEME.load().help_fg
+                } else {
+                    THEME.load().error_color
+                };
                 lines.push(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
                 ]));
@@ -153,7 +179,10 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &
     }
     frame.render_widget(Paragraph::new(lines), area);
 
-    if let Some(ActiveEditor::Picker { options, cursor, .. }) = &state.edit_mode {
+    if let Some(ActiveEditor::Picker {
+        options, cursor, ..
+    }) = &state.edit_mode
+    {
         render_picker(frame, area, options, *cursor);
     }
 }
@@ -171,10 +200,12 @@ fn render_plugin_category(
     };
     let mut lines: Vec<ratatui::text::Line> = Vec::new();
     // Header — makes the source explicit so users can audit.
-    lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-        format!("  Plugin: {}", cat.plugin),
-        Style::default().fg(THEME.load().help_fg),
-    )]));
+    lines.push(ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(
+            format!("  Plugin: {}", cat.plugin),
+            Style::default().fg(THEME.load().help_fg),
+        ),
+    ]));
     for (i, field) in cat.fields.iter().enumerate() {
         let selected = i == state.setting_idx && state.focus == Focus::Right;
         let style = if selected {
@@ -186,9 +217,16 @@ fn render_plugin_category(
         use synaps_cli::skills::registry::PluginSettingsEditor as PE;
         let display = if selected {
             match (&state.edit_mode, &field.editor) {
-                (Some(super::ActiveEditor::PluginText { plugin_id, key, buffer, error, .. }), _)
-                    if *plugin_id == cat.plugin && *key == field.key =>
-                {
+                (
+                    Some(super::ActiveEditor::PluginText {
+                        plugin_id,
+                        key,
+                        buffer,
+                        error,
+                        ..
+                    }),
+                    _,
+                ) if *plugin_id == cat.plugin && *key == field.key => {
                     let mut s = format!("[{}_]", buffer);
                     if let Some(err) = error {
                         s.push_str(&format!("  ! {}", err));
@@ -196,9 +234,14 @@ fn render_plugin_category(
                     s
                 }
                 (None, PE::Cycler { .. }) => format!("◀ {} ▶", current),
-                (Some(super::ActiveEditor::PluginCustom { plugin_id, field: active_field, .. }), PE::Custom)
-                    if *plugin_id == cat.plugin && *active_field == field.key =>
-                {
+                (
+                    Some(super::ActiveEditor::PluginCustom {
+                        plugin_id,
+                        field: active_field,
+                        ..
+                    }),
+                    PE::Custom,
+                ) if *plugin_id == cat.plugin && *active_field == field.key => {
                     "(custom editor open)".to_string()
                 }
                 (_, PE::Custom) => "(custom — Enter to edit)".to_string(),
@@ -209,15 +252,18 @@ fn render_plugin_category(
         } else {
             current.clone()
         };
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            format!("  {:<20} {}", field.label, display),
-            style,
-        )]));
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(format!("  {:<20} {}", field.label, display), style),
+        ]));
         if let Some((rk, msg)) = &state.row_error {
             let want = format!("plugin.{}.{}", cat.plugin, field.key);
             if selected && rk == &want {
                 let is_note = msg.starts_with("saved");
-                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                let color = if is_note {
+                    THEME.load().help_fg
+                } else {
+                    THEME.load().error_color
+                };
                 lines.push(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
                 ]));
@@ -227,7 +273,12 @@ fn render_plugin_category(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+fn render_plugins_list(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+) {
     let mut lines = Vec::new();
 
     // Row 0 — action row. Styled distinctly so it reads as a button, not a plugin.
@@ -241,16 +292,19 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
             .fg(THEME.load().claude_text)
             .add_modifier(ratatui::style::Modifier::BOLD)
     };
-    lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-        "  + Open Plugin Marketplace…",
-        action_style,
-    )]));
+    lines.push(ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled("  + Open Plugin Marketplace…", action_style),
+    ]));
 
     // Surface load errors / notes attached to the action row.
     if let Some((key, msg)) = &state.row_error {
         if key == "plugins" {
             let is_note = msg.starts_with("saved");
-            let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+            let color = if is_note {
+                THEME.load().help_fg
+            } else {
+                THEME.load().error_color
+            };
             lines.push(ratatui::text::Line::from(vec![
                 ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
             ]));
@@ -261,7 +315,11 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
     for (i, p) in snap.plugins.iter().enumerate() {
         let row_idx = i + 1;
         let disabled = snap.disabled_plugins.iter().any(|d| d == &p.name);
-        let status = if disabled { "✗ disabled" } else { "✓ enabled" };
+        let status = if disabled {
+            "✗ disabled"
+        } else {
+            "✓ enabled"
+        };
         let skills_part = if p.skill_count > 0 {
             format!("  ({} skills)", p.skill_count)
         } else {
@@ -273,20 +331,31 @@ fn render_plugins_list(frame: &mut Frame, area: Rect, state: &SettingsState, sna
         } else {
             Style::default().fg(THEME.load().claude_text)
         };
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            format!("  {:<20} {}{}", p.name, status, skills_part),
-            style,
-        )]));
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(
+                format!("  {:<20} {}{}", p.name, status, skills_part),
+                style,
+            ),
+        ]));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
+fn render_providers_list(
+    frame: &mut Frame,
+    area: Rect,
+    state: &SettingsState,
+    snap: &RuntimeSnapshot,
+) {
     let providers = synaps_cli::runtime::openai::registry::providers();
     let total_rows = providers.len() + 1; // +1 for Local
     let visible_height = area.height as usize;
-    let selected = if state.focus == Focus::Right { state.setting_idx } else { usize::MAX };
+    let selected = if state.focus == Focus::Right {
+        state.setting_idx
+    } else {
+        usize::MAX
+    };
 
     // Scroll offset — keep selected row in view (no scroll when focus is on left pane)
     let scroll_offset = if selected == usize::MAX {
@@ -319,7 +388,11 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
         };
 
         // Show editor if active on this row
-        let display = if let Some(ActiveEditor::ApiKey { provider_id, buffer }) = &state.edit_mode {
+        let display = if let Some(ActiveEditor::ApiKey {
+            provider_id,
+            buffer,
+        }) = &state.edit_mode
+        {
             if provider_id == "local.url" {
                 format!("[{}_]", buffer)
             } else {
@@ -329,15 +402,21 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
             local_status
         };
 
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            format!("  {:<20} {}", "Local (Ollama/etc)", display),
-            style,
-        )]));
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(
+                format!("  {:<20} {}", "Local (Ollama/etc)", display),
+                style,
+            ),
+        ]));
 
         if let Some((key, msg)) = &state.row_error {
             if key == "provider.local.url" && is_selected {
                 let is_note = msg.starts_with("saved");
-                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                let color = if is_note {
+                    THEME.load().help_fg
+                } else {
+                    THEME.load().error_color
+                };
                 lines.push(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
                 ]));
@@ -358,7 +437,11 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
             Style::default().fg(THEME.load().claude_text)
         };
 
-        let status = if let Some(ActiveEditor::ApiKey { provider_id, buffer }) = &state.edit_mode {
+        let status = if let Some(ActiveEditor::ApiKey {
+            provider_id,
+            buffer,
+        }) = &state.edit_mode
+        {
             if provider_id == p.key {
                 let masked: String = "*".repeat(buffer.len().min(32));
                 format!("[{}_]", masked)
@@ -369,15 +452,18 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
             provider_status(p, snap)
         };
 
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            format!("  {:<20} {}", p.name, status),
-            style,
-        )]));
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(format!("  {:<20} {}", p.name, status), style),
+        ]));
 
         if let Some((key, msg)) = &state.row_error {
             if key == &format!("provider.{}", p.key) && is_selected {
                 let is_note = msg.starts_with("saved");
-                let color = if is_note { THEME.load().help_fg } else { THEME.load().error_color };
+                let color = if is_note {
+                    THEME.load().help_fg
+                } else {
+                    THEME.load().error_color
+                };
                 lines.push(ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(format!("    {}", msg), Style::default().fg(color)),
                 ]));
@@ -387,20 +473,27 @@ fn render_providers_list(frame: &mut Frame, area: Rect, state: &SettingsState, s
 
     // Scroll indicators
     if scroll_offset > 0 {
-        lines.insert(0, ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            "  ▲ more", Style::default().fg(THEME.load().help_fg),
-        )]));
+        lines.insert(
+            0,
+            ratatui::text::Line::from(vec![ratatui::text::Span::styled(
+                "  ▲ more",
+                Style::default().fg(THEME.load().help_fg),
+            )]),
+        );
     }
     if scroll_offset + visible_height < total_rows {
-        lines.push(ratatui::text::Line::from(vec![ratatui::text::Span::styled(
-            "  ▼ more", Style::default().fg(THEME.load().help_fg),
-        )]));
+        lines.push(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled("  ▼ more", Style::default().fg(THEME.load().help_fg)),
+        ]));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap: &RuntimeSnapshot) -> String {
+fn provider_status(
+    p: &synaps_cli::runtime::openai::registry::ProviderSpec,
+    snap: &RuntimeSnapshot,
+) -> String {
     // Broker-sourced, non-secret status: the TUI renders a masked preview and
     // never holds the key value itself.
     let key_status = match snap.provider_key_status.get(p.key) {
@@ -410,7 +503,9 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
     };
 
     // Append ping summary if available — count online/total models for this provider
-    let models: Vec<_> = p.models.iter()
+    let models: Vec<_> = p
+        .models
+        .iter()
         .filter_map(|(id, _, _)| {
             let full_key = format!("{}/{}", p.key, id);
             snap.model_health.get(&full_key).map(|(s, ms)| (s, *ms))
@@ -421,11 +516,13 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
         return key_status;
     }
 
-    let online = models.iter().filter(|(s, _)| {
-        matches!(s, synaps_cli::runtime::openai::ping::PingStatus::Online)
-    }).count();
+    let online = models
+        .iter()
+        .filter(|(s, _)| matches!(s, synaps_cli::runtime::openai::ping::PingStatus::Online))
+        .count();
     let total = models.len();
-    let fastest = models.iter()
+    let fastest = models
+        .iter()
         .filter(|(s, _)| matches!(s, synaps_cli::runtime::openai::ping::PingStatus::Online))
         .map(|(_, ms)| *ms)
         .min();
@@ -439,7 +536,6 @@ fn provider_status(p: &synaps_cli::runtime::openai::registry::ProviderSpec, snap
     format!("{}{}", key_status, ping_str)
 }
 
-
 fn render_plugin_custom_editor(
     frame: &mut Frame,
     area: Rect,
@@ -447,12 +543,21 @@ fn render_plugin_custom_editor(
 ) {
     let rows = &session.render.rows;
     let cursor = session.render.cursor.unwrap_or(0);
-    let footer_lines: u16 = if session.render.footer.is_some() { 1 } else { 0 };
+    let footer_lines: u16 = if session.render.footer.is_some() {
+        1
+    } else {
+        0
+    };
     let avail_w = area.width.saturating_sub(4).max(1);
     let w = avail_w.clamp(avail_w.min(40), 100); // clamp min to avail so narrow terminals can't overflow (#tui-safety fix 3)
     let needed = rows.len() as u16 + 2 + footer_lines;
     let h = needed.clamp(3, area.height.saturating_sub(2).max(3));
-    let rect = Rect { x: area.x + 2, y: area.y + 2, width: w, height: h };
+    let rect = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .title(format!(" {} · {} ", session.plugin_id, session.field))
@@ -464,17 +569,26 @@ fn render_plugin_custom_editor(
     frame.render_widget(block, rect);
 
     let (list_area, footer_area) = if footer_lines > 0 {
-        let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(footer_lines)])
-            .areas(inner);
+        let [body, foot] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(footer_lines)]).areas(inner);
         (body, Some(foot))
     } else {
         (inner, None)
     };
 
     let visible_height = list_area.height as usize;
-    let scroll_offset = if cursor >= visible_height { cursor - visible_height + 1 } else { 0 };
+    let scroll_offset = if cursor >= visible_height {
+        cursor - visible_height + 1
+    } else {
+        0
+    };
     let mut lines = Vec::new();
-    for (i, row) in rows.iter().enumerate().skip(scroll_offset).take(visible_height) {
+    for (i, row) in rows
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+    {
         let mut style = if i == cursor {
             Style::default().fg(THEME.load().claude_label)
         } else {
@@ -503,7 +617,12 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     let h = (options.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let x = area.x + 2;
     let y = area.y + 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -521,7 +640,12 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
     };
 
     let mut lines = Vec::new();
-    for (i, opt) in options.iter().enumerate().skip(scroll_offset).take(visible_height) {
+    for (i, opt) in options
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+    {
         let style = if i == cursor {
             Style::default().fg(THEME.load().claude_label)
         } else {
@@ -537,11 +661,13 @@ fn render_picker(frame: &mut Frame, area: Rect, options: &[String], cursor: usiz
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &SettingsState, snap: &RuntimeSnapshot) {
     let cats = visible_categories(&snap.lifecycle_claims);
-    let cat = cats.get(state.category_idx).copied().unwrap_or(super::schema::Category::Plugins);
-    let on_plugins_right = cat == super::schema::Category::Plugins
-        && state.focus == Focus::Right;
-    let on_providers_right = cat == super::schema::Category::Providers
-        && state.focus == Focus::Right;
+    let cat = cats
+        .get(state.category_idx)
+        .copied()
+        .unwrap_or(super::schema::Category::Plugins);
+    let on_plugins_right = cat == super::schema::Category::Plugins && state.focus == Focus::Right;
+    let on_providers_right =
+        cat == super::schema::Category::Providers && state.focus == Focus::Right;
     let in_api_key_editor = matches!(state.edit_mode, Some(ActiveEditor::ApiKey { .. }));
     let hint = if in_api_key_editor {
         "type key  Enter save  Esc cancel"
@@ -590,7 +716,9 @@ mod tui_safety_tests {
     fn mask_key(key: &str) -> String {
         let chars: Vec<char> = key.chars().collect();
         let n = chars.len();
-        if n <= 8 { return "*".repeat(n); }
+        if n <= 8 {
+            return "*".repeat(n);
+        }
         let suffix: String = chars[n - 4..].iter().collect();
         format!("***...{}", suffix)
     }
@@ -608,7 +736,10 @@ mod tui_safety_tests {
         let key = "sk-abcdefghij1234";
         let result = mask_key(key);
         assert!(result.starts_with("***..."), "should start with ***...");
-        assert!(result.ends_with("1234"), "should end with last 4 ASCII chars");
+        assert!(
+            result.ends_with("1234"),
+            "should end with last 4 ASCII chars"
+        );
     }
 
     #[test]
@@ -616,8 +747,10 @@ mod tui_safety_tests {
         // Multi-byte UTF-8 — old code panicked here, new code must not
         let key = "sk-café-über-日本語-key1"; // contains non-ASCII
         let result = mask_key(key); // must not panic
-        assert!(result.starts_with("***...") || result.chars().all(|c| c == '*'),
-            "unexpected shape: {result}");
+        assert!(
+            result.starts_with("***...") || result.chars().all(|c| c == '*'),
+            "unexpected shape: {result}"
+        );
     }
 
     #[test]
@@ -628,8 +761,14 @@ mod tui_safety_tests {
         // Must not panic; must start with ***...
         assert!(result.starts_with("***..."), "got: {result}");
         // Last 4 chars should be the tail
-        let expected_tail: String = key.chars().rev().take(4).collect::<Vec<_>>()
-            .into_iter().rev().collect();
+        let expected_tail: String = key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         assert!(result.ends_with(&expected_tail), "tail mismatch: {result}");
     }
 
@@ -663,8 +802,7 @@ mod tui_safety_tests {
     fn plugin_editor_width_never_exceeds_area() {
         for aw in 0u16..=200 {
             let w = plugin_editor_w(aw);
-            assert!(w <= aw.max(1),
-                "plugin editor width {w} exceeds area {aw}");
+            assert!(w <= aw.max(1), "plugin editor width {w} exceeds area {aw}");
         }
     }
 
@@ -672,8 +810,7 @@ mod tui_safety_tests {
     fn picker_width_never_exceeds_area() {
         for aw in 0u16..=200 {
             let w = picker_w(aw);
-            assert!(w <= aw.max(1),
-                "picker width {w} exceeds area {aw}");
+            assert!(w <= aw.max(1), "picker width {w} exceeds area {aw}");
         }
     }
 
@@ -681,8 +818,7 @@ mod tui_safety_tests {
     fn secret_prompt_width_never_exceeds_area() {
         for aw in 0u16..=200 {
             let w = secret_prompt_w(aw);
-            assert!(w <= aw,
-                "secret prompt width {w} exceeds area {aw}");
+            assert!(w <= aw, "secret prompt width {w} exceeds area {aw}");
         }
     }
 

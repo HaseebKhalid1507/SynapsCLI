@@ -1,9 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
-    build_sections, expanded_visible_models, normalize_favorite_id,
-    remove_favorite_compat, selected_expanded_model, selected_model, selected_provider,
-    visible_rows, ExpandedLoadState, ExpandedModelsState, ModelsModalState, ModelsView,
+    build_sections, expanded_visible_models, normalize_favorite_id, remove_favorite_compat,
+    selected_expanded_model, selected_model, selected_provider, visible_rows, ExpandedLoadState,
+    ExpandedModelsState, ModelsModalState, ModelsView,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

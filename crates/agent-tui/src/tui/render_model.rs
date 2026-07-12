@@ -99,7 +99,6 @@ pub(crate) struct RenderModel {
     // ── Edge-scrub geometry ───────────────────────────────────────────────────
     /// Pre-computed `protected_bottom_rows` for `scrub_crossterm_terminal_edges`.
     pub(crate) protected_bottom_rows: u16,
-
 }
 
 // ── Projection types ─────────────────────────────────────────────────────────

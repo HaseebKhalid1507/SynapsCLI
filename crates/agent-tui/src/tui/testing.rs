@@ -565,7 +565,8 @@ impl TestHarness {
     /// Begin a streaming tool call — drives the store's real
     /// `on_tool_use_start` routing, exactly as the stream handler does.
     pub fn tool_use_start(&mut self, tool_id: &str, tool_name: &str) -> &mut Self {
-        self.app.on_tool_use_start(tool_id.to_string(), tool_name.to_string());
+        self.app
+            .on_tool_use_start(tool_id.to_string(), tool_name.to_string());
         self
     }
 
@@ -589,8 +590,8 @@ impl TestHarness {
     /// Publish a toast with an explicit TTL (seconds) through the same
     /// provider the app uses. Expiry is governed by the frozen clock.
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
-        let toast = super::toast::Toast::new(id, text)
-            .ttl(Some(std::time::Duration::from_secs(ttl_secs)));
+        let toast =
+            super::toast::Toast::new(id, text).ttl(Some(std::time::Duration::from_secs(ttl_secs)));
         self.app.toasts.upsert(toast);
         self
     }
@@ -728,7 +729,8 @@ impl TestHarness {
     }
 
     fn record_unexecuted(&mut self, name: &str) {
-        self.actions.push(format!("command-action-unexecuted:{name}"));
+        self.actions
+            .push(format!("command-action-unexecuted:{name}"));
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
@@ -755,7 +757,11 @@ impl TestHarness {
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),
-            InputAction::PluginEditorOpen { plugin_id, category, field } => {
+            InputAction::PluginEditorOpen {
+                plugin_id,
+                category,
+                field,
+            } => {
                 format!("plugin-editor-open:{plugin_id}:{category}:{field}")
             }
             InputAction::PluginEditorKey { plugin_id, .. } => {

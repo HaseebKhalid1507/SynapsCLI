@@ -13,10 +13,7 @@ fn which_gamba() -> Option<std::path::PathBuf> {
         }
     }
     // 2. Check $PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("hidden")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("hidden").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -25,7 +22,8 @@ fn which_gamba() -> Option<std::path::PathBuf> {
         }
     }
     // 3. Fallback: dev build path
-    std::env::var("HOME").ok()
+    std::env::var("HOME")
+        .ok()
         .map(|h| std::path::PathBuf::from(h).join("Projects/GamblersDen/target/release/hidden"))
         .filter(|p| p.exists())
 }
@@ -41,7 +39,8 @@ impl App {
             // the TUI loses scroll-wheel events (and paste) after returning.
             crossterm::event::EnableMouseCapture,
             crossterm::event::EnableBracketedPaste
-        ).ok();
+        )
+        .ok();
     }
 
     /// Yield terminal to casino — tears down TUI, spawns GamblersDen.
@@ -50,16 +49,11 @@ impl App {
         if self.gamba_child.is_some() {
             return Err("🎰 Casino already running!".to_string());
         }
-        let bin = which_gamba().ok_or_else(|| {
-            "🎰 Nothing to see here...".to_string()
-        })?;
+        let bin = which_gamba().ok_or_else(|| "🎰 Nothing to see here...".to_string())?;
 
         // Tear down our TUI
         crossterm::terminal::disable_raw_mode().ok();
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen
-        ).ok();
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
         // Spawn the casino (non-blocking)
         match std::process::Command::new(&bin)
             .stdin(std::process::Stdio::inherit())
@@ -107,5 +101,4 @@ impl App {
             None
         }
     }
-
 }

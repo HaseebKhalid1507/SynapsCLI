@@ -1,15 +1,12 @@
 //! Chat TUI binary — event loop, terminal setup, module wiring.
 mod transcript;
 
-
 mod app;
 mod clock;
 mod commands;
 mod dispatch;
 mod draw;
-mod view_model;
 mod focus;
-pub(crate) mod text_metrics;
 mod gamba;
 mod help_find;
 mod helpers;
@@ -35,8 +32,10 @@ mod termcaps;
 /// in-crate tests or downstream consumers of the `testing` feature.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub(crate) mod text_metrics;
 mod theme;
 mod toast;
+mod view_model;
 mod viewport;
 
 /// Single process-global lock for ALL tests that mutate config-env vars
@@ -125,14 +124,23 @@ pub async fn run(
         // 100ms/10fps #131 throttle; 0.3.6 made publish O(viewport) so the cap
         // could be raised to a real frame rate without burning a core.)
         let throttle = std::time::Duration::from_millis(1000 / config.max_fps.max(1) as u64);
-        if should_draw(app.needs_redraw, app.force_redraw, app.streaming, last_draw.elapsed(), throttle) {
+        if should_draw(
+            app.needs_redraw,
+            app.force_redraw,
+            app.streaming,
+            last_draw.elapsed(),
+            throttle,
+        ) {
             // Terminal lives on the render thread — get size via the crossterm
             // TTY syscall directly (doesn't need the Terminal object).
             // Skip the frame entirely if the reported size is 0×0 (terminal not
             // yet ready, or a transient resize event) — publishing a 0×0 model
             // would produce layout artifacts.
             let term_size = match crossterm::terminal::size() {
-                Ok((w, h)) if w > 0 && h > 0 => ratatui::layout::Size { width: w, height: h },
+                Ok((w, h)) if w > 0 && h > 0 => ratatui::layout::Size {
+                    width: w,
+                    height: h,
+                },
                 _ => {
                     // Terminal not yet ready or transient resize — clear redraw
                     // flags and back off so we don't busy-spin when the size is

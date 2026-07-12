@@ -1,12 +1,12 @@
+use super::highlight::highlight_code_block;
+use super::render::classify_row;
+use super::text_metrics::{char_width, width as display_width};
+use super::theme::THEME;
+use super::transcript::LineMeta;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use super::text_metrics::{width as display_width, char_width};
-use super::theme::THEME;
-use super::highlight::highlight_code_block;
-use super::transcript::LineMeta;
-use super::render::classify_row;
 
 pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -15,7 +15,9 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
 
     let bold_style = base_style.add_modifier(Modifier::BOLD);
     let italic_style = base_style.add_modifier(Modifier::ITALIC);
-    let code_style = Style::default().fg(THEME.load().code_fg).bg(THEME.load().code_bg);
+    let code_style = Style::default()
+        .fg(THEME.load().code_fg)
+        .bg(THEME.load().code_bg);
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -26,7 +28,10 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
                 }
                 let mut code = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c == '`' { chars.next(); break; }
+                    if c == '`' {
+                        chars.next();
+                        break;
+                    }
                     code.push(c);
                     chars.next();
                 }
@@ -40,18 +45,26 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
                     buf.clear();
                 }
                 let is_bold = chars.peek() == Some(&'*');
-                if is_bold { chars.next(); }
+                if is_bold {
+                    chars.next();
+                }
                 let delim = if is_bold { "**" } else { "*" };
                 let mut inner = String::new();
                 loop {
                     match chars.next() {
                         Some('*') if is_bold => {
-                            if chars.peek() == Some(&'*') { chars.next(); break; }
+                            if chars.peek() == Some(&'*') {
+                                chars.next();
+                                break;
+                            }
                             inner.push('*');
                         }
                         Some('*') if !is_bold => break,
                         Some(c) => inner.push(c),
-                        None => { inner = format!("{}{}", delim, inner); break; }
+                        None => {
+                            inner = format!("{}{}", delim, inner);
+                            break;
+                        }
                     }
                 }
                 let style = if is_bold { bold_style } else { italic_style };
@@ -76,20 +89,29 @@ fn strip_inline_md(text: &str) -> String {
             '`' => {
                 // Skip backtick, consume until closing backtick
                 while let Some(&c) = chars.peek() {
-                    if c == '`' { chars.next(); break; }
+                    if c == '`' {
+                        chars.next();
+                        break;
+                    }
                     result.push(c);
                     chars.next();
                 }
             }
             '*' => {
                 let is_bold = chars.peek() == Some(&'*');
-                if is_bold { chars.next(); } // skip second *
-                // Consume content until closing delimiter
+                if is_bold {
+                    chars.next();
+                } // skip second *
+                  // Consume content until closing delimiter
                 let mut found_end = false;
                 while let Some(c) = chars.next() {
                     if c == '*' {
                         if is_bold {
-                            if chars.peek() == Some(&'*') { chars.next(); found_end = true; break; }
+                            if chars.peek() == Some(&'*') {
+                                chars.next();
+                                found_end = true;
+                                break;
+                            }
                             result.push(c);
                         } else {
                             found_end = true;
@@ -188,7 +210,11 @@ fn wrap_cell(text: &str, max_width: usize) -> Vec<String> {
 /// No outer border — clean, breathable layout. Header row is bold with a
 /// single ─ rule underneath. For tables >6 rows a faint rule appears every
 /// 5th body row for readability. Columns are padded to the widest cell.
-pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn render_table(
+    table_lines: &[String],
+    prefix: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut result: Vec<Line> = Vec::new();
     if table_lines.is_empty() {
         return result;
@@ -213,10 +239,7 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             continue;
         }
 
-        let cells: Vec<String> = stripped
-            .split('|')
-            .map(|c| c.trim().to_string())
-            .collect();
+        let cells: Vec<String> = stripped.split('|').map(|c| c.trim().to_string()).collect();
         rows.push(cells);
     }
 
@@ -251,7 +274,8 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     // "…" while giving long-text columns as much room as possible.
     let prefix_overhead = display_width(prefix) + 2; // prefix + "  "
     let per_col_overhead = 3; // " " + cell + " " + gap
-    let total_table_width = prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
+    let total_table_width =
+        prefix_overhead + col_widths.iter().sum::<usize>() + num_cols * per_col_overhead;
     if width > 0 && total_table_width > width {
         let available = width.saturating_sub(prefix_overhead + num_cols * per_col_overhead);
         if available > 0 && num_cols > 0 {
@@ -280,13 +304,15 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                 if shrinkable_indices.is_empty() || budget_for_shrinkable == 0 {
                     // All columns are narrow or no budget left — fall back to
                     // proportional shrink across everything.
-                    new_widths = col_widths.iter()
+                    new_widths = col_widths
+                        .iter()
                         .map(|&w| (w * available / total_content).max(3))
                         .collect();
                 } else {
                     // Distribute budget proportionally among shrinkable columns
                     for &idx in &shrinkable_indices {
-                        let share = (col_widths[idx] * budget_for_shrinkable / shrinkable_total).max(6);
+                        let share =
+                            (col_widths[idx] * budget_for_shrinkable / shrinkable_total).max(6);
                         new_widths[idx] = share;
                     }
                 }
@@ -298,7 +324,9 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
                     let mut indices: Vec<usize> = (0..num_cols).collect();
                     indices.sort_by(|a, b| col_widths[*b].cmp(&col_widths[*a]));
                     for &idx in &indices {
-                        if remainder == 0 { break; }
+                        if remainder == 0 {
+                            break;
+                        }
                         new_widths[idx] += 1;
                         remainder -= 1;
                     }
@@ -309,7 +337,9 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     }
 
     let border_style = Style::default().fg(THEME.load().table_border_color);
-    let header_style = Style::default().fg(THEME.load().table_header_color).add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(THEME.load().table_header_color)
+        .add_modifier(Modifier::BOLD);
     let cell_style = Style::default().fg(THEME.load().table_cell_color);
 
     // No top border — let it breathe
@@ -319,7 +349,11 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
     let body_count = rows.len().saturating_sub(body_start);
 
     for (i, row) in rows.iter().enumerate() {
-        let style = if has_header && i == 0 { header_style } else { cell_style };
+        let style = if has_header && i == 0 {
+            header_style
+        } else {
+            cell_style
+        };
 
         // Wrap each cell into multiple visual lines
         let mut wrapped_cols: Vec<Vec<String>> = Vec::new();
@@ -358,17 +392,27 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
         // so adjacent rows don't blur together
         if max_lines > 1 && i >= body_start && i < rows.len() - 1 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2508}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
+            let sep = format!(
+                "{}  {}",
+                prefix,
+                "\u{2508}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2)))
+            );
             result.push(Line::from(Span::styled(
                 sep,
-                Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(THEME.load().table_border_color)
+                    .add_modifier(Modifier::DIM),
             )));
         }
 
         // After header row, draw a single ─ rule
         if has_header && i == 0 {
             let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-            let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
+            let sep = format!(
+                "{}  {}",
+                prefix,
+                "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2)))
+            );
             result.push(Line::from(Span::styled(sep, border_style)));
         }
 
@@ -377,20 +421,34 @@ pub(crate) fn render_table(table_lines: &[String], prefix: &str, width: usize) -
             let body_idx = i - body_start; // 0-indexed body row
             if body_idx > 0 && body_idx % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
+                let sep = format!(
+                    "{}  {}",
+                    prefix,
+                    "\u{2500}"
+                        .repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2)))
+                );
                 result.push(Line::from(Span::styled(
                     sep,
-                    Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(THEME.load().table_border_color)
+                        .add_modifier(Modifier::DIM),
                 )));
             }
         } else if !has_header && body_count > 6 {
             // No header case — stripe from row 0
             if i > 0 && i % 5 == 0 && i < rows.len() - 1 {
                 let rule_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3;
-                let sep = format!("{}  {}", prefix, "\u{2500}".repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2))));
+                let sep = format!(
+                    "{}  {}",
+                    prefix,
+                    "\u{2500}"
+                        .repeat(rule_width.min(width.saturating_sub(display_width(prefix) + 2)))
+                );
                 result.push(Line::from(Span::styled(
                     sep,
-                    Style::default().fg(THEME.load().table_border_color).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(THEME.load().table_border_color)
+                        .add_modifier(Modifier::DIM),
                 )));
             }
         }
@@ -422,8 +480,10 @@ pub(crate) fn render_markdown_spans(
     // Byte offset of each source line within `text` — the composition step
     // of design §1.3 (all_lines borrows `text`, so ptr arithmetic is exact).
     let base_ptr = text.as_ptr() as usize;
-    let line_offs: Vec<usize> =
-        all_lines.iter().map(|l| l.as_ptr() as usize - base_ptr).collect();
+    let line_offs: Vec<usize> = all_lines
+        .iter()
+        .map(|l| l.as_ptr() as usize - base_ptr)
+        .collect();
 
     /// Flush a buffered table run. Rendered table rows are transformed views
     /// (cells re-split, padded, possibly wrapped) — ContentLine per lock L1's
@@ -442,7 +502,10 @@ pub(crate) fn render_markdown_spans(
             return;
         }
         let last = table_buf.len() - 1;
-        for (j, l) in render_table(table_buf, prefix, width).into_iter().enumerate() {
+        for (j, l) in render_table(table_buf, prefix, width)
+            .into_iter()
+            .enumerate()
+        {
             let src_line = table_start + j.min(last);
             lines.push((l, LineMeta::ContentLine { msg_idx, src_line }));
         }
@@ -452,12 +515,22 @@ pub(crate) fn render_markdown_spans(
     for (line_idx, line) in all_lines.iter().enumerate() {
         let trimmed = line.trim();
         let line_off = line_offs[line_idx];
-        let content_line = LineMeta::ContentLine { msg_idx, src_line: line_idx };
+        let content_line = LineMeta::ContentLine {
+            msg_idx,
+            src_line: line_idx,
+        };
 
         // Code block toggle
         if trimmed.starts_with("```") {
             // Flush any pending table
-            flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
+            flush_table(
+                &mut lines,
+                &mut table_buf,
+                table_start_line,
+                prefix,
+                width,
+                msg_idx,
+            );
             if !in_code_block {
                 in_code_block = true;
                 code_lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
@@ -466,7 +539,9 @@ pub(crate) fn render_markdown_spans(
             } else {
                 // End of code block — render with language tag chip + border frame
                 let border_style = Style::default().fg(THEME.load().border);
-                let lang_style = Style::default().fg(THEME.load().muted).add_modifier(Modifier::DIM);
+                let lang_style = Style::default()
+                    .fg(THEME.load().muted)
+                    .add_modifier(Modifier::DIM);
 
                 // Calculate block width: use a reasonable portion of available width
                 let block_inner_width = width.saturating_sub(display_width(prefix) + 4); // prefix + "  " + borders
@@ -477,43 +552,68 @@ pub(crate) fn render_markdown_spans(
                 // ContentLine so whole-block selections cover the fences and
                 // copy reconstructs ``` delimiters (design §1.4/§2: fences are
                 // source, not chrome). Breathing blanks are injected: Chrome.
-                let open_fence = LineMeta::ContentLine { msg_idx, src_line: code_open_line };
+                let open_fence = LineMeta::ContentLine {
+                    msg_idx,
+                    src_line: code_open_line,
+                };
                 lines.push((Line::from(""), LineMeta::Chrome)); // breathing room above code block
                 if !code_lang.is_empty() {
                     // Language label line (above the top rule)
                     let lang_upper = code_lang.to_uppercase();
-                    let spaced: String = lang_upper.chars()
+                    let spaced: String = lang_upper
+                        .chars()
                         .enumerate()
-                        .map(|(i, c)| if i > 0 { format!(" {}", c) } else { c.to_string() })
+                        .map(|(i, c)| {
+                            if i > 0 {
+                                format!(" {}", c)
+                            } else {
+                                c.to_string()
+                            }
+                        })
                         .collect();
-                    lines.push((Line::from(vec![
-                        Span::styled(format!("{}  ", prefix), Style::default()),
-                        Span::styled(spaced, lang_style),
-                    ]), open_fence.clone()));
+                    lines.push((
+                        Line::from(vec![
+                            Span::styled(format!("{}  ", prefix), Style::default()),
+                            Span::styled(spaced, lang_style),
+                        ]),
+                        open_fence.clone(),
+                    ));
                 }
                 // Top border rule
-                lines.push((Line::from(Span::styled(
-                    format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
-                    border_style,
-                )), open_fence));
+                lines.push((
+                    Line::from(Span::styled(
+                        format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
+                        border_style,
+                    )),
+                    open_fence,
+                ));
 
                 // Code body (highlight_code_block already adds prefix + │ per line).
                 // One rendered row per code_buf line (LinesWithEndings), so the
                 // enumeration index maps 1:1 onto the source lines after the
                 // opening fence. Highlighted + clamped ⇒ ContentLine (lock L1);
                 // copy recovers the clamped tails from source.
-                for (j, hl_line) in highlight_code_block(&code_buf, &code_lang, prefix).into_iter().enumerate() {
+                for (j, hl_line) in highlight_code_block(&code_buf, &code_lang, prefix)
+                    .into_iter()
+                    .enumerate()
+                {
                     lines.push((
                         super::highlight::clamp_line(hl_line, width),
-                        LineMeta::ContentLine { msg_idx, src_line: code_open_line + 1 + j },
+                        LineMeta::ContentLine {
+                            msg_idx,
+                            src_line: code_open_line + 1 + j,
+                        },
                     ));
                 }
 
                 // Bottom border rule — stands in for the closing fence line.
-                lines.push((Line::from(Span::styled(
-                    format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
-                    border_style,
-                )), content_line.clone()));
+                lines.push((
+                    Line::from(Span::styled(
+                        format!("{}  {}", prefix, "\u{2500}".repeat(rule_width)),
+                        border_style,
+                    )),
+                    content_line.clone(),
+                ));
 
                 lines.push((Line::from(""), LineMeta::Chrome)); // breathing room below code block
                 in_code_block = false;
@@ -551,13 +651,27 @@ pub(crate) fn render_markdown_spans(
                 false
             };
             if !next_is_table {
-                flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
+                flush_table(
+                    &mut lines,
+                    &mut table_buf,
+                    table_start_line,
+                    prefix,
+                    width,
+                    msg_idx,
+                );
             }
             continue;
         }
 
         // Flush any pending table (shouldn't happen, but safety)
-        flush_table(&mut lines, &mut table_buf, table_start_line, prefix, width, msg_idx);
+        flush_table(
+            &mut lines,
+            &mut table_buf,
+            table_start_line,
+            prefix,
+            width,
+            msg_idx,
+        );
 
         // Headings — '#' markers stripped: transformed view, ContentLine.
         if trimmed.starts_with('#') {
@@ -569,10 +683,15 @@ pub(crate) fn render_markdown_spans(
             }
             let full = format!("{}  {}", prefix, heading_text);
             for wline in wrap_text(&full, width) {
-                lines.push((Line::from(Span::styled(
-                    wline,
-                    Style::default().fg(THEME.load().heading_color).add_modifier(Modifier::BOLD),
-                )), content_line.clone()));
+                lines.push((
+                    Line::from(Span::styled(
+                        wline,
+                        Style::default()
+                            .fg(THEME.load().heading_color)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    content_line.clone(),
+                ));
             }
             continue;
         }
@@ -582,7 +701,15 @@ pub(crate) fn render_markdown_spans(
             let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
             let full = format!("{}  \u{2502} {}", prefix, quote_text);
             for wline in wrap_text(&full, width) {
-                lines.push((Line::from(Span::styled(wline, Style::default().fg(THEME.load().quote_color).add_modifier(Modifier::ITALIC))), content_line.clone()));
+                lines.push((
+                    Line::from(Span::styled(
+                        wline,
+                        Style::default()
+                            .fg(THEME.load().quote_color)
+                            .add_modifier(Modifier::ITALIC),
+                    )),
+                    content_line.clone(),
+                ));
             }
             continue;
         }
@@ -594,7 +721,10 @@ pub(crate) fn render_markdown_spans(
             let cont_prefix = format!("{}    ", prefix);
             let flat = format!("{}{}", bullet_prefix, item_text);
             if flat.chars().count() <= width {
-                let bullet_span = Span::styled(bullet_prefix, Style::default().fg(THEME.load().list_bullet_color));
+                let bullet_span = Span::styled(
+                    bullet_prefix,
+                    Style::default().fg(THEME.load().list_bullet_color),
+                );
                 let mut item_spans = parse_inline_md(item_text, base_style);
                 let mut all_spans = vec![bullet_span];
                 all_spans.append(&mut item_spans);
@@ -607,7 +737,10 @@ pub(crate) fn render_markdown_spans(
                         } else {
                             &wline
                         };
-                        let bullet_span = Span::styled(bullet_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
+                        let bullet_span = Span::styled(
+                            bullet_prefix.clone(),
+                            Style::default().fg(THEME.load().list_bullet_color),
+                        );
                         let mut all_spans = vec![bullet_span];
                         all_spans.extend(parse_inline_md(inner, base_style));
                         lines.push((Line::from(all_spans), content_line.clone()));
@@ -631,7 +764,10 @@ pub(crate) fn render_markdown_spans(
                     let cont_prefix = format!("{}     ", prefix);
                     let flat = format!("{}{}", num_prefix, item_text);
                     if flat.chars().count() <= width {
-                        let num_span = Span::styled(num_prefix, Style::default().fg(THEME.load().list_bullet_color));
+                        let num_span = Span::styled(
+                            num_prefix,
+                            Style::default().fg(THEME.load().list_bullet_color),
+                        );
                         let mut item_spans = parse_inline_md(item_text, base_style);
                         let mut all_spans = vec![num_span];
                         all_spans.append(&mut item_spans);
@@ -644,12 +780,16 @@ pub(crate) fn render_markdown_spans(
                                 } else {
                                     &wline
                                 };
-                                let num_span = Span::styled(num_prefix.clone(), Style::default().fg(THEME.load().list_bullet_color));
+                                let num_span = Span::styled(
+                                    num_prefix.clone(),
+                                    Style::default().fg(THEME.load().list_bullet_color),
+                                );
                                 let mut all_spans = vec![num_span];
                                 all_spans.extend(parse_inline_md(inner, base_style));
                                 lines.push((Line::from(all_spans), content_line.clone()));
                             } else {
-                                let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
+                                let mut all_spans =
+                                    vec![Span::styled(cont_prefix.clone(), base_style)];
                                 all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
                                 lines.push((Line::from(all_spans), content_line.clone()));
                             }
@@ -681,8 +821,20 @@ pub(crate) fn render_markdown_spans(
         let full = format!("{}{}", full_prefix, flat);
         if full.chars().count() <= width {
             let meta = if untransformed {
-                let row = WrapRow { text: full.clone(), src: Some(0..full.len()), content_col: 0 };
-                classify_row(&full, &row, line, line_off, full_prefix.len(), msg_idx, line_idx)
+                let row = WrapRow {
+                    text: full.clone(),
+                    src: Some(0..full.len()),
+                    content_col: 0,
+                };
+                classify_row(
+                    &full,
+                    &row,
+                    line,
+                    line_off,
+                    full_prefix.len(),
+                    msg_idx,
+                    line_idx,
+                )
             } else {
                 content_line
             };
@@ -711,7 +863,15 @@ pub(crate) fn render_markdown_spans(
                     let rendered: String = std::iter::once(prefix_part.as_str())
                         .chain(parsed.iter().map(|s| s.content.as_ref()))
                         .collect();
-                    classify_row(&rendered, &row, line, line_off, full_prefix.len(), msg_idx, line_idx)
+                    classify_row(
+                        &rendered,
+                        &row,
+                        line,
+                        line_off,
+                        full_prefix.len(),
+                        msg_idx,
+                        line_idx,
+                    )
                 } else {
                     content_line.clone()
                 };
@@ -799,7 +959,11 @@ pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
     // Use display width (matching wrap_cell's policy) for the early-return check.
     if width == 0 || display_width(text.as_str()) <= width {
         let src = eligible.then_some(0..text.len());
-        return vec![WrapRow { text, src, content_col: 0 }];
+        return vec![WrapRow {
+            text,
+            src,
+            content_col: 0,
+        }];
     }
 
     // Continuation lines normally indent to match the leading whitespace of
@@ -912,9 +1076,13 @@ pub(crate) fn wrap_text(raw_text: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
-    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1_000.0) }
-    else { format!("{}", n) }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
 }
 
 #[cfg(test)]
@@ -923,9 +1091,15 @@ mod tests {
 
     /// Helper: extract all text content from rendered lines
     fn rendered_text(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(|l| {
-            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-        }).collect()
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     #[test]
@@ -971,7 +1145,11 @@ mod tests {
 
         // Short columns (#, Status, Speed) must survive intact
         let row1 = texts.iter().find(|t| t.contains("example")).unwrap();
-        assert!(row1.contains("0.13s"), "Speed column was truncated in: {}", row1);
+        assert!(
+            row1.contains("0.13s"),
+            "Speed column was truncated in: {}",
+            row1
+        );
         assert!(row1.contains("✅"), "Status was truncated in: {}", row1);
     }
 
@@ -987,8 +1165,10 @@ mod tests {
         let result = render_table(&table_lines, "", 80);
         let texts = rendered_text(&result);
         // No ellipsis anywhere
-        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
-            "Small table was unnecessarily truncated");
+        assert!(
+            !texts.iter().any(|t| t.contains('\u{2026}')),
+            "Small table was unnecessarily truncated"
+        );
     }
 
     #[test]
@@ -1022,11 +1202,16 @@ mod tests {
 
         // Full description text should be present across wrapped lines
         let all_text: String = texts.join(" ");
-        assert!(all_text.contains("grunt work"),
-            "Wrapped table lost content: {}", all_text);
+        assert!(
+            all_text.contains("grunt work"),
+            "Wrapped table lost content: {}",
+            all_text
+        );
         // No ellipsis — we wrap, not truncate
-        assert!(!texts.iter().any(|t| t.contains('\u{2026}')),
-            "Table used truncation instead of wrapping");
+        assert!(
+            !texts.iter().any(|t| t.contains('\u{2026}')),
+            "Table used truncation instead of wrapping"
+        );
     }
 
     #[test]
@@ -1042,16 +1227,32 @@ mod tests {
 
         // The ** markers should NOT appear in rendered text
         let all_text: String = texts.join(" ");
-        assert!(!all_text.contains("**"), "Bold markers ** still visible in: {}", all_text);
-        assert!(all_text.contains("Era"), "Bold content 'Era' missing from: {}", all_text);
+        assert!(
+            !all_text.contains("**"),
+            "Bold markers ** still visible in: {}",
+            all_text
+        );
+        assert!(
+            all_text.contains("Era"),
+            "Bold content 'Era' missing from: {}",
+            all_text
+        );
 
         // Check that the Era span actually has BOLD modifier
-        let era_line = result.iter().find(|l| {
-            l.spans.iter().any(|s| s.content.contains("Era"))
-        }).expect("No line contains 'Era'");
-        let era_span = era_line.spans.iter().find(|s| s.content.contains("Era")).unwrap();
-        assert!(era_span.style.add_modifier == Modifier::BOLD,
-            "Era span is not bold: {:?}", era_span.style);
+        let era_line = result
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("Era")))
+            .expect("No line contains 'Era'");
+        let era_span = era_line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Era"))
+            .unwrap();
+        assert!(
+            era_span.style.add_modifier == Modifier::BOLD,
+            "Era span is not bold: {:?}",
+            era_span.style
+        );
     }
 
     #[test]
@@ -1078,8 +1279,11 @@ mod tests {
         let texts = rendered_text(&result);
         let all_text: String = texts.join(" ");
         // Full label should be visible, not truncated
-        assert!(all_text.contains("Signature Move"),
-            "Label was truncated: {}", all_text);
+        assert!(
+            all_text.contains("Signature Move"),
+            "Label was truncated: {}",
+            all_text
+        );
     }
 
     // --- tab-anchor wrap tests ---
@@ -1192,15 +1396,14 @@ mod tests {
         // Each output line must fit within 6 display columns.
         for line in &lines {
             let w = display_width(line.as_str());
-            assert!(
-                w <= 6,
-                "line {:?} has display width {} > 6",
-                line,
-                w
-            );
+            assert!(w <= 6, "line {:?} has display width {} > 6", line, w);
         }
         // Must actually be split — it wouldn't fit on one line.
-        assert!(lines.len() >= 2, "CJK text should have wrapped but got {:?}", lines);
+        assert!(
+            lines.len() >= 2,
+            "CJK text should have wrapped but got {:?}",
+            lines
+        );
     }
 
     /// Emoji are typically 2 columns wide. Verify that a run of emoji wraps at the
@@ -1212,14 +1415,13 @@ mod tests {
         let lines = wrap_text(text, 6);
         for line in &lines {
             let w = display_width(line.as_str());
-            assert!(
-                w <= 6,
-                "emoji line {:?} has display width {} > 6",
-                line,
-                w
-            );
+            assert!(w <= 6, "emoji line {:?} has display width {} > 6", line, w);
         }
-        assert!(lines.len() >= 2, "emoji text should have wrapped but got {:?}", lines);
+        assert!(
+            lines.len() >= 2,
+            "emoji text should have wrapped but got {:?}",
+            lines
+        );
     }
 
     /// Mixed ASCII + CJK: ensures the display-width accounting is correct when both
@@ -1232,15 +1434,14 @@ mod tests {
         let lines = wrap_text(text, 5);
         for line in &lines {
             let w = display_width(line.as_str());
-            assert!(
-                w <= 5,
-                "mixed line {:?} has display width {} > 5",
-                line,
-                w
-            );
+            assert!(w <= 5, "mixed line {:?} has display width {} > 5", line, w);
         }
         // "AB" fits in 5 cols; "你好" (4 cols) fits in 5 cols but combined they don't.
-        assert!(lines.len() >= 2, "mixed ASCII+CJK should wrap at width=5, got {:?}", lines);
+        assert!(
+            lines.len() >= 2,
+            "mixed ASCII+CJK should wrap at width=5, got {:?}",
+            lines
+        );
     }
 
     /// Sanity: pure ASCII must still wrap the same way it always did.
@@ -1351,10 +1552,10 @@ mod tests {
     #[test]
     fn wrap_text_spans_tab_inputs_report_no_src_ranges() {
         let corpus: &[&str] = &[
-            "ab\tcd",                                                    // early return, expanded
+            "ab\tcd", // early return, expanded
             "\t",
             "key:\tlong value with several words that should wrap onto a second line",
-            "aaaaaaaa\tbbbbbbbb cccccccc dddddddd eeeeeeee ffffffff",    // \t near wrap boundary
+            "aaaaaaaa\tbbbbbbbb cccccccc dddddddd eeeeeeee ffffffff", // \t near wrap boundary
             "a\tb\tc",
         ];
         for input in corpus {
@@ -1375,7 +1576,10 @@ mod tests {
         // behavior, easy to get subtly wrong in the wrapper — red-team note).
         let rows = wrap_text_spans("ab\tcd", 80);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "ab  cd", "early return must yield expanded text");
+        assert_eq!(
+            rows[0].text, "ab  cd",
+            "early return must yield expanded text"
+        );
         assert_eq!(rows[0].src, None);
     }
 }

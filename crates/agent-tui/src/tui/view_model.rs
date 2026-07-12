@@ -72,10 +72,8 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) models: &'a Option<super::models::ModelsModalState>,
     pub(crate) help_find: &'a Option<synaps_cli::help::HelpFindState>,
     /// Settings-modal-scoped health snapshot input (spec §3.1).
-    pub(crate) model_health: &'a std::collections::HashMap<
-        String,
-        (synaps_cli::runtime::openai::ping::PingStatus, u64),
-    >,
+    pub(crate) model_health:
+        &'a std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
     pub(crate) secret_prompts: &'a synaps_cli::tools::SecretPromptQueue,
     pub(crate) modal_stack: &'a super::focus::ModalStack,
 }
