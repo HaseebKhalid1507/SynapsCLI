@@ -1,7 +1,7 @@
 //! C5c RED → GREEN: server broadcasts runtime events, policy-gated auto-turn.
 //!
 //! Tests:
-//!  1. events_auto_turn_default_false — EventsConfig default
+//!  1. events_auto_turn_default_true — EventsConfig default
 //!  2. events_auto_turn_parses_true — config key parsing
 //!  3. server_message_event_broadcast_shape — ServerMessage::Event serialises
 //!  4. drain_for_server_builds_server_message_event — integration of drain +
@@ -35,16 +35,35 @@ fn user_msg(text: &str) -> synaps_cli::SharedMessage {
 // ─── 1. EventsConfig default ──────────────────────────────────────────────────
 
 #[test]
-fn events_auto_turn_default_false() {
-    assert!(!EventsConfig::default().auto_turn);
+fn events_auto_turn_default_true() {
+    assert!(EventsConfig::default().auto_turn,
+        "default auto_turn must be true; opt-out via events.auto_turn = false");
 }
 
 // ─── 2. EventsConfig parses ───────────────────────────────────────────────────
 
 #[test]
-fn events_auto_turn_parses_true() {
+fn events_auto_turn_explicit_true_parses() {
     let cfg = load_config_from_str("events.auto_turn = true\n");
     assert!(cfg.events.auto_turn);
+}
+
+#[test]
+fn events_auto_turn_opt_out_false_parses() {
+    let cfg = load_config_from_str("events.auto_turn = false\n");
+    assert!(!cfg.events.auto_turn);
+}
+
+#[test]
+fn events_auto_turn_opt_out_zero_parses() {
+    let cfg = load_config_from_str("events.auto_turn = 0\n");
+    assert!(!cfg.events.auto_turn);
+}
+
+#[test]
+fn events_auto_turn_opt_out_no_parses() {
+    let cfg = load_config_from_str("events.auto_turn = no\n");
+    assert!(!cfg.events.auto_turn);
 }
 
 // ─── 3. ServerMessage::Event serialises correctly ────────────────────────────

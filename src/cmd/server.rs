@@ -50,13 +50,10 @@ struct ServerState {
     max_message_size: Option<usize>,
     /// Auto-approve confirm hooks (headless/agent mode).
     auto_approve_confirms: bool,
-    /// When true, the server will trigger a new model turn when runtime events
-    /// arrive while idle. Default false — clients must send a follow-up.
-    /// Controlled by `events.auto_turn` config key.
+    /// Auto-turn is on by default (`events.auto_turn` defaults to `true`).
+    /// Set `events.auto_turn = false` (or `0` / `no`) to opt out.
     ///
-    /// POLICY: broadcasts ALWAYS happen. The auto-turn is gated on this flag.
-    /// Do not enable in production without rate-limiting — busy event sources
-    /// can drain the API budget rapidly.
+    /// POLICY: broadcasts ALWAYS happen (C3: removed). The auto-turn is gated on this flag.
     events_auto_turn: bool,
     /// Internal channel: event drainer signals the auto-turn listener task
     /// when conditions are met. Unit trigger — the event content is already
