@@ -162,3 +162,9 @@ Assign people before coding; these are ownership boundaries, not permission to e
 | Docs owner | Keep spec/runbook/engplan truthful and synchronized | `docs/cloud-oauth-providers-{spec,runbook}.md`, `.plans/cloud-oauth-providers.plan.html` | All checkpoints |
 
 Conflicts are resolved by the listed file owner; cross-cutting interface changes require both owners. No worker edits another owner’s implementation files without handoff. Every checkpoint records commit, commands, result, blockers, owner, and UTC timestamp.
+
+## 9. Integration evidence (2026-03-12)
+
+Implemented commits through `bd24091` provide the typed cloud broker/RPC boundary, production AWS HTTPS/SigV4 and EventStream adapter, broker-owned cloud-state storage, runtime dispatch, and dynamic `/models` catalogs. `synaps login --provider aws-bedrock` now performs dynamic client registration, device polling, explicit account/role selection (or explicit unattended selectors), role credential acquisition, and atomic broker-state persistence. The opt-in live gate is `scripts/aws-bedrock-live-smoke.sh`; it remains unclaimed unless its prerequisite environment is present.
+
+Azure and Vertex continue to report `registration_required` when their respective Synaps-owned public client IDs are absent. Provider-local zero-network contracts cover Azure device polling/two-audience tokens/ARM deployments and Vertex PKCE/refresh/catalog/SSE. Live readiness remains blocked by the registrations and cloud resources listed in §§0 and 5; fixture success does not waive those gates.
