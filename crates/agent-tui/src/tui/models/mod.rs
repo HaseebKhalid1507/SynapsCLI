@@ -458,9 +458,13 @@ fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, 
         "github-copilot" => synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
             .into_iter()
             .map(|model| {
+                // Tiers are UI-only hints. Every id here is fixture-selectable
+                // (see `COPILOT_FALLBACK_MODELS`); disabled/endpointless rows
+                // never reach this list.
                 let tier = match model.id.as_str() {
-                    "gpt-5.3-codex" | "gpt-5.5" | "claude-opus-4.8" | "claude-fable-5" => "S+",
-                    "gpt-5.4" | "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.7" => "S",
+                    "gpt-5.3-codex" | "gpt-5.6-luna" | "gpt-5.6-terra" => "S+",
+                    "gpt-5.4" | "gpt-5.4-mini" | "claude-sonnet-4.6" | "claude-sonnet-5"
+                    | "claude-haiku-4.5" => "S",
                     _ => "",
                 };
                 (model.id, model.label.unwrap_or_default(), tier.to_string())
