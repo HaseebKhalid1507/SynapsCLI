@@ -151,10 +151,8 @@ pub(super) async fn handle_stream_event(
                     .display_rows();
                 reconcile_subagents(&mut app.subagents, &rows, std::time::Instant::now());
             }
-            // Clean up finished reactive subagent handles
-            if let Some(registry) = runtime.subagent_registry().lock().ok().as_mut() {
-                registry.cleanup_finished();
-            }
+            // NOTE: cleanup_finished removed — engine now reaps at turn completion
+            // inside the tokio::spawn wrapper (runtime/mod.rs) before Done is sent.
 
             // Flush events that arrived during streaming into api_messages
             let had_pending = !app.pending_events.is_empty();

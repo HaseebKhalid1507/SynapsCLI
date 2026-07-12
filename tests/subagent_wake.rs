@@ -484,3 +484,67 @@ fn live_reactive_subagent_end_to_end() {
         assert!(collect_result.is_ok(), "subagent_collect must succeed: {collect_result:?}");
     });
 }
+
+// ── C2: reap_finished engine seam (no-TUI) ───────────────────────────────────
+//
+// Verify that the engine-owned `reap_finished` seam works correctly from an
+// integration perspective: collected+finished handles are reaped, running
+// handles survive, and the seam is poison-safe.  No mock stream harness needed.
+
+/// C2-S1: reap_finished reaps collected handle and leaves running handle intact.
+#[test]
+fn c2_reap_finished_engine_seam_headless() {
+    use agent_engine::runtime::subagent::{reap_finished, SubagentHandle, SubagentRegistry, SubagentState, SubagentStatus};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    fn make_h(id: &str, state: Arc<RwLock<SubagentState>>) -> SubagentHandle {
+        let numeric_id: u64 = id.strip_prefix("sa_").and_then(|n| n.parse().ok()).unwrap_or(0);
+        SubagentHandle::new(
+            id.to_string(), numeric_id, "test-agent".into(), "task".into(),
+            "model".into(), "".into(), 300, state, None, None, None,
+        )
+    }
+
+    let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+
+    // Collected + finished handle — should be reaped
+    let done_state = Arc::new(RwLock::new(SubagentState::new()));
+    {
+        let mut s = done_state.write().unwrap();
+        s.status = SubagentStatus::Completed;
+        s.finished_at = Some(std::time::Instant::now());
+    }
+    // Running handle — should survive
+    let running_state = Arc::new(RwLock::new(SubagentState::new()));
+
+    {
+        let mut reg = registry.lock().unwrap();
+        let mut done = make_h("sa_c2_done", Arc::clone(&done_state));
+        done.mark_collected();
+        reg.register(done);
+        reg.register(make_h("sa_c2_running", Arc::clone(&running_state)));
+    }
+
+    reap_finished(&registry);
+
+    let reg = registry.lock().unwrap();
+    assert!(reg.get("sa_c2_done").is_none(), "collected+finished handle must be reaped by engine seam");
+    assert!(reg.get("sa_c2_running").is_some(), "running handle must survive engine reap");
+}
+
+/// C2-S2: reap_finished is poison-safe — must not panic when lock was poisoned.
+#[test]
+fn c2_reap_finished_poison_safe() {
+    use agent_engine::runtime::subagent::{reap_finished, SubagentRegistry};
+    use std::sync::{Arc, Mutex};
+
+    let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+    // Poison the mutex
+    let reg_c = Arc::clone(&registry);
+    let _ = std::panic::catch_unwind(|| {
+        let _g = reg_c.lock().unwrap();
+        panic!("poison");
+    });
+    // Must not panic
+    reap_finished(&registry);
+}

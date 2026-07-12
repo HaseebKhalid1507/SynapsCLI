@@ -342,6 +342,19 @@ impl SubagentRegistry {
     }
 }
 
+/// Engine-owned housekeeping seam: reap finished subagent handles at end of
+/// each turn.  Acquires the lock poison-safely — a panicked subagent thread
+/// must not prevent the turn from completing.
+///
+/// Intended to be called from the `tokio::spawn` wrapper in `runtime/mod.rs`
+/// after `run_stream_internal` returns and BEFORE sending `SessionEvent::Done`.
+pub fn reap_finished(registry: &Arc<std::sync::Mutex<SubagentRegistry>>) {
+    match registry.lock() {
+        Ok(mut guard) => guard.cleanup_finished(),
+        Err(poisoned) => poisoned.into_inner().cleanup_finished(),
+    }
+}
+
 impl Default for SubagentRegistry {
     fn default() -> Self {
         Self::new()
@@ -712,6 +725,65 @@ mod tests {
     fn display_rows_empty_registry() {
         let reg = SubagentRegistry::new();
         assert!(reg.display_rows().is_empty());
+    }
+
+    // ── reap_finished free-function tests ────────────────────────────────────
+
+    /// R1: reap_finished with a collected+finished handle in an Arc<Mutex<>> reaps it.
+    #[test]
+    fn reap_finished_headless_reaps_collected() {
+        let registry = Arc::new(std::sync::Mutex::new(SubagentRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let mut h = make_finished_handle("sa_r1");
+            h.mark_collected();
+            reg.register(h);
+        }
+        super::reap_finished(&registry);
+        assert!(registry.lock().unwrap().get("sa_r1").is_none(),
+            "reap_finished must reap collected+finished handle");
+    }
+
+    /// R2: reap_finished retains running handles — must not touch live work.
+    #[test]
+    fn reap_finished_headless_retains_running() {
+        let registry = Arc::new(std::sync::Mutex::new(SubagentRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.register(make_handle("sa_running"));
+        }
+        super::reap_finished(&registry);
+        assert!(registry.lock().unwrap().get("sa_running").is_some(),
+            "reap_finished must not touch running handles");
+    }
+
+    /// R3: reap_finished recovers from a poisoned lock without panicking.
+    #[test]
+    fn reap_finished_poisoned_lock_recovery() {
+        let registry = Arc::new(std::sync::Mutex::new(SubagentRegistry::new()));
+        {
+            let mut reg = registry.lock().unwrap();
+            let mut h = make_finished_handle("sa_poison");
+            h.mark_collected();
+            reg.register(h);
+        }
+
+        // Poison the mutex by panicking inside a lock guard.
+        let registry_c = Arc::clone(&registry);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = registry_c.lock().unwrap();
+            panic!("deliberately poison the mutex");
+        });
+
+        // reap_finished must not panic despite poisoned lock.
+        super::reap_finished(&registry);
+
+        // The handle must be reaped (cleanup ran despite poison).
+        let result = registry.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get("sa_poison")
+            .is_none();
+        assert!(result, "reap_finished must run cleanup even after poison");
     }
 }
 
