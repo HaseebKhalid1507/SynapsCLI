@@ -282,6 +282,7 @@ pub(crate) fn normalize_favorite_id(model: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn model_id_for_runtime(favorite_id: &str) -> String {
     normalize_favorite_id(favorite_id)
 }

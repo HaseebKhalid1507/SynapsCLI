@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
-    build_sections, expanded_visible_models, model_id_for_runtime, normalize_favorite_id,
+    build_sections, expanded_visible_models, normalize_favorite_id,
     remove_favorite_compat, selected_expanded_model, selected_model, selected_provider,
     visible_rows, ExpandedLoadState, ExpandedModelsState, ModelsModalState, ModelsView,
 };
@@ -90,7 +90,9 @@ pub(crate) fn handle_event(
         }
         KeyCode::Enter => {
             if let Some(model) = selected_model(&sections, state) {
-                InputOutcome::Apply(model_id_for_runtime(&model.favorite_id))
+                // Apply the provider-qualified identity of the visible row directly.
+                // Favorite normalization is compatibility-only and must not reroute it.
+                InputOutcome::Apply(model.id.clone())
             } else {
                 InputOutcome::None
             }
@@ -180,7 +182,7 @@ fn handle_expanded_event(state: &mut ModelsModalState, key: KeyEvent) -> InputOu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::models::ExpandedModelEntry;
+    use crate::tui::models::{model_id_for_runtime, ExpandedModelEntry};
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {

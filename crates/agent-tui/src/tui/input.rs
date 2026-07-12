@@ -865,6 +865,39 @@ mod tests {
     use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
     use synaps_cli::Session;
 
+    fn models_key(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn routed_models_search_navigation_applies_visible_provider_qualified_id() {
+        use crate::tui::focus::PaneId;
+        use crate::tui::models::{ExpandedLoadState, ExpandedModelEntry, ExpandedModelsState, ModelsModalState};
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        let mut models = ModelsModalState::new();
+        models.expanded = Some(ExpandedModelsState {
+            provider_key: "github-copilot".into(), provider_name: "GitHub Copilot".into(),
+            cursor: 0, search: String::new(),
+            load_state: ExpandedLoadState::Ready(vec![
+                ExpandedModelEntry::new("github-copilot/claude-opus-4.7".into(), "Opus 4.7".into(), false),
+                ExpandedModelEntry::new("github-copilot/claude-opus-4.8".into(), "Opus 4.8".into(), false),
+            ]),
+        });
+        app.models = Some(models);
+        app.modal_stack.push(PaneId::Models);
+        for ch in "opus 4".chars() {
+            assert!(matches!(route_models(models_key(KeyCode::Char(ch)), &mut app, &runtime), InputAction::None));
+        }
+        assert!(matches!(route_models(models_key(KeyCode::Down), &mut app, &runtime), InputAction::None));
+        match route_models(models_key(KeyCode::Enter), &mut app, &runtime) {
+            InputAction::ModelsApply(id) => assert_eq!(id, "github-copilot/claude-opus-4.8"),
+            _ => panic!("Enter did not apply selected visible model"),
+        }
+        assert!(app.models.is_none());
+        assert_eq!(app.modal_stack.top(), PaneId::Chat);
+    }
+
     fn make_app() -> App {
         App::new(Session::new("test-model", "low", None))
     }
