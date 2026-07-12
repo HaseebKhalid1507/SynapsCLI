@@ -495,24 +495,17 @@ fn registration_check_allows_when_reservation_intact() {
     );
 }
 
-/// Non-auto prompts always pass the registration check regardless of flags.
+/// Non-auto prompts pass only when no reservation or live turn raced in.
 #[test]
-fn registration_check_always_allows_non_auto_prompts() {
-    // Even with auto_turn_pending=false and in_flight=true, a real prompt passes.
-    let mut auto_turn_pending = false;
-    let in_flight_live = true; // shouldn't matter for non-auto
-    let is_auto = false;
+fn registration_check_revalidates_non_auto_prompts() {
+    let mut clear = false;
+    assert!(spawn_prompt_registration_check(false, &mut clear, false));
 
-    let allowed = spawn_prompt_registration_check(
-        is_auto,
-        &mut auto_turn_pending,
-        in_flight_live,
-    );
+    let mut auto_reserved = true;
+    assert!(!spawn_prompt_registration_check(false, &mut auto_reserved, false));
 
-    assert!(
-        allowed,
-        "non-auto prompts always pass the registration check"
-    );
+    let mut no_reservation = false;
+    assert!(!spawn_prompt_registration_check(false, &mut no_reservation, true));
 }
 
 /// Registration check denies when in_flight is already Some (concurrent real prompt

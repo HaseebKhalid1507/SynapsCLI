@@ -274,7 +274,9 @@ pub fn spawn_prompt_registration_check(
     in_flight_live: bool,
 ) -> bool {
     if !is_auto {
-        return true;
+        // A client prompt was checked before spawning, but an auto-turn or
+        // another prompt may have reserved/registered in the meantime.
+        return !*auto_turn_pending && !in_flight_live;
     }
     if *auto_turn_pending && !in_flight_live {
         return true;
