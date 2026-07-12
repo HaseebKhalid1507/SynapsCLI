@@ -16,10 +16,8 @@ pub(super) struct AuthMethods;
 /// Anthropic token first is wasteful and would FAIL on a codex-only Remote
 /// broker. (#158 C4/#7)
 pub(super) fn model_is_anthropic(model: &str) -> bool {
-    matches!(
-        crate::runtime::openai::resolve_route(model),
-        crate::runtime::openai::Provider::Anthropic
-    )
+    crate::runtime::openai::resolve_route(model)
+        .is_some_and(|route| route.wire == crate::runtime::openai::WireProtocol::AnthropicMessages)
 }
 
 impl AuthMethods {

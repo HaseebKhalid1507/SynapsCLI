@@ -47,56 +47,84 @@ pub fn extension_manager_for_routing() -> Option<Arc<tokio::sync::RwLock<Extensi
         .clone()
 }
 
-/// Routing decision for a given model id.
-#[derive(Debug, Clone)]
-pub enum Provider {
-    /// Native Anthropic path (default, backward-compatible).
-    Anthropic,
-    /// OpenAI-compatible provider with a resolved config.
-    OpenAi(ProviderConfig),
-    /// ChatGPT subscription-backed Codex responses endpoint.
-    Codex(ProviderConfig),
-    /// xAI public Responses API using broker-owned OAuth.
-    Xai(ProviderConfig),
-    /// Known provider prefix but no API key configured.
-    MissingKey(String),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPolicy {
+    OAuthAccessToken(crate::auth::OAuthProviderId),
+    BrokerProxy,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireProtocol {
+    AnthropicMessages,
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    CodexResponses,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRoute {
+    pub endpoint: String,
+    pub model: String,
+    pub provider: String,
+    pub auth: AuthPolicy,
+    pub wire: WireProtocol,
 }
 
-/// Decide which backend a model should route to.
-///
-/// - `provider/model` shorthand where `provider` matches a known provider key → `OpenAi`
-/// - `claude-*` → `Anthropic`
-/// - anything else → `Anthropic` (backward compat)
-///
-/// Configured-ness is answered by the credential broker; the routing decision
-/// never touches provider-key config or environment variables directly.
-pub fn resolve_route(model: &str) -> Provider {
-    if let Some((prefix, _rest)) = model.split_once('/') {
-        if prefix == "xai-auth" {
-            if model == "xai-auth/grok-4.5" {
-                return Provider::Xai(ProviderConfig {
-                    base_url: "https://api.x.ai/v1".into(),
-                    model: "grok-4.5".into(),
-                    provider: "xai-auth".into(),
-                });
-            }
-            return Provider::MissingKey(prefix.to_string());
+/// Resolve typed credential and wire dimensions. Unknown explicit prefixes fail closed.
+pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
+    if let Some((prefix, rest)) = model.split_once('/') {
+        if prefix == "xai-auth" && rest == "grok-4.5" {
+            return Some(ResolvedRoute {
+                endpoint: "https://api.x.ai/v1".into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Xai),
+                wire: WireProtocol::OpenAiResponses,
+            });
         }
         if prefix == "openai-codex" {
-            if let Some(cfg) = registry::resolve_codex_shorthand(model) {
-                return Provider::Codex(cfg);
-            }
-            return Provider::MissingKey(prefix.to_string());
+            let c = registry::resolve_codex_shorthand(model)?;
+            return Some(ResolvedRoute {
+                endpoint: c.base_url,
+                model: c.model,
+                provider: c.provider,
+                auth: AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::OpenAiCodex),
+                wire: WireProtocol::CodexResponses,
+            });
         }
-        if prefix == "local" || registry::providers().iter().any(|s| s.key == prefix) {
-            if let Some(cfg) = registry::resolve_shorthand(model) {
-                return Provider::OpenAi(cfg);
-            }
-            // Known provider but no broker-available credential.
-            return Provider::MissingKey(prefix.to_string());
+        if prefix == "local" {
+            let c = registry::resolve_provider_model(prefix, rest)?;
+            return Some(ResolvedRoute {
+                endpoint: c.base_url,
+                model: c.model,
+                provider: c.provider,
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::OpenAiChatCompletions,
+            });
         }
+        if let Some(spec) = registry::providers().iter().find(|s| s.key == prefix) {
+            return Some(ResolvedRoute {
+                endpoint: spec.base_url.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::OpenAiChatCompletions,
+            });
+        }
+        return None;
     }
-    Provider::Anthropic
+    Some(ResolvedRoute {
+        endpoint: "https://api.anthropic.com".into(),
+        model: model.into(),
+        provider: "anthropic".into(),
+        auth: AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Anthropic),
+        wire: WireProtocol::AnthropicMessages,
+    })
+}
+fn provider_config(r: &ResolvedRoute) -> ProviderConfig {
+    ProviderConfig {
+        base_url: r.endpoint.clone(),
+        model: r.model.clone(),
+        provider: r.provider.clone(),
+    }
 }
 
 /// Try to route a request through an OpenAI-compatible provider.
@@ -357,34 +385,59 @@ pub async fn try_route(
         .into()));
     }
 
-    match resolve_route(model) {
-        Provider::OpenAi(cfg) => {
-            let broker = crate::auth::broker_from_source(source, cache, client.clone());
-            let result = stream::call_oai_stream_inner(
-                &cfg, &broker, tools_schema, system_prompt, messages, tx,
-                temperature, max_tokens, thinking_budget, cancel,
-            ).await;
-            Some(result)
-        }
-        Provider::Xai(cfg) => {
-            let broker = crate::auth::broker_from_source(source, cache, client.clone());
-            Some(stream::call_xai_responses_stream_inner(&cfg, &broker, tools_schema, system_prompt, messages, tx, max_tokens, thinking_budget, cancel).await)
-        }
-        Provider::Codex(cfg) => {
-            let broker = crate::auth::broker_from_source(source, cache, client.clone());
-            let result = stream::call_codex_stream_inner(
-                &cfg, client, &broker, tools_schema, system_prompt, messages, tx,
-                temperature, max_tokens, cancel,
-            ).await;
-            Some(result)
-        }
-        Provider::Anthropic => None,
-        Provider::MissingKey(provider) => {
-            Some(Err(format!(
-                "No API key for '{}'. Run `synaps login`, set provider.{} in ~/.synaps-cli/config, or export the provider env var.",
-                provider, provider
-            ).into()))
-        }
+    let Some(route) = resolve_route(model) else {
+        return Some(Err(
+            format!("Unknown provider route for model '{model}'").into()
+        ));
+    };
+    let cfg = provider_config(&route);
+    let broker = crate::auth::broker_from_source(source, cache, client.clone());
+    match route.wire {
+        WireProtocol::OpenAiChatCompletions => Some(
+            stream::call_oai_stream_inner(
+                &cfg,
+                &broker,
+                tools_schema,
+                system_prompt,
+                messages,
+                tx,
+                temperature,
+                max_tokens,
+                thinking_budget,
+                cancel,
+            )
+            .await,
+        ),
+        WireProtocol::OpenAiResponses => Some(
+            stream::call_xai_responses_stream_inner(
+                &cfg,
+                &broker,
+                tools_schema,
+                system_prompt,
+                messages,
+                tx,
+                max_tokens,
+                thinking_budget,
+                cancel,
+            )
+            .await,
+        ),
+        WireProtocol::CodexResponses => Some(
+            stream::call_codex_stream_inner(
+                &cfg,
+                client,
+                &broker,
+                tools_schema,
+                system_prompt,
+                messages,
+                tx,
+                temperature,
+                max_tokens,
+                cancel,
+            )
+            .await,
+        ),
+        WireProtocol::AnthropicMessages => None,
     }
 }
 
@@ -393,16 +446,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn brokered_provider_routing_is_typed_and_fail_closed() {
+        let xai = resolve_route("xai-auth/grok-4.5").unwrap();
+        assert_eq!(
+            xai.auth,
+            AuthPolicy::OAuthAccessToken(crate::auth::OAuthProviderId::Xai)
+        );
+        assert_eq!(xai.wire, WireProtocol::OpenAiResponses);
+        let static_route = resolve_route("groq/llama-3.3-70b-versatile").unwrap();
+        assert_eq!(static_route.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(static_route.wire, WireProtocol::OpenAiChatCompletions);
+        assert!(resolve_route("unknown-provider/model").is_none());
+        assert!(resolve_route("xai-auth/not-a-real-model").is_none());
+    }
+
+    #[test]
     fn resolves_openai_codex_without_requiring_eager_credentials() {
         std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN");
-        match resolve_route("openai-codex/gpt-5.1-codex-mini") {
-            Provider::Codex(cfg) => {
-                assert_eq!(cfg.provider, "openai-codex");
-                assert_eq!(cfg.model, "gpt-5.1-codex-mini");
-                assert!(cfg.base_url.contains("chatgpt.com/backend-api"));
-            }
-            other => panic!("expected Codex route, got {other:?}"),
-        }
+        let route = resolve_route("openai-codex/gpt-5.1-codex-mini").unwrap();
+        assert_eq!(route.provider, "openai-codex");
+        assert_eq!(route.wire, WireProtocol::CodexResponses);
     }
 
     #[test]
