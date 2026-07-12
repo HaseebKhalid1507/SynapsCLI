@@ -41,6 +41,27 @@ impl FromStr for CloudProviderId {
     }
 }
 
+/// Persist a credential-free cloud route while retaining the broker's opaque context.
+/// The context is not interpreted outside the broker and contains no account identity.
+pub fn qualify_model_route(model_id: &str, context_ref: &str) -> Result<String, String> {
+    if !context_ref.starts_with("ctx-")
+        || context_ref.len() > 128
+        || !context_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || model_id.contains("#synaps-context=")
+    {
+        return Err("invalid opaque cloud model context".into());
+    }
+    Ok(format!("{model_id}#synaps-context={context_ref}"))
+}
+
+pub fn split_model_route(route: &str) -> (&str, Option<&str>) {
+    route
+        .rsplit_once("#synaps-context=")
+        .map_or((route, None), |(model, context)| (model, Some(context)))
+}
+
 /// General auth identity. Existing OAuth identity remains strongly typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderId {

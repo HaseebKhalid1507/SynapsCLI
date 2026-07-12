@@ -1345,8 +1345,13 @@ pub(crate) async fn handle_input_action(
                             entries
                                 .into_iter()
                                 .map(|entry| {
+                                    let route = synaps_cli::auth::cloud::qualify_model_route(
+                                        &entry.id,
+                                        &entry.context_ref,
+                                    )
+                                    .unwrap_or(entry.id);
                                     models::ExpandedModelEntry::with_metadata(
-                                        entry.id,
+                                        route,
                                         entry.display_name,
                                         false,
                                         vec![

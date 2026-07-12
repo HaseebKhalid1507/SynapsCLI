@@ -695,8 +695,11 @@ fn decode_event_frame(bytes: &[u8]) -> Result<Option<ConverseEvent>, AwsError> {
     {
         return Err(AwsError::Upstream);
     }
+    let header_bytes = &bytes[12..12 + headers];
+    let payload = &bytes[12 + headers..total - 4];
     let value: serde_json::Value =
-        serde_json::from_slice(&bytes[12 + headers..total - 4]).map_err(|_| AwsError::Upstream)?;
+        serde_json::from_slice(payload).map_err(|_| AwsError::Upstream)?;
+    validate_event_headers(header_bytes, &value)?;
     if let Some(delta) = value
         .pointer("/contentBlockDelta/delta/text")
         .and_then(|v| v.as_str())
@@ -728,6 +731,58 @@ fn decode_event_frame(bytes: &[u8]) -> Result<Option<ConverseEvent>, AwsError> {
     } else {
         Ok(None)
     }
+}
+
+fn validate_event_headers(bytes: &[u8], value: &serde_json::Value) -> Result<(), AwsError> {
+    let mut cursor = 0;
+    let mut values = std::collections::HashMap::new();
+    while cursor < bytes.len() {
+        let name_len = *bytes.get(cursor).ok_or(AwsError::Upstream)? as usize;
+        cursor += 1;
+        let name = std::str::from_utf8(
+            bytes
+                .get(cursor..cursor + name_len)
+                .ok_or(AwsError::Upstream)?,
+        )
+        .map_err(|_| AwsError::Upstream)?;
+        cursor += name_len;
+        if bytes.get(cursor) != Some(&7) {
+            return Err(AwsError::Upstream);
+        }
+        cursor += 1;
+        let len = u16::from_be_bytes(
+            bytes
+                .get(cursor..cursor + 2)
+                .ok_or(AwsError::Upstream)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        cursor += 2;
+        let text = std::str::from_utf8(bytes.get(cursor..cursor + len).ok_or(AwsError::Upstream)?)
+            .map_err(|_| AwsError::Upstream)?;
+        cursor += len;
+        if values.insert(name, text).is_some() {
+            return Err(AwsError::Upstream);
+        }
+    }
+    if values.get(":content-type") != Some(&"application/json") {
+        return Err(AwsError::Upstream);
+    }
+    let message = *values.get(":message-type").ok_or(AwsError::Upstream)?;
+    let kind = match message {
+        "event" => *values.get(":event-type").ok_or(AwsError::Upstream)?,
+        "exception" => *values.get(":exception-type").ok_or(AwsError::Upstream)?,
+        _ => return Err(AwsError::Upstream),
+    };
+    if values.contains_key(if message == "event" {
+        ":exception-type"
+    } else {
+        ":event-type"
+    }) || value.get(kind).is_none()
+    {
+        return Err(AwsError::Upstream);
+    }
+    Ok(())
 }
 
 /// Decode AWS EventStream frames returned by Bedrock ConverseStream. CRCs are
@@ -899,11 +954,8 @@ pub fn sign_bedrock_request(
         format!("bedrock.{region}.amazonaws.com")
     };
     let payload = hex(Sha256::digest(body));
-    let content_type = if runtime && path.ends_with("converse-stream") {
-        "application/vnd.amazon.eventstream"
-    } else {
-        "application/json"
-    };
+    let content_type = "application/json";
+    let accepts_eventstream = runtime && path.ends_with("converse-stream");
     let canonical=format!("{method}\n{path}\n\ncontent-type:{content_type}\nhost:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{amz}\nx-amz-security-token:{}\n\ncontent-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n{payload}",c.session_token);
     let scope = format!("{date}/{region}/bedrock/aws4_request");
     let sts = format!(
@@ -917,6 +969,9 @@ pub fn sign_bedrock_request(
     let sig = hex(hmac(&key, sts.as_bytes()));
     let mut headers = BTreeMap::new();
     headers.insert("content-type".into(), content_type.into());
+    if accepts_eventstream {
+        headers.insert("accept".into(), "application/vnd.amazon.eventstream".into());
+    }
     headers.insert("host".into(), host.clone());
     headers.insert("x-amz-content-sha256".into(), payload);
     headers.insert("x-amz-date".into(), amz);

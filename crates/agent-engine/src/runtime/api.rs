@@ -740,7 +740,8 @@ impl ApiMethods {
         telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     ) -> Result<Value> {
         // Cloud models always dispatch through the typed credential broker.
-        if let Some((provider_key, _)) = model.split_once('/') {
+        let (cloud_model, cloud_context) = crate::auth::cloud::split_model_route(model);
+        if let Some((provider_key, _)) = cloud_model.split_once('/') {
             if let Ok(provider) = provider_key.parse::<crate::auth::CloudProviderId>() {
                 use futures::StreamExt;
                 let broker = crate::auth::broker_from_source(
@@ -774,8 +775,9 @@ impl ApiMethods {
                     stream: true,
                     options: Default::default(),
                 };
+                let context_ref = cloud_context.unwrap_or(provider.as_str());
                 let mut stream = broker
-                    .cloud_invoke(provider, provider.as_str(), model, request)
+                    .cloud_invoke(provider, context_ref, cloud_model, request)
                     .await
                     .map_err(|e| RuntimeError::Config(e.to_string()))?;
                 let mut text = String::new();
